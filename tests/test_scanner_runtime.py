@@ -94,14 +94,17 @@ def test_scan_cycle_fetches_market_data_in_parallel(monkeypatch):
 
 def test_get_scanner_symbols_refreshes_dynamic_universe():
     class Client:
-        def get_liquid_symbols(self, **kwargs):
+        def get_liquid_instruments(self, **kwargs):
             assert kwargs == {
                 "top_n": 2,
                 "min_turnover_24h": 123,
                 "min_volume_24h": 45,
                 "quote_coin": "USDT",
             }
-            return ["SOLUSDT", "BTCUSDT"]
+            return [
+                {"symbol": "SOLUSDT", "turnover_24h": 200, "volume_24h": 50, "rank": 1},
+                {"symbol": "BTCUSDT", "turnover_24h": 150, "volume_24h": 46, "rank": 2},
+            ]
 
     settings = Settings(scanner_universe=ScannerUniverseSettings(
         mode="dynamic", top_n=2, min_turnover_24h=123, min_volume_24h=45,
@@ -114,7 +117,7 @@ def test_get_scanner_symbols_refreshes_dynamic_universe():
 
 def test_get_scanner_symbols_rejects_empty_dynamic_universe():
     class Client:
-        def get_liquid_symbols(self, **kwargs):
+        def get_liquid_instruments(self, **kwargs):
             return []
 
     settings = Settings(scanner_universe=ScannerUniverseSettings(mode="dynamic"))
@@ -205,3 +208,17 @@ def test_schema_keeps_fractional_runtime_and_run_universe_history():
 
     assert "duration_ms NUMERIC(12,3)" in sql
     assert "CREATE TABLE IF NOT EXISTS dds.scanner_run_instrument" in sql
+
+
+def test_dynamic_universe_preserves_liquidity_metadata():
+    class Client:
+        def get_liquid_instruments(self, **kwargs):
+            return [{"symbol": "BTCUSDT", "turnover_24h": 123.5,
+                     "volume_24h": 4.25, "rank": 1}]
+
+    universe = scanner_runner.get_scanner_universe(
+        Client(), Settings(scanner_universe=ScannerUniverseSettings(mode="dynamic")),
+    )
+
+    assert universe == [{"symbol": "BTCUSDT", "turnover_24h": 123.5,
+                         "volume_24h": 4.25, "rank": 1}]

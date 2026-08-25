@@ -12,6 +12,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from app.config import Settings, load_settings
 from app.db.repository import ScannerRepository
@@ -43,24 +44,32 @@ def _handle_signal(signum, frame):
 
 def get_scanner_symbols(client: BybitClient, settings: Settings) -> list[str]:
     """Return the scanner universe selected by the current configuration."""
+    return [str(item["symbol"]) for item in get_scanner_universe(client, settings)]
+
+
+def get_scanner_universe(
+    client: BybitClient, settings: Settings,
+) -> list[dict[str, Any]]:
+    """Return the ranked universe and the metadata used to select it."""
     universe = settings.scanner_universe
     if universe.mode == "dynamic":
-        symbols = client.get_liquid_symbols(
+        instruments = client.get_liquid_instruments(
             top_n=universe.top_n,
             min_turnover_24h=universe.min_turnover_24h,
             min_volume_24h=universe.min_volume_24h,
             quote_coin=universe.quote_coin,
         )
-        if not symbols:
+        if not instruments:
             raise RuntimeError(
                 "Dynamic scanner universe is empty; check liquidity thresholds"
             )
-        return symbols
+        return instruments
 
     symbols = list(settings.symbols)
     if not symbols:
         raise RuntimeError("Static scanner universe is empty")
-    return symbols
+    return [{"symbol": symbol, "rank": rank}
+            for rank, symbol in enumerate(symbols, start=1)]
 
 
 def seconds_until_next_cycle(started_at: float, interval: int, now: float) -> float:
@@ -163,7 +172,8 @@ def main() -> None:
 
     settings = load_settings()
     client = BybitClient(settings)
-    symbols = get_scanner_symbols(client, settings)
+    universe = get_scanner_universe(client, settings)
+    symbols = [str(item["symbol"]) for item in universe]
 
     repository = ScannerRepository(
         host="localhost", port=5432, database="trad_bot", user="postgres",
@@ -185,7 +195,8 @@ def main() -> None:
     cycle = 0
     while not SHUTDOWN:
         try:
-            symbols = get_scanner_symbols(client, settings)
+            universe = get_scanner_universe(client, settings)
+            symbols = [str(item["symbol"]) for item in universe]
             logger.info("scanner universe refreshed: %d symbols", len(symbols))
         except Exception:
             # Keep the last good universe after a transient Bybit failure and
@@ -200,7 +211,7 @@ def main() -> None:
             symbols_total=len(symbols),
             universe_mode=settings.scanner_universe.mode,
         )
-        repository.save_run_universe(run_id, symbols)
+        repository.save_run_universe(run_id, universe)
 
         try:
             total, scanned, failed = run_scan_cycle(
