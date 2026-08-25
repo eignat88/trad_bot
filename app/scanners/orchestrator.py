@@ -65,12 +65,12 @@ class ScannerOrchestrator:
 
     def scan_all_with_stats(
         self, ctx: MarketContext,
-    ) -> tuple[list[SetupCandidate], dict[str, dict[str, int]]]:
+    ) -> tuple[list[SetupCandidate], dict[str, dict[str, int | float]]]:
         """Run every configured scanner and return per-scanner observability data."""
         self.scan_count += 1
         self.last_scan_time = datetime.now(timezone.utc)
         all_candidates: list[SetupCandidate] = []
-        stats: dict[str, dict[str, int]] = {}
+        stats: dict[str, dict[str, int | float]] = {}
 
         for name, scanner in self.scanners.items():
             started = time.perf_counter()
@@ -80,14 +80,14 @@ class ScannerOrchestrator:
                 stats[name] = {
                     "candidates_found": len(candidates),
                     "errors_count": 0,
-                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 3),
                 }
             except Exception:
                 logger.exception("scanner %s failed on %s", name, ctx.symbol)
                 stats[name] = {
                     "candidates_found": 0,
                     "errors_count": 1,
-                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 3),
                 }
 
         scored = [score_candidate(c) for c in all_candidates]

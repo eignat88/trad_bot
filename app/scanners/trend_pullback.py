@@ -32,6 +32,10 @@ class TrendPullbackScanner:
             return None
         invalidation = min(c.low for c in candles_5m[-3:]) * 0.998
         atr = ind.atr if ind.atr > 0 else (current_price * 0.015)
+        ema_distance = min(abs(current_price - ind.ema20) / ind.ema20,
+                           abs(current_price - ind.ema50) / ind.ema50)
+        pullback_quality = 1 - min(ema_distance / self.pullback_tolerance, 1)
+        rsi_confirmation = 1 - min(abs(ind.rsi - 50) / 15, 1)
         return SetupCandidate(
             scanner_name=self.name, scanner_version=self.version, symbol=ctx.symbol,
             direction=ScannerDirection.LONG.value, htf_timeframe="1h", setup_timeframe="15m", entry_timeframe="5m",
@@ -40,7 +44,10 @@ class TrendPullbackScanner:
             entry_zone_high=max(ind.ema20, ind.ema50) * 1.002, invalidation_price=invalidation,
             target_1=current_price + atr * 2, target_2=current_price + atr * 3.5,
             market_regime=ctx.market_regime, state=SetupState.SETUP_READY,
-            features={"htf_context": True, "trend_alignment": True, "pullback_to_ema": True, "rsi_cool": True, "stop_distance_ok": True},
+            features={"htf_context": True, "trend_alignment": True,
+                      "pullback_to_ema": True, "pullback_quality": pullback_quality,
+                      "rsi_cool": True, "rsi_confirmation": rsi_confirmation,
+                      "stop_distance_ok": True},
         )
 
     def _scan_short(self, ctx: MarketContext) -> SetupCandidate | None:
@@ -63,6 +70,10 @@ class TrendPullbackScanner:
             return None
         invalidation = max(c.high for c in candles_5m[-3:]) * 1.002
         atr = ind.atr if ind.atr > 0 else (current_price * 0.015)
+        ema_distance = min(abs(current_price - ind.ema20) / ind.ema20,
+                           abs(current_price - ind.ema50) / ind.ema50)
+        pullback_quality = 1 - min(ema_distance / self.pullback_tolerance, 1)
+        rsi_confirmation = 1 - min(abs(ind.rsi - 50) / 15, 1)
         return SetupCandidate(
             scanner_name=self.name, scanner_version=self.version, symbol=ctx.symbol,
             direction=ScannerDirection.SHORT.value, htf_timeframe="1h", setup_timeframe="15m", entry_timeframe="5m",
@@ -71,7 +82,10 @@ class TrendPullbackScanner:
             entry_zone_high=max(ind.ema20, ind.ema50) * 1.002, invalidation_price=invalidation,
             target_1=current_price - atr * 2, target_2=current_price - atr * 3.5,
             market_regime=ctx.market_regime, state=SetupState.SETUP_READY,
-            features={"htf_context": True, "trend_alignment": True, "pullback_to_ema": True, "rsi_cool": True, "stop_distance_ok": True},
+            features={"htf_context": True, "trend_alignment": True,
+                      "pullback_to_ema": True, "pullback_quality": pullback_quality,
+                      "rsi_cool": True, "rsi_confirmation": rsi_confirmation,
+                      "stop_distance_ok": True},
         )
 
     def scan(self, ctx: MarketContext) -> list[SetupCandidate]:

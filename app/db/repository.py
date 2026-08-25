@@ -106,7 +106,7 @@ class ScannerRepository:
     # ----------------------------------------------------------------
     # SCANNER RUN
     # ----------------------------------------------------------------
-    def start_run(self, symbols_total: int, universe_mode: str = "exchange") -> int | None:
+    def start_run(self, symbols_total: int, universe_mode: str) -> int | None:
         if not self._use_pg:
             return None
         cursor = self._conn.cursor()
@@ -118,6 +118,29 @@ class ScannerRepository:
             )
             self._conn.commit()
             return cursor.fetchone()[0]
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def save_run_universe(self, run_id: int | None, symbols: list[str]) -> None:
+        """Persist the ranked symbol snapshot used by a scanner run."""
+        if not self._use_pg or run_id is None:
+            return
+        cursor = self._conn.cursor()
+        try:
+            for rank, symbol in enumerate(symbols, start=1):
+                instrument_id = self.ensure_instrument(symbol)
+                cursor.execute(
+                    """
+                    INSERT INTO dds.scanner_run_instrument (
+                        run_id, instrument_id, universe_rank
+                    ) VALUES (%s, %s, %s)
+                    ON CONFLICT (run_id, instrument_id) DO UPDATE SET
+                        universe_rank = EXCLUDED.universe_rank
+                    """,
+                    (run_id, instrument_id, rank),
+                )
+            self._conn.commit()
         except Exception:
             self._conn.rollback()
             raise
@@ -147,7 +170,9 @@ class ScannerRepository:
         self._conn.commit()
         return count
 
-    def save_run_stat(self, run_id: int | None, scanner_name: str, **values: int) -> None:
+    def save_run_stat(
+        self, run_id: int | None, scanner_name: str, **values: int | float,
+    ) -> None:
         if not self._use_pg or run_id is None:
             return
         cursor = self._conn.cursor()

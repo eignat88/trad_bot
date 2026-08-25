@@ -38,7 +38,7 @@ class BreakoutRetestScanner:
             return None
         breakout_vol = candles_15m[breakout_candle_idx].volume
         avg_vol = sum(c.volume for c in candles_15m[-20:]) / 20
-        if breakout_vol < avg_vol * 1.2:
+        if avg_vol <= 0 or breakout_vol < avg_vol * 1.2:
             return None
         current_price = candles_5m[-1].close
         retest_zone_high = resistance * (1 + self.retest_margin)
@@ -57,7 +57,10 @@ class BreakoutRetestScanner:
             reference_price=resistance, entry_zone_low=retest_zone_low, entry_zone_high=retest_zone_high,
             invalidation_price=invalidation, target_1=resistance + atr * 2, target_2=resistance + atr * 3.5,
             market_regime=ctx.market_regime, state=SetupState.SETUP_READY,
-            features={"htf_context": True, "breakout_level": resistance, "volume_spike": breakout_vol > avg_vol * 1.5, "retest_quality": True, "stop_distance_ok": True},
+            features={"htf_context": True, "breakout_level": resistance,
+                      "volume_confirmation": min(breakout_vol / avg_vol / 2, 1),
+                      "retest_quality": max(0, 1 - abs(current_price - resistance) /
+                      (resistance * self.retest_margin)), "stop_distance_ok": True},
         )
 
     def _scan_short(self, ctx: MarketContext) -> SetupCandidate | None:
@@ -76,7 +79,7 @@ class BreakoutRetestScanner:
             return None
         breakdown_vol = candles_15m[breakdown_candle_idx].volume
         avg_vol = sum(c.volume for c in candles_15m[-20:]) / 20
-        if breakdown_vol < avg_vol * 1.2:
+        if avg_vol <= 0 or breakdown_vol < avg_vol * 1.2:
             return None
         current_price = candles_5m[-1].close
         retest_zone_high = support * (1 + self.retest_margin)
@@ -95,7 +98,10 @@ class BreakoutRetestScanner:
             reference_price=support, entry_zone_low=retest_zone_low, entry_zone_high=retest_zone_high,
             invalidation_price=invalidation, target_1=support - atr * 2, target_2=support - atr * 3.5,
             market_regime=ctx.market_regime, state=SetupState.SETUP_READY,
-            features={"htf_context": True, "breakout_level": support, "volume_spike": breakdown_vol > avg_vol * 1.5, "retest_quality": True, "stop_distance_ok": True},
+            features={"htf_context": True, "breakout_level": support,
+                      "volume_confirmation": min(breakdown_vol / avg_vol / 2, 1),
+                      "retest_quality": max(0, 1 - abs(current_price - support) /
+                      (support * self.retest_margin)), "stop_distance_ok": True},
         )
 
     def scan(self, ctx: MarketContext) -> list[SetupCandidate]:

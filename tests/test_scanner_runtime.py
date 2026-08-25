@@ -7,6 +7,8 @@ import scanner_runner
 from app.config import ScannerUniverseSettings, Settings
 from app.exchange.bybit_client import BybitClient, BybitTimeoutError
 from app.scanners.models import SetupCandidate
+from app.scanners.orchestrator import ScannerOrchestrator
+from app.scanners.scoring import score_candidate
 
 
 class SuccessfulResponse:
@@ -160,3 +162,46 @@ def test_scan_cycle_propagates_run_id_to_all_records(monkeypatch):
         Settings(scanner_workers=1),
     ) == (1, 1, 0)
     assert repository.calls == [("setup", 42), ("event", 42), ("stat", 42)]
+
+
+def test_scanner_duration_preserves_sub_millisecond_precision(monkeypatch):
+    class Scanner:
+        def scan(self, ctx):
+            return []
+
+    orchestrator = ScannerOrchestrator(enabled_scanners=[])
+    orchestrator.scanners = {"TEST": Scanner()}
+    ticks = iter([10.0, 10.000184])
+    monkeypatch.setattr("app.scanners.orchestrator.time.perf_counter", lambda: next(ticks))
+
+    _, stats = orchestrator.scan_all_with_stats(object())
+
+    assert stats["TEST"]["duration_ms"] == pytest.approx(0.184)
+
+
+def test_shared_scoring_ranks_confirmation_quality():
+    weak = SetupCandidate(
+        scanner_name="TREND_PULLBACK", symbol="ALTUSDT", reference_price=100,
+        invalidation_price=98, target_1=103,
+        features={"htf_context": True, "pullback_quality": 0.1,
+                  "rsi_confirmation": 0.2, "stop_distance_ok": True},
+    )
+    strong = SetupCandidate(
+        scanner_name="TREND_PULLBACK", symbol="BTCUSDT", reference_price=100,
+        invalidation_price=98, target_1=104,
+        features={"htf_context": True, "pullback_quality": 0.9,
+                  "rsi_confirmation": 0.8, "volume_confirmation": 1.0,
+                  "stop_distance_ok": True},
+    )
+
+    assert score_candidate(strong).score > score_candidate(weak).score
+
+
+def test_schema_keeps_fractional_runtime_and_run_universe_history():
+    # Read through the repository package location rather than the process CWD.
+    from pathlib import Path
+    import app.db
+    sql = (Path(app.db.__file__).parent / "schema.sql").read_text(encoding="utf-8")
+
+    assert "duration_ms NUMERIC(12,3)" in sql
+    assert "CREATE TABLE IF NOT EXISTS dds.scanner_run_instrument" in sql

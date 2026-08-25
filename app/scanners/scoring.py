@@ -1,64 +1,67 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from numbers import Real
+
 from app.scanners.models import SetupCandidate
 
 
+# Shared, scanner-independent confirmations. Boolean values receive the full
+# weight; a numeric value in [0, 1] represents confirmation quality.
+CONFIRMATION_WEIGHTS = {
+    "htf_context": (10.0, "HTF_CONTEXT"),
+    "trend_alignment": (5.0, "TREND_ALIGNMENT"),
+    "pullback_quality": (10.0, "PULLBACK_QUALITY"),
+    "rsi_confirmation": (5.0, "RSI_CONFIRMATION"),
+    "liquidity_sweep": (15.0, "LIQUIDITY_SWEEP"),
+    "choch": (15.0, "CHOCH"),
+    "ob_confluence": (10.0, "OB_CONFLUENCE"),
+    "retest_quality": (10.0, "RETEST_QUALITY"),
+    "regime_confirmation": (5.0, "REGIME_CONFIRMATION"),
+    "structure_break": (5.0, "STRUCTURE_QUALITY"),
+    "weak_continuation": (5.0, "WEAK_CONTINUATION"),
+    "rsi_extreme": (5.0, "RSI_CONFIRMATION"),
+    "stop_distance_ok": (5.0, "ACCEPTABLE_STOP"),
+    "volume_confirmation": (5.0, "VOLUME_CONFIRMATION"),
+    "volume_spike": (5.0, "VOLUME_SPIKE"),
+    "displacement": (5.0, "DISPLACEMENT"),
+}
+
+
+def _quality(value: object) -> float:
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, Real):
+        return max(0.0, min(float(value), 1.0))
+    return 0.0
+
+
+def _reward_to_risk(candidate: SetupCandidate) -> float:
+    if candidate.invalidation_price is None or candidate.target_1 is None:
+        return 0.0
+    risk = abs(candidate.reference_price - candidate.invalidation_price)
+    if risk <= 0:
+        return 0.0
+    return abs(candidate.target_1 - candidate.reference_price) / risk
+
+
 def score_candidate(candidate: SetupCandidate) -> SetupCandidate:
-    score = 0.0
-    reasons: list[str] = []
-    features = candidate.features
+    """Score every scanner on one comparable, quality-sensitive scale."""
+    score = 10.0
+    reasons: list[str] = ["VALID_SETUP"]
 
-    if features.get("htf_context"):
-        score += 20
-        reasons.append("HTF_CONTEXT")
-    if features.get("liquidity_sweep"):
-        score += 20
-        reasons.append("LIQUIDITY_SWEEP")
-    if features.get("choch"):
-        score += 20
-        reasons.append("CHOCH")
-    if features.get("ob_confluence"):
-        score += 15
-        reasons.append("OB_CONFLUENCE")
-    if features.get("retest_quality"):
-        score += 10
-        reasons.append("RETEST_QUALITY")
-    if features.get("regime_confirmation"):
-        score += 10
-        reasons.append("REGIME_CONFIRMATION")
-    if features.get("stop_distance_ok"):
-        score += 5
-        reasons.append("ACCEPTABLE_STOP")
-    if features.get("volume_spike"):
-        score += 5
-        reasons.append("VOLUME_SPIKE")
-    if features.get("displacement"):
-        score += 5
-        reasons.append("DISPLACEMENT")
+    for feature, (weight, reason) in CONFIRMATION_WEIGHTS.items():
+        quality = _quality(candidate.features.get(feature))
+        if quality:
+            score += weight * quality
+            reasons.append(reason)
 
-    score = min(score, 100.0)
+    rr = _reward_to_risk(candidate)
+    if rr >= 1.5:
+        score += 5
+        reasons.append("RR_1_5")
+    if rr >= 2.0:
+        score += 5
+        reasons.append("RR_2")
 
-    return SetupCandidate(
-        setup_id=candidate.setup_id,
-        scanner_name=candidate.scanner_name,
-        scanner_version=candidate.scanner_version,
-        symbol=candidate.symbol,
-        direction=candidate.direction,
-        htf_timeframe=candidate.htf_timeframe,
-        setup_timeframe=candidate.setup_timeframe,
-        entry_timeframe=candidate.entry_timeframe,
-        detected_at=candidate.detected_at,
-        setup_started_at=candidate.setup_started_at,
-        reference_price=candidate.reference_price,
-        entry_zone_low=candidate.entry_zone_low,
-        entry_zone_high=candidate.entry_zone_high,
-        invalidation_price=candidate.invalidation_price,
-        target_1=candidate.target_1,
-        target_2=candidate.target_2,
-        score=score,
-        market_regime=candidate.market_regime,
-        reasons=tuple(reasons),
-        features=candidate.features,
-        source_candle_ids=candidate.source_candle_ids,
-        state=candidate.state,
-    )
+    return replace(candidate, score=round(min(score, 100.0), 2), reasons=tuple(reasons))

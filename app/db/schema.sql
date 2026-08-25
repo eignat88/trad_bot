@@ -56,10 +56,28 @@ CREATE TABLE IF NOT EXISTS dds.scanner_run_stat (
     candidates_found INTEGER NOT NULL DEFAULT 0,
     setups_saved INTEGER NOT NULL DEFAULT 0,
     errors_count INTEGER NOT NULL DEFAULT 0,
-    duration_ms BIGINT NOT NULL DEFAULT 0,
+    duration_ms NUMERIC(12,3) NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (run_id, scanner_name)
 );
+
+ALTER TABLE dds.scanner_run_stat
+    ALTER COLUMN duration_ms TYPE NUMERIC(12,3) USING duration_ms::NUMERIC(12,3);
+
+-- Immutable membership snapshot for each dynamic or static run universe.
+CREATE TABLE IF NOT EXISTS dds.scanner_run_instrument (
+    run_id BIGINT NOT NULL REFERENCES dds.scanner_run(run_id) ON DELETE CASCADE,
+    instrument_id BIGINT NOT NULL REFERENCES dds.instrument(instrument_id),
+    universe_rank INTEGER NOT NULL,
+    turnover_24h NUMERIC,
+    volume_24h NUMERIC,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_id, instrument_id),
+    CONSTRAINT scanner_run_instrument_rank_chk CHECK (universe_rank > 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scanner_run_instrument_instrument
+ON dds.scanner_run_instrument (instrument_id, run_id DESC);
 
 -- ============================================================
 -- SCANNER_SETUP: сырые результаты каждого из 7 сканеров

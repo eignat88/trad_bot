@@ -83,7 +83,7 @@ def run_scan_cycle(
     failed = 0
     run_stats = {
         name: {"symbols_scanned": 0, "candidates_found": 0,
-               "setups_saved": 0, "errors_count": 0, "duration_ms": 0}
+               "setups_saved": 0, "errors_count": 0, "duration_ms": 0.0}
         for name in orchestrator.scanners
     }
 
@@ -196,7 +196,11 @@ def main() -> None:
         start = time.monotonic()
 
         # Start a new run
-        run_id = repository.start_run(symbols_total=len(symbols))
+        run_id = repository.start_run(
+            symbols_total=len(symbols),
+            universe_mode=settings.scanner_universe.mode,
+        )
+        repository.save_run_universe(run_id, symbols)
 
         try:
             total, scanned, failed = run_scan_cycle(
