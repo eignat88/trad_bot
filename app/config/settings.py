@@ -28,6 +28,11 @@ class Settings:
     live_trading_enabled: bool = False
     bybit_api_key: str = ""
     bybit_api_secret: str = ""
+    bybit_timeout: float = 15.0
+    bybit_max_attempts: int = 3
+    bybit_retry_backoff: float = 1.0
+    scanner_workers: int = 5
+    scan_interval: int = 300
     telegram_token: str = ""
     telegram_chat_id: str = ""
     initial_balance: float = 10_000.0
@@ -117,4 +122,10 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         raise ValueError("scanner_universe.top_n must be positive")
     if universe.min_turnover_24h < 0 or universe.min_volume_24h < 0:
         raise ValueError("scanner universe liquidity thresholds cannot be negative")
+    if settings.bybit_timeout <= 0 or settings.bybit_max_attempts <= 0:
+        raise ValueError("Bybit timeout and max attempts must be positive")
+    if settings.bybit_retry_backoff < 0:
+        raise ValueError("bybit_retry_backoff cannot be negative")
+    if settings.scanner_workers <= 0 or settings.scan_interval <= 0:
+        raise ValueError("scanner workers and interval must be positive")
     return settings
