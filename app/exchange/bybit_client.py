@@ -70,6 +70,55 @@ class BybitClient:
         rows = payload["result"]["list"]
         return float(rows[0]["fundingRate"]) * 100.0 if rows else 0.0
 
+    def get_linear_instruments(self, quote_coin: str = "USDT") -> list[dict[str, Any]]:
+        """Return all actively trading linear perpetuals for a quote coin."""
+        instruments: list[dict[str, Any]] = []
+        cursor = ""
+        while True:
+            params: dict[str, Any] = {"category": "linear", "limit": 1000}
+            if cursor:
+                params["cursor"] = cursor
+            result = self._public_get("/v5/market/instruments-info", **params)["result"]
+            instruments.extend(
+                row for row in result.get("list", [])
+                if row.get("status") == "Trading"
+                and row.get("quoteCoin") == quote_coin
+                and row.get("contractType") == "LinearPerpetual"
+            )
+            next_cursor = result.get("nextPageCursor", "")
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+        return instruments
+
+    def get_tickers(self, category: str = "linear") -> list[dict[str, Any]]:
+        """Return the latest 24-hour market statistics for a category."""
+        payload = self._public_get("/v5/market/tickers", category=category)
+        return payload["result"].get("list", [])
+
+    def get_liquid_symbols(
+        self,
+        top_n: int = 50,
+        min_turnover_24h: float = 10_000_000.0,
+        min_volume_24h: float = 0.0,
+        quote_coin: str = "USDT",
+    ) -> list[str]:
+        """Select active USDT perpetuals, ranked by their 24-hour turnover."""
+        eligible = {row["symbol"] for row in self.get_linear_instruments(quote_coin)}
+        liquid: list[tuple[str, float]] = []
+        for ticker in self.get_tickers("linear"):
+            symbol = ticker.get("symbol")
+            try:
+                turnover = float(ticker.get("turnover24h", 0))
+                volume = float(ticker.get("volume24h", 0))
+            except (TypeError, ValueError):
+                continue
+            if (symbol in eligible and turnover >= min_turnover_24h
+                    and volume >= min_volume_24h):
+                liquid.append((symbol, turnover))
+        liquid.sort(key=lambda item: (-item[1], item[0]))
+        return [symbol for symbol, _ in liquid[:top_n]]
+
     def create_order(self, symbol: str, side: str, qty: float, order_type: str = "Market") -> dict[str, Any]:
         if self.settings.trading_mode != "live" or not self.settings.live_trading_enabled:
             raise RuntimeError("live order rejected: both live mode and explicit switch are required")

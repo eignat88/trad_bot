@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app.config import load_settings
+from app.config import Settings, load_settings
 from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
 from app.scanners.context_builder import build_market_context
@@ -46,11 +46,13 @@ def run_scan_cycle(
     orchestrator: ScannerOrchestrator,
     repository: ScannerRepository,
     symbols: list[str],
+    settings: Settings | None = None,
 ) -> int:
+    settings = settings or load_settings()
     total_found = 0
     for symbol in symbols:
         try:
-            ctx = build_market_context(client, symbol, load_settings())
+            ctx = build_market_context(client, symbol, settings)
             candidates = orchestrator.scan_all(ctx)
 
             for c in candidates:
@@ -85,7 +87,18 @@ def main() -> None:
 
     settings = load_settings()
     client = BybitClient(settings)
-    symbols = list(settings.symbols)
+    universe = settings.scanner_universe
+    if universe.mode == "dynamic":
+        symbols = client.get_liquid_symbols(
+            top_n=universe.top_n,
+            min_turnover_24h=universe.min_turnover_24h,
+            min_volume_24h=universe.min_volume_24h,
+            quote_coin=universe.quote_coin,
+        )
+        if not symbols:
+            raise RuntimeError("dynamic scanner universe is empty; check liquidity thresholds")
+    else:
+        symbols = list(settings.symbols)
 
     repository = ScannerRepository(
         host="localhost", port=5432, database="trad_bot", user="postgres",
@@ -95,8 +108,8 @@ def main() -> None:
     orchestrator = ScannerOrchestrator(repository=repository)
 
     logger.info(
-        "scanner started: symbols=%s scanners=%d interval=%ds",
-        symbols, len(orchestrator.scanners), SCAN_INTERVAL,
+        "scanner started: symbols=%d scanners=%d interval=%ds universe=%s",
+        len(symbols), len(orchestrator.scanners), SCAN_INTERVAL, universe.mode,
     )
 
     cycle = 0
@@ -105,7 +118,7 @@ def main() -> None:
         start = time.time()
 
         try:
-            total = run_scan_cycle(client, orchestrator, repository, symbols)
+            total = run_scan_cycle(client, orchestrator, repository, symbols, settings)
             elapsed = time.time() - start
             logger.info("cycle #%d done: %d setups in %.1fs", cycle, total, elapsed)
         except Exception:

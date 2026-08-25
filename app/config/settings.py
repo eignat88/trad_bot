@@ -6,6 +6,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+
+@dataclass(frozen=True)
+class ScannerUniverseSettings:
+    """Controls how scanner symbols are selected."""
+
+    mode: str = "static"
+    quote_coin: str = "USDT"
+    category: str = "linear"
+    top_n: int = 50
+    min_turnover_24h: float = 10_000_000.0
+    min_volume_24h: float = 0.0
+
+
 @dataclass(frozen=True)
 class Settings:
     symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT")
@@ -53,6 +66,7 @@ class Settings:
     data_file: str = "data/trades.jsonl"
     rejection_file: str = "data/rejections.jsonl"
     market_data_file: str = "data/market_snapshots.jsonl"
+    scanner_universe: ScannerUniverseSettings = field(default_factory=ScannerUniverseSettings)
 
 
 def _load_dotenv(path: Path) -> None:
@@ -87,9 +101,20 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
     values.update(env)
     if "symbols" in values:
         values["symbols"] = tuple(values["symbols"])
+    if "scanner_universe" in values and isinstance(values["scanner_universe"], dict):
+        values["scanner_universe"] = ScannerUniverseSettings(**values["scanner_universe"])
     settings = Settings(**values)
     if settings.category != "linear":
         raise ValueError("Price/OI strategy requires category=linear")
     if settings.trading_mode not in {"paper", "live"}:
         raise ValueError("TRADING_MODE must be paper or live")
+    universe = settings.scanner_universe
+    if universe.mode not in {"static", "dynamic"}:
+        raise ValueError("scanner_universe.mode must be static or dynamic")
+    if universe.category != "linear":
+        raise ValueError("scanner_universe.category must be linear")
+    if universe.top_n <= 0:
+        raise ValueError("scanner_universe.top_n must be positive")
+    if universe.min_turnover_24h < 0 or universe.min_volume_24h < 0:
+        raise ValueError("scanner universe liquidity thresholds cannot be negative")
     return settings

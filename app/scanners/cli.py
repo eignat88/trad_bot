@@ -47,7 +47,20 @@ def main() -> None:
 
     settings = load_settings()
     client = BybitClient(settings)
-    symbols = args.symbols or list(settings.symbols)
+    universe = settings.scanner_universe
+    if args.symbols:
+        symbols = args.symbols
+    elif universe.mode == "dynamic":
+        symbols = client.get_liquid_symbols(
+            top_n=universe.top_n,
+            min_turnover_24h=universe.min_turnover_24h,
+            min_volume_24h=universe.min_volume_24h,
+            quote_coin=universe.quote_coin,
+        )
+        if not symbols:
+            parser.error("dynamic scanner universe is empty; check liquidity thresholds")
+    else:
+        symbols = list(settings.symbols)
     enabled = args.scanners or ALL_SCANNERS
 
     repository = ScannerRepository()
