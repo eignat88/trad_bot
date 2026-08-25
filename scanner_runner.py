@@ -32,7 +32,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("scanner_runner")
 
-SCAN_INTERVAL = 300  # 5 minutes
 SHUTDOWN = False
 
 
@@ -40,6 +39,33 @@ def _handle_signal(signum, frame):
     global SHUTDOWN
     logger.info("shutdown signal received")
     SHUTDOWN = True
+
+
+def get_scanner_symbols(client: BybitClient, settings: Settings) -> list[str]:
+    """Return the scanner universe selected by the current configuration."""
+    universe = settings.scanner_universe
+    if universe.mode == "dynamic":
+        symbols = client.get_liquid_symbols(
+            top_n=universe.top_n,
+            min_turnover_24h=universe.min_turnover_24h,
+            min_volume_24h=universe.min_volume_24h,
+            quote_coin=universe.quote_coin,
+        )
+        if not symbols:
+            raise RuntimeError(
+                "Dynamic scanner universe is empty; check liquidity thresholds"
+            )
+        return symbols
+
+    symbols = list(settings.symbols)
+    if not symbols:
+        raise RuntimeError("Static scanner universe is empty")
+    return symbols
+
+
+def seconds_until_next_cycle(started_at: float, interval: int, now: float) -> float:
+    """Return the remaining delay, keeping cycles anchored to their start."""
+    return max(0, interval - (now - started_at))
 
 
 def run_scan_cycle(
@@ -58,7 +84,7 @@ def run_scan_cycle(
     if not symbols:
         return 0, 0, 0
 
-    workers = min(4, len(symbols))
+    workers = min(settings.scanner_workers, len(symbols))
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="market-data") as executor:
         futures = {
@@ -121,7 +147,7 @@ def main() -> None:
 
     settings = load_settings()
     client = BybitClient(settings)
-    symbols = list(settings.symbols)
+    symbols = get_scanner_symbols(client, settings)
 
     repository = ScannerRepository(
         host="localhost", port=5432, database="trad_bot", user="postgres",
@@ -132,11 +158,19 @@ def main() -> None:
 
     logger.info(
         "scanner started: symbols=%s scanners=%d interval=%ds",
-        symbols, len(orchestrator.scanners), SCAN_INTERVAL,
+        symbols, len(orchestrator.scanners), settings.scan_interval,
     )
 
     cycle = 0
     while not SHUTDOWN:
+        try:
+            symbols = get_scanner_symbols(client, settings)
+            logger.info("scanner universe refreshed: %d symbols", len(symbols))
+        except Exception:
+            # Keep the last good universe after a transient Bybit failure and
+            # retry the refresh at the beginning of the next cycle.
+            logger.exception("failed to refresh scanner universe")
+
         cycle += 1
         start = time.monotonic()
 
@@ -179,7 +213,10 @@ def main() -> None:
                 )
 
         # Sleep in small intervals to respond to shutdown
-        for _ in range(SCAN_INTERVAL):
+        delay = seconds_until_next_cycle(
+            start, settings.scan_interval, time.monotonic(),
+        )
+        for _ in range(int(delay)):
             if SHUTDOWN:
                 break
             time.sleep(1)
