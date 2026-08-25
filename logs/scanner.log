@@ -1,0 +1,3 @@
+2026-08-25 13:06:40,947 [INFO] app.db.repository: scanner repository connected to PostgreSQL (localhost:5432/trad_bot)
+2026-08-25 13:06:41,079 [INFO] app.db.repository: scanner schema applied
+2026-08-25 13:06:41,079 [INFO] scanner_runner: scanner started: symbols=['BTCUSDT', 'ETHUSDT'] scanners=7 interval=300s
