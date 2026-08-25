@@ -41,6 +41,35 @@ def test_bybit_klines_are_reversed_before_conversion():
     assert [row.timestamp for row in rows] == [100, 200]
 
 
+def test_bybit_liquid_symbols_are_active_perpetuals_ranked_by_turnover():
+    class Response:
+        def __init__(self, payload): self.payload = payload
+        def raise_for_status(self): pass
+        def json(self): return self.payload
+
+    class Session:
+        def get(self, url, params, timeout):
+            if url.endswith("/instruments-info"):
+                rows = [
+                    {"symbol": "BTCUSDT", "status": "Trading", "quoteCoin": "USDT", "contractType": "LinearPerpetual"},
+                    {"symbol": "ETHUSDT", "status": "Trading", "quoteCoin": "USDT", "contractType": "LinearPerpetual"},
+                    {"symbol": "OLDUSDT", "status": "Settled", "quoteCoin": "USDT", "contractType": "LinearPerpetual"},
+                    {"symbol": "FUTUSDT", "status": "Trading", "quoteCoin": "USDT", "contractType": "LinearFutures"},
+                ]
+                return Response({"retCode": 0, "result": {"list": rows, "nextPageCursor": ""}})
+            rows = [
+                {"symbol": "BTCUSDT", "turnover24h": "20000000", "volume24h": "1000"},
+                {"symbol": "ETHUSDT", "turnover24h": "30000000", "volume24h": "2000"},
+                {"symbol": "OLDUSDT", "turnover24h": "90000000", "volume24h": "9000"},
+            ]
+            return Response({"retCode": 0, "result": {"list": rows}})
+
+    symbols = BybitClient(Settings(), Session()).get_liquid_symbols(
+        top_n=2, min_turnover_24h=10_000_000, min_volume_24h=500,
+    )
+    assert symbols == ["ETHUSDT", "BTCUSDT"]
+
+
 def test_market_data_builds_changes_from_chronological_data():
     settings = Settings()
     service = MarketDataService(None, settings)  # type: ignore[arg-type]

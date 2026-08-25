@@ -1,5 +1,13 @@
 {
   "symbols": ["BTCUSDT", "ETHUSDT"],
+  "scanner_universe": {
+    "mode": "dynamic",
+    "quote_coin": "USDT",
+    "category": "linear",
+    "top_n": 50,
+    "min_turnover_24h": 10000000,
+    "min_volume_24h": 0
+  },
   "category": "linear",
   "timeframe": "5",
   "trading_mode": "paper",
