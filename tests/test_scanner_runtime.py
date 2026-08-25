@@ -4,7 +4,7 @@ import time
 import pytest
 
 import scanner_runner
-from app.config import Settings
+from app.config import ScannerUniverseSettings, Settings
 from app.exchange.bybit_client import BybitClient, BybitTimeoutError
 
 
@@ -71,13 +71,46 @@ def test_scan_cycle_fetches_market_data_in_parallel(monkeypatch):
             return []
 
     monkeypatch.setattr(scanner_runner, "build_market_context", build_context)
-    total = scanner_runner.run_scan_cycle(
+    total, scanned, failed = scanner_runner.run_scan_cycle(
         object(), Orchestrator(), object(), ["A", "B", "C", "D"],
         Settings(scanner_workers=3),
     )
 
     assert total == 0
+    assert scanned == 4
+    assert failed == 0
     assert peak == 3
+
+
+def test_get_scanner_symbols_refreshes_dynamic_universe():
+    class Client:
+        def get_liquid_symbols(self, **kwargs):
+            assert kwargs == {
+                "top_n": 2,
+                "min_turnover_24h": 123,
+                "min_volume_24h": 45,
+                "quote_coin": "USDT",
+            }
+            return ["SOLUSDT", "BTCUSDT"]
+
+    settings = Settings(scanner_universe=ScannerUniverseSettings(
+        mode="dynamic", top_n=2, min_turnover_24h=123, min_volume_24h=45,
+    ))
+
+    assert scanner_runner.get_scanner_symbols(Client(), settings) == [
+        "SOLUSDT", "BTCUSDT",
+    ]
+
+
+def test_get_scanner_symbols_rejects_empty_dynamic_universe():
+    class Client:
+        def get_liquid_symbols(self, **kwargs):
+            return []
+
+    settings = Settings(scanner_universe=ScannerUniverseSettings(mode="dynamic"))
+
+    with pytest.raises(RuntimeError, match="Dynamic scanner universe is empty"):
+        scanner_runner.get_scanner_symbols(Client(), settings)
 
 
 def test_cycle_delay_is_measured_from_cycle_start():

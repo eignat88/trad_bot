@@ -30,4 +30,40 @@ funding requests comfortably bounded.
 
 Set `scanner_universe.mode` to `static` to use the top-level `symbols` list
 instead. An explicit CLI `--symbols` list always takes precedence over either
-configured mode.
+configured mode. The continuous runner refreshes the dynamic universe before
+every cycle. If Bybit is temporarily unavailable during a refresh, it keeps the
+last successfully loaded universe and retries on the next cycle.
+
+## Running the project
+
+Create the environment and install dependencies on Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+Start the continuous scanner (TOP-N universe, all seven scanners, PostgreSQL):
+
+```powershell
+python .\scanner_runner.py
+```
+
+Alternatively, use the bundled background-process scripts:
+
+```powershell
+.\start_scanner.bat
+.\stop_scanner.bat
+```
+
+Run a one-off scanner check or the paper-trading application:
+
+```powershell
+python -m app.scanners.cli --once
+python .\bot.py --check-config
+python .\bot.py
+```
+
+On Linux or macOS, activate the environment with
+`source .venv/bin/activate`; the Python commands are otherwise the same.
