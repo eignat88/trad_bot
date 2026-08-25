@@ -54,3 +54,27 @@ def volume_ratio(volumes: Sequence[float], period: int = 20) -> float:
         raise ValueError("volume ratio requires period + 1 values")
     average = sum(volumes[-period - 1:-1]) / period
     return volumes[-1] / average if average else 0.0
+
+
+def ema(values: Sequence[float], period: int) -> float:
+    """Exponential Moving Average."""
+    if len(values) < period:
+        raise ValueError(f"EMA requires at least {period} values")
+    multiplier = 2.0 / (period + 1)
+    result = sum(values[:period]) / period
+    for val in values[period:]:
+        result = (val - result) * multiplier + result
+    return result
+
+
+def bollinger_bands(
+    values: Sequence[float], period: int = 20, num_std: float = 2.0
+) -> tuple[float, float, float]:
+    """Returns (upper, middle, lower) Bollinger Bands."""
+    if len(values) < period:
+        raise ValueError(f"Bollinger Bands require at least {period} values")
+    window = values[-period:]
+    middle = sum(window) / period
+    variance = sum((v - middle) ** 2 for v in window) / period
+    std = variance ** 0.5
+    return middle + num_std * std, middle, middle - num_std * std
