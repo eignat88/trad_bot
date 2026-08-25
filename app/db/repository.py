@@ -130,7 +130,7 @@ class ScannerRepository:
                 c.setup_started_at, c.signal_candle_open_time, c.detected_at, c.reference_price,
                 c.entry_zone_low, c.entry_zone_high, c.invalidation_price,
                 c.target_1, c.target_2, c.score, c.market_regime,
-                "READY" if (c.state.value == "SETUP_READY" if isinstance(c.state, SetupState) else c.state == "SETUP_READY") else (c.state.value if isinstance(c.state, SetupState) else c.state),
+                c.state.value if isinstance(c.state, SetupState) else c.state,
                 json.dumps(list(c.reasons)), json.dumps(c.features),
             ),
         )
@@ -159,7 +159,7 @@ class ScannerRepository:
             "target_2": c.target_2,
             "score": c.score,
             "market_regime": c.market_regime,
-            "status": "READY" if c.state == SetupState.SETUP_READY else (c.state.value if isinstance(c.state, SetupState) else c.state),
+            "status": c.state.value if isinstance(c.state, SetupState) else c.state,
             "reasons": list(c.reasons),
             "features": c.features,
         }
@@ -201,7 +201,7 @@ class ScannerRepository:
                        s.target_1, s.target_2, s.reasons, s.features
                 FROM dds.scanner_setup s
                 JOIN dds.instrument i ON i.instrument_id = s.instrument_id
-                WHERE i.symbol = %s AND s.status IN ('CANDIDATE', 'READY')
+                WHERE i.symbol = %s AND s.status = 'READY_TO_TRADE'
                 ORDER BY s.score DESC
                 """,
                 (symbol,),
@@ -215,7 +215,7 @@ class ScannerRepository:
                        s.target_1, s.target_2, s.reasons, s.features
                 FROM dds.scanner_setup s
                 JOIN dds.instrument i ON i.instrument_id = s.instrument_id
-                WHERE s.status IN ('CANDIDATE', 'READY')
+                WHERE s.status = 'READY_TO_TRADE'
                 ORDER BY s.score DESC
                 LIMIT 20
                 """,
@@ -247,7 +247,7 @@ class ScannerRepository:
             if not line.strip():
                 continue
             record = json.loads(line)
-            if record.get("status") not in ("CANDIDATE", "READY"):
+            if record.get("status") != "READY_TO_TRADE":
                 continue
             if symbol and record.get("symbol") != symbol:
                 continue

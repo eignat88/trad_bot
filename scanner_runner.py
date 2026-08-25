@@ -18,6 +18,7 @@ from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient, BybitTimeoutError
 from app.scanners.context_builder import build_market_context
 from app.scanners.orchestrator import ScannerOrchestrator
+from app.scanners.signal_aggregator import SignalAggregator
 
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -52,11 +53,13 @@ def run_scan_cycle(
     repository: ScannerRepository,
     symbols: list[str],
     settings: Settings | None = None,
+    aggregator: SignalAggregator | None = None,
 ) -> int:
     settings = settings or load_settings()
     total_found = 0
     if not symbols:
         return 0
+    aggregator = aggregator or SignalAggregator(settings.signal_conflict_window)
     workers = min(settings.scanner_workers, len(symbols))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="market-data") as executor:
         futures = {
@@ -78,8 +81,21 @@ def run_scan_cycle(
             try:
                 candidates = orchestrator.scan_all(ctx)
 
+                decisions = aggregator.resolve(candidates)
+                trade_candidates = []
+                for decision in decisions:
+                    # Re-save the complete window so an older opposite signal is
+                    # also moved to CONFLICT as soon as the conflict appears.
+                    for c in decision.signals:
+                        repository.save_setup(c)
+                    trade_candidates.extend(decision.trade_candidates)
+                    if decision.status.value == "CONFLICT":
+                        logger.warning(
+                            "%s: CONFLICT long_score=%.0f short_score=%.0f; trade blocked",
+                            symbol, decision.long_score, decision.short_score,
+                        )
+
                 for c in candidates:
-                    repository.save_setup(c)
                     repository.save_event(
                         "SETUP_DETECTED", c.scanner_name, symbol,
                         timeframe=c.setup_timeframe,
@@ -89,7 +105,7 @@ def run_scan_cycle(
                         payload={"entry_zone": [c.entry_zone_low, c.entry_zone_high]},
                     )
 
-                total_found += len(candidates)
+                total_found += len(trade_candidates)
 
                 if candidates:
                     best = max(candidates, key=lambda c: c.score)
@@ -129,6 +145,7 @@ def main() -> None:
     repository.ensure_schema()
 
     orchestrator = ScannerOrchestrator(repository=repository)
+    aggregator = SignalAggregator(settings.signal_conflict_window)
 
     logger.info(
         "scanner started: symbols=%d scanners=%d workers=%d interval=%ds universe=%s",
@@ -142,7 +159,9 @@ def main() -> None:
         start = time.monotonic()
 
         try:
-            total = run_scan_cycle(client, orchestrator, repository, symbols, settings)
+            total = run_scan_cycle(
+                client, orchestrator, repository, symbols, settings, aggregator
+            )
             elapsed = time.monotonic() - start
             logger.info("cycle #%d done: %d setups in %.1fs", cycle, total, elapsed)
         except Exception:

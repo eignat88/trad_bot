@@ -32,13 +32,16 @@ CREATE TABLE IF NOT EXISTS dds.scanner_setup (
     target_2 NUMERIC,
     score NUMERIC NOT NULL,
     market_regime TEXT,
-    status TEXT NOT NULL DEFAULT 'CANDIDATE',
+    status TEXT NOT NULL DEFAULT 'DETECTED',
     reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
     features JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT scanner_setup_direction_chk CHECK (direction IN ('LONG', 'SHORT')),
     CONSTRAINT scanner_setup_status_chk CHECK (
-        status IN ('CANDIDATE', 'READY', 'INVALIDATED', 'EXPIRED', 'CONSUMED')
+        status IN (
+            'DETECTED', 'CONFIRMED', 'READY_TO_TRADE', 'CONFLICT',
+            'EXECUTED', 'INVALIDATED', 'EXPIRED'
+        )
     )
 );
 
@@ -46,6 +49,17 @@ CREATE TABLE IF NOT EXISTS dds.scanner_setup (
 -- deduplication was introduced.
 ALTER TABLE dds.scanner_setup
     ADD COLUMN IF NOT EXISTS signal_candle_open_time BIGINT NOT NULL DEFAULT 0;
+
+ALTER TABLE dds.scanner_setup DROP CONSTRAINT IF EXISTS scanner_setup_status_chk;
+UPDATE dds.scanner_setup SET status = 'DETECTED' WHERE status = 'CANDIDATE';
+UPDATE dds.scanner_setup SET status = 'READY_TO_TRADE' WHERE status = 'READY';
+UPDATE dds.scanner_setup SET status = 'EXECUTED' WHERE status = 'CONSUMED';
+ALTER TABLE dds.scanner_setup ADD CONSTRAINT scanner_setup_status_chk CHECK (
+    status IN (
+        'DETECTED', 'CONFIRMED', 'READY_TO_TRADE', 'CONFLICT',
+        'EXECUTED', 'INVALIDATED', 'EXPIRED'
+    )
+);
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_scanner_setup_signal_candle
 ON dds.scanner_setup (
@@ -80,11 +94,12 @@ CREATE OR REPLACE VIEW dds.scanner_stats AS
 SELECT
     scanner_name,
     COUNT(*) AS total_setups,
-    COUNT(*) FILTER (WHERE status = 'READY') AS ready,
-    COUNT(*) FILTER (WHERE status = 'CANDIDATE') AS candidate,
+    COUNT(*) FILTER (WHERE status = 'READY_TO_TRADE') AS ready_to_trade,
+    COUNT(*) FILTER (WHERE status = 'DETECTED') AS detected,
+    COUNT(*) FILTER (WHERE status = 'CONFLICT') AS conflict,
     COUNT(*) FILTER (WHERE status = 'INVALIDATED') AS invalidated,
     COUNT(*) FILTER (WHERE status = 'EXPIRED') AS expired,
-    COUNT(*) FILTER (WHERE status = 'CONSUMED') AS consumed,
+    COUNT(*) FILTER (WHERE status = 'EXECUTED') AS executed,
     AVG(score) AS avg_score,
     MAX(detected_at) AS last_detected
 FROM dds.scanner_setup

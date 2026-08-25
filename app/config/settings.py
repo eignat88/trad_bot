@@ -33,6 +33,7 @@ class Settings:
     bybit_retry_backoff: float = 1.0
     scanner_workers: int = 5
     scan_interval: int = 300
+    signal_conflict_window: int = 600
     telegram_token: str = ""
     telegram_chat_id: str = ""
     initial_balance: float = 10_000.0
@@ -126,6 +127,7 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         raise ValueError("Bybit timeout and max attempts must be positive")
     if settings.bybit_retry_backoff < 0:
         raise ValueError("bybit_retry_backoff cannot be negative")
-    if settings.scanner_workers <= 0 or settings.scan_interval <= 0:
+    if (settings.scanner_workers <= 0 or settings.scan_interval <= 0
+            or settings.signal_conflict_window <= 0):
         raise ValueError("scanner workers and interval must be positive")
     return settings

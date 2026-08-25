@@ -9,6 +9,7 @@ from app.scanners.models import (
     MarketContext,
     MarketLevels,
     SetupCandidate,
+    SetupState,
 )
 from app.scanners.orchestrator import ScannerOrchestrator
 
@@ -60,12 +61,14 @@ def test_orchestrator_attaches_entry_candle_open_time():
 def test_jsonl_repository_upserts_same_signal_candle(tmp_path):
     path = tmp_path / "setups.jsonl"
     repository = ScannerRepository(jsonl_path=str(path))
-    first = candidate()
+    first = candidate(state=SetupState.READY_TO_TRADE)
     repository.save_setup(first)
-    repository.save_setup(candidate(reference_price=79_219.80))
+    repository.save_setup(candidate(
+        reference_price=79_219.80, state=SetupState.READY_TO_TRADE
+    ))
 
     records = repository.get_active_setups()
     assert len(records) == 1
     assert records[0]["setup_id"] == str(first.setup_id)
     assert records[0]["reference_price"] == 79_219.80
-    assert records[0]["status"] == "READY"
+    assert records[0]["status"] == "READY_TO_TRADE"

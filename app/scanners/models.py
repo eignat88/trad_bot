@@ -10,6 +10,11 @@ from app.models import Candle
 
 
 class SetupState(str, Enum):
+    DETECTED = "DETECTED"
+    CONFIRMED = "CONFIRMED"
+    READY_TO_TRADE = "READY_TO_TRADE"
+    CONFLICT = "CONFLICT"
+    EXECUTED = "EXECUTED"
     SEARCHING = "SEARCHING"
     POI_FOUND = "POI_FOUND"
     LIQUIDITY_SWEPT = "LIQUIDITY_SWEPT"
@@ -90,7 +95,7 @@ class SetupCandidate:
     reasons: tuple[str, ...] = ()
     features: dict[str, Any] = field(default_factory=dict)
     source_candle_ids: tuple[int, ...] = ()
-    state: SetupState = SetupState.SETUP_READY
+    state: SetupState = SetupState.DETECTED
 
     @property
     def fingerprint(self) -> str:
