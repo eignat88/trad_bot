@@ -9,12 +9,13 @@ import logging
 import signal
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
 from app.config import Settings, load_settings
 from app.db.repository import ScannerRepository
-from app.exchange.bybit_client import BybitClient
+from app.exchange.bybit_client import BybitClient, BybitTimeoutError
 from app.scanners.context_builder import build_market_context
 from app.scanners.orchestrator import ScannerOrchestrator
 
@@ -31,7 +32,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("scanner_runner")
 
-SCAN_INTERVAL = 300  # 5 minutes
 SHUTDOWN = False
 
 
@@ -39,6 +39,11 @@ def _handle_signal(signum, frame):
     global SHUTDOWN
     logger.info("shutdown signal received")
     SHUTDOWN = True
+
+
+def seconds_until_next_cycle(started_at: float, interval: float, now: float) -> float:
+    """Return cadence delay, including the elapsed scan time in the interval."""
+    return max(0.0, started_at + interval - now)
 
 
 def run_scan_cycle(
@@ -50,33 +55,51 @@ def run_scan_cycle(
 ) -> int:
     settings = settings or load_settings()
     total_found = 0
-    for symbol in symbols:
-        try:
-            ctx = build_market_context(client, symbol, settings)
-            candidates = orchestrator.scan_all(ctx)
+    if not symbols:
+        return 0
+    workers = min(settings.scanner_workers, len(symbols))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="market-data") as executor:
+        futures = {
+            executor.submit(build_market_context, client, symbol, settings): symbol
+            for symbol in symbols
+        }
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                ctx = future.result()
+            except BybitTimeoutError:
+                logger.error("%s: skipped after %d timeouts", symbol, settings.bybit_max_attempts)
+                continue
+            except Exception:
+                logger.exception("market data failed for %s", symbol)
+                continue
 
-            for c in candidates:
-                repository.save_setup(c)
-                repository.save_event(
-                    "SETUP_DETECTED", c.scanner_name, symbol,
-                    timeframe=c.setup_timeframe,
-                    direction=c.direction,
-                    score=c.score,
-                    detected_at=c.detected_at,
-                    payload={"entry_zone": [c.entry_zone_low, c.entry_zone_high]},
-                )
+            # Keep mutable deduplication and repository state on the main thread.
+            try:
+                candidates = orchestrator.scan_all(ctx)
 
-            total_found += len(candidates)
+                for c in candidates:
+                    repository.save_setup(c)
+                    repository.save_event(
+                        "SETUP_DETECTED", c.scanner_name, symbol,
+                        timeframe=c.setup_timeframe,
+                        direction=c.direction,
+                        score=c.score,
+                        detected_at=c.detected_at,
+                        payload={"entry_zone": [c.entry_zone_low, c.entry_zone_high]},
+                    )
 
-            if candidates:
-                best = max(candidates, key=lambda c: c.score)
-                logger.info(
-                    "%s: %d setups (best: %s %s score=%.0f)",
-                    symbol, len(candidates), best.direction,
-                    best.scanner_name, best.score,
-                )
-        except Exception:
-            logger.exception("scan failed for %s", symbol)
+                total_found += len(candidates)
+
+                if candidates:
+                    best = max(candidates, key=lambda c: c.score)
+                    logger.info(
+                        "%s: %d setups (best: %s %s score=%.0f)",
+                        symbol, len(candidates), best.direction,
+                        best.scanner_name, best.score,
+                    )
+            except Exception:
+                logger.exception("scan failed for %s", symbol)
 
     return total_found
 
@@ -108,27 +131,29 @@ def main() -> None:
     orchestrator = ScannerOrchestrator(repository=repository)
 
     logger.info(
-        "scanner started: symbols=%d scanners=%d interval=%ds universe=%s",
-        len(symbols), len(orchestrator.scanners), SCAN_INTERVAL, universe.mode,
+        "scanner started: symbols=%d scanners=%d workers=%d interval=%ds universe=%s",
+        len(symbols), len(orchestrator.scanners), settings.scanner_workers,
+        settings.scan_interval, universe.mode,
     )
 
     cycle = 0
     while not SHUTDOWN:
         cycle += 1
-        start = time.time()
+        start = time.monotonic()
 
         try:
             total = run_scan_cycle(client, orchestrator, repository, symbols, settings)
-            elapsed = time.time() - start
+            elapsed = time.monotonic() - start
             logger.info("cycle #%d done: %d setups in %.1fs", cycle, total, elapsed)
         except Exception:
             logger.exception("cycle #%d failed", cycle)
 
-        # Sleep in small intervals to respond to shutdown quickly
-        for _ in range(SCAN_INTERVAL):
-            if SHUTDOWN:
+        # Scan duration counts toward the interval, keeping a start-to-start cadence.
+        while not SHUTDOWN:
+            remaining = seconds_until_next_cycle(start, settings.scan_interval, time.monotonic())
+            if remaining <= 0:
                 break
-            time.sleep(1)
+            time.sleep(min(1, remaining))
 
     repository.close()
     logger.info("scanner stopped")

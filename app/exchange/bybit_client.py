@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
+import socket
 import time
 from typing import Any
+from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -14,6 +17,13 @@ from app.models import Candle
 
 class BybitError(RuntimeError):
     pass
+
+
+class BybitTimeoutError(BybitError):
+    pass
+
+
+logger = logging.getLogger(__name__)
 
 
 class _Response:
@@ -45,12 +55,35 @@ class BybitClient:
         self.session = session or _UrlSession()
 
     def _public_get(self, endpoint: str, **params: Any) -> dict[str, Any]:
-        response = self.session.get(self.BASE_URL + endpoint, params=params, timeout=10)
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("retCode") != 0:
-            raise BybitError(payload.get("retMsg", "Bybit request failed"))
-        return payload
+        attempts = self.settings.bybit_max_attempts
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self.session.get(
+                    self.BASE_URL + endpoint, params=params,
+                    timeout=self.settings.bybit_timeout,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if payload.get("retCode") != 0:
+                    raise BybitError(payload.get("retMsg", "Bybit request failed"))
+                return payload
+            except (TimeoutError, socket.timeout) as exc:
+                timeout_error = exc
+            except URLError as exc:
+                if not isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                    raise
+                timeout_error = exc
+
+            symbol = params.get("symbol", endpoint)
+            if attempt < attempts:
+                logger.warning("%s: Bybit timeout, retry %d/%d", symbol, attempt, attempts)
+                time.sleep(self.settings.bybit_retry_backoff * attempt)
+                continue
+            raise BybitTimeoutError(
+                f"{symbol}: Bybit request timed out after {attempts} attempts"
+            ) from timeout_error
+
+        raise AssertionError("unreachable")
 
     def get_klines(self, symbol: str, interval: str = "5", limit: int = 200) -> list[Candle]:
         payload = self._public_get("/v5/market/kline", category="linear", symbol=symbol,
