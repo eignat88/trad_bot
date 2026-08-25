@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from app.scanners.models import SetupCandidate, SetupState
 
@@ -20,7 +20,10 @@ class ScannerRepository:
         database: str = "trad_bot",
         user: str = "postgres",
         jsonl_path: str = "data/scanner_setups.jsonl",
+        backend: Literal["auto", "postgres", "jsonl"] = "auto",
     ) -> None:
+        if backend not in {"auto", "postgres", "jsonl"}:
+            raise ValueError("backend must be 'auto', 'postgres', or 'jsonl'")
         self._host = host
         self._port = port
         self._database = database
@@ -28,6 +31,13 @@ class ScannerRepository:
         self._jsonl_path = jsonl_path
         self._conn: Any = None
         self._use_pg = False
+
+        # JSONL is also a supported explicit backend, not merely an emergency
+        # fallback.  In particular, callers using an isolated JSONL file must
+        # not silently read from a locally running PostgreSQL instance.
+        if backend == "jsonl":
+            logger.info("scanner repository using JSONL (%s)", jsonl_path)
+            return
 
         try:
             import pg8000
@@ -37,8 +47,12 @@ class ScannerRepository:
             self._use_pg = True
             logger.info("scanner repository connected to PostgreSQL (%s:%d/%s)", host, port, database)
         except ImportError:
+            if backend == "postgres":
+                raise
             logger.warning("pg8000 not installed, using JSONL fallback")
         except Exception:
+            if backend == "postgres":
+                raise
             logger.warning("PostgreSQL connection failed, using JSONL fallback")
 
     def ensure_schema(self) -> None:
@@ -108,6 +122,54 @@ class ScannerRepository:
             self._conn.rollback()
             raise
 
+    def acquire_runner_lock(self, lock_id: int = 1_937_261) -> bool:
+        """Hold a session advisory lock for the lifetime of this repository."""
+        if not self._use_pg:
+            return True
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT pg_try_advisory_lock(%s)", (lock_id,))
+        return bool(cursor.fetchone()[0])
+
+    def abort_stale_runs(self, stale_minutes: int = 10) -> int:
+        if not self._use_pg:
+            return 0
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            UPDATE dds.scanner_run SET status = 'ABORTED', finished_at = now(),
+                duration_sec = EXTRACT(EPOCH FROM (now() - started_at))
+            WHERE status = 'RUNNING'
+              AND started_at < now() - (%s * interval '1 minute')
+            """,
+            (stale_minutes,),
+        )
+        count = cursor.rowcount
+        self._conn.commit()
+        return count
+
+    def save_run_stat(self, run_id: int | None, scanner_name: str, **values: int) -> None:
+        if not self._use_pg or run_id is None:
+            return
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO dds.scanner_run_stat (
+                run_id, scanner_name, symbols_scanned, candidates_found,
+                setups_saved, errors_count, duration_ms
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (run_id, scanner_name) DO UPDATE SET
+                symbols_scanned = EXCLUDED.symbols_scanned,
+                candidates_found = EXCLUDED.candidates_found,
+                setups_saved = EXCLUDED.setups_saved,
+                errors_count = EXCLUDED.errors_count,
+                duration_ms = EXCLUDED.duration_ms
+            """,
+            (run_id, scanner_name, values["symbols_scanned"],
+             values["candidates_found"], values["setups_saved"],
+             values["errors_count"], values["duration_ms"]),
+        )
+        self._conn.commit()
+
     def finish_run(
         self,
         run_id: int,
@@ -166,6 +228,8 @@ class ScannerRepository:
     # SCANNER SETUP
     # ----------------------------------------------------------------
     def save_setup(self, candidate: SetupCandidate, run_id: int | None = None) -> None:
+        if not candidate.signal_candle_open_time:
+            raise ValueError("signal_candle_open_time must be a non-zero candle timestamp")
         if self._use_pg:
             self._save_pg(candidate, run_id)
         else:
@@ -197,6 +261,7 @@ class ScannerRepository:
                     instrument_id, scanner_name, direction, entry_timeframe,
                     signal_candle_open_time
                 ) WHERE signal_candle_open_time > 0 DO UPDATE SET
+                    run_id = EXCLUDED.run_id,
                     detected_at = EXCLUDED.detected_at,
                     reference_price = EXCLUDED.reference_price,
                     entry_zone_low = EXCLUDED.entry_zone_low,
@@ -359,60 +424,46 @@ class ScannerRepository:
 
         cursor = self._conn.cursor()
 
-        # Upsert aggregated signals from active setups
+        # Pick only the latest setup from each independent scanner. Repeated
+        # detections by one strategy must not manufacture confirmation.
         cursor.execute("""
+            WITH latest AS (
+                SELECT DISTINCT ON (
+                    s.instrument_id, s.direction, s.setup_timeframe, s.scanner_name
+                ) s.*
+                FROM dds.scanner_setup s
+                WHERE s.status IN ('DETECTED', 'CONFIRMED', 'READY_TO_TRADE')
+                  AND s.detected_at > now() - interval '4 hours'
+                ORDER BY s.instrument_id, s.direction, s.setup_timeframe,
+                         s.scanner_name, s.detected_at DESC
+            ), aggregated AS (
+                SELECT instrument_id, direction, setup_timeframe,
+                    COUNT(*) AS scanner_count,
+                    jsonb_agg(scanner_name ORDER BY scanner_name) AS scanners,
+                    MAX(score) AS max_score,
+                    ROUND(AVG(score) + (COUNT(*) - 1) * 5, 2) AS aggregate_score,
+                    MIN(detected_at) AS first_detected_at,
+                    MAX(detected_at) AS last_detected_at
+                FROM latest
+                GROUP BY instrument_id, direction, setup_timeframe
+            )
             INSERT INTO dds.market_signal (
                 instrument_id, direction, timeframe, scanner_count, scanners,
                 max_score, aggregate_score, first_detected_at, last_detected_at, status
             )
             SELECT
-                s.instrument_id,
-                s.direction,
-                s.setup_timeframe,
-                COUNT(*) AS scanner_count,
-                jsonb_agg(DISTINCT s.scanner_name) AS scanners,
-                MAX(s.score) AS max_score,
-                ROUND(AVG(s.score) + (COUNT(*) - 1) * 5, 2) AS aggregate_score,
-                MIN(s.detected_at) AS first_detected_at,
-                MAX(s.detected_at) AS last_detected_at,
+                instrument_id, direction, setup_timeframe, scanner_count, scanners,
+                max_score, aggregate_score, first_detected_at, last_detected_at,
                 'ACTIVE' AS status
-            FROM dds.scanner_setup s
-            WHERE s.status IN ('DETECTED', 'CONFIRMED', 'READY_TO_TRADE')
-              AND s.detected_at > now() - interval '4 hours'
-            GROUP BY s.instrument_id, s.direction, s.setup_timeframe
-            HAVING COUNT(*) >= 1
-            ON CONFLICT DO NOTHING
-        """)
-        self._conn.commit()
-
-        # Update scores for existing signals
-        cursor.execute("""
-            WITH fresh AS (
-                SELECT
-                    s.instrument_id, s.direction, s.setup_timeframe,
-                    COUNT(*) AS scanner_count,
-                    jsonb_agg(DISTINCT s.scanner_name) AS scanners,
-                    MAX(s.score) AS max_score,
-                    ROUND(AVG(s.score) + (COUNT(*) - 1) * 5, 2) AS aggregate_score,
-                    MIN(s.detected_at) AS first_detected_at,
-                    MAX(s.detected_at) AS last_detected_at
-                FROM dds.scanner_setup s
-                WHERE s.status IN ('DETECTED', 'CONFIRMED', 'READY_TO_TRADE')
-                  AND s.detected_at > now() - interval '4 hours'
-                GROUP BY s.instrument_id, s.direction, s.setup_timeframe
-            )
-            UPDATE dds.market_signal ms SET
-                scanner_count = f.scanner_count,
-                scanners = f.scanners,
-                max_score = f.max_score,
-                aggregate_score = f.aggregate_score,
-                last_detected_at = f.last_detected_at,
+            FROM aggregated
+            ON CONFLICT (instrument_id, direction, timeframe)
+            WHERE status = 'ACTIVE' DO UPDATE SET
+                scanner_count = EXCLUDED.scanner_count,
+                scanners = EXCLUDED.scanners,
+                max_score = EXCLUDED.max_score,
+                aggregate_score = EXCLUDED.aggregate_score,
+                last_detected_at = EXCLUDED.last_detected_at,
                 updated_at = now()
-            FROM fresh f
-            WHERE ms.instrument_id = f.instrument_id
-              AND ms.direction = f.direction
-              AND ms.timeframe = f.setup_timeframe
-              AND ms.status = 'ACTIVE'
         """)
         self._conn.commit()
 
@@ -436,6 +487,26 @@ class ScannerRepository:
 
         cursor.execute("SELECT COUNT(*) FROM dds.market_signal WHERE status = 'ACTIVE'")
         return cursor.fetchone()[0]
+
+    def expire_setups(self) -> int:
+        """Expire active setups after their setup-timeframe candle TTL."""
+        if not self._use_pg:
+            return 0
+        cursor = self._conn.cursor()
+        cursor.execute("""
+            UPDATE dds.scanner_setup SET status = 'EXPIRED', expired_at = now(),
+                status_reason = 'TTL_EXCEEDED', updated_at = now()
+            WHERE status IN ('DETECTED', 'CONFIRMED', 'READY_TO_TRADE')
+              AND detected_at < now() - CASE setup_timeframe
+                WHEN '5m' THEN interval '60 minutes'
+                WHEN '15m' THEN interval '120 minutes'
+                WHEN '1h' THEN interval '6 hours'
+                WHEN '4h' THEN interval '16 hours'
+                ELSE interval '2 hours' END
+        """)
+        count = cursor.rowcount
+        self._conn.commit()
+        return count
 
     # ----------------------------------------------------------------
     # QUERIES

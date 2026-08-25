@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -59,19 +60,38 @@ class ScannerOrchestrator:
         self.last_scan_time: datetime | None = None
 
     def scan_all(self, ctx: MarketContext) -> list[SetupCandidate]:
+        candidates, _ = self.scan_all_with_stats(ctx)
+        return candidates
+
+    def scan_all_with_stats(
+        self, ctx: MarketContext,
+    ) -> tuple[list[SetupCandidate], dict[str, dict[str, int]]]:
+        """Run every configured scanner and return per-scanner observability data."""
         self.scan_count += 1
         self.last_scan_time = datetime.now(timezone.utc)
         all_candidates: list[SetupCandidate] = []
+        stats: dict[str, dict[str, int]] = {}
 
         for name, scanner in self.scanners.items():
+            started = time.perf_counter()
             try:
                 candidates = scanner.scan(ctx)
                 all_candidates.extend(candidates)
+                stats[name] = {
+                    "candidates_found": len(candidates),
+                    "errors_count": 0,
+                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                }
             except Exception:
                 logger.exception("scanner %s failed on %s", name, ctx.symbol)
+                stats[name] = {
+                    "candidates_found": 0,
+                    "errors_count": 1,
+                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                }
 
         scored = [score_candidate(c) for c in all_candidates]
-        scored = [self._attach_signal_candle(c, ctx) for c in scored]
+        scored = [self._attach_context(c, ctx) for c in scored]
         scored.sort(key=lambda c: c.score, reverse=True)
         unique = self.dedup.filter_new(scored)
 
@@ -85,7 +105,21 @@ class ScannerOrchestrator:
                 "scanner scan=%d symbol=%s candidates=%d unique=%d",
                 self.scan_count, ctx.symbol, len(all_candidates), len(valid),
             )
-        return valid
+        saved_by_scanner: dict[str, int] = {}
+        for candidate in valid:
+            saved_by_scanner[candidate.scanner_name] = (
+                saved_by_scanner.get(candidate.scanner_name, 0) + 1
+            )
+        for name in stats:
+            stats[name]["setups_saved"] = saved_by_scanner.get(name, 0)
+        return valid, stats
+
+    @classmethod
+    def _attach_context(cls, c: SetupCandidate, ctx: MarketContext) -> SetupCandidate:
+        candidate = cls._attach_signal_candle(c, ctx)
+        if candidate.market_regime is None:
+            candidate = replace(candidate, market_regime=ctx.market_regime)
+        return candidate
 
     @staticmethod
     def _attach_signal_candle(c: SetupCandidate, ctx: MarketContext) -> SetupCandidate:

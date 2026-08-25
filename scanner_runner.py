@@ -73,6 +73,7 @@ def run_scan_cycle(
     orchestrator: ScannerOrchestrator,
     repository: ScannerRepository,
     symbols: list[str],
+    run_id: int | None,
     settings: Settings | None = None,
 ) -> tuple[int, int, int]:
     """Returns (total_found, scanned, failed)."""
@@ -80,6 +81,11 @@ def run_scan_cycle(
     total_found = 0
     scanned = 0
     failed = 0
+    run_stats = {
+        name: {"symbols_scanned": 0, "candidates_found": 0,
+               "setups_saved": 0, "errors_count": 0, "duration_ms": 0}
+        for name in orchestrator.scanners
+    }
 
     if not symbols:
         return 0, 0, 0
@@ -101,18 +107,25 @@ def run_scan_cycle(
                 failed += 1
                 repository.save_error(
                     symbol=symbol, scanner_name="ALL",
+                    run_id=run_id,
                     error_type="MARKET_DATA_ERROR",
                     error_message=str(sys.exc_info()[1]),
                 )
                 continue
 
             try:
-                candidates = orchestrator.scan_all(ctx)
+                candidates, symbol_stats = orchestrator.scan_all_with_stats(ctx)
+                for name, values in symbol_stats.items():
+                    stat = run_stats[name]
+                    stat["symbols_scanned"] += 1
+                    for field in ("candidates_found", "setups_saved", "errors_count", "duration_ms"):
+                        stat[field] += values[field]
 
                 for c in candidates:
-                    repository.save_setup(c)
+                    repository.save_setup(c, run_id=run_id)
                     repository.save_event(
                         "SETUP_DETECTED", c.scanner_name, symbol,
+                        run_id=run_id,
                         timeframe=c.setup_timeframe,
                         direction=c.direction,
                         score=c.score,
@@ -134,10 +147,13 @@ def run_scan_cycle(
                 failed += 1
                 repository.save_error(
                     symbol=symbol, scanner_name="SCANNER",
+                    run_id=run_id,
                     error_type="SCAN_ERROR",
                     error_message=str(sys.exc_info()[1]),
                 )
 
+    for scanner_name, values in run_stats.items():
+        repository.save_run_stat(run_id, scanner_name, **values)
     return total_found, scanned, failed
 
 
@@ -153,6 +169,11 @@ def main() -> None:
         host="localhost", port=5432, database="trad_bot", user="postgres",
     )
     repository.ensure_schema()
+
+    if not repository.acquire_runner_lock():
+        repository.close()
+        raise SystemExit("scanner runner already active")
+    repository.abort_stale_runs()
 
     orchestrator = ScannerOrchestrator(repository=repository)
 
@@ -179,8 +200,10 @@ def main() -> None:
 
         try:
             total, scanned, failed = run_scan_cycle(
-                client, orchestrator, repository, symbols, settings,
+                client, orchestrator, repository, symbols, run_id, settings,
             )
+
+            repository.expire_setups()
 
             # Aggregate signals
             active_signals = 0

@@ -43,6 +43,17 @@ def _find_levels(candles_1d: list[Candle] | None) -> MarketLevels:
     )
 
 
+def _classify_market_regime(indicators: IndicatorSnapshot, price: float) -> str:
+    """Provide a small, deterministic regime taxonomy for persisted setups."""
+    if indicators.bb_width >= 0.08:
+        return "HIGH_VOLATILITY"
+    if indicators.ema20 > indicators.ema50 > indicators.ema200 and price > indicators.ema20:
+        return "TREND_UP"
+    if indicators.ema20 < indicators.ema50 < indicators.ema200 and price < indicators.ema20:
+        return "TREND_DOWN"
+    return "RANGE"
+
+
 def build_market_context(
     client: BybitClient,
     symbol: str,
@@ -61,7 +72,7 @@ def build_market_context(
         candles_1h=tuple(candles_1h),
         candles_4h=tuple(candles_4h),
         indicators=indicators,
-        market_regime=None,
+        market_regime=_classify_market_regime(indicators, candles_1h[-1].close),
         levels=levels,
         evaluated_at=datetime.now(timezone.utc),
     )
