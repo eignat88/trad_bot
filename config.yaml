@@ -15,6 +15,7 @@
   "bybit_retry_backoff": 1,
   "scanner_workers": 5,
   "scan_interval": 300,
+  "signal_conflict_window": 600,
   "trading_mode": "paper",
   "initial_balance": 10000,
   "risk_per_trade": 0.005,
