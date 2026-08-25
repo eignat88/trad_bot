@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS dds.scanner_setup (
     setup_timeframe TEXT NOT NULL,
     entry_timeframe TEXT NOT NULL,
     setup_started_at TIMESTAMPTZ NOT NULL,
+    signal_candle_open_time BIGINT NOT NULL DEFAULT 0,
     detected_at TIMESTAMPTZ NOT NULL,
     reference_price NUMERIC NOT NULL,
     entry_zone_low NUMERIC,
@@ -40,6 +41,17 @@ CREATE TABLE IF NOT EXISTS dds.scanner_setup (
         status IN ('CANDIDATE', 'READY', 'INVALIDATED', 'EXPIRED', 'CONSUMED')
     )
 );
+
+-- Keep upgrades idempotent for databases created before candle-level
+-- deduplication was introduced.
+ALTER TABLE dds.scanner_setup
+    ADD COLUMN IF NOT EXISTS signal_candle_open_time BIGINT NOT NULL DEFAULT 0;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_scanner_setup_signal_candle
+ON dds.scanner_setup (
+    instrument_id, scanner_name, direction, entry_timeframe,
+    signal_candle_open_time
+) WHERE signal_candle_open_time > 0;
 
 CREATE INDEX IF NOT EXISTS idx_scanner_setup_symbol ON dds.scanner_setup (instrument_id);
 CREATE INDEX IF NOT EXISTS idx_scanner_setup_status ON dds.scanner_setup (status);
