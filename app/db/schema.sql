@@ -38,11 +38,28 @@ CREATE TABLE IF NOT EXISTS dds.scanner_run (
     error_count INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT scanner_run_status_chk CHECK (
-        status IN ('RUNNING', 'COMPLETED', 'FAILED', 'PARTIAL')
+        status IN ('RUNNING', 'COMPLETED', 'FAILED', 'PARTIAL', 'ABORTED')
     )
 );
 
 CREATE INDEX IF NOT EXISTS idx_scanner_run_started ON dds.scanner_run (started_at DESC);
+
+ALTER TABLE dds.scanner_run DROP CONSTRAINT IF EXISTS scanner_run_status_chk;
+ALTER TABLE dds.scanner_run ADD CONSTRAINT scanner_run_status_chk CHECK (
+    status IN ('RUNNING', 'COMPLETED', 'FAILED', 'PARTIAL', 'ABORTED')
+);
+
+CREATE TABLE IF NOT EXISTS dds.scanner_run_stat (
+    run_id BIGINT NOT NULL REFERENCES dds.scanner_run(run_id) ON DELETE CASCADE,
+    scanner_name TEXT NOT NULL,
+    symbols_scanned INTEGER NOT NULL DEFAULT 0,
+    candidates_found INTEGER NOT NULL DEFAULT 0,
+    setups_saved INTEGER NOT NULL DEFAULT 0,
+    errors_count INTEGER NOT NULL DEFAULT 0,
+    duration_ms BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_id, scanner_name)
+);
 
 -- ============================================================
 -- SCANNER_SETUP: сырые результаты каждого из 7 сканеров
@@ -118,6 +135,9 @@ ALTER TABLE dds.scanner_setup ADD CONSTRAINT scanner_setup_status_chk CHECK (
     )
 );
 
+-- Legacy rows without a candle identity cannot be deduplicated reliably.
+DELETE FROM dds.scanner_setup WHERE signal_candle_open_time = 0;
+
 -- Unique index: один сигнал на одну свечу
 CREATE UNIQUE INDEX IF NOT EXISTS uq_scanner_setup_signal_candle
 ON dds.scanner_setup (
@@ -139,6 +159,11 @@ WHERE status IN ('DETECTED', 'CONFIRMED', 'READY_TO_TRADE');
 
 CREATE INDEX IF NOT EXISTS idx_scanner_setup_symbol_direction
 ON dds.scanner_setup (instrument_id, direction, detected_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_scanner_setup_aggregation
+ON dds.scanner_setup (
+    instrument_id, direction, setup_timeframe, scanner_name, detected_at DESC
+) WHERE status IN ('DETECTED', 'CONFIRMED', 'READY_TO_TRADE');
 
 -- ============================================================
 -- SCANNER_EVENT: история событий
@@ -212,6 +237,20 @@ CREATE INDEX IF NOT EXISTS idx_market_signal_instrument ON dds.market_signal (in
 CREATE INDEX IF NOT EXISTS idx_market_signal_status ON dds.market_signal (status);
 CREATE INDEX IF NOT EXISTS idx_market_signal_score ON dds.market_signal (aggregate_score DESC);
 CREATE INDEX IF NOT EXISTS idx_market_signal_active ON dds.market_signal (aggregate_score DESC)
+WHERE status = 'ACTIVE';
+
+-- Repair historical duplicates before enforcing the active business key.
+DELETE FROM dds.market_signal older
+USING dds.market_signal newer
+WHERE older.status = 'ACTIVE' AND newer.status = 'ACTIVE'
+  AND older.instrument_id = newer.instrument_id
+  AND older.direction = newer.direction
+  AND older.timeframe = newer.timeframe
+  AND (older.last_detected_at, older.signal_id) <
+      (newer.last_detected_at, newer.signal_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_market_signal_active
+ON dds.market_signal (instrument_id, direction, timeframe)
 WHERE status = 'ACTIVE';
 
 -- ============================================================

@@ -58,6 +58,31 @@ def test_orchestrator_attaches_entry_candle_open_time():
     assert result.signal_candle_open_time == candle.timestamp
 
 
+def test_orchestrator_attaches_market_regime_from_context():
+    candle = Candle(1_777_294_700_000, 100, 102, 99, 101, 10)
+    ctx = MarketContext(
+        symbol="BTCUSDT", candles_5m=(candle,), candles_15m=(),
+        candles_1h=(), candles_4h=(), indicators=IndicatorSnapshot(),
+        market_regime="TREND_UP", levels=MarketLevels(),
+        evaluated_at=datetime.now(timezone.utc),
+    )
+
+    result = ScannerOrchestrator._attach_context(
+        candidate(signal_candle_open_time=0, market_regime=None), ctx
+    )
+
+    assert result.signal_candle_open_time == candle.timestamp
+    assert result.market_regime == "TREND_UP"
+
+
+def test_repository_rejects_setup_without_candle_timestamp(tmp_path):
+    repository = ScannerRepository(jsonl_path=str(tmp_path / "setups.jsonl"))
+
+    import pytest
+    with pytest.raises(ValueError, match="signal_candle_open_time"):
+        repository.save_setup(candidate(signal_candle_open_time=0))
+
+
 def test_jsonl_repository_upserts_same_signal_candle(tmp_path):
     path = tmp_path / "setups.jsonl"
     repository = ScannerRepository(jsonl_path=str(path))

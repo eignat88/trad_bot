@@ -6,6 +6,7 @@ import pytest
 import scanner_runner
 from app.config import ScannerUniverseSettings, Settings
 from app.exchange.bybit_client import BybitClient, BybitTimeoutError
+from app.scanners.models import SetupCandidate
 
 
 class SuccessfulResponse:
@@ -67,12 +68,19 @@ def test_scan_cycle_fetches_market_data_in_parallel(monkeypatch):
         return symbol
 
     class Orchestrator:
-        def scan_all(self, ctx):
-            return []
+        scanners = {"TEST": object()}
+
+        def scan_all_with_stats(self, ctx):
+            return [], {"TEST": {"candidates_found": 0, "setups_saved": 0,
+                                  "errors_count": 0, "duration_ms": 1}}
+
+    class Repository:
+        def save_run_stat(self, *args, **kwargs):
+            pass
 
     monkeypatch.setattr(scanner_runner, "build_market_context", build_context)
     total, scanned, failed = scanner_runner.run_scan_cycle(
-        object(), Orchestrator(), object(), ["A", "B", "C", "D"],
+        object(), Orchestrator(), Repository(), ["A", "B", "C", "D"], None,
         Settings(scanner_workers=3),
     )
 
@@ -116,3 +124,39 @@ def test_get_scanner_symbols_rejects_empty_dynamic_universe():
 def test_cycle_delay_is_measured_from_cycle_start():
     assert scanner_runner.seconds_until_next_cycle(100, 300, 283) == 117
     assert scanner_runner.seconds_until_next_cycle(100, 300, 450) == 0
+
+
+def test_scan_cycle_propagates_run_id_to_all_records(monkeypatch):
+    candidate = SetupCandidate(
+        scanner_name="TEST", symbol="BTCUSDT",
+        signal_candle_open_time=1_777_294_700_000,
+    )
+
+    class Orchestrator:
+        scanners = {"TEST": object()}
+
+        def scan_all_with_stats(self, ctx):
+            return [candidate], {"TEST": {"candidates_found": 1,
+                "setups_saved": 1, "errors_count": 0, "duration_ms": 2}}
+
+    class Repository:
+        def __init__(self):
+            self.calls = []
+
+        def save_setup(self, value, run_id=None):
+            self.calls.append(("setup", run_id))
+
+        def save_event(self, *args, run_id=None, **kwargs):
+            self.calls.append(("event", run_id))
+
+        def save_run_stat(self, run_id, *args, **kwargs):
+            self.calls.append(("stat", run_id))
+
+    repository = Repository()
+    monkeypatch.setattr(scanner_runner, "build_market_context", lambda *args: object())
+
+    assert scanner_runner.run_scan_cycle(
+        object(), Orchestrator(), repository, ["BTCUSDT"], 42,
+        Settings(scanner_workers=1),
+    ) == (1, 1, 0)
+    assert repository.calls == [("setup", 42), ("event", 42), ("stat", 42)]
