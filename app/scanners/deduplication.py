@@ -11,7 +11,7 @@ class DeduplicationEngine:
     def _key(self, candidate: SetupCandidate) -> str:
         return (
             f"{candidate.scanner_name}|{candidate.symbol}|{candidate.direction}|"
-            f"{candidate.setup_timeframe}"
+            f"{candidate.entry_timeframe}|{candidate.signal_candle_open_time}"
         )
 
     def _is_duplicate(self, candidate: SetupCandidate) -> bool:
@@ -19,12 +19,10 @@ class DeduplicationEngine:
         existing = self._seen.get(key)
         if existing is None:
             return False
-        if candidate.scanner_name != existing.scanner_name:
-            return False
-        if candidate.symbol != existing.symbol:
-            return False
-        if candidate.direction != existing.direction:
-            return False
+        # A key represents one strategy/side/LTF candle. Price movement within
+        # an unclosed candle must update/skip that setup, never create another.
+        if candidate.signal_candle_open_time:
+            return True
         if existing.reference_price > 0:
             diff = abs(candidate.reference_price - existing.reference_price) / existing.reference_price
             if diff < self.price_tolerance:

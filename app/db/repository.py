@@ -99,19 +99,35 @@ class ScannerRepository:
             INSERT INTO dds.scanner_setup (
                 setup_id, scanner_name, scanner_version, instrument_id,
                 direction, htf_timeframe, setup_timeframe, entry_timeframe,
-                setup_started_at, detected_at, reference_price,
+                setup_started_at, signal_candle_open_time, detected_at, reference_price,
                 entry_zone_low, entry_zone_high, invalidation_price,
                 target_1, target_2, score, market_regime, status,
                 reasons, features
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
+            ON CONFLICT (
+                instrument_id, scanner_name, direction, entry_timeframe,
+                signal_candle_open_time
+            ) WHERE signal_candle_open_time > 0 DO UPDATE SET
+                detected_at = EXCLUDED.detected_at,
+                reference_price = EXCLUDED.reference_price,
+                entry_zone_low = EXCLUDED.entry_zone_low,
+                entry_zone_high = EXCLUDED.entry_zone_high,
+                invalidation_price = EXCLUDED.invalidation_price,
+                target_1 = EXCLUDED.target_1,
+                target_2 = EXCLUDED.target_2,
+                score = EXCLUDED.score,
+                market_regime = EXCLUDED.market_regime,
+                status = EXCLUDED.status,
+                reasons = EXCLUDED.reasons,
+                features = EXCLUDED.features
             """,
             (
                 str(c.setup_id), c.scanner_name, c.scanner_version, instrument_id,
                 c.direction, c.htf_timeframe, c.setup_timeframe, c.entry_timeframe,
-                c.setup_started_at, c.detected_at, c.reference_price,
+                c.setup_started_at, c.signal_candle_open_time, c.detected_at, c.reference_price,
                 c.entry_zone_low, c.entry_zone_high, c.invalidation_price,
                 c.target_1, c.target_2, c.score, c.market_regime,
                 "READY" if (c.state.value == "SETUP_READY" if isinstance(c.state, SetupState) else c.state == "SETUP_READY") else (c.state.value if isinstance(c.state, SetupState) else c.state),
@@ -133,6 +149,7 @@ class ScannerRepository:
             "setup_timeframe": c.setup_timeframe,
             "entry_timeframe": c.entry_timeframe,
             "setup_started_at": c.setup_started_at.isoformat(),
+            "signal_candle_open_time": c.signal_candle_open_time,
             "detected_at": c.detected_at.isoformat(),
             "reference_price": c.reference_price,
             "entry_zone_low": c.entry_zone_low,
@@ -142,12 +159,31 @@ class ScannerRepository:
             "target_2": c.target_2,
             "score": c.score,
             "market_regime": c.market_regime,
-            "status": c.state.value if isinstance(c.state, SetupState) else c.state,
+            "status": "READY" if c.state == SetupState.SETUP_READY else (c.state.value if isinstance(c.state, SetupState) else c.state),
             "reasons": list(c.reasons),
             "features": c.features,
         }
-        with open(self._jsonl_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        path = Path(self._jsonl_path)
+        records = []
+        if path.exists():
+            records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        identity = self._signal_identity(record)
+        for index, existing in enumerate(records):
+            if self._signal_identity(existing) == identity:
+                record["setup_id"] = existing["setup_id"]
+                records[index] = record
+                break
+        else:
+            records.append(record)
+        path.write_text("".join(json.dumps(item) + "\n" for item in records), encoding="utf-8")
+
+    @staticmethod
+    def _signal_identity(record: dict) -> tuple:
+        return (
+            record.get("symbol"), record.get("scanner_name"),
+            record.get("direction"), record.get("entry_timeframe"),
+            record.get("signal_candle_open_time"),
+        )
 
     def get_active_setups(self, symbol: str | None = None) -> list[dict]:
         if self._use_pg:

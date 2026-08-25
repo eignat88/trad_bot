@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -70,6 +71,7 @@ class ScannerOrchestrator:
                 logger.exception("scanner %s failed on %s", name, ctx.symbol)
 
         scored = [score_candidate(c) for c in all_candidates]
+        scored = [self._attach_signal_candle(c, ctx) for c in scored]
         scored.sort(key=lambda c: c.score, reverse=True)
         unique = self.dedup.filter_new(scored)
 
@@ -84,6 +86,21 @@ class ScannerOrchestrator:
                 self.scan_count, ctx.symbol, len(all_candidates), len(valid),
             )
         return valid
+
+    @staticmethod
+    def _attach_signal_candle(c: SetupCandidate, ctx: MarketContext) -> SetupCandidate:
+        if c.signal_candle_open_time:
+            return c
+        candles_by_timeframe = {
+            "5m": ctx.candles_5m,
+            "15m": ctx.candles_15m,
+            "1h": ctx.candles_1h,
+            "4h": ctx.candles_4h,
+        }
+        candles = candles_by_timeframe.get(c.entry_timeframe, ())
+        if not candles:
+            return c
+        return replace(c, signal_candle_open_time=candles[-1].timestamp)
 
     def check_expiration(
         self,

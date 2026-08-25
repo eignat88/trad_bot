@@ -75,6 +75,10 @@ class SetupCandidate:
     entry_timeframe: str = "5m"
     detected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     setup_started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Open timestamp (milliseconds since epoch) of the entry-timeframe candle
+    # which produced the signal.  This is the stable part of signal identity;
+    # detected_at and prices may change while that candle is still forming.
+    signal_candle_open_time: int = 0
     reference_price: float = 0.0
     entry_zone_low: float = 0.0
     entry_zone_high: float = 0.0
@@ -92,8 +96,7 @@ class SetupCandidate:
     def fingerprint(self) -> str:
         return (
             f"{self.scanner_name}|{self.symbol}|{self.direction}|"
-            f"{self.reference_price:.4f}|{self.setup_timeframe}|"
-            f"{self.setup_started_at.isoformat()}"
+            f"{self.entry_timeframe}|{self.signal_candle_open_time}"
         )
 
 
