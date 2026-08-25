@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from app.scanners.models import SetupCandidate, SetupState
 
@@ -20,7 +20,10 @@ class ScannerRepository:
         database: str = "trad_bot",
         user: str = "postgres",
         jsonl_path: str = "data/scanner_setups.jsonl",
+        backend: Literal["auto", "postgres", "jsonl"] = "auto",
     ) -> None:
+        if backend not in {"auto", "postgres", "jsonl"}:
+            raise ValueError("backend must be 'auto', 'postgres', or 'jsonl'")
         self._host = host
         self._port = port
         self._database = database
@@ -28,6 +31,13 @@ class ScannerRepository:
         self._jsonl_path = jsonl_path
         self._conn: Any = None
         self._use_pg = False
+
+        # JSONL is also a supported explicit backend, not merely an emergency
+        # fallback.  In particular, callers using an isolated JSONL file must
+        # not silently read from a locally running PostgreSQL instance.
+        if backend == "jsonl":
+            logger.info("scanner repository using JSONL (%s)", jsonl_path)
+            return
 
         try:
             import pg8000
@@ -37,8 +47,12 @@ class ScannerRepository:
             self._use_pg = True
             logger.info("scanner repository connected to PostgreSQL (%s:%d/%s)", host, port, database)
         except ImportError:
+            if backend == "postgres":
+                raise
             logger.warning("pg8000 not installed, using JSONL fallback")
         except Exception:
+            if backend == "postgres":
+                raise
             logger.warning("PostgreSQL connection failed, using JSONL fallback")
 
     def ensure_schema(self) -> None:

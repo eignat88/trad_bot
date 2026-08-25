@@ -76,7 +76,9 @@ def test_orchestrator_attaches_market_regime_from_context():
 
 
 def test_repository_rejects_setup_without_candle_timestamp(tmp_path):
-    repository = ScannerRepository(jsonl_path=str(tmp_path / "setups.jsonl"))
+    repository = ScannerRepository(
+        jsonl_path=str(tmp_path / "setups.jsonl"), backend="jsonl",
+    )
 
     import pytest
     with pytest.raises(ValueError, match="signal_candle_open_time"):
@@ -85,7 +87,7 @@ def test_repository_rejects_setup_without_candle_timestamp(tmp_path):
 
 def test_jsonl_repository_upserts_same_signal_candle(tmp_path):
     path = tmp_path / "setups.jsonl"
-    repository = ScannerRepository(jsonl_path=str(path))
+    repository = ScannerRepository(jsonl_path=str(path), backend="jsonl")
     first = candidate(state=SetupState.READY_TO_TRADE)
     repository.save_setup(first)
     repository.save_setup(candidate(
