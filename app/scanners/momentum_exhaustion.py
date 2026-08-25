@@ -38,6 +38,7 @@ class MomentumExhaustionScanner:
         if ctx.indicators.rsi < 65:
             return None
         atr = ctx.indicators.atr if ctx.indicators.atr > 0 else (current_price * 0.015)
+        avg_volume = sum(c.volume for c in candles_5m[-10:]) / 10
         return SetupCandidate(
             scanner_name=self.name, scanner_version=self.version, symbol=ctx.symbol,
             direction=ScannerDirection.SHORT.value, htf_timeframe="1h", setup_timeframe="15m", entry_timeframe="5m",
@@ -45,7 +46,11 @@ class MomentumExhaustionScanner:
             reference_price=recent_high, entry_zone_low=current_price * 0.998, entry_zone_high=current_price * 1.001,
             invalidation_price=recent_high * 1.002, target_1=current_price - atr * 2, target_2=current_price - atr * 3,
             market_regime=ctx.market_regime, state=SetupState.SETUP_READY,
-            features={"htf_context": True, "new_high_failed": True, "weak_continuation": True, "structure_break": True, "rsi_extreme": ctx.indicators.rsi > 70, "volume_spike": last.volume > sum(c.volume for c in candles_5m[-10:]) / 10 * 1.5, "stop_distance_ok": True},
+            features={"htf_context": True, "new_high_failed": True,
+                      "weak_continuation": True, "structure_break": True,
+                      "rsi_confirmation": min((ctx.indicators.rsi - 65) / 15, 1),
+                      "volume_confirmation": min(last.volume / avg_volume / 2, 1)
+                      if avg_volume > 0 else 0, "stop_distance_ok": True},
         )
 
     def _scan_long(self, ctx: MarketContext) -> SetupCandidate | None:
@@ -73,6 +78,7 @@ class MomentumExhaustionScanner:
         if ctx.indicators.rsi > 35:
             return None
         atr = ctx.indicators.atr if ctx.indicators.atr > 0 else (current_price * 0.015)
+        avg_volume = sum(c.volume for c in candles_5m[-10:]) / 10
         return SetupCandidate(
             scanner_name=self.name, scanner_version=self.version, symbol=ctx.symbol,
             direction=ScannerDirection.LONG.value, htf_timeframe="1h", setup_timeframe="15m", entry_timeframe="5m",
@@ -80,7 +86,11 @@ class MomentumExhaustionScanner:
             reference_price=recent_low, entry_zone_low=current_price * 0.999, entry_zone_high=current_price * 1.002,
             invalidation_price=recent_low * 0.998, target_1=current_price + atr * 2, target_2=current_price + atr * 3,
             market_regime=ctx.market_regime, state=SetupState.SETUP_READY,
-            features={"htf_context": True, "new_low_failed": True, "weak_continuation": True, "structure_break": True, "rsi_extreme": ctx.indicators.rsi < 30, "volume_spike": last.volume > sum(c.volume for c in candles_5m[-10:]) / 10 * 1.5, "stop_distance_ok": True},
+            features={"htf_context": True, "new_low_failed": True,
+                      "weak_continuation": True, "structure_break": True,
+                      "rsi_confirmation": min((35 - ctx.indicators.rsi) / 15, 1),
+                      "volume_confirmation": min(last.volume / avg_volume / 2, 1)
+                      if avg_volume > 0 else 0, "stop_distance_ok": True},
         )
 
     def scan(self, ctx: MarketContext) -> list[SetupCandidate]:
