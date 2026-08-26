@@ -31,7 +31,7 @@ scanner universe refreshed: 50 symbols
 
 ## Phase 2 — Signal quality guardrails
 
-Implement before any live trading.
+Status: implemented for new scanner outputs. Historical rows still need optional cleanup/reporting.
 
 - Validate risk geometry before saving/showing a setup:
   - LONG: `invalidation_price < entry_zone_low`, `target_1 > entry_zone_high`.

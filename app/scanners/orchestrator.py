@@ -12,6 +12,7 @@ from app.scanners.liquidity_reversal import LiquidityReversalScanner
 from app.scanners.liquidity_sweep_choch import LiquiditySweepCHOCHScanner
 from app.scanners.models import MarketContext, SetupCandidate
 from app.scanners.momentum_exhaustion import MomentumExhaustionScanner
+from app.scanners.risk_geometry import validate_risk_geometry
 from app.scanners.scoring import score_candidate
 from app.scanners.support_resistance import SupportResistanceScanner
 from app.scanners.trend_pullback import TrendPullbackScanner
@@ -96,7 +97,20 @@ class ScannerOrchestrator:
         unique = self.dedup.filter_new(scored)
 
         valid: list[SetupCandidate] = []
+        invalid_geometry_by_scanner: dict[str, int] = {}
         for c in unique:
+            risk_ok, reason = validate_risk_geometry(c)
+            if not risk_ok:
+                invalid_geometry_by_scanner[c.scanner_name] = (
+                    invalid_geometry_by_scanner.get(c.scanner_name, 0) + 1
+                )
+                logger.warning(
+                    "scanner rejected invalid risk geometry: symbol=%s scanner=%s direction=%s reason=%s entry=%s-%s stop=%s target_1=%s",
+                    c.symbol, c.scanner_name, c.direction, reason,
+                    c.entry_zone_low, c.entry_zone_high,
+                    c.invalidation_price, c.target_1,
+                )
+                continue
             if c.score >= 20:
                 valid.append(c)
 

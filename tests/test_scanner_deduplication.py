@@ -12,6 +12,7 @@ from app.scanners.models import (
     SetupState,
 )
 from app.scanners.orchestrator import ScannerOrchestrator
+from app.scanners.risk_geometry import INVALID_RISK_GEOMETRY, validate_risk_geometry
 
 
 def candidate(**overrides):
@@ -73,6 +74,96 @@ def test_orchestrator_attaches_market_regime_from_context():
 
     assert result.signal_candle_open_time == candle.timestamp
     assert result.market_regime == "TREND_UP"
+
+
+def test_risk_geometry_accepts_valid_long_and_short_setups():
+    valid_long = candidate(
+        direction="LONG",
+        entry_zone_low=100,
+        entry_zone_high=101,
+        invalidation_price=99,
+        target_1=103,
+    )
+    valid_short = candidate(
+        direction="SHORT",
+        entry_zone_low=100,
+        entry_zone_high=101,
+        invalidation_price=102,
+        target_1=98,
+    )
+
+    assert validate_risk_geometry(valid_long) == (True, None)
+    assert validate_risk_geometry(valid_short) == (True, None)
+
+
+def test_risk_geometry_rejects_stop_inside_or_wrong_side_of_entry_zone():
+    bad_long = candidate(
+        direction="LONG",
+        entry_zone_low=100,
+        entry_zone_high=101,
+        invalidation_price=100.5,
+        target_1=103,
+    )
+    bad_short = candidate(
+        direction="SHORT",
+        entry_zone_low=100,
+        entry_zone_high=101,
+        invalidation_price=100.5,
+        target_1=98,
+    )
+
+    assert validate_risk_geometry(bad_long) == (False, INVALID_RISK_GEOMETRY)
+    assert validate_risk_geometry(bad_short) == (False, INVALID_RISK_GEOMETRY)
+
+
+def test_risk_geometry_rejects_target_on_wrong_side_of_entry_zone():
+    bad_long = candidate(
+        direction="LONG",
+        entry_zone_low=100,
+        entry_zone_high=101,
+        invalidation_price=99,
+        target_1=100.5,
+    )
+    bad_short = candidate(
+        direction="SHORT",
+        entry_zone_low=100,
+        entry_zone_high=101,
+        invalidation_price=102,
+        target_1=100.5,
+    )
+
+    assert validate_risk_geometry(bad_long) == (False, INVALID_RISK_GEOMETRY)
+    assert validate_risk_geometry(bad_short) == (False, INVALID_RISK_GEOMETRY)
+
+
+def test_orchestrator_filters_invalid_risk_geometry_before_returning_setups():
+    class FakeScanner:
+        def scan(self, ctx):
+            return [candidate(
+                direction="LONG",
+                entry_zone_low=100,
+                entry_zone_high=101,
+                invalidation_price=100.5,
+                target_1=103,
+                reference_price=101,
+                features={"stop_distance_ok": True, "trend_alignment": True},
+            )]
+
+    candle = Candle(1_777_294_700_000, 100, 102, 99, 101, 10)
+    ctx = MarketContext(
+        symbol="BTCUSDT", candles_5m=(candle,), candles_15m=(),
+        candles_1h=(), candles_4h=(), indicators=IndicatorSnapshot(),
+        market_regime="TREND_UP", levels=MarketLevels(),
+        evaluated_at=datetime.now(timezone.utc),
+    )
+    orchestrator = ScannerOrchestrator(enabled_scanners=[])
+    orchestrator.scanners = {"TREND_PULLBACK": FakeScanner()}
+
+    candidates, stats = orchestrator.scan_all_with_stats(ctx)
+
+    assert candidates == []
+    assert stats["TREND_PULLBACK"]["candidates_found"] == 1
+    assert stats["TREND_PULLBACK"]["setups_saved"] == 0
 
 
 def test_repository_rejects_setup_without_candle_timestamp(tmp_path):
