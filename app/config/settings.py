@@ -73,6 +73,10 @@ class Settings:
     rejection_file: str = "data/rejections.jsonl"
     market_data_file: str = "data/market_snapshots.jsonl"
     scanner_universe: ScannerUniverseSettings = field(default_factory=ScannerUniverseSettings)
+    # Expectancy filter: reject scanner/direction combos with negative historical R.
+    expectancy_filter_enabled: bool = False
+    expectancy_min_avg_r: float = 0.0
+    expectancy_min_samples: int = 10
 
 
 def _load_dotenv(path: Path) -> None:

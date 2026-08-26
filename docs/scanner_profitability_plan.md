@@ -110,6 +110,10 @@ valid_risk_geometry = true
 market_regime allowed
 ```
 
+## Phase 4b — Expectancy filter
+
+Status: implemented. `ExpectancyFilter` loads historical R from `dds.scanner_expectancy` and rejects scanner/direction combinations with negative avg_r_after_costs. Controlled by `expectancy_filter_enabled`, `expectancy_min_avg_r`, and `expectancy_min_samples` in settings.
+
 ## Phase 5 — Paper trading gate
 
 Only after Phase 3-4:

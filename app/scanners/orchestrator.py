@@ -12,6 +12,7 @@ from app.scanners.liquidity_reversal import LiquidityReversalScanner
 from app.scanners.liquidity_sweep_choch import LiquiditySweepCHOCHScanner
 from app.scanners.models import MarketContext, SetupCandidate
 from app.scanners.momentum_exhaustion import MomentumExhaustionScanner
+from app.scanners.expectancy_filter import ExpectancyFilter, filter_candidates
 from app.scanners.risk_geometry import validate_risk_geometry
 from app.scanners.scoring import score_candidate
 from app.scanners.support_resistance import SupportResistanceScanner
@@ -60,12 +61,20 @@ class ScannerOrchestrator:
         self.scan_count = 0
         self.last_scan_time: datetime | None = None
 
-    def scan_all(self, ctx: MarketContext) -> list[SetupCandidate]:
-        candidates, _ = self.scan_all_with_stats(ctx)
+    def scan_all(
+        self,
+        ctx: MarketContext,
+        expectancy_filter: ExpectancyFilter | None = None,
+        min_avg_r: float = 0.0,
+    ) -> list[SetupCandidate]:
+        candidates, _ = self.scan_all_with_stats(ctx, expectancy_filter, min_avg_r)
         return candidates
 
     def scan_all_with_stats(
-        self, ctx: MarketContext,
+        self,
+        ctx: MarketContext,
+        expectancy_filter: ExpectancyFilter | None = None,
+        min_avg_r: float = 0.0,
     ) -> tuple[list[SetupCandidate], dict[str, dict[str, int | float]]]:
         """Run every configured scanner and return per-scanner observability data."""
         self.scan_count += 1
@@ -113,6 +122,13 @@ class ScannerOrchestrator:
                 continue
             if c.score >= 20:
                 valid.append(c)
+
+        # Expectancy filter: drop scanner/direction combos with negative historical R
+        expectancy_rejected = 0
+        if expectancy_filter is not None:
+            valid, expectancy_rejected = filter_candidates(
+                valid, expectancy_filter, min_avg_r=min_avg_r,
+            )
 
         if valid:
             logger.info(
