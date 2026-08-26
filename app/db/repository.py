@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from app.scanners.models import SetupCandidate, SetupState
 
@@ -122,23 +122,40 @@ class ScannerRepository:
             self._conn.rollback()
             raise
 
-    def save_run_universe(self, run_id: int | None, symbols: list[str]) -> None:
+    def save_run_universe(
+        self,
+        run_id: int | None,
+        instruments: list[str | Mapping[str, Any]],
+    ) -> None:
         """Persist the ranked symbol snapshot used by a scanner run."""
         if not self._use_pg or run_id is None:
             return
         cursor = self._conn.cursor()
         try:
-            for rank, symbol in enumerate(symbols, start=1):
+            for position, item in enumerate(instruments, start=1):
+                if isinstance(item, str):
+                    symbol = item
+                    rank = position
+                    turnover_24h = None
+                    volume_24h = None
+                else:
+                    symbol = str(item["symbol"])
+                    rank = int(item.get("rank", position))
+                    turnover_24h = item.get("turnover_24h")
+                    volume_24h = item.get("volume_24h")
                 instrument_id = self.ensure_instrument(symbol)
                 cursor.execute(
                     """
                     INSERT INTO dds.scanner_run_instrument (
-                        run_id, instrument_id, universe_rank
-                    ) VALUES (%s, %s, %s)
+                        run_id, instrument_id, universe_rank,
+                        turnover_24h, volume_24h
+                    ) VALUES (%s, %s, %s, %s, %s)
                     ON CONFLICT (run_id, instrument_id) DO UPDATE SET
-                        universe_rank = EXCLUDED.universe_rank
+                        universe_rank = EXCLUDED.universe_rank,
+                        turnover_24h = EXCLUDED.turnover_24h,
+                        volume_24h = EXCLUDED.volume_24h
                     """,
-                    (run_id, instrument_id, rank),
+                    (run_id, instrument_id, rank, turnover_24h, volume_24h),
                 )
             self._conn.commit()
         except Exception:

@@ -137,8 +137,23 @@ class BybitClient:
         quote_coin: str = "USDT",
     ) -> list[str]:
         """Select active USDT perpetuals, ranked by their 24-hour turnover."""
+        return [row["symbol"] for row in self.get_liquid_instruments(
+            top_n=top_n,
+            min_turnover_24h=min_turnover_24h,
+            min_volume_24h=min_volume_24h,
+            quote_coin=quote_coin,
+        )]
+
+    def get_liquid_instruments(
+        self,
+        top_n: int = 50,
+        min_turnover_24h: float = 10_000_000.0,
+        min_volume_24h: float = 0.0,
+        quote_coin: str = "USDT",
+    ) -> list[dict[str, str | float | int]]:
+        """Return ranked liquid perpetuals together with selection metadata."""
         eligible = {row["symbol"] for row in self.get_linear_instruments(quote_coin)}
-        liquid: list[tuple[str, float]] = []
+        liquid: list[tuple[str, float, float]] = []
         for ticker in self.get_tickers("linear"):
             symbol = ticker.get("symbol")
             try:
@@ -148,9 +163,17 @@ class BybitClient:
                 continue
             if (symbol in eligible and turnover >= min_turnover_24h
                     and volume >= min_volume_24h):
-                liquid.append((symbol, turnover))
+                liquid.append((symbol, turnover, volume))
         liquid.sort(key=lambda item: (-item[1], item[0]))
-        return [symbol for symbol, _ in liquid[:top_n]]
+        return [
+            {
+                "symbol": symbol,
+                "turnover_24h": turnover,
+                "volume_24h": volume,
+                "rank": rank,
+            }
+            for rank, (symbol, turnover, volume) in enumerate(liquid[:top_n], start=1)
+        ]
 
     def create_order(self, symbol: str, side: str, qty: float, order_type: str = "Market") -> dict[str, Any]:
         if self.settings.trading_mode != "live" or not self.settings.live_trading_enabled:

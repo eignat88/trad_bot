@@ -12,6 +12,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from app.config import Settings, load_settings
 from app.db.repository import ScannerRepository
@@ -19,7 +20,10 @@ from app.exchange.bybit_client import BybitClient
 from app.scanners.context_builder import build_market_context
 from app.scanners.orchestrator import ScannerOrchestrator
 
-LOG_DIR = Path(__file__).parent / "logs"
+PROJECT_ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+ENV_PATH = PROJECT_ROOT / ".env"
+LOG_DIR = PROJECT_ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
 logging.basicConfig(
@@ -35,6 +39,21 @@ logger = logging.getLogger("scanner_runner")
 SHUTDOWN = False
 
 
+def _load_runner_settings() -> Settings:
+    """Load settings from files next to this runner, regardless of cwd."""
+    settings = load_settings(path=CONFIG_PATH, env_file=ENV_PATH)
+    logger.info(
+        "scanner config: universe_mode=%s top_n=%s symbols=%s cwd=%s config=%s env_file=%s",
+        settings.scanner_universe.mode,
+        settings.scanner_universe.top_n,
+        list(settings.symbols),
+        Path.cwd(),
+        CONFIG_PATH,
+        ENV_PATH,
+    )
+    return settings
+
+
 def _handle_signal(signum, frame):
     global SHUTDOWN
     logger.info("shutdown signal received")
@@ -43,24 +62,32 @@ def _handle_signal(signum, frame):
 
 def get_scanner_symbols(client: BybitClient, settings: Settings) -> list[str]:
     """Return the scanner universe selected by the current configuration."""
+    return [str(item["symbol"]) for item in get_scanner_universe(client, settings)]
+
+
+def get_scanner_universe(
+    client: BybitClient, settings: Settings,
+) -> list[dict[str, Any]]:
+    """Return the ranked universe and the metadata used to select it."""
     universe = settings.scanner_universe
     if universe.mode == "dynamic":
-        symbols = client.get_liquid_symbols(
+        instruments = client.get_liquid_instruments(
             top_n=universe.top_n,
             min_turnover_24h=universe.min_turnover_24h,
             min_volume_24h=universe.min_volume_24h,
             quote_coin=universe.quote_coin,
         )
-        if not symbols:
+        if not instruments:
             raise RuntimeError(
                 "Dynamic scanner universe is empty; check liquidity thresholds"
             )
-        return symbols
+        return instruments
 
     symbols = list(settings.symbols)
     if not symbols:
         raise RuntimeError("Static scanner universe is empty")
-    return symbols
+    return [{"symbol": symbol, "rank": rank}
+            for rank, symbol in enumerate(symbols, start=1)]
 
 
 def seconds_until_next_cycle(started_at: float, interval: int, now: float) -> float:
@@ -77,7 +104,7 @@ def run_scan_cycle(
     settings: Settings | None = None,
 ) -> tuple[int, int, int]:
     """Returns (total_found, scanned, failed)."""
-    settings = settings or load_settings()
+    settings = settings or _load_runner_settings()
     total_found = 0
     scanned = 0
     failed = 0
@@ -161,9 +188,10 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    settings = load_settings()
+    settings = _load_runner_settings()
     client = BybitClient(settings)
-    symbols = get_scanner_symbols(client, settings)
+    universe = get_scanner_universe(client, settings)
+    symbols = [str(item["symbol"]) for item in universe]
 
     repository = ScannerRepository(
         host="localhost", port=5432, database="trad_bot", user="postgres",
@@ -185,7 +213,8 @@ def main() -> None:
     cycle = 0
     while not SHUTDOWN:
         try:
-            symbols = get_scanner_symbols(client, settings)
+            universe = get_scanner_universe(client, settings)
+            symbols = [str(item["symbol"]) for item in universe]
             logger.info("scanner universe refreshed: %d symbols", len(symbols))
         except Exception:
             # Keep the last good universe after a transient Bybit failure and
@@ -200,7 +229,7 @@ def main() -> None:
             symbols_total=len(symbols),
             universe_mode=settings.scanner_universe.mode,
         )
-        repository.save_run_universe(run_id, symbols)
+        repository.save_run_universe(run_id, universe)
 
         try:
             total, scanned, failed = run_scan_cycle(

@@ -5,3 +5,6 @@ __pycache__/
 data/
 logs/
 *.log
+logs/
+.npm-cache/
+artifacts/
