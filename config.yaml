@@ -30,5 +30,8 @@
   "reward_risk": 2.0,
   "trend_start": {"price_change_min": 0.5, "price_change_max": 3.0, "oi_change_min": 5.0, "volume_ratio_min": 1.5, "funding_max": 0.03},
   "compression": {"price_range_max": 1.0, "oi_change_min": 10.0, "volume_ratio_min": 1.0, "breakout_volume_min": 1.2},
-  "capitulation": {"price_change_max": -8.0, "oi_change_max": -15.0, "volume_ratio_min": 2.0, "oi_stabilization_min": -2.0}
+  "capitulation": {"price_change_max": -8.0, "oi_change_max": -15.0, "volume_ratio_min": 2.0, "oi_stabilization_min": -2.0},
+  "expectancy_filter_enabled": true,
+  "expectancy_min_avg_r": 0.0,
+  "expectancy_min_samples": 10
 }

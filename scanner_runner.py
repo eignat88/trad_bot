@@ -18,6 +18,7 @@ from app.config import Settings, load_settings
 from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
 from app.scanners.context_builder import build_market_context
+from app.scanners.expectancy_filter import ExpectancyFilter, load_expectancy
 from app.scanners.orchestrator import ScannerOrchestrator
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -102,12 +103,14 @@ def run_scan_cycle(
     symbols: list[str],
     run_id: int | None,
     settings: Settings | None = None,
+    expectancy_filter: ExpectancyFilter | None = None,
 ) -> tuple[int, int, int]:
     """Returns (total_found, scanned, failed)."""
     settings = settings or _load_runner_settings()
     total_found = 0
     scanned = 0
     failed = 0
+    expectancy_rejected = 0
     run_stats = {
         name: {"symbols_scanned": 0, "candidates_found": 0,
                "setups_saved": 0, "errors_count": 0, "duration_ms": 0.0}
@@ -117,6 +120,7 @@ def run_scan_cycle(
     if not symbols:
         return 0, 0, 0
 
+    min_avg_r = settings.expectancy_min_avg_r if settings.expectancy_filter_enabled else 0.0
     workers = min(settings.scanner_workers, len(symbols))
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="market-data") as executor:
@@ -141,7 +145,11 @@ def run_scan_cycle(
                 continue
 
             try:
-                candidates, symbol_stats = orchestrator.scan_all_with_stats(ctx)
+                candidates, symbol_stats = orchestrator.scan_all_with_stats(
+                    ctx,
+                    expectancy_filter=expectancy_filter if settings.expectancy_filter_enabled else None,
+                    min_avg_r=min_avg_r,
+                )
                 for name, values in symbol_stats.items():
                     stat = run_stats[name]
                     stat["symbols_scanned"] += 1
@@ -161,7 +169,6 @@ def run_scan_cycle(
                     )
 
                 total_found += len(candidates)
-
                 if candidates:
                     best = max(candidates, key=lambda c: c.score)
                     logger.info(
@@ -205,9 +212,22 @@ def main() -> None:
 
     orchestrator = ScannerOrchestrator(repository=repository)
 
+    # Load expectancy filter if enabled
+    expectancy_filter = None
+    if settings.expectancy_filter_enabled:
+        expectancy_filter = load_expectancy(repository)
+        logger.info(
+            "expectancy filter loaded: %d records, min_avg_r=%.4f, min_samples=%d",
+            len(expectancy_filter.records), settings.expectancy_min_avg_r,
+            settings.expectancy_min_samples,
+        )
+    else:
+        logger.info("expectancy filter disabled")
+
     logger.info(
-        "scanner started: symbols=%s scanners=%d interval=%ds",
+        "scanner started: symbols=%s scanners=%d interval=%ds expectancy_filter=%s",
         symbols, len(orchestrator.scanners), settings.scan_interval,
+        "ON" if expectancy_filter else "OFF",
     )
 
     cycle = 0
@@ -234,6 +254,7 @@ def main() -> None:
         try:
             total, scanned, failed = run_scan_cycle(
                 client, orchestrator, repository, symbols, run_id, settings,
+                expectancy_filter=expectancy_filter,
             )
 
             repository.expire_setups()
@@ -261,6 +282,11 @@ def main() -> None:
                 "cycle #%d done: %d/%d symbols | %d setups | %d active signals | %.1fs",
                 cycle, scanned, len(symbols), total, active_signals, elapsed,
             )
+
+            # Refresh expectancy filter every 10 cycles
+            if expectancy_filter is not None and cycle % 10 == 0:
+                expectancy_filter = load_expectancy(repository)
+                logger.info("expectancy filter refreshed: %d records", len(expectancy_filter.records))
         except Exception:
             logger.exception("cycle #%d failed", cycle)
             if run_id:
