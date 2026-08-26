@@ -51,7 +51,7 @@ New invalid tradable count should be `0`.
 
 ## Phase 3 — Outcome evaluator
 
-Status: core evaluator, storage schema, repository persistence and batch CLI implemented. Remaining work: schedule the backfill periodically and build expectancy reports on top of accumulated outcomes.
+Status: core evaluator, storage schema, repository persistence, batch CLI and hourly scheduled backfill launcher implemented. Remaining work: richer expectancy reports on top of accumulated outcomes.
 
 Add a module that evaluates every saved setup against subsequent candles.
 

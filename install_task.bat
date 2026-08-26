@@ -2,7 +2,8 @@
 REM Install scanner Windows Scheduled Tasks.
 REM Creates:
 REM   BybitScanner     - starts on computer startup
-REM   BybitScannerStop - stops BybitScanner at 18:00 Mon-Fri
+REM   BybitScannerStop            - stops BybitScanner at 18:00 Mon-Fri
+REM   BybitScannerOutcomeBackfill - updates signal outcomes hourly
 REM Run this script as the Windows user that should own the tasks.
 
 cd /d %~dp0
@@ -16,6 +17,7 @@ if %errorlevel% equ 0 (
     echo Tasks installed successfully.
     echo Start now:   schtasks /run /tn "BybitScanner"
     echo Stop now:    schtasks /end /tn "BybitScanner"
+    echo Backfill:    schtasks /run /tn "BybitScannerOutcomeBackfill"
     echo Remove:      "%PYTHON%" create_scheduled_task.py uninstall
 ) else (
     echo.

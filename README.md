@@ -63,10 +63,11 @@ Install Windows Scheduled Tasks for unattended operation:
 .\install_task.bat
 ```
 
-This creates two tasks:
+This creates three tasks:
 
 - `BybitScanner` starts `scanner_runner.py` automatically on computer startup with the project directory as the working directory.
 - `BybitScannerStop` stops `BybitScanner` at 18:00, Monday through Friday.
+- `BybitScannerOutcomeBackfill` runs `run_outcome_backfill.bat` hourly to keep `dds.signal_outcome` and expectancy reports current. The launcher self-skips weekends and hours after 18:00.
 
 Manual task commands:
 

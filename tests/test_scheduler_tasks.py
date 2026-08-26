@@ -1,12 +1,17 @@
 from pathlib import Path
 
 from app.scheduler.windows_tasks import (
+    OUTCOME_INTERVAL_MINUTES,
+    OUTCOME_START_TIME,
+    OUTCOME_TASK_NAME,
     START_TASK_NAME,
     STOP_TASK_NAME,
     STOP_TIME,
     WEEKDAYS_SHORT,
+    build_outcome_task_command,
     build_start_task_command,
     build_stop_task_command,
+    outcome_launcher,
     scheduled_launcher,
     stop_launcher,
 )
@@ -48,3 +53,22 @@ def test_stop_task_runs_weekdays_at_1800():
         "/F",
     ]
     assert stop_launcher(root) == root / "stop_scanner.bat"
+
+
+def test_outcome_task_runs_hourly():
+    root = Path(r"D:\py_pro\trad_bot")
+    command = build_outcome_task_command(root=root)
+
+    assert OUTCOME_TASK_NAME == "BybitScannerOutcomeBackfill"
+    assert OUTCOME_START_TIME == "09:05"
+    assert OUTCOME_INTERVAL_MINUTES == 60
+    assert command == [
+        "schtasks", "/Create",
+        "/TN", "BybitScannerOutcomeBackfill",
+        "/TR", f'cmd.exe /c "{root / "run_outcome_backfill.bat"}"',
+        "/SC", "HOURLY",
+        "/MO", "1",
+        "/ST", "09:05",
+        "/F",
+    ]
+    assert outcome_launcher(root) == root / "run_outcome_backfill.bat"
