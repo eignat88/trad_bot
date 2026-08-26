@@ -57,6 +57,25 @@ Alternatively, use the bundled background-process scripts:
 .\stop_scanner.bat
 ```
 
+Install Windows Scheduled Tasks for unattended operation:
+
+```powershell
+.\install_task.bat
+```
+
+This creates two tasks:
+
+- `BybitScanner` starts `scanner_runner.py` automatically on computer startup with the project directory as the working directory.
+- `BybitScannerStop` stops `BybitScanner` at 18:00, Monday through Friday.
+
+Manual task commands:
+
+```powershell
+schtasks /run /tn "BybitScanner"
+schtasks /end /tn "BybitScanner"
+python .\create_scheduled_task.py uninstall
+```
+
 Run a one-off scanner check or the paper-trading application:
 
 ```powershell

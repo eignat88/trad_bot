@@ -1,29 +1,24 @@
 @echo off
-REM Install scanner as Windows scheduled task (runs on startup)
-REM Run this script as Administrator
+REM Install scanner Windows Scheduled Tasks.
+REM Creates:
+REM   BybitScanner     - starts on computer startup
+REM   BybitScannerStop - stops BybitScanner at 18:00 Mon-Fri
+REM Run this script as the Windows user that should own the tasks.
 
-set TASK_NAME=BybitScanner
-set SCRIPT_DIR=%~dp0
-set PYTHON=%SCRIPT_DIR%.venv\Scripts\python.exe
-set RUNNER=%SCRIPT_DIR%scanner_runner.py
+cd /d %~dp0
+set PYTHON=%~dp0.venv\Scripts\python.exe
+if not exist "%PYTHON%" set PYTHON=python
 
-if not exist "%PYTHON%" (
-    set PYTHON=python
-)
-
-echo Creating scheduled task: %TASK_NAME%
-echo Script: %RUNNER%
-echo Python: %PYTHON%
-
-schtasks /create /tn "%TASK_NAME%" /tr "\"%PYTHON%\" \"%RUNNER%\"" /sc onstart /ru SYSTEM /rl HIGHEST /f
+echo Installing scheduled tasks from %CD%
+"%PYTHON%" create_scheduled_task.py install
 if %errorlevel% equ 0 (
-    echo Task created successfully!
     echo.
-    echo To start now: schtasks /run /tn "%TASK_NAME%"
-    echo To stop:      schtasks /end /tn "%TASK_NAME%"
-    echo To delete:    schtasks /delete /tn "%TASK_NAME%" /f
+    echo Tasks installed successfully.
+    echo Start now:   schtasks /run /tn "BybitScanner"
+    echo Stop now:    schtasks /end /tn "BybitScanner"
+    echo Remove:      "%PYTHON%" create_scheduled_task.py uninstall
 ) else (
-    echo Failed to create task. Run this script as Administrator.
+    echo.
+    echo Failed to install tasks. Try running this script as Administrator.
 )
-
 pause

@@ -1,4 +1,4 @@
 @echo off
-schtasks /create /tn "BybitScanner" /tr "D:\Python\python.exe D:\py_pro\trad_bot\scanner_runner.py" /sc onstart /ru SYSTEM /rl HIGHEST /f
-echo Result: %errorlevel%
-pause
+REM Backward-compatible wrapper. Prefer install_task.bat.
+cd /d %~dp0
+call install_task.bat
