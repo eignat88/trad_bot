@@ -20,7 +20,10 @@ from app.exchange.bybit_client import BybitClient
 from app.scanners.context_builder import build_market_context
 from app.scanners.orchestrator import ScannerOrchestrator
 
-LOG_DIR = Path(__file__).parent / "logs"
+PROJECT_ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+ENV_PATH = PROJECT_ROOT / ".env"
+LOG_DIR = PROJECT_ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
 logging.basicConfig(
@@ -34,6 +37,21 @@ logging.basicConfig(
 logger = logging.getLogger("scanner_runner")
 
 SHUTDOWN = False
+
+
+def _load_runner_settings() -> Settings:
+    """Load settings from files next to this runner, regardless of cwd."""
+    settings = load_settings(path=CONFIG_PATH, env_file=ENV_PATH)
+    logger.info(
+        "scanner config: universe_mode=%s top_n=%s symbols=%s cwd=%s config=%s env_file=%s",
+        settings.scanner_universe.mode,
+        settings.scanner_universe.top_n,
+        list(settings.symbols),
+        Path.cwd(),
+        CONFIG_PATH,
+        ENV_PATH,
+    )
+    return settings
 
 
 def _handle_signal(signum, frame):
@@ -86,7 +104,7 @@ def run_scan_cycle(
     settings: Settings | None = None,
 ) -> tuple[int, int, int]:
     """Returns (total_found, scanned, failed)."""
-    settings = settings or load_settings()
+    settings = settings or _load_runner_settings()
     total_found = 0
     scanned = 0
     failed = 0
@@ -170,7 +188,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    settings = load_settings()
+    settings = _load_runner_settings()
     client = BybitClient(settings)
     universe = get_scanner_universe(client, settings)
     symbols = [str(item["symbol"]) for item in universe]
