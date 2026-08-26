@@ -76,10 +76,11 @@ schtasks /end /tn "BybitScanner"
 python .\create_scheduled_task.py uninstall
 ```
 
-Run a one-off scanner check or the paper-trading application:
+Run a one-off scanner check, fill measured signal outcomes, or start the paper-trading application:
 
 ```powershell
 python -m app.scanners.cli --once
+python -m app.scanners.outcome_cli --limit 100 --min-age-minutes 240
 python .\bot.py --check-config
 python .\bot.py
 ```

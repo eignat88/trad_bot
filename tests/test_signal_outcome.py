@@ -2,7 +2,12 @@ import pytest
 
 from app.models import Candle
 from app.scanners.models import SetupCandidate
-from app.scanners.outcome import evaluate_setup_outcome
+from app.scanners.outcome import SignalOutcome, evaluate_setup_outcome
+from app.scanners.outcome_cli import (
+    bybit_interval_for_timeframe,
+    fetch_outcome_candles,
+    process_pending_outcomes,
+)
 
 
 def candidate(**overrides):
@@ -101,3 +106,76 @@ def test_outcome_rejects_invalid_risk_geometry():
 
     with pytest.raises(ValueError, match="invalid setup risk geometry"):
         evaluate_setup_outcome(setup, [candle(1_300, high=104, low=100)])
+
+
+def test_bybit_interval_for_timeframe_mapping():
+    assert bybit_interval_for_timeframe("5m") == "5"
+    assert bybit_interval_for_timeframe("15m") == "15"
+    assert bybit_interval_for_timeframe("1h") == "60"
+    assert bybit_interval_for_timeframe("4h") == "240"
+    with pytest.raises(ValueError, match="unsupported entry timeframe"):
+        bybit_interval_for_timeframe("1d")
+
+
+def test_fetch_outcome_candles_filters_after_signal_time():
+    class Client:
+        def get_klines(self, symbol, interval, limit):
+            assert symbol == "BTCUSDT"
+            assert interval == "5"
+            assert limit == 200
+            return [
+                candle(700, high=200, low=1),
+                candle(1_000, high=200, low=1),
+                candle(1_300, high=101, low=100),
+                candle(1_600, high=103, low=101),
+            ]
+
+    assert [c.timestamp for c in fetch_outcome_candles(Client(), candidate(), max_bars=2)] == [1_300, 1_600]
+
+
+def test_process_pending_outcomes_saves_evaluated_rows():
+    setup = candidate()
+
+    class Repository:
+        def __init__(self):
+            self.saved: list[SignalOutcome] = []
+
+        def get_setups_without_outcomes(self, *, limit, min_age_minutes):
+            assert limit == 5
+            assert min_age_minutes == 10
+            return [setup]
+
+        def save_signal_outcome(self, outcome):
+            self.saved.append(outcome)
+
+    class Client:
+        def get_klines(self, symbol, interval, limit):
+            return [
+                candle(1_300, high=101.5, low=100.5, close=101),
+                candle(1_600, high=103.5, low=101, close=103),
+            ]
+
+    repository = Repository()
+    evaluated, failed = process_pending_outcomes(
+        repository, Client(), limit=5, min_age_minutes=10, max_bars=2,
+    )
+
+    assert evaluated == 1
+    assert failed == 0
+    assert len(repository.saved) == 1
+    assert repository.saved[0].first_event == "TP1"
+
+
+def test_process_pending_outcomes_dry_run_does_not_save():
+    class Repository:
+        def get_setups_without_outcomes(self, *, limit, min_age_minutes):
+            return [candidate()]
+
+        def save_signal_outcome(self, outcome):
+            raise AssertionError("dry-run must not save")
+
+    class Client:
+        def get_klines(self, symbol, interval, limit):
+            return [candle(1_300, high=103.5, low=100.5, close=103)]
+
+    assert process_pending_outcomes(Repository(), Client(), dry_run=True) == (1, 0)

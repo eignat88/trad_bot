@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Literal, Mapping
+from uuid import UUID
 
 from app.scanners.models import SetupCandidate, SetupState
 from app.scanners.outcome import SignalOutcome
@@ -600,6 +601,81 @@ class ScannerRepository:
         except Exception:
             self._conn.rollback()
             raise
+
+    def get_setups_without_outcomes(
+        self,
+        *,
+        limit: int = 100,
+        min_age_minutes: int = 240,
+    ) -> list[SetupCandidate]:
+        if not self._use_pg:
+            return []
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT s.setup_id, s.scanner_name, i.symbol, s.direction,
+                   s.htf_timeframe, s.setup_timeframe, s.entry_timeframe,
+                   s.setup_started_at, s.signal_candle_open_time,
+                   s.detected_at, s.reference_price,
+                   s.entry_zone_low, s.entry_zone_high,
+                   s.invalidation_price, s.target_1, s.target_2,
+                   s.score, s.market_regime, s.reasons, s.features
+            FROM dds.scanner_setup s
+            JOIN dds.instrument i ON i.instrument_id = s.instrument_id
+            LEFT JOIN dds.signal_outcome o ON o.setup_id = s.setup_id
+            WHERE o.setup_id IS NULL
+              AND s.signal_candle_open_time > 0
+              AND s.detected_at < now() - (%s * interval '1 minute')
+              AND s.entry_zone_low IS NOT NULL
+              AND s.entry_zone_high IS NOT NULL
+              AND s.invalidation_price IS NOT NULL
+              AND s.target_1 IS NOT NULL
+              AND (
+                (s.direction = 'LONG'
+                 AND s.invalidation_price < s.entry_zone_low
+                 AND s.target_1 > s.entry_zone_high)
+                OR
+                (s.direction = 'SHORT'
+                 AND s.invalidation_price > s.entry_zone_high
+                 AND s.target_1 < s.entry_zone_low)
+              )
+            ORDER BY s.detected_at ASC
+            LIMIT %s
+            """,
+            (min_age_minutes, limit),
+        )
+        return [self._row_to_setup_candidate(row) for row in cursor.fetchall()]
+
+    @staticmethod
+    def _row_to_setup_candidate(row: tuple) -> SetupCandidate:
+        reasons = row[18]
+        features = row[19]
+        if isinstance(reasons, str):
+            reasons = json.loads(reasons)
+        if isinstance(features, str):
+            features = json.loads(features)
+        return SetupCandidate(
+            setup_id=UUID(str(row[0])),
+            scanner_name=row[1],
+            symbol=row[2],
+            direction=row[3],
+            htf_timeframe=row[4],
+            setup_timeframe=row[5],
+            entry_timeframe=row[6],
+            setup_started_at=row[7],
+            signal_candle_open_time=int(row[8]),
+            detected_at=row[9],
+            reference_price=float(row[10]),
+            entry_zone_low=float(row[11]),
+            entry_zone_high=float(row[12]),
+            invalidation_price=float(row[13]),
+            target_1=float(row[14]),
+            target_2=float(row[15]) if row[15] is not None else None,
+            score=float(row[16]),
+            market_regime=row[17],
+            reasons=tuple(reasons or ()),
+            features=dict(features or {}),
+        )
 
     # ----------------------------------------------------------------
     # QUERIES

@@ -308,6 +308,7 @@ CREATE INDEX IF NOT EXISTS idx_signal_outcome_result_r ON dds.signal_outcome (re
 DROP VIEW IF EXISTS dds.scanner_stats CASCADE;
 DROP VIEW IF EXISTS dds.run_history CASCADE;
 DROP VIEW IF EXISTS dds.active_signals CASCADE;
+DROP VIEW IF EXISTS dds.scanner_expectancy CASCADE;
 
 CREATE OR REPLACE VIEW dds.scanner_stats AS
 SELECT
@@ -352,3 +353,29 @@ FROM dds.market_signal ms
 JOIN dds.instrument i ON i.instrument_id = ms.instrument_id
 WHERE ms.status = 'ACTIVE'
 ORDER BY ms.aggregate_score DESC;
+
+CREATE OR REPLACE VIEW dds.scanner_expectancy AS
+SELECT
+    scanner_name,
+    direction,
+    COUNT(*) AS samples,
+    COUNT(*) FILTER (WHERE entry_touched) AS entries,
+    COUNT(*) FILTER (WHERE first_event IN ('TP1', 'TP2')) AS wins,
+    COUNT(*) FILTER (WHERE first_event = 'SL') AS losses,
+    ROUND(AVG(result_r), 4) AS avg_r,
+    ROUND(AVG(fee_slippage_adjusted_result_r), 4) AS avg_r_after_costs,
+    ROUND(AVG(mfe_r), 4) AS avg_mfe_r,
+    ROUND(AVG(mae_r), 4) AS avg_mae_r,
+    ROUND(
+        (COUNT(*) FILTER (WHERE first_event IN ('TP1', 'TP2')))::numeric
+        / NULLIF(COUNT(*) FILTER (WHERE entry_touched), 0),
+        4
+    ) AS win_rate_on_entries,
+    ROUND(
+        SUM(GREATEST(result_r, 0))
+        / NULLIF(ABS(SUM(LEAST(result_r, 0))), 0),
+        4
+    ) AS profit_factor
+FROM dds.signal_outcome
+GROUP BY scanner_name, direction
+ORDER BY avg_r_after_costs DESC NULLS LAST;

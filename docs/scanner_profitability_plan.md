@@ -51,7 +51,7 @@ New invalid tradable count should be `0`.
 
 ## Phase 3 — Outcome evaluator
 
-Status: core evaluator and storage schema implemented. Remaining work: batch job/CLI that fetches candles for historical setups and fills outcomes continuously.
+Status: core evaluator, storage schema, repository persistence and batch CLI implemented. Remaining work: schedule the backfill periodically and build expectancy reports on top of accumulated outcomes.
 
 Add a module that evaluates every saved setup against subsequent candles.
 
@@ -75,6 +75,8 @@ Acceptance metrics:
 - No look-ahead: only candles after `signal_candle_open_time` are used.
 
 ## Phase 4 — Scanner ranking by expectancy
+
+Status: initial `dds.scanner_expectancy` view implemented by scanner/direction. Remaining work: richer grouping by symbol, regime, score bucket and confluence.
 
 After outcomes exist, rank signals by measured edge, not raw score.
 
