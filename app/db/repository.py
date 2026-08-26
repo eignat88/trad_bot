@@ -785,6 +785,187 @@ class ScannerRepository:
             return {r[0]: dict(zip(cols[1:], r[1:])) for r in rows}
         return {"mode": "jsonl", "file": self._jsonl_path}
 
+    # ----------------------------------------------------------------
+    # PAPER TRADING
+    # ----------------------------------------------------------------
+    def save_paper_trade(self, trade: Any) -> int | None:
+        """Insert a new paper trade and return its trade_id."""
+        if not self._use_pg:
+            return None
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO dds.paper_trade (
+                    setup_id, symbol, scanner_name, direction, score,
+                    entry_price, entry_fee, stop_price, target_1, target_2,
+                    position_size, risk_usdt, balance_before, market_regime,
+                    status, entered_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    'OPEN', %s
+                ) RETURNING trade_id
+                """,
+                (
+                    trade.setup_id, trade.symbol, trade.scanner_name,
+                    trade.direction, trade.score, trade.entry_price,
+                    trade.entry_fee, trade.stop_price, trade.target_1,
+                    trade.target_2, trade.position_size, trade.risk_usdt,
+                    trade.balance_before, trade.market_regime, trade.entered_at,
+                ),
+            )
+            self._conn.commit()
+            row = cursor.fetchone()
+            return row[0] if row else None
+        except Exception:
+            self._conn.rollback()
+            logger.exception("save_paper_trade failed for %s", trade.symbol)
+            raise
+
+    def close_paper_trade(
+        self,
+        trade_id: int | None,
+        exit_price: float,
+        exit_reason: str,
+        exit_fee: float,
+        pnl_usdt: float,
+        pnl_r: float,
+        pnl_percent: float,
+        slippage: float,
+        balance_after: float,
+        duration_sec: float,
+    ) -> None:
+        """Update a paper trade with exit data."""
+        if not self._use_pg or trade_id is None:
+            return
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(
+                """
+                UPDATE dds.paper_trade SET
+                    exit_price = %s,
+                    exit_reason = %s,
+                    exit_fee = %s,
+                    pnl_usdt = %s,
+                    pnl_r = %s,
+                    pnl_percent = %s,
+                    slippage = %s,
+                    balance_after = %s,
+                    duration_sec = %s,
+                    status = 'CLOSED',
+                    closed_at = now(),
+                    updated_at = now()
+                WHERE trade_id = %s
+                """,
+                (
+                    exit_price, exit_reason, exit_fee, pnl_usdt,
+                    pnl_r, pnl_percent, slippage, balance_after,
+                    duration_sec, trade_id,
+                ),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            logger.exception("close_paper_trade failed for trade_id=%s", trade_id)
+            raise
+
+    def get_open_paper_trades(self) -> list[dict]:
+        """Load all OPEN paper trades (for engine restart recovery)."""
+        if not self._use_pg:
+            return []
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT trade_id, setup_id, symbol, scanner_name, direction, score,
+                   entry_price, entry_fee, stop_price, target_1, target_2,
+                   position_size, risk_usdt, balance_before, market_regime,
+                   entered_at
+            FROM dds.paper_trade
+            WHERE status = 'OPEN'
+            ORDER BY entered_at DESC
+            """
+        )
+        rows = cursor.fetchall()
+        return [
+            {
+                "trade_id": r[0], "setup_id": r[1], "symbol": r[2],
+                "scanner_name": r[3], "direction": r[4], "score": float(r[5]),
+                "entry_price": float(r[6]), "entry_fee": float(r[7]),
+                "stop_price": float(r[8]),
+                "target_1": float(r[9]) if r[9] is not None else None,
+                "target_2": float(r[10]) if r[10] is not None else None,
+                "position_size": float(r[11]), "risk_usdt": float(r[12]),
+                "balance_before": float(r[13]),
+                "market_regime": r[14],
+                "entered_at": r[15],
+            }
+            for r in rows
+        ]
+
+    def expire_stale_setups(self, max_age_minutes: int = 120) -> int:
+        """Mark old READY_TO_TRADE setups as EXPIRED."""
+        if not self._use_pg:
+            return 0
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(
+                """
+                UPDATE dds.scanner_setup SET status = 'EXPIRED', expired_at = now(), updated_at = now()
+                WHERE status = 'READY_TO_TRADE'
+                  AND detected_at < now() - make_interval(mins := %s)
+                """,
+                (max_age_minutes,),
+            )
+            count = cursor.rowcount
+            self._conn.commit()
+            return count
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def get_paper_trade_stats(self) -> list[dict]:
+        """Get aggregated paper trade performance by scanner/direction."""
+        if not self._use_pg:
+            return []
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT * FROM dds.paper_trade_stats")
+        rows = cursor.fetchall()
+        cols = [d[0] for d in cursor.description] if cursor.description else []
+        return [dict(zip(cols, r)) for r in rows]
+
+    def save_paper_account_snapshot(
+        self,
+        balance: float,
+        equity: float,
+        open_positions: int,
+        total_trades: int,
+        winning_trades: int,
+        losing_trades: int,
+        total_pnl: float,
+        max_drawdown: float,
+    ) -> None:
+        """Save an account equity snapshot."""
+        if not self._use_pg:
+            return
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO dds.paper_account (
+                    balance, equity, open_positions, total_trades,
+                    winning_trades, losing_trades, total_pnl, max_drawdown
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    balance, equity, open_positions, total_trades,
+                    winning_trades, losing_trades, total_pnl, max_drawdown,
+                ),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
     def close(self) -> None:
         if self._conn:
             self._conn.close()

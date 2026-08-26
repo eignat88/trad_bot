@@ -454,3 +454,113 @@ FROM dds._outcome_enriched
 GROUP BY scanner_name, direction, score_bucket
 HAVING COUNT(*) >= 3
 ORDER BY score_bucket, avg_r_after_costs DESC NULLS LAST;
+
+-- ============================================================
+-- PAPER_TRADE: paper trading gate — simulated positions
+-- ============================================================
+CREATE TABLE IF NOT EXISTS dds.paper_trade (
+    trade_id        BIGSERIAL PRIMARY KEY,
+    setup_id        TEXT NOT NULL REFERENCES dds.scanner_setup(setup_id),
+    symbol          TEXT NOT NULL,
+    scanner_name    TEXT NOT NULL,
+    direction       TEXT NOT NULL,
+    score           NUMERIC NOT NULL,
+    -- entry / exit
+    entry_price     NUMERIC NOT NULL,
+    entry_fee       NUMERIC NOT NULL DEFAULT 0,
+    stop_price      NUMERIC NOT NULL,
+    target_1        NUMERIC,
+    target_2        NUMERIC,
+    position_size   NUMERIC NOT NULL,
+    risk_usdt       NUMERIC NOT NULL,
+    -- exit (NULL → still open)
+    exit_price      NUMERIC,
+    exit_reason     TEXT,
+    exit_fee        NUMERIC NOT NULL DEFAULT 0,
+    -- P&L
+    pnl_usdt        NUMERIC NOT NULL DEFAULT 0,
+    pnl_r           NUMERIC NOT NULL DEFAULT 0,
+    pnl_percent     NUMERIC NOT NULL DEFAULT 0,
+    slippage        NUMERIC NOT NULL DEFAULT 0,
+    -- status & timestamps
+    status          TEXT NOT NULL DEFAULT 'PENDING',
+    entered_at      TIMESTAMPTZ,
+    closed_at       TIMESTAMPTZ,
+    duration_sec    NUMERIC,
+    -- account snapshot
+    balance_before  NUMERIC NOT NULL DEFAULT 0,
+    balance_after   NUMERIC NOT NULL DEFAULT 0,
+    -- metadata
+    market_regime   TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT paper_trade_direction_chk CHECK (direction IN ('LONG', 'SHORT')),
+    CONSTRAINT paper_trade_status_chk CHECK (
+        status IN ('PENDING', 'OPEN', 'CLOSED', 'EXPIRED', 'CANCELLED')
+    ),
+    CONSTRAINT paper_trade_exit_reason_chk CHECK (
+        exit_reason IS NULL OR exit_reason IN (
+            'TAKE_PROFIT_1', 'TAKE_PROFIT_2', 'STOP_LOSS', 'TRAILING_STOP',
+            'EXPIRED', 'TIMEOUT', 'MANUAL', 'RISK_LIMIT'
+        )
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_trade_status ON dds.paper_trade (status);
+CREATE INDEX IF NOT EXISTS idx_paper_trade_symbol ON dds.paper_trade (symbol, status);
+CREATE INDEX IF NOT EXISTS idx_paper_trade_scanner ON dds.paper_trade (scanner_name);
+CREATE INDEX IF NOT EXISTS idx_paper_trade_entered ON dds.paper_trade (entered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_paper_trade_setup ON dds.paper_trade (setup_id);
+
+-- Only one active (OPEN or PENDING) trade per setup
+CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_trade_active_per_setup
+ON dds.paper_trade (setup_id)
+WHERE status IN ('PENDING', 'OPEN');
+
+-- ============================================================
+-- PAPER_ACCOUNT: running account equity snapshots
+-- ============================================================
+CREATE TABLE IF NOT EXISTS dds.paper_account (
+    snapshot_id     BIGSERIAL PRIMARY KEY,
+    balance         NUMERIC NOT NULL,
+    equity          NUMERIC NOT NULL,
+    open_positions  INTEGER NOT NULL DEFAULT 0,
+    total_trades    INTEGER NOT NULL DEFAULT 0,
+    winning_trades  INTEGER NOT NULL DEFAULT 0,
+    losing_trades   INTEGER NOT NULL DEFAULT 0,
+    total_pnl       NUMERIC NOT NULL DEFAULT 0,
+    max_drawdown    NUMERIC NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_account_time ON dds.paper_account (created_at DESC);
+
+-- ============================================================
+-- PAPER_TRADE_STATS: aggregated performance by scanner
+-- ============================================================
+CREATE OR REPLACE VIEW dds.paper_trade_stats AS
+SELECT
+    scanner_name,
+    direction,
+    COUNT(*) AS total_trades,
+    COUNT(*) FILTER (WHERE status = 'CLOSED') AS closed,
+    COUNT(*) FILTER (WHERE pnl_usdt > 0) AS wins,
+    COUNT(*) FILTER (WHERE pnl_usdt < 0) AS losses,
+    ROUND(AVG(pnl_r), 4) AS avg_r,
+    ROUND(AVG(pnl_usdt), 2) AS avg_pnl_usdt,
+    ROUND(SUM(pnl_usdt), 2) AS total_pnl_usdt,
+    ROUND(AVG(pnl_percent), 2) AS avg_pnl_pct,
+    ROUND(AVG(duration_sec), 1) AS avg_duration_sec,
+    ROUND(
+        COUNT(*) FILTER (WHERE pnl_usdt > 0)::numeric
+        / NULLIF(COUNT(*) FILTER (WHERE status = 'CLOSED'), 0),
+        4
+    ) AS win_rate,
+    ROUND(
+        SUM(GREATEST(pnl_usdt, 0))
+        / NULLIF(ABS(SUM(LEAST(pnl_usdt, 0))), 0),
+        4
+    ) AS profit_factor
+FROM dds.paper_trade
+GROUP BY scanner_name, direction
+ORDER BY total_pnl_usdt DESC;
