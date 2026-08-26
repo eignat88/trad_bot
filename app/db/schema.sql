@@ -272,6 +272,37 @@ ON dds.market_signal (instrument_id, direction, timeframe)
 WHERE status = 'ACTIVE';
 
 -- ============================================================
+-- SIGNAL_OUTCOME: measured post-signal result for expectancy reports
+-- ============================================================
+CREATE TABLE IF NOT EXISTS dds.signal_outcome (
+    setup_id TEXT PRIMARY KEY REFERENCES dds.scanner_setup(setup_id) ON DELETE CASCADE,
+    symbol TEXT NOT NULL,
+    scanner_name TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    entry_touched BOOLEAN NOT NULL DEFAULT false,
+    first_event TEXT NOT NULL,
+    result_r NUMERIC NOT NULL DEFAULT 0,
+    mfe_r NUMERIC NOT NULL DEFAULT 0,
+    mae_r NUMERIC NOT NULL DEFAULT 0,
+    bars_to_entry INTEGER,
+    bars_to_exit INTEGER,
+    entry_price NUMERIC,
+    exit_price NUMERIC,
+    fee_slippage_adjusted_result_r NUMERIC NOT NULL DEFAULT 0,
+    evaluated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT signal_outcome_direction_chk CHECK (direction IN ('LONG', 'SHORT')),
+    CONSTRAINT signal_outcome_first_event_chk CHECK (
+        first_event IN ('NO_ENTRY', 'TP1', 'TP2', 'SL', 'EXPIRED', 'OPEN')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_outcome_scanner ON dds.signal_outcome (scanner_name);
+CREATE INDEX IF NOT EXISTS idx_signal_outcome_symbol ON dds.signal_outcome (symbol);
+CREATE INDEX IF NOT EXISTS idx_signal_outcome_event ON dds.signal_outcome (first_event);
+CREATE INDEX IF NOT EXISTS idx_signal_outcome_result_r ON dds.signal_outcome (result_r DESC);
+
+-- ============================================================
 -- VIEWS
 -- ============================================================
 DROP VIEW IF EXISTS dds.scanner_stats CASCADE;

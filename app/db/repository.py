@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal, Mapping
 
 from app.scanners.models import SetupCandidate, SetupState
+from app.scanners.outcome import SignalOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -549,6 +550,56 @@ class ScannerRepository:
         count = cursor.rowcount
         self._conn.commit()
         return count
+
+    # ----------------------------------------------------------------
+    # SIGNAL OUTCOME
+    # ----------------------------------------------------------------
+    def save_signal_outcome(self, outcome: SignalOutcome) -> None:
+        if not self._use_pg:
+            return
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO dds.signal_outcome (
+                    setup_id, symbol, scanner_name, direction, entry_touched,
+                    first_event, result_r, mfe_r, mae_r, bars_to_entry,
+                    bars_to_exit, entry_price, exit_price,
+                    fee_slippage_adjusted_result_r, evaluated_at, updated_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    now(), now()
+                )
+                ON CONFLICT (setup_id) DO UPDATE SET
+                    symbol = EXCLUDED.symbol,
+                    scanner_name = EXCLUDED.scanner_name,
+                    direction = EXCLUDED.direction,
+                    entry_touched = EXCLUDED.entry_touched,
+                    first_event = EXCLUDED.first_event,
+                    result_r = EXCLUDED.result_r,
+                    mfe_r = EXCLUDED.mfe_r,
+                    mae_r = EXCLUDED.mae_r,
+                    bars_to_entry = EXCLUDED.bars_to_entry,
+                    bars_to_exit = EXCLUDED.bars_to_exit,
+                    entry_price = EXCLUDED.entry_price,
+                    exit_price = EXCLUDED.exit_price,
+                    fee_slippage_adjusted_result_r = EXCLUDED.fee_slippage_adjusted_result_r,
+                    updated_at = now()
+                """,
+                (
+                    outcome.setup_id, outcome.symbol, outcome.scanner_name,
+                    outcome.direction, outcome.entry_touched,
+                    outcome.first_event, outcome.result_r, outcome.mfe_r,
+                    outcome.mae_r, outcome.bars_to_entry,
+                    outcome.bars_to_exit, outcome.entry_price,
+                    outcome.exit_price,
+                    outcome.fee_slippage_adjusted_result_r,
+                ),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     # ----------------------------------------------------------------
     # QUERIES

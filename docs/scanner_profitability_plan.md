@@ -51,6 +51,8 @@ New invalid tradable count should be `0`.
 
 ## Phase 3 — Outcome evaluator
 
+Status: core evaluator and storage schema implemented. Remaining work: batch job/CLI that fetches candles for historical setups and fills outcomes continuously.
+
 Add a module that evaluates every saved setup against subsequent candles.
 
 Required fields per setup outcome:
