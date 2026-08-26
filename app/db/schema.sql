@@ -309,6 +309,9 @@ DROP VIEW IF EXISTS dds.scanner_stats CASCADE;
 DROP VIEW IF EXISTS dds.run_history CASCADE;
 DROP VIEW IF EXISTS dds.active_signals CASCADE;
 DROP VIEW IF EXISTS dds.scanner_expectancy CASCADE;
+DROP VIEW IF EXISTS dds.scanner_symbol_expectancy CASCADE;
+DROP VIEW IF EXISTS dds.scanner_regime_expectancy CASCADE;
+DROP VIEW IF EXISTS dds.score_bucket_expectancy CASCADE;
 
 CREATE OR REPLACE VIEW dds.scanner_stats AS
 SELECT
@@ -379,3 +382,75 @@ SELECT
 FROM dds.signal_outcome
 GROUP BY scanner_name, direction
 ORDER BY avg_r_after_costs DESC NULLS LAST;
+
+-- Enriched expectancy: join outcome with setup for regime/score context
+CREATE OR REPLACE VIEW dds._outcome_enriched AS
+SELECT
+    o.*,
+    s.market_regime,
+    s.score AS setup_score,
+    CASE
+        WHEN s.score < 30 THEN '<30'
+        WHEN s.score < 40 THEN '30-39'
+        WHEN s.score < 50 THEN '40-49'
+        ELSE '50+'
+    END AS score_bucket
+FROM dds.signal_outcome o
+JOIN dds.scanner_setup s ON s.setup_id = o.setup_id;
+
+CREATE OR REPLACE VIEW dds.scanner_symbol_expectancy AS
+SELECT
+    scanner_name,
+    symbol,
+    direction,
+    COUNT(*) AS samples,
+    COUNT(*) FILTER (WHERE entry_touched) AS entries,
+    ROUND(AVG(result_r), 4) AS avg_r,
+    ROUND(AVG(fee_slippage_adjusted_result_r), 4) AS avg_r_after_costs,
+    ROUND(
+        (COUNT(*) FILTER (WHERE first_event IN ('TP1', 'TP2')))::numeric
+        / NULLIF(COUNT(*) FILTER (WHERE entry_touched), 0),
+        4
+    ) AS win_rate_on_entries
+FROM dds.signal_outcome
+GROUP BY scanner_name, symbol, direction
+HAVING COUNT(*) >= 3
+ORDER BY avg_r_after_costs DESC NULLS LAST;
+
+CREATE OR REPLACE VIEW dds.scanner_regime_expectancy AS
+SELECT
+    scanner_name,
+    direction,
+    market_regime,
+    COUNT(*) AS samples,
+    COUNT(*) FILTER (WHERE entry_touched) AS entries,
+    ROUND(AVG(result_r), 4) AS avg_r,
+    ROUND(AVG(fee_slippage_adjusted_result_r), 4) AS avg_r_after_costs,
+    ROUND(
+        (COUNT(*) FILTER (WHERE first_event IN ('TP1', 'TP2')))::numeric
+        / NULLIF(COUNT(*) FILTER (WHERE entry_touched), 0),
+        4
+    ) AS win_rate_on_entries
+FROM dds._outcome_enriched
+GROUP BY scanner_name, direction, market_regime
+HAVING COUNT(*) >= 3
+ORDER BY avg_r_after_costs DESC NULLS LAST;
+
+CREATE OR REPLACE VIEW dds.score_bucket_expectancy AS
+SELECT
+    scanner_name,
+    direction,
+    score_bucket,
+    COUNT(*) AS samples,
+    COUNT(*) FILTER (WHERE entry_touched) AS entries,
+    ROUND(AVG(result_r), 4) AS avg_r,
+    ROUND(AVG(fee_slippage_adjusted_result_r), 4) AS avg_r_after_costs,
+    ROUND(
+        (COUNT(*) FILTER (WHERE first_event IN ('TP1', 'TP2')))::numeric
+        / NULLIF(COUNT(*) FILTER (WHERE entry_touched), 0),
+        4
+    ) AS win_rate_on_entries
+FROM dds._outcome_enriched
+GROUP BY scanner_name, direction, score_bucket
+HAVING COUNT(*) >= 3
+ORDER BY score_bucket, avg_r_after_costs DESC NULLS LAST;

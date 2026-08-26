@@ -82,6 +82,7 @@ Run a one-off scanner check, fill measured signal outcomes, or start the paper-t
 ```powershell
 python -m app.scanners.cli --once
 python -m app.scanners.outcome_cli --limit 100 --min-age-minutes 240
+python -m app.scanners.expectancy_report
 python .\bot.py --check-config
 python .\bot.py
 ```

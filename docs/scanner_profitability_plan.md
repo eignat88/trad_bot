@@ -76,7 +76,7 @@ Acceptance metrics:
 
 ## Phase 4 — Scanner ranking by expectancy
 
-Status: initial `dds.scanner_expectancy` view implemented by scanner/direction. Remaining work: richer grouping by symbol, regime, score bucket and confluence.
+Status: `dds.scanner_expectancy`, `dds.scanner_symbol_expectancy`, `dds.scanner_regime_expectancy`, and `dds.score_bucket_expectancy` views implemented. CLI report command available via `python -m app.scanners.expectancy_report`. Remaining work: confluence-level grouping and filter-based gating.
 
 After outcomes exist, rank signals by measured edge, not raw score.
 
