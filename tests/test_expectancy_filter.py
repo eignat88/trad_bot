@@ -93,6 +93,19 @@ def test_filter_candidates_returns_accepted_and_rejected():
     assert accepted[0].scanner_name == "VOLATILITY_COMPRESSION"
 
 
+def test_filter_rejects_manual_block_without_history():
+    candidates = [candidate(scanner_name="BREAKOUT_RETEST", direction="SHORT")]
+
+    accepted, rejected = filter_candidates(
+        candidates,
+        ExpectancyFilter(),
+        blocked_combinations=frozenset({("BREAKOUT_RETEST", "SHORT")}),
+    )
+
+    assert accepted == []
+    assert rejected == 1
+
+
 def test_orchestrator_applies_expectancy_filter():
     """Expectancy filter is applied in scan_all_with_stats."""
 

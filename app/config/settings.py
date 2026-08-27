@@ -77,6 +77,8 @@ class Settings:
     expectancy_filter_enabled: bool = False
     expectancy_min_avg_r: float = 0.0
     expectancy_min_samples: int = 10
+    # Explicitly paused scanner/direction combinations, regardless of sample size.
+    blocked_scanner_directions: tuple[tuple[str, str], ...] = ()
     # Live gate thresholds measured from persisted forward paper trading.
     paper_min_forward_days: int = 14
     paper_min_closed_trades: int = 30
@@ -117,6 +119,16 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
     values.update(env)
     if "symbols" in values:
         values["symbols"] = tuple(values["symbols"])
+    if "blocked_scanner_directions" in values:
+        try:
+            values["blocked_scanner_directions"] = tuple(
+                (str(scanner_name).upper(), str(direction).upper())
+                for scanner_name, direction in values["blocked_scanner_directions"]
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "blocked_scanner_directions must contain [scanner_name, direction] pairs"
+            ) from exc
     if "scanner_universe" in values and isinstance(values["scanner_universe"], dict):
         values["scanner_universe"] = ScannerUniverseSettings(**values["scanner_universe"])
     settings = Settings(**values)
