@@ -126,6 +126,23 @@ def test_trade_expiry_uses_the_setup_entry_timeframe():
     assert "BTCUSDT" in engine.open_trades
 
 
+def test_overdue_trade_closes_at_first_recovery_price_not_stop_price():
+    repo = FakeRepository()
+    engine = PaperTradingEngine(Settings(slippage_percent=0.0), repo)
+    trade = engine.check_entries(
+        [_candidate(direction="SHORT", invalidation_price=110.0, target_1=None)],
+        {"BTCUSDT": 100.0},
+    )[0]
+    trade.entered_at = datetime.now(timezone.utc) - timedelta(hours=2)
+
+    closed = engine.check_exits({"BTCUSDT": 111.0})
+
+    assert len(closed) == 1
+    assert repo.closed[0]["exit_reason"] == "EXPIRED"
+    assert repo.closed[0]["exit_price"] == 111.0
+    assert "BTCUSDT" not in engine.open_trades
+
+
 def test_funding_is_settled_once_per_completed_interval():
     repo = FakeRepository()
     settings = Settings(

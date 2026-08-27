@@ -215,6 +215,15 @@ class PaperTradingEngine:
             if price is None:
                 continue
 
+            # An outage can leave a trade past its lifetime before the next
+            # quote arrives. In that case, the recovery quote is the only
+            # executable price: do not turn it into a stop/target fill at an
+            # earlier historical level.
+            if self._is_expired(trade):
+                closed.append(self._close_trade(trade, price, "EXPIRED"))
+                to_remove.append(symbol)
+                continue
+
             funding_rate = (funding_rates_percent or {}).get(symbol, 0.0)
             self._apply_funding(trade, funding_rate)
 
@@ -251,12 +260,8 @@ class PaperTradingEngine:
                 result = self._check_trailing_stop(trade, price)
 
             # 5. Timeout check (setup expired)
-            if result is None:
-                tf_minutes = self._parse_timeframe(trade)
-                max_bars = _ENTRY_TIMEOUT_MAP.get(trade.entry_timeframe, 12)
-                age_minutes = (datetime.now(timezone.utc) - trade.entered_at).total_seconds() / 60
-                if age_minutes > max_bars * tf_minutes:
-                    result = self._close_trade(trade, price, "EXPIRED")
+            if result is None and self._is_expired(trade):
+                result = self._close_trade(trade, price, "EXPIRED")
 
             if result is not None:
                 closed.append(result)
@@ -501,6 +506,13 @@ class PaperTradingEngine:
                 "paper: loaded %d open trades, reconstructed balance=$%.2f",
                 len(rows), self.balance,
             )
+
+    def _is_expired(self, trade: PaperTradeRecord) -> bool:
+        """Return whether a trade has exceeded its entry-timeframe lifetime."""
+        tf_minutes = self._parse_timeframe(trade)
+        max_bars = _ENTRY_TIMEOUT_MAP.get(trade.entry_timeframe, 12)
+        age_minutes = (datetime.now(timezone.utc) - trade.entered_at).total_seconds() / 60
+        return age_minutes > max_bars * tf_minutes
 
     def _parse_timeframe(self, trade: PaperTradeRecord) -> int:
         """Return the number of minutes for a trade's persisted entry timeframe."""
