@@ -57,6 +57,34 @@ class ScannerRepository:
                 raise
             logger.warning("PostgreSQL connection failed, using JSONL fallback")
 
+    def ping(self) -> bool:
+        """Send a lightweight keepalive to prevent idle connection timeout."""
+        if not self._use_pg:
+            return True
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute("SELECT 1")
+            return True
+        except Exception:
+            return False
+
+    def reconnect(self) -> bool:
+        """Attempt to re-establish a dropped PostgreSQL connection."""
+        if not self._use_pg:
+            return False
+        try:
+            import pg8000
+            self._conn = pg8000.connect(
+                host=self._host, port=self._port,
+                database=self._database, user=self._user,
+            )
+            logger.info("scanner repository reconnected to PostgreSQL")
+            self.ensure_schema()
+            return True
+        except Exception:
+            logger.exception("reconnect to PostgreSQL failed")
+            return False
+
     def ensure_schema(self) -> None:
         if not self._use_pg:
             return
@@ -75,6 +103,10 @@ class ScannerRepository:
                 logger.info("scanner schema applied")
             except Exception as e:
                 logger.warning("schema apply error (may already exist): %s", e)
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
 
     # ----------------------------------------------------------------
     # INSTRUMENT
