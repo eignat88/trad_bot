@@ -48,11 +48,14 @@ class PaperTradeRecord:
     market_regime: str | None
     entered_at: datetime
     status: str = "OPEN"
+    entry_timeframe: str = "5m"
     # trailing / management
     trail_stop: float | None = None
     highest_since_entry: float = 0.0
     lowest_since_entry: float = math.inf
     partial_tp_hit: bool = False
+    funding_paid: float = 0.0
+    funding_periods_charged: int = 0
 
 
 class PaperTradingEngine:
@@ -72,9 +75,14 @@ class PaperTradingEngine:
         self.open_trades: dict[str, PaperTradeRecord] = {}  # symbol → trade
         self._peak_balance: float = settings.initial_balance
         self._max_drawdown: float = 0.0
+        self._loaded_account_snapshot = False
+        self._daily_loss_usdt: float = 0.0
+        self._consecutive_losses: int = 0
 
-        # Load any existing open trades from DB
+        # Restore account/risk state before rebuilding any open positions.
+        self._load_account_state()
         self._load_open_trades()
+        self._load_risk_state()
 
     # ------------------------------------------------------------------
     # ENTRY: scan READY_TO_TRADE setups → open positions
@@ -106,6 +114,13 @@ class PaperTradingEngine:
             if len(self.open_trades) >= self.settings.max_open_positions:
                 logger.info("paper gate: max open positions reached (%d), skipping %s",
                             self.settings.max_open_positions, c.symbol)
+                break
+
+            if self._daily_loss_usdt >= self.settings.initial_balance * self.settings.max_daily_loss:
+                logger.warning("paper gate: daily loss limit reached, skipping new entries")
+                break
+            if self._consecutive_losses >= self.settings.max_consecutive_losses:
+                logger.warning("paper gate: consecutive loss limit reached, skipping new entries")
                 break
 
             # Entry zone check: price must be within [entry_zone_low, entry_zone_high]
@@ -154,6 +169,7 @@ class PaperTradingEngine:
                 stop_price=round(stop, 6),
                 target_1=c.target_1,
                 target_2=c.target_2,
+                entry_timeframe=c.entry_timeframe,
                 position_size=round(quantity, 6),
                 risk_usdt=round(risk_usdt, 6),
                 balance_before=round(self.balance, 2),
@@ -182,8 +198,12 @@ class PaperTradingEngine:
     # ------------------------------------------------------------------
     # EXIT: check open positions against current prices
     # ------------------------------------------------------------------
-    def check_exits(self, prices: dict[str, float]) -> list[PaperTradeRecord]:
-        """Check all open paper trades against current prices.
+    def check_exits(
+        self,
+        prices: dict[str, float],
+        funding_rates_percent: dict[str, float] | None = None,
+    ) -> list[PaperTradeRecord]:
+        """Check all open paper trades against current prices and funding.
 
         Returns list of trades that were closed in this cycle.
         """
@@ -194,6 +214,9 @@ class PaperTradingEngine:
             price = prices.get(symbol)
             if price is None:
                 continue
+
+            funding_rate = (funding_rates_percent or {}).get(symbol, 0.0)
+            self._apply_funding(trade, funding_rate)
 
             is_long = trade.direction == "LONG"
 
@@ -230,11 +253,7 @@ class PaperTradingEngine:
             # 5. Timeout check (setup expired)
             if result is None:
                 tf_minutes = self._parse_timeframe(trade)
-                max_bars = _ENTRY_TIMEOUT_MAP.get("5m", 12)
-                for tf, bars in _ENTRY_TIMEOUT_MAP.items():
-                    if self._timeframe_matches(trade, tf):
-                        max_bars = bars
-                        break
+                max_bars = _ENTRY_TIMEOUT_MAP.get(trade.entry_timeframe, 12)
                 age_minutes = (datetime.now(timezone.utc) - trade.entered_at).total_seconds() / 60
                 if age_minutes > max_bars * tf_minutes:
                     result = self._close_trade(trade, price, "EXPIRED")
@@ -297,6 +316,41 @@ class PaperTradingEngine:
 
         return None
 
+    def _apply_funding(self, trade: PaperTradeRecord, funding_rate_percent: float) -> None:
+        """Settle completed funding intervals at the current observed funding rate.
+
+        Positive funding means longs pay shorts. The periodic runner supplies the
+        latest rate; settlement is deliberately conservative and only charges
+        whole configured intervals elapsed since entry.
+        """
+        interval_seconds = self.settings.paper_funding_interval_hours * 3600
+        elapsed = (datetime.now(timezone.utc) - trade.entered_at).total_seconds()
+        due_periods = max(0, int(elapsed // interval_seconds))
+        new_periods = due_periods - trade.funding_periods_charged
+        if new_periods <= 0:
+            return
+
+        notional = trade.entry_price * trade.position_size
+        signed_rate = float(funding_rate_percent) / 100.0
+        cost = notional * signed_rate * new_periods
+        if trade.direction == "SHORT":
+            cost = -cost
+        trade.funding_paid += cost
+        trade.funding_periods_charged = due_periods
+        self.balance -= cost
+
+        update_funding = getattr(self.repo, "update_paper_trade_funding", None)
+        if update_funding is not None:
+            update_funding(
+                trade.trade_id,
+                round(trade.funding_paid, 6),
+                trade.funding_periods_charged,
+            )
+        logger.info(
+            "paper funding: %s periods=%d rate=%.6f%% cost=$%.4f",
+            trade.symbol, new_periods, funding_rate_percent, cost,
+        )
+
     def _close_trade(
         self,
         trade: PaperTradeRecord,
@@ -314,9 +368,17 @@ class PaperTradingEngine:
 
         gross_pnl = signed_move * trade.position_size
         exit_fee = adjusted_exit * trade.position_size * self.settings.taker_fee
-        net_pnl = gross_pnl - exit_fee
+        net_pnl = gross_pnl - exit_fee - trade.funding_paid
 
-        self.balance += net_pnl
+        # Funding was debited/credited at each settlement, so do not apply it
+        # a second time to the cash balance at exit.
+        self.balance += gross_pnl - exit_fee
+        net_after_entry_fee = net_pnl - trade.entry_fee
+        if net_after_entry_fee < 0:
+            self._daily_loss_usdt += -net_after_entry_fee
+            self._consecutive_losses += 1
+        else:
+            self._consecutive_losses = 0
 
         # Update drawdown
         if self.balance > self._peak_balance:
@@ -338,6 +400,7 @@ class PaperTradingEngine:
             pnl_r=round(r_multiple, 4),
             pnl_percent=round(pnl_pct, 2),
             slippage=round(abs(adjusted_exit - exit_price) * trade.position_size, 6),
+            funding_paid=round(trade.funding_paid, 6),
             balance_after=round(self.balance, 2),
             duration_sec=round(duration, 1),
         )
@@ -366,16 +429,41 @@ class PaperTradingEngine:
             market_regime=trade.market_regime,
             entered_at=trade.entered_at,
             status="CLOSED",
+            entry_timeframe=trade.entry_timeframe,
             trail_stop=trade.trail_stop,
             highest_since_entry=trade.highest_since_entry,
             lowest_since_entry=trade.lowest_since_entry,
+            funding_paid=trade.funding_paid,
+            funding_periods_charged=trade.funding_periods_charged,
         )
+
+    def _load_account_state(self) -> None:
+        """Restore balance and drawdown from the most recent account snapshot."""
+        get_snapshot = getattr(self.repo, "get_latest_paper_account_snapshot", None)
+        if get_snapshot is None:
+            return
+        snapshot = get_snapshot()
+        if snapshot is None:
+            return
+        self.balance = float(snapshot["balance"])
+        self._max_drawdown = float(snapshot.get("max_drawdown", 0.0))
+        self._peak_balance = self.balance / (1 - self._max_drawdown) if self._max_drawdown < 1 else self.balance
+        self._loaded_account_snapshot = True
+
+    def _load_risk_state(self) -> None:
+        """Restore today's realized loss and current loss streak after restart."""
+        get_state = getattr(self.repo, "get_paper_risk_state", None)
+        if get_state is None:
+            return
+        state = get_state()
+        self._daily_loss_usdt = float(state.get("daily_loss_usdt", 0.0))
+        self._consecutive_losses = int(state.get("consecutive_losses", 0))
 
     def _load_open_trades(self) -> None:
         """Load any existing OPEN paper trades from the DB on startup.
 
-        Reconstructs the correct balance: start from balance_before of the
-        earliest open trade, then subtract entry fees for all open trades.
+        When no account snapshot exists yet, reconstruct balance from the
+        earliest open trade and its entry fees.
         """
         rows = self.repo.get_open_paper_trades()
         for row in rows:
@@ -397,11 +485,14 @@ class PaperTradingEngine:
                 market_regime=row.get("market_regime"),
                 entered_at=row["entered_at"],
                 status="OPEN",
+                entry_timeframe=str(row.get("entry_timeframe", "5m")),
+                funding_paid=float(row.get("funding_paid", 0.0)),
+                funding_periods_charged=int(row.get("funding_periods", 0)),
             )
             self.open_trades[trade.symbol] = trade
 
-        if rows:
-            # Reconstruct balance: use earliest trade's balance_before minus all entry fees
+        if rows and not self._loaded_account_snapshot:
+            # Legacy recovery: use earliest trade's balance_before minus entry fees.
             earliest = min(rows, key=lambda r: r["entered_at"])
             base_balance = float(earliest["balance_before"])
             total_entry_fees = sum(float(r["entry_fee"]) for r in rows)
@@ -412,13 +503,13 @@ class PaperTradingEngine:
             )
 
     def _parse_timeframe(self, trade: PaperTradeRecord) -> int:
-        """Return the number of minutes for a trade's entry timeframe."""
-        # We store entry_timeframe in the setup, approximate from setup context
-        return 5  # default; can be enriched later
-
-    def _timeframe_matches(self, trade: PaperTradeRecord, tf: str) -> bool:
-        """Check if the trade's timeframe matches (simplified)."""
-        return True  # simplified for now
+        """Return the number of minutes for a trade's persisted entry timeframe."""
+        return {
+            "5m": 5,
+            "15m": 15,
+            "1h": 60,
+            "4h": 240,
+        }.get(trade.entry_timeframe, 5)
 
     # ------------------------------------------------------------------
     # SNAPSHOT

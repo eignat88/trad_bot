@@ -97,6 +97,20 @@ def show_reports(*, limit: int = 30, backend: str = "postgres") -> None:
              "avg_r", "avg_r_after_costs", "win_rate_on_entries"],
             cursor.fetchall(),
         )
+
+        # 5. Confluence expectancy
+        cursor.execute(
+            """SELECT scanner_name, direction, confluence_count, samples, entries,
+                      avg_r, avg_r_after_costs, win_rate_on_entries
+               FROM dds.scanner_confluence_expectancy LIMIT %s""",
+            (limit,),
+        )
+        _print_table(
+            "Scanner Confluence Expectancy (min 3 samples)",
+            ["scanner_name", "direction", "confluence_count", "samples", "entries",
+             "avg_r", "avg_r_after_costs", "win_rate_on_entries"],
+            cursor.fetchall(),
+        )
     finally:
         repository.close()
 

@@ -7,7 +7,8 @@
 Status: implemented.
 
 - Scheduled task `BybitScanner`: стартует при включении компьютера.
-- Scheduled task `BybitScannerStop`: останавливает `BybitScanner` в 18:00 по будням, Monday-Friday.
+- Scheduled task `BybitScannerStop`: останавливает `BybitScanner` и `BybitPaperRunner` в 18:00 по будням, Monday-Friday.
+- Scheduled task `BybitPaperRunner`: стартует paper-trading gate при включении компьютера.
 - Runner грузит проектный `config.yaml`/`.env` независимо от текущей working directory.
 - Intermediate tests: scheduler command tests.
 
@@ -76,7 +77,7 @@ Acceptance metrics:
 
 ## Phase 4 — Scanner ranking by expectancy
 
-Status: `dds.scanner_expectancy`, `dds.scanner_symbol_expectancy`, `dds.scanner_regime_expectancy`, and `dds.score_bucket_expectancy` views implemented. CLI report command available via `python -m app.scanners.expectancy_report`. Remaining work: confluence-level grouping and filter-based gating.
+Status: `dds.scanner_expectancy`, `dds.scanner_symbol_expectancy`, `dds.scanner_regime_expectancy`, `dds.score_bucket_expectancy`, and `dds.scanner_confluence_expectancy` views implemented. CLI report command available via `python -m app.scanners.expectancy_report`; it includes confluence-level grouping. Filter-based gating is implemented in the scanner and paper gate.
 
 After outcomes exist, rank signals by measured edge, not raw score.
 
@@ -116,6 +117,8 @@ Status: implemented. `ExpectancyFilter` loads historical R from `dds.scanner_exp
 
 ## Phase 5 — Paper trading gate
 
+Status: core paper gate implemented. `paper_runner.py` and `python -m app.paper.cli run-once` read only recent `READY_TO_TRADE` setups, applies the expectancy filter before entry, validates risk configuration and enforces geometry/position/exposure/daily-loss/loss-streak limits, models fees and slippage, persists and restores trade/account state and entry-timeframe-specific expiry across restarts, and has deterministic entry/exit tests. Creating `data/PAPER_TRADING_STOP` is an emergency kill switch that blocks new paper entries while monitoring exits. It remains a forward-test tool; Funding is settled every configured interval from the latest observed Bybit funding rate and persisted per trade. Live-trading execution remains intentionally out of scope. Use `python -m app.paper.cli readiness` to evaluate the accumulated forward-test data against the explicit live-gate thresholds.
+
 Only after Phase 3-4:
 
 - Paper-execute filtered signals.
@@ -124,6 +127,8 @@ Only after Phase 3-4:
 - Disable live mode until paper forward-test is positive for at least 2-4 weeks.
 
 ## Phase 6 — Live trading gate
+
+Status: `LiveExchange` enforces the persisted paper forward-test thresholds in addition to the explicit live-mode flags, so changing configuration alone cannot bypass the gate.
 
 Live trading stays disabled unless all are true:
 

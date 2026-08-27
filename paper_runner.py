@@ -20,9 +20,9 @@ from app.config import Settings, load_settings
 from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
 from app.paper.engine import PaperTradingEngine
-from app.scanners.expectancy_filter import ExpectancyFilter, load_expectancy
+from app.scanners.expectancy_filter import ExpectancyFilter, filter_candidates, load_expectancy
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 ENV_PATH = PROJECT_ROOT / ".env"
 LOG_DIR = PROJECT_ROOT / "logs"
@@ -73,6 +73,25 @@ def _get_prices(client: BybitClient, symbols: list[str]) -> dict[str, float]:
     return prices
 
 
+def _get_funding_rates(client: BybitClient, symbols: list[str]) -> dict[str, float]:
+    """Fetch the latest realized funding rate percentage for open positions."""
+    rates: dict[str, float] = {}
+    for symbol in symbols:
+        try:
+            rates[symbol] = client.get_funding_rate(symbol)
+        except Exception:
+            logger.exception("failed to fetch funding rate for %s", symbol)
+    return rates
+
+
+def _emergency_stop_requested(settings: Settings) -> bool:
+    """Return True when the operator-created stop file blocks new entries."""
+    stop_file = Path(settings.paper_emergency_stop_file)
+    if not stop_file.is_absolute():
+        stop_file = PROJECT_ROOT / stop_file
+    return stop_file.exists()
+
+
 def _load_ready_setups(repo: ScannerRepository) -> list[dict]:
     """Load READY_TO_TRADE setups directly from DB — no re-scanning."""
     cursor = repo._conn.cursor()
@@ -119,51 +138,67 @@ def run_cycle(
     Does NOT re-scan via Bybit API. Reads READY_TO_TRADE setups from DB
     and only fetches current prices for entry-zone / exit checks.
     """
-    stats = {"exits": 0, "entries": 0, "skipped_no_setup": 0}
+    stats = {"exits": 0, "entries": 0, "skipped_no_setup": 0, "expectancy_rejected": 0, "emergency_stop": 0}
 
     # --- 1. CHECK EXITS (monitor existing open positions) ---
     open_symbols = list(engine.open_trades.keys())
     if open_symbols:
         prices = _get_prices(client, open_symbols)
-        closed = engine.check_exits(prices)
+        funding_rates = _get_funding_rates(client, open_symbols)
+        closed = engine.check_exits(prices, funding_rates)
         stats["exits"] = len(closed)
 
     # --- 2. CHECK ENTRIES (read from DB, fetch prices only) ---
-    try:
-        ready_setups = _load_ready_setups(repo)
-    except Exception:
-        logger.exception("failed to load READY_TO_TRADE setups")
+    if _emergency_stop_requested(settings):
+        stats["emergency_stop"] = 1
+        logger.critical("paper emergency stop is active: new entries are disabled")
         ready_setups = []
+    else:
+        try:
+            ready_setups = _load_ready_setups(repo)
+        except Exception:
+            logger.exception("failed to load READY_TO_TRADE setups")
+            ready_setups = []
 
+    candidates = []
+    all_prices: dict[str, float] = {}
     if not ready_setups:
         stats["skipped_no_setup"] = 1
-        return stats
+    else:
+        # Deduplicate symbols and fetch current entry prices.
+        needed_symbols = list({s["symbol"] for s in ready_setups} | set(engine.open_trades.keys()))
+        all_prices = _get_prices(client, needed_symbols)
 
-    # Deduplicate symbols
-    needed_symbols = list({s["symbol"] for s in ready_setups} | set(engine.open_trades.keys()))
-    all_prices = _get_prices(client, needed_symbols)
+        from app.scanners.models import SetupCandidate
+        candidates = [
+            SetupCandidate(
+                setup_id=s["setup_id"],
+                scanner_name=s["scanner_name"],
+                symbol=s["symbol"],
+                direction=s["direction"],
+                score=s["score"],
+                entry_zone_low=s["entry_zone_low"],
+                entry_zone_high=s["entry_zone_high"],
+                invalidation_price=s["invalidation_price"],
+                target_1=s["target_1"],
+                target_2=s["target_2"],
+                market_regime=s["market_regime"],
+                reference_price=s["reference_price"],
+            )
+            for s in ready_setups
+        ]
 
-    # Convert to SetupCandidate-like objects
-    from app.scanners.models import SetupCandidate
-    candidates = []
-    for s in ready_setups:
-        candidates.append(SetupCandidate(
-            setup_id=s["setup_id"],
-            scanner_name=s["scanner_name"],
-            symbol=s["symbol"],
-            direction=s["direction"],
-            score=s["score"],
-            entry_zone_low=s["entry_zone_low"],
-            entry_zone_high=s["entry_zone_high"],
-            invalidation_price=s["invalidation_price"],
-            target_1=s["target_1"],
-            target_2=s["target_2"],
-            market_regime=s["market_regime"],
-            reference_price=s["reference_price"],
-        ))
+        if expectancy_filter is not None:
+            candidates, rejected = filter_candidates(
+                candidates,
+                expectancy_filter,
+                min_avg_r=settings.expectancy_min_avg_r,
+                min_samples=settings.expectancy_min_samples,
+            )
+            stats["expectancy_rejected"] = rejected
 
-    opened = engine.check_entries(candidates, all_prices)
-    stats["entries"] = len(opened)
+        opened = engine.check_entries(candidates, all_prices)
+        stats["entries"] = len(opened)
 
     # --- 3. EXPIRE OLD SETUPS ---
     try:

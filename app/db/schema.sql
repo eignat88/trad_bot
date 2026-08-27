@@ -312,6 +312,7 @@ DROP VIEW IF EXISTS dds.scanner_expectancy CASCADE;
 DROP VIEW IF EXISTS dds.scanner_symbol_expectancy CASCADE;
 DROP VIEW IF EXISTS dds.scanner_regime_expectancy CASCADE;
 DROP VIEW IF EXISTS dds.score_bucket_expectancy CASCADE;
+DROP VIEW IF EXISTS dds.scanner_confluence_expectancy CASCADE;
 
 CREATE OR REPLACE VIEW dds.scanner_stats AS
 SELECT
@@ -455,6 +456,47 @@ GROUP BY scanner_name, direction, score_bucket
 HAVING COUNT(*) >= 3
 ORDER BY score_bucket, avg_r_after_costs DESC NULLS LAST;
 
+-- Scanner confluence is the number of distinct scanners that detected the
+-- same symbol/direction within the runner's ten-minute conflict window.
+CREATE OR REPLACE VIEW dds.scanner_confluence_expectancy AS
+WITH enriched AS (
+    SELECT
+        o.scanner_name,
+        o.direction,
+        o.entry_touched,
+        o.first_event,
+        o.result_r,
+        o.fee_slippage_adjusted_result_r,
+        (
+            SELECT COUNT(DISTINCT nearby.scanner_name)
+            FROM dds.scanner_setup nearby
+            JOIN dds.instrument nearby_i ON nearby_i.instrument_id = nearby.instrument_id
+            WHERE nearby_i.symbol = o.symbol
+              AND nearby.direction = o.direction
+              AND nearby.detected_at BETWEEN s.detected_at - interval '10 minutes'
+                                          AND s.detected_at + interval '10 minutes'
+        ) AS confluence_count
+    FROM dds.signal_outcome o
+    JOIN dds.scanner_setup s ON s.setup_id = o.setup_id
+)
+SELECT
+    scanner_name,
+    direction,
+    confluence_count,
+    COUNT(*) AS samples,
+    COUNT(*) FILTER (WHERE entry_touched) AS entries,
+    ROUND(AVG(result_r), 4) AS avg_r,
+    ROUND(AVG(fee_slippage_adjusted_result_r), 4) AS avg_r_after_costs,
+    ROUND(
+        (COUNT(*) FILTER (WHERE first_event IN ('TP1', 'TP2')))::numeric
+        / NULLIF(COUNT(*) FILTER (WHERE entry_touched), 0),
+        4
+    ) AS win_rate_on_entries
+FROM enriched
+GROUP BY scanner_name, direction, confluence_count
+HAVING COUNT(*) >= 3
+ORDER BY confluence_count DESC, avg_r_after_costs DESC NULLS LAST;
+
 -- ============================================================
 -- PAPER_TRADE: paper trading gate — simulated positions
 -- ============================================================
@@ -471,6 +513,7 @@ CREATE TABLE IF NOT EXISTS dds.paper_trade (
     stop_price      NUMERIC NOT NULL,
     target_1        NUMERIC,
     target_2        NUMERIC,
+    entry_timeframe TEXT NOT NULL DEFAULT '5m',
     position_size   NUMERIC NOT NULL,
     risk_usdt       NUMERIC NOT NULL,
     -- exit (NULL → still open)
@@ -482,6 +525,8 @@ CREATE TABLE IF NOT EXISTS dds.paper_trade (
     pnl_r           NUMERIC NOT NULL DEFAULT 0,
     pnl_percent     NUMERIC NOT NULL DEFAULT 0,
     slippage        NUMERIC NOT NULL DEFAULT 0,
+    funding_paid    NUMERIC NOT NULL DEFAULT 0,
+    funding_periods INTEGER NOT NULL DEFAULT 0,
     -- status & timestamps
     status          TEXT NOT NULL DEFAULT 'PENDING',
     entered_at      TIMESTAMPTZ,
@@ -505,6 +550,13 @@ CREATE TABLE IF NOT EXISTS dds.paper_trade (
         )
     )
 );
+
+ALTER TABLE dds.paper_trade
+    ADD COLUMN IF NOT EXISTS entry_timeframe TEXT NOT NULL DEFAULT '5m';
+ALTER TABLE dds.paper_trade
+    ADD COLUMN IF NOT EXISTS funding_paid NUMERIC NOT NULL DEFAULT 0;
+ALTER TABLE dds.paper_trade
+    ADD COLUMN IF NOT EXISTS funding_periods INTEGER NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_paper_trade_status ON dds.paper_trade (status);
 CREATE INDEX IF NOT EXISTS idx_paper_trade_symbol ON dds.paper_trade (symbol, status);

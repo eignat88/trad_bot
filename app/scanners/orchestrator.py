@@ -66,8 +66,11 @@ class ScannerOrchestrator:
         ctx: MarketContext,
         expectancy_filter: ExpectancyFilter | None = None,
         min_avg_r: float = 0.0,
+        min_samples: int = 10,
     ) -> list[SetupCandidate]:
-        candidates, _ = self.scan_all_with_stats(ctx, expectancy_filter, min_avg_r)
+        candidates, _ = self.scan_all_with_stats(
+            ctx, expectancy_filter, min_avg_r, min_samples,
+        )
         return candidates
 
     def scan_all_with_stats(
@@ -75,6 +78,7 @@ class ScannerOrchestrator:
         ctx: MarketContext,
         expectancy_filter: ExpectancyFilter | None = None,
         min_avg_r: float = 0.0,
+        min_samples: int = 10,
     ) -> tuple[list[SetupCandidate], dict[str, dict[str, int | float]]]:
         """Run every configured scanner and return per-scanner observability data."""
         self.scan_count += 1
@@ -127,7 +131,10 @@ class ScannerOrchestrator:
         expectancy_rejected = 0
         if expectancy_filter is not None:
             valid, expectancy_rejected = filter_candidates(
-                valid, expectancy_filter, min_avg_r=min_avg_r,
+                valid,
+                expectancy_filter,
+                min_avg_r=min_avg_r,
+                min_samples=min_samples,
             )
 
         if valid:

@@ -77,6 +77,12 @@ class Settings:
     expectancy_filter_enabled: bool = False
     expectancy_min_avg_r: float = 0.0
     expectancy_min_samples: int = 10
+    # Live gate thresholds measured from persisted forward paper trading.
+    paper_min_forward_days: int = 14
+    paper_min_closed_trades: int = 30
+    paper_max_drawdown: float = 0.10
+    paper_funding_interval_hours: int = 8
+    paper_emergency_stop_file: str = "data/PAPER_TRADING_STOP"
 
 
 def _load_dotenv(path: Path) -> None:
@@ -131,6 +137,26 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         raise ValueError("Bybit timeout and max attempts must be positive")
     if settings.bybit_retry_backoff < 0:
         raise ValueError("bybit_retry_backoff cannot be negative")
+    if settings.initial_balance <= 0:
+        raise ValueError("initial_balance must be positive")
+    if not 0 < settings.risk_per_trade <= 1:
+        raise ValueError("risk_per_trade must be in (0, 1]")
+    if settings.max_open_positions <= 0 or settings.max_consecutive_losses <= 0:
+        raise ValueError("paper position and loss-streak limits must be positive")
+    if not 0 < settings.max_daily_loss < 1:
+        raise ValueError("max_daily_loss must be in (0, 1)")
+    if not 0 < settings.max_symbol_exposure <= 1:
+        raise ValueError("max_symbol_exposure must be in (0, 1]")
+    if any(value < 0 for value in (settings.maker_fee, settings.taker_fee, settings.slippage_percent)):
+        raise ValueError("paper fees and slippage cannot be negative")
+    if settings.atr_stop_multiple <= 0:
+        raise ValueError("atr_stop_multiple must be positive")
+    if settings.paper_min_forward_days <= 0 or settings.paper_min_closed_trades <= 0:
+        raise ValueError("paper forward-test thresholds must be positive")
+    if not 0 < settings.paper_max_drawdown < 1:
+        raise ValueError("paper_max_drawdown must be in (0, 1)")
+    if settings.paper_funding_interval_hours <= 0:
+        raise ValueError("paper_funding_interval_hours must be positive")
     if (settings.scanner_workers <= 0 or settings.scan_interval <= 0
             or settings.signal_conflict_window <= 0):
         raise ValueError("scanner workers and interval must be positive")

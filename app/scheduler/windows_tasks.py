@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 START_TASK_NAME = "BybitScanner"
+PAPER_TASK_NAME = "BybitPaperRunner"
 STOP_TASK_NAME = "BybitScannerStop"
 OUTCOME_TASK_NAME = "BybitScannerOutcomeBackfill"
 STOP_TIME = "18:00"
@@ -20,6 +21,24 @@ def project_root() -> Path:
 
 def scheduled_launcher(root: Path | None = None) -> Path:
     return (root or project_root()) / "run_scanner_task.bat"
+
+
+def paper_launcher(root: Path | None = None) -> Path:
+    return (root or project_root()) / "run_paper_task.bat"
+
+
+def build_paper_task_command(*, root: Path | None = None) -> list[str]:
+    """Return a schtasks command that starts the paper gate on computer startup."""
+    launcher = paper_launcher(root)
+    return [
+        "schtasks", "/Create",
+        "/TN", PAPER_TASK_NAME,
+        "/TR", f'cmd.exe /c "{launcher}"',
+        "/SC", "ONSTART",
+        "/RU", "SYSTEM",
+        "/RL", "HIGHEST",
+        "/F",
+    ]
 
 
 def stop_launcher(root: Path | None = None) -> Path:
@@ -81,12 +100,13 @@ def _run(command: list[str]) -> None:
 def install_tasks(*, root: Path | None = None) -> None:
     root = root or project_root()
     _run(build_start_task_command(root=root))
+    _run(build_paper_task_command(root=root))
     _run(build_stop_task_command(root=root))
     _run(build_outcome_task_command(root=root))
 
 
 def uninstall_tasks() -> None:
-    for task_name in (OUTCOME_TASK_NAME, STOP_TASK_NAME, START_TASK_NAME):
+    for task_name in (OUTCOME_TASK_NAME, STOP_TASK_NAME, PAPER_TASK_NAME, START_TASK_NAME):
         subprocess.run(["schtasks", "/Delete", "/TN", task_name, "/F"], check=False)
 
 
@@ -99,13 +119,13 @@ def main() -> None:
     if args.action == "install":
         install_tasks(root=args.root)
         print(
-            f"Installed tasks: {START_TASK_NAME} on startup, "
+            f"Installed tasks: {START_TASK_NAME} and {PAPER_TASK_NAME} on startup, "
             f"{STOP_TASK_NAME} weekdays at {STOP_TIME}, "
             f"{OUTCOME_TASK_NAME} every {OUTCOME_INTERVAL_MINUTES} minutes from {OUTCOME_START_TIME}"
         )
     else:
         uninstall_tasks()
-        print(f"Deleted tasks if present: {START_TASK_NAME}, {STOP_TASK_NAME}, {OUTCOME_TASK_NAME}")
+        print(f"Deleted tasks if present: {START_TASK_NAME}, {PAPER_TASK_NAME}, {STOP_TASK_NAME}, {OUTCOME_TASK_NAME}")
 
 
 if __name__ == "__main__":

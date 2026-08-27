@@ -799,10 +799,10 @@ class ScannerRepository:
                 INSERT INTO dds.paper_trade (
                     setup_id, symbol, scanner_name, direction, score,
                     entry_price, entry_fee, stop_price, target_1, target_2,
-                    position_size, risk_usdt, balance_before, market_regime,
+                    entry_timeframe, position_size, risk_usdt, balance_before, market_regime,
                     status, entered_at
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     'OPEN', %s
                 ) RETURNING trade_id
                 """,
@@ -810,7 +810,8 @@ class ScannerRepository:
                     trade.setup_id, trade.symbol, trade.scanner_name,
                     trade.direction, trade.score, trade.entry_price,
                     trade.entry_fee, trade.stop_price, trade.target_1,
-                    trade.target_2, trade.position_size, trade.risk_usdt,
+                    trade.target_2, trade.entry_timeframe, trade.position_size,
+                    trade.risk_usdt,
                     trade.balance_before, trade.market_regime, trade.entered_at,
                 ),
             )
@@ -832,6 +833,7 @@ class ScannerRepository:
         pnl_r: float,
         pnl_percent: float,
         slippage: float,
+        funding_paid: float,
         balance_after: float,
         duration_sec: float,
     ) -> None:
@@ -850,6 +852,7 @@ class ScannerRepository:
                     pnl_r = %s,
                     pnl_percent = %s,
                     slippage = %s,
+                    funding_paid = %s,
                     balance_after = %s,
                     duration_sec = %s,
                     status = 'CLOSED',
@@ -859,7 +862,7 @@ class ScannerRepository:
                 """,
                 (
                     exit_price, exit_reason, exit_fee, pnl_usdt,
-                    pnl_r, pnl_percent, slippage, balance_after,
+                    pnl_r, pnl_percent, slippage, funding_paid, balance_after,
                     duration_sec, trade_id,
                 ),
             )
@@ -867,6 +870,28 @@ class ScannerRepository:
         except Exception:
             self._conn.rollback()
             logger.exception("close_paper_trade failed for trade_id=%s", trade_id)
+            raise
+
+    def update_paper_trade_funding(
+        self, trade_id: int | None, funding_paid: float, funding_periods: int,
+    ) -> None:
+        """Persist accumulated funding for an open paper position."""
+        if not self._use_pg or trade_id is None:
+            return
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(
+                """
+                UPDATE dds.paper_trade
+                SET funding_paid = %s, funding_periods = %s, updated_at = now()
+                WHERE trade_id = %s AND status = 'OPEN'
+                """,
+                (funding_paid, funding_periods, trade_id),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            logger.exception("update_paper_trade_funding failed for trade_id=%s", trade_id)
             raise
 
     def get_open_paper_trades(self) -> list[dict]:
@@ -878,8 +903,8 @@ class ScannerRepository:
             """
             SELECT trade_id, setup_id, symbol, scanner_name, direction, score,
                    entry_price, entry_fee, stop_price, target_1, target_2,
-                   position_size, risk_usdt, balance_before, market_regime,
-                   entered_at
+                   entry_timeframe, position_size, risk_usdt, balance_before, market_regime,
+                   funding_paid, funding_periods, entered_at
             FROM dds.paper_trade
             WHERE status = 'OPEN'
             ORDER BY entered_at DESC
@@ -894,10 +919,13 @@ class ScannerRepository:
                 "stop_price": float(r[8]),
                 "target_1": float(r[9]) if r[9] is not None else None,
                 "target_2": float(r[10]) if r[10] is not None else None,
-                "position_size": float(r[11]), "risk_usdt": float(r[12]),
-                "balance_before": float(r[13]),
-                "market_regime": r[14],
-                "entered_at": r[15],
+                "entry_timeframe": r[11],
+                "position_size": float(r[12]), "risk_usdt": float(r[13]),
+                "balance_before": float(r[14]),
+                "market_regime": r[15],
+                "funding_paid": float(r[16] or 0),
+                "funding_periods": int(r[17] or 0),
+                "entered_at": r[18],
             }
             for r in rows
         ]
@@ -932,6 +960,90 @@ class ScannerRepository:
         rows = cursor.fetchall()
         cols = [d[0] for d in cursor.description] if cursor.description else []
         return [dict(zip(cols, r)) for r in rows]
+
+    def get_paper_forward_summary(self) -> dict[str, float | int]:
+        """Summarize persisted paper performance for the live-gate readiness check."""
+        if not self._use_pg:
+            return {
+                "forward_days": 0.0, "closed_trades": 0,
+                "net_pnl_usdt": 0.0, "max_drawdown": 0.0,
+            }
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                COALESCE(
+                    EXTRACT(EPOCH FROM (now() - MIN(entered_at))) / 86400.0,
+                    0
+                ) AS forward_days,
+                COUNT(*) FILTER (WHERE status = 'CLOSED') AS closed_trades,
+                COALESCE(
+                    SUM(pnl_usdt - entry_fee) FILTER (WHERE status = 'CLOSED'),
+                    0
+                ) AS net_pnl_usdt
+            FROM dds.paper_trade
+            """
+        )
+        forward_days, closed_trades, net_pnl_usdt = cursor.fetchone()
+        cursor.execute("SELECT COALESCE(MAX(max_drawdown), 0) FROM dds.paper_account")
+        max_drawdown = cursor.fetchone()[0]
+        return {
+            "forward_days": float(forward_days or 0),
+            "closed_trades": int(closed_trades or 0),
+            "net_pnl_usdt": float(net_pnl_usdt or 0),
+            "max_drawdown": float(max_drawdown or 0),
+        }
+
+    def get_latest_paper_account_snapshot(self) -> dict[str, float] | None:
+        """Load the most recent persisted paper-account state for restart recovery."""
+        if not self._use_pg:
+            return None
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT balance, equity, max_drawdown
+            FROM dds.paper_account
+            ORDER BY created_at DESC, snapshot_id DESC
+            LIMIT 1
+            """
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "balance": float(row[0]),
+            "equity": float(row[1]),
+            "max_drawdown": float(row[2]),
+        }
+
+    def get_paper_risk_state(self) -> dict[str, int | float]:
+        """Return today's realized loss and the current consecutive-loss streak."""
+        if not self._use_pg:
+            return {"daily_loss_usdt": 0.0, "consecutive_losses": 0}
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT pnl_usdt, entry_fee
+            FROM dds.paper_trade
+            WHERE status = 'CLOSED'
+              AND closed_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
+            ORDER BY closed_at DESC
+            """
+        )
+        rows = cursor.fetchall()
+        daily_loss = sum(
+            max(0.0, -(float(pnl or 0) - float(entry_fee or 0)))
+            for pnl, entry_fee in rows
+        )
+        consecutive_losses = 0
+        for pnl, entry_fee in rows:
+            if float(pnl or 0) - float(entry_fee or 0) >= 0:
+                break
+            consecutive_losses += 1
+        return {
+            "daily_loss_usdt": daily_loss,
+            "consecutive_losses": consecutive_losses,
+        }
 
     def save_paper_account_snapshot(
         self,

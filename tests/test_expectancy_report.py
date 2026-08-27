@@ -37,11 +37,11 @@ class TestExpectancyViewsExist:
             cursor.execute(
                 "SELECT table_name FROM information_schema.views "
                 "WHERE table_schema='dds' AND table_name IN "
-                "('scanner_expectancy','scanner_symbol_expectancy','scanner_regime_expectancy','score_bucket_expectancy') "
+                "('scanner_expectancy','scanner_symbol_expectancy','scanner_regime_expectancy','score_bucket_expectancy','scanner_confluence_expectancy') "
                 "ORDER BY table_name"
             )
             views = [row[0] for row in cursor.fetchall()]
-            assert len(views) == 4
+            assert len(views) == 5
             assert "scanner_expectancy" in views
             assert "scanner_symbol_expectancy" in views
             assert "scanner_regime_expectancy" in views

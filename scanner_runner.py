@@ -145,11 +145,15 @@ def run_scan_cycle(
                 continue
 
             try:
-                candidates, symbol_stats = orchestrator.scan_all_with_stats(
-                    ctx,
-                    expectancy_filter=expectancy_filter if settings.expectancy_filter_enabled else None,
-                    min_avg_r=min_avg_r,
-                )
+                if settings.expectancy_filter_enabled:
+                    candidates, symbol_stats = orchestrator.scan_all_with_stats(
+                        ctx,
+                        expectancy_filter=expectancy_filter,
+                        min_avg_r=min_avg_r,
+                        min_samples=settings.expectancy_min_samples,
+                    )
+                else:
+                    candidates, symbol_stats = orchestrator.scan_all_with_stats(ctx)
                 for name, values in symbol_stats.items():
                     stat = run_stats[name]
                     stat["symbols_scanned"] += 1

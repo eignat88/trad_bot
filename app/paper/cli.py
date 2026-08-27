@@ -12,15 +12,17 @@ import argparse
 import json
 import logging
 import sys
+from pathlib import Path
 from datetime import datetime, timezone
 
 from app.config import Settings, load_settings
 from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
 from app.paper.engine import PaperTradingEngine
+from app.paper.readiness import assess_readiness
 from app.scanners.context_builder import build_market_context
 from app.scanners.orchestrator import ScannerOrchestrator
-from app.scanners.expectancy_filter import ExpectancyFilter, load_expectancy
+from app.scanners.expectancy_filter import filter_candidates, load_expectancy
 
 logger = logging.getLogger("paper_cli")
 
@@ -29,6 +31,13 @@ def _load_settings() -> Settings:
     from pathlib import Path
     root = Path(__file__).resolve().parent.parent.parent
     return load_settings(path=root / "config.yaml", env_file=root / ".env")
+
+
+def _emergency_stop_requested(settings: Settings) -> bool:
+    stop_file = Path(settings.paper_emergency_stop_file)
+    if not stop_file.is_absolute():
+        stop_file = Path(__file__).resolve().parent.parent.parent / stop_file
+    return stop_file.exists()
 
 
 def _get_repo() -> ScannerRepository:
@@ -46,6 +55,16 @@ def _get_prices(client: BybitClient, symbols: list[str]) -> dict[str, float]:
             except (KeyError, TypeError, ValueError):
                 pass
     return prices
+
+
+def _get_funding_rates(client: BybitClient, symbols: list[str]) -> dict[str, float]:
+    rates: dict[str, float] = {}
+    for symbol in symbols:
+        try:
+            rates[symbol] = client.get_funding_rate(symbol)
+        except Exception:
+            logger.exception("failed to fetch funding rate for %s", symbol)
+    return rates
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -87,6 +106,23 @@ def cmd_status(args: argparse.Namespace) -> None:
 
     print()
     repo.close()
+
+
+def cmd_readiness(args: argparse.Namespace) -> None:
+    """Show whether accumulated paper results satisfy the live-gate thresholds."""
+    repo = _get_repo()
+    try:
+        readiness = assess_readiness(repo.get_paper_forward_summary(), _load_settings())
+        print("\nPAPER FORWARD-TEST READINESS")
+        print(f"  Forward days:  {readiness.forward_days:.1f}")
+        print(f"  Closed trades: {readiness.closed_trades}")
+        print(f"  Net P&L:       ${readiness.net_pnl_usdt:+,.2f}")
+        print(f"  Max drawdown:  {readiness.max_drawdown:.2%}")
+        print(f"  Eligible:      {'YES' if readiness.eligible else 'NO'}")
+        for reason in readiness.failed_checks:
+            print(f"  - {reason}")
+    finally:
+        repo.close()
 
 
 def cmd_trades(args: argparse.Namespace) -> None:
@@ -203,12 +239,14 @@ def cmd_run_once(args: argparse.Namespace) -> None:
     open_symbols = list(engine.open_trades.keys())
     if open_symbols:
         prices = _get_prices(client, open_symbols)
-        closed = engine.check_exits(prices)
+        closed = engine.check_exits(prices, _get_funding_rates(client, open_symbols))
         if closed:
             logger.info("paper: %d trades closed this cycle", len(closed))
 
     # --- 2. CHECK ENTRIES (read READY_TO_TRADE from DB, fetch prices only) ---
-    ready_setups = _load_ready_setups(repo)
+    ready_setups = [] if _emergency_stop_requested(settings) else _load_ready_setups(repo)
+    if _emergency_stop_requested(settings):
+        logger.critical("paper emergency stop is active: new entries are disabled")
     if not ready_setups:
         logger.info("no READY_TO_TRADE setups found")
     else:
@@ -237,6 +275,17 @@ def cmd_run_once(args: argparse.Namespace) -> None:
                 reference_price=s["reference_price"],
             )
             candidates.append(c)
+
+        if settings.expectancy_filter_enabled:
+            expectancy = load_expectancy(repo)
+            candidates, rejected = filter_candidates(
+                candidates,
+                expectancy,
+                min_avg_r=settings.expectancy_min_avg_r,
+                min_samples=settings.expectancy_min_samples,
+            )
+            if rejected:
+                logger.info("paper: expectancy filter rejected %d setups", rejected)
 
         opened = engine.check_entries(candidates, prices)
         if opened:
@@ -279,6 +328,7 @@ def main() -> None:
     sub.add_parser("status", help="Show account status and open trades")
     sub.add_parser("trades", help="List closed paper trades")
     sub.add_parser("stats", help="Aggregated stats by scanner")
+    sub.add_parser("readiness", help="Check forward paper results against the live gate")
     sub.add_parser("run-once", help="Run one entry/exit cycle")
 
     # trades --limit N
@@ -297,6 +347,8 @@ def main() -> None:
         cmd_trades(args)
     elif args.command == "stats":
         cmd_stats(args)
+    elif args.command == "readiness":
+        cmd_readiness(args)
     elif args.command == "run-once":
         cmd_run_once(args)
     else:

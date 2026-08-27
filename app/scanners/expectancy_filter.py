@@ -38,11 +38,18 @@ class ExpectancyFilter:
 
     records: dict[tuple[str, str], ExpectancyRecord] = field(default_factory=dict)
 
-    def is_profitable(self, scanner_name: str, direction: str, *, min_avg_r: float = 0.0) -> bool:
+    def is_profitable(
+        self,
+        scanner_name: str,
+        direction: str,
+        *,
+        min_avg_r: float = 0.0,
+        min_samples: int = DEFAULT_MIN_SAMPLES,
+    ) -> bool:
         """Return True if the combination is allowed (no data = allowed)."""
         key = (scanner_name, direction)
         rec = self.records.get(key)
-        if rec is None or rec.samples < DEFAULT_MIN_SAMPLES:
+        if rec is None or rec.samples < min_samples:
             return True  # insufficient data → allow
         return rec.avg_r_after_costs >= min_avg_r
 
@@ -89,6 +96,7 @@ def filter_candidates(
     expectancy: ExpectancyFilter,
     *,
     min_avg_r: float = 0.0,
+    min_samples: int = DEFAULT_MIN_SAMPLES,
 ) -> tuple[list[SetupCandidate], int]:
     """Filter candidates by historical expectancy.
 
@@ -97,7 +105,12 @@ def filter_candidates(
     accepted: list[SetupCandidate] = []
     rejected = 0
     for c in candidates:
-        if expectancy.is_profitable(c.scanner_name, c.direction, min_avg_r=min_avg_r):
+        if expectancy.is_profitable(
+            c.scanner_name,
+            c.direction,
+            min_avg_r=min_avg_r,
+            min_samples=min_samples,
+        ):
             accepted.append(c)
         else:
             rejected += 1
