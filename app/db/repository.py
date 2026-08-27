@@ -172,6 +172,38 @@ class ScannerRepository:
         cursor.execute("SELECT pg_try_advisory_lock(%s)", (lock_id,))
         return bool(cursor.fetchone()[0])
 
+    def cleanup_stale_advisory_lock(self, lock_id: int = 1_937_261) -> int:
+        """Terminate idle backends holding *lock_id* so the new scanner can start.
+
+        Returns the number of backends terminated.
+        """
+        if not self._use_pg:
+            return 0
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT l.pid
+              FROM pg_locks l
+              JOIN pg_stat_activity a ON a.pid = l.pid
+             WHERE l.locktype = 'advisory'
+               AND l.objid = %s
+               AND l.granted
+               AND a.state = 'idle'
+            """,
+            (lock_id,),
+        )
+        stale_pids = [row[0] for row in cursor.fetchall()]
+        killed = 0
+        for pid in stale_pids:
+            try:
+                cursor.execute("SELECT pg_terminate_backend(%s)", (pid,))
+                killed += 1
+            except Exception:
+                pass
+        if killed:
+            self._conn.commit()
+        return killed
+
     def abort_stale_runs(self, stale_minutes: int = 10) -> int:
         if not self._use_pg:
             return 0

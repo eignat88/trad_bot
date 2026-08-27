@@ -210,8 +210,20 @@ def main() -> None:
     repository.ensure_schema()
 
     if not repository.acquire_runner_lock():
-        repository.close()
-        raise SystemExit("scanner runner already active")
+        # Try to clear stale idle backends holding the advisory lock
+        killed = repository.cleanup_stale_advisory_lock()
+        if killed:
+            logger.warning("cleaned up %d stale advisory lock holder(s)", killed)
+            if not repository.acquire_runner_lock():
+                logger.error("scanner runner lock still held after cleanup")
+                repository.close()
+                raise SystemExit("scanner runner already active")
+        else:
+            logger.error(
+                "scanner runner lock held by active process — terminating"
+            )
+            repository.close()
+            raise SystemExit("scanner runner already active")
     repository.abort_stale_runs()
 
     orchestrator = ScannerOrchestrator(repository=repository)
