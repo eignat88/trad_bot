@@ -283,6 +283,7 @@ def cmd_run_once(args: argparse.Namespace) -> None:
                 expectancy,
                 min_avg_r=settings.expectancy_min_avg_r,
                 min_samples=settings.expectancy_min_samples,
+                blocked_combinations=frozenset(settings.blocked_scanner_directions),
             )
             if rejected:
                 logger.info("paper: expectancy filter rejected %d setups", rejected)

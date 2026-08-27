@@ -151,6 +151,7 @@ def run_scan_cycle(
                         expectancy_filter=expectancy_filter,
                         min_avg_r=min_avg_r,
                         min_samples=settings.expectancy_min_samples,
+                        blocked_combinations=frozenset(settings.blocked_scanner_directions),
                     )
                 else:
                     candidates, symbol_stats = orchestrator.scan_all_with_stats(ctx)
@@ -260,12 +261,28 @@ def main() -> None:
         cycle += 1
         start = time.monotonic()
 
-        # Start a new run
-        run_id = repository.start_run(
-            symbols_total=len(symbols),
-            universe_mode=settings.scanner_universe.mode,
-        )
-        repository.save_run_universe(run_id, universe)
+        # Start a new run (reconnect if DB connection dropped)
+        try:
+            run_id = repository.start_run(
+                symbols_total=len(symbols),
+                universe_mode=settings.scanner_universe.mode,
+            )
+            repository.save_run_universe(run_id, universe)
+        except Exception:
+            logger.warning("DB error starting run, attempting reconnect")
+            if repository.reconnect():
+                try:
+                    run_id = repository.start_run(
+                        symbols_total=len(symbols),
+                        universe_mode=settings.scanner_universe.mode,
+                    )
+                    repository.save_run_universe(run_id, universe)
+                except Exception:
+                    logger.exception("run start failed after reconnect")
+                    run_id = None
+            else:
+                logger.error("reconnect failed, skipping cycle")
+                run_id = None
 
         try:
             total, scanned, failed = run_scan_cycle(
@@ -306,9 +323,13 @@ def main() -> None:
         except Exception:
             logger.exception("cycle #%d failed", cycle)
             if run_id:
-                repository.finish_run(
-                    run_id, status="FAILED", error_count=1,
-                )
+                try:
+                    repository.finish_run(
+                        run_id, status="FAILED", error_count=1,
+                    )
+                except Exception:
+                    logger.warning("could not record failed run status")
+                    repository.reconnect()
 
         # Sleep in small intervals to respond to shutdown
         delay = seconds_until_next_cycle(

@@ -97,14 +97,24 @@ def filter_candidates(
     *,
     min_avg_r: float = 0.0,
     min_samples: int = DEFAULT_MIN_SAMPLES,
+    blocked_combinations: frozenset[tuple[str, str]] = frozenset(),
 ) -> tuple[list[SetupCandidate], int]:
-    """Filter candidates by historical expectancy.
+    """Filter candidates by manual blocks and historical expectancy.
 
-    Returns (accepted, rejected_count).
+    ``blocked_combinations`` rejects a scanner/direction pair regardless of its
+    historical sample count. Returns (accepted, rejected_count).
     """
     accepted: list[SetupCandidate] = []
     rejected = 0
     for c in candidates:
+        combination = (c.scanner_name.upper(), c.direction.upper())
+        if combination in blocked_combinations:
+            rejected += 1
+            logger.info(
+                "signal block rejected: %s %s %s (reason: MANUAL_BLOCK)",
+                c.symbol, c.scanner_name, c.direction,
+            )
+            continue
         if expectancy.is_profitable(
             c.scanner_name,
             c.direction,

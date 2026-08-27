@@ -194,6 +194,7 @@ def run_cycle(
                 expectancy_filter,
                 min_avg_r=settings.expectancy_min_avg_r,
                 min_samples=settings.expectancy_min_samples,
+                blocked_combinations=frozenset(settings.blocked_scanner_directions),
             )
             stats["expectancy_rejected"] = rejected
 
@@ -265,6 +266,18 @@ def main() -> None:
         cycle += 1
         start = time.monotonic()
 
+        # Keepalive ping to prevent idle connection timeout
+        if not repo.ping():
+            logger.warning("DB ping failed, attempting reconnect")
+            if repo.reconnect():
+                logger.info("paper runner reconnected to PostgreSQL")
+                if settings.expectancy_filter_enabled:
+                    expectancy_filter = load_expectancy(repo)
+            else:
+                logger.error("reconnect failed, will retry next cycle")
+                time.sleep(5)
+                continue
+
         try:
             stats = run_cycle(engine, client, repo, expectancy_filter, settings)
             logger.info(
@@ -274,6 +287,11 @@ def main() -> None:
             )
         except Exception:
             logger.exception("cycle #%d failed", cycle)
+            # Attempt reconnect after DB connection drop
+            if repo.reconnect():
+                logger.info("paper runner reconnected to PostgreSQL")
+                if settings.expectancy_filter_enabled:
+                    expectancy_filter = load_expectancy(repo)
 
         # Sleep in small intervals to respond to shutdown
         delay = max(0, interval - (time.monotonic() - start))

@@ -67,9 +67,10 @@ class ScannerOrchestrator:
         expectancy_filter: ExpectancyFilter | None = None,
         min_avg_r: float = 0.0,
         min_samples: int = 10,
+        blocked_combinations: frozenset[tuple[str, str]] = frozenset(),
     ) -> list[SetupCandidate]:
         candidates, _ = self.scan_all_with_stats(
-            ctx, expectancy_filter, min_avg_r, min_samples,
+            ctx, expectancy_filter, min_avg_r, min_samples, blocked_combinations,
         )
         return candidates
 
@@ -79,6 +80,7 @@ class ScannerOrchestrator:
         expectancy_filter: ExpectancyFilter | None = None,
         min_avg_r: float = 0.0,
         min_samples: int = 10,
+        blocked_combinations: frozenset[tuple[str, str]] = frozenset(),
     ) -> tuple[list[SetupCandidate], dict[str, dict[str, int | float]]]:
         """Run every configured scanner and return per-scanner observability data."""
         self.scan_count += 1
@@ -135,6 +137,7 @@ class ScannerOrchestrator:
                 expectancy_filter,
                 min_avg_r=min_avg_r,
                 min_samples=min_samples,
+                blocked_combinations=blocked_combinations,
             )
 
         if valid:
