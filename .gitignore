@@ -10,4 +10,7 @@ logs/
 logs/
 .npm-cache/
 artifacts/
+*.dump
+*.backup
+artifacts/db_backup/
 docs/VPS_DEPLOY.md
