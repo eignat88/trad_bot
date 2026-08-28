@@ -94,6 +94,7 @@ echo "Step 3: Restoring dump..."
 RESTORE_LOG=$(mktemp)
 RESTORE_EXIT=0
 sudo -u postgres pg_restore \
+    --role="$DB_USER" \
     --clean \
     --if-exists \
     --no-owner \
@@ -111,6 +112,7 @@ if [ "$RESTORE_EXIT" -ne 0 ]; then
         echo "Rolling back: restoring backup..."
         ROLLBACK_EXIT=0
         sudo -u postgres pg_restore \
+            --role="$DB_USER" \
             --clean --if-exists --no-owner --no-privileges \
             -d "$DB_NAME" "$BACKUP_FILE" 2>&1 || ROLLBACK_EXIT=$?
         if [ "$ROLLBACK_EXIT" -ne 0 ]; then
@@ -151,16 +153,7 @@ if ! sudo -u postgres psql -d "$DB_NAME" -c \
     exit 4
 fi
 
-# 4c. Reassign all objects owned by postgres in this database to trad_bot.
-#     This covers tables, sequences, views, functions, and any other
-#     object types that pg_restore created under the postgres role.
-if ! sudo -u postgres psql -d "$DB_NAME" -c \
-    "REASSIGN OWNED BY postgres TO $DB_USER;" 2>&1; then
-    echo "ERROR: Failed to reassign owned objects to $DB_USER."
-    exit 4
-fi
-
-# 4d. Grant schema-level and default privileges
+# 4c. Grant schema-level and default privileges
 if ! sudo -u postgres psql -d "$DB_NAME" -c "
     GRANT ALL ON SCHEMA dds TO $DB_USER;
     GRANT ALL ON ALL TABLES IN SCHEMA dds TO $DB_USER;
