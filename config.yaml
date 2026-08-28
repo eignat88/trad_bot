@@ -33,6 +33,11 @@
   "capitulation": {"price_change_max": -8.0, "oi_change_max": -15.0, "volume_ratio_min": 2.0, "oi_stabilization_min": -2.0},
   "expectancy_filter_enabled": true,
   "expectancy_min_avg_r": 0.0,
-  "blocked_scanner_directions": [["BREAKOUT_RETEST", "SHORT"]],
-  "expectancy_min_samples": 10
+  "blocked_scanner_directions": [
+    ["VOLATILITY_COMPRESSION", "SHORT"],
+    ["BREAKOUT_RETEST", "SHORT"],
+    ["BREAKOUT_RETEST", "LONG"],
+    ["MOMENTUM_EXHAUSTION", "LONG"]
+  ],
+  "expectancy_min_samples": 30
 }
