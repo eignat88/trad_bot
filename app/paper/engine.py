@@ -19,12 +19,13 @@ from app.scanners.models import SetupCandidate
 
 logger = logging.getLogger(__name__)
 
-# Maximum bars (in entry_timeframe units) to keep a setup alive before expiry.
-_ENTRY_TIMEOUT_MAP = {
-    "5m": 12,   # 1 hour
-    "15m": 8,   # 2 hours
-    "1h": 6,    # 6 hours
-    "4h": 4,    # 16 hours
+# Base maximum bars (in entry_timeframe units) to keep a setup alive before expiry.
+# Actual timeout = base * setup_ttl_multiplier (default 2.0).
+_ENTRY_TIMEOUT_BASE = {
+    "5m": 12,   # 1 hour base → 2 hours at 2x
+    "15m": 8,   # 2 hours base → 4 hours at 2x
+    "1h": 6,    # 6 hours base → 12 hours at 2x
+    "4h": 4,    # 16 hours base → 32 hours at 2x
 }
 
 
@@ -158,6 +159,17 @@ class PaperTradingEngine:
                 logger.warning("paper gate: consecutive loss limit reached, skipping new entries")
                 break
 
+            # Market regime filter: reject entries that fight the dominant trend.
+            if self.settings.regime_filter_enabled and c.market_regime:
+                regime = c.market_regime
+                if (c.direction == "LONG" and regime == "TREND_DOWN") or \
+                   (c.direction == "SHORT" and regime == "TREND_UP"):
+                    logger.info(
+                        "paper regime filter: rejecting %s %s in %s",
+                        c.symbol, c.direction, regime,
+                    )
+                    continue
+
             # Entry zone check: price must be within [entry_zone_low, entry_zone_high]
             entry_low = c.entry_zone_low
             entry_high = c.entry_zone_high
@@ -280,7 +292,9 @@ class PaperTradingEngine:
             # executable price: do not turn it into a stop/target fill at an
             # earlier historical level.
             if self._is_expired(trade):
-                closed.append(self._close_trade(trade, price, "EXPIRED"))
+                gross = self._unrealized_gross(trade, price)
+                reason = "EXPIRED_PROFITABLE" if gross > 0 else "EXPIRED"
+                closed.append(self._close_trade(trade, price, reason))
                 to_remove.append(symbol)
                 continue
 
@@ -335,7 +349,9 @@ class PaperTradingEngine:
 
             # 5. Timeout check (setup expired)
             if result is None and self._is_expired(trade):
-                result = self._close_trade(trade, price, "EXPIRED")
+                gross = self._unrealized_gross(trade, price)
+                reason = "EXPIRED_PROFITABLE" if gross > 0 else "EXPIRED"
+                result = self._close_trade(trade, price, reason)
 
             if result is not None:
                 closed.append(result)
@@ -476,7 +492,7 @@ class PaperTradingEngine:
         risk_distance = trade.risk_usdt / trade.position_size if trade.position_size > 0 else 0.0
         mfe_r = trade.mfe / risk_distance if risk_distance > 0 else 0.0
         mae_r = trade.mae / risk_distance if risk_distance > 0 else 0.0
-        is_expiry = reason == "EXPIRED"
+        is_expiry = reason in ("EXPIRED", "EXPIRED_PROFITABLE")
         if is_expiry and trade.direction == "LONG":
             distance_to_tp = trade.target_1 - exit_price if trade.target_1 is not None else None
             distance_to_sl = exit_price - trade.stop_price
@@ -622,7 +638,8 @@ class PaperTradingEngine:
     def _is_expired(self, trade: PaperTradeRecord) -> bool:
         """Return whether a trade has exceeded its entry-timeframe lifetime."""
         tf_minutes = self._parse_timeframe(trade)
-        max_bars = _ENTRY_TIMEOUT_MAP.get(trade.entry_timeframe, 12)
+        base_bars = _ENTRY_TIMEOUT_BASE.get(trade.entry_timeframe, 12)
+        max_bars = base_bars * self.settings.setup_ttl_multiplier
         age_minutes = (self._clock() - trade.entered_at).total_seconds() / 60
         return age_minutes > max_bars * tf_minutes
 
@@ -634,6 +651,13 @@ class PaperTradingEngine:
             "1h": 60,
             "4h": 240,
         }.get(trade.entry_timeframe, 5)
+
+    @staticmethod
+    def _unrealized_gross(trade: PaperTradeRecord, price: float) -> float:
+        """Return gross unrealized P&L (before fees/slippage) for an open trade."""
+        if trade.direction == "LONG":
+            return (price - trade.entry_price) * trade.position_size
+        return (trade.entry_price - price) * trade.position_size
 
     def mark_to_market(self, prices: dict[str, float] | None = None) -> dict[str, float]:
         """Return realized balance, unrealized P&L and MTM equity."""

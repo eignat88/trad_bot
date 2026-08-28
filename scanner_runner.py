@@ -152,9 +152,13 @@ def run_scan_cycle(
                         min_avg_r=min_avg_r,
                         min_samples=settings.expectancy_min_samples,
                         blocked_combinations=frozenset(settings.blocked_scanner_directions),
+                        regime_filter=settings.regime_filter_enabled,
                     )
                 else:
-                    candidates, symbol_stats = orchestrator.scan_all_with_stats(ctx)
+                    candidates, symbol_stats = orchestrator.scan_all_with_stats(
+                        ctx,
+                        regime_filter=settings.regime_filter_enabled,
+                    )
                 for name, values in symbol_stats.items():
                     stat = run_stats[name]
                     stat["symbols_scanned"] += 1

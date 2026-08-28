@@ -260,7 +260,7 @@ def main() -> None:
     )
 
     cycle = 0
-    interval = 60  # Check every 60 seconds
+    interval = settings.paper_scan_interval  # Default 300s (5 minutes)
 
     while not SHUTDOWN:
         cycle += 1

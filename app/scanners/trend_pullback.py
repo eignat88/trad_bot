@@ -8,7 +8,7 @@ class TrendPullbackScanner:
     name = "TREND_PULLBACK"
     version = "1.0.0"
 
-    def __init__(self, pullback_tolerance: float = 0.005, rsi_cool_threshold: float = 55) -> None:
+    def __init__(self, pullback_tolerance: float = 0.01, rsi_cool_threshold: float = 55) -> None:
         self.pullback_tolerance = pullback_tolerance
         self.rsi_cool_threshold = rsi_cool_threshold
 

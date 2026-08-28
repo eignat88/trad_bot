@@ -97,6 +97,14 @@ class Settings:
     paper_max_drawdown: float = 0.10
     paper_funding_interval_hours: int = 8
     paper_emergency_stop_file: str = "data/PAPER_TRADING_STOP"
+    # Paper trading scan interval in seconds (default 300 = 5 minutes).
+    paper_scan_interval: int = 300
+    # Multiplier for setup TTL — doubles the default entry-timeout bars.
+    # 2.0 means a 5m setup lives 2 hours instead of 1 hour.
+    setup_ttl_multiplier: float = 2.0
+    # When enabled, reject entries where direction conflicts with the
+    # market regime (e.g. LONG in TREND_DOWN, SHORT in TREND_UP).
+    regime_filter_enabled: bool = True
 
 
 def _load_dotenv(path: Path) -> None:
@@ -188,4 +196,8 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
     if (settings.scanner_workers <= 0 or settings.scan_interval <= 0
             or settings.signal_conflict_window <= 0):
         raise ValueError("scanner workers and interval must be positive")
+    if settings.paper_scan_interval <= 0:
+        raise ValueError("paper_scan_interval must be positive")
+    if settings.setup_ttl_multiplier <= 0:
+        raise ValueError("setup_ttl_multiplier must be positive")
     return settings

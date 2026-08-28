@@ -24,12 +24,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-EXPIRATION_MAP = {
+# Base expiration bars; actual = base * setup_ttl_multiplier (from settings).
+EXPIRATION_BASE_MAP = {
     "5m": 12,
     "15m": 8,
     "1h": 6,
     "4h": 4,
 }
+
+# Legacy alias for callers that don't pass a multiplier.
+EXPIRATION_MAP = dict(EXPIRATION_BASE_MAP)
 
 
 class ScannerOrchestrator:
@@ -68,10 +72,13 @@ class ScannerOrchestrator:
         min_avg_r: float = 0.0,
         min_samples: int = 10,
         blocked_combinations: frozenset[tuple[str, str]] = frozenset(),
+        regime_filter: bool = False,
     ) -> list[SetupCandidate]:
         candidates, _ = self.scan_all_with_stats(
             ctx, expectancy_filter, min_avg_r, min_samples, blocked_combinations,
         )
+        if regime_filter:
+            candidates = self._apply_regime_filter(ctx, candidates)
         return candidates
 
     def scan_all_with_stats(
@@ -81,6 +88,7 @@ class ScannerOrchestrator:
         min_avg_r: float = 0.0,
         min_samples: int = 10,
         blocked_combinations: frozenset[tuple[str, str]] = frozenset(),
+        regime_filter: bool = False,
     ) -> tuple[list[SetupCandidate], dict[str, dict[str, int | float]]]:
         """Run every configured scanner and return per-scanner observability data."""
         self.scan_count += 1
@@ -152,6 +160,11 @@ class ScannerOrchestrator:
             )
         for name in stats:
             stats[name]["setups_saved"] = saved_by_scanner.get(name, 0)
+
+        # Market regime filter: reject entries that fight the dominant trend.
+        if regime_filter:
+            valid = self._apply_regime_filter(ctx, valid)
+
         return valid, stats
 
     @classmethod
@@ -180,11 +193,13 @@ class ScannerOrchestrator:
         self,
         candidates: list[SetupCandidate],
         current_time: datetime | None = None,
+        ttl_multiplier: float = 1.0,
     ) -> list[SetupCandidate]:
         now = current_time or datetime.now(timezone.utc)
         expired: list[SetupCandidate] = []
         for c in candidates:
-            max_candles = EXPIRATION_MAP.get(c.setup_timeframe, 8)
+            base_candles = EXPIRATION_BASE_MAP.get(c.setup_timeframe, 8)
+            max_candles = base_candles * ttl_multiplier
             tf_minutes = int(c.setup_timeframe.replace("m", "").replace("h", ""))
             if "h" in c.setup_timeframe:
                 tf_minutes *= 60
@@ -205,3 +220,30 @@ class ScannerOrchestrator:
     def save_setup(self, candidate: SetupCandidate) -> None:
         if self.repository:
             self.repository.save_setup(candidate)
+
+    @staticmethod
+    def _apply_regime_filter(
+        ctx: MarketContext, candidates: list[SetupCandidate],
+    ) -> list[SetupCandidate]:
+        """Remove candidates whose direction fights the market regime.
+
+        LONG in TREND_DOWN and SHORT in TREND_UP are rejected.
+        RANGE and HIGH_VOLATILITY allow both directions.
+        """
+        regime = ctx.market_regime
+        if not regime or regime in ("RANGE", "HIGH_VOLATILITY"):
+            return candidates
+        filtered = []
+        for c in candidates:
+            if c.direction == "LONG" and regime == "TREND_DOWN":
+                logger.debug(
+                    "regime filter: dropping %s LONG in TREND_DOWN", c.symbol,
+                )
+                continue
+            if c.direction == "SHORT" and regime == "TREND_UP":
+                logger.debug(
+                    "regime filter: dropping %s SHORT in TREND_UP", c.symbol,
+                )
+                continue
+            filtered.append(c)
+        return filtered

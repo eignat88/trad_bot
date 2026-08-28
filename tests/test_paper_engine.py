@@ -134,7 +134,9 @@ def test_overdue_trade_closes_at_first_recovery_price_not_stop_price():
         [_candidate(direction="SHORT", invalidation_price=110.0, target_1=None)],
         {"BTCUSDT": 100.0},
     )[0]
-    trade.entered_at = datetime.now(timezone.utc) - timedelta(hours=2)
+    # Use a 4h timeframe so the 2h timeout is well within the base TTL (8 bars × 4h = 32h).
+    trade.entry_timeframe = "4h"
+    trade.entered_at = datetime.now(timezone.utc) - timedelta(hours=33)
 
     closed = engine.check_exits({"BTCUSDT": 111.0})
 

@@ -72,7 +72,7 @@ def test_scan_cycle_fetches_market_data_in_parallel(monkeypatch):
     class Orchestrator:
         scanners = {"TEST": object()}
 
-        def scan_all_with_stats(self, ctx):
+        def scan_all_with_stats(self, ctx, **kwargs):
             return [], {"TEST": {"candidates_found": 0, "setups_saved": 0,
                                   "errors_count": 0, "duration_ms": 1}}
 
@@ -140,7 +140,7 @@ def test_scan_cycle_propagates_run_id_to_all_records(monkeypatch):
     class Orchestrator:
         scanners = {"TEST": object()}
 
-        def scan_all_with_stats(self, ctx):
+        def scan_all_with_stats(self, ctx, **kwargs):
             return [candidate], {"TEST": {"candidates_found": 1,
                 "setups_saved": 1, "errors_count": 0, "duration_ms": 2}}
 
