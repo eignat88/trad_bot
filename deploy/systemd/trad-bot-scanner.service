@@ -1,0 +1,22 @@
+[Unit]
+Description=Trad Bot Scanner
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trad_bot
+EnvironmentFile=/opt/trad_bot/.env
+ExecStart=/opt/trad_bot/.venv/bin/python /opt/trad_bot/scanner_runner.py
+
+Restart=on-failure
+RestartSec=10
+
+User=tradbot
+Group=tradbot
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

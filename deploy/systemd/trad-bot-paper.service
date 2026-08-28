@@ -1,0 +1,22 @@
+[Unit]
+Description=Trad Bot Paper Trading Runner
+After=network-online.target postgresql.service trad-bot-scanner.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trad_bot
+EnvironmentFile=/opt/trad_bot/.env
+ExecStart=/opt/trad_bot/.venv/bin/python /opt/trad_bot/paper_runner.py
+
+Restart=on-failure
+RestartSec=10
+
+User=tradbot
+Group=tradbot
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -38,7 +38,11 @@ class LiveExchange:
 
         owns_repository = repository is None
         repo = repository or ScannerRepository(
-            host="localhost", port=5432, database="trad_bot", user="postgres",
+            host=settings.db_host,
+            port=settings.db_port,
+            database=settings.db_name,
+            user=settings.db_user,
+            password=settings.db_password,
             backend="postgres",
         )
         try:

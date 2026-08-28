@@ -63,7 +63,13 @@ def main() -> None:
         symbols = list(settings.symbols)
     enabled = args.scanners or ALL_SCANNERS
 
-    repository = ScannerRepository()
+    repository = ScannerRepository(
+        host=settings.db_host,
+        port=settings.db_port,
+        database=settings.db_name,
+        user=settings.db_user,
+        password=settings.db_password,
+    )
     repository.ensure_schema()
     orchestrator = ScannerOrchestrator(enabled_scanners=enabled, repository=repository)
 

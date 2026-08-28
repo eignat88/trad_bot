@@ -22,6 +22,7 @@ class ScannerRepository:
         port: int = 5432,
         database: str = "trad_bot",
         user: str = "postgres",
+        password: str | None = None,
         jsonl_path: str = "data/scanner_setups.jsonl",
         backend: Literal["auto", "postgres", "jsonl"] = "auto",
     ) -> None:
@@ -31,6 +32,7 @@ class ScannerRepository:
         self._port = port
         self._database = database
         self._user = user
+        self._password = password or None
         self._jsonl_path = jsonl_path
         self._conn: Any = None
         self._use_pg = False
@@ -45,10 +47,14 @@ class ScannerRepository:
         try:
             import pg8000
             self._conn = pg8000.connect(
-                host=host, port=port, database=database, user=user
+                host=host, port=port, database=database, user=user,
+                password=self._password,
             )
             self._use_pg = True
-            logger.info("scanner repository connected to PostgreSQL (%s:%d/%s)", host, port, database)
+            logger.info(
+                "PostgreSQL connected: %s:%d/%s user=%s",
+                host, port, database, user,
+            )
         except ImportError:
             if backend == "postgres":
                 raise
@@ -78,6 +84,7 @@ class ScannerRepository:
             self._conn = pg8000.connect(
                 host=self._host, port=self._port,
                 database=self._database, user=self._user,
+                password=self._password,
             )
             logger.info("scanner repository reconnected to PostgreSQL")
             self.ensure_schema()

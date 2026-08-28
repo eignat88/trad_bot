@@ -42,9 +42,14 @@ def _emergency_stop_requested(settings: Settings) -> bool:
 
 def _get_repo() -> ScannerRepository:
     """Paper state is PostgreSQL-only; fail fast rather than lose lifecycle data."""
+    settings = _load_settings()
     try:
         return ScannerRepository(
-            host="localhost", port=5432, database="trad_bot", user="postgres",
+            host=settings.db_host,
+            port=settings.db_port,
+            database=settings.db_name,
+            user=settings.db_user,
+            password=settings.db_password,
             backend="postgres",
         )
     except Exception as exc:

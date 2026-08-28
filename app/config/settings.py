@@ -21,6 +21,12 @@ class ScannerUniverseSettings:
 
 @dataclass(frozen=True)
 class Settings:
+    # --- PostgreSQL database configuration ---
+    db_host: str = "localhost"
+    db_port: int = 5432
+    db_name: str = "trad_bot"
+    db_user: str = "postgres"
+    db_password: str = ""
     symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT")
     category: str = "linear"
     timeframe: str = "5"
@@ -127,6 +133,11 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         # without requiring a parser merely to validate/start the application.
         raw = json.loads(config_path.read_text(encoding="utf-8"))
     env = {
+        "db_host": os.getenv("DB_HOST", raw.get("db_host", "localhost")),
+        "db_port": int(os.getenv("DB_PORT", str(raw.get("db_port", 5432)))),
+        "db_name": os.getenv("DB_NAME", raw.get("db_name", "trad_bot")),
+        "db_user": os.getenv("DB_USER", raw.get("db_user", "postgres")),
+        "db_password": os.getenv("DB_PASSWORD", raw.get("db_password", "")),
         "trading_mode": os.getenv("TRADING_MODE", raw.get("trading_mode", "paper")).lower(),
         "live_trading_enabled": os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true",
         "bybit_api_key": os.getenv("BYBIT_API_KEY", ""),
@@ -167,6 +178,10 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         raise ValueError("scanner universe liquidity thresholds cannot be negative")
     if settings.bybit_timeout <= 0 or settings.bybit_max_attempts <= 0:
         raise ValueError("Bybit timeout and max attempts must be positive")
+    if not 1 <= settings.db_port <= 65535:
+        raise ValueError("db_port must be between 1 and 65535")
+    if not settings.db_name:
+        raise ValueError("db_name must not be empty")
     if settings.bybit_retry_backoff < 0:
         raise ValueError("bybit_retry_backoff cannot be negative")
     if settings.initial_balance <= 0:
