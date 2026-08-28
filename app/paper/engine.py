@@ -12,19 +12,20 @@ import logging
 import math
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from app.config import Settings
 from app.scanners.models import SetupCandidate
 
 logger = logging.getLogger(__name__)
 
-# Maximum bars (in entry_timeframe units) to keep a setup alive before expiry.
-_ENTRY_TIMEOUT_MAP = {
-    "5m": 12,   # 1 hour
-    "15m": 8,   # 2 hours
-    "1h": 6,    # 6 hours
-    "4h": 4,    # 16 hours
+# Base maximum bars (in entry_timeframe units) to keep a setup alive before expiry.
+# Actual timeout = base * setup_ttl_multiplier (default 2.0).
+_ENTRY_TIMEOUT_BASE = {
+    "5m": 12,   # 1 hour base → 2 hours at 2x
+    "15m": 8,   # 2 hours base → 4 hours at 2x
+    "1h": 6,    # 6 hours base → 12 hours at 2x
+    "4h": 4,    # 16 hours base → 32 hours at 2x
 }
 
 
@@ -47,6 +48,14 @@ class PaperTradeRecord:
     balance_before: float
     market_regime: str | None
     entered_at: datetime
+    entry_market_price: float = 0.0
+    entry_slippage_cost: float = 0.0
+    gross_pnl: float = 0.0
+    exit_fee: float = 0.0
+    slippage_cost: float = 0.0
+    net_pnl: float = 0.0
+    mfe: float = 0.0
+    mae: float = 0.0
     status: str = "OPEN"
     entry_timeframe: str = "5m"
     # trailing / management
@@ -68,13 +77,17 @@ class PaperTradingEngine:
         self,
         settings: Settings,
         repository: Any,  # ScannerRepository
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.settings = settings
         self.repo = repository
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.balance: float = settings.initial_balance
         self.open_trades: dict[str, PaperTradeRecord] = {}  # symbol → trade
         self._peak_balance: float = settings.initial_balance
+        self._peak_equity: float = settings.initial_balance
         self._max_drawdown: float = 0.0
+        self._mark_prices: dict[str, float] = {}
         self._loaded_account_snapshot = False
         self._daily_loss_usdt: float = 0.0
         self._consecutive_losses: int = 0
@@ -83,6 +96,29 @@ class PaperTradingEngine:
         self._load_account_state()
         self._load_open_trades()
         self._load_risk_state()
+
+    def portfolio_exposure(self, prices: dict[str, float] | None = None) -> dict[str, float]:
+        """Return gross, directional and net exposure as fractions of MTM equity."""
+        if prices:
+            self._mark_prices.update({k: float(v) for k, v in prices.items()})
+        long_notional = short_notional = 0.0
+        for trade in self.open_trades.values():
+            mark = self._mark_prices.get(trade.symbol, trade.entry_market_price or trade.entry_price)
+            notional = max(0.0, mark * trade.position_size)
+            if trade.direction == "LONG":
+                long_notional += notional
+            else:
+                short_notional += notional
+        equity = self.mark_to_market()["equity"]
+        denominator = equity if equity > 0 else self.settings.initial_balance
+        return {
+            "gross_exposure_pct": (long_notional + short_notional) / denominator,
+            "long_exposure_pct": long_notional / denominator,
+            "short_exposure_pct": short_notional / denominator,
+            "net_exposure_pct": (long_notional - short_notional) / denominator,
+            "long_notional": long_notional,
+            "short_notional": short_notional,
+        }
 
     # ------------------------------------------------------------------
     # ENTRY: scan READY_TO_TRADE setups → open positions
@@ -123,6 +159,17 @@ class PaperTradingEngine:
                 logger.warning("paper gate: consecutive loss limit reached, skipping new entries")
                 break
 
+            # Market regime filter: reject entries that fight the dominant trend.
+            if self.settings.regime_filter_enabled and c.market_regime:
+                regime = c.market_regime
+                if (c.direction == "LONG" and regime == "TREND_DOWN") or \
+                   (c.direction == "SHORT" and regime == "TREND_UP"):
+                    logger.info(
+                        "paper regime filter: rejecting %s %s in %s",
+                        c.symbol, c.direction, regime,
+                    )
+                    continue
+
             # Entry zone check: price must be within [entry_zone_low, entry_zone_high]
             entry_low = c.entry_zone_low
             entry_high = c.entry_zone_high
@@ -135,28 +182,48 @@ class PaperTradingEngine:
 
             # Size the position
             risk_fraction = self.settings.risk_per_trade
-            entry = price
+            entry_market = price
+            slip = self.settings.slippage_percent
+            entry = entry_market * (1 + slip if c.direction == "LONG" else 1 - slip)
             stop = c.invalidation_price
             distance = abs(entry - stop)
             if distance <= 0 or entry <= 0:
                 continue
 
-            risk_usdt = self.balance * risk_fraction
-            quantity = risk_usdt / distance
-            # Cap by max_symbol_exposure
+            requested_risk = self.balance * risk_fraction
+            quantity = requested_risk / distance
+            # Cap by max_symbol_exposure, then persist the actual final risk.
             exposure_cap = self.balance * self.settings.max_symbol_exposure / entry
             quantity = min(quantity, exposure_cap)
+
+            exposure = self.portfolio_exposure(prices)
+            equity = self.mark_to_market()["equity"]
+            gross_remaining = max(
+                0.0,
+                equity * self.settings.max_portfolio_gross_exposure
+                - exposure["long_notional"] - exposure["short_notional"],
+            )
+            current_net = exposure["long_notional"] - exposure["short_notional"]
+            net_limit = equity * self.settings.max_portfolio_net_exposure
+            net_remaining = (
+                net_limit - current_net if c.direction == "LONG"
+                else net_limit + current_net
+            )
+            portfolio_notional_cap = max(0.0, min(gross_remaining, net_remaining))
+            quantity = min(quantity, portfolio_notional_cap / entry)
 
             if quantity <= 0:
                 continue
 
+            risk_usdt = distance * quantity
             entry_fee = entry * quantity * self.settings.taker_fee
+            entry_slippage_cost = abs(entry - entry_market) * quantity
 
             # Check daily loss / consecutive losses
-            if self.balance - entry_fee <= 0:
+            if self.balance - entry_fee - entry_slippage_cost <= 0:
                 continue
 
-            now = datetime.now(timezone.utc)
+            now = self._clock()
             trade = PaperTradeRecord(
                 trade_id=None,
                 setup_id=str(c.setup_id),
@@ -175,6 +242,9 @@ class PaperTradingEngine:
                 balance_before=round(self.balance, 2),
                 market_regime=c.market_regime,
                 entered_at=now,
+                entry_market_price=round(entry_market, 6),
+                entry_slippage_cost=round(entry_slippage_cost, 6),
+                slippage_cost=round(entry_slippage_cost, 6),
                 highest_since_entry=price,
                 lowest_since_entry=price,
             )
@@ -183,8 +253,9 @@ class PaperTradingEngine:
             trade_id = self.repo.save_paper_trade(trade)
             trade.trade_id = trade_id
 
-            self.balance -= entry_fee
+            self.balance -= entry_fee + entry_slippage_cost
             self.open_trades[c.symbol] = trade
+            self._mark_prices[c.symbol] = price
             opened.append(trade)
 
             logger.info(
@@ -214,13 +285,16 @@ class PaperTradingEngine:
             price = prices.get(symbol)
             if price is None:
                 continue
+            self._mark_prices[symbol] = price
 
             # An outage can leave a trade past its lifetime before the next
             # quote arrives. In that case, the recovery quote is the only
             # executable price: do not turn it into a stop/target fill at an
             # earlier historical level.
             if self._is_expired(trade):
-                closed.append(self._close_trade(trade, price, "EXPIRED"))
+                gross = self._unrealized_gross(trade, price)
+                reason = "EXPIRED_PROFITABLE" if gross > 0 else "EXPIRED"
+                closed.append(self._close_trade(trade, price, reason))
                 to_remove.append(symbol)
                 continue
 
@@ -232,14 +306,28 @@ class PaperTradingEngine:
             # Update high/low watermarks
             trade.highest_since_entry = max(trade.highest_since_entry, price)
             trade.lowest_since_entry = min(trade.lowest_since_entry, price)
+            if is_long:
+                trade.mfe = max(trade.mfe, trade.highest_since_entry - trade.entry_price)
+                trade.mae = max(trade.mae, trade.entry_price - trade.lowest_since_entry)
+            else:
+                trade.mfe = max(trade.mfe, trade.entry_price - trade.lowest_since_entry)
+                trade.mae = max(trade.mae, trade.highest_since_entry - trade.entry_price)
 
             result = None
 
             # 1. Stop loss check
             if is_long and price <= trade.stop_price:
-                result = self._close_trade(trade, trade.stop_price, "STOP_LOSS")
+                gap = price < trade.stop_price
+                result = self._close_trade(
+                    trade, price if gap else trade.stop_price,
+                    "STOP_LOSS_GAP" if gap else "STOP_LOSS",
+                )
             elif not is_long and price >= trade.stop_price:
-                result = self._close_trade(trade, trade.stop_price, "STOP_LOSS")
+                gap = price > trade.stop_price
+                result = self._close_trade(
+                    trade, price if gap else trade.stop_price,
+                    "STOP_LOSS_GAP" if gap else "STOP_LOSS",
+                )
 
             # 2. Take profit 1 check (full close)
             if result is None and trade.target_1 is not None:
@@ -261,7 +349,9 @@ class PaperTradingEngine:
 
             # 5. Timeout check (setup expired)
             if result is None and self._is_expired(trade):
-                result = self._close_trade(trade, price, "EXPIRED")
+                gross = self._unrealized_gross(trade, price)
+                reason = "EXPIRED_PROFITABLE" if gross > 0 else "EXPIRED"
+                result = self._close_trade(trade, price, reason)
 
             if result is not None:
                 closed.append(result)
@@ -269,6 +359,9 @@ class PaperTradingEngine:
 
         for symbol in to_remove:
             self.open_trades.pop(symbol, None)
+            self._mark_prices.pop(symbol, None)
+
+        self._update_equity_drawdown()
 
         return closed
 
@@ -329,7 +422,7 @@ class PaperTradingEngine:
         whole configured intervals elapsed since entry.
         """
         interval_seconds = self.settings.paper_funding_interval_hours * 3600
-        elapsed = (datetime.now(timezone.utc) - trade.entered_at).total_seconds()
+        elapsed = (self._clock() - trade.entered_at).total_seconds()
         due_periods = max(0, int(elapsed // interval_seconds))
         new_periods = due_periods - trade.funding_periods_charged
         if new_periods <= 0:
@@ -366,21 +459,23 @@ class PaperTradingEngine:
         slip = self.settings.slippage_percent
         adjusted_exit = exit_price * (1 - slip if trade.direction == "LONG" else 1 + slip)
 
+        market_entry = trade.entry_market_price or trade.entry_price
         if trade.direction == "LONG":
-            signed_move = adjusted_exit - trade.entry_price
+            signed_move = exit_price - market_entry
         else:
-            signed_move = trade.entry_price - adjusted_exit
+            signed_move = market_entry - exit_price
 
         gross_pnl = signed_move * trade.position_size
         exit_fee = adjusted_exit * trade.position_size * self.settings.taker_fee
-        net_pnl = gross_pnl - exit_fee - trade.funding_paid
+        exit_slippage = abs(adjusted_exit - exit_price) * trade.position_size
+        slippage_cost = trade.entry_slippage_cost + exit_slippage
+        net_pnl = gross_pnl - trade.entry_fee - exit_fee - trade.funding_paid - slippage_cost
 
-        # Funding was debited/credited at each settlement, so do not apply it
-        # a second time to the cash balance at exit.
-        self.balance += gross_pnl - exit_fee
-        net_after_entry_fee = net_pnl - trade.entry_fee
-        if net_after_entry_fee < 0:
-            self._daily_loss_usdt += -net_after_entry_fee
+        # Entry costs and funding were already booked. Apply only the remaining
+        # raw-price move and exit costs so balance delta equals all-in net P&L.
+        self.balance += gross_pnl - exit_fee - exit_slippage
+        if net_pnl < 0:
+            self._daily_loss_usdt += -net_pnl
             self._consecutive_losses += 1
         else:
             self._consecutive_losses = 0
@@ -393,7 +488,19 @@ class PaperTradingEngine:
 
         r_multiple = net_pnl / trade.risk_usdt if trade.risk_usdt > 0 else 0
         pnl_pct = net_pnl / (trade.entry_price * trade.position_size) * 100 if trade.entry_price * trade.position_size > 0 else 0
-        duration = (datetime.now(timezone.utc) - trade.entered_at).total_seconds()
+        duration = (self._clock() - trade.entered_at).total_seconds()
+        risk_distance = trade.risk_usdt / trade.position_size if trade.position_size > 0 else 0.0
+        mfe_r = trade.mfe / risk_distance if risk_distance > 0 else 0.0
+        mae_r = trade.mae / risk_distance if risk_distance > 0 else 0.0
+        is_expiry = reason in ("EXPIRED", "EXPIRED_PROFITABLE")
+        if is_expiry and trade.direction == "LONG":
+            distance_to_tp = trade.target_1 - exit_price if trade.target_1 is not None else None
+            distance_to_sl = exit_price - trade.stop_price
+        elif is_expiry:
+            distance_to_tp = exit_price - trade.target_1 if trade.target_1 is not None else None
+            distance_to_sl = trade.stop_price - exit_price
+        else:
+            distance_to_tp = distance_to_sl = None
 
         # Persist to DB
         self.repo.close_paper_trade(
@@ -404,10 +511,18 @@ class PaperTradingEngine:
             pnl_usdt=round(net_pnl, 2),
             pnl_r=round(r_multiple, 4),
             pnl_percent=round(pnl_pct, 2),
-            slippage=round(abs(adjusted_exit - exit_price) * trade.position_size, 6),
+            slippage=round(slippage_cost, 6),
             funding_paid=round(trade.funding_paid, 6),
             balance_after=round(self.balance, 2),
             duration_sec=round(duration, 1),
+            gross_pnl=round(gross_pnl, 6),
+            mfe=round(trade.mfe, 6),
+            mae=round(trade.mae, 6),
+            mfe_r=round(mfe_r, 6),
+            mae_r=round(mae_r, 6),
+            price_at_expiry=round(exit_price, 6) if is_expiry else None,
+            distance_to_tp=round(distance_to_tp, 6) if distance_to_tp is not None else None,
+            distance_to_sl=round(distance_to_sl, 6) if distance_to_sl is not None else None,
         )
 
         logger.info(
@@ -433,6 +548,14 @@ class PaperTradingEngine:
             balance_before=trade.balance_before,
             market_regime=trade.market_regime,
             entered_at=trade.entered_at,
+            entry_market_price=market_entry,
+            entry_slippage_cost=trade.entry_slippage_cost,
+            gross_pnl=gross_pnl,
+            exit_fee=exit_fee,
+            slippage_cost=slippage_cost,
+            net_pnl=net_pnl,
+            mfe=trade.mfe,
+            mae=trade.mae,
             status="CLOSED",
             entry_timeframe=trade.entry_timeframe,
             trail_stop=trade.trail_stop,
@@ -489,6 +612,11 @@ class PaperTradingEngine:
                 balance_before=float(row["balance_before"]),
                 market_regime=row.get("market_regime"),
                 entered_at=row["entered_at"],
+                entry_market_price=float(row.get("entry_market_price", row["entry_price"])),
+                entry_slippage_cost=float(row.get("slippage", 0.0)),
+                slippage_cost=float(row.get("slippage", 0.0)),
+                mfe=float(row.get("mfe", 0.0)),
+                mae=float(row.get("mae", 0.0)),
                 status="OPEN",
                 entry_timeframe=str(row.get("entry_timeframe", "5m")),
                 funding_paid=float(row.get("funding_paid", 0.0)),
@@ -510,8 +638,9 @@ class PaperTradingEngine:
     def _is_expired(self, trade: PaperTradeRecord) -> bool:
         """Return whether a trade has exceeded its entry-timeframe lifetime."""
         tf_minutes = self._parse_timeframe(trade)
-        max_bars = _ENTRY_TIMEOUT_MAP.get(trade.entry_timeframe, 12)
-        age_minutes = (datetime.now(timezone.utc) - trade.entered_at).total_seconds() / 60
+        base_bars = _ENTRY_TIMEOUT_BASE.get(trade.entry_timeframe, 12)
+        max_bars = base_bars * self.settings.setup_ttl_multiplier
+        age_minutes = (self._clock() - trade.entered_at).total_seconds() / 60
         return age_minutes > max_bars * tf_minutes
 
     def _parse_timeframe(self, trade: PaperTradeRecord) -> int:
@@ -523,19 +652,60 @@ class PaperTradingEngine:
             "4h": 240,
         }.get(trade.entry_timeframe, 5)
 
+    @staticmethod
+    def _unrealized_gross(trade: PaperTradeRecord, price: float) -> float:
+        """Return gross unrealized P&L (before fees/slippage) for an open trade."""
+        if trade.direction == "LONG":
+            return (price - trade.entry_price) * trade.position_size
+        return (trade.entry_price - price) * trade.position_size
+
+    def mark_to_market(self, prices: dict[str, float] | None = None) -> dict[str, float]:
+        """Return realized balance, unrealized P&L and MTM equity."""
+        if prices:
+            self._mark_prices.update({k: float(v) for k, v in prices.items()})
+        unrealized = 0.0
+        for symbol, trade in self.open_trades.items():
+            mark = self._mark_prices.get(symbol)
+            if mark is None:
+                continue
+            market_entry = trade.entry_market_price or trade.entry_price
+            move = mark - market_entry if trade.direction == "LONG" else market_entry - mark
+            unrealized += move * trade.position_size
+        return {
+            "balance": self.balance,
+            "unrealized_pnl": unrealized,
+            "equity": self.balance + unrealized,
+        }
+
+    def _update_equity_drawdown(self) -> None:
+        account = self.mark_to_market()
+        equity = account["equity"]
+        self._peak_equity = max(self._peak_equity, equity)
+        dd = (self._peak_equity - equity) / self._peak_equity if self._peak_equity > 0 else 0.0
+        self._max_drawdown = max(self._max_drawdown, dd)
+
     # ------------------------------------------------------------------
     # SNAPSHOT
     # ------------------------------------------------------------------
-    def snapshot(self) -> dict[str, Any]:
-        """Return current account state."""
-        total_pnl = self.balance - self.settings.initial_balance
+    def snapshot(self, prices: dict[str, float] | None = None) -> dict[str, Any]:
+        """Return current account state using mark-to-market equity."""
+        account = self.mark_to_market(prices)
+        self._update_equity_drawdown()
+        exposure = self.portfolio_exposure()
+        total_pnl = account["equity"] - self.settings.initial_balance
         return {
-            "balance": round(self.balance, 2),
+            "balance": round(account["balance"], 2),
+            "unrealized_pnl": round(account["unrealized_pnl"], 2),
+            "equity": round(account["equity"], 2),
             "starting_balance": self.settings.initial_balance,
             "total_pnl": round(total_pnl, 2),
             "total_pnl_pct": round(total_pnl / self.settings.initial_balance * 100, 2),
             "open_positions": len(self.open_trades),
             "max_drawdown_pct": round(self._max_drawdown * 100, 2),
+            "gross_exposure_pct": round(exposure["gross_exposure_pct"] * 100, 2),
+            "long_exposure_pct": round(exposure["long_exposure_pct"] * 100, 2),
+            "short_exposure_pct": round(exposure["short_exposure_pct"] * 100, 2),
+            "net_exposure_pct": round(exposure["net_exposure_pct"] * 100, 2),
             "open_trades": [
                 {
                     "symbol": t.symbol,

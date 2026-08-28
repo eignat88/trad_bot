@@ -8,6 +8,7 @@ from uuid import UUID
 
 from app.scanners.models import SetupCandidate, SetupState
 from app.scanners.outcome import SignalOutcome
+from app.storage.safe_jsonl import atomic_rewrite, file_lock, read_records
 
 logger = logging.getLogger(__name__)
 
@@ -94,19 +95,28 @@ class ScannerRepository:
         if schema_path.exists():
             sql = schema_path.read_text(encoding="utf-8")
             cursor = self._conn.cursor()
+            schema_lock_id = 7_314_202_608
+            locked = False
             try:
+                # Session advisory lock serializes DDL across scanner/paper runners.
+                cursor.execute("SELECT pg_advisory_lock(%s)", (schema_lock_id,))
+                locked = True
                 for stmt in sql.split(";"):
                     stmt = stmt.strip()
                     if stmt:
                         cursor.execute(stmt)
                 self._conn.commit()
-                logger.info("scanner schema applied")
-            except Exception as e:
-                logger.warning("schema apply error (may already exist): %s", e)
-                try:
-                    self._conn.rollback()
-                except Exception:
-                    pass
+                logger.info("scanner schema applied under advisory lock")
+            except Exception:
+                self._conn.rollback()
+                logger.exception("schema apply failed")
+                raise
+            finally:
+                if locked:
+                    try:
+                        cursor.execute("SELECT pg_advisory_unlock(%s)", (schema_lock_id,))
+                    except Exception:
+                        logger.exception("failed to release schema advisory lock")
 
     # ----------------------------------------------------------------
     # INSTRUMENT
@@ -426,18 +436,17 @@ class ScannerRepository:
             "features": c.features,
         }
         path = Path(self._jsonl_path)
-        records = []
-        if path.exists():
-            records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        identity = self._signal_identity(record)
-        for index, existing in enumerate(records):
-            if self._signal_identity(existing) == identity:
-                record["setup_id"] = existing["setup_id"]
-                records[index] = record
-                break
-        else:
-            records.append(record)
-        path.write_text("".join(json.dumps(item) + "\n" for item in records), encoding="utf-8")
+        with file_lock(path):
+            records = read_records(path)
+            identity = self._signal_identity(record)
+            for index, existing in enumerate(records):
+                if self._signal_identity(existing) == identity:
+                    record["setup_id"] = existing["setup_id"]
+                    records[index] = record
+                    break
+            else:
+                records.append(record)
+            atomic_rewrite(path, records)
 
     @staticmethod
     def _signal_identity(record: dict) -> tuple:
@@ -864,10 +873,10 @@ class ScannerRepository:
                     setup_id, symbol, scanner_name, direction, score,
                     entry_price, entry_fee, stop_price, target_1, target_2,
                     entry_timeframe, position_size, risk_usdt, balance_before, market_regime,
-                    status, entered_at
+                    entry_market_price, slippage, status, entered_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    'OPEN', %s
+                    %s, %s, 'OPEN', %s
                 ) RETURNING trade_id
                 """,
                 (
@@ -876,7 +885,9 @@ class ScannerRepository:
                     trade.entry_fee, trade.stop_price, trade.target_1,
                     trade.target_2, trade.entry_timeframe, trade.position_size,
                     trade.risk_usdt,
-                    trade.balance_before, trade.market_regime, trade.entered_at,
+                    trade.balance_before, trade.market_regime,
+                    trade.entry_market_price, trade.entry_slippage_cost,
+                    trade.entered_at,
                 ),
             )
             self._conn.commit()
@@ -900,6 +911,14 @@ class ScannerRepository:
         funding_paid: float,
         balance_after: float,
         duration_sec: float,
+        gross_pnl: float,
+        mfe: float,
+        mae: float,
+        mfe_r: float,
+        mae_r: float,
+        price_at_expiry: float | None,
+        distance_to_tp: float | None,
+        distance_to_sl: float | None,
     ) -> None:
         """Update a paper trade with exit data."""
         if not self._use_pg or trade_id is None:
@@ -919,6 +938,14 @@ class ScannerRepository:
                     funding_paid = %s,
                     balance_after = %s,
                     duration_sec = %s,
+                    gross_pnl = %s,
+                    mfe = %s,
+                    mae = %s,
+                    mfe_r = %s,
+                    mae_r = %s,
+                    price_at_expiry = %s,
+                    distance_to_tp = %s,
+                    distance_to_sl = %s,
                     status = 'CLOSED',
                     closed_at = now(),
                     updated_at = now()
@@ -927,7 +954,8 @@ class ScannerRepository:
                 (
                     exit_price, exit_reason, exit_fee, pnl_usdt,
                     pnl_r, pnl_percent, slippage, funding_paid, balance_after,
-                    duration_sec, trade_id,
+                    duration_sec, gross_pnl, mfe, mae, mfe_r, mae_r,
+                    price_at_expiry, distance_to_tp, distance_to_sl, trade_id,
                 ),
             )
             self._conn.commit()
@@ -968,7 +996,8 @@ class ScannerRepository:
             SELECT trade_id, setup_id, symbol, scanner_name, direction, score,
                    entry_price, entry_fee, stop_price, target_1, target_2,
                    entry_timeframe, position_size, risk_usdt, balance_before, market_regime,
-                   funding_paid, funding_periods, entered_at
+                   funding_paid, funding_periods, entered_at,
+                   entry_market_price, slippage, mfe, mae
             FROM dds.paper_trade
             WHERE status = 'OPEN'
             ORDER BY entered_at DESC
@@ -990,6 +1019,10 @@ class ScannerRepository:
                 "funding_paid": float(r[16] or 0),
                 "funding_periods": int(r[17] or 0),
                 "entered_at": r[18],
+                "entry_market_price": float(r[19] or r[6]),
+                "slippage": float(r[20] or 0),
+                "mfe": float(r[21] or 0),
+                "mae": float(r[22] or 0),
             }
             for r in rows
         ]

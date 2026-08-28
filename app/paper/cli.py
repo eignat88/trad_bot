@@ -41,7 +41,19 @@ def _emergency_stop_requested(settings: Settings) -> bool:
 
 
 def _get_repo() -> ScannerRepository:
-    return ScannerRepository(host="localhost", port=5432, database="trad_bot", user="postgres")
+    """Paper state is PostgreSQL-only; fail fast rather than lose lifecycle data."""
+    try:
+        return ScannerRepository(
+            host="localhost", port=5432, database="trad_bot", user="postgres",
+            backend="postgres",
+        )
+    except Exception as exc:
+        logger.critical(
+            "PAPER_RUNNER_STOPPED: database unavailable and fallback cannot guarantee state consistency"
+        )
+        raise RuntimeError(
+            "PAPER_RUNNER_STOPPED: database unavailable and fallback cannot guarantee state consistency"
+        ) from exc
 
 
 def _get_prices(client: BybitClient, symbols: list[str]) -> dict[str, float]:
@@ -276,17 +288,22 @@ def cmd_run_once(args: argparse.Namespace) -> None:
             )
             candidates.append(c)
 
-        if settings.expectancy_filter_enabled:
-            expectancy = load_expectancy(repo)
-            candidates, rejected = filter_candidates(
-                candidates,
-                expectancy,
-                min_avg_r=settings.expectancy_min_avg_r,
-                min_samples=settings.expectancy_min_samples,
-                blocked_combinations=frozenset(settings.blocked_scanner_directions),
-            )
-            if rejected:
-                logger.info("paper: expectancy filter rejected %d setups", rejected)
+        # Manual scanner/direction blocks are safety controls and therefore
+        # apply independently of the statistical expectancy feature flag.
+        expectancy = load_expectancy(repo) if settings.expectancy_filter_enabled else None
+        from app.scanners.expectancy_filter import ExpectancyFilter
+        candidates, rejected = filter_candidates(
+            candidates,
+            expectancy or ExpectancyFilter(),
+            min_avg_r=settings.expectancy_min_avg_r,
+            min_samples=settings.expectancy_min_samples,
+            min_profit_factor=settings.expectancy_min_profit_factor,
+            min_net_pnl=settings.expectancy_min_net_pnl,
+            enforce_expectancy=settings.expectancy_filter_enabled,
+            blocked_combinations=frozenset(settings.blocked_scanner_directions),
+        )
+        if rejected:
+            logger.info("paper: candidate filter rejected %d setups", rejected)
 
         opened = engine.check_entries(candidates, prices)
         if opened:
@@ -306,9 +323,10 @@ def cmd_run_once(args: argparse.Namespace) -> None:
     losing = sum(s.get("losses", 0) or 0 for s in stats_rows)
     total_pnl = sum(s.get("total_pnl_usdt", 0) or 0 for s in stats_rows)
 
+    account = engine.snapshot()
     repo.save_paper_account_snapshot(
-        balance=engine.balance,
-        equity=engine.balance,
+        balance=account["balance"],
+        equity=account["equity"],
         open_positions=len(engine.open_trades),
         total_trades=total_trades,
         winning_trades=winning,
@@ -317,8 +335,7 @@ def cmd_run_once(args: argparse.Namespace) -> None:
         max_drawdown=engine._max_drawdown,
     )
 
-    snap = engine.snapshot()
-    print(json.dumps(snap, indent=2))
+    print(json.dumps(account, indent=2))
     repo.close()
 
 

@@ -35,8 +35,8 @@ def candidate(**overrides):
 
 def test_filter_allows_no_history_combinations():
     f = ExpectancyFilter()
-    assert f.is_profitable("UNKNOWN_SCANNER", "LONG") is True
-    assert f.reason_for("UNKNOWN_SCANNER", "LONG") == "NO_HISTORY"
+    assert f.is_profitable("UNKNOWN_SCANNER", "LONG") is False
+    assert f.reason_for("UNKNOWN_SCANNER", "LONG") == "INSUFFICIENT_DATA(0)"
 
 
 def test_filter_allows_insufficient_samples():
@@ -46,15 +46,16 @@ def test_filter_allows_insufficient_samples():
             samples=5, avg_r_after_costs=-0.5, win_rate=0.0,
         ),
     })
-    assert f.is_profitable("TREND_PULLBACK", "LONG") is True
-    assert f.reason_for("TREND_PULLBACK", "LONG").startswith("INSUFFICIENT_SAMPLES")
+    assert f.is_profitable("TREND_PULLBACK", "LONG") is False
+    assert f.reason_for("TREND_PULLBACK", "LONG").startswith("INSUFFICIENT_DATA")
 
 
 def test_filter_rejects_negative_expectancy():
     f = ExpectancyFilter(records={
         ("TREND_PULLBACK", "LONG"): ExpectancyRecord(
             scanner_name="TREND_PULLBACK", direction="LONG",
-            samples=20, avg_r_after_costs=-0.2, win_rate=0.1,
+            samples=30, avg_r_after_costs=-0.2, win_rate=0.1,
+            profit_factor=1.3, net_pnl=1.0,
         ),
     })
     assert f.is_profitable("TREND_PULLBACK", "LONG", min_avg_r=0.0) is False
@@ -65,7 +66,8 @@ def test_filter_allows_positive_expectancy():
     f = ExpectancyFilter(records={
         ("SUPPORT_RESISTANCE_REACTION", "LONG"): ExpectancyRecord(
             scanner_name="SUPPORT_RESISTANCE_REACTION", direction="LONG",
-            samples=15, avg_r_after_costs=0.3, win_rate=0.4,
+            samples=30, avg_r_after_costs=0.3, win_rate=0.4,
+            profit_factor=1.2, net_pnl=1.0,
         ),
     })
     assert f.is_profitable("SUPPORT_RESISTANCE_REACTION", "LONG") is True
@@ -88,9 +90,8 @@ def test_filter_candidates_returns_accepted_and_rejected():
         candidate(scanner_name="VOLATILITY_COMPRESSION", direction="SHORT"),  # no history
     ]
     accepted, rejected = filter_candidates(candidates, f)
-    assert rejected == 2
-    assert len(accepted) == 1
-    assert accepted[0].scanner_name == "VOLATILITY_COMPRESSION"
+    assert rejected == 3
+    assert accepted == []
 
 
 def test_filter_rejects_manual_block_without_history():
@@ -158,3 +159,20 @@ def test_orchestrator_applies_expectancy_filter():
     candidates2, stats2 = orchestrator2.scan_all_with_stats(ctx2)
     assert len(candidates2) == 1
     assert stats2["TREND_PULLBACK"]["setups_saved"] == 1
+
+
+def test_expectancy_requires_30_samples_pf_expectancy_and_net_pnl():
+    def allowed(samples=30, avg_r=0.1, pf=1.2, net=1.0):
+        f = ExpectancyFilter({
+            ("TEST", "LONG"): ExpectancyRecord(
+                "TEST", "LONG", samples, avg_r, 0.5, pf, net,
+            )
+        })
+        return f.is_profitable("TEST", "LONG")
+
+    assert not allowed(samples=10)
+    assert not allowed(samples=29)
+    assert allowed(samples=30)
+    assert not allowed(pf=1.19)
+    assert not allowed(avg_r=0.0)
+    assert not allowed(net=0.0)

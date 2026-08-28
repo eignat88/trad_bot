@@ -63,8 +63,9 @@ def build_market_context(
     candles_15m = client.get_klines(symbol, "15", 200)
     candles_1h = client.get_klines(symbol, "60", 200)
     candles_4h = client.get_klines(symbol, "240", 200)
+    candles_1d = client.get_klines(symbol, "D", 8)
     indicators = _build_indicators(candles_1h)
-    levels = _find_levels(None)
+    levels = _find_levels(candles_1d)
     return MarketContext(
         symbol=symbol,
         candles_5m=tuple(candles_5m),

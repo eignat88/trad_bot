@@ -26,6 +26,9 @@ class Settings:
     timeframe: str = "5"
     trading_mode: str = "paper"
     live_trading_enabled: bool = False
+    # Internal kill switch: remains false until protected SL/TP, reduce-only,
+    # confirmation, reconciliation and restart recovery are implemented.
+    live_safety_ready: bool = False
     bybit_api_key: str = ""
     bybit_api_secret: str = ""
     bybit_timeout: float = 15.0
@@ -42,6 +45,8 @@ class Settings:
     max_daily_loss: float = 0.03
     max_consecutive_losses: int = 4
     max_symbol_exposure: float = 0.20
+    max_portfolio_gross_exposure: float = 0.60
+    max_portfolio_net_exposure: float = 0.40
     maker_fee: float = 0.0002
     taker_fee: float = 0.00055
     slippage_percent: float = 0.0005
@@ -76,15 +81,30 @@ class Settings:
     # Expectancy filter: reject scanner/direction combos with negative historical R.
     expectancy_filter_enabled: bool = False
     expectancy_min_avg_r: float = 0.0
-    expectancy_min_samples: int = 10
+    expectancy_min_samples: int = 30
+    expectancy_min_profit_factor: float = 1.20
+    expectancy_min_net_pnl: float = 0.0
     # Explicitly paused scanner/direction combinations, regardless of sample size.
-    blocked_scanner_directions: tuple[tuple[str, str], ...] = ()
+    blocked_scanner_directions: tuple[tuple[str, str], ...] = (
+        ("VOLATILITY_COMPRESSION", "SHORT"),
+        ("BREAKOUT_RETEST", "SHORT"),
+        ("BREAKOUT_RETEST", "LONG"),
+        ("MOMENTUM_EXHAUSTION", "LONG"),
+    )
     # Live gate thresholds measured from persisted forward paper trading.
     paper_min_forward_days: int = 14
     paper_min_closed_trades: int = 30
     paper_max_drawdown: float = 0.10
     paper_funding_interval_hours: int = 8
     paper_emergency_stop_file: str = "data/PAPER_TRADING_STOP"
+    # Paper trading scan interval in seconds (default 300 = 5 minutes).
+    paper_scan_interval: int = 300
+    # Multiplier for setup TTL — doubles the default entry-timeout bars.
+    # 2.0 means a 5m setup lives 2 hours instead of 1 hour.
+    setup_ttl_multiplier: float = 2.0
+    # When enabled, reject entries where direction conflicts with the
+    # market regime (e.g. LONG in TREND_DOWN, SHORT in TREND_UP).
+    regime_filter_enabled: bool = True
 
 
 def _load_dotenv(path: Path) -> None:
@@ -159,6 +179,10 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         raise ValueError("max_daily_loss must be in (0, 1)")
     if not 0 < settings.max_symbol_exposure <= 1:
         raise ValueError("max_symbol_exposure must be in (0, 1]")
+    if not 0 < settings.max_portfolio_gross_exposure <= 1:
+        raise ValueError("max_portfolio_gross_exposure must be in (0, 1]")
+    if not 0 <= settings.max_portfolio_net_exposure <= settings.max_portfolio_gross_exposure:
+        raise ValueError("max_portfolio_net_exposure must not exceed gross exposure")
     if any(value < 0 for value in (settings.maker_fee, settings.taker_fee, settings.slippage_percent)):
         raise ValueError("paper fees and slippage cannot be negative")
     if settings.atr_stop_multiple <= 0:
@@ -172,4 +196,8 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
     if (settings.scanner_workers <= 0 or settings.scan_interval <= 0
             or settings.signal_conflict_window <= 0):
         raise ValueError("scanner workers and interval must be positive")
+    if settings.paper_scan_interval <= 0:
+        raise ValueError("paper_scan_interval must be positive")
+    if settings.setup_ttl_multiplier <= 0:
+        raise ValueError("setup_ttl_multiplier must be positive")
     return settings
