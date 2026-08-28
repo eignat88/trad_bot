@@ -65,13 +65,14 @@ def test_entry_and_target_exit_include_fees_and_slippage():
     opened = engine.check_entries([_candidate()], {"BTCUSDT": 100.0})
 
     assert len(opened) == 1
-    assert opened[0].position_size == 1.0
-    assert engine.balance == 999.9  # entry fee
+    assert opened[0].position_size == pytest.approx(10 / 10.1, rel=1e-6)
+    assert opened[0].risk_usdt == pytest.approx(10.0, abs=1e-5)
+    assert engine.balance < 1_000.0  # entry fee and entry slippage booked once
     assert engine.check_exits({"BTCUSDT": 120.0})
-    # The exit is filled below TP and includes an exit fee.
+    # The exit is filled below TP and all fees/slippage are included.
     assert repo.closed[0]["exit_price"] == 119.88
-    assert repo.closed[0]["pnl_usdt"] == 19.76
-    assert engine.balance == pytest.approx(1019.66012)
+    assert repo.closed[0]["pnl_usdt"] == 19.37
+    assert engine.balance == pytest.approx(1019.36636, rel=1e-6)
 
 
 def test_invalid_geometry_and_out_of_zone_do_not_open_trade():
@@ -150,6 +151,7 @@ def test_funding_is_settled_once_per_completed_interval():
         risk_per_trade=0.01,
         max_symbol_exposure=1.0,
         taker_fee=0.0,
+        slippage_percent=0.0,
         paper_funding_interval_hours=8,
     )
     engine = PaperTradingEngine(settings, repo)
@@ -164,3 +166,62 @@ def test_funding_is_settled_once_per_completed_interval():
 
     engine._apply_funding(trade, 0.1)
     assert trade.funding_paid == pytest.approx(0.1)
+
+
+def test_exposure_cap_recalculates_actual_risk():
+    engine = PaperTradingEngine(
+        Settings(initial_balance=1_000, risk_per_trade=0.10,
+                 max_symbol_exposure=0.10, taker_fee=0, slippage_percent=0),
+        FakeRepository(),
+    )
+    trade = engine.check_entries([_candidate(invalidation_price=90)], {"BTCUSDT": 100})[0]
+    assert trade.position_size == 1
+    assert trade.risk_usdt == 10
+
+
+def test_mark_to_market_equity_and_drawdown_use_open_pnl():
+    engine = PaperTradingEngine(
+        Settings(initial_balance=1_000, taker_fee=0, slippage_percent=0),
+        FakeRepository(),
+    )
+    engine.check_entries([_candidate()], {"BTCUSDT": 100})
+    assert engine.snapshot({"BTCUSDT": 105})["equity"] > engine.balance
+    loss = engine.snapshot({"BTCUSDT": 95})
+    assert loss["equity"] < engine.balance
+    assert loss["max_drawdown_pct"] > 0
+
+
+def test_long_stop_gap_uses_observed_price_not_stop():
+    repo = FakeRepository()
+    engine = PaperTradingEngine(Settings(taker_fee=0, slippage_percent=0), repo)
+    engine.check_entries([_candidate(invalidation_price=90)], {"BTCUSDT": 100})
+    engine.check_exits({"BTCUSDT": 85})
+    assert repo.closed[0]["exit_reason"] == "STOP_LOSS_GAP"
+    assert repo.closed[0]["exit_price"] == 85
+
+
+def test_short_stop_gap_uses_observed_price_not_stop():
+    repo = FakeRepository()
+    engine = PaperTradingEngine(Settings(taker_fee=0, slippage_percent=0), repo)
+    engine.check_entries([
+        _candidate(direction="SHORT", invalidation_price=110, target_1=80)
+    ], {"BTCUSDT": 100})
+    engine.check_exits({"BTCUSDT": 115})
+    assert repo.closed[0]["exit_reason"] == "STOP_LOSS_GAP"
+    assert repo.closed[0]["exit_price"] == 115
+
+
+def test_portfolio_exposure_limits_and_metrics():
+    settings = Settings(
+        initial_balance=1_000, risk_per_trade=0.5, max_symbol_exposure=1,
+        max_portfolio_gross_exposure=0.2, max_portfolio_net_exposure=0.1,
+        taker_fee=0, slippage_percent=0,
+    )
+    engine = PaperTradingEngine(settings, FakeRepository())
+    trade = engine.check_entries([_candidate()], {"BTCUSDT": 100})[0]
+    assert trade.position_size == 1  # net limit caps notional to $100
+    exposure = engine.portfolio_exposure()
+    assert exposure["gross_exposure_pct"] == pytest.approx(0.1)
+    assert exposure["long_exposure_pct"] == pytest.approx(0.1)
+    assert exposure["short_exposure_pct"] == 0
+    assert exposure["net_exposure_pct"] == pytest.approx(0.1)

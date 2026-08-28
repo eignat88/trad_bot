@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from app.models import MarketSnapshot, StrategyDecision, Trade
+from app.storage.safe_jsonl import append_record
 
 
 class JsonlRepository:
@@ -16,9 +17,7 @@ class JsonlRepository:
 
     @staticmethod
     def _append(path: Path, record: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        append_record(path, record)
 
     def save_trade(self, trade: Trade) -> None:
         self._append(self.trade_file, trade.to_dict())

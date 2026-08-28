@@ -1,8 +1,11 @@
 """Scanner 03: Liquidity Sweep Reversal."""
 from __future__ import annotations
+import logging
 from datetime import datetime, timezone
 from app.scanners.models import MarketContext, ScannerDirection, SetupCandidate, SetupState
 from app.scanners.swing_engine import detect_displacement, find_swing_highs, find_swing_lows
+
+logger = logging.getLogger(__name__)
 
 
 class LiquidityReversalScanner:
@@ -92,6 +95,13 @@ class LiquidityReversalScanner:
         )
 
     def scan(self, ctx: MarketContext) -> list[SetupCandidate]:
+        levels = ctx.levels
+        if any(value <= 0 for value in (
+            levels.previous_day_high, levels.previous_day_low,
+            levels.previous_week_high, levels.previous_week_low,
+        )):
+            logger.info("LIQUIDITY_REVERSAL skipped: HTF levels unavailable")
+            return []
         results: list[SetupCandidate] = []
         long_setup = self._scan_long(ctx)
         if long_setup:

@@ -521,10 +521,19 @@ CREATE TABLE IF NOT EXISTS dds.paper_trade (
     exit_reason     TEXT,
     exit_fee        NUMERIC NOT NULL DEFAULT 0,
     -- P&L
+    gross_pnl       NUMERIC NOT NULL DEFAULT 0,
     pnl_usdt        NUMERIC NOT NULL DEFAULT 0,
     pnl_r           NUMERIC NOT NULL DEFAULT 0,
     pnl_percent     NUMERIC NOT NULL DEFAULT 0,
     slippage        NUMERIC NOT NULL DEFAULT 0,
+    entry_market_price NUMERIC,
+    mfe             NUMERIC NOT NULL DEFAULT 0,
+    mae             NUMERIC NOT NULL DEFAULT 0,
+    mfe_r           NUMERIC NOT NULL DEFAULT 0,
+    mae_r           NUMERIC NOT NULL DEFAULT 0,
+    price_at_expiry NUMERIC,
+    distance_to_tp  NUMERIC,
+    distance_to_sl  NUMERIC,
     funding_paid    NUMERIC NOT NULL DEFAULT 0,
     funding_periods INTEGER NOT NULL DEFAULT 0,
     -- status & timestamps
@@ -545,7 +554,8 @@ CREATE TABLE IF NOT EXISTS dds.paper_trade (
     ),
     CONSTRAINT paper_trade_exit_reason_chk CHECK (
         exit_reason IS NULL OR exit_reason IN (
-            'TAKE_PROFIT_1', 'TAKE_PROFIT_2', 'STOP_LOSS', 'TRAILING_STOP',
+            'TAKE_PROFIT_1', 'TAKE_PROFIT_2', 'TAKE_PROFIT_SLIPPAGE',
+            'STOP_LOSS', 'STOP_LOSS_GAP', 'TRAILING_STOP',
             'EXPIRED', 'TIMEOUT', 'MANUAL', 'RISK_LIMIT'
         )
     )
@@ -557,6 +567,23 @@ ALTER TABLE dds.paper_trade
     ADD COLUMN IF NOT EXISTS funding_paid NUMERIC NOT NULL DEFAULT 0;
 ALTER TABLE dds.paper_trade
     ADD COLUMN IF NOT EXISTS funding_periods INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE dds.paper_trade ADD COLUMN IF NOT EXISTS gross_pnl NUMERIC NOT NULL DEFAULT 0;
+ALTER TABLE dds.paper_trade ADD COLUMN IF NOT EXISTS entry_market_price NUMERIC;
+ALTER TABLE dds.paper_trade ADD COLUMN IF NOT EXISTS mfe NUMERIC NOT NULL DEFAULT 0;
+ALTER TABLE dds.paper_trade ADD COLUMN IF NOT EXISTS mae NUMERIC NOT NULL DEFAULT 0;
+ALTER TABLE dds.paper_trade ADD COLUMN IF NOT EXISTS mfe_r NUMERIC NOT NULL DEFAULT 0;
+ALTER TABLE dds.paper_trade ADD COLUMN IF NOT EXISTS mae_r NUMERIC NOT NULL DEFAULT 0;
+ALTER TABLE dds.paper_trade ADD COLUMN IF NOT EXISTS price_at_expiry NUMERIC;
+ALTER TABLE dds.paper_trade ADD COLUMN IF NOT EXISTS distance_to_tp NUMERIC;
+ALTER TABLE dds.paper_trade ADD COLUMN IF NOT EXISTS distance_to_sl NUMERIC;
+ALTER TABLE dds.paper_trade DROP CONSTRAINT IF EXISTS paper_trade_exit_reason_chk;
+ALTER TABLE dds.paper_trade ADD CONSTRAINT paper_trade_exit_reason_chk CHECK (
+    exit_reason IS NULL OR exit_reason IN (
+        'TAKE_PROFIT_1', 'TAKE_PROFIT_2', 'TAKE_PROFIT_SLIPPAGE',
+        'STOP_LOSS', 'STOP_LOSS_GAP', 'TRAILING_STOP',
+        'EXPIRED', 'TIMEOUT', 'MANUAL', 'RISK_LIMIT'
+    )
+);
 
 CREATE INDEX IF NOT EXISTS idx_paper_trade_status ON dds.paper_trade (status);
 CREATE INDEX IF NOT EXISTS idx_paper_trade_symbol ON dds.paper_trade (symbol, status);
