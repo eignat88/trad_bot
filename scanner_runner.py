@@ -210,9 +210,20 @@ def main() -> None:
     symbols = [str(item["symbol"]) for item in universe]
 
     repository = ScannerRepository(
-        host="localhost", port=5432, database="trad_bot", user="postgres",
+        host=settings.db_host,
+        port=settings.db_port,
+        database=settings.db_name,
+        user=settings.db_user,
+        password=settings.db_password,
+        backend="postgres",
     )
     repository.ensure_schema()
+
+    # Health-check: verify database connectivity before starting
+    if not repository.ping():
+        logger.error("database health check failed")
+        repository.close()
+        raise SystemExit("database health check failed")
 
     if not repository.acquire_runner_lock():
         # Try to clear stale idle backends holding the advisory lock

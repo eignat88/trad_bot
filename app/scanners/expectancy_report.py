@@ -34,7 +34,16 @@ def _print_table(title: str, columns: list[str], rows: list[tuple]) -> None:
 
 
 def show_reports(*, limit: int = 30, backend: str = "postgres") -> None:
-    repository = ScannerRepository(backend=backend)
+    from app.config import load_settings
+    settings = load_settings()
+    repository = ScannerRepository(
+        host=settings.db_host,
+        port=settings.db_port,
+        database=settings.db_name,
+        user=settings.db_user,
+        password=settings.db_password,
+        backend=backend,
+    )
     repository.ensure_schema()
     try:
         cursor = repository._conn.cursor() if repository._use_pg else None

@@ -1,1 +1,1 @@
-# The runtime intentionally uses only the Python standard library.
+pg8000==1.31.5

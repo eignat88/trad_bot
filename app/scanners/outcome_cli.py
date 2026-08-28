@@ -95,7 +95,14 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     settings = load_settings()
-    repository = ScannerRepository(backend="postgres")
+    repository = ScannerRepository(
+        host=settings.db_host,
+        port=settings.db_port,
+        database=settings.db_name,
+        user=settings.db_user,
+        password=settings.db_password,
+        backend="postgres",
+    )
     repository.ensure_schema()
     client = BybitClient(settings)
     try:
