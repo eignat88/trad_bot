@@ -153,6 +153,7 @@ def run_scan_cycle(
                         min_samples=settings.expectancy_min_samples,
                         blocked_combinations=frozenset(settings.blocked_scanner_directions),
                         regime_filter=settings.regime_filter_enabled,
+                        trading_mode=settings.trading_mode,
                     )
                 else:
                     candidates, symbol_stats = orchestrator.scan_all_with_stats(

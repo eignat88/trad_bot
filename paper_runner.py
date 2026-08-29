@@ -195,6 +195,7 @@ def run_cycle(
                 min_avg_r=settings.expectancy_min_avg_r,
                 min_samples=settings.expectancy_min_samples,
                 blocked_combinations=frozenset(settings.blocked_scanner_directions),
+                trading_mode=settings.trading_mode,
             )
             stats["expectancy_rejected"] = rejected
 

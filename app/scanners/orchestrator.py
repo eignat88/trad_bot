@@ -73,9 +73,11 @@ class ScannerOrchestrator:
         min_samples: int = 10,
         blocked_combinations: frozenset[tuple[str, str]] = frozenset(),
         regime_filter: bool = False,
+        trading_mode: str = "paper",
     ) -> list[SetupCandidate]:
         candidates, _ = self.scan_all_with_stats(
             ctx, expectancy_filter, min_avg_r, min_samples, blocked_combinations,
+            trading_mode=trading_mode,
         )
         if regime_filter:
             candidates = self._apply_regime_filter(ctx, candidates)
@@ -89,6 +91,7 @@ class ScannerOrchestrator:
         min_samples: int = 10,
         blocked_combinations: frozenset[tuple[str, str]] = frozenset(),
         regime_filter: bool = False,
+        trading_mode: str = "paper",
     ) -> tuple[list[SetupCandidate], dict[str, dict[str, int | float]]]:
         """Run every configured scanner and return per-scanner observability data."""
         self.scan_count += 1
@@ -146,6 +149,7 @@ class ScannerOrchestrator:
                 min_avg_r=min_avg_r,
                 min_samples=min_samples,
                 blocked_combinations=blocked_combinations,
+                trading_mode=trading_mode,
             )
 
         if valid:

@@ -49,11 +49,20 @@ class ExpectancyFilter:
         min_samples: int = DEFAULT_MIN_SAMPLES,
         min_profit_factor: float = 1.20,
         min_net_pnl: float = 0.0,
+        trading_mode: str = "paper",
     ) -> bool:
-        """Allow execution only after the configured evidence gates pass."""
+        """Allow execution only after the configured evidence gates pass.
+
+        In PAPER mode, combinations with insufficient samples are allowed
+        through for bootstrap data collection.  LIVE mode always enforces
+        the full evidence gate.
+        """
         key = (scanner_name, direction)
         rec = self.records.get(key)
         if rec is None or rec.samples < min_samples:
+            # PAPER bootstrap: allow to accumulate stats.
+            if trading_mode == "paper":
+                return True
             return False
         return (
             rec.avg_r_after_costs > min_avg_r
@@ -114,11 +123,14 @@ def filter_candidates(
     min_net_pnl: float = 0.0,
     enforce_expectancy: bool = True,
     blocked_combinations: frozenset[tuple[str, str]] = frozenset(),
+    trading_mode: str = "paper",
 ) -> tuple[list[SetupCandidate], int]:
     """Filter candidates by manual blocks and historical expectancy.
 
     ``blocked_combinations`` rejects a scanner/direction pair regardless of its
-    historical sample count. Returns (accepted, rejected_count).
+    historical sample count.  In PAPER mode, combinations with fewer than
+    ``min_samples`` closed trades are allowed through for bootstrap data
+    collection.  Returns (accepted, rejected_count).
     """
     accepted: list[SetupCandidate] = []
     rejected = 0
@@ -141,6 +153,7 @@ def filter_candidates(
             min_samples=min_samples,
             min_profit_factor=min_profit_factor,
             min_net_pnl=min_net_pnl,
+            trading_mode=trading_mode,
         ):
             accepted.append(c)
         else:
