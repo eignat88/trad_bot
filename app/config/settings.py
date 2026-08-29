@@ -114,7 +114,7 @@ class Settings:
     # Paper consecutive-loss cooldown: after max_consecutive_losses is
     # reached, block new entries for this many minutes before allowing
     # fresh entries again.  Set to 0 to keep the old hard-stop behavior.
-    paper_consecutive_loss_cooldown_minutes: int = 360
+    paper_consecutive_loss_cooldown_minutes: int = 5
 
 
 def _load_dotenv(path: Path) -> None:
