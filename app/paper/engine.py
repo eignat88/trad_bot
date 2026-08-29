@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from app.config import Settings
+from app.paper.exit_reasons import EXPIRED_EXIT_REASONS, PaperTradeExitReason
 from app.scanners.models import SetupCandidate
 
 logger = logging.getLogger(__name__)
@@ -453,7 +454,7 @@ class PaperTradingEngine:
         self,
         trade: PaperTradeRecord,
         exit_price: float,
-        reason: str,
+        reason: PaperTradeExitReason,
     ) -> PaperTradeRecord:
         """Close a paper trade and calculate P&L."""
         slip = self.settings.slippage_percent
@@ -492,7 +493,7 @@ class PaperTradingEngine:
         risk_distance = trade.risk_usdt / trade.position_size if trade.position_size > 0 else 0.0
         mfe_r = trade.mfe / risk_distance if risk_distance > 0 else 0.0
         mae_r = trade.mae / risk_distance if risk_distance > 0 else 0.0
-        is_expiry = reason in ("EXPIRED", "EXPIRED_PROFITABLE")
+        is_expiry = reason in EXPIRED_EXIT_REASONS
         if is_expiry and trade.direction == "LONG":
             distance_to_tp = trade.target_1 - exit_price if trade.target_1 is not None else None
             distance_to_sl = exit_price - trade.stop_price
