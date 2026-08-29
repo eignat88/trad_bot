@@ -50,12 +50,16 @@ class BreakoutRetestScanner:
         recent_low = min(c.low for c in candles_5m[-5:])
         invalidation = recent_low * 0.998
         atr = ctx.indicators.atr if ctx.indicators.atr > 0 else (resistance * 0.02)
+        target_1 = resistance + atr * 2
+        target_2 = resistance + atr * 3.5
+        if invalidation >= retest_zone_low or target_1 <= retest_zone_high:
+            return None
         return SetupCandidate(
             scanner_name=self.name, scanner_version=self.version, symbol=ctx.symbol,
             direction=ScannerDirection.LONG.value, htf_timeframe="1h", setup_timeframe="15m", entry_timeframe="5m",
             detected_at=ctx.evaluated_at, setup_started_at=datetime.fromtimestamp(candles_15m[breakout_candle_idx].timestamp / 1000, tz=timezone.utc),
             reference_price=resistance, entry_zone_low=retest_zone_low, entry_zone_high=retest_zone_high,
-            invalidation_price=invalidation, target_1=resistance + atr * 2, target_2=resistance + atr * 3.5,
+            invalidation_price=invalidation, target_1=target_1, target_2=target_2,
             market_regime=ctx.market_regime, state=SetupState.SETUP_READY,
             features={"htf_context": True, "breakout_level": resistance,
                       "volume_confirmation": min(breakout_vol / avg_vol / 2, 1),
@@ -91,12 +95,16 @@ class BreakoutRetestScanner:
         recent_high = max(c.high for c in candles_5m[-5:])
         invalidation = recent_high * 1.002
         atr = ctx.indicators.atr if ctx.indicators.atr > 0 else (support * 0.02)
+        target_1 = support - atr * 2
+        target_2 = support - atr * 3.5
+        if invalidation <= retest_zone_high or target_1 >= retest_zone_low:
+            return None
         return SetupCandidate(
             scanner_name=self.name, scanner_version=self.version, symbol=ctx.symbol,
             direction=ScannerDirection.SHORT.value, htf_timeframe="1h", setup_timeframe="15m", entry_timeframe="5m",
             detected_at=ctx.evaluated_at, setup_started_at=datetime.fromtimestamp(candles_15m[breakdown_candle_idx].timestamp / 1000, tz=timezone.utc),
             reference_price=support, entry_zone_low=retest_zone_low, entry_zone_high=retest_zone_high,
-            invalidation_price=invalidation, target_1=support - atr * 2, target_2=support - atr * 3.5,
+            invalidation_price=invalidation, target_1=target_1, target_2=target_2,
             market_regime=ctx.market_regime, state=SetupState.SETUP_READY,
             features={"htf_context": True, "breakout_level": support,
                       "volume_confirmation": min(breakdown_vol / avg_vol / 2, 1),
