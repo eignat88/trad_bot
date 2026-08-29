@@ -306,6 +306,7 @@ def cmd_run_once(args: argparse.Namespace) -> None:
             min_net_pnl=settings.expectancy_min_net_pnl,
             enforce_expectancy=settings.expectancy_filter_enabled,
             blocked_combinations=frozenset(settings.blocked_scanner_directions),
+            trading_mode=settings.trading_mode,
         )
         if rejected:
             logger.info("paper: candidate filter rejected %d setups", rejected)
