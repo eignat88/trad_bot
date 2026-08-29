@@ -111,6 +111,10 @@ class Settings:
     # When enabled, reject entries where direction conflicts with the
     # market regime (e.g. LONG in TREND_DOWN, SHORT in TREND_UP).
     regime_filter_enabled: bool = True
+    # Paper consecutive-loss cooldown: after max_consecutive_losses is
+    # reached, block new entries for this many minutes before allowing
+    # fresh entries again.  Set to 0 to keep the old hard-stop behavior.
+    paper_consecutive_loss_cooldown_minutes: int = 360
 
 
 def _load_dotenv(path: Path) -> None:
@@ -215,4 +219,6 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         raise ValueError("paper_scan_interval must be positive")
     if settings.setup_ttl_multiplier <= 0:
         raise ValueError("setup_ttl_multiplier must be positive")
+    if settings.paper_consecutive_loss_cooldown_minutes < 0:
+        raise ValueError("paper_consecutive_loss_cooldown_minutes cannot be negative")
     return settings

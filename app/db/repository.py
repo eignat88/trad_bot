@@ -1120,10 +1120,10 @@ class ScannerRepository:
             "max_drawdown": float(row[2]),
         }
 
-    def get_paper_risk_state(self) -> dict[str, int | float]:
-        """Return today's realized loss and the current consecutive-loss streak."""
+    def get_paper_risk_state(self) -> dict[str, int | float | Any]:
+        """Return today's realized loss, consecutive-loss streak, and cooldown state."""
         if not self._use_pg:
-            return {"daily_loss_usdt": 0.0, "consecutive_losses": 0}
+            return {"daily_loss_usdt": 0.0, "consecutive_losses": 0, "cooldown_until": None}
         cursor = self._conn.cursor()
         cursor.execute(
             """
@@ -1144,9 +1144,18 @@ class ScannerRepository:
             if float(pnl or 0) - float(entry_fee or 0) >= 0:
                 break
             consecutive_losses += 1
+
+        # Read cooldown_until from the latest paper_account snapshot
+        cursor.execute(
+            "SELECT cooldown_until FROM dds.paper_account ORDER BY created_at DESC LIMIT 1"
+        )
+        cooldown_row = cursor.fetchone()
+        cooldown_until = cooldown_row[0] if cooldown_row and cooldown_row[0] else None
+
         return {
             "daily_loss_usdt": daily_loss,
             "consecutive_losses": consecutive_losses,
+            "cooldown_until": cooldown_until,
         }
 
     def save_paper_account_snapshot(
@@ -1159,8 +1168,9 @@ class ScannerRepository:
         losing_trades: int,
         total_pnl: float,
         max_drawdown: float,
+        cooldown_until: Any | None = None,
     ) -> None:
-        """Save an account equity snapshot."""
+        """Save an account equity snapshot, optionally including cooldown state."""
         if not self._use_pg:
             return
         cursor = self._conn.cursor()
@@ -1169,12 +1179,14 @@ class ScannerRepository:
                 """
                 INSERT INTO dds.paper_account (
                     balance, equity, open_positions, total_trades,
-                    winning_trades, losing_trades, total_pnl, max_drawdown
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    winning_trades, losing_trades, total_pnl, max_drawdown,
+                    cooldown_until
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     balance, equity, open_positions, total_trades,
                     winning_trades, losing_trades, total_pnl, max_drawdown,
+                    cooldown_until,
                 ),
             )
             self._conn.commit()
