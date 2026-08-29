@@ -108,6 +108,7 @@ def test_daily_and_consecutive_loss_limits_survive_restart():
         initial_balance=1_000.0,
         max_daily_loss=0.03,
         max_consecutive_losses=2,
+        paper_consecutive_loss_cooldown_minutes=0,  # disable cooldown for hard-stop test
     )
     daily_limit_repo = FakeRepository({"daily_loss_usdt": 30.0, "consecutive_losses": 0})
     assert PaperTradingEngine(settings, daily_limit_repo).check_entries(
@@ -243,3 +244,236 @@ def test_portfolio_exposure_limits_and_metrics():
     assert exposure["long_exposure_pct"] == pytest.approx(0.1)
     assert exposure["short_exposure_pct"] == 0
     assert exposure["net_exposure_pct"] == pytest.approx(0.1)
+
+
+# ===================================================================
+# CONSECUTIVE-LOSS COOLDOWN TESTS (P0 fix)
+# ===================================================================
+
+def _cooldown_settings(**overrides) -> Settings:
+    defaults = dict(
+        initial_balance=10_000.0,
+        risk_per_trade=0.005,
+        max_consecutive_losses=4,
+        paper_consecutive_loss_cooldown_minutes=360,
+        trading_mode="paper",
+    )
+    defaults.update(overrides)
+    return Settings(**defaults)
+
+
+class FakeCooldownRepository:
+    """Repository that tracks cooldown state in memory."""
+
+    def __init__(self, risk_state=None):
+        self.saved = []
+        self.closed = []
+        self.risk_state = risk_state or {
+            "daily_loss_usdt": 0.0,
+            "consecutive_losses": 0,
+            "cooldown_until": None,
+        }
+        self.last_snapshot_cooldown = None
+
+    def get_open_paper_trades(self):
+        return []
+
+    def get_paper_risk_state(self):
+        return self.risk_state
+
+    def get_latest_paper_account_snapshot(self):
+        return None
+
+    def save_paper_trade(self, trade):
+        self.saved.append(trade)
+        return len(self.saved)
+
+    def close_paper_trade(self, **kwargs):
+        self.closed.append(kwargs)
+
+    def update_paper_trade_funding(self, *args):
+        pass
+
+    def save_paper_account_snapshot(self, **kwargs):
+        self.last_snapshot_cooldown = kwargs.get("cooldown_until")
+
+
+def _make_loss_candidate() -> SetupCandidate:
+    return _candidate()
+
+
+def _simulate_n_losses(engine, n, repo):
+    """Simulate n consecutive losses by entering and immediately stopping."""
+    for _ in range(n):
+        opened = engine.check_entries([_make_loss_candidate()], {"BTCUSDT": 100.0})
+        assert len(opened) == 1
+        closed = engine.check_exits({"BTCUSDT": 85.0})
+        assert len(closed) == 1
+        assert repo.closed[-1]["exit_reason"] in ("STOP_LOSS", "STOP_LOSS_GAP")
+
+
+# TEST 1 — below limit: consecutive_losses=3, max=4 → entry allowed
+def test_below_limit_entry_allowed():
+    repo = FakeCooldownRepository(
+        risk_state={"daily_loss_usdt": 0.0, "consecutive_losses": 3, "cooldown_until": None}
+    )
+    settings = _cooldown_settings(max_consecutive_losses=4)
+    engine = PaperTradingEngine(settings, repo)
+
+    opened = engine.check_entries([_make_loss_candidate()], {"BTCUSDT": 100.0})
+    assert len(opened) == 1
+    assert engine._cooldown_until is None
+
+
+# TEST 2 — reaching limit: losses become 4 → cooldown activated, entries blocked
+def test_reaching_limit_activates_cooldown():
+    repo = FakeCooldownRepository(
+        risk_state={"daily_loss_usdt": 0.0, "consecutive_losses": 3, "cooldown_until": None}
+    )
+    settings = _cooldown_settings(max_consecutive_losses=4)
+    engine = PaperTradingEngine(settings, repo)
+
+    # 4th loss triggers cooldown
+    _simulate_n_losses(engine, 1, repo)
+    assert engine._consecutive_losses == 4
+    assert engine._cooldown_until is not None
+
+    # Next cycle: entries blocked
+    opened = engine.check_entries([_make_loss_candidate()], {"BTCUSDT": 100.0})
+    assert len(opened) == 0
+
+
+# TEST 3 — cooldown expires: entries unblocked, losses reset
+def test_cooldown_expires_entries_unblocked():
+    fixed_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    repo = FakeCooldownRepository(
+        risk_state={"daily_loss_usdt": 0.0, "consecutive_losses": 4, "cooldown_until": None}
+    )
+    settings = _cooldown_settings(max_consecutive_losses=4)
+    engine = PaperTradingEngine(settings, repo, clock=lambda: fixed_now)
+
+    # Manually set cooldown that already expired
+    engine._consecutive_losses = 4
+    engine._cooldown_until = fixed_now - timedelta(hours=1)
+
+    opened = engine.check_entries([_make_loss_candidate()], {"BTCUSDT": 100.0})
+    assert len(opened) == 1
+    assert engine._consecutive_losses == 0
+    assert engine._cooldown_until is None
+
+
+# TEST 4 — restart during active cooldown: state restored
+def test_restart_during_cooldown_restores_state():
+    cooldown_until = datetime(2026, 1, 1, 18, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 1, 1, 14, 0, 0, tzinfo=timezone.utc)
+    repo = FakeCooldownRepository(
+        risk_state={
+            "daily_loss_usdt": 0.0,
+            "consecutive_losses": 4,
+            "cooldown_until": cooldown_until,
+        }
+    )
+    settings = _cooldown_settings(max_consecutive_losses=4)
+    engine = PaperTradingEngine(settings, repo, clock=lambda: fixed_now)
+
+    assert engine._consecutive_losses == 4
+    assert engine._cooldown_until == cooldown_until
+
+    # Entries blocked
+    opened = engine.check_entries([_make_loss_candidate()], {"BTCUSDT": 100.0})
+    assert len(opened) == 0
+
+
+# TEST 5 — restart after expired cooldown: cleared, entries allowed
+def test_restart_after_expired_cooldown_clears():
+    cooldown_until = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 1, 1, 14, 0, 0, tzinfo=timezone.utc)
+    repo = FakeCooldownRepository(
+        risk_state={
+            "daily_loss_usdt": 0.0,
+            "consecutive_losses": 4,
+            "cooldown_until": cooldown_until,
+        }
+    )
+    settings = _cooldown_settings(max_consecutive_losses=4)
+    engine = PaperTradingEngine(settings, repo, clock=lambda: fixed_now)
+
+    assert engine._consecutive_losses == 0
+    assert engine._cooldown_until is None
+
+    opened = engine.check_entries([_make_loss_candidate()], {"BTCUSDT": 100.0})
+    assert len(opened) == 1
+
+
+# TEST 6 — LIVE mode: hard stop, no cooldown
+def test_live_mode_hard_stop_no_cooldown():
+    repo = FakeCooldownRepository(
+        risk_state={"daily_loss_usdt": 0.0, "consecutive_losses": 4, "cooldown_until": None}
+    )
+    settings = _cooldown_settings(trading_mode="live")
+    engine = PaperTradingEngine(settings, repo)
+
+    opened = engine.check_entries([_make_loss_candidate()], {"BTCUSDT": 100.0})
+    assert len(opened) == 0
+    assert engine._cooldown_until is None
+
+
+# TEST 7 — profit before limit resets streak
+def test_profit_before_limit_resets_streak():
+    repo = FakeCooldownRepository()
+    settings = _cooldown_settings(max_consecutive_losses=4)
+    engine = PaperTradingEngine(settings, repo)
+
+    # 2 losses
+    _simulate_n_losses(engine, 2, repo)
+    assert engine._consecutive_losses == 2
+
+    # 1 win → streak resets
+    opened = engine.check_entries([_make_loss_candidate()], {"BTCUSDT": 100.0})
+    assert len(opened) == 1
+    closed = engine.check_exits({"BTCUSDT": 120.0})
+    assert len(closed) == 1
+    assert engine._consecutive_losses == 0
+    assert engine._cooldown_until is None
+
+
+# TEST 8 — existing position management continues during cooldown
+def test_position_management_during_cooldown():
+    repo = FakeCooldownRepository()
+    settings = _cooldown_settings(max_consecutive_losses=2)
+    engine = PaperTradingEngine(settings, repo)
+
+    # Open a trade (before limit)
+    opened = engine.check_entries([_make_loss_candidate()], {"BTCUSDT": 100.0})
+    assert len(opened) == 1
+
+    # Simulate 2 losses to activate cooldown
+    engine._consecutive_losses = 2
+    engine._cooldown_until = datetime.now(timezone.utc) + timedelta(hours=6)
+
+    # Entries blocked
+    assert engine.check_entries([_make_loss_candidate()], {"BTCUSDT": 100.0}) == []
+
+    # But exit check still works — position can be closed
+    closed = engine.check_exits({"BTCUSDT": 85.0})
+    assert len(closed) == 1
+    assert "BTCUSDT" not in engine.open_trades
+
+
+# TEST 9 — repeated cycles don't push cooldown_until forward
+def test_cooldown_not_extended_on_each_cycle():
+    fixed_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    repo = FakeCooldownRepository()
+    settings = _cooldown_settings(max_consecutive_losses=4)
+    engine = PaperTradingEngine(settings, repo, clock=lambda: fixed_now)
+
+    # Activate cooldown
+    engine._consecutive_losses = 4
+    engine._cooldown_until = fixed_now + timedelta(hours=6)
+
+    original_until = engine._cooldown_until
+
+    # Multiple cycles — cooldown_until must not change
+    for _ in range(5):
+        engine.check_entries([_make_loss_candidate()], {"BTCUSDT": 100.0})
+        assert engine._cooldown_until == original_until

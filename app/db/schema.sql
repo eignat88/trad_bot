@@ -616,6 +616,10 @@ CREATE TABLE IF NOT EXISTS dds.paper_account (
 
 CREATE INDEX IF NOT EXISTS idx_paper_account_time ON dds.paper_account (created_at DESC);
 
+-- Cooldown state for paper consecutive-loss gate
+ALTER TABLE dds.paper_account
+    ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMPTZ;
+
 -- ============================================================
 -- PAPER_TRADE_STATS: aggregated performance by scanner
 -- ============================================================

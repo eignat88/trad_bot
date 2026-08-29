@@ -339,6 +339,7 @@ def cmd_run_once(args: argparse.Namespace) -> None:
         losing_trades=losing,
         total_pnl=total_pnl,
         max_drawdown=engine._max_drawdown,
+        cooldown_until=engine._cooldown_until,
     )
 
     print(json.dumps(account, indent=2))

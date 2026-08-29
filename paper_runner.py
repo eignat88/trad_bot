@@ -227,6 +227,7 @@ def run_cycle(
             losing_trades=losing,
             total_pnl=total_pnl,
             max_drawdown=engine._max_drawdown,
+            cooldown_until=engine._cooldown_until,
         )
     except Exception:
         logger.exception("failed to save account snapshot")

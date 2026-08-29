@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from app.config import Settings
@@ -92,6 +92,7 @@ class PaperTradingEngine:
         self._loaded_account_snapshot = False
         self._daily_loss_usdt: float = 0.0
         self._consecutive_losses: int = 0
+        self._cooldown_until: datetime | None = None
 
         # Restore account/risk state before rebuilding any open positions.
         self._load_account_state()
@@ -157,8 +158,46 @@ class PaperTradingEngine:
                 logger.warning("paper gate: daily loss limit reached, skipping new entries")
                 break
             if self._consecutive_losses >= self.settings.max_consecutive_losses:
-                logger.warning("paper gate: consecutive loss limit reached, skipping new entries")
-                break
+                if self.settings.trading_mode == "paper" and self.settings.paper_consecutive_loss_cooldown_minutes > 0:
+                    # Paper mode: activate cooldown instead of hard stop
+                    if self._cooldown_until is None:
+                        self._cooldown_until = self._clock().replace(
+                            microsecond=0
+                        ) + timedelta(
+                            minutes=self.settings.paper_consecutive_loss_cooldown_minutes
+                        )
+                        logger.warning(
+                            "paper risk gate activated: reason=MAX_CONSECUTIVE_LOSSES "
+                            "losses=%d limit=%d cooldown_until=%s",
+                            self._consecutive_losses,
+                            self.settings.max_consecutive_losses,
+                            self._cooldown_until.isoformat(),
+                        )
+                    elif self._cooldown_until <= self._clock():
+                        # Cooldown expired — reset and allow entries
+                        prev = self._consecutive_losses
+                        self._consecutive_losses = 0
+                        self._cooldown_until = None
+                        logger.info(
+                            "paper consecutive-loss cooldown completed: "
+                            "previous_losses=%d consecutive_losses reset to 0 "
+                            "new entries enabled",
+                            prev,
+                        )
+                    else:
+                        remaining = (self._cooldown_until - self._clock()).total_seconds() / 60
+                        logger.debug(
+                            "paper consecutive-loss cooldown active: "
+                            "losses=%d cooldown_until=%s remaining_minutes=%.0f",
+                            self._consecutive_losses,
+                            self._cooldown_until.isoformat(),
+                            remaining,
+                        )
+                        break
+                else:
+                    # Live mode or cooldown disabled: hard stop
+                    logger.warning("paper gate: consecutive loss limit reached, skipping new entries")
+                    break
 
             # Market regime filter: reject entries that fight the dominant trend.
             if self.settings.regime_filter_enabled and c.market_regime:
@@ -495,6 +534,23 @@ class PaperTradingEngine:
         if net_pnl < 0:
             self._daily_loss_usdt += -net_pnl
             self._consecutive_losses += 1
+            # Activate cooldown immediately when limit is reached (paper mode)
+            if (self._consecutive_losses >= self.settings.max_consecutive_losses
+                    and self.settings.trading_mode == "paper"
+                    and self.settings.paper_consecutive_loss_cooldown_minutes > 0
+                    and self._cooldown_until is None):
+                self._cooldown_until = self._clock().replace(
+                    microsecond=0
+                ) + timedelta(
+                    minutes=self.settings.paper_consecutive_loss_cooldown_minutes
+                )
+                logger.warning(
+                    "paper risk gate activated: reason=MAX_CONSECUTIVE_LOSSES "
+                    "losses=%d limit=%d cooldown_until=%s",
+                    self._consecutive_losses,
+                    self.settings.max_consecutive_losses,
+                    self._cooldown_until.isoformat(),
+                )
         else:
             self._consecutive_losses = 0
 
@@ -597,13 +653,38 @@ class PaperTradingEngine:
         self._loaded_account_snapshot = True
 
     def _load_risk_state(self) -> None:
-        """Restore today's realized loss and current loss streak after restart."""
+        """Restore today's realized loss, loss streak, and cooldown after restart."""
         get_state = getattr(self.repo, "get_paper_risk_state", None)
         if get_state is None:
             return
         state = get_state()
         self._daily_loss_usdt = float(state.get("daily_loss_usdt", 0.0))
         self._consecutive_losses = int(state.get("consecutive_losses", 0))
+
+        # Restore cooldown state
+        cooldown_until = state.get("cooldown_until")
+        if cooldown_until is not None:
+            now = self._clock()
+            if cooldown_until > now:
+                # Cooldown still active
+                self._cooldown_until = cooldown_until
+                remaining = (cooldown_until - now).total_seconds() / 60
+                logger.info(
+                    "paper consecutive-loss cooldown restored: "
+                    "losses=%d cooldown_until=%s remaining_minutes=%.0f",
+                    self._consecutive_losses,
+                    cooldown_until.isoformat(),
+                    remaining,
+                )
+            else:
+                # Cooldown expired while process was down — clear it
+                logger.info(
+                    "paper consecutive-loss cooldown expired during downtime: "
+                    "clearing cooldown, resetting losses from %d to 0",
+                    self._consecutive_losses,
+                )
+                self._consecutive_losses = 0
+                self._cooldown_until = None
 
     def _load_open_trades(self) -> None:
         """Load any existing OPEN paper trades from the DB on startup.
@@ -711,7 +792,7 @@ class PaperTradingEngine:
         self._update_equity_drawdown()
         exposure = self.portfolio_exposure()
         total_pnl = account["equity"] - self.settings.initial_balance
-        return {
+        result = {
             "balance": round(account["balance"], 2),
             "unrealized_pnl": round(account["unrealized_pnl"], 2),
             "equity": round(account["equity"], 2),
@@ -724,6 +805,8 @@ class PaperTradingEngine:
             "long_exposure_pct": round(exposure["long_exposure_pct"] * 100, 2),
             "short_exposure_pct": round(exposure["short_exposure_pct"] * 100, 2),
             "net_exposure_pct": round(exposure["net_exposure_pct"] * 100, 2),
+            "consecutive_losses": self._consecutive_losses,
+            "cooldown_until": self._cooldown_until.isoformat() if self._cooldown_until else None,
             "open_trades": [
                 {
                     "symbol": t.symbol,
@@ -737,3 +820,4 @@ class PaperTradingEngine:
                 for t in self.open_trades.values()
             ],
         }
+        return result
