@@ -23,7 +23,8 @@ $DB_PORT = "5432"
 $DB_USER = "postgres"
 $DB_NAME = "trad_bot"
 
-$backupDir = Join-Path $PSScriptRoot ".." "artifacts" "db_backup"
+$projectRoot = Split-Path $PSScriptRoot -Parent
+$backupDir = Join-Path $projectRoot "artifacts\db_backup"
 if (-not (Test-Path $backupDir)) {
     New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
 }
