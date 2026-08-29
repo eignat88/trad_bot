@@ -591,10 +591,12 @@ CREATE INDEX IF NOT EXISTS idx_paper_trade_scanner ON dds.paper_trade (scanner_n
 CREATE INDEX IF NOT EXISTS idx_paper_trade_entered ON dds.paper_trade (entered_at DESC);
 CREATE INDEX IF NOT EXISTS idx_paper_trade_setup ON dds.paper_trade (setup_id);
 
--- Only one active (OPEN or PENDING) trade per setup
-CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_trade_active_per_setup
-ON dds.paper_trade (setup_id)
-WHERE status IN ('PENDING', 'OPEN');
+-- One scanner setup is executable exactly once, including after terminal states.
+-- Existing duplicate historical data makes this statement fail explicitly: it is
+-- deliberately not deleted or silently repaired during bootstrap.
+DROP INDEX IF EXISTS dds.uq_paper_trade_active_per_setup;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_trade_setup
+ON dds.paper_trade (setup_id);
 
 -- ============================================================
 -- PAPER_ACCOUNT: running account equity snapshots
@@ -623,21 +625,24 @@ SELECT
     direction,
     COUNT(*) AS total_trades,
     COUNT(*) FILTER (WHERE status = 'CLOSED') AS closed,
-    COUNT(*) FILTER (WHERE pnl_usdt > 0) AS wins,
-    COUNT(*) FILTER (WHERE pnl_usdt < 0) AS losses,
-    ROUND(AVG(pnl_r), 4) AS avg_r,
-    ROUND(AVG(pnl_usdt), 2) AS avg_pnl_usdt,
-    ROUND(SUM(pnl_usdt), 2) AS total_pnl_usdt,
-    ROUND(AVG(pnl_percent), 2) AS avg_pnl_pct,
-    ROUND(AVG(duration_sec), 1) AS avg_duration_sec,
+    COUNT(*) FILTER (WHERE status = 'CLOSED' AND pnl_usdt > 0) AS wins,
+    COUNT(*) FILTER (WHERE status = 'CLOSED' AND pnl_usdt < 0) AS losses,
+    ROUND(AVG(pnl_r) FILTER (WHERE status = 'CLOSED'), 4) AS avg_r,
+    ROUND(AVG(pnl_usdt) FILTER (WHERE status = 'CLOSED'), 2) AS avg_pnl_usdt,
+    ROUND(SUM(pnl_usdt) FILTER (WHERE status = 'CLOSED'), 2) AS total_pnl_usdt,
+    ROUND(AVG(pnl_percent) FILTER (WHERE status = 'CLOSED'), 2) AS avg_pnl_pct,
+    ROUND(AVG(duration_sec) FILTER (WHERE status = 'CLOSED'), 1) AS avg_duration_sec,
     ROUND(
-        COUNT(*) FILTER (WHERE pnl_usdt > 0)::numeric
+        COUNT(*) FILTER (WHERE status = 'CLOSED' AND pnl_usdt > 0)::numeric
         / NULLIF(COUNT(*) FILTER (WHERE status = 'CLOSED'), 0),
         4
     ) AS win_rate,
     ROUND(
-        SUM(GREATEST(pnl_usdt, 0))
-        / NULLIF(ABS(SUM(LEAST(pnl_usdt, 0))), 0),
+        SUM(GREATEST(pnl_usdt, 0)) FILTER (WHERE status = 'CLOSED')
+        / NULLIF(
+            ABS(SUM(LEAST(pnl_usdt, 0)) FILTER (WHERE status = 'CLOSED')),
+            0
+        ),
         4
     ) AS profit_factor
 FROM dds.paper_trade

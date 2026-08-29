@@ -249,8 +249,25 @@ class PaperTradingEngine:
                 lowest_since_entry=price,
             )
 
-            # Persist to DB
+            # Do not re-execute a setup after runner restart or a terminal exit.
+            # The repository repeats this check transactionally and its database
+            # unique index is the final guard for concurrent workers.
+            existing_trade_id = getattr(
+                self.repo, "get_paper_trade_by_setup", lambda _setup_id: None,
+            )(trade.setup_id)
+            if existing_trade_id is not None:
+                logger.info(
+                    "paper trade duplicate suppressed: setup_id=%s symbol=%s scanner=%s "
+                    "existing_trade_id=%s duplicate_reason=setup_already_executed",
+                    trade.setup_id, trade.symbol, trade.scanner_name, existing_trade_id,
+                )
+                continue
+
             trade_id = self.repo.save_paper_trade(trade)
+            if trade_id is None and getattr(self.repo, "_use_pg", False):
+                # A concurrent worker inserted this setup and save_paper_trade
+                # converted the expected unique violation into an idempotent result.
+                continue
             trade.trade_id = trade_id
 
             self.balance -= entry_fee + entry_slippage_cost
