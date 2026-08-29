@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal, Mapping
 from uuid import UUID
 
+from app.paper.exit_reasons import PAPER_TRADE_EXIT_REASONS, PaperTradeExitReason
 from app.scanners.models import SetupCandidate, SetupState
 from app.scanners.outcome import SignalOutcome
 from app.storage.safe_jsonl import atomic_rewrite, file_lock, read_records
@@ -945,7 +946,7 @@ class ScannerRepository:
         self,
         trade_id: int | None,
         exit_price: float,
-        exit_reason: str,
+        exit_reason: PaperTradeExitReason,
         exit_fee: float,
         pnl_usdt: float,
         pnl_r: float,
@@ -963,7 +964,9 @@ class ScannerRepository:
         distance_to_tp: float | None,
         distance_to_sl: float | None,
     ) -> None:
-        """Update a paper trade with exit data."""
+        """Update a paper trade with exit data from the canonical contract."""
+        if exit_reason not in PAPER_TRADE_EXIT_REASONS:
+            raise ValueError(f"Unsupported paper trade exit reason: {exit_reason}")
         if not self._use_pg or trade_id is None:
             return
         cursor = self._conn.cursor()
