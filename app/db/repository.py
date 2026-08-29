@@ -868,12 +868,37 @@ class ScannerRepository:
     # ----------------------------------------------------------------
     # PAPER TRADING
     # ----------------------------------------------------------------
+    def get_paper_trade_by_setup(self, setup_id: str) -> int | None:
+        """Return any historical paper trade for setup_id, regardless of status."""
+        if not self._use_pg:
+            return None
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "SELECT trade_id FROM dds.paper_trade WHERE setup_id = %s",
+            (setup_id,),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+
     def save_paper_trade(self, trade: Any) -> int | None:
-        """Insert a new paper trade and return its trade_id."""
+        """Atomically create a trade and mark its setup EXECUTED.
+
+        A None result means the setup was already executed by another call; the
+        database unique index is the final race-condition guard.
+        """
         if not self._use_pg:
             return None
         cursor = self._conn.cursor()
         try:
+            existing_id = self.get_paper_trade_by_setup(str(trade.setup_id))
+            if existing_id is not None:
+                logger.info(
+                    "paper trade duplicate suppressed: setup_id=%s symbol=%s scanner=%s "
+                    "existing_trade_id=%s duplicate_reason=setup_already_executed",
+                    trade.setup_id, trade.symbol, trade.scanner_name, existing_id,
+                )
+                return None
+
             cursor.execute(
                 """
                 INSERT INTO dds.paper_trade (
@@ -891,17 +916,28 @@ class ScannerRepository:
                     trade.direction, trade.score, trade.entry_price,
                     trade.entry_fee, trade.stop_price, trade.target_1,
                     trade.target_2, trade.entry_timeframe, trade.position_size,
-                    trade.risk_usdt,
-                    trade.balance_before, trade.market_regime,
-                    trade.entry_market_price, trade.entry_slippage_cost,
-                    trade.entered_at,
+                    trade.risk_usdt, trade.balance_before, trade.market_regime,
+                    trade.entry_market_price, trade.entry_slippage_cost, trade.entered_at,
                 ),
             )
-            self._conn.commit()
             row = cursor.fetchone()
+            cursor.execute(
+                "UPDATE dds.scanner_setup SET status = 'EXECUTED', executed_at = now(), "
+                "updated_at = now() WHERE setup_id = %s",
+                (trade.setup_id,),
+            )
+            self._conn.commit()
             return row[0] if row else None
-        except Exception:
+        except Exception as exc:
             self._conn.rollback()
+            if getattr(exc, "sqlstate", None) == "23505" or "duplicate key" in str(exc).lower():
+                existing_id = self.get_paper_trade_by_setup(str(trade.setup_id))
+                logger.info(
+                    "paper trade duplicate suppressed: setup_id=%s symbol=%s scanner=%s "
+                    "existing_trade_id=%s duplicate_reason=unique_violation",
+                    trade.setup_id, trade.symbol, trade.scanner_name, existing_id,
+                )
+                return None
             logger.exception("save_paper_trade failed for %s", trade.symbol)
             raise
 

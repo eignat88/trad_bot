@@ -25,6 +25,12 @@ class FakeRepository:
     def get_latest_paper_account_snapshot(self):
         return self.account_snapshot
 
+    def get_paper_trade_by_setup(self, setup_id):
+        for index, trade in enumerate(self.saved, start=1):
+            if trade.setup_id == setup_id:
+                return index
+        return None
+
     def save_paper_trade(self, trade):
         self.saved.append(trade)
         return len(self.saved)
@@ -73,6 +79,16 @@ def test_entry_and_target_exit_include_fees_and_slippage():
     assert repo.closed[0]["exit_price"] == 119.88
     assert repo.closed[0]["pnl_usdt"] == 19.37
     assert engine.balance == pytest.approx(1019.36636, rel=1e-6)
+
+
+def test_setup_is_not_reexecuted_after_its_trade_is_closed():
+    repo = FakeRepository()
+    engine = PaperTradingEngine(Settings(taker_fee=0, slippage_percent=0), repo)
+    candidate = _candidate()
+    assert len(engine.check_entries([candidate], {"BTCUSDT": 100.0})) == 1
+    engine.check_exits({"BTCUSDT": 120.0})
+    assert engine.check_entries([candidate], {"BTCUSDT": 100.0}) == []
+    assert len(repo.saved) == 1
 
 
 def test_invalid_geometry_and_out_of_zone_do_not_open_trade():
