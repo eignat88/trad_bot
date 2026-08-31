@@ -14,3 +14,8 @@ artifacts/
 *.backup
 artifacts/db_backup/
 docs/VPS_DEPLOY.md
+
+# Grafana / monitoring secrets
+monitoring/grafana/.env
+*.secret
+*.key

@@ -1,0 +1,22 @@
+# Grafana datasource: PostgreSQL
+# Uses environment variable for password (GRAFANA_READER_PASSWORD).
+apiVersion: 1
+
+datasources:
+  - name: trad_bot
+    type: postgres
+    uid: trad_bot_postgres
+    access: proxy
+    url: localhost:5432
+    database: trad_bot
+    user: grafana_reader
+    secureJsonData:
+      password: ${GRAFANA_READER_PASSWORD}
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1700
+      timescaledb: false
+      tlsAuth: false
+      tlsAuthWithCACert: false
+    isDefault: true
+    editable: false
