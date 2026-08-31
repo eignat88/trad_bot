@@ -93,6 +93,9 @@ class PaperTradingEngine:
         self._daily_loss_usdt: float = 0.0
         self._consecutive_losses: int = 0
         self._cooldown_until: datetime | None = None
+        # A severe stop gap keeps its observed fill for diagnostics and blocks
+        # fresh entries until the operator reviews the paper-forward run.
+        self._gap_loss_halt = False
         self._risk_day = self._clock().date()
 
         # Restore account/risk state before rebuilding any open positions.
@@ -182,6 +185,12 @@ class PaperTradingEngine:
         self._refresh_daily_risk_state_if_needed()
 
         opened: list[PaperTradeRecord] = []
+        if self._gap_loss_halt:
+            logger.critical(
+                "paper gate: severe STOP_LOSS_GAP observed; new entries remain blocked "
+                "until the runner is restarted after operator review"
+            )
+            return opened
         for c in candidates:
             price = prices.get(c.symbol)
             if price is None:
@@ -242,14 +251,22 @@ class PaperTradingEngine:
                     logger.warning("paper gate: consecutive loss limit reached, skipping new entries")
                     break
 
-            # Market regime filter: reject entries that fight the dominant trend.
+            # Scanner-specific regime allow-lists override the generic trend
+            # conflict rule. This keeps paper execution aligned with scanning.
             if self.settings.regime_filter_enabled and c.market_regime:
                 regime = c.market_regime
-                if (c.direction == "LONG" and regime == "TREND_DOWN") or \
-                   (c.direction == "SHORT" and regime == "TREND_UP"):
+                allowed = self.settings.scanner_regime_whitelist.get(
+                    c.scanner_name, {}
+                ).get(c.direction)
+                rejected = (
+                    regime not in allowed if allowed is not None else
+                    (c.direction == "LONG" and regime == "TREND_DOWN") or
+                    (c.direction == "SHORT" and regime == "TREND_UP")
+                )
+                if rejected:
                     logger.info(
-                        "paper regime filter: rejecting %s %s in %s",
-                        c.symbol, c.direction, regime,
+                        "paper regime filter: rejecting %s %s %s in %s",
+                        c.symbol, c.scanner_name, c.direction, regime,
                     )
                     continue
 
@@ -604,6 +621,16 @@ class PaperTradingEngine:
         self._max_drawdown = max(self._max_drawdown, dd)
 
         r_multiple = net_pnl / trade.risk_usdt if trade.risk_usdt > 0 else 0
+        if (
+            reason == "STOP_LOSS_GAP"
+            and r_multiple < -self.settings.paper_max_loss_r_per_trade
+        ):
+            self._gap_loss_halt = True
+            logger.critical(
+                "paper risk halt: STOP_LOSS_GAP loss %.2fR exceeds limit %.2fR; "
+                "observed exit is retained and new entries are blocked",
+                r_multiple, self.settings.paper_max_loss_r_per_trade,
+            )
         pnl_pct = net_pnl / (trade.entry_price * trade.position_size) * 100 if trade.entry_price * trade.position_size > 0 else 0
         duration = (self._clock() - trade.entered_at).total_seconds()
         risk_distance = trade.risk_usdt / trade.position_size if trade.position_size > 0 else 0.0

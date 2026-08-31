@@ -161,9 +161,15 @@ class TestPaperEngineRegimeFilter:
     def test_both_allowed_in_range(self):
         settings = Settings(regime_filter_enabled=True, max_symbol_exposure=1.0)
         engine = PaperTradingEngine(settings, _FakeRepo())
-        long_c = _candidate("LONG", market_regime="RANGE")
+        long_c = _candidate("LONG", scanner="OTHER_SCANNER", market_regime="RANGE")
         opened = engine.check_entries([long_c], {"BTCUSDT": 100.0})
         assert len(opened) == 1
+
+    def test_trend_pullback_rejected_in_range_by_scanner_allowlist(self):
+        settings = Settings(regime_filter_enabled=True, max_symbol_exposure=1.0)
+        engine = PaperTradingEngine(settings, _FakeRepo())
+        candidate = _candidate("LONG", market_regime="RANGE")
+        assert engine.check_entries([candidate], {"BTCUSDT": 100.0}) == []
 
     def test_filter_disabled_allows_all(self):
         settings = Settings(regime_filter_enabled=False, max_symbol_exposure=1.0)

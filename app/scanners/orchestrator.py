@@ -73,14 +73,15 @@ class ScannerOrchestrator:
         min_samples: int = 10,
         blocked_combinations: frozenset[tuple[str, str]] = frozenset(),
         regime_filter: bool = False,
+        scanner_regime_whitelist: dict[str, dict[str, tuple[str, ...]]] | None = None,
         trading_mode: str = "paper",
     ) -> list[SetupCandidate]:
         candidates, _ = self.scan_all_with_stats(
             ctx, expectancy_filter, min_avg_r, min_samples, blocked_combinations,
+            regime_filter=regime_filter,
+            scanner_regime_whitelist=scanner_regime_whitelist,
             trading_mode=trading_mode,
         )
-        if regime_filter:
-            candidates = self._apply_regime_filter(ctx, candidates)
         return candidates
 
     def scan_all_with_stats(
@@ -91,6 +92,7 @@ class ScannerOrchestrator:
         min_samples: int = 10,
         blocked_combinations: frozenset[tuple[str, str]] = frozenset(),
         regime_filter: bool = False,
+        scanner_regime_whitelist: dict[str, dict[str, tuple[str, ...]]] | None = None,
         trading_mode: str = "paper",
     ) -> tuple[list[SetupCandidate], dict[str, dict[str, int | float]]]:
         """Run every configured scanner and return per-scanner observability data."""
@@ -117,7 +119,13 @@ class ScannerOrchestrator:
                     "duration_ms": round((time.perf_counter() - started) * 1000, 3),
                 }
 
-        scored = [score_candidate(c) for c in all_candidates]
+        # Some scanners (currently TREND_PULLBACK) emit a calibrated local
+        # score with explainable reasons. Preserve it instead of silently
+        # replacing it with the generic confirmation score.
+        scored = [
+            c if c.score > 0 and c.reasons else score_candidate(c)
+            for c in all_candidates
+        ]
         scored = [self._attach_context(c, ctx) for c in scored]
         scored.sort(key=lambda c: c.score, reverse=True)
         unique = self.dedup.filter_new(scored)
@@ -165,9 +173,12 @@ class ScannerOrchestrator:
         for name in stats:
             stats[name]["setups_saved"] = saved_by_scanner.get(name, 0)
 
-        # Market regime filter: reject entries that fight the dominant trend.
+        # Market regime filter: apply scanner-specific allow-lists first, then
+        # the generic direction-conflict policy for scanners without a rule.
         if regime_filter:
-            valid = self._apply_regime_filter(ctx, valid)
+            valid = self._apply_regime_filter(
+                ctx, valid, scanner_regime_whitelist or {},
+            )
 
         return valid, stats
 
@@ -227,26 +238,31 @@ class ScannerOrchestrator:
 
     @staticmethod
     def _apply_regime_filter(
-        ctx: MarketContext, candidates: list[SetupCandidate],
+        ctx: MarketContext,
+        candidates: list[SetupCandidate],
+        scanner_regime_whitelist: dict[str, dict[str, tuple[str, ...]]] | None = None,
     ) -> list[SetupCandidate]:
-        """Remove candidates whose direction fights the market regime.
-
-        LONG in TREND_DOWN and SHORT in TREND_UP are rejected.
-        RANGE and HIGH_VOLATILITY allow both directions.
-        """
+        """Apply scanner-specific regime allow-lists and generic trend conflict rules."""
         regime = ctx.market_regime
-        if not regime or regime in ("RANGE", "HIGH_VOLATILITY"):
+        if not regime:
             return candidates
+        whitelist = scanner_regime_whitelist or {}
         filtered = []
         for c in candidates:
-            if c.direction == "LONG" and regime == "TREND_DOWN":
+            allowed_by_scanner = whitelist.get(c.scanner_name, {}).get(c.direction)
+            if allowed_by_scanner is not None:
+                if regime not in allowed_by_scanner:
+                    logger.debug(
+                        "regime filter: dropping %s %s %s in %s (scanner allow-list)",
+                        c.symbol, c.scanner_name, c.direction, regime,
+                    )
+                    continue
+            elif (c.direction == "LONG" and regime == "TREND_DOWN") or (
+                c.direction == "SHORT" and regime == "TREND_UP"
+            ):
                 logger.debug(
-                    "regime filter: dropping %s LONG in TREND_DOWN", c.symbol,
-                )
-                continue
-            if c.direction == "SHORT" and regime == "TREND_UP":
-                logger.debug(
-                    "regime filter: dropping %s SHORT in TREND_UP", c.symbol,
+                    "regime filter: dropping %s %s in %s",
+                    c.symbol, c.direction, regime,
                 )
                 continue
             filtered.append(c)
