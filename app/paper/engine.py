@@ -93,6 +93,7 @@ class PaperTradingEngine:
         self._daily_loss_usdt: float = 0.0
         self._consecutive_losses: int = 0
         self._cooldown_until: datetime | None = None
+        self._risk_day = self._clock().date()
 
         # Restore account/risk state before rebuilding any open positions.
         self._load_account_state()
@@ -123,6 +124,46 @@ class PaperTradingEngine:
         }
 
     # ------------------------------------------------------------------
+    # DAILY RISK STATE ROLLOVER
+    # ------------------------------------------------------------------
+    def _refresh_daily_risk_state_if_needed(self) -> None:
+        """Rebuild daily risk counters when the UTC day changes.
+
+        Instead of a simple ``self._daily_loss_usdt = 0.0`` reset the engine
+        reloads the current-day loss from the repository.  This ensures that a
+        normal midnight transition, a process restart, a crash recovery and a
+        manual restart all produce the same daily risk state.
+
+        ``_consecutive_losses`` is intentionally **not** reset here — it has
+        its own cooldown lifecycle that is independent of the UTC day.
+        """
+        today = self._clock().date()
+        if today == self._risk_day:
+            return
+
+        previous_day = self._risk_day
+        previous_daily_loss = self._daily_loss_usdt
+
+        # Reload risk state from the repository (same path as _load_risk_state).
+        self._load_risk_state()
+
+        # _load_risk_state overwrites _risk_day implicitly via the same
+        # repository query; track the new day explicitly.
+        self._risk_day = today
+
+        logger.info(
+            "paper daily risk state rollover: "
+            "previous_day=%s new_day=%s "
+            "previous_daily_loss_usdt=%.2f current_daily_loss_usdt=%.2f "
+            "entries_enabled=%s",
+            previous_day,
+            today,
+            previous_daily_loss,
+            self._daily_loss_usdt,
+            self._daily_loss_usdt < self.settings.initial_balance * self.settings.max_daily_loss,
+        )
+
+    # ------------------------------------------------------------------
     # ENTRY: scan READY_TO_TRADE setups → open positions
     # ------------------------------------------------------------------
     def check_entries(
@@ -138,6 +179,8 @@ class PaperTradingEngine:
         Returns:
             List of newly opened trades.
         """
+        self._refresh_daily_risk_state_if_needed()
+
         opened: list[PaperTradeRecord] = []
         for c in candidates:
             price = prices.get(c.symbol)
