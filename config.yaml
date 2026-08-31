@@ -37,7 +37,15 @@
     ["VOLATILITY_COMPRESSION", "SHORT"],
     ["BREAKOUT_RETEST", "SHORT"],
     ["BREAKOUT_RETEST", "LONG"],
-    ["MOMENTUM_EXHAUSTION", "LONG"]
+    ["MOMENTUM_EXHAUSTION", "LONG"],
+    ["TREND_PULLBACK", "SHORT"]
   ],
-  "expectancy_min_samples": 30
+  "scanner_regime_whitelist": {
+    "TREND_PULLBACK": {"LONG": ["TREND_UP"], "SHORT": []}
+  },
+  "expectancy_min_samples": 30,
+  "paper_min_closed_trades": 100,
+  "paper_min_avg_r": 0.0,
+  "paper_min_profit_factor": 1.0,
+  "paper_max_loss_r_per_trade": 1.2
 }

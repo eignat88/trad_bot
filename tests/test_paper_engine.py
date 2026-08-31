@@ -230,6 +230,19 @@ def test_short_stop_gap_uses_observed_price_not_stop():
     assert repo.closed[0]["exit_price"] == 115
 
 
+def test_severe_stop_gap_halts_subsequent_entries():
+    repo = FakeRepository()
+    engine = PaperTradingEngine(
+        Settings(taker_fee=0, slippage_percent=0, paper_max_loss_r_per_trade=1.2),
+        repo,
+    )
+    engine.check_entries([_candidate(invalidation_price=90)], {"BTCUSDT": 100})
+    engine.check_exits({"BTCUSDT": 85})
+
+    assert engine._gap_loss_halt
+    assert engine.check_entries([_candidate()], {"BTCUSDT": 100}) == []
+
+
 def test_portfolio_exposure_limits_and_metrics():
     settings = Settings(
         initial_balance=1_000, risk_per_trade=0.5, max_symbol_exposure=1,
@@ -256,6 +269,7 @@ def _cooldown_settings(**overrides) -> Settings:
         risk_per_trade=0.005,
         max_consecutive_losses=4,
         paper_consecutive_loss_cooldown_minutes=360,
+        paper_max_loss_r_per_trade=2.0,
         trading_mode="paper",
     )
     defaults.update(overrides)

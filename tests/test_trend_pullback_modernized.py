@@ -5,6 +5,7 @@ import pytest
 from app.models import Candle
 from app.scanners.models import IndicatorSnapshot, MarketContext, MarketLevels
 from app.scanners.trend_pullback import TrendPullbackScanner
+from app.scanners.orchestrator import ScannerOrchestrator
 
 
 def candle(index, open_, high, low, close, volume=10):
@@ -84,3 +85,13 @@ def test_long_target_uses_entry_plus_risk_times_target_r():
 
 def test_pullback_quality_above_max_is_filtered():
     assert TrendPullbackScanner(max_pullback_quality=0.75).scan(make_ctx(pullback_close=100)) == []
+
+
+def test_orchestrator_preserves_scanner_specific_score_and_reasons():
+    candidate = TrendPullbackScanner().scan(make_ctx())[0]
+    expected_score, expected_reasons = candidate.score, candidate.reasons
+    orchestrator = ScannerOrchestrator(enabled_scanners=("TREND_PULLBACK",))
+    result, _ = orchestrator.scan_all_with_stats(make_ctx())
+
+    assert result[0].score == expected_score
+    assert result[0].reasons == expected_reasons

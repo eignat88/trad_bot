@@ -26,17 +26,21 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 ENV_PATH = PROJECT_ROOT / ".env"
 LOG_DIR = PROJECT_ROOT / "logs"
-LOG_DIR.mkdir(exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_DIR / "paper_trading.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
 logger = logging.getLogger("paper_runner")
+
+
+def setup_logging() -> None:
+    """Configure runner logging only when the executable is started."""
+    LOG_DIR.mkdir(exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_DIR / "paper_trading.log", encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+        force=True,
+    )
 
 SHUTDOWN = False
 
@@ -100,7 +104,7 @@ def _load_ready_setups(repo: ScannerRepository) -> list[dict]:
         SELECT s.setup_id, i.symbol, s.scanner_name, s.direction, s.score,
                s.entry_zone_low, s.entry_zone_high, s.invalidation_price,
                s.target_1, s.target_2, s.market_regime, s.detected_at,
-               s.reference_price
+               s.reference_price, s.entry_timeframe
         FROM dds.scanner_setup s
         JOIN dds.instrument i ON i.instrument_id = s.instrument_id
         WHERE s.status = 'READY_TO_TRADE'
@@ -121,6 +125,7 @@ def _load_ready_setups(repo: ScannerRepository) -> list[dict]:
             "market_regime": r[10],
             "detected_at": r[11],
             "reference_price": float(r[12]) if r[12] else 0.0,
+            "entry_timeframe": r[13] or "5m",
         }
         for r in rows
     ]
@@ -184,6 +189,7 @@ def run_cycle(
                 target_2=s["target_2"],
                 market_regime=s["market_regime"],
                 reference_price=s["reference_price"],
+                entry_timeframe=s["entry_timeframe"],
             )
             for s in ready_setups
         ]
@@ -236,6 +242,7 @@ def run_cycle(
 
 
 def main() -> None:
+    setup_logging()
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
