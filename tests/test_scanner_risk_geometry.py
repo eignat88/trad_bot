@@ -13,11 +13,11 @@ def candle(index, open_, high, low, close, volume=10):
     return Candle(index * 300_000, open_, high, low, close, volume)
 
 
-def context(*, candles_5m, candles_15m=(), candles_1h=(), indicators):
+def context(*, candles_5m, candles_15m=(), candles_1h=(), indicators, market_regime="TREND_UP"):
     return MarketContext(
         symbol="BTCUSDT", candles_5m=tuple(candles_5m), candles_15m=tuple(candles_15m),
         candles_1h=tuple(candles_1h), candles_4h=(), indicators=indicators,
-        market_regime="TREND", levels=MarketLevels(), evaluated_at=datetime.now(timezone.utc),
+        market_regime=market_regime, levels=MarketLevels(), evaluated_at=datetime.now(timezone.utc),
     )
 
 
@@ -25,23 +25,36 @@ def trend_context(direction, *, atr=2, recent_extreme=None):
     if direction == "LONG":
         indicators = IndicatorSnapshot(atr=atr, rsi=50, ema20=100, ema50=95, ema200=90)
         one_hour = [candle(i, 101, 102, 100, 101) for i in range(50)]
-        five_minute = [candle(i, 100, 101, 99, 100) for i in range(20)]
+        five_minute = [candle(i, 100, 101, 99, 99.5) for i in range(20)]
         low = 98 if recent_extreme is None else recent_extreme
-        five_minute[-3:] = [candle(i, 99, 101, low, 100) for i in range(17, 20)]
-        five_minute[-1] = candle(19, 99, 101, low, 100)
+        five_minute[-3:] = [candle(i, 99, 101, low, 99.5) for i in range(17, 20)]
+        five_minute[-1] = candle(19, 99, 101, low, 99.5)
     else:
         indicators = IndicatorSnapshot(atr=atr, rsi=50, ema20=100, ema50=105, ema200=110)
         one_hour = [candle(i, 99, 100, 98, 99) for i in range(50)]
-        five_minute = [candle(i, 100, 101, 99, 100) for i in range(20)]
+        five_minute = [candle(i, 100, 101, 99, 100.5) for i in range(20)]
         high = 102 if recent_extreme is None else recent_extreme
-        five_minute[-3:] = [candle(i, 101, high, 99, 100) for i in range(17, 20)]
-        five_minute[-1] = candle(19, 101, high, 99, 100)
-    return context(candles_5m=five_minute, candles_15m=[candle(i, 100, 101, 99, 100) for i in range(30)], candles_1h=one_hour, indicators=indicators)
+        five_minute[-3:] = [candle(i, 101, high, 99, 100.5) for i in range(17, 20)]
+        five_minute[-1] = candle(19, 101, high, 99, 100.5)
+    market_regime = "TREND_UP" if direction == "LONG" else "TREND_DOWN"
+    return context(
+        candles_5m=five_minute,
+        candles_15m=[candle(i, 99, 101, low, 99.5) for i in range(30)] if direction == "LONG" else [candle(i, 101, high, 99, 100.5) for i in range(30)],
+        candles_1h=one_hour,
+        indicators=indicators,
+        market_regime=market_regime,
+    )
+
+
+def trend_pullback_scanner(direction):
+    regime = "TREND_UP" if direction == "LONG" else "TREND_DOWN"
+    return TrendPullbackScanner(allowed_regimes=(regime,))
 
 
 @pytest.mark.parametrize("direction", ["LONG", "SHORT"])
 def test_trend_pullback_returned_candidate_has_valid_geometry(direction):
-    candidate = getattr(TrendPullbackScanner(), f"_scan_{direction.lower()}")(trend_context(direction))
+    scanner = trend_pullback_scanner(direction)
+    candidate = getattr(scanner, f"_scan_{direction.lower()}")(trend_context(direction))
 
     assert candidate is not None
     assert validate_risk_geometry(candidate)[0] is True
@@ -49,14 +62,19 @@ def test_trend_pullback_returned_candidate_has_valid_geometry(direction):
 
 @pytest.mark.parametrize(("direction", "recent_extreme"), [("LONG", 100), ("SHORT", 100)])
 def test_trend_pullback_rejects_stop_inside_entry_zone(direction, recent_extreme):
-    candidate = getattr(TrendPullbackScanner(), f"_scan_{direction.lower()}")(trend_context(direction, recent_extreme=recent_extreme))
+    scanner = trend_pullback_scanner(direction)
+    candidate = getattr(scanner, f"_scan_{direction.lower()}")(trend_context(direction, recent_extreme=recent_extreme))
 
     assert candidate is None
 
 
 @pytest.mark.parametrize("direction", ["LONG", "SHORT"])
 def test_trend_pullback_rejects_target_inside_entry_zone(direction):
-    candidate = getattr(TrendPullbackScanner(), f"_scan_{direction.lower()}")(trend_context(direction, atr=0.05))
+    scanner = TrendPullbackScanner(
+        allowed_regimes=("TREND_UP",) if direction == "LONG" else ("TREND_DOWN",),
+        target_r=0,
+    )
+    candidate = getattr(scanner, f"_scan_{direction.lower()}")(trend_context(direction))
 
     assert candidate is None
 
