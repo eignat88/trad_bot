@@ -20,6 +20,9 @@ class FakeRepository:
             "closed_trades": 100,
             "net_pnl_usdt": 1_000,
             "max_drawdown": 0.01,
+            "avg_r": 0.1,
+            "profit_factor": 1.1,
+            "scanner_stats": [],
         }
 
 

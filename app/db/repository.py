@@ -1104,12 +1104,13 @@ class ScannerRepository:
         cols = [d[0] for d in cursor.description] if cursor.description else []
         return [dict(zip(cols, r)) for r in rows]
 
-    def get_paper_forward_summary(self) -> dict[str, float | int]:
+    def get_paper_forward_summary(self) -> dict[str, Any]:
         """Summarize persisted paper performance for the live-gate readiness check."""
         if not self._use_pg:
             return {
                 "forward_days": 0.0, "closed_trades": 0,
                 "net_pnl_usdt": 0.0, "max_drawdown": 0.0,
+                "avg_r": 0.0, "profit_factor": 0.0, "scanner_stats": [],
             }
         cursor = self._conn.cursor()
         cursor.execute(
@@ -1121,7 +1122,7 @@ class ScannerRepository:
                 ) AS forward_days,
                 COUNT(*) FILTER (WHERE status = 'CLOSED') AS closed_trades,
                 COALESCE(
-                    SUM(pnl_usdt - entry_fee) FILTER (WHERE status = 'CLOSED'),
+                    SUM(pnl_usdt) FILTER (WHERE status = 'CLOSED'),
                     0
                 ) AS net_pnl_usdt
             FROM dds.paper_trade
@@ -1130,11 +1131,49 @@ class ScannerRepository:
         forward_days, closed_trades, net_pnl_usdt = cursor.fetchone()
         cursor.execute("SELECT COALESCE(MAX(max_drawdown), 0) FROM dds.paper_account")
         max_drawdown = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT scanner_name, direction, closed, avg_r, profit_factor
+            FROM dds.paper_trade_stats
+            """
+        )
+        scanner_stats = [
+            {
+                "scanner_name": row[0],
+                "direction": row[1],
+                "closed": int(row[2] or 0),
+                "avg_r": float(row[3] or 0),
+                "profit_factor": float(row[4] or 0),
+            }
+            for row in cursor.fetchall()
+        ]
+        closed_stats = [row for row in scanner_stats if row["closed"] > 0]
+        avg_r = (
+            sum(row["avg_r"] * row["closed"] for row in closed_stats)
+            / sum(row["closed"] for row in closed_stats)
+            if closed_stats else 0.0
+        )
+        cursor.execute(
+            """
+            SELECT
+                COALESCE(SUM(GREATEST(pnl_usdt, 0)) FILTER (WHERE status = 'CLOSED'), 0),
+                COALESCE(ABS(SUM(LEAST(pnl_usdt, 0)) FILTER (WHERE status = 'CLOSED')), 0)
+            FROM dds.paper_trade
+            """
+        )
+        gross_profit, gross_loss = cursor.fetchone()
+        profit_factor = (
+            float(gross_profit) / float(gross_loss) if gross_loss else
+            (float("inf") if gross_profit else 0.0)
+        )
         return {
             "forward_days": float(forward_days or 0),
             "closed_trades": int(closed_trades or 0),
             "net_pnl_usdt": float(net_pnl_usdt or 0),
             "max_drawdown": float(max_drawdown or 0),
+            "avg_r": avg_r,
+            "profit_factor": profit_factor,
+            "scanner_stats": scanner_stats,
         }
 
     def get_latest_paper_account_snapshot(self) -> dict[str, float] | None:
@@ -1166,7 +1205,7 @@ class ScannerRepository:
         cursor = self._conn.cursor()
         cursor.execute(
             """
-            SELECT pnl_usdt, entry_fee
+            SELECT pnl_usdt
             FROM dds.paper_trade
             WHERE status = 'CLOSED'
               AND closed_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
@@ -1174,13 +1213,10 @@ class ScannerRepository:
             """
         )
         rows = cursor.fetchall()
-        daily_loss = sum(
-            max(0.0, -(float(pnl or 0) - float(entry_fee or 0)))
-            for pnl, entry_fee in rows
-        )
+        daily_loss = sum(max(0.0, -float(pnl or 0)) for (pnl,) in rows)
         consecutive_losses = 0
-        for pnl, entry_fee in rows:
-            if float(pnl or 0) - float(entry_fee or 0) >= 0:
+        for (pnl,) in rows:
+            if float(pnl or 0) >= 0:
                 break
             consecutive_losses += 1
 

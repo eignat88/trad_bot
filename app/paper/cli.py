@@ -134,6 +134,8 @@ def cmd_readiness(args: argparse.Namespace) -> None:
         print(f"  Forward days:  {readiness.forward_days:.1f}")
         print(f"  Closed trades: {readiness.closed_trades}")
         print(f"  Net P&L:       ${readiness.net_pnl_usdt:+,.2f}")
+        print(f"  Avg R:         {readiness.avg_r:.2f}")
+        print(f"  Profit factor: {readiness.profit_factor:.2f}")
         print(f"  Max drawdown:  {readiness.max_drawdown:.2%}")
         print(f"  Eligible:      {'YES' if readiness.eligible else 'NO'}")
         for reason in readiness.failed_checks:
@@ -213,7 +215,7 @@ def _load_ready_setups(repo: ScannerRepository) -> list[dict]:
         SELECT s.setup_id, i.symbol, s.scanner_name, s.direction, s.score,
                s.entry_zone_low, s.entry_zone_high, s.invalidation_price,
                s.target_1, s.target_2, s.market_regime, s.detected_at,
-               s.reference_price
+               s.reference_price, s.entry_timeframe
         FROM dds.scanner_setup s
         JOIN dds.instrument i ON i.instrument_id = s.instrument_id
         WHERE s.status = 'READY_TO_TRADE'
@@ -234,6 +236,7 @@ def _load_ready_setups(repo: ScannerRepository) -> list[dict]:
             "market_regime": r[10],
             "detected_at": r[11],
             "reference_price": float(r[12]) if r[12] else 0.0,
+            "entry_timeframe": r[13] or "5m",
         }
         for r in rows
     ]
@@ -290,6 +293,7 @@ def cmd_run_once(args: argparse.Namespace) -> None:
                 target_2=s["target_2"],
                 market_regime=s["market_regime"],
                 reference_price=s["reference_price"],
+                entry_timeframe=s["entry_timeframe"],
             )
             candidates.append(c)
 

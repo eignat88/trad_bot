@@ -96,11 +96,24 @@ class Settings:
         ("BREAKOUT_RETEST", "SHORT"),
         ("BREAKOUT_RETEST", "LONG"),
         ("MOMENTUM_EXHAUSTION", "LONG"),
+        ("TREND_PULLBACK", "SHORT"),
+    )
+    # Optional scanner/direction regime allow-lists. Unspecified scanners use
+    # the generic direction-conflict filter; an empty tuple blocks a direction.
+    scanner_regime_whitelist: dict[str, dict[str, tuple[str, ...]]] = field(
+        default_factory=lambda: {
+            "TREND_PULLBACK": {"LONG": ("TREND_UP",), "SHORT": ()},
+        }
     )
     # Live gate thresholds measured from persisted forward paper trading.
     paper_min_forward_days: int = 14
-    paper_min_closed_trades: int = 30
+    paper_min_closed_trades: int = 100
+    paper_min_avg_r: float = 0.0
+    paper_min_profit_factor: float = 1.0
     paper_max_drawdown: float = 0.10
+    # Keep observed gap fills for diagnostic integrity, then halt new entries
+    # when a realized loss exceeds this multiple of the planned risk.
+    paper_max_loss_r_per_trade: float = 1.2
     paper_funding_interval_hours: int = 8
     paper_emergency_stop_file: str = "data/PAPER_TRADING_STOP"
     # Paper trading scan interval in seconds (default 300 = 5 minutes).
@@ -166,6 +179,21 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
             ) from exc
     if "scanner_universe" in values and isinstance(values["scanner_universe"], dict):
         values["scanner_universe"] = ScannerUniverseSettings(**values["scanner_universe"])
+    if "scanner_regime_whitelist" in values:
+        try:
+            values["scanner_regime_whitelist"] = {
+                str(scanner_name).upper(): {
+                    str(direction).upper(): tuple(
+                        str(regime).upper() for regime in regimes
+                    )
+                    for direction, regimes in directions.items()
+                }
+                for scanner_name, directions in values["scanner_regime_whitelist"].items()
+            }
+        except (AttributeError, TypeError) as exc:
+            raise ValueError(
+                "scanner_regime_whitelist must map scanner names to direction/regime lists"
+            ) from exc
     settings = Settings(**values)
     if settings.category != "linear":
         raise ValueError("Price/OI strategy requires category=linear")
@@ -210,6 +238,12 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         raise ValueError("paper forward-test thresholds must be positive")
     if not 0 < settings.paper_max_drawdown < 1:
         raise ValueError("paper_max_drawdown must be in (0, 1)")
+    if settings.paper_min_avg_r < 0:
+        raise ValueError("paper_min_avg_r cannot be negative")
+    if settings.paper_min_profit_factor <= 0:
+        raise ValueError("paper_min_profit_factor must be positive")
+    if settings.paper_max_loss_r_per_trade < 1:
+        raise ValueError("paper_max_loss_r_per_trade must be at least 1")
     if settings.paper_funding_interval_hours <= 0:
         raise ValueError("paper_funding_interval_hours must be positive")
     if (settings.scanner_workers <= 0 or settings.scan_interval <= 0
