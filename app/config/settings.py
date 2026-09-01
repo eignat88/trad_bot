@@ -128,6 +128,10 @@ class Settings:
     # reached, block new entries for this many minutes before allowing
     # fresh entries again.  Set to 0 to keep the old hard-stop behavior.
     paper_consecutive_loss_cooldown_minutes: int = 5
+    # Position monitor interval in seconds (default 10s).
+    # This controls how often open positions are checked for SL/TP/trailing.
+    # Faster monitoring reduces STOP_LOSS_GAP events.
+    position_monitor_interval: int = 10
 
 
 def _load_dotenv(path: Path) -> None:

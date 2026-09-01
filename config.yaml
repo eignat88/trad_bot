@@ -47,5 +47,6 @@
   "paper_min_closed_trades": 100,
   "paper_min_avg_r": 0.0,
   "paper_min_profit_factor": 1.0,
-  "paper_max_loss_r_per_trade": 1.2
+  "paper_max_loss_r_per_trade": 1.2,
+  "position_monitor_interval": 10
 }
