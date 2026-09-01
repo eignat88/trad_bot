@@ -1408,6 +1408,57 @@ class ScannerRepository:
 
         return self._with_retry(_do, label="get_paper_risk_state")
 
+    def get_paper_safety_gate_state(self) -> dict[str, bool | str | Any | None]:
+        """Return the durable severe-execution entry-gate state."""
+        if not self._use_pg:
+            return {"is_blocked": False, "reason": None, "blocked_since": None}
+
+        def _do():
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT is_blocked, reason, blocked_since
+                FROM dds.paper_safety_gate_state
+                WHERE gate_id = 1
+                """
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return {"is_blocked": False, "reason": None, "blocked_since": None}
+            return {
+                "is_blocked": bool(row[0]),
+                "reason": row[1],
+                "blocked_since": row[2],
+            }
+
+        return self._with_retry(_do, label="get_paper_safety_gate_state")
+
+    def block_paper_safety_gate(self, reason: str, blocked_since: Any) -> None:
+        """Durably halt new paper entries after a severe execution incident."""
+        if not self._use_pg:
+            return
+
+        def _do():
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO dds.paper_safety_gate_state (
+                    gate_id, is_blocked, reason, blocked_since, updated_at
+                ) VALUES (1, TRUE, %s, %s, now())
+                ON CONFLICT (gate_id) DO UPDATE SET
+                    is_blocked = TRUE,
+                    reason = EXCLUDED.reason,
+                    blocked_since = COALESCE(
+                        dds.paper_safety_gate_state.blocked_since,
+                        EXCLUDED.blocked_since
+                    ),
+                    updated_at = now()
+                """,
+                (reason, blocked_since),
+            )
+
+        self._with_retry(_do, label="block_paper_safety_gate")
+
     def save_paper_account_snapshot(
         self,
         balance: float,

@@ -24,3 +24,11 @@ def test_paper_stats_filter_performance_metrics_to_closed_trades():
         "status = 'CLOSED' AND pnl_usdt < 0",
     ):
         assert metric in view
+
+
+def test_paper_safety_gate_state_is_durable_singleton():
+    sql = SCHEMA.read_text(encoding="utf-8")
+    assert "CREATE TABLE IF NOT EXISTS dds.paper_safety_gate_state" in sql
+    assert "gate_id       SMALLINT PRIMARY KEY DEFAULT 1 CHECK (gate_id = 1)" in sql
+    assert "is_blocked    BOOLEAN NOT NULL DEFAULT FALSE" in sql
+    assert "blocked_since TIMESTAMPTZ" in sql

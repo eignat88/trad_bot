@@ -10,17 +10,30 @@ from app.scanners.models import SetupCandidate
 
 
 class FakeRepository:
-    def __init__(self, risk_state=None, account_snapshot=None) -> None:
+    def __init__(self, risk_state=None, account_snapshot=None, safety_gate_state=None) -> None:
         self.saved = []
         self.closed = []
         self.risk_state = risk_state or {"daily_loss_usdt": 0.0, "consecutive_losses": 0}
         self.account_snapshot = account_snapshot
+        self.safety_gate_state = safety_gate_state or {
+            "is_blocked": False, "reason": None, "blocked_since": None,
+        }
 
     def get_open_paper_trades(self):
         return []
 
     def get_paper_risk_state(self):
         return self.risk_state
+
+    def get_paper_safety_gate_state(self):
+        return self.safety_gate_state
+
+    def block_paper_safety_gate(self, reason, blocked_since):
+        self.safety_gate_state = {
+            "is_blocked": True,
+            "reason": reason,
+            "blocked_since": blocked_since,
+        }
 
     def get_latest_paper_account_snapshot(self):
         return self.account_snapshot
@@ -241,6 +254,27 @@ def test_severe_stop_gap_halts_subsequent_entries():
 
     assert engine._gap_loss_halt
     assert engine.check_entries([_candidate()], {"BTCUSDT": 100}) == []
+
+
+def test_severe_stop_gap_gate_survives_runner_restart():
+    repo = FakeRepository()
+    settings = Settings(taker_fee=0, slippage_percent=0, paper_severe_stop_gap_r=0.20)
+    engine = PaperTradingEngine(settings, repo)
+    engine.check_entries([_candidate(invalidation_price=90)], {"BTCUSDT": 100})
+    engine.check_exits({"BTCUSDT": 87.5})
+
+    persisted = repo.safety_gate_state
+    assert persisted["is_blocked"] is True
+    assert persisted["reason"] == "STOP_LOSS_GAP"
+    assert persisted["blocked_since"] is not None
+
+    restarted = PaperTradingEngine(settings, repo)
+    assert restarted.gate_status["status"] == "BLOCKED"
+    assert restarted.gate_status["reason"] == "STOP_LOSS_GAP"
+    assert restarted.gate_status["since"] == persisted["blocked_since"].isoformat()
+    assert restarted.check_entries(
+        [_candidate(symbol="ETHUSDT")], {"ETHUSDT": 100}
+    ) == []
 
 
 def test_stop_gap_metrics_keep_small_market_gap_gate_open():

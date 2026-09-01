@@ -35,6 +35,14 @@ active_signals AS (
     SELECT COUNT(*) AS active_count
     FROM dds.market_signal
     WHERE status = 'ACTIVE'
+),
+safety_gate AS (
+    SELECT
+        COALESCE(g.is_blocked, FALSE) AS is_blocked,
+        g.reason,
+        g.blocked_since
+    FROM (SELECT 1) AS singleton
+    LEFT JOIN dds.paper_safety_gate_state g ON g.gate_id = 1
 )
 SELECT
     ls.balance,
@@ -51,8 +59,11 @@ SELECT
     lt.last_trade_r,
     lt.last_symbol,
     asig.active_count AS active_signals,
+    gate.is_blocked AS is_blocked,
+    gate.reason AS gate_reason,
+    gate.blocked_since AS gate_blocked_since,
     CASE
-        WHEN sg.stop_gap_count_24h > 0 AND ls.open_positions = 0 THEN 'BLOCKED'
+        WHEN gate.is_blocked THEN 'BLOCKED'
         WHEN ls.open_positions > 0 THEN 'TRADING'
         WHEN ls.total_trades = 0 THEN 'NO_TRADES'
         ELSE 'OK'
@@ -60,9 +71,10 @@ SELECT
 FROM latest_snapshot ls
 CROSS JOIN recent_stop_gap sg
 CROSS JOIN last_trade lt
-CROSS JOIN active_signals asig;
+CROSS JOIN active_signals asig
+CROSS JOIN safety_gate gate;
 
-COMMENT ON VIEW mart.paper_safety_gate IS 'Paper bot safety gate: BLOCKED if STOP_LOSS_GAP in 24h with no open positions.';
+COMMENT ON VIEW mart.paper_safety_gate IS 'Paper bot safety gate: BLOCKED only when the durable severe-execution gate is set.';
 
 -- =============================================
 -- 2. paper_trade_summary — Extended stats
