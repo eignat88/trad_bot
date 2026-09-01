@@ -1,6 +1,7 @@
 -- 008_scanner_health.sql
 -- Operational health: last run, last signal, error counts, run durations.
 -- Single-row view for System Health dashboard.
+-- Updated: added healthy_count, total_count, unhealthy_count for SCANNERS HEALTHY card.
 
 CREATE OR REPLACE VIEW mart.scanner_health AS
 WITH latest_run AS (
@@ -47,6 +48,29 @@ avg_duration AS (
         ROUND(AVG(duration_sec), 2) AS avg_run_duration_sec,
         SUM(CASE WHEN status IN ('ABORTED', 'PARTIAL') THEN 1 ELSE 0 END) AS failed_runs
     FROM dds.scanner_run
+),
+scanner_summary AS (
+    SELECT
+        COUNT(*) FILTER (
+            WHERE CASE
+                WHEN EXTRACT(EPOCH FROM (NOW() - sr.finished_at)) / 60 > 12 THEN 'STALE'
+                WHEN srs.errors_count > 0 THEN 'ERROR'
+                WHEN srs.symbols_scanned < sr.symbols_total THEN 'WARNING'
+                ELSE 'OK'
+            END = 'OK'
+        ) AS healthy_count,
+        COUNT(*) AS total_count,
+        COUNT(*) FILTER (
+            WHERE CASE
+                WHEN EXTRACT(EPOCH FROM (NOW() - sr.finished_at)) / 60 > 12 THEN 'STALE'
+                WHEN srs.errors_count > 0 THEN 'ERROR'
+                WHEN srs.symbols_scanned < sr.symbols_total THEN 'WARNING'
+                ELSE 'OK'
+            END != 'OK'
+        ) AS unhealthy_count
+    FROM dds.scanner_run_stat srs
+    JOIN dds.scanner_run sr ON sr.run_id = srs.run_id
+    WHERE sr.run_id = (SELECT run_id FROM dds.scanner_run ORDER BY started_at DESC LIMIT 1)
 )
 SELECT
     lr.last_scanner_run,
@@ -60,7 +84,10 @@ SELECT
     r1h.runs_last_1h,
     sg.signals_last_1h,
     ad.avg_run_duration_sec,
-    ad.failed_runs
+    ad.failed_runs,
+    ss.healthy_count,
+    ss.total_count,
+    ss.unhealthy_count
 FROM latest_run lr
 CROSS JOIN latest_signal ls
 CROSS JOIN latest_error le
@@ -68,4 +95,5 @@ CROSS JOIN errors_1h e1h
 CROSS JOIN errors_24h e24h
 CROSS JOIN runs_1h r1h
 CROSS JOIN signals_1h sg
-CROSS JOIN avg_duration ad;
+CROSS JOIN avg_duration ad
+CROSS JOIN scanner_summary ss;
