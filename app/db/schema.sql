@@ -463,8 +463,8 @@ ORDER BY score_bucket, avg_r_after_costs DESC NULLS LAST;
 -- Score calibration: per-scanner expectancy by score bucket for tuning thresholds
 CREATE OR REPLACE VIEW dds.score_calibration AS
 SELECT
-    scanner_name,
-    direction,
+    s.scanner_name,
+    s.direction,
     CASE
         WHEN s.score < 20 THEN '0-19'
         WHEN s.score < 40 THEN '20-39'
@@ -483,9 +483,9 @@ SELECT
 FROM dds.signal_outcome o
 JOIN dds.scanner_setup s ON s.setup_id = o.setup_id
 WHERE o.entry_touched = true
-GROUP BY scanner_name, direction, score_bucket
+GROUP BY s.scanner_name, s.direction, score_bucket
 HAVING COUNT(*) >= 5
-ORDER BY scanner_name, direction, score_bucket;
+ORDER BY s.scanner_name, s.direction, score_bucket;
 
 -- Scanner confluence is the number of distinct scanners that detected the
 -- same symbol/direction within the runner's ten-minute conflict window.
