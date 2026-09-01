@@ -86,7 +86,7 @@
       },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
       "id": 3,
-      "options": { "displayMode": "gradient", "minVizHeight": 16, "minVizWidth": 8, "namePlacement": "auto", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showThresholdLabels": false, "showThresholdMarkers": true },
+      "options": { "displayMode": "gradient", "minVizHeight": 16, "minVizWidth": 8, "namePlacement": "auto", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showThresholdLabels": false, "showThresholdMarkers": true, "showUnfilled": true },
       "title": "Avg R by Scanner",
       "type": "bargauge",
       "targets": [
@@ -95,6 +95,17 @@
           "rawSql": "SELECT pt.scanner_name AS \"Scanner\", ROUND(AVG(pt.pnl_r)::numeric, 3)::double precision AS \"Avg R\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name ~ '^(${Scanner:regex})$' AND pt.direction ~ '^(${Direction:regex})$' GROUP BY pt.scanner_name ORDER BY AVG(pt.pnl_r) DESC;",
           "format": "table",
           "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "rowsToFields",
+          "options": {
+            "mappings": [
+              { "fieldNameFrom": "Scanner", "fieldNameTo": "name" },
+              { "fieldNameFrom": "Avg R", "fieldNameTo": "value" }
+            ]
+          }
         }
       ]
     },
@@ -111,7 +122,7 @@
       },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
       "id": 4,
-      "options": { "displayMode": "gradient", "minVizHeight": 16, "minVizWidth": 8, "namePlacement": "auto", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showThresholdLabels": false, "showThresholdMarkers": true },
+      "options": { "displayMode": "gradient", "minVizHeight": 16, "minVizWidth": 8, "namePlacement": "auto", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showThresholdLabels": false, "showThresholdMarkers": true, "showUnfilled": true },
       "title": "Profit Factor by Scanner",
       "type": "bargauge",
       "targets": [
@@ -120,6 +131,17 @@
           "rawSql": "SELECT pt.scanner_name AS \"Scanner\", ROUND((SUM(pt.pnl_usdt) FILTER (WHERE pt.pnl_usdt > 0) / NULLIF(ABS(SUM(pt.pnl_usdt) FILTER (WHERE pt.pnl_usdt < 0)), 0))::numeric, 2)::double precision AS \"Profit Factor\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name ~ '^(${Scanner:regex})$' AND pt.direction ~ '^(${Direction:regex})$' GROUP BY pt.scanner_name ORDER BY \"Profit Factor\" DESC NULLS LAST;",
           "format": "table",
           "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "rowsToFields",
+          "options": {
+            "mappings": [
+              { "fieldNameFrom": "Scanner", "fieldNameTo": "name" },
+              { "fieldNameFrom": "Profit Factor", "fieldNameTo": "value" }
+            ]
+          }
         }
       ]
     },
@@ -136,7 +158,7 @@
       },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
       "id": 5,
-      "options": { "displayMode": "gradient", "minVizHeight": 16, "minVizWidth": 8, "namePlacement": "auto", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showThresholdLabels": false, "showThresholdMarkers": true },
+      "options": { "displayMode": "gradient", "minVizHeight": 16, "minVizWidth": 8, "namePlacement": "auto", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showThresholdLabels": false, "showThresholdMarkers": true, "showUnfilled": true },
       "title": "Win Rate by Scanner",
       "type": "bargauge",
       "targets": [
@@ -145,6 +167,17 @@
           "rawSql": "SELECT pt.scanner_name AS \"Scanner\", ROUND((100.0 * COUNT(*) FILTER (WHERE pt.pnl_usdt > 0) / NULLIF(COUNT(*), 0))::numeric, 1)::double precision AS \"Win Rate\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name ~ '^(${Scanner:regex})$' AND pt.direction ~ '^(${Direction:regex})$' GROUP BY pt.scanner_name ORDER BY \"Win Rate\" DESC;",
           "format": "table",
           "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "rowsToFields",
+          "options": {
+            "mappings": [
+              { "fieldNameFrom": "Scanner", "fieldNameTo": "name" },
+              { "fieldNameFrom": "Win Rate", "fieldNameTo": "value" }
+            ]
+          }
         }
       ]
     },
@@ -161,7 +194,7 @@
       },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
       "id": 6,
-      "options": { "displayMode": "gradient", "minVizHeight": 16, "minVizWidth": 8, "namePlacement": "auto", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showThresholdLabels": false, "showThresholdMarkers": true },
+      "options": { "displayMode": "gradient", "minVizHeight": 16, "minVizWidth": 8, "namePlacement": "auto", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showThresholdLabels": false, "showThresholdMarkers": true, "showUnfilled": true },
       "title": "Trades by Scanner",
       "type": "bargauge",
       "targets": [
@@ -170,6 +203,17 @@
           "rawSql": "SELECT pt.scanner_name AS \"Scanner\", COUNT(*)::double precision AS \"Trades\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name ~ '^(${Scanner:regex})$' AND pt.direction ~ '^(${Direction:regex})$' GROUP BY pt.scanner_name ORDER BY \"Trades\" DESC;",
           "format": "table",
           "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "rowsToFields",
+          "options": {
+            "mappings": [
+              { "fieldNameFrom": "Scanner", "fieldNameTo": "name" },
+              { "fieldNameFrom": "Trades", "fieldNameTo": "value" }
+            ]
+          }
         }
       ]
     },
