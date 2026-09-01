@@ -119,9 +119,13 @@ class Settings:
     paper_min_avg_r: float = 0.0
     paper_min_profit_factor: float = 1.0
     paper_max_drawdown: float = 0.10
-    # Keep observed gap fills for diagnostic integrity, then halt new entries
-    # when a realized loss exceeds this multiple of the planned risk.
+    # Legacy reporting threshold retained for backwards-compatible settings.
+    # Severe STOP_LOSS_GAP gating uses the execution-gap thresholds below.
     paper_max_loss_r_per_trade: float = 1.2
+    # Halt only for an anomalous market move through the stop or for execution
+    # materially worse than the normal all-in stop fill.
+    paper_severe_stop_gap_r: float = 0.20
+    paper_severe_execution_extra_r: float = 0.15
     paper_funding_interval_hours: int = 8
     paper_emergency_stop_file: str = "data/PAPER_TRADING_STOP"
     # Paper trading scan interval in seconds (default 300 = 5 minutes).
@@ -256,6 +260,10 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         raise ValueError("paper_min_profit_factor must be positive")
     if settings.paper_max_loss_r_per_trade < 1:
         raise ValueError("paper_max_loss_r_per_trade must be at least 1")
+    if settings.paper_severe_stop_gap_r < 0:
+        raise ValueError("paper_severe_stop_gap_r cannot be negative")
+    if settings.paper_severe_execution_extra_r < 0:
+        raise ValueError("paper_severe_execution_extra_r cannot be negative")
     if settings.paper_funding_interval_hours <= 0:
         raise ValueError("paper_funding_interval_hours must be positive")
     if (settings.scanner_workers <= 0 or settings.scan_interval <= 0

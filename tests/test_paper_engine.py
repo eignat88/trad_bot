@@ -243,6 +243,116 @@ def test_severe_stop_gap_halts_subsequent_entries():
     assert engine.check_entries([_candidate()], {"BTCUSDT": 100}) == []
 
 
+def test_stop_gap_metrics_keep_small_market_gap_gate_open():
+    repo = FakeRepository()
+    engine = PaperTradingEngine(
+        Settings(taker_fee=0, slippage_percent=0, paper_severe_stop_gap_r=0.20),
+        repo,
+    )
+    engine.check_entries([_candidate(invalidation_price=90)], {"BTCUSDT": 100})
+    engine.check_exits({"BTCUSDT": 89.3})  # raw loss = -1.07R; gap = 0.07R
+
+    event = engine.last_stop_gap
+    assert repo.closed[0]["exit_reason"] == "STOP_LOSS_GAP"
+    assert event is not None
+    assert event["raw_stop_r"] == pytest.approx(-1.07)
+    assert event["expected_stop_net_r"] == pytest.approx(-1.0)
+    assert event["actual_net_r"] == pytest.approx(-1.07)
+    assert event["gap_r"] == pytest.approx(0.07)
+    assert event["excess_execution_r"] == pytest.approx(-0.07)
+    assert event["severe"] is False
+    assert engine.gate_status["status"] == "OPEN"
+
+
+def test_gap_just_below_market_threshold_keeps_gate_open():
+    repo = FakeRepository()
+    engine = PaperTradingEngine(
+        Settings(
+            taker_fee=0,
+            slippage_percent=0,
+            paper_severe_stop_gap_r=0.20,
+            paper_severe_execution_extra_r=0.20,
+        ),
+        repo,
+    )
+    engine.check_entries([_candidate(invalidation_price=90)], {"BTCUSDT": 100})
+    engine.check_exits({"BTCUSDT": 88.1})  # raw loss = -1.19R; gap = 0.19R
+
+    assert engine.last_stop_gap is not None
+    assert engine.last_stop_gap["raw_stop_r"] == pytest.approx(-1.19)
+    assert engine.last_stop_gap["gap_r"] == pytest.approx(0.19)
+    assert engine.last_stop_gap["severe"] is False
+    assert engine.gate_status["status"] == "OPEN"
+
+
+def test_fees_and_slippage_do_not_turn_small_stop_gap_into_severe_halt():
+    repo = FakeRepository()
+    engine = PaperTradingEngine(
+        Settings(
+            taker_fee=0.01,
+            slippage_percent=0.01,
+            paper_severe_stop_gap_r=0.20,
+            paper_severe_execution_extra_r=0.15,
+        ),
+        repo,
+    )
+    trade = engine.check_entries([_candidate(invalidation_price=90)], {"BTCUSDT": 100})[0]
+    observed = trade.stop_price - (0.07 * trade.risk_usdt / trade.position_size)
+    engine.check_exits({"BTCUSDT": observed})
+
+    event = engine.last_stop_gap
+    assert repo.closed[0]["pnl_r"] < -1.20
+    assert event is not None
+    assert event["gap_r"] == pytest.approx(0.07)
+    assert event["severe"] is False
+    assert engine.gate_status["status"] == "OPEN"
+
+
+def test_large_market_gap_blocks_new_entries():
+    repo = FakeRepository()
+    engine = PaperTradingEngine(
+        Settings(taker_fee=0, slippage_percent=0, paper_severe_stop_gap_r=0.20),
+        repo,
+    )
+    engine.check_entries([_candidate(invalidation_price=90)], {"BTCUSDT": 100})
+    engine.check_exits({"BTCUSDT": 87.5})  # 0.25R through the stop
+
+    assert engine.last_stop_gap is not None
+    assert engine.last_stop_gap["severe"] is True
+    assert engine.gate_status["status"] == "BLOCKED"
+
+
+def test_excess_execution_loss_can_block_before_market_gap_threshold():
+    repo = FakeRepository()
+    engine = PaperTradingEngine(
+        Settings(
+            taker_fee=0,
+            slippage_percent=0,
+            paper_severe_stop_gap_r=0.50,
+            paper_severe_execution_extra_r=0.05,
+        ),
+        repo,
+    )
+    engine.check_entries([_candidate(invalidation_price=90)], {"BTCUSDT": 100})
+    engine.check_exits({"BTCUSDT": 89.0})  # 0.10R through stop, but 0.10R worse than normal stop
+
+    assert engine.last_stop_gap is not None
+    assert engine.last_stop_gap["gap_r"] == pytest.approx(0.10)
+    assert engine.last_stop_gap["excess_execution_r"] == pytest.approx(-0.10)
+    assert engine.last_stop_gap["severe"] is True
+    assert engine.gate_status["status"] == "BLOCKED"
+
+
+def test_non_stop_exits_never_activate_severe_gap_gate():
+    repo = FakeRepository()
+    engine = PaperTradingEngine(Settings(taker_fee=0, slippage_percent=0), repo)
+    engine.check_entries([_candidate()], {"BTCUSDT": 100})
+    engine.check_exits({"BTCUSDT": 120})
+
+    assert repo.closed[0]["exit_reason"] == "TAKE_PROFIT_1"
+    assert engine.gate_status["status"] == "OPEN"
+
+
 def test_portfolio_exposure_limits_and_metrics():
     settings = Settings(
         initial_balance=1_000, risk_per_trade=0.5, max_symbol_exposure=1,
@@ -321,7 +431,7 @@ def _simulate_n_losses(engine, n, repo):
     for _ in range(n):
         opened = engine.check_entries([_make_loss_candidate()], {"BTCUSDT": 100.0})
         assert len(opened) == 1
-        closed = engine.check_exits({"BTCUSDT": 85.0})
+        closed = engine.check_exits({"BTCUSDT": 90.0})
         assert len(closed) == 1
         assert repo.closed[-1]["exit_reason"] in ("STOP_LOSS", "STOP_LOSS_GAP")
 

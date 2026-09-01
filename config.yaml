@@ -53,5 +53,7 @@
   "paper_min_avg_r": 0.0,
   "paper_min_profit_factor": 1.0,
   "paper_max_loss_r_per_trade": 1.2,
+  "paper_severe_stop_gap_r": 0.20,
+  "paper_severe_execution_extra_r": 0.15,
   "position_monitor_interval": 10
 }

@@ -450,14 +450,24 @@ class PaperTradingEngine:
                 exit_reason = "STOP_LOSS_GAP" if gap else "STOP_LOSS"
                 result = self._close_trade(trade, exit_price, exit_reason)
                 if gap:
-                    self._record_stop_gap_event(trade, exit_price, price)
+                    self._record_stop_gap_event(
+                        trade,
+                        exit_price,
+                        price,
+                        self._stop_gap_execution_metrics(trade, price, result.net_pnl),
+                    )
             elif not is_long and price >= trade.stop_price:
                 gap = price > trade.stop_price
                 exit_price = price if gap else trade.stop_price
                 exit_reason = "STOP_LOSS_GAP" if gap else "STOP_LOSS"
                 result = self._close_trade(trade, exit_price, exit_reason)
                 if gap:
-                    self._record_stop_gap_event(trade, exit_price, price)
+                    self._record_stop_gap_event(
+                        trade,
+                        exit_price,
+                        price,
+                        self._stop_gap_execution_metrics(trade, price, result.net_pnl),
+                    )
 
             # 2. Take profit 1 check (full close)
             if result is None and trade.target_1 is not None:
@@ -498,11 +508,77 @@ class PaperTradingEngine:
     # ------------------------------------------------------------------
     # STOP_GAP DIAGNOSTICS
     # ------------------------------------------------------------------
+    def _stop_gap_execution_metrics(
+        self,
+        trade: PaperTradeRecord,
+        observed_price: float,
+        actual_net_pnl: float,
+    ) -> dict[str, float | bool]:
+        """Measure a gap against a normal all-in stop execution.
+
+        Fees and configured slippage are expected costs of both a normal stop
+        and a gap exit.  They must not by themselves turn a small market gap
+        into a severe execution incident.
+        """
+        if trade.risk_usdt <= 0:
+            return {
+                "raw_stop_r": 0.0,
+                "expected_stop_net_r": 0.0,
+                "actual_net_r": 0.0,
+                "gap_r": 0.0,
+                "excess_execution_r": 0.0,
+                "severe": False,
+            }
+
+        market_entry = trade.entry_market_price or trade.entry_price
+        if trade.direction == "LONG":
+            expected_gross = (trade.stop_price - market_entry) * trade.position_size
+        else:
+            expected_gross = (market_entry - trade.stop_price) * trade.position_size
+        expected_adjusted_exit = trade.stop_price * (
+            1 - self.settings.slippage_percent
+            if trade.direction == "LONG"
+            else 1 + self.settings.slippage_percent
+        )
+        expected_exit_fee = (
+            expected_adjusted_exit * trade.position_size * self.settings.taker_fee
+        )
+        expected_exit_slippage = abs(expected_adjusted_exit - trade.stop_price) * trade.position_size
+        expected_net_pnl = (
+            expected_gross
+            - trade.entry_fee
+            - expected_exit_fee
+            - trade.funding_paid
+            - trade.entry_slippage_cost
+            - expected_exit_slippage
+        )
+        if trade.direction == "LONG":
+            raw_gross = (observed_price - market_entry) * trade.position_size
+        else:
+            raw_gross = (market_entry - observed_price) * trade.position_size
+        gap_r = abs(observed_price - trade.stop_price) * trade.position_size / trade.risk_usdt
+        expected_stop_net_r = expected_net_pnl / trade.risk_usdt
+        actual_net_r = actual_net_pnl / trade.risk_usdt
+        excess_execution_r = actual_net_r - expected_stop_net_r
+        severe = (
+            gap_r > self.settings.paper_severe_stop_gap_r
+            or actual_net_r < expected_stop_net_r - self.settings.paper_severe_execution_extra_r
+        )
+        return {
+            "raw_stop_r": raw_gross / trade.risk_usdt,
+            "expected_stop_net_r": expected_stop_net_r,
+            "actual_net_r": actual_net_r,
+            "gap_r": gap_r,
+            "excess_execution_r": excess_execution_r,
+            "severe": severe,
+        }
+
     def _record_stop_gap_event(
         self,
         trade: PaperTradeRecord,
         expected_exit: float,
         observed_price: float,
+        metrics: dict[str, float | bool],
     ) -> None:
         """Record diagnostic data for a STOP_LOSS_GAP event.
 
@@ -512,23 +588,7 @@ class PaperTradingEngine:
         - Incorrect stop placement (fix: review stop logic)
         - Extreme volatility (fix: widen stops or reduce position size)
         """
-        risk_distance = abs(trade.entry_price - trade.stop_price)
-        if risk_distance <= 0:
-            return
-
-        # Calculate gap percentage (how far price moved beyond stop)
-        if trade.direction == "LONG":
-            gap_pct = abs(observed_price - trade.stop_price) / trade.stop_price * 100
-        else:
-            gap_pct = abs(observed_price - trade.stop_price) / trade.stop_price * 100
-
-        # Calculate R-multiple of the gap loss
-        gap_loss_usdt = abs(observed_price - trade.stop_price) * trade.position_size
-        gap_r = gap_loss_usdt / trade.risk_usdt if trade.risk_usdt > 0 else 0
-
-        # Calculate total R including the original stop
-        total_r = -(risk_distance + abs(observed_price - trade.stop_price)) * trade.position_size / trade.risk_usdt if trade.risk_usdt > 0 else 0
-
+        gap_pct = abs(observed_price - trade.stop_price) / trade.stop_price * 100
         gap_event = {
             "symbol": trade.symbol,
             "scanner_name": trade.scanner_name,
@@ -538,8 +598,12 @@ class PaperTradingEngine:
             "expected_exit": expected_exit,
             "observed_price": observed_price,
             "gap_pct": round(gap_pct, 4),
-            "gap_r": round(gap_r, 4),
-            "total_r": round(total_r, 4),
+            "raw_stop_r": round(float(metrics["raw_stop_r"]), 4),
+            "expected_stop_net_r": round(float(metrics["expected_stop_net_r"]), 4),
+            "actual_net_r": round(float(metrics["actual_net_r"]), 4),
+            "gap_r": round(float(metrics["gap_r"]), 4),
+            "excess_execution_r": round(float(metrics["excess_execution_r"]), 4),
+            "severe": bool(metrics["severe"]),
             "position_size": trade.position_size,
             "risk_usdt": trade.risk_usdt,
             "timestamp": self._clock().isoformat(),
@@ -548,16 +612,16 @@ class PaperTradingEngine:
 
         self._stop_gap_events.append(gap_event)
         self._last_stop_gap = gap_event
-
-        # Cleanup old events (>24h)
         self._cleanup_old_stop_gap_events()
 
         logger.warning(
-            "STOP_GAP recorded: %s %s %s entry=%.4f stop=%.4f "
-            "expected=%.4f observed=%.4f gap=%.2f%% total_R=%.2f",
-            trade.symbol, trade.direction, trade.scanner_name,
-            trade.entry_price, trade.stop_price, expected_exit,
-            observed_price, gap_pct, total_r,
+            "STOP_GAP: symbol=%s scanner=%s direction=%s raw_stop_r=%.2f "
+            "expected_stop_net_r=%.2f actual_net_r=%.2f gap_r=%.2f "
+            "excess_execution_r=%.2f severe=%s",
+            trade.symbol, trade.scanner_name, trade.direction,
+            metrics["raw_stop_r"], metrics["expected_stop_net_r"],
+            metrics["actual_net_r"], metrics["gap_r"],
+            metrics["excess_execution_r"], metrics["severe"],
         )
 
     def _cleanup_old_stop_gap_events(self) -> None:
@@ -729,18 +793,22 @@ class PaperTradingEngine:
         self._max_drawdown = max(self._max_drawdown, dd)
 
         r_multiple = net_pnl / trade.risk_usdt if trade.risk_usdt > 0 else 0
-        if (
-            reason == "STOP_LOSS_GAP"
-            and r_multiple < -self.settings.paper_max_loss_r_per_trade
-        ):
-            self._gap_loss_halt = True
-            self._gate_reason = "STOP_LOSS_GAP"
-            self._gate_since = self._clock()
-            logger.critical(
-                "paper risk halt: STOP_LOSS_GAP loss %.2fR exceeds limit %.2fR; "
-                "observed exit is retained and new entries are blocked",
-                r_multiple, self.settings.paper_max_loss_r_per_trade,
-            )
+        stop_gap_metrics = None
+        if reason == "STOP_LOSS_GAP":
+            stop_gap_metrics = self._stop_gap_execution_metrics(trade, exit_price, net_pnl)
+            if bool(stop_gap_metrics["severe"]):
+                self._gap_loss_halt = True
+                self._gate_reason = "STOP_LOSS_GAP"
+                self._gate_since = self._clock()
+                logger.critical(
+                    "paper risk halt: STOP_LOSS_GAP severe=true gap_r=%.2fR "
+                    "expected_stop_net_r=%.2fR actual_net_r=%.2fR "
+                    "excess_execution_r=%.2fR; new entries are blocked",
+                    stop_gap_metrics["gap_r"],
+                    stop_gap_metrics["expected_stop_net_r"],
+                    stop_gap_metrics["actual_net_r"],
+                    stop_gap_metrics["excess_execution_r"],
+                )
         pnl_pct = net_pnl / (trade.entry_price * trade.position_size) * 100 if trade.entry_price * trade.position_size > 0 else 0
         duration = (self._clock() - trade.entered_at).total_seconds()
         risk_distance = trade.risk_usdt / trade.position_size if trade.position_size > 0 else 0.0
