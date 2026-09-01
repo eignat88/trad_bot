@@ -91,11 +91,19 @@ class Settings:
     expectancy_min_profit_factor: float = 1.20
     expectancy_min_net_pnl: float = 0.0
     # Explicitly paused scanner/direction combinations, regardless of sample size.
+    # This safety blocklist follows the 2026-09-01 paper-trading analysis.
+    # Blocked combinations remain observable through scanner outcomes, but are
+    # never persisted as tradeable setups or opened by paper_runner.
     blocked_scanner_directions: tuple[tuple[str, str], ...] = (
+        ("VOLATILITY_COMPRESSION", "LONG"),
         ("VOLATILITY_COMPRESSION", "SHORT"),
-        ("BREAKOUT_RETEST", "SHORT"),
+        ("SUPPORT_RESISTANCE_REACTION", "LONG"),
+        ("SUPPORT_RESISTANCE_REACTION", "SHORT"),
+        ("LIQUIDITY_REVERSAL", "SHORT"),
         ("BREAKOUT_RETEST", "LONG"),
+        ("BREAKOUT_RETEST", "SHORT"),
         ("MOMENTUM_EXHAUSTION", "LONG"),
+        ("TREND_PULLBACK", "LONG"),
         ("TREND_PULLBACK", "SHORT"),
     )
     # Optional scanner/direction regime allow-lists. Unspecified scanners use
