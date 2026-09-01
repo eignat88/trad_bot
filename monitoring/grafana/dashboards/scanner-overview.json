@@ -25,7 +25,7 @@
       "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
       "id": 1,
       "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "title": "Scanner Runs",
+      "title": "Runs",
       "type": "stat",
       "targets": [
         {
@@ -48,7 +48,7 @@
       "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
       "id": 2,
       "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "title": "Setups Found",
+      "title": "Setups",
       "type": "stat",
       "targets": [
         {
@@ -94,7 +94,7 @@
       "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
       "id": 4,
       "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "title": "Paper Trades",
+      "title": "Trades",
       "type": "stat",
       "targets": [
         {
@@ -117,7 +117,7 @@
       "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
       "id": 5,
       "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "title": "Scanner Errors",
+      "title": "Errors",
       "type": "stat",
       "targets": [
         {
@@ -153,7 +153,7 @@
       "targets": [
         {
           "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
-          "rawSql": "SELECT last_run_at AS value FROM mart.scanner_overview;",
+          "rawSql": "SELECT EXTRACT(EPOCH FROM last_run_at) * 1000 AS value FROM mart.scanner_overview;",
           "format": "table",
           "refId": "A"
         }
@@ -177,7 +177,7 @@
       "targets": [
         {
           "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
-          "rawSql": "SELECT last_signal_at AS value FROM mart.scanner_overview;",
+          "rawSql": "SELECT EXTRACT(EPOCH FROM last_signal_at) * 1000 AS value FROM mart.scanner_overview;",
           "format": "table",
           "refId": "A"
         }
@@ -201,7 +201,7 @@
       "targets": [
         {
           "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
-          "rawSql": "SELECT last_error_at AS value FROM mart.scanner_overview;",
+          "rawSql": "SELECT EXTRACT(EPOCH FROM last_error_at) * 1000 AS value FROM mart.scanner_overview;",
           "format": "table",
           "refId": "A"
         }
@@ -250,9 +250,9 @@
       },
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 10 },
       "id": 10,
-      "options": { "legend": { "displayMode": "table", "placement": "right", "values": ["value"] }, "tooltip": { "mode": "multi" }, "pieType": "donut" },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "values": ["lastNotNull"] }, "orientation": "horizontal", "showValue": "auto", "tooltip": { "mode": "single", "sort": "desc" }, "xTickLabelRotation": 0, "xTickLabelSpacing": 0 },
       "title": "Trades by Scanner",
-      "type": "piechart",
+      "type": "barchart",
       "targets": [
         {
           "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
@@ -287,6 +287,9 @@
           "format": "table",
           "refId": "A"
         }
+      ],
+      "transformations": [
+        { "id": "rowsToFields", "options": { "byFieldName": "direction", "valueFieldName": "value" } }
       ]
     },
     {
@@ -432,7 +435,7 @@
       "gridPos": { "h": 4, "w": 4, "x": 12, "y": 28 },
       "id": 17,
       "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "title": "Paper Trades",
+      "title": "Trades",
       "type": "stat",
       "targets": [
         {
@@ -487,6 +490,9 @@
           "format": "table",
           "refId": "A"
         }
+      ],
+      "transformations": [
+        { "id": "rowsToFields", "options": { "byFieldName": "metric", "valueFieldName": "value" } }
       ]
     }
   ],

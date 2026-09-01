@@ -227,6 +227,9 @@
       "type": "piechart",
       "targets": [
         { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT 'Setups' AS metric, scanner_setups AS value FROM mart.signal_funnel UNION ALL SELECT 'Signals', market_signals FROM mart.signal_funnel UNION ALL SELECT 'Trades', paper_trades FROM mart.signal_funnel UNION ALL SELECT 'Wins', winning_trades FROM mart.signal_funnel ORDER BY value DESC;", "format": "table", "refId": "A" }
+      ],
+      "transformations": [
+        { "id": "rowsToFields", "options": { "byFieldName": "metric", "valueFieldName": "value" } }
       ]
     },
     {

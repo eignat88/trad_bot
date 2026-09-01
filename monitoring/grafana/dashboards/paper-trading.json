@@ -271,9 +271,9 @@
       },
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 15 },
       "id": 12,
-      "options": { "legend": { "displayMode": "table", "placement": "right", "values": ["value"] }, "tooltip": { "mode": "multi" }, "pieType": "donut" },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "values": ["lastNotNull"] }, "orientation": "horizontal", "showValue": "auto", "tooltip": { "mode": "single", "sort": "desc" }, "xTickLabelRotation": 0, "xTickLabelSpacing": 0 },
       "title": "PnL by Scanner",
-      "type": "piechart",
+      "type": "barchart",
       "targets": [
         {
           "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
@@ -298,9 +298,9 @@
       },
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 15 },
       "id": 13,
-      "options": { "legend": { "displayMode": "table", "placement": "right", "values": ["value"] }, "tooltip": { "mode": "multi" }, "pieType": "donut" },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "values": ["lastNotNull"] }, "orientation": "horizontal", "showValue": "auto", "tooltip": { "mode": "single", "sort": "desc" }, "xTickLabelRotation": 0, "xTickLabelSpacing": 0 },
       "title": "PnL by Direction",
-      "type": "piechart",
+      "type": "barchart",
       "targets": [
         {
           "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },

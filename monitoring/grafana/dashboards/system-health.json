@@ -25,7 +25,7 @@
       "title": "Last Scanner Run",
       "type": "stat",
       "targets": [
-        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT last_scanner_run AS value FROM mart.scanner_health;", "format": "table", "refId": "A" }
+        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT EXTRACT(EPOCH FROM last_scanner_run) * 1000 AS value FROM mart.scanner_health;", "format": "table", "refId": "A" }
       ]
     },
     {
@@ -40,7 +40,7 @@
       "title": "Last Signal",
       "type": "stat",
       "targets": [
-        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT last_signal AS value FROM mart.scanner_health;", "format": "table", "refId": "A" }
+        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT EXTRACT(EPOCH FROM last_signal) * 1000 AS value FROM mart.scanner_health;", "format": "table", "refId": "A" }
       ]
     },
     {
@@ -55,7 +55,7 @@
       "title": "Last Error",
       "type": "stat",
       "targets": [
-        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT last_error AS value FROM mart.scanner_health;", "format": "table", "refId": "A" }
+        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT EXTRACT(EPOCH FROM last_error) * 1000 AS value FROM mart.scanner_health;", "format": "table", "refId": "A" }
       ]
     },
     {
