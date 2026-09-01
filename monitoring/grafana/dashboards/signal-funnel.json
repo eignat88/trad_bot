@@ -251,7 +251,7 @@
       "title": "Trades by Scanner",
       "type": "table",
       "targets": [
-        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT scanner_name AS \"Scanner\", SUM(trades) AS \"Total Trades\", SUM(wins) AS \"Wins\", SUM(losses) AS \"Losses\", CASE WHEN SUM(trades) > 0 THEN ROUND(SUM(wins)::numeric / SUM(trades), 4) ELSE NULL END AS \"Win Rate\", ROUND(SUM(pnl_usdt), 2) AS \"PnL USDT\" FROM mart.scanner_daily_stats GROUP BY scanner_name ORDER BY \"PnL USDT\" DESC;", "format": "table", "refId": "A" }
+        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT scanner_name AS \"Scanner\", SUM(trades) AS \"Total Trades\", SUM(wins) AS \"Wins\", SUM(losses) AS \"Losses\", CASE WHEN SUM(trades) > 0 THEN ROUND(SUM(wins)::numeric / SUM(trades), 4) ELSE NULL END AS \"Win Rate\", ROUND(SUM(pnl_usdt), 2) AS \"PnL USDT\" FROM mart.scanner_daily_stats WHERE $__timeFilter(trade_date) AND scanner_name IN (${Scanner:sqlstring}) GROUP BY scanner_name ORDER BY \"PnL USDT\" DESC;", "format": "table", "refId": "A" }
       ]
     }
   ],
