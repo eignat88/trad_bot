@@ -34,10 +34,15 @@
   "expectancy_filter_enabled": true,
   "expectancy_min_avg_r": 0.0,
   "blocked_scanner_directions": [
+    ["VOLATILITY_COMPRESSION", "LONG"],
     ["VOLATILITY_COMPRESSION", "SHORT"],
-    ["BREAKOUT_RETEST", "SHORT"],
+    ["SUPPORT_RESISTANCE_REACTION", "LONG"],
+    ["SUPPORT_RESISTANCE_REACTION", "SHORT"],
+    ["LIQUIDITY_REVERSAL", "SHORT"],
     ["BREAKOUT_RETEST", "LONG"],
+    ["BREAKOUT_RETEST", "SHORT"],
     ["MOMENTUM_EXHAUSTION", "LONG"],
+    ["TREND_PULLBACK", "LONG"],
     ["TREND_PULLBACK", "SHORT"]
   ],
   "scanner_regime_whitelist": {
