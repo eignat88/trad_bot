@@ -36,7 +36,7 @@
       "targets": [
         {
           "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
-          "rawSql": "SELECT pt.scanner_name AS \"Scanner\", pt.direction AS \"Direction\", COUNT(*) AS \"Trades\", SUM(CASE WHEN pt.pnl_r > 0 THEN 1 ELSE 0 END) AS \"Wins\", SUM(CASE WHEN pt.pnl_r <= 0 THEN 1 ELSE 0 END) AS \"Losses\", ROUND(SUM(CASE WHEN pt.pnl_r > 0 THEN 1 ELSE 0 END)::numeric / COUNT(*), 4) AS \"Win Rate\", ROUND(AVG(pt.pnl_r), 4) AS \"Avg R\", CASE WHEN SUM(CASE WHEN pt.pnl_r < 0 THEN ABS(pt.pnl_r) ELSE 0 END) > 0 THEN ROUND(SUM(CASE WHEN pt.pnl_r > 0 THEN pt.pnl_r ELSE 0 END) / SUM(CASE WHEN pt.pnl_r < 0 THEN ABS(pt.pnl_r) ELSE 0 END), 4) ELSE NULL END AS \"Profit Factor\", ROUND(SUM(pt.pnl_usdt), 2) AS \"PnL USDT\", ROUND(SUM(pt.pnl_r), 4) AS \"Total R\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name IN (${Scanner:sqlstring}) AND ('${Direction}' = '$__all' OR pt.direction = '${Direction}') GROUP BY pt.scanner_name, pt.direction ORDER BY \"PnL USDT\" DESC;",
+          "rawSql": "SELECT pt.scanner_name AS \"Scanner\", pt.direction AS \"Direction\", COUNT(*) AS \"Trades\", SUM(CASE WHEN pt.pnl_r > 0 THEN 1 ELSE 0 END) AS \"Wins\", SUM(CASE WHEN pt.pnl_r <= 0 THEN 1 ELSE 0 END) AS \"Losses\", ROUND(SUM(CASE WHEN pt.pnl_r > 0 THEN 1 ELSE 0 END)::numeric / COUNT(*), 4) AS \"Win Rate\", ROUND(AVG(pt.pnl_r), 4) AS \"Avg R\", CASE WHEN SUM(CASE WHEN pt.pnl_r < 0 THEN ABS(pt.pnl_r) ELSE 0 END) > 0 THEN ROUND(SUM(CASE WHEN pt.pnl_r > 0 THEN pt.pnl_r ELSE 0 END) / SUM(CASE WHEN pt.pnl_r < 0 THEN ABS(pt.pnl_r) ELSE 0 END), 4) ELSE NULL END AS \"Profit Factor\", ROUND(SUM(pt.pnl_usdt), 2) AS \"PnL USDT\", ROUND(SUM(pt.pnl_r), 4) AS \"Total R\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name IN (${Scanner:sqlstring}) AND pt.direction IN (${Direction:sqlstring}) GROUP BY pt.scanner_name, pt.direction ORDER BY \"PnL USDT\" DESC;",
           "format": "table",
           "refId": "A"
         }
@@ -67,7 +67,7 @@
       "targets": [
         {
           "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
-          "rawSql": "SELECT trade_date AS time, scanner_name, SUM(pnl_usdt) AS \"PnL USDT\" FROM mart.scanner_daily_stats WHERE $__timeFilter(trade_date) AND scanner_name IN (${Scanner:sqlstring}) AND ('${Direction}' = '$__all' OR direction = '${Direction}') GROUP BY trade_date, scanner_name ORDER BY trade_date;",
+          "rawSql": "SELECT trade_date AS time, scanner_name, SUM(pnl_usdt) AS \"PnL USDT\" FROM mart.scanner_daily_stats WHERE $__timeFilter(trade_date) AND scanner_name IN (${Scanner:sqlstring}) AND direction IN (${Direction:sqlstring}) GROUP BY trade_date, scanner_name ORDER BY trade_date;",
           "format": "time_series",
           "refId": "A"
         }
@@ -92,7 +92,7 @@
       "targets": [
         {
           "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
-          "rawSql": "SELECT pt.scanner_name, ROUND(AVG(pt.pnl_r), 4) AS \"Avg R\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name IN (${Scanner:sqlstring}) AND ('${Direction}' = '$__all' OR pt.direction = '${Direction}') GROUP BY pt.scanner_name ORDER BY \"Avg R\" DESC;",
+          "rawSql": "SELECT pt.scanner_name, ROUND(AVG(pt.pnl_r), 4) AS \"Avg R\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name IN (${Scanner:sqlstring}) AND pt.direction IN (${Direction:sqlstring}) GROUP BY pt.scanner_name ORDER BY \"Avg R\" DESC;",
           "format": "table",
           "refId": "A"
         }
@@ -117,7 +117,7 @@
       "targets": [
         {
           "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
-          "rawSql": "SELECT pt.scanner_name, CASE WHEN SUM(CASE WHEN pt.pnl_r < 0 THEN ABS(pt.pnl_r) ELSE 0 END) > 0 THEN ROUND(SUM(CASE WHEN pt.pnl_r > 0 THEN pt.pnl_r ELSE 0 END) / SUM(CASE WHEN pt.pnl_r < 0 THEN ABS(pt.pnl_r) ELSE 0 END), 4) ELSE NULL END AS \"Profit Factor\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name IN (${Scanner:sqlstring}) AND ('${Direction}' = '$__all' OR pt.direction = '${Direction}') GROUP BY pt.scanner_name ORDER BY \"Profit Factor\" DESC;",
+          "rawSql": "SELECT pt.scanner_name, CASE WHEN SUM(CASE WHEN pt.pnl_r < 0 THEN ABS(pt.pnl_r) ELSE 0 END) > 0 THEN ROUND(SUM(CASE WHEN pt.pnl_r > 0 THEN pt.pnl_r ELSE 0 END) / SUM(CASE WHEN pt.pnl_r < 0 THEN ABS(pt.pnl_r) ELSE 0 END), 4) ELSE NULL END AS \"Profit Factor\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name IN (${Scanner:sqlstring}) AND pt.direction IN (${Direction:sqlstring}) GROUP BY pt.scanner_name ORDER BY \"Profit Factor\" DESC;",
           "format": "table",
           "refId": "A"
         }
@@ -142,7 +142,7 @@
       "targets": [
         {
           "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
-          "rawSql": "SELECT pt.scanner_name, ROUND(SUM(CASE WHEN pt.pnl_r > 0 THEN 1 ELSE 0 END)::numeric / COUNT(*), 4) AS \"Win Rate\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name IN (${Scanner:sqlstring}) AND ('${Direction}' = '$__all' OR pt.direction = '${Direction}') GROUP BY pt.scanner_name ORDER BY \"Win Rate\" DESC;",
+          "rawSql": "SELECT pt.scanner_name, ROUND(SUM(CASE WHEN pt.pnl_r > 0 THEN 1 ELSE 0 END)::numeric / COUNT(*), 4) AS \"Win Rate\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name IN (${Scanner:sqlstring}) AND pt.direction IN (${Direction:sqlstring}) GROUP BY pt.scanner_name ORDER BY \"Win Rate\" DESC;",
           "format": "table",
           "refId": "A"
         }
@@ -166,7 +166,7 @@
       "targets": [
         {
           "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
-          "rawSql": "SELECT pt.scanner_name, COUNT(*) AS \"Trades\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name IN (${Scanner:sqlstring}) AND ('${Direction}' = '$__all' OR pt.direction = '${Direction}') GROUP BY pt.scanner_name ORDER BY \"Trades\" DESC;",
+          "rawSql": "SELECT pt.scanner_name, COUNT(*) AS \"Trades\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name IN (${Scanner:sqlstring}) AND pt.direction IN (${Direction:sqlstring}) GROUP BY pt.scanner_name ORDER BY \"Trades\" DESC;",
           "format": "table",
           "refId": "A"
         }
@@ -190,7 +190,7 @@
       "targets": [
         {
           "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
-          "rawSql": "SELECT trade_date AS time, direction, SUM(pnl_usdt) AS \"PnL USDT\" FROM mart.scanner_daily_stats WHERE $__timeFilter(trade_date) AND scanner_name IN (${Scanner:sqlstring}) AND ('${Direction}' = '$__all' OR direction = '${Direction}') GROUP BY trade_date, direction ORDER BY trade_date;",
+          "rawSql": "SELECT trade_date AS time, direction, SUM(pnl_usdt) AS \"PnL USDT\" FROM mart.scanner_daily_stats WHERE $__timeFilter(trade_date) AND scanner_name IN (${Scanner:sqlstring}) AND direction IN (${Direction:sqlstring}) GROUP BY trade_date, direction ORDER BY trade_date;",
           "format": "time_series",
           "refId": "A"
         }
@@ -215,13 +215,14 @@
       {
         "current": { "selected": true, "text": "All", "value": "$__all" },
         "includeAll": true,
-        "multi": false,
+        "multi": true,
         "name": "Direction",
         "options": [
           { "selected": true, "text": "All", "value": "$__all" },
           { "selected": false, "text": "LONG", "value": "LONG" },
           { "selected": false, "text": "SHORT", "value": "SHORT" }
         ],
+        "query": "LONG,SHORT",
         "type": "custom"
       }
     ]
