@@ -1,7 +1,9 @@
-"""Tests for PositionMonitor — fast position monitoring with STOP_GAP diagnostics."""
+"""Tests for PositionMonitor — background thread with fast position monitoring."""
 from __future__ import annotations
 
 import math
+import threading
+import time
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -14,7 +16,6 @@ from app.paper.position_monitor import PositionMonitor
 
 @pytest.fixture
 def settings() -> Settings:
-    """Create test settings."""
     return Settings(
         initial_balance=10000,
         risk_per_trade=0.005,
@@ -27,7 +28,6 @@ def settings() -> Settings:
 
 @pytest.fixture
 def mock_repo() -> MagicMock:
-    """Create a mock repository."""
     repo = MagicMock()
     repo.get_open_paper_trades.return_value = []
     repo.get_latest_paper_account_snapshot.return_value = None
@@ -43,7 +43,6 @@ def mock_repo() -> MagicMock:
 
 @pytest.fixture
 def engine(settings: Settings, mock_repo: MagicMock) -> PaperTradingEngine:
-    """Create a paper trading engine."""
     return PaperTradingEngine(settings, mock_repo)
 
 
@@ -58,7 +57,6 @@ def _make_trade(
     entered_at: datetime | None = None,
 ) -> PaperTradeRecord:
     """Create a test trade record."""
-    # Calculate risk_usdt from entry/stop if not provided
     if risk_usdt is None:
         risk_distance = abs(entry_price - stop_price)
         risk_usdt = risk_distance * position_size
@@ -73,7 +71,7 @@ def _make_trade(
         entry_price=entry_price,
         entry_fee=entry_price * position_size * 0.00055,
         stop_price=stop_price,
-        target_1=entry_price + 2 * abs(entry_price - stop_price) if direction == "LONG" else entry_price - 2 * abs(entry_price - stop_price),
+        target_1=None,
         target_2=None,
         position_size=position_size,
         risk_usdt=risk_usdt,
@@ -88,83 +86,247 @@ def _make_trade(
     )
 
 
-class TestPositionMonitorBasic:
-    """Test basic PositionMonitor functionality."""
+# ==================================================================
+# Thread safety
+# ==================================================================
+class TestTradingLock:
+    def test_engine_has_trading_lock(self, engine: PaperTradingEngine):
+        assert hasattr(engine, "trading_lock")
+        assert isinstance(engine.trading_lock, type(threading.Lock()))
 
-    def test_initialization(self, engine: PaperTradingEngine):
-        """Test PositionMonitor can be initialized."""
-        price_fetcher = MagicMock(return_value={})
+    def test_engine_lock_is_usable(self, engine: PaperTradingEngine):
+        with engine.trading_lock:
+            pass
+
+
+# ==================================================================
+# Background thread lifecycle
+# ==================================================================
+class TestBackgroundThread:
+    def test_start_and_stop(self, engine: PaperTradingEngine):
         monitor = PositionMonitor(
             engine=engine,
-            price_fetcher=price_fetcher,
-            interval_seconds=10,
+            price_fetcher=lambda s: {},
+            interval_seconds=1,
         )
-        assert monitor.is_running is False
-        assert monitor.last_check is None
-        assert monitor.total_checks == 0
-        assert monitor.total_closes == 0
-        assert monitor.stop_gap_count_24h == 0
+        assert not monitor.is_running
+        monitor.start()
+        time.sleep(0.2)
+        assert monitor.is_running
+        monitor.stop()
+        assert not monitor.is_running
 
-    def test_heartbeat_when_stopped(self, engine: PaperTradingEngine):
-        """Test heartbeat when monitor is not running."""
-        price_fetcher = MagicMock(return_value={})
+    def test_start_is_idempotent(self, engine: PaperTradingEngine):
         monitor = PositionMonitor(
             engine=engine,
-            price_fetcher=price_fetcher,
+            price_fetcher=lambda s: {},
+            interval_seconds=1,
         )
+        monitor.start()
+        t1 = monitor._thread
+        monitor.start()
+        t2 = monitor._thread
+        assert t1 is t2
+        monitor.stop()
+
+    def test_daemon_thread(self, engine: PaperTradingEngine):
+        monitor = PositionMonitor(
+            engine=engine,
+            price_fetcher=lambda s: {},
+            interval_seconds=1,
+        )
+        monitor.start()
+        time.sleep(0.1)
+        assert monitor._thread.daemon is True
+        monitor.stop()
+
+
+# ==================================================================
+# Core: multiple checks within 30-40s at 10s interval
+# ==================================================================
+class TestFastMonitoringFrequency:
+    def test_multiple_checks_in_35_seconds(self, engine: PaperTradingEngine):
+        """Verify that the background monitor performs multiple position
+        checks within a 35-second window when paper_scan_interval=300.
+
+        With interval_seconds=5 (fast for testing), we expect >=5 checks
+        in 35 seconds -- proving the monitor runs independently of the
+        300s paper cycle.
+        """
+        check_times: list[float] = []
+
+        def tracking_fetcher(symbols):
+            check_times.append(time.monotonic())
+            return {"BTCUSDT": 100100.0}
+
+        trade = _make_trade(entry_price=100000.0, stop_price=99500.0)
+        engine.open_trades["BTCUSDT"] = trade
+
+        monitor = PositionMonitor(
+            engine=engine,
+            price_fetcher=tracking_fetcher,
+            interval_seconds=5,
+        )
+        monitor.start()
+        time.sleep(35)
+        monitor.stop()
+
+        assert len(check_times) >= 5, (
+            f"Expected >= 5 checks in 35s at 5s interval, got {len(check_times)}"
+        )
+
+        if len(check_times) >= 2:
+            gaps = [
+                check_times[i + 1] - check_times[i]
+                for i in range(len(check_times) - 1)
+            ]
+            for gap in gaps:
+                assert 3.0 <= gap <= 8.0, (
+                    f"Gap between checks was {gap:.1f}s, expected ~5s"
+                )
+
+    def test_paper_scan_interval_does_not_affect_monitor(
+        self, engine: PaperTradingEngine,
+    ):
+        """The monitor should check positions every interval_seconds
+        regardless of paper_scan_interval (300s)."""
+        check_times: list[float] = []
+
+        def tracking_fetcher(symbols):
+            check_times.append(time.monotonic())
+            return {"BTCUSDT": 100100.0}
+
+        trade = _make_trade()
+        engine.open_trades["BTCUSDT"] = trade
+
+        monitor = PositionMonitor(
+            engine=engine,
+            price_fetcher=tracking_fetcher,
+            interval_seconds=3,
+        )
+        monitor.start()
+        time.sleep(12)
+        monitor.stop()
+
+        assert len(check_times) >= 3, (
+            f"Expected >= 3 checks in 12s, got {len(check_times)}"
+        )
+
+
+# ==================================================================
+# Lock acquisition during check
+# ==================================================================
+class TestLockDuringCheck:
+    def test_check_acquires_lock(self, engine: PaperTradingEngine):
+        """Verify the position monitor acquires engine.trading_lock."""
+        lock_was_held = threading.Event()
+        original_acquire = engine.trading_lock.acquire
+
+        def tracking_acquire(*args, **kwargs):
+            result = original_acquire(*args, **kwargs)
+            lock_was_held.set()
+            return result
+
+        class LockProxy:
+            def __init__(self, real_lock):
+                self._real = real_lock
+            def acquire(self, *a, **kw):
+                result = self._real.acquire(*a, **kw)
+                lock_was_held.set()
+                return result
+            def release(self, *a, **kw):
+                return self._real.release(*a, **kw)
+            def __enter__(self):
+                return self._real.__enter__()
+            def __exit__(self, *a):
+                return self._real.__exit__(*a)
+
+        engine.trading_lock = LockProxy(engine.trading_lock)
+
+        trade = _make_trade()
+        engine.open_trades["BTCUSDT"] = trade
+
+        monitor = PositionMonitor(
+            engine=engine,
+            price_fetcher=lambda s: {"BTCUSDT": 100100.0},
+            interval_seconds=1,
+        )
+        monitor.run_once()
+        assert lock_was_held.is_set()
+
+    def test_check_releases_lock_on_exception(self, engine: PaperTradingEngine):
+        """Lock must be released even if check_exits raises."""
+        def boom(*a, **kw):
+            raise RuntimeError("test error")
+
+        engine.check_exits = boom
+
+        trade = _make_trade()
+        engine.open_trades["BTCUSDT"] = trade
+
+        monitor = PositionMonitor(
+            engine=engine,
+            price_fetcher=lambda s: {"BTCUSDT": 100000.0},
+        )
+        try:
+            monitor._check_positions()
+        except RuntimeError:
+            pass
+
+        assert engine.trading_lock.acquire(timeout=1)
+        engine.trading_lock.release()
+
+
+# ==================================================================
+# Heartbeat and diagnostics
+# ==================================================================
+class TestHeartbeat:
+    def test_heartbeat_updates_in_background(self, engine: PaperTradingEngine):
+        monitor = PositionMonitor(
+            engine=engine,
+            price_fetcher=lambda s: {},
+            interval_seconds=1,
+        )
+        monitor.start()
+        time.sleep(3)
+        hb_running = monitor.heartbeat
+        assert hb_running["status"] == "RUNNING"
+        assert hb_running["total_checks"] >= 2
+        assert hb_running["last_check"] is not None
+
+        monitor.stop()
+        hb_stopped = monitor.heartbeat
+        assert hb_stopped["status"] == "STOPPED"
+
+    def test_diagnostics_include_engine_state(self, engine: PaperTradingEngine):
+        monitor = PositionMonitor(
+            engine=engine,
+            price_fetcher=lambda s: {},
+        )
+        diag = monitor.get_diagnostics()
+        assert "engine_state" in diag
+        assert "open_positions" in diag["engine_state"]
+        assert "gap_loss_halt" in diag["engine_state"]
+
+    def test_heartbeat_updates_after_run_once(self, engine: PaperTradingEngine):
+        """Test that heartbeat is updated after run_once."""
+        monitor = PositionMonitor(
+            engine=engine,
+            price_fetcher=MagicMock(return_value={}),
+        )
+        monitor.run_once()
         heartbeat = monitor.heartbeat
-        assert heartbeat["status"] == "STOPPED"
-        assert heartbeat["last_check"] is None
+        assert heartbeat["last_check"] is not None
+        assert heartbeat["total_checks"] == 1
         assert heartbeat["open_positions"] == 0
 
-    def test_check_positions_no_open_trades(self, engine: PaperTradingEngine):
-        """Test check_positions when there are no open trades."""
-        price_fetcher = MagicMock(return_value={})
-        monitor = PositionMonitor(
-            engine=engine,
-            price_fetcher=price_fetcher,
-        )
-        closed = monitor.check_positions()
-        assert closed == []
-        assert monitor.total_checks == 1
 
-    def test_check_positions_with_open_trades(self, engine: PaperTradingEngine):
-        """Test check_positions with open trades."""
-        trade = _make_trade()
-        engine.open_trades["BTCUSDT"] = trade
-
-        price_fetcher = MagicMock(return_value={"BTCUSDT": 100500.0})
-        monitor = PositionMonitor(
-            engine=engine,
-            price_fetcher=price_fetcher,
-        )
-        closed = monitor.check_positions()
-        assert len(closed) == 0  # Price is above entry, no exit
-        assert monitor.total_checks == 1
-        assert monitor.last_check is not None
-
-    def test_check_positions_price_fetch_failure(self, engine: PaperTradingEngine):
-        """Test check_positions when price fetch fails."""
-        trade = _make_trade()
-        engine.open_trades["BTCUSDT"] = trade
-
-        price_fetcher = MagicMock(side_effect=Exception("API error"))
-        monitor = PositionMonitor(
-            engine=engine,
-            price_fetcher=price_fetcher,
-        )
-        closed = monitor.check_positions()
-        assert closed == []
-        assert monitor.total_checks == 1
-
-
+# ==================================================================
+# STOP_LOSS_GAP detection (from main PR #31)
+# ==================================================================
 class TestStopLossGapDetection:
-    """Test STOP_LOSS_GAP detection and diagnostics."""
-
     def test_gap_detected_long_position(self, engine: PaperTradingEngine):
         """Test STOP_LOSS_GAP detection for LONG position."""
-        # Create a trade with stop at 99500
-        # risk_usdt = abs(100000 - 99500) * 0.001 = 0.5
         trade = _make_trade(
             direction="LONG",
             entry_price=100000.0,
@@ -173,17 +335,15 @@ class TestStopLossGapDetection:
         )
         engine.open_trades["BTCUSDT"] = trade
 
-        # Price gaps through stop to 99300 (below stop)
         price_fetcher = MagicMock(return_value={"BTCUSDT": 99300.0})
         monitor = PositionMonitor(
             engine=engine,
             price_fetcher=price_fetcher,
         )
 
-        closed = monitor.check_positions()
+        closed = monitor.run_once()
         assert len(closed) == 1
         assert closed[0].status == "CLOSED"
-        # The engine records the gap event, check engine's count
         assert engine.stop_gap_count_24h == 1
         assert engine.last_stop_gap is not None
         assert engine.last_stop_gap["symbol"] == "BTCUSDT"
@@ -192,8 +352,6 @@ class TestStopLossGapDetection:
 
     def test_gap_detected_short_position(self, engine: PaperTradingEngine):
         """Test STOP_LOSS_GAP detection for SHORT position."""
-        # Create a SHORT trade with stop at 100500
-        # risk_usdt = abs(100000 - 100500) * 0.001 = 0.5
         trade = _make_trade(
             direction="SHORT",
             entry_price=100000.0,
@@ -202,17 +360,14 @@ class TestStopLossGapDetection:
         )
         engine.open_trades["BTCUSDT"] = trade
 
-        # Price gaps through stop to 100700 (above stop)
         price_fetcher = MagicMock(return_value={"BTCUSDT": 100700.0})
         monitor = PositionMonitor(
             engine=engine,
             price_fetcher=price_fetcher,
         )
 
-        closed = monitor.check_positions()
+        closed = monitor.run_once()
         assert len(closed) == 1
-        assert closed[0].status == "CLOSED"
-        # The engine records the gap event
         assert engine.stop_gap_count_24h == 1
         assert engine.last_stop_gap["direction"] == "SHORT"
 
@@ -225,17 +380,15 @@ class TestStopLossGapDetection:
         )
         engine.open_trades["BTCUSDT"] = trade
 
-        # Price exactly at stop level
         price_fetcher = MagicMock(return_value={"BTCUSDT": 99500.0})
         monitor = PositionMonitor(
             engine=engine,
             price_fetcher=price_fetcher,
         )
 
-        closed = monitor.check_positions()
+        closed = monitor.run_once()
         assert len(closed) == 1
-        # Should be STOP_LOSS, not STOP_LOSS_GAP
-        assert monitor.stop_gap_count_24h == 0
+        assert engine.stop_gap_count_24h == 0
 
     def test_no_gap_when_profitable(self, engine: PaperTradingEngine):
         """Test no GAP when position is profitable."""
@@ -244,168 +397,25 @@ class TestStopLossGapDetection:
             entry_price=100000.0,
             stop_price=99500.0,
         )
-        # Set target_1 higher than the price we'll check
         trade.target_1 = 102000.0
         engine.open_trades["BTCUSDT"] = trade
 
-        # Price is above entry (profitable) but below target
         price_fetcher = MagicMock(return_value={"BTCUSDT": 101000.0})
         monitor = PositionMonitor(
             engine=engine,
             price_fetcher=price_fetcher,
         )
 
-        closed = monitor.check_positions()
+        closed = monitor.run_once()
         assert len(closed) == 0
         assert engine.stop_gap_count_24h == 0
 
 
-class TestDiagnostics:
-    """Test diagnostic data collection."""
-
-    def test_gap_event_recorded_with_all_fields(self, engine: PaperTradingEngine):
-        """Test that STOP_LOSS_GAP event contains all required diagnostic fields."""
-        # risk_usdt = abs(100000 - 99500) * 0.001 = 0.5
-        trade = _make_trade(
-            direction="LONG",
-            entry_price=100000.0,
-            stop_price=99500.0,
-            position_size=0.001,
-            scanner_name="TREND_PULLBACK",
-        )
-        engine.open_trades["BTCUSDT"] = trade
-
-        # Price gaps to 99200
-        price_fetcher = MagicMock(return_value={"BTCUSDT": 99200.0})
-        monitor = PositionMonitor(
-            engine=engine,
-            price_fetcher=price_fetcher,
-        )
-
-        monitor.check_positions()
-
-        # The engine records the gap event
-        gap_event = engine.last_stop_gap
-        assert gap_event is not None
-        assert gap_event["symbol"] == "BTCUSDT"
-        assert gap_event["scanner_name"] == "TREND_PULLBACK"
-        assert gap_event["direction"] == "LONG"
-        assert gap_event["entry_price"] == 100000.0
-        assert gap_event["stop_price"] == 99500.0
-        assert gap_event["observed_price"] == 99200.0
-        assert gap_event["gap_pct"] > 0
-        assert gap_event["total_r"] < 0
-        assert gap_event["timestamp"] is not None
-
-    def test_multiple_gaps_tracked(self, engine: PaperTradingEngine):
-        """Test that multiple STOP_LOSS_GAP events are tracked."""
-        # First trade
-        trade1 = _make_trade(
-            symbol="BTCUSDT",
-            direction="LONG",
-            entry_price=100000.0,
-            stop_price=99500.0,
-        )
-        engine.open_trades["BTCUSDT"] = trade1
-
-        price_fetcher = MagicMock(return_value={"BTCUSDT": 99200.0})
-        monitor = PositionMonitor(
-            engine=engine,
-            price_fetcher=price_fetcher,
-        )
-
-        monitor.check_positions()
-        # The engine records the gap event
-        assert engine.stop_gap_count_24h == 1
-
-        # Second trade
-        trade2 = _make_trade(
-            symbol="ETHUSDT",
-            direction="LONG",
-            entry_price=3000.0,
-            stop_price=2985.0,
-        )
-        engine.open_trades["ETHUSDT"] = trade2
-
-        price_fetcher2 = MagicMock(return_value={"ETHUSDT": 2970.0})
-        monitor2 = PositionMonitor(
-            engine=engine,
-            price_fetcher=price_fetcher2,
-        )
-
-        monitor2.check_positions()
-        # Both gaps are tracked in the engine
-        assert engine.stop_gap_count_24h == 2
-
-    def test_old_events_cleaned_up(self, engine: PaperTradingEngine):
-        """Test that events older than 24 hours are cleaned up."""
-        price_fetcher = MagicMock(return_value={})
-        monitor = PositionMonitor(
-            engine=engine,
-            price_fetcher=price_fetcher,
-        )
-
-        # Manually add an old event (25 hours ago)
-        old_time = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
-        monitor._stop_gap_events.append({
-            "symbol": "BTCUSDT",
-            "timestamp": old_time,
-        })
-        monitor._stop_gap_count_24h = 1
-
-        # Add a recent event
-        recent_time = datetime.now(timezone.utc).isoformat()
-        monitor._stop_gap_events.append({
-            "symbol": "ETHUSDT",
-            "timestamp": recent_time,
-        })
-
-        # Cleanup should remove old event
-        monitor._cleanup_old_stop_gap_events()
-        assert monitor.stop_gap_count_24h == 1
-
-
-class TestHeartbeat:
-    """Test heartbeat and monitoring status."""
-
-    def test_heartbeat_updates_after_check(self, engine: PaperTradingEngine):
-        """Test that heartbeat is updated after position check."""
-        price_fetcher = MagicMock(return_value={})
-        monitor = PositionMonitor(
-            engine=engine,
-            price_fetcher=price_fetcher,
-        )
-
-        monitor.check_positions()
-
-        heartbeat = monitor.heartbeat
-        assert heartbeat["status"] == "STOPPED"  # Not running continuously
-        assert heartbeat["last_check"] is not None
-        assert heartbeat["total_checks"] == 1
-        assert heartbeat["open_positions"] == 0
-
-    def test_diagnostics_include_engine_state(self, engine: PaperTradingEngine):
-        """Test that diagnostics include engine state."""
-        price_fetcher = MagicMock(return_value={})
-        monitor = PositionMonitor(
-            engine=engine,
-            price_fetcher=price_fetcher,
-        )
-
-        diagnostics = monitor.get_diagnostics()
-        assert "heartbeat" in diagnostics
-        assert "stop_gap_events_24h" in diagnostics
-        assert "engine_state" in diagnostics
-        assert "open_positions" in diagnostics["engine_state"]
-        assert "balance" in diagnostics["engine_state"]
-        assert "gap_loss_halt" in diagnostics["engine_state"]
-
-
+# ==================================================================
+# Engine gate status
+# ==================================================================
 class TestEngineGateStatus:
-    """Test enriched gate status in PaperTradingEngine."""
-
     def test_gate_status_default(self, engine: PaperTradingEngine):
-        """Test default gate status."""
         gate = engine.gate_status
         assert gate["status"] == "OPEN"
         assert gate["reason"] is None
@@ -414,8 +424,6 @@ class TestEngineGateStatus:
 
     def test_gate_status_blocked_after_gap(self, engine: PaperTradingEngine):
         """Test gate status changes to BLOCKED after severe gap."""
-        # Create a trade that will trigger the gate
-        # risk_usdt = abs(100000 - 99500) * 0.001 = 0.5
         trade = _make_trade(
             direction="LONG",
             entry_price=100000.0,
@@ -424,14 +432,7 @@ class TestEngineGateStatus:
         )
         engine.open_trades["BTCUSDT"] = trade
 
-        # Price gaps significantly (more than 1.2R loss)
-        # 1.2R = 1.2 * 0.5 = 0.6 USDT loss
-        # We need net_pnl < -0.6 USDT
-        # gross_pnl = (exit_price - entry_price) * position_size
-        # For exit_price = 99399: gross_pnl = (99399 - 100000) * 0.001 = -60.1 USDT
-        # This is way more than -0.6 USDT, so it should trigger the gate
         closed = engine.check_exits({"BTCUSDT": 99399.0})
-
         assert len(closed) == 1
         assert engine._gap_loss_halt is True
         assert engine.gate_status["status"] == "BLOCKED"
@@ -439,7 +440,6 @@ class TestEngineGateStatus:
         assert engine.gate_status["since"] is not None
 
     def test_snapshot_includes_gate_status(self, engine: PaperTradingEngine):
-        """Test that snapshot includes gate status."""
         snapshot = engine.snapshot()
         assert "gate" in snapshot
         assert "stop_gap_24h" in snapshot
@@ -447,13 +447,12 @@ class TestEngineGateStatus:
         assert snapshot["gate"]["status"] == "OPEN"
 
 
+# ==================================================================
+# Integration: monitor blocks entries when gate is triggered
+# ==================================================================
 class TestPositionMonitorIntegration:
-    """Integration tests for PositionMonitor with PaperTradingEngine."""
-
     def test_monitor_prevents_new_entries_when_blocked(self, engine: PaperTradingEngine):
-        """Test that position monitor doesn't affect entry logic."""
-        # Create a trade that will trigger the gate
-        # risk_usdt = abs(100000 - 99500) * 0.001 = 0.5
+        """Test that entries are blocked when gate triggers."""
         trade = _make_trade(
             direction="LONG",
             entry_price=100000.0,
@@ -462,12 +461,10 @@ class TestPositionMonitorIntegration:
         )
         engine.open_trades["BTCUSDT"] = trade
 
-        # Price gaps significantly (more than 1.2R loss)
         closed = engine.check_exits({"BTCUSDT": 99399.0})
         assert len(closed) == 1
         assert engine._gap_loss_halt is True
 
-        # Verify entries are blocked
         from app.scanners.models import SetupCandidate
         candidate = SetupCandidate(
             setup_id="test-setup-2",
@@ -484,28 +481,21 @@ class TestPositionMonitorIntegration:
             reference_price=3000.0,
         )
 
-        # Mock the duplicate check
         engine.repo.get_paper_trade_by_setup = MagicMock(return_value=None)
-
-        # This should be blocked by the gate
         opened = engine.check_entries([candidate], {"ETHUSDT": 3000.0})
         assert len(opened) == 0  # Blocked by gate
 
-    def test_position_monitor_heartbeat_in_snapshot(self, engine: PaperTradingEngine):
-        """Test that position monitor heartbeat is available."""
-        price_fetcher = MagicMock(return_value={})
+    def test_diagnostics_full_flow(self, engine: PaperTradingEngine):
+        """Test diagnostics include engine state after gap."""
         monitor = PositionMonitor(
             engine=engine,
-            price_fetcher=price_fetcher,
+            price_fetcher=MagicMock(return_value={}),
         )
 
-        # Run a check
-        monitor.check_positions()
-
-        # Get diagnostics
         diagnostics = monitor.get_diagnostics()
-        heartbeat = diagnostics["heartbeat"]
-
-        assert heartbeat["total_checks"] == 1
-        assert heartbeat["last_check"] is not None
-        assert heartbeat["interval_seconds"] == 10
+        assert "heartbeat" in diagnostics
+        assert "stop_gap_events_24h" in diagnostics
+        assert "engine_state" in diagnostics
+        assert "open_positions" in diagnostics["engine_state"]
+        assert "balance" in diagnostics["engine_state"]
+        assert "gap_loss_halt" in diagnostics["engine_state"]

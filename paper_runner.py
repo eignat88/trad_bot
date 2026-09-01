@@ -1,13 +1,19 @@
 """Paper Trading Runner — continuously monitors setups and manages paper trades.
 
-Runs alongside scanner_runner.py. On each cycle:
-1. Fetches current prices for all symbols with active setups + open positions.
-2. Checks exits for open positions (TP/SL/trailing/expire).
-3. Scans for new entries (READY_TO_TRADE setups in entry zone).
-4. Saves account snapshots.
+Runs alongside scanner_runner.py.  Two independent loops:
 
-Position monitoring is separated into a fast loop (every 10 seconds) to
-minimize STOP_LOSS_GAP events caused by slow monitoring frequency.
+  **Fast loop** (position monitor, ~10 s):
+    Fetches prices for open positions and checks SL/TP/trailing/breakeven.
+    Runs in a dedicated daemon thread so that stop-loss monitoring is never
+    delayed by the slower entry cycle.
+
+  **Slow loop** (main thread, ~300 s):
+    Reads READY_TO_TRADE setups from the DB, opens new paper positions,
+    expires stale setups, and saves account snapshots.
+
+Separating the two loops eliminates the root cause of systematic
+STOP_LOSS_GAP events: with a 5-minute check cycle almost every stop hit
+gapped through the level.
 """
 from __future__ import annotations
 
@@ -105,49 +111,33 @@ def _load_ready_setups(repo: ScannerRepository) -> list[dict]:
     return repo.load_ready_setups()
 
 
-def run_cycle(
+def run_entry_cycle(
     engine: PaperTradingEngine,
     client: BybitClient,
     repo: ScannerRepository,
     expectancy_filter: ExpectancyFilter | None,
     settings: Settings,
-    position_monitor: PositionMonitor | None = None,
 ) -> dict[str, Any]:
-    """Run one paper trading cycle: exits → entries → snapshot.
+    """Run one paper-trading entry cycle (runs every ~300 s).
 
-    Does NOT re-scan via Bybit API. Reads READY_TO_TRADE setups from DB
-    and only fetches current prices for entry-zone / exit checks.
+    Does NOT check exits — that is handled by the fast position monitor
+    thread.  Reads READY_TO_TRADE setups from DB, checks entry zones,
+    and saves account snapshots.
 
     Each DB block is independently error-protected to prevent cascading
     SQLSTATE 25P02 errors from a single transient failure.
-
-    When position_monitor is provided, it's used for exit checks (fast loop).
-    Otherwise, exits are checked directly in this cycle.
     """
-    stats = {"exits": 0, "entries": 0, "skipped_no_setup": 0, "expectancy_rejected": 0, "emergency_stop": 0}
+    stats: dict[str, Any] = {
+        "entries": 0, "skipped_no_setup": 0,
+        "expectancy_rejected": 0, "emergency_stop": 0,
+    }
 
-    # --- 1. CHECK EXITS (monitor existing open positions) ---
-    # Use position monitor for fast exit checking if available
-    if position_monitor is not None and engine.open_trades:
-        closed = position_monitor.check_positions()
-        stats["exits"] = len(closed)
-    else:
-        # Fallback to direct exit checking (original behavior)
-        open_symbols = list(engine.open_trades.keys())
-        if open_symbols:
-            prices = _get_prices(client, open_symbols)
-            funding_rates = _get_funding_rates(client, open_symbols)
-            closed = engine.check_exits(prices, funding_rates)
-            stats["exits"] = len(closed)
-
-    # --- 2. CHECK ENTRIES (read from DB, fetch prices only) ---
+    # --- 1. CHECK ENTRIES (read from DB, fetch prices only) ---
     ready_setups: list[dict] = []
     if _emergency_stop_requested(settings):
         stats["emergency_stop"] = 1
         logger.critical("paper emergency stop is active: new entries are disabled")
     else:
-        # This DB block is independently protected — failure here does not
-        # affect expire/snapshot blocks below.
         try:
             ready_setups = _load_ready_setups(repo)
         except Exception:
@@ -155,11 +145,9 @@ def run_cycle(
             ready_setups = []
 
     candidates = []
-    all_prices: dict[str, float] = {}
     if not ready_setups:
         stats["skipped_no_setup"] = 1
     else:
-        # Deduplicate symbols and fetch current entry prices.
         needed_symbols = list({s["symbol"] for s in ready_setups} | set(engine.open_trades.keys()))
         all_prices = _get_prices(client, needed_symbols)
 
@@ -194,10 +182,13 @@ def run_cycle(
             )
             stats["expectancy_rejected"] = rejected
 
-        opened = engine.check_entries(candidates, all_prices)
+        # Acquire lock so the position monitor thread is not mutating
+        # open_trades while we open new positions.
+        with engine.trading_lock:
+            opened = engine.check_entries(candidates, all_prices)
         stats["entries"] = len(opened)
 
-    # --- 3. EXPIRE OLD SETUPS (independently protected) ---
+    # --- 2. EXPIRE OLD SETUPS (independently protected) ---
     try:
         expired = repo.expire_stale_setups(max_age_minutes=120)
         if expired:
@@ -205,7 +196,7 @@ def run_cycle(
     except Exception:
         logger.exception("failed to expire setups")
 
-    # --- 4. ACCOUNT SNAPSHOT (independently protected) ---
+    # --- 3. ACCOUNT SNAPSHOT (independently protected) ---
     try:
         stats_rows = repo.get_paper_trade_stats()
         total_trades = sum(s.get("total_trades", 0) or 0 for s in stats_rows)
@@ -213,17 +204,18 @@ def run_cycle(
         losing = sum(s.get("losses", 0) or 0 for s in stats_rows)
         total_pnl = sum(s.get("total_pnl_usdt", 0) or 0 for s in stats_rows)
 
-        repo.save_paper_account_snapshot(
-            balance=engine.balance,
-            equity=engine.balance,
-            open_positions=len(engine.open_trades),
-            total_trades=total_trades,
-            winning_trades=winning,
-            losing_trades=losing,
-            total_pnl=total_pnl,
-            max_drawdown=engine._max_drawdown,
-            cooldown_until=engine._cooldown_until,
-        )
+        with engine.trading_lock:
+            repo.save_paper_account_snapshot(
+                balance=engine.balance,
+                equity=engine.balance,
+                open_positions=len(engine.open_trades),
+                total_trades=total_trades,
+                winning_trades=winning,
+                losing_trades=losing,
+                total_pnl=total_pnl,
+                max_drawdown=engine._max_drawdown,
+                cooldown_until=engine._cooldown_until,
+            )
     except Exception:
         logger.exception("failed to save account snapshot")
 
@@ -246,7 +238,7 @@ def main() -> None:
         backend="postgres",
     )
 
-    # Verify DB connectivity (schema must be applied separately via schema.sql)
+    # Verify DB connectivity
     if not repo.ping():
         logger.error("database health check failed")
         repo.close()
@@ -263,28 +255,33 @@ def main() -> None:
 
     engine = PaperTradingEngine(settings, repo)
 
-    # Create fast position monitor (10 second interval by default)
-    position_monitor_interval = getattr(settings, 'position_monitor_interval', 10)
-    position_monitor = PositionMonitor(
+    # --- Create and start the FAST position monitor (background thread) ---
+    monitor_interval = getattr(settings, "position_monitor_interval", 10)
+    monitor = PositionMonitor(
         engine=engine,
         price_fetcher=lambda symbols: _get_prices(client, symbols),
         funding_fetcher=lambda symbols: _get_funding_rates(client, symbols),
-        interval_seconds=position_monitor_interval,
+        interval_seconds=monitor_interval,
     )
+    monitor.start()
+
     logger.info(
-        "paper runner started: balance=$%.2f positions=%d monitor_interval=%ds",
-        engine.balance, len(engine.open_trades), position_monitor_interval,
+        "paper runner started: balance=$%.2f positions=%d "
+        "monitor_interval=%ds paper_cycle=%ds",
+        engine.balance, len(engine.open_trades),
+        monitor_interval, settings.paper_scan_interval,
     )
 
+    # --- SLOW loop: entry checks + snapshots ---
     cycle = 0
-    interval = settings.paper_scan_interval  # Default 300s (5 minutes)
+    interval = settings.paper_scan_interval
     last_heartbeat_log = time.monotonic()
 
     while not SHUTDOWN:
         cycle += 1
         start = time.monotonic()
 
-        # Keepalive ping to prevent idle connection timeout
+        # Keepalive ping
         if not repo.ping():
             logger.warning("DB ping failed, attempting reconnect")
             if repo.reconnect():
@@ -297,35 +294,33 @@ def main() -> None:
                 continue
 
         try:
-            stats = run_cycle(
+            stats = run_entry_cycle(
                 engine, client, repo, expectancy_filter, settings,
-                position_monitor=position_monitor,
             )
             logger.info(
-                "cycle #%d: entries=%d exits=%d open=%d balance=$%.2f",
-                cycle, stats["entries"], stats["exits"],
+                "cycle #%d: entries=%d open=%d balance=$%.2f",
+                cycle, stats["entries"],
                 len(engine.open_trades), engine.balance,
             )
-
-            # Log position monitor heartbeat every 60 seconds
-            if time.monotonic() - last_heartbeat_log >= 60:
-                heartbeat = position_monitor.heartbeat
-                logger.info(
-                    "position monitor: status=%s checks=%d closes=%d "
-                    "stop_gap_24h=%d last_check_age=%.1fs",
-                    heartbeat["status"], heartbeat["total_checks"],
-                    heartbeat["total_closes"], heartbeat["stop_gap_24h"],
-                    heartbeat["last_check_age_sec"] or 0,
-                )
-                last_heartbeat_log = time.monotonic()
-
         except Exception:
             logger.exception("cycle #%d failed", cycle)
-            # Attempt reconnect after DB connection drop
             if repo.reconnect():
                 logger.info("paper runner reconnected to PostgreSQL")
                 if settings.expectancy_filter_enabled:
                     expectancy_filter = load_expectancy(repo)
+
+        # --- Independent heartbeat logging every 60 s ---
+        now_mono = time.monotonic()
+        if now_mono - last_heartbeat_log >= 60:
+            hb = monitor.heartbeat
+            logger.info(
+                "position monitor: status=%s checks=%d closes=%d "
+                "stop_gap_24h=%d last_check_age=%.1fs",
+                hb["status"], hb["total_checks"], hb["total_closes"],
+                hb["stop_gap_24h"],
+                hb["last_check_age_sec"] or 0,
+            )
+            last_heartbeat_log = now_mono
 
         # Sleep in small intervals to respond to shutdown
         delay = max(0, interval - (time.monotonic() - start))
@@ -334,9 +329,13 @@ def main() -> None:
                 break
             time.sleep(1)
 
-    # Save final snapshot
+    # --- Shutdown ---
+    logger.info("stopping position monitor...")
+    monitor.stop()
+
     try:
-        snap = engine.snapshot()
+        with engine.trading_lock:
+            snap = engine.snapshot()
         logger.info("paper runner shutting down: %s", snap)
     except Exception:
         pass

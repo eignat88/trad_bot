@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -97,6 +98,10 @@ class PaperTradingEngine:
         # fresh entries until the operator reviews the paper-forward run.
         self._gap_loss_halt = False
         self._risk_day = self._clock().date()
+
+        # Thread safety: protects open_trades / balance / check_exits / check_entries
+        # when the position monitor runs in a background thread.
+        self.trading_lock = threading.Lock()
 
         # STOP_GAP diagnostic tracking
         self._stop_gap_events: list[dict] = []
