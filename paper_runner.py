@@ -5,6 +5,9 @@ Runs alongside scanner_runner.py. On each cycle:
 2. Checks exits for open positions (TP/SL/trailing/expire).
 3. Scans for new entries (READY_TO_TRADE setups in entry zone).
 4. Saves account snapshots.
+
+Position monitoring is separated into a fast loop (every 10 seconds) to
+minimize STOP_LOSS_GAP events caused by slow monitoring frequency.
 """
 from __future__ import annotations
 
@@ -20,6 +23,7 @@ from app.config import Settings, load_settings
 from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
 from app.paper.engine import PaperTradingEngine
+from app.paper.position_monitor import PositionMonitor
 from app.scanners.expectancy_filter import ExpectancyFilter, filter_candidates, load_expectancy
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -107,6 +111,7 @@ def run_cycle(
     repo: ScannerRepository,
     expectancy_filter: ExpectancyFilter | None,
     settings: Settings,
+    position_monitor: PositionMonitor | None = None,
 ) -> dict[str, Any]:
     """Run one paper trading cycle: exits → entries → snapshot.
 
@@ -115,16 +120,25 @@ def run_cycle(
 
     Each DB block is independently error-protected to prevent cascading
     SQLSTATE 25P02 errors from a single transient failure.
+
+    When position_monitor is provided, it's used for exit checks (fast loop).
+    Otherwise, exits are checked directly in this cycle.
     """
     stats = {"exits": 0, "entries": 0, "skipped_no_setup": 0, "expectancy_rejected": 0, "emergency_stop": 0}
 
     # --- 1. CHECK EXITS (monitor existing open positions) ---
-    open_symbols = list(engine.open_trades.keys())
-    if open_symbols:
-        prices = _get_prices(client, open_symbols)
-        funding_rates = _get_funding_rates(client, open_symbols)
-        closed = engine.check_exits(prices, funding_rates)
+    # Use position monitor for fast exit checking if available
+    if position_monitor is not None and engine.open_trades:
+        closed = position_monitor.check_positions()
         stats["exits"] = len(closed)
+    else:
+        # Fallback to direct exit checking (original behavior)
+        open_symbols = list(engine.open_trades.keys())
+        if open_symbols:
+            prices = _get_prices(client, open_symbols)
+            funding_rates = _get_funding_rates(client, open_symbols)
+            closed = engine.check_exits(prices, funding_rates)
+            stats["exits"] = len(closed)
 
     # --- 2. CHECK ENTRIES (read from DB, fetch prices only) ---
     ready_setups: list[dict] = []
@@ -248,13 +262,23 @@ def main() -> None:
         )
 
     engine = PaperTradingEngine(settings, repo)
+
+    # Create fast position monitor (10 second interval by default)
+    position_monitor_interval = getattr(settings, 'position_monitor_interval', 10)
+    position_monitor = PositionMonitor(
+        engine=engine,
+        price_fetcher=lambda symbols: _get_prices(client, symbols),
+        funding_fetcher=lambda symbols: _get_funding_rates(client, symbols),
+        interval_seconds=position_monitor_interval,
+    )
     logger.info(
-        "paper runner started: balance=$%.2f positions=%d",
-        engine.balance, len(engine.open_trades),
+        "paper runner started: balance=$%.2f positions=%d monitor_interval=%ds",
+        engine.balance, len(engine.open_trades), position_monitor_interval,
     )
 
     cycle = 0
     interval = settings.paper_scan_interval  # Default 300s (5 minutes)
+    last_heartbeat_log = time.monotonic()
 
     while not SHUTDOWN:
         cycle += 1
@@ -273,12 +297,28 @@ def main() -> None:
                 continue
 
         try:
-            stats = run_cycle(engine, client, repo, expectancy_filter, settings)
+            stats = run_cycle(
+                engine, client, repo, expectancy_filter, settings,
+                position_monitor=position_monitor,
+            )
             logger.info(
                 "cycle #%d: entries=%d exits=%d open=%d balance=$%.2f",
                 cycle, stats["entries"], stats["exits"],
                 len(engine.open_trades), engine.balance,
             )
+
+            # Log position monitor heartbeat every 60 seconds
+            if time.monotonic() - last_heartbeat_log >= 60:
+                heartbeat = position_monitor.heartbeat
+                logger.info(
+                    "position monitor: status=%s checks=%d closes=%d "
+                    "stop_gap_24h=%d last_check_age=%.1fs",
+                    heartbeat["status"], heartbeat["total_checks"],
+                    heartbeat["total_closes"], heartbeat["stop_gap_24h"],
+                    heartbeat["last_check_age_sec"] or 0,
+                )
+                last_heartbeat_log = time.monotonic()
+
         except Exception:
             logger.exception("cycle #%d failed", cycle)
             # Attempt reconnect after DB connection drop
