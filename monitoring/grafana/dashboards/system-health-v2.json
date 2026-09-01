@@ -185,6 +185,143 @@
     {
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 21 },
+      "id": 106,
+      "title": "Paper Bot Status",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "red", "value": null },
+            { "color": "green", "value": 1 }
+          ] }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Gate" }, "properties": [
+            { "id": "mappings", "value": [
+              { "type": "value", "options": {
+                "BLOCKED": { "color": "red", "text": "BLOCKED" },
+                "TRADING": { "color": "green", "text": "TRADING" },
+                "OK": { "color": "green", "text": "OK" },
+                "NO_TRADES": { "color": "yellow", "text": "NO TRADES" }
+              } }
+            ]},
+            { "id": "custom.cellOptions", "value": { "mode": "basic", "type": "color-background" } }
+          ]},
+          { "matcher": { "id": "byName", "options": "Balance" }, "properties": [{ "id": "unit", "value": "currencyUSD" }, { "id": "decimals", "value": 2 }] },
+          { "matcher": { "id": "byName", "options": "Equity" }, "properties": [{ "id": "unit", "value": "currencyUSD" }, { "id": "decimals", "value": 2 }] }
+        ]
+      },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 22 },
+      "id": 30,
+      "options": { "showHeader": true, "footer": { "show": false } },
+      "title": "Paper Bot Safety Gate",
+      "type": "table",
+      "targets": [
+        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT gate_status AS \"Gate\", balance AS \"Balance\", equity AS \"Equity\", open_positions AS \"Open Positions\", stop_gap_count_24h AS \"STOP_GAP 24h\", total_trades AS \"Total Trades\", active_signals AS \"Active Signals\" FROM mart.paper_safety_gate;", "format": "table", "refId": "A" }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 28 },
+      "id": 31,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Open Positions",
+      "type": "stat",
+      "targets": [
+        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT open_positions AS value FROM mart.paper_safety_gate;", "format": "table", "refId": "A" }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 10 }, { "color": "red", "value": 20 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 28 },
+      "id": 32,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "STOP_GAP Events (24h)",
+      "type": "stat",
+      "targets": [
+        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT stop_gap_count_24h AS value FROM mart.paper_safety_gate;", "format": "table", "refId": "A" }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 28 },
+      "id": 33,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Active Signals",
+      "type": "stat",
+      "targets": [
+        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT active_signals AS value FROM mart.paper_safety_gate;", "format": "table", "refId": "A" }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "orange", "value": null }] },
+          "unit": "dateTimeFromNow"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 28 },
+      "id": 34,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Last STOP_GAP At",
+      "type": "stat",
+      "targets": [
+        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT EXTRACT(EPOCH FROM last_stop_gap_at) * 1000 AS value FROM mart.paper_safety_gate;", "format": "table", "refId": "A" }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 28 },
+      "id": 35,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Balance",
+      "type": "stat",
+      "targets": [
+        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT balance AS value FROM mart.paper_safety_gate;", "format": "table", "refId": "A" }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
       "id": 101,
       "title": "Counters (1h / 24h)",
       "type": "row"
@@ -195,7 +332,7 @@
         "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "short" },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 22 },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 33 },
       "id": 5,
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Runs Last 1h",
@@ -210,7 +347,7 @@
         "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }, "unit": "short" },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 22 },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 33 },
       "id": 6,
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Signals Last 1h",
@@ -225,7 +362,7 @@
         "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 5 }] }, "unit": "short" },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 22 },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 33 },
       "id": 7,
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Errors Last 1h",
@@ -240,7 +377,7 @@
         "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 20 }] }, "unit": "short" },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 22 },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 33 },
       "id": 8,
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Errors Last 24h",
@@ -255,7 +392,7 @@
         "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "orange", "value": null }] }, "unit": "s" },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 22 },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 33 },
       "id": 9,
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Avg Run Duration",
@@ -270,7 +407,7 @@
         "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }, "unit": "short" },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 22 },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 33 },
       "id": 10,
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Failed Runs (total)",
@@ -281,7 +418,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 37 },
       "id": 102,
       "title": "Time Series",
       "type": "row"
@@ -296,7 +433,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 27 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 38 },
       "id": 11,
       "options": { "legend": { "calcs": ["count"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "title": "Scanner Runs Over Time",
@@ -315,7 +452,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 27 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 38 },
       "id": 12,
       "options": { "legend": { "calcs": ["mean"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "title": "Run Duration Over Time",
@@ -334,7 +471,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 27 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 38 },
       "id": 13,
       "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "title": "Scanner Errors Over Time",
@@ -345,7 +482,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 46 },
       "id": 103,
       "title": "Run Details",
       "type": "row"
@@ -356,7 +493,7 @@
         "defaults": { "custom": { "align": "auto", "filterable": true } },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 36 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 47 },
       "id": 14,
       "options": { "showHeader": true, "footer": { "show": false } },
       "title": "Run Stats by Scanner",
