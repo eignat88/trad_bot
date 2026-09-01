@@ -350,6 +350,11 @@ class TestStopLossGapDetection:
         assert engine.last_stop_gap["direction"] == "LONG"
         assert engine.last_stop_gap["gap_pct"] > 0
 
+        diagnostics = monitor.get_diagnostics()
+        assert diagnostics["heartbeat"]["stop_gap_24h"] == 1
+        assert diagnostics["heartbeat"]["last_stop_gap"] == engine.last_stop_gap
+        assert diagnostics["stop_gap_events_24h"] == [engine.last_stop_gap]
+
     def test_gap_detected_short_position(self, engine: PaperTradingEngine):
         """Test STOP_LOSS_GAP detection for SHORT position."""
         trade = _make_trade(

@@ -64,9 +64,6 @@ class PositionMonitor:
         self._last_check_duration_ms: float = 0.0
         self._total_checks: int = 0
         self._total_closes: int = 0
-        self._stop_gap_events: list[dict[str, Any]] = []
-        self._stop_gap_count_24h: int = 0
-        self._last_stop_gap: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # PUBLIC API
@@ -118,14 +115,13 @@ class PositionMonitor:
 
     @property
     def stop_gap_count_24h(self) -> int:
-        """Return the number of STOP_LOSS_GAP events in the last 24 hours."""
-        self._cleanup_old_stop_gap_events()
-        return self._stop_gap_count_24h
+        """Return the engine's STOP_LOSS_GAP count for the last 24 hours."""
+        return self.engine.stop_gap_count_24h
 
     @property
     def last_stop_gap(self) -> dict[str, Any] | None:
-        """Return the most recent STOP_LOSS_GAP event details."""
-        return self._last_stop_gap
+        """Return the most recent engine STOP_LOSS_GAP event details."""
+        return self.engine.last_stop_gap
 
     @property
     def heartbeat(self) -> dict[str, Any]:
@@ -145,7 +141,7 @@ class PositionMonitor:
             "total_checks": self._total_checks,
             "total_closes": self._total_closes,
             "stop_gap_24h": self.stop_gap_count_24h,
-            "last_stop_gap": self._last_stop_gap,
+            "last_stop_gap": self.last_stop_gap,
             "open_positions": len(self.engine.open_trades),
             "interval_seconds": self._interval,
         }
@@ -158,7 +154,7 @@ class PositionMonitor:
         """Return comprehensive diagnostic data for dashboard/debugging."""
         return {
             "heartbeat": self.heartbeat,
-            "stop_gap_events_24h": list(self._stop_gap_events),
+            "stop_gap_events_24h": self.engine.get_stop_gap_diagnostics(),
             "engine_state": {
                 "open_positions": len(self.engine.open_trades),
                 "balance": self.engine.balance,
@@ -254,13 +250,3 @@ class PositionMonitor:
             )
 
         return closed
-
-    def _cleanup_old_stop_gap_events(self) -> None:
-        """Remove STOP_LOSS_GAP events older than 24 hours."""
-        cutoff = self._clock().timestamp() - 86400
-        self._stop_gap_events = [
-            e
-            for e in self._stop_gap_events
-            if datetime.fromisoformat(e["timestamp"]).timestamp() > cutoff
-        ]
-        self._stop_gap_count_24h = len(self._stop_gap_events)
