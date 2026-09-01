@@ -277,9 +277,6 @@ def main() -> None:
     interval = settings.paper_scan_interval
     last_heartbeat_log = time.monotonic()
 
-    def _shutdown_check() -> bool:
-        return SHUTDOWN
-
     while not SHUTDOWN:
         cycle += 1
         start = time.monotonic()

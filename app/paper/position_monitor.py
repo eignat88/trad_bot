@@ -65,6 +65,7 @@ class PositionMonitor:
         self._total_checks: int = 0
         self._total_closes: int = 0
         self._stop_gap_events: list[dict[str, Any]] = []
+        self._stop_gap_count_24h: int = 0
         self._last_stop_gap: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
@@ -117,11 +118,13 @@ class PositionMonitor:
 
     @property
     def stop_gap_count_24h(self) -> int:
+        """Return the number of STOP_LOSS_GAP events in the last 24 hours."""
         self._cleanup_old_stop_gap_events()
-        return len(self._stop_gap_events)
+        return self._stop_gap_count_24h
 
     @property
     def last_stop_gap(self) -> dict[str, Any] | None:
+        """Return the most recent STOP_LOSS_GAP event details."""
         return self._last_stop_gap
 
     @property
@@ -260,3 +263,4 @@ class PositionMonitor:
             for e in self._stop_gap_events
             if datetime.fromisoformat(e["timestamp"]).timestamp() > cutoff
         ]
+        self._stop_gap_count_24h = len(self._stop_gap_events)

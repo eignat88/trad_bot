@@ -103,6 +103,12 @@ class PaperTradingEngine:
         # when the position monitor runs in a background thread.
         self.trading_lock = threading.Lock()
 
+        # STOP_GAP diagnostic tracking
+        self._stop_gap_events: list[dict] = []
+        self._last_stop_gap: dict | None = None
+        self._gate_since: datetime | None = None
+        self._gate_reason: str | None = None
+
         # Restore account/risk state before rebuilding any open positions.
         self._load_account_state()
         self._load_open_trades()
@@ -440,16 +446,18 @@ class PaperTradingEngine:
             # 1. Stop loss check
             if is_long and price <= trade.stop_price:
                 gap = price < trade.stop_price
-                result = self._close_trade(
-                    trade, price if gap else trade.stop_price,
-                    "STOP_LOSS_GAP" if gap else "STOP_LOSS",
-                )
+                exit_price = price if gap else trade.stop_price
+                exit_reason = "STOP_LOSS_GAP" if gap else "STOP_LOSS"
+                result = self._close_trade(trade, exit_price, exit_reason)
+                if gap:
+                    self._record_stop_gap_event(trade, exit_price, price)
             elif not is_long and price >= trade.stop_price:
                 gap = price > trade.stop_price
-                result = self._close_trade(
-                    trade, price if gap else trade.stop_price,
-                    "STOP_LOSS_GAP" if gap else "STOP_LOSS",
-                )
+                exit_price = price if gap else trade.stop_price
+                exit_reason = "STOP_LOSS_GAP" if gap else "STOP_LOSS"
+                result = self._close_trade(trade, exit_price, exit_reason)
+                if gap:
+                    self._record_stop_gap_event(trade, exit_price, price)
 
             # 2. Take profit 1 check (full close)
             if result is None and trade.target_1 is not None:
@@ -486,6 +494,101 @@ class PaperTradingEngine:
         self._update_equity_drawdown()
 
         return closed
+
+    # ------------------------------------------------------------------
+    # STOP_GAP DIAGNOSTICS
+    # ------------------------------------------------------------------
+    def _record_stop_gap_event(
+        self,
+        trade: PaperTradeRecord,
+        expected_exit: float,
+        observed_price: float,
+    ) -> None:
+        """Record diagnostic data for a STOP_LOSS_GAP event.
+
+        Called when price gaps through the stop level between monitoring cycles.
+        The diagnostic data helps identify whether gaps are due to:
+        - Slow monitoring frequency (fix: increase check rate)
+        - Incorrect stop placement (fix: review stop logic)
+        - Extreme volatility (fix: widen stops or reduce position size)
+        """
+        risk_distance = abs(trade.entry_price - trade.stop_price)
+        if risk_distance <= 0:
+            return
+
+        # Calculate gap percentage (how far price moved beyond stop)
+        if trade.direction == "LONG":
+            gap_pct = abs(observed_price - trade.stop_price) / trade.stop_price * 100
+        else:
+            gap_pct = abs(observed_price - trade.stop_price) / trade.stop_price * 100
+
+        # Calculate R-multiple of the gap loss
+        gap_loss_usdt = abs(observed_price - trade.stop_price) * trade.position_size
+        gap_r = gap_loss_usdt / trade.risk_usdt if trade.risk_usdt > 0 else 0
+
+        # Calculate total R including the original stop
+        total_r = -(risk_distance + abs(observed_price - trade.stop_price)) * trade.position_size / trade.risk_usdt if trade.risk_usdt > 0 else 0
+
+        gap_event = {
+            "symbol": trade.symbol,
+            "scanner_name": trade.scanner_name,
+            "direction": trade.direction,
+            "entry_price": trade.entry_price,
+            "stop_price": trade.stop_price,
+            "expected_exit": expected_exit,
+            "observed_price": observed_price,
+            "gap_pct": round(gap_pct, 4),
+            "gap_r": round(gap_r, 4),
+            "total_r": round(total_r, 4),
+            "position_size": trade.position_size,
+            "risk_usdt": trade.risk_usdt,
+            "timestamp": self._clock().isoformat(),
+            "duration_sec": (self._clock() - trade.entered_at).total_seconds(),
+        }
+
+        self._stop_gap_events.append(gap_event)
+        self._last_stop_gap = gap_event
+
+        # Cleanup old events (>24h)
+        self._cleanup_old_stop_gap_events()
+
+        logger.warning(
+            "STOP_GAP recorded: %s %s %s entry=%.4f stop=%.4f "
+            "expected=%.4f observed=%.4f gap=%.2f%% total_R=%.2f",
+            trade.symbol, trade.direction, trade.scanner_name,
+            trade.entry_price, trade.stop_price, expected_exit,
+            observed_price, gap_pct, total_r,
+        )
+
+    def _cleanup_old_stop_gap_events(self) -> None:
+        """Remove STOP_LOSS_GAP events older than 24 hours."""
+        cutoff = self._clock().timestamp() - 86400  # 24 hours ago
+        self._stop_gap_events = [
+            e for e in self._stop_gap_events
+            if datetime.fromisoformat(e["timestamp"]).timestamp() > cutoff
+        ]
+
+    @property
+    def stop_gap_count_24h(self) -> int:
+        """Return the number of STOP_LOSS_GAP events in the last 24 hours."""
+        self._cleanup_old_stop_gap_events()
+        return len(self._stop_gap_events)
+
+    @property
+    def last_stop_gap(self) -> dict | None:
+        """Return the most recent STOP_LOSS_GAP event details."""
+        return self._last_stop_gap
+
+    @property
+    def gate_status(self) -> dict:
+        """Return comprehensive gate status for dashboard."""
+        return {
+            "status": "BLOCKED" if self._gap_loss_halt else "OPEN",
+            "reason": self._gate_reason,
+            "since": self._gate_since.isoformat() if self._gate_since else None,
+            "last_stop_gap": self._last_stop_gap,
+            "stop_gap_24h": self.stop_gap_count_24h,
+        }
 
     # ------------------------------------------------------------------
     # INTERNAL HELPERS
@@ -631,6 +734,8 @@ class PaperTradingEngine:
             and r_multiple < -self.settings.paper_max_loss_r_per_trade
         ):
             self._gap_loss_halt = True
+            self._gate_reason = "STOP_LOSS_GAP"
+            self._gate_since = self._clock()
             logger.critical(
                 "paper risk halt: STOP_LOSS_GAP loss %.2fR exceeds limit %.2fR; "
                 "observed exit is retained and new entries are blocked",
@@ -833,6 +938,11 @@ class PaperTradingEngine:
             return (price - trade.entry_price) * trade.position_size
         return (trade.entry_price - price) * trade.position_size
 
+    def get_stop_gap_diagnostics(self) -> list[dict]:
+        """Return all STOP_LOSS_GAP events from the last 24 hours."""
+        self._cleanup_old_stop_gap_events()
+        return self._stop_gap_events.copy()
+
     def mark_to_market(self, prices: dict[str, float] | None = None) -> dict[str, float]:
         """Return realized balance, unrealized P&L and MTM equity."""
         if prices:
@@ -882,6 +992,10 @@ class PaperTradingEngine:
             "net_exposure_pct": round(exposure["net_exposure_pct"] * 100, 2),
             "consecutive_losses": self._consecutive_losses,
             "cooldown_until": self._cooldown_until.isoformat() if self._cooldown_until else None,
+            # Enriched gate status
+            "gate": self.gate_status,
+            "stop_gap_24h": self.stop_gap_count_24h,
+            "last_stop_gap": self._last_stop_gap,
             "open_trades": [
                 {
                     "symbol": t.symbol,
