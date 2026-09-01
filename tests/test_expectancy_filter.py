@@ -117,6 +117,7 @@ def test_orchestrator_applies_expectancy_filter():
             entry_zone_low=95, entry_zone_high=100,
             invalidation_price=90, target_1=110,
             reference_price=100,
+            score=50, reasons=("TEST",),
             features={"trend_alignment": True, "htf_context": True},
         )
         return SetupCandidate(**{**base.__dict__, **overrides})
