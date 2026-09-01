@@ -312,6 +312,7 @@ DROP VIEW IF EXISTS dds.scanner_expectancy CASCADE;
 DROP VIEW IF EXISTS dds.scanner_symbol_expectancy CASCADE;
 DROP VIEW IF EXISTS dds.scanner_regime_expectancy CASCADE;
 DROP VIEW IF EXISTS dds.score_bucket_expectancy CASCADE;
+DROP VIEW IF EXISTS dds.score_calibration CASCADE;
 DROP VIEW IF EXISTS dds.scanner_confluence_expectancy CASCADE;
 
 CREATE OR REPLACE VIEW dds.scanner_stats AS
@@ -385,16 +386,19 @@ GROUP BY scanner_name, direction
 ORDER BY avg_r_after_costs DESC NULLS LAST;
 
 -- Enriched expectancy: join outcome with setup for regime/score context
+-- Score buckets are wider (0-19, 20-39, 40-59, 60-79, 80-100) to better
+-- reflect the new quality-based scoring where scores are more spread out.
 CREATE OR REPLACE VIEW dds._outcome_enriched AS
 SELECT
     o.*,
     s.market_regime,
     s.score AS setup_score,
     CASE
-        WHEN s.score < 30 THEN '<30'
-        WHEN s.score < 40 THEN '30-39'
-        WHEN s.score < 50 THEN '40-49'
-        ELSE '50+'
+        WHEN s.score < 20 THEN '0-19'
+        WHEN s.score < 40 THEN '20-39'
+        WHEN s.score < 60 THEN '40-59'
+        WHEN s.score < 80 THEN '60-79'
+        ELSE '80-100'
     END AS score_bucket
 FROM dds.signal_outcome o
 JOIN dds.scanner_setup s ON s.setup_id = o.setup_id;
@@ -455,6 +459,33 @@ FROM dds._outcome_enriched
 GROUP BY scanner_name, direction, score_bucket
 HAVING COUNT(*) >= 3
 ORDER BY score_bucket, avg_r_after_costs DESC NULLS LAST;
+
+-- Score calibration: per-scanner expectancy by score bucket for tuning thresholds
+CREATE OR REPLACE VIEW dds.score_calibration AS
+SELECT
+    scanner_name,
+    direction,
+    CASE
+        WHEN s.score < 20 THEN '0-19'
+        WHEN s.score < 40 THEN '20-39'
+        WHEN s.score < 60 THEN '40-59'
+        WHEN s.score < 80 THEN '60-79'
+        ELSE '80-100'
+    END AS score_bucket,
+    COUNT(*) AS samples,
+    COUNT(*) FILTER (WHERE o.entry_touched) AS entries,
+    ROUND(AVG(o.result_r), 4) AS avg_r,
+    ROUND(AVG(o.fee_slippage_adjusted_result_r), 4) AS avg_r_adjusted,
+    ROUND(
+        COUNT(*) FILTER (WHERE o.first_event IN ('TP1', 'TP2'))::numeric /
+        NULLIF(COUNT(*) FILTER (WHERE o.entry_touched), 0), 4
+    ) AS win_rate
+FROM dds.signal_outcome o
+JOIN dds.scanner_setup s ON s.setup_id = o.setup_id
+WHERE o.entry_touched = true
+GROUP BY scanner_name, direction, score_bucket
+HAVING COUNT(*) >= 5
+ORDER BY scanner_name, direction, score_bucket;
 
 -- Scanner confluence is the number of distinct scanners that detected the
 -- same symbol/direction within the runner's ten-minute conflict window.

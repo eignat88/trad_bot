@@ -1,4 +1,12 @@
-"""Scanner 02: Breakout + Retest."""
+"""Scanner 02: Breakout + Retest.
+
+Quality features emitted (all normalised to [0, 1]):
+    volume_ratio          – breakout volume / average volume (graduated)
+    retest_distance       – how close price is to retest zone center
+    rr_ratio              – reward-to-risk normalised
+    stop_distance_atr     – stop distance in ATR (inverted: tighter = higher)
+    regime_alignment      – regime direction matches trade direction
+"""
 from __future__ import annotations
 from datetime import datetime, timezone
 from app.scanners.models import MarketContext, ScannerDirection, SetupCandidate, SetupState
@@ -7,7 +15,7 @@ from app.scanners.swing_engine import find_swing_highs, find_swing_lows
 
 class BreakoutRetestScanner:
     name = "BREAKOUT_RETEST"
-    version = "1.0.0"
+    version = "2.0.0"
 
     def __init__(self, swing_lookback: int = 5, breakout_margin: float = 0.001, retest_margin: float = 0.003) -> None:
         self.swing_lookback = swing_lookback
@@ -21,6 +29,50 @@ class BreakoutRetestScanner:
             return highs[-1].price if highs else None
         lows = find_swing_lows(subset, self.swing_lookback)
         return lows[-1].price if lows else None
+
+    def _build_features(
+        self,
+        candles_15m: list,
+        candles_5m: list,
+        level: float,
+        current_price: float,
+        entry: float,
+        invalidation: float,
+        target_1: float,
+        atr: float,
+        breakout_vol: float,
+        avg_vol: float,
+        direction: str,
+        market_regime: str | None,
+    ) -> dict[str, object]:
+        # Volume ratio: breakout volume relative to average, normalised
+        volume_ratio = min(breakout_vol / avg_vol / 2, 1.0) if avg_vol > 0 else 0.0
+
+        # Retest distance: how close price is to the breakout level
+        retest_distance = max(0.0, 1.0 - abs(current_price - level) / (level * self.retest_margin))
+
+        # R:R ratio
+        risk = abs(entry - invalidation)
+        rr_raw = abs(target_1 - entry) / risk if risk > 0 else 0.0
+        rr_ratio = min(rr_raw / 3.0, 1.0)
+
+        # Stop distance in ATR
+        stop_atr = risk / atr if atr > 0 else 2.0
+        stop_distance_atr = max(0.0, 1.0 - min(stop_atr / 2.0, 1.0))
+
+        # Regime alignment
+        regime_alignment = 1.0 if (
+            (direction == "LONG" and market_regime == "TREND_UP") or
+            (direction == "SHORT" and market_regime == "TREND_DOWN")
+        ) else 0.3
+
+        return {
+            "volume_ratio": volume_ratio,
+            "retest_distance": retest_distance,
+            "rr_ratio": rr_ratio,
+            "stop_distance_atr": stop_distance_atr,
+            "regime_alignment": regime_alignment,
+        }
 
     def _scan_long(self, ctx: MarketContext) -> SetupCandidate | None:
         candles_15m, candles_5m = list(ctx.candles_15m), list(ctx.candles_5m)
@@ -54,6 +106,11 @@ class BreakoutRetestScanner:
         target_2 = resistance + atr * 3.5
         if invalidation >= retest_zone_low or target_1 <= retest_zone_high:
             return None
+        features = self._build_features(
+            candles_15m, candles_5m, resistance, current_price,
+            resistance, invalidation, target_1, atr,
+            breakout_vol, avg_vol, "LONG", ctx.market_regime,
+        )
         return SetupCandidate(
             scanner_name=self.name, scanner_version=self.version, symbol=ctx.symbol,
             direction=ScannerDirection.LONG.value, htf_timeframe="1h", setup_timeframe="15m", entry_timeframe="5m",
@@ -61,10 +118,7 @@ class BreakoutRetestScanner:
             reference_price=resistance, entry_zone_low=retest_zone_low, entry_zone_high=retest_zone_high,
             invalidation_price=invalidation, target_1=target_1, target_2=target_2,
             market_regime=ctx.market_regime, state=SetupState.SETUP_READY,
-            features={"htf_context": True, "breakout_level": resistance,
-                      "volume_confirmation": min(breakout_vol / avg_vol / 2, 1),
-                      "retest_quality": max(0, 1 - abs(current_price - resistance) /
-                      (resistance * self.retest_margin)), "stop_distance_ok": True},
+            features=features,
         )
 
     def _scan_short(self, ctx: MarketContext) -> SetupCandidate | None:
@@ -99,6 +153,11 @@ class BreakoutRetestScanner:
         target_2 = support - atr * 3.5
         if invalidation <= retest_zone_high or target_1 >= retest_zone_low:
             return None
+        features = self._build_features(
+            candles_15m, candles_5m, support, current_price,
+            support, invalidation, target_1, atr,
+            breakdown_vol, avg_vol, "SHORT", ctx.market_regime,
+        )
         return SetupCandidate(
             scanner_name=self.name, scanner_version=self.version, symbol=ctx.symbol,
             direction=ScannerDirection.SHORT.value, htf_timeframe="1h", setup_timeframe="15m", entry_timeframe="5m",
@@ -106,10 +165,7 @@ class BreakoutRetestScanner:
             reference_price=support, entry_zone_low=retest_zone_low, entry_zone_high=retest_zone_high,
             invalidation_price=invalidation, target_1=target_1, target_2=target_2,
             market_regime=ctx.market_regime, state=SetupState.SETUP_READY,
-            features={"htf_context": True, "breakout_level": support,
-                      "volume_confirmation": min(breakdown_vol / avg_vol / 2, 1),
-                      "retest_quality": max(0, 1 - abs(current_price - support) /
-                      (support * self.retest_margin)), "stop_distance_ok": True},
+            features=features,
         )
 
     def scan(self, ctx: MarketContext) -> list[SetupCandidate]:

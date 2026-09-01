@@ -186,15 +186,15 @@ def test_shared_scoring_ranks_confirmation_quality():
     weak = SetupCandidate(
         scanner_name="TREND_PULLBACK", symbol="ALTUSDT", reference_price=100,
         invalidation_price=98, target_1=103,
-        features={"htf_context": True, "pullback_quality": 0.1,
-                  "rsi_confirmation": 0.2, "stop_distance_ok": True},
+        features={"pullback_quality": 0.1,
+                  "rsi_confirmation": 0.2, "rr_ratio": 0.3},
     )
     strong = SetupCandidate(
         scanner_name="TREND_PULLBACK", symbol="BTCUSDT", reference_price=100,
         invalidation_price=98, target_1=104,
-        features={"htf_context": True, "pullback_quality": 0.9,
-                  "rsi_confirmation": 0.8, "volume_confirmation": 1.0,
-                  "stop_distance_ok": True},
+        features={"pullback_quality": 0.9,
+                  "rsi_confirmation": 0.8, "volume_ratio": 1.0,
+                  "rr_ratio": 0.8, "stop_distance_atr": 0.7},
     )
 
     assert score_candidate(strong).score > score_candidate(weak).score
