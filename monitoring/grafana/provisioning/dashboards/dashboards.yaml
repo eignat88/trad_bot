@@ -1,0 +1,15 @@
+# Grafana dashboard provisioning
+apiVersion: 1
+
+providers:
+  - name: trad_bot
+    orgId: 1
+    folder: 'Trad Bot'
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards/trad_bot
+      foldersFromFilesStructure: false

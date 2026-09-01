@@ -1,0 +1,236 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "title": "Performance Table",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "filterable": true } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "win_rate" }, "properties": [{ "id": "unit", "value": "percentunit" }, { "id": "decimals", "value": 2 }] },
+          { "matcher": { "id": "byName", "options": "total_pnl_usdt" }, "properties": [{ "id": "unit", "value": "currencyUSD" }, { "id": "decimals", "value": 2 }] },
+          { "matcher": { "id": "byName", "options": "avg_pnl_usdt" }, "properties": [{ "id": "unit", "value": "currencyUSD" }, { "id": "decimals", "value": 2 }] },
+          { "matcher": { "id": "byName", "options": "profit_factor" }, "properties": [{ "id": "decimals", "value": 2 }] },
+          { "matcher": { "id": "byName", "options": "avg_r" }, "properties": [{ "id": "decimals", "value": 4 }] },
+          { "matcher": { "id": "byName", "options": "total_r" }, "properties": [{ "id": "decimals", "value": 4 }] },
+          { "matcher": { "id": "byName", "options": "avg_win_r" }, "properties": [{ "id": "decimals", "value": 4 }] },
+          { "matcher": { "id": "byName", "options": "avg_loss_r" }, "properties": [{ "id": "decimals", "value": 4 }] }
+        ]
+      },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 1 },
+      "id": 1,
+      "options": { "showHeader": true, "footer": { "show": false } },
+      "title": "Scanner Performance",
+      "type": "table",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+          "rawSql": "SELECT pt.scanner_name AS \"Scanner\", pt.direction AS \"Direction\", COUNT(*) AS \"Trades\", SUM(CASE WHEN pt.pnl_r > 0 THEN 1 ELSE 0 END) AS \"Wins\", SUM(CASE WHEN pt.pnl_r <= 0 THEN 1 ELSE 0 END) AS \"Losses\", ROUND(SUM(CASE WHEN pt.pnl_r > 0 THEN 1 ELSE 0 END)::numeric / COUNT(*), 4) AS \"Win Rate\", ROUND(AVG(pt.pnl_r), 4) AS \"Avg R\", CASE WHEN SUM(CASE WHEN pt.pnl_r < 0 THEN ABS(pt.pnl_r) ELSE 0 END) > 0 THEN ROUND(SUM(CASE WHEN pt.pnl_r > 0 THEN pt.pnl_r ELSE 0 END) / SUM(CASE WHEN pt.pnl_r < 0 THEN ABS(pt.pnl_r) ELSE 0 END), 4) ELSE NULL END AS \"Profit Factor\", ROUND(SUM(pt.pnl_usdt), 2) AS \"PnL USDT\", ROUND(SUM(pt.pnl_r), 4) AS \"Total R\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name IN (${Scanner:sqlstring}) AND pt.direction IN (${Direction:sqlstring}) GROUP BY pt.scanner_name, pt.direction ORDER BY \"PnL USDT\" DESC;",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 11 },
+      "id": 101,
+      "title": "Charts",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": true, "axisColorMode": "text", "axisLabel": "PnL USDT", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 80, "gradientMode": "none", "insertNulls": false, "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 12 },
+      "id": 2,
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "title": "PnL by Scanner",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+          "rawSql": "SELECT trade_date AS time, scanner_name, SUM(pnl_usdt) AS \"PnL USDT\" FROM mart.scanner_daily_stats WHERE $__timeFilter(trade_date) AND scanner_name IN (${Scanner:sqlstring}) AND direction IN (${Direction:sqlstring}) GROUP BY trade_date, scanner_name ORDER BY trade_date;",
+          "format": "time_series",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "Avg R", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 80, "gradientMode": "none", "insertNulls": false, "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "unit": "short",
+          "decimals": 4
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "id": 3,
+      "options": { "legend": { "displayMode": "hidden", "placement": "bottom" }, "orientation": "horizontal", "showValue": "auto", "tooltip": { "mode": "single", "sort": "desc" }, "xTickLabelRotation": 0, "xTickLabelSpacing": 0 },
+      "title": "Avg R by Scanner",
+      "type": "barchart",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+          "rawSql": "SELECT pt.scanner_name, ROUND(AVG(pt.pnl_r), 4) AS \"Avg R\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name IN (${Scanner:sqlstring}) AND pt.direction IN (${Direction:sqlstring}) GROUP BY pt.scanner_name ORDER BY \"Avg R\" DESC;",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "Profit Factor", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 80, "gradientMode": "none", "insertNulls": false, "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "unit": "short",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "id": 4,
+      "options": { "legend": { "displayMode": "hidden", "placement": "bottom" }, "orientation": "horizontal", "showValue": "auto", "tooltip": { "mode": "single", "sort": "desc" }, "xTickLabelRotation": 0, "xTickLabelSpacing": 0 },
+      "title": "Profit Factor by Scanner",
+      "type": "barchart",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+          "rawSql": "SELECT pt.scanner_name, CASE WHEN SUM(CASE WHEN pt.pnl_r < 0 THEN ABS(pt.pnl_r) ELSE 0 END) > 0 THEN ROUND(SUM(CASE WHEN pt.pnl_r > 0 THEN pt.pnl_r ELSE 0 END) / SUM(CASE WHEN pt.pnl_r < 0 THEN ABS(pt.pnl_r) ELSE 0 END), 4) ELSE NULL END AS \"Profit Factor\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name IN (${Scanner:sqlstring}) AND pt.direction IN (${Direction:sqlstring}) GROUP BY pt.scanner_name ORDER BY \"Profit Factor\" DESC;",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "Win Rate", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 80, "gradientMode": "none", "insertNulls": false, "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "unit": "percentunit",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "id": 5,
+      "options": { "legend": { "displayMode": "hidden", "placement": "bottom" }, "orientation": "horizontal", "showValue": "auto", "tooltip": { "mode": "single", "sort": "desc" }, "xTickLabelRotation": 0, "xTickLabelSpacing": 0 },
+      "title": "Win Rate by Scanner",
+      "type": "barchart",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+          "rawSql": "SELECT pt.scanner_name, ROUND(SUM(CASE WHEN pt.pnl_r > 0 THEN 1 ELSE 0 END)::numeric / COUNT(*), 4) AS \"Win Rate\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name IN (${Scanner:sqlstring}) AND pt.direction IN (${Direction:sqlstring}) GROUP BY pt.scanner_name ORDER BY \"Win Rate\" DESC;",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "Trades", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 80, "gradientMode": "none", "insertNulls": false, "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "id": 6,
+      "options": { "legend": { "displayMode": "hidden", "placement": "bottom" }, "orientation": "horizontal", "showValue": "auto", "tooltip": { "mode": "single", "sort": "desc" }, "xTickLabelRotation": 0, "xTickLabelSpacing": 0 },
+      "title": "Trades by Scanner",
+      "type": "barchart",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+          "rawSql": "SELECT pt.scanner_name, COUNT(*) AS \"Trades\" FROM dds.paper_trade pt WHERE pt.status = 'CLOSED' AND pt.closed_at IS NOT NULL AND $__timeFilter(pt.closed_at) AND pt.scanner_name IN (${Scanner:sqlstring}) AND pt.direction IN (${Direction:sqlstring}) GROUP BY pt.scanner_name ORDER BY \"Trades\" DESC;",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": true, "axisColorMode": "text", "axisLabel": "PnL USDT", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 80, "gradientMode": "none", "insertNulls": false, "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 36 },
+      "id": 7,
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "title": "PnL by Direction Over Time",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+          "rawSql": "SELECT trade_date AS time, direction, SUM(pnl_usdt) AS \"PnL USDT\" FROM mart.scanner_daily_stats WHERE $__timeFilter(trade_date) AND scanner_name IN (${Scanner:sqlstring}) AND direction IN (${Direction:sqlstring}) GROUP BY trade_date, direction ORDER BY trade_date;",
+          "format": "time_series",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["trad_bot", "scanner", "performance"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": true, "text": "All", "value": "$__all" },
+        "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+        "definition": "SELECT DISTINCT scanner_name FROM mart.scanner_performance ORDER BY scanner_name;",
+        "includeAll": true,
+        "multi": true,
+        "name": "Scanner",
+        "query": "SELECT DISTINCT scanner_name FROM mart.scanner_performance ORDER BY scanner_name;",
+        "refresh": 2,
+        "type": "query"
+      },
+      {
+        "current": { "selected": true, "text": "All", "value": "$__all" },
+        "includeAll": true,
+        "multi": true,
+        "name": "Direction",
+        "options": [
+          { "selected": true, "text": "All", "value": "$__all" },
+          { "selected": false, "text": "LONG", "value": "LONG" },
+          { "selected": false, "text": "SHORT", "value": "SHORT" }
+        ],
+        "query": "LONG,SHORT",
+        "type": "custom"
+      }
+    ]
+  },
+  "time": { "from": "now-30d", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Trad Bot — Scanner Performance",
+  "uid": "scanner-performance",
+  "version": 1
+}
