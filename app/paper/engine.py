@@ -94,8 +94,8 @@ class PaperTradingEngine:
         self._daily_loss_usdt: float = 0.0
         self._consecutive_losses: int = 0
         self._cooldown_until: datetime | None = None
-        # A severe stop gap keeps its observed fill for diagnostics and blocks
-        # fresh entries until the operator reviews the paper-forward run.
+        # A severe stop gap blocks fresh entries until explicit operator review.
+        # The halt is restored from the repository after a runner restart.
         self._gap_loss_halt = False
         self._risk_day = self._clock().date()
 
@@ -113,6 +113,7 @@ class PaperTradingEngine:
         self._load_account_state()
         self._load_open_trades()
         self._load_risk_state()
+        self._load_safety_gate_state()
 
     def portfolio_exposure(self, prices: dict[str, float] | None = None) -> dict[str, float]:
         """Return gross, directional and net exposure as fractions of MTM equity."""
@@ -199,7 +200,7 @@ class PaperTradingEngine:
         if self._gap_loss_halt:
             logger.critical(
                 "paper gate: severe STOP_LOSS_GAP observed; new entries remain blocked "
-                "until the runner is restarted after operator review"
+                "until the durable gate is cleared after operator review"
             )
             return opened
         for c in candidates:
@@ -797,9 +798,7 @@ class PaperTradingEngine:
         if reason == "STOP_LOSS_GAP":
             stop_gap_metrics = self._stop_gap_execution_metrics(trade, exit_price, net_pnl)
             if bool(stop_gap_metrics["severe"]):
-                self._gap_loss_halt = True
-                self._gate_reason = "STOP_LOSS_GAP"
-                self._gate_since = self._clock()
+                self._activate_safety_gate("STOP_LOSS_GAP")
                 logger.critical(
                     "paper risk halt: STOP_LOSS_GAP severe=true gap_r=%.2fR "
                     "expected_stop_net_r=%.2fR actual_net_r=%.2fR "
@@ -887,6 +886,25 @@ class PaperTradingEngine:
             funding_periods_charged=trade.funding_periods_charged,
         )
 
+    def _activate_safety_gate(self, reason: str) -> None:
+        """Fail closed locally, then persist a severe-execution entry halt."""
+        if not self._gap_loss_halt:
+            self._gate_since = self._clock()
+        self._gap_loss_halt = True
+        self._gate_reason = reason
+
+        block_gate = getattr(self.repo, "block_paper_safety_gate", None)
+        if block_gate is None:
+            return
+        try:
+            block_gate(reason, self._gate_since)
+        except Exception:
+            # The in-process halt must remain active even if persistence is down.
+            logger.critical(
+                "paper risk halt could not be persisted; keeping local gate blocked",
+                exc_info=True,
+            )
+
     def _load_account_state(self) -> None:
         """Restore balance and drawdown from the most recent account snapshot."""
         get_snapshot = getattr(self.repo, "get_latest_paper_account_snapshot", None)
@@ -933,6 +951,24 @@ class PaperTradingEngine:
                 )
                 self._consecutive_losses = 0
                 self._cooldown_until = None
+
+    def _load_safety_gate_state(self) -> None:
+        """Restore a severe-execution halt so a restart cannot reopen entries."""
+        get_state = getattr(self.repo, "get_paper_safety_gate_state", None)
+        if get_state is None:
+            return
+        state = get_state()
+        if state.get("is_blocked") is not True:
+            return
+
+        self._gap_loss_halt = True
+        self._gate_reason = str(state.get("reason") or "SAFETY_GATE")
+        self._gate_since = state.get("blocked_since")
+        logger.critical(
+            "paper safety gate restored: reason=%s blocked_since=%s; new entries remain blocked",
+            self._gate_reason,
+            self._gate_since.isoformat() if self._gate_since else None,
+        )
 
     def _load_open_trades(self) -> None:
         """Load any existing OPEN paper trades from the DB on startup.

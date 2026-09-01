@@ -652,6 +652,20 @@ ALTER TABLE dds.paper_account
     ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMPTZ;
 
 -- ============================================================
+-- PAPER_SAFETY_GATE_STATE: durable runtime entry gate
+-- ============================================================
+-- A severe stop-loss gap must continue blocking entries across a runner restart.
+-- This singleton is deliberately separate from periodic account snapshots so the
+-- halt is persisted immediately by the position-monitor thread.
+CREATE TABLE IF NOT EXISTS dds.paper_safety_gate_state (
+    gate_id       SMALLINT PRIMARY KEY DEFAULT 1 CHECK (gate_id = 1),
+    is_blocked    BOOLEAN NOT NULL DEFAULT FALSE,
+    reason        TEXT,
+    blocked_since TIMESTAMPTZ,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================
 -- PAPER_TRADE_STATS: aggregated performance by scanner
 -- ============================================================
 CREATE OR REPLACE VIEW dds.paper_trade_stats AS
