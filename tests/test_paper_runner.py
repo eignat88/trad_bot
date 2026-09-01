@@ -15,20 +15,17 @@ def test_missing_emergency_stop_file_allows_entries(monkeypatch):
 
 
 def test_ready_setup_loader_preserves_entry_timeframe():
-    row = (
-        "setup", "BTCUSDT", "TREND_PULLBACK", "LONG", 80,
-        99, 101, 95, 105, None, "TREND_UP", None, 100, "15m",
-    )
-
-    class Cursor:
-        def execute(self, _query):
-            pass
-
-        def fetchall(self):
-            return [row]
+    row = {
+        "setup_id": "setup", "symbol": "BTCUSDT", "scanner_name": "TREND_PULLBACK",
+        "direction": "LONG", "score": 80,
+        "entry_zone_low": 99, "entry_zone_high": 101, "invalidation_price": 95,
+        "target_1": 105, "target_2": None, "market_regime": "TREND_UP",
+        "detected_at": None, "reference_price": 100, "entry_timeframe": "15m",
+    }
 
     class Repo:
-        _conn = type("Connection", (), {"cursor": lambda self: Cursor()})()
+        def load_ready_setups(self):
+            return [row]
 
     setups = paper_runner._load_ready_setups(Repo())
     assert setups[0]["entry_timeframe"] == "15m"

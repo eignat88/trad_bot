@@ -225,9 +225,8 @@ def main() -> None:
         password=settings.db_password,
         backend="postgres",
     )
-    repository.ensure_schema()
 
-    # Health-check: verify database connectivity before starting
+    # Verify DB connectivity (schema must be applied separately via schema.sql)
     if not repository.ping():
         logger.error("database health check failed")
         repository.close()

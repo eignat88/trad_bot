@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime, timezone
-from typing import Any, Literal, Mapping
+from functools import wraps
+from typing import Any, Callable, Literal, Mapping, TypeVar
 from uuid import UUID
 
 from app.paper.exit_reasons import PAPER_TRADE_EXIT_REASONS, PaperTradeExitReason
@@ -12,6 +14,23 @@ from app.scanners.outcome import SignalOutcome
 from app.storage.safe_jsonl import atomic_rewrite, file_lock, read_records
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+# PostgreSQL SQLSTATE codes we handle specifically.
+_SQLSTATE_DEADLOCK = "40P01"
+_SQLSTATE_SERIALIZATION = "40001"
+_SQLSTATE_IN_FAILED_TXN = "25P02"
+_RETRYABLE_SQLSTATES = {_SQLSTATE_DEADLOCK, _SQLSTATE_SERIALIZATION}
+
+_MAX_RETRIES = 2  # 1 original + 1 retry
+_RETRY_BACKOFF = 0.1  # seconds
+
+
+def _get_sqlstate(exc: Exception) -> str | None:
+    """Extract the PostgreSQL SQLSTATE from an exception, if present."""
+    # pg8000 stores it as exc.sqlstate; psycopg2 as exc.pgcode
+    return getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
 
 
 class ScannerRepository:
@@ -74,25 +93,112 @@ class ScannerRepository:
             cursor.execute("SELECT 1")
             return True
         except Exception:
+            # Connection may be in aborted transaction state — try recovery
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
             return False
 
     def reconnect(self) -> bool:
-        """Attempt to re-establish a dropped PostgreSQL connection."""
+        """Attempt to re-establish a dropped PostgreSQL connection.
+
+        Does NOT run schema migration — schema is a deployment concern, not a
+        runtime operation.
+        """
         if not self._use_pg:
             return False
         try:
+            # Close the old connection if still open
+            try:
+                self._conn.close()
+            except Exception:
+                pass
             import pg8000
             self._conn = pg8000.connect(
                 host=self._host, port=self._port,
                 database=self._database, user=self._user,
                 password=self._password,
             )
-            logger.info("scanner repository reconnected to PostgreSQL")
-            self.ensure_schema()
+            logger.info("PostgreSQL connection reset after transaction failure")
             return True
         except Exception:
             logger.exception("reconnect to PostgreSQL failed")
             return False
+
+    def _recover_connection(self) -> bool:
+        """Recover a connection that is in an aborted transaction state (SQLSTATE 25P02).
+
+        Attempts a rollback first.  If the connection is unrecoverable, falls
+        back to a full reconnect.
+        """
+        if not self._use_pg:
+            return False
+        try:
+            self._conn.rollback()
+            logger.debug("PostgreSQL transaction rolled back (recovery)")
+            return True
+        except Exception:
+            logger.warning("rollback failed, attempting full reconnect")
+            return self.reconnect()
+
+    def _with_retry(self, operation: Callable[[], T], label: str = "DB operation") -> T:
+        """Execute *operation* with retry on deadlock/serialization errors.
+
+        On SQLSTATE 25P02 (in failed transaction) the connection is recovered
+        before retrying.  On 40P01/40001 the transaction is rolled back and
+        the operation is retried once.
+
+        Raises the original exception if retries are exhausted.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(1, _MAX_RETRIES + 1):
+            try:
+                return operation()
+            except Exception as exc:
+                sqlstate = _get_sqlstate(exc)
+
+                if sqlstate == _SQLSTATE_IN_FAILED_TXN:
+                    logger.warning(
+                        "PostgreSQL in failed transaction SQLSTATE=%s"
+                        " — recovering connection", sqlstate,
+                    )
+                    if not self._recover_connection():
+                        raise
+                    last_exc = exc
+                    continue
+
+                if sqlstate in _RETRYABLE_SQLSTATES:
+                    logger.warning(
+                        "PostgreSQL error SQLSTATE=%s detected"
+                        " — rolling back transaction"
+                        " — retrying %s attempt=%d/%d",
+                        sqlstate, label, attempt, _MAX_RETRIES,
+                    )
+                    try:
+                        self._conn.rollback()
+                    except Exception:
+                        logger.exception("rollback failed during retry")
+                        if not self.reconnect():
+                            raise
+                    if attempt < _MAX_RETRIES:
+                        time.sleep(_RETRY_BACKOFF * attempt)
+                    last_exc = exc
+                    continue
+
+                # Non-retryable error — rollback and re-raise
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                raise
+
+        # All retries exhausted
+        logger.error(
+            "%s failed after %d attempts (last SQLSTATE=%s)",
+            label, _MAX_RETRIES, _get_sqlstate(last_exc),
+        )
+        raise last_exc  # type: ignore[misc]
 
     def ensure_schema(self) -> None:
         if not self._use_pg:
@@ -617,21 +723,25 @@ class ScannerRepository:
         """Expire active setups after their setup-timeframe candle TTL."""
         if not self._use_pg:
             return 0
-        cursor = self._conn.cursor()
-        cursor.execute("""
-            UPDATE dds.scanner_setup SET status = 'EXPIRED', expired_at = now(),
-                status_reason = 'TTL_EXCEEDED', updated_at = now()
-            WHERE status IN ('DETECTED', 'CONFIRMED', 'READY_TO_TRADE')
-              AND detected_at < now() - CASE setup_timeframe
-                WHEN '5m' THEN interval '60 minutes'
-                WHEN '15m' THEN interval '120 minutes'
-                WHEN '1h' THEN interval '6 hours'
-                WHEN '4h' THEN interval '16 hours'
-                ELSE interval '2 hours' END
-        """)
-        count = cursor.rowcount
-        self._conn.commit()
-        return count
+
+        def _do():
+            cursor = self._conn.cursor()
+            cursor.execute("""
+                UPDATE dds.scanner_setup SET status = 'EXPIRED', expired_at = now(),
+                    status_reason = 'TTL_EXCEEDED', updated_at = now()
+                WHERE status IN ('DETECTED', 'CONFIRMED', 'READY_TO_TRADE')
+                  AND detected_at < now() - CASE setup_timeframe
+                    WHEN '5m' THEN interval '60 minutes'
+                    WHEN '15m' THEN interval '120 minutes'
+                    WHEN '1h' THEN interval '6 hours'
+                    WHEN '4h' THEN interval '16 hours'
+                    ELSE interval '2 hours' END
+            """)
+            count = cursor.rowcount
+            self._conn.commit()
+            return count
+
+        return self._with_retry(_do, label="expire_setups")
 
     # ----------------------------------------------------------------
     # SIGNAL OUTCOME
@@ -889,8 +999,9 @@ class ScannerRepository:
         """
         if not self._use_pg:
             return None
-        cursor = self._conn.cursor()
-        try:
+
+        def _do():
+            cursor = self._conn.cursor()
             existing_id = self.get_paper_trade_by_setup(str(trade.setup_id))
             if existing_id is not None:
                 logger.info(
@@ -929,8 +1040,10 @@ class ScannerRepository:
             )
             self._conn.commit()
             return row[0] if row else None
+
+        try:
+            return self._with_retry(_do, label="save_paper_trade")
         except Exception as exc:
-            self._conn.rollback()
             if getattr(exc, "sqlstate", None) == "23505" or "duplicate key" in str(exc).lower():
                 existing_id = self.get_paper_trade_by_setup(str(trade.setup_id))
                 logger.info(
@@ -969,8 +1082,9 @@ class ScannerRepository:
             raise ValueError(f"Unsupported paper trade exit reason: {exit_reason}")
         if not self._use_pg or trade_id is None:
             return
-        cursor = self._conn.cursor()
-        try:
+
+        def _do():
+            cursor = self._conn.cursor()
             cursor.execute(
                 """
                 UPDATE dds.paper_trade SET
@@ -1005,8 +1119,10 @@ class ScannerRepository:
                 ),
             )
             self._conn.commit()
+
+        try:
+            self._with_retry(_do, label="close_paper_trade")
         except Exception:
-            self._conn.rollback()
             logger.exception("close_paper_trade failed for trade_id=%s", trade_id)
             raise
 
@@ -1036,49 +1152,94 @@ class ScannerRepository:
         """Load all OPEN paper trades (for engine restart recovery)."""
         if not self._use_pg:
             return []
-        cursor = self._conn.cursor()
-        cursor.execute(
-            """
-            SELECT trade_id, setup_id, symbol, scanner_name, direction, score,
-                   entry_price, entry_fee, stop_price, target_1, target_2,
-                   entry_timeframe, position_size, risk_usdt, balance_before, market_regime,
-                   funding_paid, funding_periods, entered_at,
-                   entry_market_price, slippage, mfe, mae
-            FROM dds.paper_trade
-            WHERE status = 'OPEN'
-            ORDER BY entered_at DESC
-            """
-        )
-        rows = cursor.fetchall()
-        return [
-            {
-                "trade_id": r[0], "setup_id": r[1], "symbol": r[2],
-                "scanner_name": r[3], "direction": r[4], "score": float(r[5]),
-                "entry_price": float(r[6]), "entry_fee": float(r[7]),
-                "stop_price": float(r[8]),
-                "target_1": float(r[9]) if r[9] is not None else None,
-                "target_2": float(r[10]) if r[10] is not None else None,
-                "entry_timeframe": r[11],
-                "position_size": float(r[12]), "risk_usdt": float(r[13]),
-                "balance_before": float(r[14]),
-                "market_regime": r[15],
-                "funding_paid": float(r[16] or 0),
-                "funding_periods": int(r[17] or 0),
-                "entered_at": r[18],
-                "entry_market_price": float(r[19] or r[6]),
-                "slippage": float(r[20] or 0),
-                "mfe": float(r[21] or 0),
-                "mae": float(r[22] or 0),
-            }
-            for r in rows
-        ]
+
+        def _do():
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT trade_id, setup_id, symbol, scanner_name, direction, score,
+                       entry_price, entry_fee, stop_price, target_1, target_2,
+                       entry_timeframe, position_size, risk_usdt, balance_before, market_regime,
+                       funding_paid, funding_periods, entered_at,
+                       entry_market_price, slippage, mfe, mae
+                FROM dds.paper_trade
+                WHERE status = 'OPEN'
+                ORDER BY entered_at DESC
+                """
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    "trade_id": r[0], "setup_id": r[1], "symbol": r[2],
+                    "scanner_name": r[3], "direction": r[4], "score": float(r[5]),
+                    "entry_price": float(r[6]), "entry_fee": float(r[7]),
+                    "stop_price": float(r[8]),
+                    "target_1": float(r[9]) if r[9] is not None else None,
+                    "target_2": float(r[10]) if r[10] is not None else None,
+                    "entry_timeframe": r[11],
+                    "position_size": float(r[12]), "risk_usdt": float(r[13]),
+                    "balance_before": float(r[14]),
+                    "market_regime": r[15],
+                    "funding_paid": float(r[16] or 0),
+                    "funding_periods": int(r[17] or 0),
+                    "entered_at": r[18],
+                    "entry_market_price": float(r[19] or r[6]),
+                    "slippage": float(r[20] or 0),
+                    "mfe": float(r[21] or 0),
+                    "mae": float(r[22] or 0),
+                }
+                for r in rows
+            ]
+
+        return self._with_retry(_do, label="get_open_paper_trades")
+
+    def load_ready_setups(self) -> list[dict]:
+        """Load READY_TO_TRADE setups for paper trading entry checks."""
+        if not self._use_pg:
+            return []
+
+        def _do():
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT s.setup_id, i.symbol, s.scanner_name, s.direction, s.score,
+                       s.entry_zone_low, s.entry_zone_high, s.invalidation_price,
+                       s.target_1, s.target_2, s.market_regime, s.detected_at,
+                       s.reference_price, s.entry_timeframe
+                FROM dds.scanner_setup s
+                JOIN dds.instrument i ON i.instrument_id = s.instrument_id
+                WHERE s.status = 'READY_TO_TRADE'
+                  AND s.detected_at > now() - interval '2 hours'
+                ORDER BY s.score DESC
+                """
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    "setup_id": r[0], "symbol": r[1], "scanner_name": r[2],
+                    "direction": r[3], "score": float(r[4]),
+                    "entry_zone_low": float(r[5]) if r[5] else 0.0,
+                    "entry_zone_high": float(r[6]) if r[6] else 0.0,
+                    "invalidation_price": float(r[7]) if r[7] else 0.0,
+                    "target_1": float(r[8]) if r[8] else None,
+                    "target_2": float(r[9]) if r[9] else None,
+                    "market_regime": r[10],
+                    "detected_at": r[11],
+                    "reference_price": float(r[12]) if r[12] else 0.0,
+                    "entry_timeframe": r[13] or "5m",
+                }
+                for r in rows
+            ]
+
+        return self._with_retry(_do, label="load_ready_setups")
 
     def expire_stale_setups(self, max_age_minutes: int = 120) -> int:
         """Mark old READY_TO_TRADE setups as EXPIRED."""
         if not self._use_pg:
             return 0
-        cursor = self._conn.cursor()
-        try:
+
+        def _do():
+            cursor = self._conn.cursor()
             cursor.execute(
                 """
                 UPDATE dds.scanner_setup SET status = 'EXPIRED', expired_at = now(), updated_at = now()
@@ -1090,19 +1251,22 @@ class ScannerRepository:
             count = cursor.rowcount
             self._conn.commit()
             return count
-        except Exception:
-            self._conn.rollback()
-            raise
+
+        return self._with_retry(_do, label="expire_stale_setups")
 
     def get_paper_trade_stats(self) -> list[dict]:
         """Get aggregated paper trade performance by scanner/direction."""
         if not self._use_pg:
             return []
-        cursor = self._conn.cursor()
-        cursor.execute("SELECT * FROM dds.paper_trade_stats")
-        rows = cursor.fetchall()
-        cols = [d[0] for d in cursor.description] if cursor.description else []
-        return [dict(zip(cols, r)) for r in rows]
+
+        def _do():
+            cursor = self._conn.cursor()
+            cursor.execute("SELECT * FROM dds.paper_trade_stats")
+            rows = cursor.fetchall()
+            cols = [d[0] for d in cursor.description] if cursor.description else []
+            return [dict(zip(cols, r)) for r in rows]
+
+        return self._with_retry(_do, label="get_paper_trade_stats")
 
     def get_paper_forward_summary(self) -> dict[str, Any]:
         """Summarize persisted paper performance for the live-gate readiness check."""
@@ -1112,126 +1276,137 @@ class ScannerRepository:
                 "net_pnl_usdt": 0.0, "max_drawdown": 0.0,
                 "avg_r": 0.0, "profit_factor": 0.0, "scanner_stats": [],
             }
-        cursor = self._conn.cursor()
-        cursor.execute(
-            """
-            SELECT
-                COALESCE(
-                    EXTRACT(EPOCH FROM (now() - MIN(entered_at))) / 86400.0,
-                    0
-                ) AS forward_days,
-                COUNT(*) FILTER (WHERE status = 'CLOSED') AS closed_trades,
-                COALESCE(
-                    SUM(pnl_usdt) FILTER (WHERE status = 'CLOSED'),
-                    0
-                ) AS net_pnl_usdt
-            FROM dds.paper_trade
-            """
-        )
-        forward_days, closed_trades, net_pnl_usdt = cursor.fetchone()
-        cursor.execute("SELECT COALESCE(MAX(max_drawdown), 0) FROM dds.paper_account")
-        max_drawdown = cursor.fetchone()[0]
-        cursor.execute(
-            """
-            SELECT scanner_name, direction, closed, avg_r, profit_factor
-            FROM dds.paper_trade_stats
-            """
-        )
-        scanner_stats = [
-            {
-                "scanner_name": row[0],
-                "direction": row[1],
-                "closed": int(row[2] or 0),
-                "avg_r": float(row[3] or 0),
-                "profit_factor": float(row[4] or 0),
+
+        def _do():
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT
+                    COALESCE(
+                        EXTRACT(EPOCH FROM (now() - MIN(entered_at))) / 86400.0,
+                        0
+                    ) AS forward_days,
+                    COUNT(*) FILTER (WHERE status = 'CLOSED') AS closed_trades,
+                    COALESCE(
+                        SUM(pnl_usdt) FILTER (WHERE status = 'CLOSED'),
+                        0
+                    ) AS net_pnl_usdt
+                FROM dds.paper_trade
+                """
+            )
+            forward_days, closed_trades, net_pnl_usdt = cursor.fetchone()
+            cursor.execute("SELECT COALESCE(MAX(max_drawdown), 0) FROM dds.paper_account")
+            max_drawdown = cursor.fetchone()[0]
+            cursor.execute(
+                """
+                SELECT scanner_name, direction, closed, avg_r, profit_factor
+                FROM dds.paper_trade_stats
+                """
+            )
+            scanner_stats = [
+                {
+                    "scanner_name": row[0],
+                    "direction": row[1],
+                    "closed": int(row[2] or 0),
+                    "avg_r": float(row[3] or 0),
+                    "profit_factor": float(row[4] or 0),
+                }
+                for row in cursor.fetchall()
+            ]
+            closed_stats = [row for row in scanner_stats if row["closed"] > 0]
+            avg_r = (
+                sum(row["avg_r"] * row["closed"] for row in closed_stats)
+                / sum(row["closed"] for row in closed_stats)
+                if closed_stats else 0.0
+            )
+            cursor.execute(
+                """
+                SELECT
+                    COALESCE(SUM(GREATEST(pnl_usdt, 0)) FILTER (WHERE status = 'CLOSED'), 0),
+                    COALESCE(ABS(SUM(LEAST(pnl_usdt, 0)) FILTER (WHERE status = 'CLOSED')), 0)
+                FROM dds.paper_trade
+                """
+            )
+            gross_profit, gross_loss = cursor.fetchone()
+            profit_factor = (
+                float(gross_profit) / float(gross_loss) if gross_loss else
+                (float("inf") if gross_profit else 0.0)
+            )
+            return {
+                "forward_days": float(forward_days or 0),
+                "closed_trades": int(closed_trades or 0),
+                "net_pnl_usdt": float(net_pnl_usdt or 0),
+                "max_drawdown": float(max_drawdown or 0),
+                "avg_r": avg_r,
+                "profit_factor": profit_factor,
+                "scanner_stats": scanner_stats,
             }
-            for row in cursor.fetchall()
-        ]
-        closed_stats = [row for row in scanner_stats if row["closed"] > 0]
-        avg_r = (
-            sum(row["avg_r"] * row["closed"] for row in closed_stats)
-            / sum(row["closed"] for row in closed_stats)
-            if closed_stats else 0.0
-        )
-        cursor.execute(
-            """
-            SELECT
-                COALESCE(SUM(GREATEST(pnl_usdt, 0)) FILTER (WHERE status = 'CLOSED'), 0),
-                COALESCE(ABS(SUM(LEAST(pnl_usdt, 0)) FILTER (WHERE status = 'CLOSED')), 0)
-            FROM dds.paper_trade
-            """
-        )
-        gross_profit, gross_loss = cursor.fetchone()
-        profit_factor = (
-            float(gross_profit) / float(gross_loss) if gross_loss else
-            (float("inf") if gross_profit else 0.0)
-        )
-        return {
-            "forward_days": float(forward_days or 0),
-            "closed_trades": int(closed_trades or 0),
-            "net_pnl_usdt": float(net_pnl_usdt or 0),
-            "max_drawdown": float(max_drawdown or 0),
-            "avg_r": avg_r,
-            "profit_factor": profit_factor,
-            "scanner_stats": scanner_stats,
-        }
+
+        return self._with_retry(_do, label="get_paper_forward_summary")
 
     def get_latest_paper_account_snapshot(self) -> dict[str, float] | None:
         """Load the most recent persisted paper-account state for restart recovery."""
         if not self._use_pg:
             return None
-        cursor = self._conn.cursor()
-        cursor.execute(
-            """
-            SELECT balance, equity, max_drawdown
-            FROM dds.paper_account
-            ORDER BY created_at DESC, snapshot_id DESC
-            LIMIT 1
-            """
-        )
-        row = cursor.fetchone()
-        if row is None:
-            return None
-        return {
-            "balance": float(row[0]),
-            "equity": float(row[1]),
-            "max_drawdown": float(row[2]),
-        }
+
+        def _do():
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT balance, equity, max_drawdown
+                FROM dds.paper_account
+                ORDER BY created_at DESC, snapshot_id DESC
+                LIMIT 1
+                """
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                "balance": float(row[0]),
+                "equity": float(row[1]),
+                "max_drawdown": float(row[2]),
+            }
+
+        return self._with_retry(_do, label="get_latest_paper_account_snapshot")
 
     def get_paper_risk_state(self) -> dict[str, int | float | Any]:
         """Return today's realized loss, consecutive-loss streak, and cooldown state."""
         if not self._use_pg:
             return {"daily_loss_usdt": 0.0, "consecutive_losses": 0, "cooldown_until": None}
-        cursor = self._conn.cursor()
-        cursor.execute(
-            """
-            SELECT pnl_usdt
-            FROM dds.paper_trade
-            WHERE status = 'CLOSED'
-              AND closed_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
-            ORDER BY closed_at DESC
-            """
-        )
-        rows = cursor.fetchall()
-        daily_loss = sum(max(0.0, -float(pnl or 0)) for (pnl,) in rows)
-        consecutive_losses = 0
-        for (pnl,) in rows:
-            if float(pnl or 0) >= 0:
-                break
-            consecutive_losses += 1
 
-        # Read cooldown_until from the latest paper_account snapshot
-        cursor.execute(
-            "SELECT cooldown_until FROM dds.paper_account ORDER BY created_at DESC LIMIT 1"
-        )
-        cooldown_row = cursor.fetchone()
-        cooldown_until = cooldown_row[0] if cooldown_row and cooldown_row[0] else None
+        def _do():
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT pnl_usdt
+                FROM dds.paper_trade
+                WHERE status = 'CLOSED'
+                  AND closed_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
+                ORDER BY closed_at DESC
+                """
+            )
+            rows = cursor.fetchall()
+            daily_loss = sum(max(0.0, -float(pnl or 0)) for (pnl,) in rows)
+            consecutive_losses = 0
+            for (pnl,) in rows:
+                if float(pnl or 0) >= 0:
+                    break
+                consecutive_losses += 1
 
-        return {
-            "daily_loss_usdt": daily_loss,
-            "consecutive_losses": consecutive_losses,
-            "cooldown_until": cooldown_until,
-        }
+            cursor.execute(
+                "SELECT cooldown_until FROM dds.paper_account ORDER BY created_at DESC LIMIT 1"
+            )
+            cooldown_row = cursor.fetchone()
+            cooldown_until = cooldown_row[0] if cooldown_row and cooldown_row[0] else None
+
+            return {
+                "daily_loss_usdt": daily_loss,
+                "consecutive_losses": consecutive_losses,
+                "cooldown_until": cooldown_until,
+            }
+
+        return self._with_retry(_do, label="get_paper_risk_state")
 
     def save_paper_account_snapshot(
         self,
@@ -1248,8 +1423,9 @@ class ScannerRepository:
         """Save an account equity snapshot, optionally including cooldown state."""
         if not self._use_pg:
             return
-        cursor = self._conn.cursor()
-        try:
+
+        def _do():
+            cursor = self._conn.cursor()
             cursor.execute(
                 """
                 INSERT INTO dds.paper_account (
@@ -1265,9 +1441,8 @@ class ScannerRepository:
                 ),
             )
             self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+
+        self._with_retry(_do, label="save_paper_account_snapshot")
 
     def close(self) -> None:
         if self._conn:

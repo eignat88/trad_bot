@@ -98,37 +98,7 @@ def _emergency_stop_requested(settings: Settings) -> bool:
 
 def _load_ready_setups(repo: ScannerRepository) -> list[dict]:
     """Load READY_TO_TRADE setups directly from DB — no re-scanning."""
-    cursor = repo._conn.cursor()
-    cursor.execute(
-        """
-        SELECT s.setup_id, i.symbol, s.scanner_name, s.direction, s.score,
-               s.entry_zone_low, s.entry_zone_high, s.invalidation_price,
-               s.target_1, s.target_2, s.market_regime, s.detected_at,
-               s.reference_price, s.entry_timeframe
-        FROM dds.scanner_setup s
-        JOIN dds.instrument i ON i.instrument_id = s.instrument_id
-        WHERE s.status = 'READY_TO_TRADE'
-          AND s.detected_at > now() - interval '2 hours'
-        ORDER BY s.score DESC
-        """
-    )
-    rows = cursor.fetchall()
-    return [
-        {
-            "setup_id": r[0], "symbol": r[1], "scanner_name": r[2],
-            "direction": r[3], "score": float(r[4]),
-            "entry_zone_low": float(r[5]) if r[5] else 0.0,
-            "entry_zone_high": float(r[6]) if r[6] else 0.0,
-            "invalidation_price": float(r[7]) if r[7] else 0.0,
-            "target_1": float(r[8]) if r[8] else None,
-            "target_2": float(r[9]) if r[9] else None,
-            "market_regime": r[10],
-            "detected_at": r[11],
-            "reference_price": float(r[12]) if r[12] else 0.0,
-            "entry_timeframe": r[13] or "5m",
-        }
-        for r in rows
-    ]
+    return repo.load_ready_setups()
 
 
 def run_cycle(
@@ -142,6 +112,9 @@ def run_cycle(
 
     Does NOT re-scan via Bybit API. Reads READY_TO_TRADE setups from DB
     and only fetches current prices for entry-zone / exit checks.
+
+    Each DB block is independently error-protected to prevent cascading
+    SQLSTATE 25P02 errors from a single transient failure.
     """
     stats = {"exits": 0, "entries": 0, "skipped_no_setup": 0, "expectancy_rejected": 0, "emergency_stop": 0}
 
@@ -154,11 +127,13 @@ def run_cycle(
         stats["exits"] = len(closed)
 
     # --- 2. CHECK ENTRIES (read from DB, fetch prices only) ---
+    ready_setups: list[dict] = []
     if _emergency_stop_requested(settings):
         stats["emergency_stop"] = 1
         logger.critical("paper emergency stop is active: new entries are disabled")
-        ready_setups = []
     else:
+        # This DB block is independently protected — failure here does not
+        # affect expire/snapshot blocks below.
         try:
             ready_setups = _load_ready_setups(repo)
         except Exception:
@@ -208,7 +183,7 @@ def run_cycle(
         opened = engine.check_entries(candidates, all_prices)
         stats["entries"] = len(opened)
 
-    # --- 3. EXPIRE OLD SETUPS ---
+    # --- 3. EXPIRE OLD SETUPS (independently protected) ---
     try:
         expired = repo.expire_stale_setups(max_age_minutes=120)
         if expired:
@@ -216,7 +191,7 @@ def run_cycle(
     except Exception:
         logger.exception("failed to expire setups")
 
-    # --- 4. ACCOUNT SNAPSHOT ---
+    # --- 4. ACCOUNT SNAPSHOT (independently protected) ---
     try:
         stats_rows = repo.get_paper_trade_stats()
         total_trades = sum(s.get("total_trades", 0) or 0 for s in stats_rows)
@@ -256,7 +231,12 @@ def main() -> None:
         password=settings.db_password,
         backend="postgres",
     )
-    repo.ensure_schema()
+
+    # Verify DB connectivity (schema must be applied separately via schema.sql)
+    if not repo.ping():
+        logger.error("database health check failed")
+        repo.close()
+        raise SystemExit("database health check failed")
 
     # Load expectancy filter
     expectancy_filter = None

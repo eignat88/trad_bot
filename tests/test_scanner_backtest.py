@@ -25,6 +25,7 @@ class DeterministicScanner:
             invalidation_price=90,
             target_1=110,
             score=90,
+            reasons=("DETERMINISTIC_SETUP",),
             features={"trend_alignment": True, "htf_context": True},
         )]
 

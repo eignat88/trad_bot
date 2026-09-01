@@ -127,6 +127,7 @@ class ScannerOrchestrator:
             for c in all_candidates
         ]
         scored = [self._attach_context(c, ctx) for c in scored]
+        scored = self._calibrate_scores(scored)
         scored.sort(key=lambda c: c.score, reverse=True)
         unique = self.dedup.filter_new(scored)
 
@@ -145,7 +146,7 @@ class ScannerOrchestrator:
                     c.invalidation_price, c.target_1,
                 )
                 continue
-            if c.score >= 20:
+            if c.score >= 30:
                 valid.append(c)
 
         # Expectancy filter: drop scanner/direction combos with negative historical R
@@ -235,6 +236,46 @@ class ScannerOrchestrator:
     def save_setup(self, candidate: SetupCandidate) -> None:
         if self.repository:
             self.repository.save_setup(candidate)
+
+    @staticmethod
+    def _calibrate_scores(candidates: list[SetupCandidate]) -> list[SetupCandidate]:
+        """Normalize per-scanner scores to [10, 90] to remove scanner-identity bias.
+
+        After the quality-metric feature overhaul, different scanners may still
+        cluster in different score ranges.  This post-scoring calibration maps
+        each scanner's score range into a common [10, 90] band so that a 60
+        from BREAKOUT_RETEST means roughly the same quality as a 60 from
+        LIQUIDITY_SWEEP_CHOCH_OB.
+        """
+        if not candidates:
+            return candidates
+
+        # Group by scanner
+        by_scanner: dict[str, list[SetupCandidate]] = {}
+        for c in candidates:
+            by_scanner.setdefault(c.scanner_name, []).append(c)
+
+        calibrated: list[SetupCandidate] = []
+        for scanner_name, scanner_candidates in by_scanner.items():
+            scores = [c.score for c in scanner_candidates]
+            if len(scores) < 2:
+                calibrated.extend(scanner_candidates)
+                continue
+
+            min_score = min(scores)
+            max_score = max(scores)
+            score_range = max_score - min_score
+
+            if score_range > 0:
+                for c in scanner_candidates:
+                    normalized = ((c.score - min_score) / score_range) * 80 + 10  # [10, 90]
+                    calibrated.append(replace(c, score=round(normalized, 2)))
+            else:
+                # All scores identical — map to midpoint
+                mid = 50.0
+                calibrated.extend(replace(c, score=mid) for c in scanner_candidates)
+
+        return calibrated
 
     @staticmethod
     def _apply_regime_filter(
