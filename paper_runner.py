@@ -222,6 +222,23 @@ def run_entry_cycle(
     return stats
 
 
+def run_cycle(
+    engine: PaperTradingEngine,
+    client: BybitClient,
+    repo: ScannerRepository,
+    expectancy_filter: ExpectancyFilter | None,
+    settings: Settings,
+) -> dict[str, Any]:
+    """Run one slow paper cycle (compatibility entry point).
+
+    Position exits are deliberately handled by :class:`PositionMonitor` in the
+    fast background loop.  Keeping this public wrapper preserves callers that
+    invoke a cycle directly while ensuring they use the same locked entry,
+    expiry, and snapshot path as the production runner.
+    """
+    return run_entry_cycle(engine, client, repo, expectancy_filter, settings)
+
+
 def main() -> None:
     setup_logging()
     signal.signal(signal.SIGTERM, _handle_signal)
