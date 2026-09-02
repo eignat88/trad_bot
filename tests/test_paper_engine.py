@@ -13,6 +13,7 @@ class FakeRepository:
     def __init__(self, risk_state=None, account_snapshot=None, safety_gate_state=None) -> None:
         self.saved = []
         self.closed = []
+        self.safety_events = []
         self.risk_state = risk_state or {"daily_loss_usdt": 0.0, "consecutive_losses": 0}
         self.account_snapshot = account_snapshot
         self.safety_gate_state = safety_gate_state or {
@@ -27,6 +28,9 @@ class FakeRepository:
 
     def get_paper_safety_gate_state(self):
         return self.safety_gate_state
+
+    def insert_paper_safety_event(self, event):
+        self.safety_events.append(event)
 
     def block_paper_safety_gate(self, reason, blocked_since):
         self.safety_gate_state = {
@@ -267,6 +271,8 @@ def test_severe_stop_gap_gate_survives_runner_restart():
     assert persisted["is_blocked"] is True
     assert persisted["reason"] == "STOP_LOSS_GAP"
     assert persisted["blocked_since"] is not None
+    assert repo.safety_events[0]["would_block"] is True
+    assert repo.safety_events[0]["gate_blocked"] is True
 
     restarted = PaperTradingEngine(settings, repo)
     assert restarted.gate_status["status"] == "BLOCKED"
@@ -275,6 +281,64 @@ def test_severe_stop_gap_gate_survives_runner_restart():
     assert restarted.check_entries(
         [_candidate(symbol="ETHUSDT")], {"ETHUSDT": 100}
     ) == []
+
+
+def test_observe_mode_persists_severe_event_without_blocking_entries():
+    repo = FakeRepository()
+    settings = Settings(
+        taker_fee=0, slippage_percent=0, paper_severe_stop_gap_r=0.20,
+        paper_safety_gate_mode="observe",
+    )
+    engine = PaperTradingEngine(settings, repo)
+    engine.check_entries([_candidate(invalidation_price=90)], {"BTCUSDT": 100})
+    engine.check_exits({"BTCUSDT": 87.5})
+
+    assert len(repo.safety_events) == 1
+    event = repo.safety_events[0]
+    assert event["event_type"] == "STOP_LOSS_GAP"
+    assert event["severity"] == "SEVERE"
+    assert event["would_block"] is True
+    assert event["gate_blocked"] is False
+    assert engine.gate_status["status"] == "OPEN"
+    assert engine.check_entries([_candidate(symbol="ETHUSDT")], {"ETHUSDT": 100})
+
+
+def test_disabled_mode_never_activates_safety_gate():
+    repo = FakeRepository()
+    engine = PaperTradingEngine(
+        Settings(taker_fee=0, slippage_percent=0, paper_safety_gate_mode="disabled"), repo
+    )
+    engine.check_entries([_candidate(invalidation_price=90)], {"BTCUSDT": 100})
+    engine.check_exits({"BTCUSDT": 85})
+
+    assert repo.safety_events[0]["would_block"] is True
+    assert repo.safety_events[0]["gate_blocked"] is False
+    assert repo.safety_gate_state["is_blocked"] is False
+    assert engine.gate_status["status"] == "OPEN"
+
+
+def test_observe_mode_ignores_durable_gate_on_restart():
+    blocked_since = datetime.now(timezone.utc)
+    repo = FakeRepository(safety_gate_state={
+        "is_blocked": True, "reason": "STOP_LOSS_GAP", "blocked_since": blocked_since,
+    })
+    engine = PaperTradingEngine(Settings(paper_safety_gate_mode="observe"), repo)
+
+    assert engine.gate_status["status"] == "OPEN"
+    assert engine.check_entries([_candidate()], {"BTCUSDT": 100})
+
+
+def test_non_severe_stop_gap_persists_observation_without_would_block():
+    repo = FakeRepository()
+    engine = PaperTradingEngine(
+        Settings(taker_fee=0, slippage_percent=0, paper_severe_stop_gap_r=0.20), repo
+    )
+    engine.check_entries([_candidate(invalidation_price=90)], {"BTCUSDT": 100})
+    engine.check_exits({"BTCUSDT": 89.3})
+
+    assert repo.safety_events[0]["would_block"] is False
+    assert repo.safety_events[0]["gate_blocked"] is False
+    assert engine.gate_status["status"] == "OPEN"
 
 
 def test_stop_gap_metrics_keep_small_market_gap_gate_open():

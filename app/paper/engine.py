@@ -453,7 +453,7 @@ class PaperTradingEngine:
                 if gap:
                     self._record_stop_gap_event(
                         trade,
-                        exit_price,
+                        trade.stop_price,
                         price,
                         self._stop_gap_execution_metrics(trade, price, result.net_pnl),
                     )
@@ -465,7 +465,7 @@ class PaperTradingEngine:
                 if gap:
                     self._record_stop_gap_event(
                         trade,
-                        exit_price,
+                        trade.stop_price,
                         price,
                         self._stop_gap_execution_metrics(trade, price, result.net_pnl),
                     )
@@ -605,25 +605,81 @@ class PaperTradingEngine:
             "gap_r": round(float(metrics["gap_r"]), 4),
             "excess_execution_r": round(float(metrics["excess_execution_r"]), 4),
             "severe": bool(metrics["severe"]),
+            "would_block": bool(metrics["severe"]),
+            "gate_blocked": bool(metrics["severe"]) and self.settings.paper_safety_gate_mode == "enforce",
+            "safety_gate_mode": self.settings.paper_safety_gate_mode,
             "position_size": trade.position_size,
             "risk_usdt": trade.risk_usdt,
             "timestamp": self._clock().isoformat(),
             "duration_sec": (self._clock() - trade.entered_at).total_seconds(),
         }
 
+        self._persist_safety_event(gap_event)
         self._stop_gap_events.append(gap_event)
         self._last_stop_gap = gap_event
         self._cleanup_old_stop_gap_events()
 
+        if gap_event["gate_blocked"]:
+            self._activate_safety_gate("STOP_LOSS_GAP")
+            logger.critical(
+                "paper risk halt: STOP_LOSS_GAP severe=true gap_r=%.2fR "
+                "expected_stop_net_r=%.2fR actual_net_r=%.2fR "
+                "excess_execution_r=%.2fR; new entries are blocked",
+                metrics["gap_r"], metrics["expected_stop_net_r"],
+                metrics["actual_net_r"], metrics["excess_execution_r"],
+            )
+        elif gap_event["would_block"] and self.settings.paper_safety_gate_mode == "observe":
+            logger.warning(
+                "paper safety observation: STOP_LOSS_GAP severe=true; production safety "
+                "gate would block, but observe mode allows new entries"
+            )
+
         logger.warning(
             "STOP_GAP: symbol=%s scanner=%s direction=%s raw_stop_r=%.2f "
             "expected_stop_net_r=%.2f actual_net_r=%.2f gap_r=%.2f "
-            "excess_execution_r=%.2f severe=%s",
+            "excess_execution_r=%.2f severe=%s would_block=%s gate_blocked=%s mode=%s",
             trade.symbol, trade.scanner_name, trade.direction,
             metrics["raw_stop_r"], metrics["expected_stop_net_r"],
             metrics["actual_net_r"], metrics["gap_r"],
-            metrics["excess_execution_r"], metrics["severe"],
+            metrics["excess_execution_r"], metrics["severe"], gap_event["would_block"],
+            gap_event["gate_blocked"], self.settings.paper_safety_gate_mode,
         )
+
+    def _persist_safety_event(self, gap_event: dict) -> None:
+        """Persist STOP_LOSS_GAP observation without coupling it to enforcement."""
+        insert_event = getattr(self.repo, "insert_paper_safety_event", None)
+        if insert_event is None:
+            return
+        event_at = datetime.fromisoformat(gap_event["timestamp"])
+        event = {
+            "event_at": event_at,
+            "event_type": "STOP_LOSS_GAP",
+            "severity": "SEVERE" if gap_event["severe"] else "WARNING",
+            "safety_gate_mode": gap_event["safety_gate_mode"],
+            "symbol": gap_event["symbol"],
+            "scanner_name": gap_event["scanner_name"],
+            "direction": gap_event["direction"],
+            "entry_price": gap_event["entry_price"],
+            "stop_price": gap_event["stop_price"],
+            "expected_exit": gap_event["expected_exit"],
+            "observed_price": gap_event["observed_price"],
+            "raw_stop_r": gap_event["raw_stop_r"],
+            "expected_stop_net_r": gap_event["expected_stop_net_r"],
+            "actual_net_r": gap_event["actual_net_r"],
+            "gap_pct": gap_event["gap_pct"],
+            "gap_r": gap_event["gap_r"],
+            "excess_execution_r": gap_event["excess_execution_r"],
+            "position_size": gap_event["position_size"],
+            "risk_usdt": gap_event["risk_usdt"],
+            "duration_sec": gap_event["duration_sec"],
+            "would_block": gap_event["would_block"],
+            "gate_blocked": gap_event["gate_blocked"],
+            "details_json": {"severe": gap_event["severe"]},
+        }
+        try:
+            insert_event(event)
+        except Exception:
+            logger.exception("paper safety event could not be persisted")
 
     def _cleanup_old_stop_gap_events(self) -> None:
         """Remove STOP_LOSS_GAP events older than 24 hours."""
@@ -649,6 +705,7 @@ class PaperTradingEngine:
         """Return comprehensive gate status for dashboard."""
         return {
             "status": "BLOCKED" if self._gap_loss_halt else "OPEN",
+            "mode": self.settings.paper_safety_gate_mode.upper(),
             "reason": self._gate_reason,
             "since": self._gate_since.isoformat() if self._gate_since else None,
             "last_stop_gap": self._last_stop_gap,
@@ -794,20 +851,6 @@ class PaperTradingEngine:
         self._max_drawdown = max(self._max_drawdown, dd)
 
         r_multiple = net_pnl / trade.risk_usdt if trade.risk_usdt > 0 else 0
-        stop_gap_metrics = None
-        if reason == "STOP_LOSS_GAP":
-            stop_gap_metrics = self._stop_gap_execution_metrics(trade, exit_price, net_pnl)
-            if bool(stop_gap_metrics["severe"]):
-                self._activate_safety_gate("STOP_LOSS_GAP")
-                logger.critical(
-                    "paper risk halt: STOP_LOSS_GAP severe=true gap_r=%.2fR "
-                    "expected_stop_net_r=%.2fR actual_net_r=%.2fR "
-                    "excess_execution_r=%.2fR; new entries are blocked",
-                    stop_gap_metrics["gap_r"],
-                    stop_gap_metrics["expected_stop_net_r"],
-                    stop_gap_metrics["actual_net_r"],
-                    stop_gap_metrics["excess_execution_r"],
-                )
         pnl_pct = net_pnl / (trade.entry_price * trade.position_size) * 100 if trade.entry_price * trade.position_size > 0 else 0
         duration = (self._clock() - trade.entered_at).total_seconds()
         risk_distance = trade.risk_usdt / trade.position_size if trade.position_size > 0 else 0.0
@@ -961,9 +1004,21 @@ class PaperTradingEngine:
         if state.get("is_blocked") is not True:
             return
 
+        reason = str(state.get("reason") or "SAFETY_GATE")
+        blocked_since = state.get("blocked_since")
+        if self.settings.paper_safety_gate_mode != "enforce":
+            logger.warning(
+                "durable paper safety gate exists: reason=%s blocked_since=%s, but "
+                "PAPER_SAFETY_GATE_MODE=%s; new entries remain enabled",
+                reason,
+                blocked_since.isoformat() if blocked_since else None,
+                self.settings.paper_safety_gate_mode,
+            )
+            return
+
         self._gap_loss_halt = True
-        self._gate_reason = str(state.get("reason") or "SAFETY_GATE")
-        self._gate_since = state.get("blocked_since")
+        self._gate_reason = reason
+        self._gate_since = blocked_since
         logger.critical(
             "paper safety gate restored: reason=%s blocked_since=%s; new entries remain blocked",
             self._gate_reason,
