@@ -34,7 +34,7 @@ def _make_ctx(regime: str = "RANGE") -> MarketContext:
 
 
 def _candidate(direction: str = "LONG", symbol: str = "BTCUSDT",
-               scanner: str = "TREND_PULLBACK", **overrides) -> SetupCandidate:
+               scanner: str = "TREND_PULLBACK_V2", **overrides) -> SetupCandidate:
     defaults = dict(
         scanner_name=scanner, symbol=symbol, direction=direction,
         entry_zone_low=99.0, entry_zone_high=101.0,

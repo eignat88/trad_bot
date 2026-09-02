@@ -42,11 +42,10 @@
     ["BREAKOUT_RETEST", "LONG"],
     ["BREAKOUT_RETEST", "SHORT"],
     ["MOMENTUM_EXHAUSTION", "LONG"],
-    ["TREND_PULLBACK", "LONG"],
-    ["TREND_PULLBACK", "SHORT"]
+    ["TREND_PULLBACK_V2", "SHORT"]
   ],
   "scanner_regime_whitelist": {
-    "TREND_PULLBACK": {"LONG": ["TREND_UP"], "SHORT": []}
+    "TREND_PULLBACK_V2": {"LONG": ["TREND_UP"]}
   },
   "expectancy_min_samples": 30,
   "paper_min_closed_trades": 100,

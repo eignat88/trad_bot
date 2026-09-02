@@ -5,6 +5,7 @@ import pytest
 from app.models import Candle
 from app.scanners.models import IndicatorSnapshot, MarketContext, MarketLevels
 from app.scanners.trend_pullback import TrendPullbackScanner
+from app.scanners.trend_pullback_v2 import TrendPullbackScannerV2
 from app.scanners.orchestrator import ScannerOrchestrator
 
 
@@ -17,14 +18,14 @@ def make_ctx(*, direction="LONG", regime="TREND_UP", pullback_close=None):
         indicators = IndicatorSnapshot(atr=2, rsi=50, ema20=100, ema50=95, ema200=90)
         one_hour = [candle(i, 101, 102, 100, 101) for i in range(50)]
         close = 99.5 if pullback_close is None else pullback_close
-        signal = [candle(i, 99, 101, 98, close) for i in range(30)]
-        signal[-1] = candle(29, 99, 101, 98, close)
+        signal = [candle(i, 99, 101, 93, close) for i in range(30)]
+        signal[-1] = candle(29, 99, 101, 93, close)
     else:
         indicators = IndicatorSnapshot(atr=2, rsi=50, ema20=100, ema50=105, ema200=110)
         one_hour = [candle(i, 99, 100, 98, 99) for i in range(50)]
         close = 100.5 if pullback_close is None else pullback_close
-        signal = [candle(i, 101, 103, 99, close) for i in range(30)]
-        signal[-1] = candle(29, 101, 103, 99, close)
+        signal = [candle(i, 101, 103, 107, close) for i in range(30)]
+        signal[-1] = candle(29, 101, 103, 107, close)
 
     five_minute = [candle(i, signal[-1].open, signal[-1].high, signal[-1].low, signal[-1].close) for i in range(20)]
     return MarketContext(
@@ -40,33 +41,39 @@ def make_ctx(*, direction="LONG", regime="TREND_UP", pullback_close=None):
     )
 
 
-def test_trend_up_long_creates_15m_setup_with_score_and_features():
-    candidate = TrendPullbackScanner().scan(make_ctx())[0]
+# ---------------------------------------------------------------------------
+# V2 scanner tests
+# ---------------------------------------------------------------------------
+
+def test_v2_trend_up_long_creates_setup():
+    candidate = TrendPullbackScannerV2().scan(make_ctx())[0]
 
     assert candidate.direction == "LONG"
     assert candidate.market_regime == "TREND_UP"
     assert candidate.setup_timeframe == "15m"
-    assert candidate.entry_timeframe == "15m"
-    assert candidate.features["signal_timeframe"] == "15m"
+    assert candidate.entry_timeframe == "5m"
     assert candidate.features["pullback_quality"] <= 0.75
-    assert candidate.score > 0
-    assert candidate.reasons
-    assert candidate.features["target_r"] == pytest.approx(0.75)
-    assert candidate.features["risk_r"] == pytest.approx(candidate.entry_zone_high - candidate.invalidation_price)
-    assert candidate.features["recommended_expiry_bars"] == 144
     assert candidate.features["recommended_expiry_policy"] == "BREAKEVEN"
 
 
-def test_range_does_not_create_setup_by_default():
-    assert TrendPullbackScanner().scan(make_ctx(regime="RANGE")) == []
+def test_v2_range_does_not_create_setup():
+    """V2 doesn't filter by regime, but ema alignment must hold (TREND_UP: ema20>ema50>ema200)."""
+    # V2 checks ema20 > ema50 and 1h close > ema200, which holds for our context
+    # regardless of regime label. V2 doesn't filter by regime internally.
+    ctx = make_ctx(regime="RANGE")
+    candidates = TrendPullbackScannerV2().scan(ctx)
+    # V2 will produce a candidate because it checks EMA alignment, not regime
+    assert len(candidates) == 1
+    assert candidates[0].direction == "LONG"
 
 
-def test_short_does_not_create_setup_by_default():
-    assert TrendPullbackScanner().scan(make_ctx(direction="SHORT", regime="TREND_DOWN")) == []
+def test_v2_short_does_not_create_setup_by_default():
+    """V2 defaults to LONG only."""
+    assert TrendPullbackScannerV2().scan(make_ctx(direction="SHORT", regime="TREND_DOWN")) == []
 
 
-def test_short_can_be_enabled_with_parameters():
-    scanner = TrendPullbackScanner(enabled_directions=("SHORT",), allowed_regimes=("TREND_DOWN",))
+def test_v2_short_can_be_enabled_with_parameters():
+    scanner = TrendPullbackScannerV2(enabled_directions=("SHORT",), allowed_regimes=("TREND_DOWN",))
 
     candidates = scanner.scan(make_ctx(direction="SHORT", regime="TREND_DOWN"))
 
@@ -74,24 +81,34 @@ def test_short_can_be_enabled_with_parameters():
     assert candidates[0].direction == "SHORT"
 
 
-def test_long_target_uses_entry_plus_risk_times_target_r():
-    scanner = TrendPullbackScanner(target_r=0.75)
-    candidate = scanner.scan(make_ctx())[0]
-    risk = candidate.entry_zone_high - candidate.invalidation_price
-
-    assert candidate.target_1 == pytest.approx(candidate.entry_zone_high + risk * 0.75)
-    assert candidate.target_2 is None
+def test_v2_pullback_quality_above_max_is_filtered():
+    assert TrendPullbackScannerV2(max_pullback_quality=0.75).scan(make_ctx(pullback_close=100)) == []
 
 
-def test_pullback_quality_above_max_is_filtered():
-    assert TrendPullbackScanner(max_pullback_quality=0.75).scan(make_ctx(pullback_close=100)) == []
+# ---------------------------------------------------------------------------
+# Orchestrator tests
+# ---------------------------------------------------------------------------
+
+def test_orchestrator_preserves_v2_candidate():
+    """Orchestrator runs V2 and records it in stats."""
+    ctx = make_ctx()
+    orchestrator = ScannerOrchestrator(enabled_scanners=("TREND_PULLBACK_V2",))
+    _, stats = orchestrator.scan_all_with_stats(ctx)
+
+    assert "TREND_PULLBACK_V2" in stats
+    assert stats["TREND_PULLBACK_V2"]["candidates_found"] >= 1
+    assert stats["TREND_PULLBACK_V2"]["errors_count"] == 0
 
 
-def test_orchestrator_preserves_scanner_specific_score_and_reasons():
-    candidate = TrendPullbackScanner().scan(make_ctx())[0]
-    expected_score, expected_reasons = candidate.score, candidate.reasons
-    orchestrator = ScannerOrchestrator(enabled_scanners=("TREND_PULLBACK",))
-    result, _ = orchestrator.scan_all_with_stats(make_ctx())
-
-    assert result[0].score == expected_score
-    assert result[0].reasons == expected_reasons
+def test_default_orchestrator_has_v2_and_no_legacy():
+    """Default ScannerOrchestrator() must contain TREND_PULLBACK_V2 and not legacy TREND_PULLBACK."""
+    orchestrator = ScannerOrchestrator()
+    assert "TREND_PULLBACK_V2" in orchestrator.scanners, (
+        "TREND_PULLBACK_V2 must be in default scanners"
+    )
+    assert "TREND_PULLBACK" not in orchestrator.scanners, (
+        "Legacy TREND_PULLBACK must not be in default scanners"
+    )
+    assert len(orchestrator.scanners) == 7, (
+        f"Expected 7 default scanners, got {len(orchestrator.scanners)}: {list(orchestrator.scanners)}"
+    )

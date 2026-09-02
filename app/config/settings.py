@@ -103,14 +103,13 @@ class Settings:
         ("BREAKOUT_RETEST", "LONG"),
         ("BREAKOUT_RETEST", "SHORT"),
         ("MOMENTUM_EXHAUSTION", "LONG"),
-        ("TREND_PULLBACK", "LONG"),
-        ("TREND_PULLBACK", "SHORT"),
+        ("TREND_PULLBACK_V2", "SHORT"),
     )
     # Optional scanner/direction regime allow-lists. Unspecified scanners use
     # the generic direction-conflict filter; an empty tuple blocks a direction.
     scanner_regime_whitelist: dict[str, dict[str, tuple[str, ...]]] = field(
         default_factory=lambda: {
-            "TREND_PULLBACK": {"LONG": ("TREND_UP",), "SHORT": ()},
+            "TREND_PULLBACK_V2": {"LONG": ("TREND_UP",)},
         }
     )
     # Live gate thresholds measured from persisted forward paper trading.
