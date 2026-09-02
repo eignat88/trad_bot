@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 
 MART = Path(__file__).parents[1] / "sql" / "mart" / "010_paper_safety_gate.sql"
 
@@ -23,11 +25,37 @@ def test_safety_mart_reads_runtime_mode_from_durable_gate_state_not_events():
     assert "FROM dds.paper_safety_event\n        ORDER BY event_at DESC" not in metrics_view
 
 
-def test_runtime_mode_and_gate_status_are_independent_mart_fields():
+@pytest.mark.parametrize(
+    ("mode", "is_blocked", "expected_status"),
+    [
+        ("enforce", True, "BLOCKED"),
+        ("enforce", False, "OPEN"),
+        ("observe", True, "OPEN"),
+        ("observe", False, "OPEN"),
+        ("disabled", True, "OPEN"),
+        ("disabled", False, "OPEN"),
+        (None, True, "OPEN"),
+        ("unknown", True, "OPEN"),
+    ],
+)
+def test_gate_status_reflects_effective_enforcement_mode(
+    mode, is_blocked, expected_status
+):
+    sql = MART.read_text(encoding="utf-8")
+
+    case_expression = """CASE
+        WHEN gate.safety_gate_mode = 'enforce' AND gate.is_blocked THEN 'BLOCKED'
+        ELSE 'OPEN'
+    END AS gate_status"""
+    assert case_expression in sql
+    assert ("BLOCKED" if mode == "enforce" and is_blocked else "OPEN") == expected_status
+
+
+def test_safety_mart_keeps_durable_gate_diagnostics_separate_from_gate_status():
     sql = MART.read_text(encoding="utf-8")
 
     assert "gate.safety_gate_mode," in sql
-    assert "CASE WHEN gate.is_blocked THEN 'BLOCKED' ELSE 'OPEN' END AS gate_status" in sql
+    assert "gate.is_blocked, gate.reason AS gate_reason, gate.blocked_since AS gate_blocked_since," in sql
 
 
 def test_safety_mart_exposes_scanner_and_recent_event_analytics():
