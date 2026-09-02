@@ -32,3 +32,11 @@ def test_paper_safety_gate_state_is_durable_singleton():
     assert "gate_id       SMALLINT PRIMARY KEY DEFAULT 1 CHECK (gate_id = 1)" in sql
     assert "is_blocked    BOOLEAN NOT NULL DEFAULT FALSE" in sql
     assert "blocked_since TIMESTAMPTZ" in sql
+
+
+def test_paper_safety_events_are_append_only_and_record_enforcement():
+    sql = SCHEMA.read_text(encoding="utf-8")
+    assert "CREATE TABLE IF NOT EXISTS dds.paper_safety_event" in sql
+    assert "would_block              BOOLEAN NOT NULL DEFAULT FALSE" in sql
+    assert "gate_blocked             BOOLEAN NOT NULL DEFAULT FALSE" in sql
+    assert "idx_paper_safety_event_type_at" in sql

@@ -1433,6 +1433,43 @@ class ScannerRepository:
 
         return self._with_retry(_do, label="get_paper_safety_gate_state")
 
+    def insert_paper_safety_event(self, event: Mapping[str, Any]) -> None:
+        """Append a paper-safety observation, independently of gate enforcement."""
+        if not self._use_pg:
+            return
+
+        def _do():
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO dds.paper_safety_event (
+                    event_at, event_type, severity, safety_gate_mode,
+                    symbol, scanner_name, direction,
+                    entry_price, stop_price, expected_exit, observed_price,
+                    raw_stop_r, expected_stop_net_r, actual_net_r,
+                    gap_pct, gap_r, excess_execution_r,
+                    position_size, risk_usdt, duration_sec,
+                    would_block, gate_blocked, details_json
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                )
+                """,
+                (
+                    event["event_at"], event["event_type"], event["severity"],
+                    event["safety_gate_mode"], event["symbol"], event["scanner_name"],
+                    event["direction"], event["entry_price"], event["stop_price"],
+                    event["expected_exit"], event["observed_price"], event["raw_stop_r"],
+                    event["expected_stop_net_r"], event["actual_net_r"], event["gap_pct"],
+                    event["gap_r"], event["excess_execution_r"], event["position_size"],
+                    event["risk_usdt"], event["duration_sec"], event["would_block"],
+                    event["gate_blocked"], json.dumps(event.get("details_json", {})),
+                ),
+            )
+
+        self._with_retry(_do, label="insert_paper_safety_event")
+
     def block_paper_safety_gate(self, reason: str, blocked_since: Any) -> None:
         """Durably halt new paper entries after a severe execution incident."""
         if not self._use_pg:

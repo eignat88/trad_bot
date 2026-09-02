@@ -218,10 +218,10 @@
       "gridPos": { "h": 6, "w": 24, "x": 0, "y": 22 },
       "id": 30,
       "options": { "showHeader": true, "footer": { "show": false } },
-      "title": "Paper Bot Safety Gate",
+      "title": "Paper Bot Safety Observations & Actual Gate",
       "type": "table",
       "targets": [
-        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT gate_status AS \"Gate\", balance AS \"Balance\", equity AS \"Equity\", open_positions AS \"Open Positions\", stop_gap_count_24h AS \"STOP_GAP 24h\", total_trades AS \"Total Trades\", active_signals AS \"Active Signals\" FROM mart.paper_safety_gate;", "format": "table", "refId": "A" }
+        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT safety_gate_mode AS \"Safety Mode\", gate_status AS \"Gate Status\", stop_gap_24h AS \"STOP_GAP 24h\", severe_stop_gap_24h AS \"Severe 24h\", would_block_24h AS \"Would Block 24h\", actual_blocks_24h AS \"Actual Blocks 24h\", max_gap_r_24h AS \"Worst Gap R\", last_severe_event_at AS \"Last Severe Event\", balance AS \"Balance\", equity AS \"Equity\", open_positions AS \"Open Positions\" FROM mart.paper_safety_metrics;", "format": "table", "refId": "A" }
       ]
     },
     {
@@ -256,7 +256,7 @@
       "gridPos": { "h": 4, "w": 4, "x": 4, "y": 28 },
       "id": 32,
       "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "title": "STOP_GAP Events (24h)",
+      "title": "Safety Observations — STOP_GAP (24h)",
       "type": "stat",
       "targets": [
         { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT stop_gap_count_24h AS value FROM mart.paper_safety_gate;", "format": "table", "refId": "A" }
@@ -500,6 +500,18 @@
       "type": "table",
       "targets": [
         { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT run_id AS \"Run ID\", scanner_name AS \"Scanner\", symbols_scanned AS \"Scanned\", candidates_found AS \"Candidates\", setups_saved AS \"Setups\", errors_count AS \"Errors\", duration_ms AS \"Duration (ms)\" FROM dds.scanner_run_stat ORDER BY run_id DESC LIMIT 50;", "format": "table", "refId": "A" }
+      ]
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "trad_bot_postgres" },
+      "fieldConfig": { "defaults": { "custom": { "align": "auto", "filterable": true } }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 55 },
+      "id": 40,
+      "options": { "showHeader": true, "footer": { "show": false } },
+      "title": "Latest Safety Events",
+      "type": "table",
+      "targets": [
+        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT event_at AS \"Time\", symbol AS \"Symbol\", scanner_name AS \"Scanner\", direction AS \"Direction\", event_type AS \"Type\", severity AS \"Severity\", expected_stop_net_r AS \"Expected R\", actual_net_r AS \"Actual R\", gap_r AS \"Gap R\", would_block AS \"Would Block\", gate_blocked AS \"Blocked\" FROM mart.paper_safety_recent_events LIMIT 50;", "format": "table", "refId": "A" }
       ]
     }
   ],

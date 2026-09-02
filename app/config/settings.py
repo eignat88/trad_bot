@@ -125,6 +125,9 @@ class Settings:
     # materially worse than the normal all-in stop fill.
     paper_severe_stop_gap_r: float = 0.20
     paper_severe_execution_extra_r: float = 0.15
+    # Controls enforcement after a severe STOP_LOSS_GAP.  Observation remains
+    # persisted in every mode; only enforce activates the durable entry gate.
+    paper_safety_gate_mode: str = "enforce"
     paper_funding_interval_hours: int = 8
     paper_emergency_stop_file: str = "data/PAPER_TRADING_STOP"
     # Paper trading scan interval in seconds (default 300 = 5 minutes).
@@ -176,6 +179,9 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         "bybit_api_secret": os.getenv("BYBIT_API_SECRET", ""),
         "telegram_token": os.getenv("TELEGRAM_TOKEN", ""),
         "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
+        "paper_safety_gate_mode": os.getenv(
+            "PAPER_SAFETY_GATE_MODE", raw.get("paper_safety_gate_mode", "enforce")
+        ).lower(),
     }
     allowed = Settings.__dataclass_fields__.keys()
     values = {k: v for k, v in raw.items() if k in allowed}
@@ -263,6 +269,10 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         raise ValueError("paper_severe_stop_gap_r cannot be negative")
     if settings.paper_severe_execution_extra_r < 0:
         raise ValueError("paper_severe_execution_extra_r cannot be negative")
+    if settings.paper_safety_gate_mode not in {"enforce", "observe", "disabled"}:
+        raise ValueError(
+            "PAPER_SAFETY_GATE_MODE must be enforce, observe, or disabled"
+        )
     if settings.paper_funding_interval_hours <= 0:
         raise ValueError("paper_funding_interval_hours must be positive")
     if (settings.scanner_workers <= 0 or settings.scan_interval <= 0
