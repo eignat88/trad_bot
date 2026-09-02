@@ -661,8 +661,11 @@ CREATE TABLE IF NOT EXISTS dds.paper_safety_gate_state (
     gate_id       SMALLINT PRIMARY KEY DEFAULT 1 CHECK (gate_id = 1),
     is_blocked    BOOLEAN NOT NULL DEFAULT FALSE,
     reason        TEXT,
-    blocked_since TIMESTAMPTZ,
-    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    blocked_since     TIMESTAMPTZ,
+    -- Runtime configuration last published by the currently running Paper Engine.
+    -- NULL is valid until the first post-migration Paper Engine startup.
+    safety_gate_mode  TEXT,
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- ============================================================

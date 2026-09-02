@@ -259,7 +259,7 @@
       "title": "Safety Observations — STOP_GAP (24h)",
       "type": "stat",
       "targets": [
-        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT stop_gap_count_24h AS value FROM mart.paper_safety_gate;", "format": "table", "refId": "A" }
+        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT stop_gap_24h AS value FROM mart.paper_safety_gate;", "format": "table", "refId": "A" }
       ]
     },
     {

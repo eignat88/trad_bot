@@ -14,6 +14,7 @@ class FakeRepository:
         self.saved = []
         self.closed = []
         self.safety_events = []
+        self.safety_gate_modes = []
         self.risk_state = risk_state or {"daily_loss_usdt": 0.0, "consecutive_losses": 0}
         self.account_snapshot = account_snapshot
         self.safety_gate_state = safety_gate_state or {
@@ -28,6 +29,10 @@ class FakeRepository:
 
     def get_paper_safety_gate_state(self):
         return self.safety_gate_state
+
+    def set_paper_safety_gate_mode(self, mode):
+        self.safety_gate_modes.append(mode)
+        self.safety_gate_state["safety_gate_mode"] = mode
 
     def insert_paper_safety_event(self, event):
         self.safety_events.append(event)
@@ -72,6 +77,16 @@ def _candidate(**changes) -> SetupCandidate:
     }
     values.update(changes)
     return SetupCandidate(**values)
+
+
+@pytest.mark.parametrize("mode", ("observe", "enforce", "disabled"))
+def test_engine_startup_persists_configured_safety_gate_mode(mode):
+    repo = FakeRepository()
+
+    PaperTradingEngine(Settings(paper_safety_gate_mode=mode), repo)
+
+    assert repo.safety_gate_modes == [mode]
+    assert repo.safety_gate_state["safety_gate_mode"] == mode
 
 
 def test_entry_and_target_exit_include_fees_and_slippage():
