@@ -11,3 +11,6 @@ logs/
 .npm-cache/
 artifacts/
 docs/VPS_DEPLOY.md
+
+# Local AI agent skills/config
+.agents/
