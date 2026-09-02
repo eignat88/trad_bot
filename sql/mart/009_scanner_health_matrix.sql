@@ -51,28 +51,20 @@ COMMENT ON VIEW mart.scanner_health_matrix IS 'Per-scanner health from latest ru
 -- =============================================
 CREATE OR REPLACE VIEW mart.scanner_direction_status AS
 SELECT
-    scanners.scanner_name,
-    CASE
-        WHEN sdc_long.scanner_name IS NULL     THEN 'ENABLED'   -- нет записи = не заблокирован
-        WHEN sdc_long.enabled                   THEN 'ENABLED'
-        WHEN sdc_long.block_reason = 'regime_filter' THEN 'REGIME'
-        ELSE 'BLOCKED'
-    END AS long_status,
-    CASE
-        WHEN sdc_short.scanner_name IS NULL    THEN 'ENABLED'   -- нет записи = не заблокирован
-        WHEN sdc_short.enabled                  THEN 'ENABLED'
-        WHEN sdc_short.block_reason = 'regime_filter' THEN 'REGIME'
-        ELSE 'BLOCKED'
-    END AS short_status
-FROM (
-    SELECT DISTINCT scanner_name
-    FROM dds.scanner_run_stat
-) scanners
-LEFT JOIN dds.scanner_direction_config sdc_long
-    ON sdc_long.scanner_name = scanners.scanner_name AND sdc_long.direction = 'LONG'
-LEFT JOIN dds.scanner_direction_config sdc_short
-    ON sdc_short.scanner_name = scanners.scanner_name AND sdc_short.direction = 'SHORT'
-ORDER BY scanners.scanner_name;
+    scanner_name,
+    MAX(CASE
+        WHEN direction = 'LONG' AND enabled THEN 'ENABLED'
+        WHEN direction = 'LONG' AND block_reason = 'regime_filter' THEN 'REGIME'
+        WHEN direction = 'LONG' THEN 'BLOCKED'
+    END) AS long_status,
+    MAX(CASE
+        WHEN direction = 'SHORT' AND enabled THEN 'ENABLED'
+        WHEN direction = 'SHORT' AND block_reason = 'regime_filter' THEN 'REGIME'
+        WHEN direction = 'SHORT' THEN 'BLOCKED'
+    END) AS short_status
+FROM dds.scanner_direction_config
+GROUP BY scanner_name
+ORDER BY scanner_name;
 
 COMMENT ON VIEW mart.scanner_direction_status IS 'Per-scanner direction availability: ENABLED/BLOCKED/REGIME.';
 

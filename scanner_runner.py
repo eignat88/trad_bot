@@ -250,6 +250,16 @@ def main() -> None:
     repository.abort_stale_runs()
 
     orchestrator = ScannerOrchestrator(repository=repository)
+    try:
+        repository.sync_scanner_direction_config(
+            active_scanners=list(orchestrator.scanners.keys()),
+            blocked_scanner_directions=settings.blocked_scanner_directions,
+            scanner_regime_whitelist=settings.scanner_regime_whitelist,
+        )
+    except Exception:
+        logger.exception("scanner direction config synchronization failed")
+        repository.close()
+        raise SystemExit("scanner direction config synchronization failed")
 
     # Load expectancy filter if enabled
     expectancy_filter = None
