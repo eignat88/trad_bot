@@ -19,15 +19,14 @@ EXPECTED_BLOCKED_COMBINATIONS = frozenset({
     ("BREAKOUT_RETEST", "LONG"),
     ("BREAKOUT_RETEST", "SHORT"),
     ("MOMENTUM_EXHAUSTION", "LONG"),
-    ("TREND_PULLBACK", "LONG"),
-    ("TREND_PULLBACK", "SHORT"),
+    ("TREND_PULLBACK_V2", "SHORT"),
 })
 
 
 @pytest.fixture
 def candidate() -> SetupCandidate:
     return SetupCandidate(
-        scanner_name="TREND_PULLBACK",
+        scanner_name="TREND_PULLBACK_V2",
         symbol="BTCUSDT",
         direction="LONG",
         entry_timeframe="5m",

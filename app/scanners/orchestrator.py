@@ -16,7 +16,6 @@ from app.scanners.expectancy_filter import ExpectancyFilter, filter_candidates
 from app.scanners.risk_geometry import validate_risk_geometry
 from app.scanners.scoring import score_candidate
 from app.scanners.support_resistance import SupportResistanceScanner
-from app.scanners.trend_pullback import TrendPullbackScanner
 from app.scanners.trend_pullback_v2 import TrendPullbackScannerV2
 from app.scanners.volatility_compression import VolatilityCompressionScanner
 
@@ -48,7 +47,6 @@ class ScannerOrchestrator:
             "LIQUIDITY_SWEEP_CHOCH_OB": LiquiditySweepCHOCHScanner(),
             "BREAKOUT_RETEST": BreakoutRetestScanner(),
             "LIQUIDITY_REVERSAL": LiquidityReversalScanner(),
-            "TREND_PULLBACK": TrendPullbackScanner(),
             "TREND_PULLBACK_V2": TrendPullbackScannerV2(),
             "VOLATILITY_COMPRESSION": VolatilityCompressionScanner(),
             "SUPPORT_RESISTANCE_REACTION": SupportResistanceScanner(),
@@ -121,7 +119,7 @@ class ScannerOrchestrator:
                     "duration_ms": round((time.perf_counter() - started) * 1000, 3),
                 }
 
-        # Some scanners (currently TREND_PULLBACK) emit a calibrated local
+        # Some scanners (currently TREND_PULLBACK_V2) emit a calibrated local
         # score with explainable reasons. Preserve it instead of silently
         # replacing it with the generic confirmation score.
         scored = [
