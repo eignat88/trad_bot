@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from app.config import Settings
+from app.paper.exit_reasons import EXPIRED_EXIT_REASONS, PaperTradeExitReason
 from app.scanners.models import SetupCandidate
 
 logger = logging.getLogger(__name__)
@@ -91,11 +93,27 @@ class PaperTradingEngine:
         self._loaded_account_snapshot = False
         self._daily_loss_usdt: float = 0.0
         self._consecutive_losses: int = 0
+        self._cooldown_until: datetime | None = None
+        # A severe stop gap blocks fresh entries until explicit operator review.
+        # The halt is restored from the repository after a runner restart.
+        self._gap_loss_halt = False
+        self._risk_day = self._clock().date()
+
+        # Thread safety: protects open_trades / balance / check_exits / check_entries
+        # when the position monitor runs in a background thread.
+        self.trading_lock = threading.Lock()
+
+        # STOP_GAP diagnostic tracking
+        self._stop_gap_events: list[dict] = []
+        self._last_stop_gap: dict | None = None
+        self._gate_since: datetime | None = None
+        self._gate_reason: str | None = None
 
         # Restore account/risk state before rebuilding any open positions.
         self._load_account_state()
         self._load_open_trades()
         self._load_risk_state()
+        self._load_safety_gate_state()
 
     def portfolio_exposure(self, prices: dict[str, float] | None = None) -> dict[str, float]:
         """Return gross, directional and net exposure as fractions of MTM equity."""
@@ -121,6 +139,46 @@ class PaperTradingEngine:
         }
 
     # ------------------------------------------------------------------
+    # DAILY RISK STATE ROLLOVER
+    # ------------------------------------------------------------------
+    def _refresh_daily_risk_state_if_needed(self) -> None:
+        """Rebuild daily risk counters when the UTC day changes.
+
+        Instead of a simple ``self._daily_loss_usdt = 0.0`` reset the engine
+        reloads the current-day loss from the repository.  This ensures that a
+        normal midnight transition, a process restart, a crash recovery and a
+        manual restart all produce the same daily risk state.
+
+        ``_consecutive_losses`` is intentionally **not** reset here — it has
+        its own cooldown lifecycle that is independent of the UTC day.
+        """
+        today = self._clock().date()
+        if today == self._risk_day:
+            return
+
+        previous_day = self._risk_day
+        previous_daily_loss = self._daily_loss_usdt
+
+        # Reload risk state from the repository (same path as _load_risk_state).
+        self._load_risk_state()
+
+        # _load_risk_state overwrites _risk_day implicitly via the same
+        # repository query; track the new day explicitly.
+        self._risk_day = today
+
+        logger.info(
+            "paper daily risk state rollover: "
+            "previous_day=%s new_day=%s "
+            "previous_daily_loss_usdt=%.2f current_daily_loss_usdt=%.2f "
+            "entries_enabled=%s",
+            previous_day,
+            today,
+            previous_daily_loss,
+            self._daily_loss_usdt,
+            self._daily_loss_usdt < self.settings.initial_balance * self.settings.max_daily_loss,
+        )
+
+    # ------------------------------------------------------------------
     # ENTRY: scan READY_TO_TRADE setups → open positions
     # ------------------------------------------------------------------
     def check_entries(
@@ -136,7 +194,15 @@ class PaperTradingEngine:
         Returns:
             List of newly opened trades.
         """
+        self._refresh_daily_risk_state_if_needed()
+
         opened: list[PaperTradeRecord] = []
+        if self._gap_loss_halt:
+            logger.critical(
+                "paper gate: severe STOP_LOSS_GAP observed; new entries remain blocked "
+                "until the durable gate is cleared after operator review"
+            )
+            return opened
         for c in candidates:
             price = prices.get(c.symbol)
             if price is None:
@@ -156,17 +222,63 @@ class PaperTradingEngine:
                 logger.warning("paper gate: daily loss limit reached, skipping new entries")
                 break
             if self._consecutive_losses >= self.settings.max_consecutive_losses:
-                logger.warning("paper gate: consecutive loss limit reached, skipping new entries")
-                break
+                if self.settings.trading_mode == "paper" and self.settings.paper_consecutive_loss_cooldown_minutes > 0:
+                    # Paper mode: activate cooldown instead of hard stop
+                    if self._cooldown_until is None:
+                        self._cooldown_until = self._clock().replace(
+                            microsecond=0
+                        ) + timedelta(
+                            minutes=self.settings.paper_consecutive_loss_cooldown_minutes
+                        )
+                        logger.warning(
+                            "paper risk gate activated: reason=MAX_CONSECUTIVE_LOSSES "
+                            "losses=%d limit=%d cooldown_until=%s",
+                            self._consecutive_losses,
+                            self.settings.max_consecutive_losses,
+                            self._cooldown_until.isoformat(),
+                        )
+                    elif self._cooldown_until <= self._clock():
+                        # Cooldown expired — reset and allow entries
+                        prev = self._consecutive_losses
+                        self._consecutive_losses = 0
+                        self._cooldown_until = None
+                        logger.info(
+                            "paper consecutive-loss cooldown completed: "
+                            "previous_losses=%d consecutive_losses reset to 0 "
+                            "new entries enabled",
+                            prev,
+                        )
+                    else:
+                        remaining = (self._cooldown_until - self._clock()).total_seconds() / 60
+                        logger.debug(
+                            "paper consecutive-loss cooldown active: "
+                            "losses=%d cooldown_until=%s remaining_minutes=%.0f",
+                            self._consecutive_losses,
+                            self._cooldown_until.isoformat(),
+                            remaining,
+                        )
+                        break
+                else:
+                    # Live mode or cooldown disabled: hard stop
+                    logger.warning("paper gate: consecutive loss limit reached, skipping new entries")
+                    break
 
-            # Market regime filter: reject entries that fight the dominant trend.
+            # Scanner-specific regime allow-lists override the generic trend
+            # conflict rule. This keeps paper execution aligned with scanning.
             if self.settings.regime_filter_enabled and c.market_regime:
                 regime = c.market_regime
-                if (c.direction == "LONG" and regime == "TREND_DOWN") or \
-                   (c.direction == "SHORT" and regime == "TREND_UP"):
+                allowed = self.settings.scanner_regime_whitelist.get(
+                    c.scanner_name, {}
+                ).get(c.direction)
+                rejected = (
+                    regime not in allowed if allowed is not None else
+                    (c.direction == "LONG" and regime == "TREND_DOWN") or
+                    (c.direction == "SHORT" and regime == "TREND_UP")
+                )
+                if rejected:
                     logger.info(
-                        "paper regime filter: rejecting %s %s in %s",
-                        c.symbol, c.direction, regime,
+                        "paper regime filter: rejecting %s %s %s in %s",
+                        c.symbol, c.scanner_name, c.direction, regime,
                     )
                     continue
 
@@ -249,8 +361,25 @@ class PaperTradingEngine:
                 lowest_since_entry=price,
             )
 
-            # Persist to DB
+            # Do not re-execute a setup after runner restart or a terminal exit.
+            # The repository repeats this check transactionally and its database
+            # unique index is the final guard for concurrent workers.
+            existing_trade_id = getattr(
+                self.repo, "get_paper_trade_by_setup", lambda _setup_id: None,
+            )(trade.setup_id)
+            if existing_trade_id is not None:
+                logger.info(
+                    "paper trade duplicate suppressed: setup_id=%s symbol=%s scanner=%s "
+                    "existing_trade_id=%s duplicate_reason=setup_already_executed",
+                    trade.setup_id, trade.symbol, trade.scanner_name, existing_trade_id,
+                )
+                continue
+
             trade_id = self.repo.save_paper_trade(trade)
+            if trade_id is None and getattr(self.repo, "_use_pg", False):
+                # A concurrent worker inserted this setup and save_paper_trade
+                # converted the expected unique violation into an idempotent result.
+                continue
             trade.trade_id = trade_id
 
             self.balance -= entry_fee + entry_slippage_cost
@@ -318,16 +447,28 @@ class PaperTradingEngine:
             # 1. Stop loss check
             if is_long and price <= trade.stop_price:
                 gap = price < trade.stop_price
-                result = self._close_trade(
-                    trade, price if gap else trade.stop_price,
-                    "STOP_LOSS_GAP" if gap else "STOP_LOSS",
-                )
+                exit_price = price if gap else trade.stop_price
+                exit_reason = "STOP_LOSS_GAP" if gap else "STOP_LOSS"
+                result = self._close_trade(trade, exit_price, exit_reason)
+                if gap:
+                    self._record_stop_gap_event(
+                        trade,
+                        exit_price,
+                        price,
+                        self._stop_gap_execution_metrics(trade, price, result.net_pnl),
+                    )
             elif not is_long and price >= trade.stop_price:
                 gap = price > trade.stop_price
-                result = self._close_trade(
-                    trade, price if gap else trade.stop_price,
-                    "STOP_LOSS_GAP" if gap else "STOP_LOSS",
-                )
+                exit_price = price if gap else trade.stop_price
+                exit_reason = "STOP_LOSS_GAP" if gap else "STOP_LOSS"
+                result = self._close_trade(trade, exit_price, exit_reason)
+                if gap:
+                    self._record_stop_gap_event(
+                        trade,
+                        exit_price,
+                        price,
+                        self._stop_gap_execution_metrics(trade, price, result.net_pnl),
+                    )
 
             # 2. Take profit 1 check (full close)
             if result is None and trade.target_1 is not None:
@@ -364,6 +505,155 @@ class PaperTradingEngine:
         self._update_equity_drawdown()
 
         return closed
+
+    # ------------------------------------------------------------------
+    # STOP_GAP DIAGNOSTICS
+    # ------------------------------------------------------------------
+    def _stop_gap_execution_metrics(
+        self,
+        trade: PaperTradeRecord,
+        observed_price: float,
+        actual_net_pnl: float,
+    ) -> dict[str, float | bool]:
+        """Measure a gap against a normal all-in stop execution.
+
+        Fees and configured slippage are expected costs of both a normal stop
+        and a gap exit.  They must not by themselves turn a small market gap
+        into a severe execution incident.
+        """
+        if trade.risk_usdt <= 0:
+            return {
+                "raw_stop_r": 0.0,
+                "expected_stop_net_r": 0.0,
+                "actual_net_r": 0.0,
+                "gap_r": 0.0,
+                "excess_execution_r": 0.0,
+                "severe": False,
+            }
+
+        market_entry = trade.entry_market_price or trade.entry_price
+        if trade.direction == "LONG":
+            expected_gross = (trade.stop_price - market_entry) * trade.position_size
+        else:
+            expected_gross = (market_entry - trade.stop_price) * trade.position_size
+        expected_adjusted_exit = trade.stop_price * (
+            1 - self.settings.slippage_percent
+            if trade.direction == "LONG"
+            else 1 + self.settings.slippage_percent
+        )
+        expected_exit_fee = (
+            expected_adjusted_exit * trade.position_size * self.settings.taker_fee
+        )
+        expected_exit_slippage = abs(expected_adjusted_exit - trade.stop_price) * trade.position_size
+        expected_net_pnl = (
+            expected_gross
+            - trade.entry_fee
+            - expected_exit_fee
+            - trade.funding_paid
+            - trade.entry_slippage_cost
+            - expected_exit_slippage
+        )
+        if trade.direction == "LONG":
+            raw_gross = (observed_price - market_entry) * trade.position_size
+        else:
+            raw_gross = (market_entry - observed_price) * trade.position_size
+        gap_r = abs(observed_price - trade.stop_price) * trade.position_size / trade.risk_usdt
+        expected_stop_net_r = expected_net_pnl / trade.risk_usdt
+        actual_net_r = actual_net_pnl / trade.risk_usdt
+        excess_execution_r = actual_net_r - expected_stop_net_r
+        severe = (
+            gap_r > self.settings.paper_severe_stop_gap_r
+            or actual_net_r < expected_stop_net_r - self.settings.paper_severe_execution_extra_r
+        )
+        return {
+            "raw_stop_r": raw_gross / trade.risk_usdt,
+            "expected_stop_net_r": expected_stop_net_r,
+            "actual_net_r": actual_net_r,
+            "gap_r": gap_r,
+            "excess_execution_r": excess_execution_r,
+            "severe": severe,
+        }
+
+    def _record_stop_gap_event(
+        self,
+        trade: PaperTradeRecord,
+        expected_exit: float,
+        observed_price: float,
+        metrics: dict[str, float | bool],
+    ) -> None:
+        """Record diagnostic data for a STOP_LOSS_GAP event.
+
+        Called when price gaps through the stop level between monitoring cycles.
+        The diagnostic data helps identify whether gaps are due to:
+        - Slow monitoring frequency (fix: increase check rate)
+        - Incorrect stop placement (fix: review stop logic)
+        - Extreme volatility (fix: widen stops or reduce position size)
+        """
+        gap_pct = abs(observed_price - trade.stop_price) / trade.stop_price * 100
+        gap_event = {
+            "symbol": trade.symbol,
+            "scanner_name": trade.scanner_name,
+            "direction": trade.direction,
+            "entry_price": trade.entry_price,
+            "stop_price": trade.stop_price,
+            "expected_exit": expected_exit,
+            "observed_price": observed_price,
+            "gap_pct": round(gap_pct, 4),
+            "raw_stop_r": round(float(metrics["raw_stop_r"]), 4),
+            "expected_stop_net_r": round(float(metrics["expected_stop_net_r"]), 4),
+            "actual_net_r": round(float(metrics["actual_net_r"]), 4),
+            "gap_r": round(float(metrics["gap_r"]), 4),
+            "excess_execution_r": round(float(metrics["excess_execution_r"]), 4),
+            "severe": bool(metrics["severe"]),
+            "position_size": trade.position_size,
+            "risk_usdt": trade.risk_usdt,
+            "timestamp": self._clock().isoformat(),
+            "duration_sec": (self._clock() - trade.entered_at).total_seconds(),
+        }
+
+        self._stop_gap_events.append(gap_event)
+        self._last_stop_gap = gap_event
+        self._cleanup_old_stop_gap_events()
+
+        logger.warning(
+            "STOP_GAP: symbol=%s scanner=%s direction=%s raw_stop_r=%.2f "
+            "expected_stop_net_r=%.2f actual_net_r=%.2f gap_r=%.2f "
+            "excess_execution_r=%.2f severe=%s",
+            trade.symbol, trade.scanner_name, trade.direction,
+            metrics["raw_stop_r"], metrics["expected_stop_net_r"],
+            metrics["actual_net_r"], metrics["gap_r"],
+            metrics["excess_execution_r"], metrics["severe"],
+        )
+
+    def _cleanup_old_stop_gap_events(self) -> None:
+        """Remove STOP_LOSS_GAP events older than 24 hours."""
+        cutoff = self._clock().timestamp() - 86400  # 24 hours ago
+        self._stop_gap_events = [
+            e for e in self._stop_gap_events
+            if datetime.fromisoformat(e["timestamp"]).timestamp() > cutoff
+        ]
+
+    @property
+    def stop_gap_count_24h(self) -> int:
+        """Return the number of STOP_LOSS_GAP events in the last 24 hours."""
+        self._cleanup_old_stop_gap_events()
+        return len(self._stop_gap_events)
+
+    @property
+    def last_stop_gap(self) -> dict | None:
+        """Return the most recent STOP_LOSS_GAP event details."""
+        return self._last_stop_gap
+
+    @property
+    def gate_status(self) -> dict:
+        """Return comprehensive gate status for dashboard."""
+        return {
+            "status": "BLOCKED" if self._gap_loss_halt else "OPEN",
+            "reason": self._gate_reason,
+            "since": self._gate_since.isoformat() if self._gate_since else None,
+            "last_stop_gap": self._last_stop_gap,
+            "stop_gap_24h": self.stop_gap_count_24h,
+        }
 
     # ------------------------------------------------------------------
     # INTERNAL HELPERS
@@ -453,7 +743,7 @@ class PaperTradingEngine:
         self,
         trade: PaperTradeRecord,
         exit_price: float,
-        reason: str,
+        reason: PaperTradeExitReason,
     ) -> PaperTradeRecord:
         """Close a paper trade and calculate P&L."""
         slip = self.settings.slippage_percent
@@ -477,6 +767,23 @@ class PaperTradingEngine:
         if net_pnl < 0:
             self._daily_loss_usdt += -net_pnl
             self._consecutive_losses += 1
+            # Activate cooldown immediately when limit is reached (paper mode)
+            if (self._consecutive_losses >= self.settings.max_consecutive_losses
+                    and self.settings.trading_mode == "paper"
+                    and self.settings.paper_consecutive_loss_cooldown_minutes > 0
+                    and self._cooldown_until is None):
+                self._cooldown_until = self._clock().replace(
+                    microsecond=0
+                ) + timedelta(
+                    minutes=self.settings.paper_consecutive_loss_cooldown_minutes
+                )
+                logger.warning(
+                    "paper risk gate activated: reason=MAX_CONSECUTIVE_LOSSES "
+                    "losses=%d limit=%d cooldown_until=%s",
+                    self._consecutive_losses,
+                    self.settings.max_consecutive_losses,
+                    self._cooldown_until.isoformat(),
+                )
         else:
             self._consecutive_losses = 0
 
@@ -487,12 +794,26 @@ class PaperTradingEngine:
         self._max_drawdown = max(self._max_drawdown, dd)
 
         r_multiple = net_pnl / trade.risk_usdt if trade.risk_usdt > 0 else 0
+        stop_gap_metrics = None
+        if reason == "STOP_LOSS_GAP":
+            stop_gap_metrics = self._stop_gap_execution_metrics(trade, exit_price, net_pnl)
+            if bool(stop_gap_metrics["severe"]):
+                self._activate_safety_gate("STOP_LOSS_GAP")
+                logger.critical(
+                    "paper risk halt: STOP_LOSS_GAP severe=true gap_r=%.2fR "
+                    "expected_stop_net_r=%.2fR actual_net_r=%.2fR "
+                    "excess_execution_r=%.2fR; new entries are blocked",
+                    stop_gap_metrics["gap_r"],
+                    stop_gap_metrics["expected_stop_net_r"],
+                    stop_gap_metrics["actual_net_r"],
+                    stop_gap_metrics["excess_execution_r"],
+                )
         pnl_pct = net_pnl / (trade.entry_price * trade.position_size) * 100 if trade.entry_price * trade.position_size > 0 else 0
         duration = (self._clock() - trade.entered_at).total_seconds()
         risk_distance = trade.risk_usdt / trade.position_size if trade.position_size > 0 else 0.0
         mfe_r = trade.mfe / risk_distance if risk_distance > 0 else 0.0
         mae_r = trade.mae / risk_distance if risk_distance > 0 else 0.0
-        is_expiry = reason in ("EXPIRED", "EXPIRED_PROFITABLE")
+        is_expiry = reason in EXPIRED_EXIT_REASONS
         if is_expiry and trade.direction == "LONG":
             distance_to_tp = trade.target_1 - exit_price if trade.target_1 is not None else None
             distance_to_sl = exit_price - trade.stop_price
@@ -565,6 +886,25 @@ class PaperTradingEngine:
             funding_periods_charged=trade.funding_periods_charged,
         )
 
+    def _activate_safety_gate(self, reason: str) -> None:
+        """Fail closed locally, then persist a severe-execution entry halt."""
+        if not self._gap_loss_halt:
+            self._gate_since = self._clock()
+        self._gap_loss_halt = True
+        self._gate_reason = reason
+
+        block_gate = getattr(self.repo, "block_paper_safety_gate", None)
+        if block_gate is None:
+            return
+        try:
+            block_gate(reason, self._gate_since)
+        except Exception:
+            # The in-process halt must remain active even if persistence is down.
+            logger.critical(
+                "paper risk halt could not be persisted; keeping local gate blocked",
+                exc_info=True,
+            )
+
     def _load_account_state(self) -> None:
         """Restore balance and drawdown from the most recent account snapshot."""
         get_snapshot = getattr(self.repo, "get_latest_paper_account_snapshot", None)
@@ -579,13 +919,56 @@ class PaperTradingEngine:
         self._loaded_account_snapshot = True
 
     def _load_risk_state(self) -> None:
-        """Restore today's realized loss and current loss streak after restart."""
+        """Restore today's realized loss, loss streak, and cooldown after restart."""
         get_state = getattr(self.repo, "get_paper_risk_state", None)
         if get_state is None:
             return
         state = get_state()
         self._daily_loss_usdt = float(state.get("daily_loss_usdt", 0.0))
         self._consecutive_losses = int(state.get("consecutive_losses", 0))
+
+        # Restore cooldown state
+        cooldown_until = state.get("cooldown_until")
+        if cooldown_until is not None:
+            now = self._clock()
+            if cooldown_until > now:
+                # Cooldown still active
+                self._cooldown_until = cooldown_until
+                remaining = (cooldown_until - now).total_seconds() / 60
+                logger.info(
+                    "paper consecutive-loss cooldown restored: "
+                    "losses=%d cooldown_until=%s remaining_minutes=%.0f",
+                    self._consecutive_losses,
+                    cooldown_until.isoformat(),
+                    remaining,
+                )
+            else:
+                # Cooldown expired while process was down — clear it
+                logger.info(
+                    "paper consecutive-loss cooldown expired during downtime: "
+                    "clearing cooldown, resetting losses from %d to 0",
+                    self._consecutive_losses,
+                )
+                self._consecutive_losses = 0
+                self._cooldown_until = None
+
+    def _load_safety_gate_state(self) -> None:
+        """Restore a severe-execution halt so a restart cannot reopen entries."""
+        get_state = getattr(self.repo, "get_paper_safety_gate_state", None)
+        if get_state is None:
+            return
+        state = get_state()
+        if state.get("is_blocked") is not True:
+            return
+
+        self._gap_loss_halt = True
+        self._gate_reason = str(state.get("reason") or "SAFETY_GATE")
+        self._gate_since = state.get("blocked_since")
+        logger.critical(
+            "paper safety gate restored: reason=%s blocked_since=%s; new entries remain blocked",
+            self._gate_reason,
+            self._gate_since.isoformat() if self._gate_since else None,
+        )
 
     def _load_open_trades(self) -> None:
         """Load any existing OPEN paper trades from the DB on startup.
@@ -659,6 +1042,11 @@ class PaperTradingEngine:
             return (price - trade.entry_price) * trade.position_size
         return (trade.entry_price - price) * trade.position_size
 
+    def get_stop_gap_diagnostics(self) -> list[dict]:
+        """Return all STOP_LOSS_GAP events from the last 24 hours."""
+        self._cleanup_old_stop_gap_events()
+        return self._stop_gap_events.copy()
+
     def mark_to_market(self, prices: dict[str, float] | None = None) -> dict[str, float]:
         """Return realized balance, unrealized P&L and MTM equity."""
         if prices:
@@ -693,7 +1081,7 @@ class PaperTradingEngine:
         self._update_equity_drawdown()
         exposure = self.portfolio_exposure()
         total_pnl = account["equity"] - self.settings.initial_balance
-        return {
+        result = {
             "balance": round(account["balance"], 2),
             "unrealized_pnl": round(account["unrealized_pnl"], 2),
             "equity": round(account["equity"], 2),
@@ -706,6 +1094,12 @@ class PaperTradingEngine:
             "long_exposure_pct": round(exposure["long_exposure_pct"] * 100, 2),
             "short_exposure_pct": round(exposure["short_exposure_pct"] * 100, 2),
             "net_exposure_pct": round(exposure["net_exposure_pct"] * 100, 2),
+            "consecutive_losses": self._consecutive_losses,
+            "cooldown_until": self._cooldown_until.isoformat() if self._cooldown_until else None,
+            # Enriched gate status
+            "gate": self.gate_status,
+            "stop_gap_24h": self.stop_gap_count_24h,
+            "last_stop_gap": self._last_stop_gap,
             "open_trades": [
                 {
                     "symbol": t.symbol,
@@ -719,3 +1113,4 @@ class PaperTradingEngine:
                 for t in self.open_trades.values()
             ],
         }
+        return result

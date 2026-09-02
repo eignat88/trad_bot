@@ -33,6 +33,27 @@
   "capitulation": {"price_change_max": -8.0, "oi_change_max": -15.0, "volume_ratio_min": 2.0, "oi_stabilization_min": -2.0},
   "expectancy_filter_enabled": true,
   "expectancy_min_avg_r": 0.0,
-  "blocked_scanner_directions": [["BREAKOUT_RETEST", "SHORT"]],
-  "expectancy_min_samples": 10
+  "blocked_scanner_directions": [
+    ["VOLATILITY_COMPRESSION", "LONG"],
+    ["VOLATILITY_COMPRESSION", "SHORT"],
+    ["SUPPORT_RESISTANCE_REACTION", "LONG"],
+    ["SUPPORT_RESISTANCE_REACTION", "SHORT"],
+    ["LIQUIDITY_REVERSAL", "SHORT"],
+    ["BREAKOUT_RETEST", "LONG"],
+    ["BREAKOUT_RETEST", "SHORT"],
+    ["MOMENTUM_EXHAUSTION", "LONG"],
+    ["TREND_PULLBACK", "LONG"],
+    ["TREND_PULLBACK", "SHORT"]
+  ],
+  "scanner_regime_whitelist": {
+    "TREND_PULLBACK": {"LONG": ["TREND_UP"], "SHORT": []}
+  },
+  "expectancy_min_samples": 30,
+  "paper_min_closed_trades": 100,
+  "paper_min_avg_r": 0.0,
+  "paper_min_profit_factor": 1.0,
+  "paper_max_loss_r_per_trade": 1.2,
+  "paper_severe_stop_gap_r": 0.20,
+  "paper_severe_execution_extra_r": 0.15,
+  "position_monitor_interval": 10
 }

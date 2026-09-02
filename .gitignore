@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .pytest_tmp/
+tests/.tmp/
 .scheduler_tmp/
 data/
 logs/
@@ -10,7 +11,15 @@ logs/
 logs/
 .npm-cache/
 artifacts/
+*.dump
+*.backup
+artifacts/db_backup/
 docs/VPS_DEPLOY.md
 
 # Local AI agent skills/config
 .agents/
+
+# Grafana / monitoring secrets
+monitoring/grafana/.env
+*.secret
+*.key

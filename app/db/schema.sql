@@ -312,6 +312,7 @@ DROP VIEW IF EXISTS dds.scanner_expectancy CASCADE;
 DROP VIEW IF EXISTS dds.scanner_symbol_expectancy CASCADE;
 DROP VIEW IF EXISTS dds.scanner_regime_expectancy CASCADE;
 DROP VIEW IF EXISTS dds.score_bucket_expectancy CASCADE;
+DROP VIEW IF EXISTS dds.score_calibration CASCADE;
 DROP VIEW IF EXISTS dds.scanner_confluence_expectancy CASCADE;
 
 CREATE OR REPLACE VIEW dds.scanner_stats AS
@@ -385,16 +386,19 @@ GROUP BY scanner_name, direction
 ORDER BY avg_r_after_costs DESC NULLS LAST;
 
 -- Enriched expectancy: join outcome with setup for regime/score context
+-- Score buckets are wider (0-19, 20-39, 40-59, 60-79, 80-100) to better
+-- reflect the new quality-based scoring where scores are more spread out.
 CREATE OR REPLACE VIEW dds._outcome_enriched AS
 SELECT
     o.*,
     s.market_regime,
     s.score AS setup_score,
     CASE
-        WHEN s.score < 30 THEN '<30'
-        WHEN s.score < 40 THEN '30-39'
-        WHEN s.score < 50 THEN '40-49'
-        ELSE '50+'
+        WHEN s.score < 20 THEN '0-19'
+        WHEN s.score < 40 THEN '20-39'
+        WHEN s.score < 60 THEN '40-59'
+        WHEN s.score < 80 THEN '60-79'
+        ELSE '80-100'
     END AS score_bucket
 FROM dds.signal_outcome o
 JOIN dds.scanner_setup s ON s.setup_id = o.setup_id;
@@ -455,6 +459,33 @@ FROM dds._outcome_enriched
 GROUP BY scanner_name, direction, score_bucket
 HAVING COUNT(*) >= 3
 ORDER BY score_bucket, avg_r_after_costs DESC NULLS LAST;
+
+-- Score calibration: per-scanner expectancy by score bucket for tuning thresholds
+CREATE OR REPLACE VIEW dds.score_calibration AS
+SELECT
+    s.scanner_name,
+    s.direction,
+    CASE
+        WHEN s.score < 20 THEN '0-19'
+        WHEN s.score < 40 THEN '20-39'
+        WHEN s.score < 60 THEN '40-59'
+        WHEN s.score < 80 THEN '60-79'
+        ELSE '80-100'
+    END AS score_bucket,
+    COUNT(*) AS samples,
+    COUNT(*) FILTER (WHERE o.entry_touched) AS entries,
+    ROUND(AVG(o.result_r), 4) AS avg_r,
+    ROUND(AVG(o.fee_slippage_adjusted_result_r), 4) AS avg_r_adjusted,
+    ROUND(
+        COUNT(*) FILTER (WHERE o.first_event IN ('TP1', 'TP2'))::numeric /
+        NULLIF(COUNT(*) FILTER (WHERE o.entry_touched), 0), 4
+    ) AS win_rate
+FROM dds.signal_outcome o
+JOIN dds.scanner_setup s ON s.setup_id = o.setup_id
+WHERE o.entry_touched = true
+GROUP BY s.scanner_name, s.direction, score_bucket
+HAVING COUNT(*) >= 5
+ORDER BY s.scanner_name, s.direction, score_bucket;
 
 -- Scanner confluence is the number of distinct scanners that detected the
 -- same symbol/direction within the runner's ten-minute conflict window.
@@ -556,7 +587,7 @@ CREATE TABLE IF NOT EXISTS dds.paper_trade (
         exit_reason IS NULL OR exit_reason IN (
             'TAKE_PROFIT_1', 'TAKE_PROFIT_2', 'TAKE_PROFIT_SLIPPAGE',
             'STOP_LOSS', 'STOP_LOSS_GAP', 'TRAILING_STOP',
-            'EXPIRED', 'TIMEOUT', 'MANUAL', 'RISK_LIMIT'
+            'EXPIRED', 'EXPIRED_PROFITABLE', 'TIMEOUT', 'MANUAL', 'RISK_LIMIT'
         )
     )
 );
@@ -581,7 +612,7 @@ ALTER TABLE dds.paper_trade ADD CONSTRAINT paper_trade_exit_reason_chk CHECK (
     exit_reason IS NULL OR exit_reason IN (
         'TAKE_PROFIT_1', 'TAKE_PROFIT_2', 'TAKE_PROFIT_SLIPPAGE',
         'STOP_LOSS', 'STOP_LOSS_GAP', 'TRAILING_STOP',
-        'EXPIRED', 'TIMEOUT', 'MANUAL', 'RISK_LIMIT'
+        'EXPIRED', 'EXPIRED_PROFITABLE', 'TIMEOUT', 'MANUAL', 'RISK_LIMIT'
     )
 );
 
@@ -591,10 +622,12 @@ CREATE INDEX IF NOT EXISTS idx_paper_trade_scanner ON dds.paper_trade (scanner_n
 CREATE INDEX IF NOT EXISTS idx_paper_trade_entered ON dds.paper_trade (entered_at DESC);
 CREATE INDEX IF NOT EXISTS idx_paper_trade_setup ON dds.paper_trade (setup_id);
 
--- Only one active (OPEN or PENDING) trade per setup
-CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_trade_active_per_setup
-ON dds.paper_trade (setup_id)
-WHERE status IN ('PENDING', 'OPEN');
+-- One scanner setup is executable exactly once, including after terminal states.
+-- Existing duplicate historical data makes this statement fail explicitly: it is
+-- deliberately not deleted or silently repaired during bootstrap.
+DROP INDEX IF EXISTS dds.uq_paper_trade_active_per_setup;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_trade_setup
+ON dds.paper_trade (setup_id);
 
 -- ============================================================
 -- PAPER_ACCOUNT: running account equity snapshots
@@ -614,6 +647,24 @@ CREATE TABLE IF NOT EXISTS dds.paper_account (
 
 CREATE INDEX IF NOT EXISTS idx_paper_account_time ON dds.paper_account (created_at DESC);
 
+-- Cooldown state for paper consecutive-loss gate
+ALTER TABLE dds.paper_account
+    ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMPTZ;
+
+-- ============================================================
+-- PAPER_SAFETY_GATE_STATE: durable runtime entry gate
+-- ============================================================
+-- A severe stop-loss gap must continue blocking entries across a runner restart.
+-- This singleton is deliberately separate from periodic account snapshots so the
+-- halt is persisted immediately by the position-monitor thread.
+CREATE TABLE IF NOT EXISTS dds.paper_safety_gate_state (
+    gate_id       SMALLINT PRIMARY KEY DEFAULT 1 CHECK (gate_id = 1),
+    is_blocked    BOOLEAN NOT NULL DEFAULT FALSE,
+    reason        TEXT,
+    blocked_since TIMESTAMPTZ,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- ============================================================
 -- PAPER_TRADE_STATS: aggregated performance by scanner
 -- ============================================================
@@ -623,21 +674,24 @@ SELECT
     direction,
     COUNT(*) AS total_trades,
     COUNT(*) FILTER (WHERE status = 'CLOSED') AS closed,
-    COUNT(*) FILTER (WHERE pnl_usdt > 0) AS wins,
-    COUNT(*) FILTER (WHERE pnl_usdt < 0) AS losses,
-    ROUND(AVG(pnl_r), 4) AS avg_r,
-    ROUND(AVG(pnl_usdt), 2) AS avg_pnl_usdt,
-    ROUND(SUM(pnl_usdt), 2) AS total_pnl_usdt,
-    ROUND(AVG(pnl_percent), 2) AS avg_pnl_pct,
-    ROUND(AVG(duration_sec), 1) AS avg_duration_sec,
+    COUNT(*) FILTER (WHERE status = 'CLOSED' AND pnl_usdt > 0) AS wins,
+    COUNT(*) FILTER (WHERE status = 'CLOSED' AND pnl_usdt < 0) AS losses,
+    ROUND(AVG(pnl_r) FILTER (WHERE status = 'CLOSED'), 4) AS avg_r,
+    ROUND(AVG(pnl_usdt) FILTER (WHERE status = 'CLOSED'), 2) AS avg_pnl_usdt,
+    ROUND(SUM(pnl_usdt) FILTER (WHERE status = 'CLOSED'), 2) AS total_pnl_usdt,
+    ROUND(AVG(pnl_percent) FILTER (WHERE status = 'CLOSED'), 2) AS avg_pnl_pct,
+    ROUND(AVG(duration_sec) FILTER (WHERE status = 'CLOSED'), 1) AS avg_duration_sec,
     ROUND(
-        COUNT(*) FILTER (WHERE pnl_usdt > 0)::numeric
+        COUNT(*) FILTER (WHERE status = 'CLOSED' AND pnl_usdt > 0)::numeric
         / NULLIF(COUNT(*) FILTER (WHERE status = 'CLOSED'), 0),
         4
     ) AS win_rate,
     ROUND(
-        SUM(GREATEST(pnl_usdt, 0))
-        / NULLIF(ABS(SUM(LEAST(pnl_usdt, 0))), 0),
+        SUM(GREATEST(pnl_usdt, 0)) FILTER (WHERE status = 'CLOSED')
+        / NULLIF(
+            ABS(SUM(LEAST(pnl_usdt, 0)) FILTER (WHERE status = 'CLOSED')),
+            0
+        ),
         4
     ) AS profit_factor
 FROM dds.paper_trade

@@ -35,7 +35,8 @@ def candidate(**overrides):
 
 def test_filter_allows_no_history_combinations():
     f = ExpectancyFilter()
-    assert f.is_profitable("UNKNOWN_SCANNER", "LONG") is False
+    # LIVE mode: no history → blocked
+    assert f.is_profitable("UNKNOWN_SCANNER", "LONG", trading_mode="live") is False
     assert f.reason_for("UNKNOWN_SCANNER", "LONG") == "INSUFFICIENT_DATA(0)"
 
 
@@ -46,7 +47,8 @@ def test_filter_allows_insufficient_samples():
             samples=5, avg_r_after_costs=-0.5, win_rate=0.0,
         ),
     })
-    assert f.is_profitable("TREND_PULLBACK", "LONG") is False
+    # LIVE mode: insufficient samples → blocked
+    assert f.is_profitable("TREND_PULLBACK", "LONG", trading_mode="live") is False
     assert f.reason_for("TREND_PULLBACK", "LONG").startswith("INSUFFICIENT_DATA")
 
 
@@ -89,7 +91,7 @@ def test_filter_candidates_returns_accepted_and_rejected():
         candidate(scanner_name="BREAKOUT_RETEST", direction="SHORT"),
         candidate(scanner_name="VOLATILITY_COMPRESSION", direction="SHORT"),  # no history
     ]
-    accepted, rejected = filter_candidates(candidates, f)
+    accepted, rejected = filter_candidates(candidates, f, trading_mode="live")
     assert rejected == 3
     assert accepted == []
 
@@ -115,6 +117,7 @@ def test_orchestrator_applies_expectancy_filter():
             entry_zone_low=95, entry_zone_high=100,
             invalidation_price=90, target_1=110,
             reference_price=100,
+            score=50, reasons=("TEST",),
             features={"trend_alignment": True, "htf_context": True},
         )
         return SetupCandidate(**{**base.__dict__, **overrides})
@@ -168,7 +171,7 @@ def test_expectancy_requires_30_samples_pf_expectancy_and_net_pnl():
                 "TEST", "LONG", samples, avg_r, 0.5, pf, net,
             )
         })
-        return f.is_profitable("TEST", "LONG")
+        return f.is_profitable("TEST", "LONG", trading_mode="live")
 
     assert not allowed(samples=10)
     assert not allowed(samples=29)
@@ -176,3 +179,120 @@ def test_expectancy_requires_30_samples_pf_expectancy_and_net_pnl():
     assert not allowed(pf=1.19)
     assert not allowed(avg_r=0.0)
     assert not allowed(net=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Paper bootstrap tests
+# ---------------------------------------------------------------------------
+
+def test_paper_allows_insufficient_samples_bootstrap():
+    """Test 1: PAPER + closed < min_samples → allowed (bootstrap)."""
+    f = ExpectancyFilter(records={
+        ("TREND_PULLBACK", "LONG"): ExpectancyRecord(
+            scanner_name="TREND_PULLBACK", direction="LONG",
+            samples=10, avg_r_after_costs=0.0, win_rate=0.0,
+        ),
+    })
+    assert f.is_profitable("TREND_PULLBACK", "LONG", trading_mode="paper") is True
+
+    # filter_candidates should also accept the candidate
+    cands = [candidate()]
+    accepted, rejected = filter_candidates(
+        cands, f, min_samples=30, trading_mode="paper",
+    )
+    assert len(accepted) == 1
+    assert rejected == 0
+
+
+def test_live_blocks_insufficient_samples():
+    """Test 2: LIVE + closed < min_samples → blocked."""
+    f = ExpectancyFilter(records={
+        ("TREND_PULLBACK", "LONG"): ExpectancyRecord(
+            scanner_name="TREND_PULLBACK", direction="LONG",
+            samples=10, avg_r_after_costs=0.0, win_rate=0.0,
+        ),
+    })
+    assert f.is_profitable("TREND_PULLBACK", "LONG", trading_mode="live") is False
+
+    cands = [candidate()]
+    accepted, rejected = filter_candidates(
+        cands, f, min_samples=30, trading_mode="live",
+    )
+    assert len(accepted) == 0
+    assert rejected == 1
+
+
+def test_paper_manual_block_overrides_bootstrap():
+    """Test 3: PAPER + manual block → blocked regardless of samples."""
+    f = ExpectancyFilter(records={
+        ("TREND_PULLBACK", "LONG"): ExpectancyRecord(
+            scanner_name="TREND_PULLBACK", direction="LONG",
+            samples=5, avg_r_after_costs=0.5, win_rate=0.5,
+        ),
+    })
+    cands = [candidate()]
+    accepted, rejected = filter_candidates(
+        cands, f,
+        blocked_combinations=frozenset({("TREND_PULLBACK", "LONG")}),
+        trading_mode="paper",
+    )
+    assert len(accepted) == 0
+    assert rejected == 1
+
+
+def test_paper_blocks_bad_expectancy_after_min_samples():
+    """Test 4: PAPER + samples >= min + bad expectancy → blocked."""
+    f = ExpectancyFilter(records={
+        ("TREND_PULLBACK", "LONG"): ExpectancyRecord(
+            scanner_name="TREND_PULLBACK", direction="LONG",
+            samples=30, avg_r_after_costs=-0.2, win_rate=0.1,
+            profit_factor=1.3, net_pnl=1.0,
+        ),
+    })
+    # avg_r is below default min_avg_r (0.0), so should be rejected
+    assert f.is_profitable("TREND_PULLBACK", "LONG", trading_mode="paper") is False
+
+    cands = [candidate()]
+    accepted, rejected = filter_candidates(cands, f, trading_mode="paper")
+    assert len(accepted) == 0
+    assert rejected == 1
+
+
+def test_paper_allows_good_expectancy_after_min_samples():
+    """Test 5: PAPER + samples >= min + good expectancy → allowed."""
+    f = ExpectancyFilter(records={
+        ("TREND_PULLBACK", "LONG"): ExpectancyRecord(
+            scanner_name="TREND_PULLBACK", direction="LONG",
+            samples=35, avg_r_after_costs=0.3, win_rate=0.4,
+            profit_factor=1.5, net_pnl=5.0,
+        ),
+    })
+    assert f.is_profitable("TREND_PULLBACK", "LONG", trading_mode="paper") is True
+
+    cands = [candidate()]
+    accepted, rejected = filter_candidates(cands, f, trading_mode="paper")
+    assert len(accepted) == 1
+    assert rejected == 0
+
+
+def test_live_safety_gate_not_weakened_by_paper_bootstrap():
+    """Test 6: LIVE mode never benefits from paper bootstrap bypass."""
+    # Case A: insufficient samples → blocked in LIVE
+    f_empty = ExpectancyFilter()
+    assert f_empty.is_profitable("ANY", "LONG", trading_mode="live") is False
+
+    # Case B: bad expectancy → blocked in LIVE
+    f_bad = ExpectancyFilter(records={
+        ("TREND_PULLBACK", "LONG"): ExpectancyRecord(
+            scanner_name="TREND_PULLBACK", direction="LONG",
+            samples=50, avg_r_after_costs=-1.0, win_rate=0.1,
+            profit_factor=0.5, net_pnl=-50.0,
+        ),
+    })
+    assert f_bad.is_profitable("TREND_PULLBACK", "LONG", trading_mode="live") is False
+
+    # Case C: filter_candidates blocks in LIVE
+    cands = [candidate()]
+    accepted, rejected = filter_candidates(cands, f_bad, trading_mode="live")
+    assert len(accepted) == 0
+    assert rejected == 1

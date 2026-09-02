@@ -91,16 +91,41 @@ class Settings:
     expectancy_min_profit_factor: float = 1.20
     expectancy_min_net_pnl: float = 0.0
     # Explicitly paused scanner/direction combinations, regardless of sample size.
+    # This safety blocklist follows the 2026-09-01 paper-trading analysis.
+    # Blocked combinations remain observable through scanner outcomes, but are
+    # never persisted as tradeable setups or opened by paper_runner.
     blocked_scanner_directions: tuple[tuple[str, str], ...] = (
+        ("VOLATILITY_COMPRESSION", "LONG"),
         ("VOLATILITY_COMPRESSION", "SHORT"),
-        ("BREAKOUT_RETEST", "SHORT"),
+        ("SUPPORT_RESISTANCE_REACTION", "LONG"),
+        ("SUPPORT_RESISTANCE_REACTION", "SHORT"),
+        ("LIQUIDITY_REVERSAL", "SHORT"),
         ("BREAKOUT_RETEST", "LONG"),
+        ("BREAKOUT_RETEST", "SHORT"),
         ("MOMENTUM_EXHAUSTION", "LONG"),
+        ("TREND_PULLBACK", "LONG"),
+        ("TREND_PULLBACK", "SHORT"),
+    )
+    # Optional scanner/direction regime allow-lists. Unspecified scanners use
+    # the generic direction-conflict filter; an empty tuple blocks a direction.
+    scanner_regime_whitelist: dict[str, dict[str, tuple[str, ...]]] = field(
+        default_factory=lambda: {
+            "TREND_PULLBACK": {"LONG": ("TREND_UP",), "SHORT": ()},
+        }
     )
     # Live gate thresholds measured from persisted forward paper trading.
     paper_min_forward_days: int = 14
-    paper_min_closed_trades: int = 30
+    paper_min_closed_trades: int = 100
+    paper_min_avg_r: float = 0.0
+    paper_min_profit_factor: float = 1.0
     paper_max_drawdown: float = 0.10
+    # Legacy reporting threshold retained for backwards-compatible settings.
+    # Severe STOP_LOSS_GAP gating uses the execution-gap thresholds below.
+    paper_max_loss_r_per_trade: float = 1.2
+    # Halt only for an anomalous market move through the stop or for execution
+    # materially worse than the normal all-in stop fill.
+    paper_severe_stop_gap_r: float = 0.20
+    paper_severe_execution_extra_r: float = 0.15
     paper_funding_interval_hours: int = 8
     paper_emergency_stop_file: str = "data/PAPER_TRADING_STOP"
     # Paper trading scan interval in seconds (default 300 = 5 minutes).
@@ -111,6 +136,14 @@ class Settings:
     # When enabled, reject entries where direction conflicts with the
     # market regime (e.g. LONG in TREND_DOWN, SHORT in TREND_UP).
     regime_filter_enabled: bool = True
+    # Paper consecutive-loss cooldown: after max_consecutive_losses is
+    # reached, block new entries for this many minutes before allowing
+    # fresh entries again.  Set to 0 to keep the old hard-stop behavior.
+    paper_consecutive_loss_cooldown_minutes: int = 5
+    # Position monitor interval in seconds (default 10).
+    # Controls how often open positions are checked for SL/TP/trailing
+    # in the background thread.  Independent of paper_scan_interval.
+    position_monitor_interval: int = 10
 
 
 def _load_dotenv(path: Path) -> None:
@@ -162,6 +195,21 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
             ) from exc
     if "scanner_universe" in values and isinstance(values["scanner_universe"], dict):
         values["scanner_universe"] = ScannerUniverseSettings(**values["scanner_universe"])
+    if "scanner_regime_whitelist" in values:
+        try:
+            values["scanner_regime_whitelist"] = {
+                str(scanner_name).upper(): {
+                    str(direction).upper(): tuple(
+                        str(regime).upper() for regime in regimes
+                    )
+                    for direction, regimes in directions.items()
+                }
+                for scanner_name, directions in values["scanner_regime_whitelist"].items()
+            }
+        except (AttributeError, TypeError) as exc:
+            raise ValueError(
+                "scanner_regime_whitelist must map scanner names to direction/regime lists"
+            ) from exc
     settings = Settings(**values)
     if settings.category != "linear":
         raise ValueError("Price/OI strategy requires category=linear")
@@ -206,6 +254,16 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         raise ValueError("paper forward-test thresholds must be positive")
     if not 0 < settings.paper_max_drawdown < 1:
         raise ValueError("paper_max_drawdown must be in (0, 1)")
+    if settings.paper_min_avg_r < 0:
+        raise ValueError("paper_min_avg_r cannot be negative")
+    if settings.paper_min_profit_factor <= 0:
+        raise ValueError("paper_min_profit_factor must be positive")
+    if settings.paper_max_loss_r_per_trade < 1:
+        raise ValueError("paper_max_loss_r_per_trade must be at least 1")
+    if settings.paper_severe_stop_gap_r < 0:
+        raise ValueError("paper_severe_stop_gap_r cannot be negative")
+    if settings.paper_severe_execution_extra_r < 0:
+        raise ValueError("paper_severe_execution_extra_r cannot be negative")
     if settings.paper_funding_interval_hours <= 0:
         raise ValueError("paper_funding_interval_hours must be positive")
     if (settings.scanner_workers <= 0 or settings.scan_interval <= 0
@@ -215,4 +273,6 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         raise ValueError("paper_scan_interval must be positive")
     if settings.setup_ttl_multiplier <= 0:
         raise ValueError("setup_ttl_multiplier must be positive")
+    if settings.paper_consecutive_loss_cooldown_minutes < 0:
+        raise ValueError("paper_consecutive_loss_cooldown_minutes cannot be negative")
     return settings

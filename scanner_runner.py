@@ -25,17 +25,21 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 ENV_PATH = PROJECT_ROOT / ".env"
 LOG_DIR = PROJECT_ROOT / "logs"
-LOG_DIR.mkdir(exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_DIR / "scanner.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
 logger = logging.getLogger("scanner_runner")
+
+
+def setup_logging() -> None:
+    """Configure runner logging only when the executable is started."""
+    LOG_DIR.mkdir(exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_DIR / "scanner.log", encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+        force=True,
+    )
 
 SHUTDOWN = False
 
@@ -153,11 +157,14 @@ def run_scan_cycle(
                         min_samples=settings.expectancy_min_samples,
                         blocked_combinations=frozenset(settings.blocked_scanner_directions),
                         regime_filter=settings.regime_filter_enabled,
+                        scanner_regime_whitelist=settings.scanner_regime_whitelist,
+                        trading_mode=settings.trading_mode,
                     )
                 else:
                     candidates, symbol_stats = orchestrator.scan_all_with_stats(
                         ctx,
                         regime_filter=settings.regime_filter_enabled,
+                        scanner_regime_whitelist=settings.scanner_regime_whitelist,
                     )
                 for name, values in symbol_stats.items():
                     stat = run_stats[name]
@@ -201,6 +208,7 @@ def run_scan_cycle(
 
 
 def main() -> None:
+    setup_logging()
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
@@ -217,9 +225,8 @@ def main() -> None:
         password=settings.db_password,
         backend="postgres",
     )
-    repository.ensure_schema()
 
-    # Health-check: verify database connectivity before starting
+    # Verify DB connectivity (schema must be applied separately via schema.sql)
     if not repository.ping():
         logger.error("database health check failed")
         repository.close()
