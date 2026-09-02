@@ -15,16 +15,16 @@ class TrendPullbackScanner:
         self,
         pullback_tolerance: float = 0.01,
         rsi_cool_threshold: float = 55,
-        enabled_directions: tuple[str, ...] = ("LONG",),
-        allowed_regimes: tuple[str, ...] = ("TREND_UP",),
-        signal_timeframe: str = "15m",
+        enabled_directions: tuple[str, ...] = ("LONG", "SHORT"),
+        allowed_regimes: tuple[str, ...] = ("TREND_UP", "TREND_DOWN", "RANGE"),
+        signal_timeframe: str = "5m",
         max_pullback_quality: float | None = 0.75,
-        target_r: float = 0.75,
+        target_r: float | None = None,
         stop_buffer: float = 0.002,
     ) -> None:
         self.pullback_tolerance = pullback_tolerance
         self.rsi_cool_threshold = rsi_cool_threshold
-        self.enabled_directions = tuple(direction.upper() for direction in enabled_directions)
+        self.enabled_directions = enabled_directions
         self.allowed_regimes = allowed_regimes
         self.signal_timeframe = signal_timeframe
         self.max_pullback_quality = max_pullback_quality

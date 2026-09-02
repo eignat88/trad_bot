@@ -7,7 +7,7 @@ from app.models import Candle
 from app.scanners.models import SetupCandidate
 from app.scanners.risk_geometry import validate_risk_geometry
 
-OutcomeEvent = Literal["NO_ENTRY", "TP1", "TP2", "SL", "EXPIRED", "OPEN"]
+OutcomeEvent = Literal["NO_ENTRY", "TP1", "TP2", "SL", "EXPIRED", "EXPIRED_BE", "OPEN"]
 
 
 @dataclass(frozen=True)
@@ -124,10 +124,17 @@ def evaluate_setup_outcome(
         result_r = 0.0
         event = "NO_ENTRY"
     elif exit_price is None:
-        last_close = future[-1].close if future else entry
-        result_r = _price_to_r(candidate, last_close, entry, risk)
-        event = "EXPIRED"
-        exit_price = last_close
+        # Check if expire_at_breakeven is enabled via features
+        expire_at_breakeven = (candidate.features or {}).get("recommended_expiry_policy") == "BREAKEVEN"
+        if expire_at_breakeven:
+            result_r = 0.0
+            event = "EXPIRED_BE"
+            exit_price = entry
+        else:
+            last_close = future[-1].close if future else entry
+            result_r = _price_to_r(candidate, last_close, entry, risk)
+            event = "EXPIRED"
+            exit_price = last_close
         exit_index = len(future) if future else entry_index
     else:
         result_r = _price_to_r(candidate, exit_price, entry, risk)
