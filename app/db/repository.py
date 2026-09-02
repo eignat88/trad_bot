@@ -1467,6 +1467,7 @@ class ScannerRepository:
                 """,
                 (safety_gate_mode,),
             )
+            self._conn.commit()
 
         self._with_retry(_do, label="set_paper_safety_gate_mode")
 
