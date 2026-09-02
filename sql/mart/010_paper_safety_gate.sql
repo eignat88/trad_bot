@@ -1,5 +1,5 @@
 -- 010_paper_safety_gate.sql
--- Persisted Paper Bot safety observations and real durable-gate state.
+-- Persisted Paper Bot safety observations, effective gate status, and durable gate history.
 
 CREATE OR REPLACE VIEW mart.paper_safety_metrics AS
 WITH latest_snapshot AS (
@@ -47,14 +47,19 @@ SELECT
     gate.safety_gate_mode,
     gate.is_blocked, gate.reason AS gate_reason, gate.blocked_since AS gate_blocked_since,
     asig.active_count AS active_signals,
-    CASE WHEN gate.is_blocked THEN 'BLOCKED' ELSE 'OPEN' END AS gate_status
+    -- is_blocked is durable history; only enforce mode applies it to new entries.
+    -- NULL or unrecognised runtime modes therefore remain explicitly OPEN.
+    CASE
+        WHEN gate.safety_gate_mode = 'enforce' AND gate.is_blocked THEN 'BLOCKED'
+        ELSE 'OPEN'
+    END AS gate_status
 FROM latest_snapshot ls
 CROSS JOIN recent_events re
 CROSS JOIN active_signals asig
 CROSS JOIN safety_gate gate;
 
 COMMENT ON VIEW mart.paper_safety_metrics IS
-'Persisted 24-hour paper safety observations plus actual durable gate state.';
+'Persisted 24-hour paper safety observations, effective runtime gate status, and durable gate history.';
 
 -- Compatibility name used by existing dashboard queries.
 CREATE OR REPLACE VIEW mart.paper_safety_gate AS
