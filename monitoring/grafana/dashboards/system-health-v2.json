@@ -204,6 +204,7 @@
             { "id": "mappings", "value": [
               { "type": "value", "options": {
                 "BLOCKED": { "color": "red", "text": "BLOCKED" },
+                "OPEN": { "color": "green", "text": "OPEN" },
                 "TRADING": { "color": "green", "text": "TRADING" },
                 "OK": { "color": "green", "text": "OK" },
                 "NO_TRADES": { "color": "yellow", "text": "NO TRADES" }
@@ -218,10 +219,10 @@
       "gridPos": { "h": 6, "w": 24, "x": 0, "y": 22 },
       "id": 30,
       "options": { "showHeader": true, "footer": { "show": false } },
-      "title": "Paper Bot Safety Observations & Actual Gate",
+      "title": "Paper Bot Safety Observations & Effective Gate",
       "type": "table",
       "targets": [
-        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT safety_gate_mode AS \"Safety Mode\", gate_status AS \"Gate Status\", stop_gap_24h AS \"STOP_GAP 24h\", severe_stop_gap_24h AS \"Severe 24h\", would_block_24h AS \"Would Block 24h\", actual_blocks_24h AS \"Actual Blocks 24h\", max_gap_r_24h AS \"Worst Gap R\", last_severe_event_at AS \"Last Severe Event\", balance AS \"Balance\", equity AS \"Equity\", open_positions AS \"Open Positions\" FROM mart.paper_safety_metrics;", "format": "table", "refId": "A" }
+        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT safety_gate_mode AS \"Safety Mode\", effective_gate_status AS \"Gate\", durable_gate_status AS \"Durable Gate\", gate_reason AS \"Gate Reason\", stop_gap_24h AS \"STOP_GAP 24h\", severe_stop_gap_24h AS \"Severe 24h\", would_block_24h AS \"Would Block 24h\", actual_blocks_24h AS \"Actual Blocks 24h\", max_gap_r_24h AS \"Worst Gap R\", last_severe_event_at AS \"Last Severe Event\", balance AS \"Balance\", equity AS \"Equity\", open_positions AS \"Open Positions\" FROM mart.paper_safety_metrics;", "format": "table", "refId": "A" }
       ]
     },
     {

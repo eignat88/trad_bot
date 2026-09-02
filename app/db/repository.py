@@ -1433,6 +1433,28 @@ class ScannerRepository:
 
         return self._with_retry(_do, label="get_paper_safety_gate_state")
 
+    def upsert_paper_runtime_state(self, safety_gate_mode: str, runner_started_at: Any) -> None:
+        """Persist the active Paper Runner safety mode for monitoring consumers."""
+        if not self._use_pg:
+            return
+
+        def _do():
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO dds.paper_runtime_state (
+                    state_id, safety_gate_mode, runner_started_at, updated_at
+                ) VALUES (1, %s, %s, now())
+                ON CONFLICT (state_id) DO UPDATE SET
+                    safety_gate_mode = EXCLUDED.safety_gate_mode,
+                    runner_started_at = EXCLUDED.runner_started_at,
+                    updated_at = now()
+                """,
+                (safety_gate_mode, runner_started_at),
+            )
+
+        self._with_retry(_do, label="upsert_paper_runtime_state")
+
     def insert_paper_safety_event(self, event: Mapping[str, Any]) -> None:
         """Append a paper-safety observation, independently of gate enforcement."""
         if not self._use_pg:

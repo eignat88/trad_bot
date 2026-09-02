@@ -34,6 +34,14 @@ def test_paper_safety_gate_state_is_durable_singleton():
     assert "blocked_since TIMESTAMPTZ" in sql
 
 
+def test_paper_runtime_state_is_a_singleton_with_the_active_safety_mode():
+    sql = SCHEMA.read_text(encoding="utf-8")
+    assert "CREATE TABLE IF NOT EXISTS dds.paper_runtime_state" in sql
+    assert "state_id          SMALLINT PRIMARY KEY DEFAULT 1 CHECK (state_id = 1)" in sql
+    assert "safety_gate_mode  TEXT NOT NULL CHECK" in sql
+    assert "runner_started_at TIMESTAMPTZ NOT NULL" in sql
+
+
 def test_paper_safety_events_are_append_only_and_record_enforcement():
     sql = SCHEMA.read_text(encoding="utf-8")
     assert "CREATE TABLE IF NOT EXISTS dds.paper_safety_event" in sql

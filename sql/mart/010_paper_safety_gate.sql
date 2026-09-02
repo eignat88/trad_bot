@@ -1,5 +1,5 @@
 -- 010_paper_safety_gate.sql
--- Persisted Paper Bot safety observations and real durable-gate state.
+-- Persisted Paper Bot safety observations, durable-gate state, and effective policy.
 
 CREATE OR REPLACE VIEW mart.paper_safety_metrics AS
 WITH latest_snapshot AS (
@@ -23,12 +23,11 @@ recent_events AS (
     FROM dds.paper_safety_event
     WHERE event_at >= NOW() - INTERVAL '24 hours'
 ),
-last_event AS (
+runtime_state AS (
     SELECT COALESCE((
         SELECT safety_gate_mode
-        FROM dds.paper_safety_event
-        ORDER BY event_at DESC, event_id DESC
-        LIMIT 1
+        FROM dds.paper_runtime_state
+        WHERE state_id = 1
     ), 'enforce') AS safety_gate_mode
 ),
 active_signals AS (
@@ -48,18 +47,31 @@ SELECT
     re.avg_gap_r_24h, re.max_gap_r_24h,
     re.avg_excess_execution_r_24h, re.max_excess_execution_r_24h,
     re.last_stop_gap_at, re.last_severe_event_at,
-    COALESCE(le.safety_gate_mode, 'enforce') AS safety_gate_mode,
-    gate.is_blocked, gate.reason AS gate_reason, gate.blocked_since AS gate_blocked_since,
+    runtime.safety_gate_mode,
+    -- Preserve existing columns and their ordering for CREATE OR REPLACE VIEW.
+    gate.is_blocked,
+    gate.reason AS gate_reason,
+    gate.blocked_since AS gate_blocked_since,
     asig.active_count AS active_signals,
-    CASE WHEN gate.is_blocked THEN 'BLOCKED' ELSE 'OPEN' END AS gate_status
+    CASE
+        WHEN runtime.safety_gate_mode IN ('observe', 'disabled') THEN 'OPEN'
+        WHEN gate.is_blocked THEN 'BLOCKED'
+        ELSE 'OPEN'
+    END AS gate_status,
+    CASE WHEN gate.is_blocked THEN 'BLOCKED' ELSE 'OPEN' END AS durable_gate_status,
+    CASE
+        WHEN runtime.safety_gate_mode IN ('observe', 'disabled') THEN 'OPEN'
+        WHEN gate.is_blocked THEN 'BLOCKED'
+        ELSE 'OPEN'
+    END AS effective_gate_status
 FROM latest_snapshot ls
 CROSS JOIN recent_events re
-CROSS JOIN last_event le
+CROSS JOIN runtime_state runtime
 CROSS JOIN active_signals asig
 CROSS JOIN safety_gate gate;
 
 COMMENT ON VIEW mart.paper_safety_metrics IS
-'Persisted 24-hour paper safety observations plus actual durable gate state.';
+'Paper safety events, durable gate state, active runtime mode, and effective entry-gate status.';
 
 -- Compatibility name used by existing dashboard queries.
 CREATE OR REPLACE VIEW mart.paper_safety_gate AS

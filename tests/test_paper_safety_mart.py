@@ -12,6 +12,15 @@ def test_safety_mart_uses_persisted_safety_events_for_24h_metrics():
         assert metric in sql
 
 
+def test_safety_mart_uses_runtime_mode_for_effective_gate_status():
+    sql = MART.read_text(encoding="utf-8")
+    assert "FROM dds.paper_runtime_state" in sql
+    assert "durable_gate_status" in sql
+    assert "effective_gate_status" in sql
+    assert "runtime.safety_gate_mode IN ('observe', 'disabled')" in sql
+    assert "last_event AS" not in sql
+
+
 def test_safety_mart_exposes_scanner_and_recent_event_analytics():
     sql = MART.read_text(encoding="utf-8")
     assert "CREATE OR REPLACE VIEW mart.paper_safety_by_scanner AS" in sql

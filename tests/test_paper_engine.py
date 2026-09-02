@@ -14,6 +14,7 @@ class FakeRepository:
         self.saved = []
         self.closed = []
         self.safety_events = []
+        self.runtime_states = []
         self.risk_state = risk_state or {"daily_loss_usdt": 0.0, "consecutive_losses": 0}
         self.account_snapshot = account_snapshot
         self.safety_gate_state = safety_gate_state or {
@@ -28,6 +29,12 @@ class FakeRepository:
 
     def get_paper_safety_gate_state(self):
         return self.safety_gate_state
+
+    def upsert_paper_runtime_state(self, safety_gate_mode, runner_started_at):
+        self.runtime_states.append({
+            "safety_gate_mode": safety_gate_mode,
+            "runner_started_at": runner_started_at,
+        })
 
     def insert_paper_safety_event(self, event):
         self.safety_events.append(event)
@@ -146,6 +153,21 @@ def test_account_balance_and_drawdown_restore_from_snapshot():
 
     assert engine.balance == 1_125.0
     assert engine.snapshot()["max_drawdown_pct"] == 10.0
+
+
+def test_runner_start_persists_active_safety_gate_mode():
+    started_at = datetime(2026, 9, 2, tzinfo=timezone.utc)
+    repo = FakeRepository()
+    PaperTradingEngine(
+        Settings(paper_safety_gate_mode="observe"),
+        repo,
+        clock=lambda: started_at,
+    )
+
+    assert repo.runtime_states == [{
+        "safety_gate_mode": "observe",
+        "runner_started_at": started_at,
+    }]
 
 
 def test_trade_expiry_uses_the_setup_entry_timeframe():

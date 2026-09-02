@@ -666,6 +666,19 @@ CREATE TABLE IF NOT EXISTS dds.paper_safety_gate_state (
 );
 
 -- ============================================================
+-- PAPER_RUNTIME_STATE: current Paper Runner configuration
+-- ============================================================
+-- This singleton records the mode active in the currently running Paper Runner.
+-- It is intentionally independent from event history and the durable gate, so
+-- Grafana can display the effective entry policy before a new safety event occurs.
+CREATE TABLE IF NOT EXISTS dds.paper_runtime_state (
+    state_id          SMALLINT PRIMARY KEY DEFAULT 1 CHECK (state_id = 1),
+    safety_gate_mode  TEXT NOT NULL CHECK (safety_gate_mode IN ('enforce', 'observe', 'disabled')),
+    runner_started_at TIMESTAMPTZ NOT NULL,
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================
 -- PAPER_SAFETY_EVENT: append-only safety observation history
 -- ============================================================
 CREATE TABLE IF NOT EXISTS dds.paper_safety_event (

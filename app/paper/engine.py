@@ -114,6 +114,7 @@ class PaperTradingEngine:
         self._load_open_trades()
         self._load_risk_state()
         self._load_safety_gate_state()
+        self._persist_runtime_state()
 
     def portfolio_exposure(self, prices: dict[str, float] | None = None) -> dict[str, float]:
         """Return gross, directional and net exposure as fractions of MTM equity."""
@@ -947,6 +948,18 @@ class PaperTradingEngine:
                 "paper risk halt could not be persisted; keeping local gate blocked",
                 exc_info=True,
             )
+
+    def _persist_runtime_state(self) -> None:
+        """Publish the safety mode selected for this Paper Runner start."""
+        upsert_state = getattr(self.repo, "upsert_paper_runtime_state", None)
+        if upsert_state is None:
+            return
+        try:
+            upsert_state(self.settings.paper_safety_gate_mode, self._clock())
+        except Exception:
+            # Observability must not prevent the runner from safely restoring
+            # its durable enforcement state and managing open positions.
+            logger.exception("paper runtime state could not be persisted")
 
     def _load_account_state(self) -> None:
         """Restore balance and drawdown from the most recent account snapshot."""
