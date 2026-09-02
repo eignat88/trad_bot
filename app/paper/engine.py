@@ -110,10 +110,25 @@ class PaperTradingEngine:
         self._gate_reason: str | None = None
 
         # Restore account/risk state before rebuilding any open positions.
+        self._persist_safety_gate_mode()
         self._load_account_state()
         self._load_open_trades()
         self._load_risk_state()
         self._load_safety_gate_state()
+
+    def _persist_safety_gate_mode(self) -> None:
+        """Publish this Paper Engine's configured safety mode to durable state."""
+        save_mode = getattr(self.repo, "set_paper_safety_gate_mode", None)
+        if not callable(save_mode):
+            logger.warning(
+                "Paper safety gate mode was not persisted: repository lacks "
+                "set_paper_safety_gate_mode"
+            )
+            return
+
+        mode = self.settings.paper_safety_gate_mode
+        save_mode(mode)
+        logger.info("Persisted Paper safety gate runtime mode: %s", mode)
 
     def portfolio_exposure(self, prices: dict[str, float] | None = None) -> dict[str, float]:
         """Return gross, directional and net exposure as fractions of MTM equity."""

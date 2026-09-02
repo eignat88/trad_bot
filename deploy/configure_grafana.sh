@@ -61,14 +61,16 @@ END
 }
 echo "  grafana_reader user ready."
 
-# --- 2. Run SQL migrations ---
+# --- 2. Run SQL migrations and Grafana MART views ---
 echo ""
 echo "Step 2: Running SQL migrations..."
-for SQL_FILE in "$PROJ_ROOT"/sql/mart/*.sql; do
-    if [ -f "$SQL_FILE" ]; then
-        echo "  Applying: $(basename "$SQL_FILE")"
-        sudo -u postgres psql -d trad_bot -f "$SQL_FILE" 2>&1 | tail -1
-    fi
+for SQL_DIR in "$PROJ_ROOT"/sql/migrations "$PROJ_ROOT"/sql/mart; do
+    for SQL_FILE in "$SQL_DIR"/*.sql; do
+        if [ -f "$SQL_FILE" ]; then
+            echo "  Applying: $(basename "$SQL_FILE")"
+            sudo -u postgres psql -d trad_bot -f "$SQL_FILE" 2>&1 | tail -1
+        fi
+    done
 done
 echo "  SQL migrations complete."
 

@@ -2,6 +2,10 @@ from pathlib import Path
 
 
 SCHEMA = Path(__file__).parents[1] / "app" / "db" / "schema.sql"
+RUNTIME_MODE_MIGRATION = (
+    Path(__file__).parents[1] / "sql" / "migrations" / "003_paper_safety_gate_runtime_mode.sql"
+)
+GRAFANA_CONFIGURE = Path(__file__).parents[1] / "deploy" / "configure_grafana.sh"
 
 
 def test_paper_trade_setup_is_globally_unique():
@@ -31,7 +35,22 @@ def test_paper_safety_gate_state_is_durable_singleton():
     assert "CREATE TABLE IF NOT EXISTS dds.paper_safety_gate_state" in sql
     assert "gate_id       SMALLINT PRIMARY KEY DEFAULT 1 CHECK (gate_id = 1)" in sql
     assert "is_blocked    BOOLEAN NOT NULL DEFAULT FALSE" in sql
-    assert "blocked_since TIMESTAMPTZ" in sql
+    assert "blocked_since     TIMESTAMPTZ" in sql
+    assert "safety_gate_mode  TEXT" in sql
+
+
+def test_paper_safety_gate_runtime_mode_migration_is_safe_for_existing_databases():
+    sql = RUNTIME_MODE_MIGRATION.read_text(encoding="utf-8")
+
+    assert "ALTER TABLE dds.paper_safety_gate_state" in sql
+    assert "ADD COLUMN IF NOT EXISTS safety_gate_mode TEXT" in sql
+
+
+def test_grafana_deploy_applies_schema_migrations_before_mart_views():
+    script = GRAFANA_CONFIGURE.read_text(encoding="utf-8")
+
+    assert '"$PROJ_ROOT"/sql/migrations' in script
+    assert '"$PROJ_ROOT"/sql/mart' in script
 
 
 def test_paper_safety_events_are_append_only_and_record_enforcement():

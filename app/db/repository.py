@@ -1411,27 +1411,64 @@ class ScannerRepository:
     def get_paper_safety_gate_state(self) -> dict[str, bool | str | Any | None]:
         """Return the durable severe-execution entry-gate state."""
         if not self._use_pg:
-            return {"is_blocked": False, "reason": None, "blocked_since": None}
+            return {
+                "is_blocked": False,
+                "reason": None,
+                "blocked_since": None,
+                "safety_gate_mode": None,
+            }
 
         def _do():
             cursor = self._conn.cursor()
             cursor.execute(
                 """
-                SELECT is_blocked, reason, blocked_since
+                SELECT is_blocked, reason, blocked_since, safety_gate_mode
                 FROM dds.paper_safety_gate_state
                 WHERE gate_id = 1
                 """
             )
             row = cursor.fetchone()
             if row is None:
-                return {"is_blocked": False, "reason": None, "blocked_since": None}
+                return {
+                    "is_blocked": False,
+                    "reason": None,
+                    "blocked_since": None,
+                    "safety_gate_mode": None,
+                }
             return {
                 "is_blocked": bool(row[0]),
                 "reason": row[1],
                 "blocked_since": row[2],
+                "safety_gate_mode": row[3],
             }
 
         return self._with_retry(_do, label="get_paper_safety_gate_state")
+
+    def set_paper_safety_gate_mode(self, safety_gate_mode: str) -> None:
+        """Persist the runtime Paper Engine safety-mode configuration.
+
+        The gate row is a durable singleton.  Updating only this column keeps the
+        entry-block state independent from process configuration and avoids
+        creating a new row on every runner startup.
+        """
+        if not self._use_pg:
+            return
+
+        def _do():
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO dds.paper_safety_gate_state (
+                    gate_id, safety_gate_mode, updated_at
+                ) VALUES (1, %s, now())
+                ON CONFLICT (gate_id) DO UPDATE SET
+                    safety_gate_mode = EXCLUDED.safety_gate_mode,
+                    updated_at = now()
+                """,
+                (safety_gate_mode,),
+            )
+
+        self._with_retry(_do, label="set_paper_safety_gate_mode")
 
     def insert_paper_safety_event(self, event: Mapping[str, Any]) -> None:
         """Append a paper-safety observation, independently of gate enforcement."""

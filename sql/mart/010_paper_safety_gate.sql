@@ -23,19 +23,15 @@ recent_events AS (
     FROM dds.paper_safety_event
     WHERE event_at >= NOW() - INTERVAL '24 hours'
 ),
-last_event AS (
-    SELECT COALESCE((
-        SELECT safety_gate_mode
-        FROM dds.paper_safety_event
-        ORDER BY event_at DESC, event_id DESC
-        LIMIT 1
-    ), 'enforce') AS safety_gate_mode
-),
 active_signals AS (
     SELECT COUNT(*) AS active_count FROM dds.market_signal WHERE status = 'ACTIVE'
 ),
 safety_gate AS (
-    SELECT COALESCE(g.is_blocked, FALSE) AS is_blocked, g.reason, g.blocked_since
+    SELECT
+        COALESCE(g.is_blocked, FALSE) AS is_blocked,
+        g.reason,
+        g.blocked_since,
+        g.safety_gate_mode
     FROM (SELECT 1) singleton
     LEFT JOIN dds.paper_safety_gate_state g ON g.gate_id = 1
 )
@@ -48,13 +44,12 @@ SELECT
     re.avg_gap_r_24h, re.max_gap_r_24h,
     re.avg_excess_execution_r_24h, re.max_excess_execution_r_24h,
     re.last_stop_gap_at, re.last_severe_event_at,
-    COALESCE(le.safety_gate_mode, 'enforce') AS safety_gate_mode,
+    gate.safety_gate_mode,
     gate.is_blocked, gate.reason AS gate_reason, gate.blocked_since AS gate_blocked_since,
     asig.active_count AS active_signals,
     CASE WHEN gate.is_blocked THEN 'BLOCKED' ELSE 'OPEN' END AS gate_status
 FROM latest_snapshot ls
 CROSS JOIN recent_events re
-CROSS JOIN last_event le
 CROSS JOIN active_signals asig
 CROSS JOIN safety_gate gate;
 

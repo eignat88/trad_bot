@@ -179,9 +179,9 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         "bybit_api_secret": os.getenv("BYBIT_API_SECRET", ""),
         "telegram_token": os.getenv("TELEGRAM_TOKEN", ""),
         "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
-        "paper_safety_gate_mode": os.getenv(
+        "paper_safety_gate_mode": str(os.getenv(
             "PAPER_SAFETY_GATE_MODE", raw.get("paper_safety_gate_mode", "enforce")
-        ).lower(),
+        )).strip().lower(),
     }
     allowed = Settings.__dataclass_fields__.keys()
     values = {k: v for k, v in raw.items() if k in allowed}
