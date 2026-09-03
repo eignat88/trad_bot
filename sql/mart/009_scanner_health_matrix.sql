@@ -47,26 +47,48 @@ ORDER BY scanner_name;
 COMMENT ON VIEW mart.scanner_health_matrix IS 'Per-scanner health from latest run: status, coverage, errors, duration.';
 
 -- =============================================
--- 2. scanner_direction_status — Direction Panel
+-- 2. scanner_direction_availability — Direction Gate Panel
 -- =============================================
+CREATE OR REPLACE VIEW mart.scanner_direction_availability AS
+WITH current_regime AS (
+    SELECT market_regime
+    FROM dds.scanner_setup
+    WHERE market_regime IS NOT NULL
+    ORDER BY detected_at DESC
+    LIMIT 1
+)
+SELECT
+    gate.scanner_name,
+    gate.direction,
+    gate.status,
+    gate.allowed_regimes,
+    gate.reason,
+    gate.source,
+    gate.updated_at,
+    current_regime.market_regime AS current_market_regime,
+    CASE
+        WHEN gate.status = 'REGIME'
+             AND current_regime.market_regime = ANY(gate.allowed_regimes) THEN 'ENABLED'
+        WHEN gate.status = 'REGIME' THEN 'BLOCKED_BY_REGIME'
+        ELSE gate.status
+    END AS effective_status
+FROM config.scanner_direction_gate gate
+LEFT JOIN current_regime ON TRUE
+ORDER BY gate.scanner_name, gate.direction;
+
 CREATE OR REPLACE VIEW mart.scanner_direction_status AS
 SELECT
     scanner_name,
-    MAX(CASE
-        WHEN direction = 'LONG' AND enabled THEN 'ENABLED'
-        WHEN direction = 'LONG' AND block_reason = 'regime_filter' THEN 'REGIME'
-        WHEN direction = 'LONG' THEN 'BLOCKED'
-    END) AS long_status,
-    MAX(CASE
-        WHEN direction = 'SHORT' AND enabled THEN 'ENABLED'
-        WHEN direction = 'SHORT' AND block_reason = 'regime_filter' THEN 'REGIME'
-        WHEN direction = 'SHORT' THEN 'BLOCKED'
-    END) AS short_status
-FROM dds.scanner_direction_config
+    MAX(status) FILTER (WHERE direction = 'LONG') AS long_status,
+    MAX(reason) FILTER (WHERE direction = 'LONG') AS long_reason,
+    MAX(status) FILTER (WHERE direction = 'SHORT') AS short_status,
+    MAX(reason) FILTER (WHERE direction = 'SHORT') AS short_reason
+FROM mart.scanner_direction_availability
 GROUP BY scanner_name
 ORDER BY scanner_name;
 
-COMMENT ON VIEW mart.scanner_direction_status IS 'Per-scanner direction availability: ENABLED/BLOCKED/REGIME.';
+COMMENT ON VIEW mart.scanner_direction_availability IS
+    'Runtime scanner/direction gate, source, reason, and effective status.';
 
 -- =============================================
 -- 3. scanner_candidates_pipeline — Pipeline

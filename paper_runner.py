@@ -30,7 +30,9 @@ from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
 from app.paper.engine import PaperTradingEngine
 from app.paper.position_monitor import PositionMonitor
+from app.scanners.direction_gate import ScannerDirectionGatePolicy
 from app.scanners.expectancy_filter import ExpectancyFilter, filter_candidates, load_expectancy
+from app.scanners.orchestrator import ScannerOrchestrator
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_ROOT / "config.yaml"
@@ -170,6 +172,28 @@ def run_entry_cycle(
             )
             for s in ready_setups
         ]
+
+        # Re-check at entry time: an operator gate update is applied on the
+        # next paper cycle even to setups that were READY before the update.
+        gate_policy = ScannerDirectionGatePolicy.load_for_cycle(
+            repo,
+            scanner_names=ScannerOrchestrator().scanners.keys(),
+            blocked_combinations=settings.blocked_scanner_directions,
+            regime_whitelist=settings.scanner_regime_whitelist,
+        )
+        gated_candidates = []
+        for candidate in candidates:
+            decision = gate_policy.evaluate(
+                candidate.scanner_name, candidate.direction, candidate.market_regime
+            )
+            if decision.allowed:
+                gated_candidates.append(candidate)
+            else:
+                logger.info(
+                    "paper entry direction gate rejected: setup=%s scanner=%s direction=%s reason_code=%s",
+                    candidate.setup_id, candidate.scanner_name, candidate.direction, decision.reason_code,
+                )
+        candidates = gated_candidates
 
         if expectancy_filter is not None:
             candidates, rejected = filter_candidates(
