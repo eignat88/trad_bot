@@ -9,6 +9,7 @@ from typing import Any, Callable, Iterable, Literal, Mapping, TypeVar
 from uuid import UUID
 
 from app.paper.exit_reasons import PAPER_TRADE_EXIT_REASONS, PaperTradeExitReason
+from app.scanners.direction_gate import ScannerDirectionGate
 from app.scanners.models import SetupCandidate, SetupState
 from app.scanners.outcome import SignalOutcome
 from app.storage.safe_jsonl import atomic_rewrite, file_lock, read_records
@@ -459,6 +460,46 @@ class ScannerRepository:
     # ----------------------------------------------------------------
     # SCANNER DIRECTION CONFIGURATION
     # ----------------------------------------------------------------
+    def get_scanner_direction_gates(self) -> list[ScannerDirectionGate]:
+        """Load the complete runtime gate snapshot once for a processing cycle.
+
+        The caller deliberately owns fallback selection: a DB failure must not
+        silently turn into an allow-all policy.
+        """
+        if not self._use_pg:
+            raise RuntimeError("scanner direction gates require PostgreSQL")
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT scanner_name, direction, status, allowed_regimes, reason "
+                "FROM config.scanner_direction_gate"
+            )
+            return [
+                ScannerDirectionGate(
+                    scanner_name=str(row[0]).upper(),
+                    direction=str(row[1]).upper(),
+                    status=str(row[2]).upper(),
+                    allowed_regimes=tuple(str(item).upper() for item in (row[3] or ())),
+                    reason=row[4],
+                )
+                for row in cursor.fetchall()
+            ]
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            raise
+
+    def get_scanner_direction_gate(
+        self, scanner_name: str, direction: str
+    ) -> ScannerDirectionGate | None:
+        """Return one gate for administrative or diagnostic callers."""
+        for gate in self.get_scanner_direction_gates():
+            if (gate.scanner_name, gate.direction) == (scanner_name.upper(), direction.upper()):
+                return gate
+        return None
+
     def sync_scanner_direction_config(
         self,
         *,

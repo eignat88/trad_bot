@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from app.scanners.breakout_retest import BreakoutRetestScanner
 from app.scanners.deduplication import DeduplicationEngine
+from app.scanners.direction_gate import ScannerDirectionGatePolicy
 from app.scanners.liquidity_reversal import LiquidityReversalScanner
 from app.scanners.liquidity_sweep_choch import LiquiditySweepCHOCHScanner
 from app.scanners.models import MarketContext, SetupCandidate
@@ -72,12 +73,14 @@ class ScannerOrchestrator:
         min_avg_r: float = 0.0,
         min_samples: int = 10,
         blocked_combinations: frozenset[tuple[str, str]] = frozenset(),
+        gate_policy: ScannerDirectionGatePolicy | None = None,
         regime_filter: bool = False,
         scanner_regime_whitelist: dict[str, dict[str, tuple[str, ...]]] | None = None,
         trading_mode: str = "paper",
     ) -> list[SetupCandidate]:
         candidates, _ = self.scan_all_with_stats(
             ctx, expectancy_filter, min_avg_r, min_samples, blocked_combinations,
+            gate_policy=gate_policy,
             regime_filter=regime_filter,
             scanner_regime_whitelist=scanner_regime_whitelist,
             trading_mode=trading_mode,
@@ -91,6 +94,7 @@ class ScannerOrchestrator:
         min_avg_r: float = 0.0,
         min_samples: int = 10,
         blocked_combinations: frozenset[tuple[str, str]] = frozenset(),
+        gate_policy: ScannerDirectionGatePolicy | None = None,
         regime_filter: bool = False,
         scanner_regime_whitelist: dict[str, dict[str, tuple[str, ...]]] | None = None,
         trading_mode: str = "paper",
@@ -149,7 +153,28 @@ class ScannerOrchestrator:
             if c.score >= 30:
                 valid.append(c)
 
-        # Expectancy filter: drop scanner/direction combos with negative historical R
+        # Direction gates are independent of expectancy.  Candidates were still
+        # generated/scored above, so blocked strategies remain observable.
+        if gate_policy is not None:
+            gate_accepted: list[SetupCandidate] = []
+            for candidate in valid:
+                decision = gate_policy.evaluate(
+                    candidate.scanner_name, candidate.direction, candidate.market_regime or ctx.market_regime
+                )
+                if decision.allowed:
+                    gate_accepted.append(candidate)
+                else:
+                    logger.info(
+                        "direction gate rejected: symbol=%s scanner=%s direction=%s "
+                        "reason_code=%s gate_status=%s gate_reason=%s allowed_regimes=%s market_regime=%s",
+                        candidate.symbol, candidate.scanner_name, candidate.direction,
+                        decision.reason_code, decision.status, decision.reason,
+                        decision.allowed_regimes, candidate.market_regime or ctx.market_regime,
+                    )
+            valid = gate_accepted
+
+        # Expectancy filter: drop scanner/direction combos with negative historical R.
+        # Static manual blocks are handled by the gate policy above.
         expectancy_rejected = 0
         if expectancy_filter is not None:
             valid, expectancy_rejected = filter_candidates(
