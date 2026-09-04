@@ -19,6 +19,7 @@ from app.scanners.risk_geometry import validate_risk_geometry
 from app.scanners.scoring import score_candidate
 from app.scanners.support_resistance import SupportResistanceScanner
 from app.scanners.trend_pullback_v2 import TrendPullbackScannerV2
+from app.scanners.trend_pullback_v3 import TrendPullbackScannerV3
 from app.scanners.volatility_compression import VolatilityCompressionScanner
 
 if TYPE_CHECKING:
@@ -50,6 +51,7 @@ class ScannerOrchestrator:
             "BREAKOUT_RETEST": BreakoutRetestScanner(),
             "LIQUIDITY_REVERSAL": LiquidityReversalScanner(),
             "TREND_PULLBACK_V2": TrendPullbackScannerV2(),
+            "TREND_PULLBACK_V3": TrendPullbackScannerV3(),
             "VOLATILITY_COMPRESSION": VolatilityCompressionScanner(),
             "SUPPORT_RESISTANCE_REACTION": SupportResistanceScanner(),
             "MOMENTUM_EXHAUSTION": MomentumExhaustionScanner(),

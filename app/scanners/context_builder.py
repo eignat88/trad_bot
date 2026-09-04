@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from app.config import Settings
 from app.exchange.bybit_client import BybitClient
-from app.indicators import atr_wilder, bollinger_bands, ema, rsi_wilder, simple_ma, volume_ratio
+from app.indicators import adx, atr_wilder, bollinger_bands, ema, ema_slope, rsi_wilder, simple_ma, volume_ratio
 from app.models import Candle
 from app.scanners.models import IndicatorSnapshot, MarketContext, MarketLevels
 
@@ -22,10 +22,13 @@ def _build_indicators(candles: list[Candle]) -> IndicatorSnapshot:
     if len(closes) >= 20:
         bb_upper, bb_mid, bb_lower = bollinger_bands(closes, 20)
     bb_width = (bb_upper - bb_lower) / bb_mid if bb_mid > 0 else 0
+    adx_val = adx(candles, 14) if len(candles) > 15 else 0.0
+    ema50_slope_val = ema_slope(closes, 50, lookback=5) if len(closes) >= 55 else 0.0
     return IndicatorSnapshot(
         atr=atr_val, rsi=rsi_val, ema20=ema20_val, ema50=ema50_val,
         ema200=ema200_val, bb_upper=bb_upper, bb_lower=bb_lower,
         bb_width=bb_width, volume_sma=vol_sma,
+        adx=adx_val, ema50_slope=ema50_slope_val,
     )
 
 
