@@ -259,6 +259,18 @@ def main() -> None:
     repository.abort_stale_runs()
 
     orchestrator = ScannerOrchestrator(repository=repository)
+
+    # Sync scanner direction config to dds.scanner_direction_config
+    try:
+        synced = repository.sync_scanner_direction_config(
+            registered_scanners=list(orchestrator.scanners.keys()),
+            blocked_combinations=frozenset(settings.blocked_scanner_directions),
+            regime_whitelist=settings.scanner_regime_whitelist,
+        )
+        logger.info("scanner direction config synced: %d rows", synced)
+    except Exception:
+        logger.exception("scanner direction config sync failed — continuing with existing config")
+
     # Load expectancy filter if enabled
     expectancy_filter = None
     if settings.expectancy_filter_enabled:
