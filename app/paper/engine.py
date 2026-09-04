@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # Actual timeout = base * setup_ttl_multiplier (default 2.0).
 _ENTRY_TIMEOUT_BASE = {
     "5m": 12,   # 1 hour base → 2 hours at 2x
-    "15m": 8,   # 2 hours base → 4 hours at 2x
+    "15m": 16,  # 4 hours base → 8 hours at 2x  [FR-2: optimization]
     "1h": 6,    # 6 hours base → 12 hours at 2x
     "4h": 4,    # 16 hours base → 32 hours at 2x
 }
@@ -738,7 +738,7 @@ class PaperTradingEngine:
             return c.invalidation_price > price
 
     def _check_trailing_stop(self, trade: PaperTradeRecord, price: float) -> PaperTradeRecord | None:
-        """Move stop to breakeven after 1R, then trail at ATR distance."""
+        """After 1R: lock +0.5R profit. After 1.5R: trail at ATR distance. [FR-3]"""
         is_long = trade.direction == "LONG"
         risk_distance = abs(trade.entry_price - trade.stop_price)
         if risk_distance <= 0:
@@ -749,12 +749,14 @@ class PaperTradingEngine:
         else:
             favorable = trade.entry_price - price
 
-        # After 1R of favorable move → move stop to breakeven
+        # After 1R of favorable move → lock +0.5R (not breakeven) [FR-3]
         if favorable >= risk_distance:
-            new_stop = trade.entry_price
+            lock_profit_r = 0.5  # фиксируем +0.5R
             if is_long:
+                new_stop = trade.entry_price + lock_profit_r * risk_distance
                 trade.stop_price = max(trade.stop_price, new_stop)
             else:
+                new_stop = trade.entry_price - lock_profit_r * risk_distance
                 trade.stop_price = min(trade.stop_price, new_stop)
 
         # After 1.5R → trail at atr_stop_multiple * ATR from high/low

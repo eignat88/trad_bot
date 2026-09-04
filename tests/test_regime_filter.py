@@ -187,7 +187,7 @@ class TestTTLMultiplier:
     def test_default_base_timeout_values(self):
         """Base timeout values should match the documented defaults."""
         assert _ENTRY_TIMEOUT_BASE["5m"] == 12
-        assert _ENTRY_TIMEOUT_BASE["15m"] == 8
+        assert _ENTRY_TIMEOUT_BASE["15m"] == 16  # FR-2: 4h base → 8h at 2x
         assert _ENTRY_TIMEOUT_BASE["1h"] == 6
         assert _ENTRY_TIMEOUT_BASE["4h"] == 4
 
