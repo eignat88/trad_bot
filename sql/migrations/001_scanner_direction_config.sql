@@ -17,14 +17,17 @@ COMMENT ON TABLE  dds.scanner_direction_config IS 'Справочник блок
 COMMENT ON COLUMN dds.scanner_direction_config.block_reason IS 'config_block | regime_filter | expectancy_filter';
 
 -- Seed data из текущего config.yaml:
--- BREAKOUT_RETEST:      LONG=BLOCKED, SHORT=BLOCKED
--- MOMENTUM_EXHAUSTION:  LONG=BLOCKED
--- TREND_PULLBACK:       SHORT=BLOCKED (regime whitelist: LONG только в TREND_UP)
--- VOLATILITY_COMPRESSION: SHORT=BLOCKED
+-- BREAKOUT_RETEST:         LONG=BLOCKED, SHORT=BLOCKED
+-- MOMENTUM_EXHAUSTION:     LONG=BLOCKED
+-- MOMENTUM_EXHAUSTION_R:   (all enabled — new reversed scanner)
+-- TREND_PULLBACK:          SHORT=BLOCKED (regime whitelist: LONG только в TREND_UP)
+-- VOLATILITY_COMPRESSION:  SHORT=BLOCKED
 INSERT INTO dds.scanner_direction_config (scanner_name, direction, enabled, block_reason) VALUES
     ('BREAKOUT_RETEST',           'LONG',  FALSE, 'config_block'),
     ('BREAKOUT_RETEST',           'SHORT', FALSE, 'config_block'),
     ('MOMENTUM_EXHAUSTION',       'LONG',  FALSE, 'config_block'),
+    ('MOMENTUM_EXHAUSTION_R',     'LONG',  TRUE,  NULL),
+    ('MOMENTUM_EXHAUSTION_R',     'SHORT', TRUE,  NULL),
     ('TREND_PULLBACK',            'SHORT', FALSE, 'regime_filter'),
     ('VOLATILITY_COMPRESSION',    'SHORT', FALSE, 'config_block')
 ON CONFLICT (scanner_name, direction) DO NOTHING;

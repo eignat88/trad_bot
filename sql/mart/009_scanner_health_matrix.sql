@@ -53,14 +53,14 @@ CREATE OR REPLACE VIEW mart.scanner_direction_status AS
 SELECT
     scanners.scanner_name,
     CASE
-        WHEN sdc_long.scanner_name IS NULL     THEN 'ENABLED'   -- нет записи = не заблокирован
-        WHEN sdc_long.enabled                   THEN 'ENABLED'
+        WHEN sdc_long.scanner_name IS NULL          THEN 'CONFIG_MISSING'  -- fail-closed: no config row
+        WHEN sdc_long.enabled                        THEN 'ENABLED'
         WHEN sdc_long.block_reason = 'regime_filter' THEN 'REGIME'
         ELSE 'BLOCKED'
     END AS long_status,
     CASE
-        WHEN sdc_short.scanner_name IS NULL    THEN 'ENABLED'   -- нет записи = не заблокирован
-        WHEN sdc_short.enabled                  THEN 'ENABLED'
+        WHEN sdc_short.scanner_name IS NULL          THEN 'CONFIG_MISSING'  -- fail-closed: no config row
+        WHEN sdc_short.enabled                       THEN 'ENABLED'
         WHEN sdc_short.block_reason = 'regime_filter' THEN 'REGIME'
         ELSE 'BLOCKED'
     END AS short_status
