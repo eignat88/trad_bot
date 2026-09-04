@@ -590,6 +590,112 @@ class ScannerRepository:
                 )
         return counts
 
+    def sync_scanner_direction_gate(
+        self,
+        *,
+        registered_scanners: list[str],
+        blocked_combinations: frozenset[tuple[str, str]],
+        regime_whitelist: dict[str, dict[str, tuple[str, ...]]] | None = None,
+    ) -> dict[str, int]:
+        """Synchronise config.scanner_direction_gate from runtime state.
+
+        ``config.yaml`` is the sole source of this snapshot.  For every
+        registered scanner × (LONG, SHORT), ensures a row exists:
+        - If the combination is in *blocked_combinations* → status='BLOCKED'
+        - If the combination is in *regime_whitelist* → status='REGIME'
+        - Otherwise → status='ENABLED'
+
+        Rows with source='MANUAL' are never overwritten (operator edits
+        survive service restarts).  Rows with source='CONFIG' are updated
+        when the corresponding config.yaml entry changes.  Rows for scanners
+        no longer in *registered_scanners* are left untouched (historical
+        auditing).
+
+        Returns a counts dict with scanners, combinations, blocked, regime,
+        enabled, and preserved keys.
+        """
+        if not self._use_pg:
+            return {"scanners": 0, "combinations": 0, "blocked": 0,
+                    "regime": 0, "enabled": 0, "preserved": 0}
+
+        whitelist = regime_whitelist or {}
+        blocked = {(s.upper(), d.upper()) for s, d in blocked_combinations}
+        counts = {"scanners": 0, "combinations": 0, "blocked": 0,
+                  "regime": 0, "enabled": 0, "preserved": 0}
+
+        # Build snapshot of what config.yaml says.
+        snapshot: dict[tuple[str, str], tuple[str, list[str] | None]] = {}
+        scanners = sorted({s.upper() for s in registered_scanners})
+        counts["scanners"] = len(scanners)
+        for scanner_name in scanners:
+            for direction in ("LONG", "SHORT"):
+                key = (scanner_name, direction)
+                if key in blocked:
+                    snapshot[key] = ("BLOCKED", None)
+                    counts["blocked"] += 1
+                elif direction in whitelist.get(scanner_name, {}):
+                    snapshot[key] = ("REGIME", list(whitelist[scanner_name][direction]))
+                    counts["regime"] += 1
+                else:
+                    snapshot[key] = ("ENABLED", None)
+                    counts["enabled"] += 1
+        counts["combinations"] = len(snapshot)
+
+        def _do() -> None:
+            cursor = self._conn.cursor()
+            # Load existing rows to respect MANUAL source.
+            cursor.execute(
+                "SELECT scanner_name, direction, source "
+                "FROM config.scanner_direction_gate"
+            )
+            existing = {
+                (str(row[0]).upper(), str(row[1]).upper()): str(row[2]).upper()
+                for row in cursor.fetchall()
+            }
+
+            for key, (status, allowed_regimes) in snapshot.items():
+                scanner_name, direction = key
+                source = existing.get(key)
+                if source == "MANUAL":
+                    # Never overwrite operator edits.
+                    counts["preserved"] += 1
+                    logger.debug(
+                        "gate sync: preserving MANUAL %s %s", scanner_name, direction,
+                    )
+                    continue
+                cursor.execute(
+                    """
+                    INSERT INTO config.scanner_direction_gate
+                        (scanner_name, direction, status, allowed_regimes,
+                         reason, source, updated_at, updated_by)
+                    VALUES (%s, %s, %s, %s, %s, 'CONFIG', now(), 'sync')
+                    ON CONFLICT (scanner_name, direction) DO UPDATE SET
+                        status          = EXCLUDED.status,
+                        allowed_regimes = EXCLUDED.allowed_regimes,
+                        reason          = EXCLUDED.reason,
+                        source          = 'CONFIG',
+                        updated_at      = now(),
+                        updated_by      = 'sync'
+                    """,
+                    (
+                        scanner_name,
+                        direction,
+                        status,
+                        allowed_regimes,
+                        f"config.yaml sync ({status.lower()})",
+                    ),
+                )
+            self._conn.commit()
+
+        self._with_retry(_do, label="sync_scanner_direction_gate")
+        logger.info(
+            "scanner direction gate synchronized: scanners=%d combinations=%d "
+            "blocked=%d regime=%d enabled=%d preserved=%d",
+            counts["scanners"], counts["combinations"], counts["blocked"],
+            counts["regime"], counts["enabled"], counts["preserved"],
+        )
+        return counts
+
     # ----------------------------------------------------------------
     # SCANNER SETUP
     # ----------------------------------------------------------------

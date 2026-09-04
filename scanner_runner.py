@@ -259,6 +259,24 @@ def main() -> None:
     repository.abort_stale_runs()
 
     orchestrator = ScannerOrchestrator(repository=repository)
+
+    # Sync scanner direction gates to config.scanner_direction_gate (canonical source)
+    try:
+        gate_counts = repository.sync_scanner_direction_gate(
+            registered_scanners=list(orchestrator.scanners.keys()),
+            blocked_combinations=frozenset(settings.blocked_scanner_directions),
+            regime_whitelist=settings.scanner_regime_whitelist,
+        )
+        logger.info(
+            "scanner direction gate synced: %d scanners, %d combinations, "
+            "%d blocked, %d regime, %d enabled, %d preserved (MANUAL)",
+            gate_counts["scanners"], gate_counts["combinations"],
+            gate_counts["blocked"], gate_counts["regime"],
+            gate_counts["enabled"], gate_counts["preserved"],
+        )
+    except Exception:
+        logger.exception("scanner direction gate sync failed — continuing with existing gates")
+
     # Load expectancy filter if enabled
     expectancy_filter = None
     if settings.expectancy_filter_enabled:
