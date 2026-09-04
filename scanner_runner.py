@@ -18,6 +18,7 @@ from app.config import Settings, load_settings
 from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
 from app.scanners.context_builder import build_market_context
+from app.scanners.direction_gate import ScannerDirectionGatePolicy
 from app.scanners.expectancy_filter import ExpectancyFilter, load_expectancy
 from app.scanners.orchestrator import ScannerOrchestrator
 
@@ -125,6 +126,13 @@ def run_scan_cycle(
         return 0, 0, 0
 
     min_avg_r = settings.expectancy_min_avg_r if settings.expectancy_filter_enabled else 0.0
+    # One SELECT per scan cycle; DB errors retain Settings as a fail-safe policy.
+    gate_policy = ScannerDirectionGatePolicy.load_for_cycle(
+        repository,
+        scanner_names=orchestrator.scanners.keys(),
+        blocked_combinations=settings.blocked_scanner_directions,
+        regime_whitelist=settings.scanner_regime_whitelist,
+    )
     workers = min(settings.scanner_workers, len(symbols))
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="market-data") as executor:
@@ -155,7 +163,7 @@ def run_scan_cycle(
                         expectancy_filter=expectancy_filter,
                         min_avg_r=min_avg_r,
                         min_samples=settings.expectancy_min_samples,
-                        blocked_combinations=frozenset(settings.blocked_scanner_directions),
+                        gate_policy=gate_policy,
                         regime_filter=settings.regime_filter_enabled,
                         scanner_regime_whitelist=settings.scanner_regime_whitelist,
                         trading_mode=settings.trading_mode,
@@ -163,6 +171,7 @@ def run_scan_cycle(
                 else:
                     candidates, symbol_stats = orchestrator.scan_all_with_stats(
                         ctx,
+                        gate_policy=gate_policy,
                         regime_filter=settings.regime_filter_enabled,
                         scanner_regime_whitelist=settings.scanner_regime_whitelist,
                     )

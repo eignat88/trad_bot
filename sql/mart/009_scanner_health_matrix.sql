@@ -47,34 +47,70 @@ ORDER BY scanner_name;
 COMMENT ON VIEW mart.scanner_health_matrix IS 'Per-scanner health from latest run: status, coverage, errors, duration.';
 
 -- =============================================
--- 2. scanner_direction_status — Direction Panel
+-- 2. scanner_direction_availability — Direction Gate Panel
 -- =============================================
+CREATE OR REPLACE VIEW mart.scanner_direction_availability AS
+WITH current_regime AS (
+    SELECT market_regime
+    FROM dds.scanner_setup
+    WHERE market_regime IS NOT NULL
+    ORDER BY detected_at DESC
+    LIMIT 1
+)
+SELECT
+    gate.scanner_name,
+    gate.direction,
+    gate.status,
+    gate.allowed_regimes,
+    gate.reason,
+    gate.source,
+    gate.updated_at,
+    current_regime.market_regime AS current_market_regime,
+    CASE
+        WHEN gate.status = 'REGIME'
+             AND current_regime.market_regime = ANY(gate.allowed_regimes) THEN 'ENABLED'
+        WHEN gate.status = 'REGIME' THEN 'BLOCKED_BY_REGIME'
+        ELSE gate.status
+    END AS effective_status
+FROM config.scanner_direction_gate gate
+LEFT JOIN current_regime ON TRUE
+ORDER BY gate.scanner_name, gate.direction;
+
 CREATE OR REPLACE VIEW mart.scanner_direction_status AS
 SELECT
-    scanners.scanner_name,
+    COALESCE(avail.scanner_name, run_stats.scanner_name) AS scanner_name,
     CASE
-        WHEN sdc_long.scanner_name IS NULL          THEN 'CONFIG_MISSING'  -- fail-closed: no config row
-        WHEN sdc_long.enabled                        THEN 'ENABLED'
-        WHEN sdc_long.block_reason = 'regime_filter' THEN 'REGIME'
-        ELSE 'BLOCKED'
+        WHEN avail.scanner_name IS NULL                THEN 'CONFIG_MISSING'
+        WHEN avail_long.status IS NULL                 THEN 'CONFIG_MISSING'
+        WHEN avail_long.effective_status = 'ENABLED'   THEN 'ENABLED'
+        WHEN avail_long.effective_status = 'BLOCKED_BY_REGIME' THEN 'REGIME'
+        WHEN avail_long.status = 'BLOCKED'             THEN 'BLOCKED'
+        ELSE avail_long.effective_status
     END AS long_status,
     CASE
-        WHEN sdc_short.scanner_name IS NULL          THEN 'CONFIG_MISSING'  -- fail-closed: no config row
-        WHEN sdc_short.enabled                       THEN 'ENABLED'
-        WHEN sdc_short.block_reason = 'regime_filter' THEN 'REGIME'
-        ELSE 'BLOCKED'
+        WHEN avail.scanner_name IS NULL                THEN 'CONFIG_MISSING'
+        WHEN avail_short.status IS NULL                THEN 'CONFIG_MISSING'
+        WHEN avail_short.effective_status = 'ENABLED'  THEN 'ENABLED'
+        WHEN avail_short.effective_status = 'BLOCKED_BY_REGIME' THEN 'REGIME'
+        WHEN avail_short.status = 'BLOCKED'            THEN 'BLOCKED'
+        ELSE avail_short.effective_status
     END AS short_status
 FROM (
     SELECT DISTINCT scanner_name
     FROM dds.scanner_run_stat
-) scanners
-LEFT JOIN dds.scanner_direction_config sdc_long
-    ON sdc_long.scanner_name = scanners.scanner_name AND sdc_long.direction = 'LONG'
-LEFT JOIN dds.scanner_direction_config sdc_short
-    ON sdc_short.scanner_name = scanners.scanner_name AND sdc_short.direction = 'SHORT'
-ORDER BY scanners.scanner_name;
+) run_stats
+LEFT JOIN (
+    SELECT DISTINCT scanner_name
+    FROM mart.scanner_direction_availability
+) avail ON avail.scanner_name = run_stats.scanner_name
+LEFT JOIN mart.scanner_direction_availability avail_long
+    ON avail_long.scanner_name = run_stats.scanner_name AND avail_long.direction = 'LONG'
+LEFT JOIN mart.scanner_direction_availability avail_short
+    ON avail_short.scanner_name = run_stats.scanner_name AND avail_short.direction = 'SHORT'
+ORDER BY run_stats.scanner_name;
 
-COMMENT ON VIEW mart.scanner_direction_status IS 'Per-scanner direction availability: ENABLED/BLOCKED/REGIME.';
+COMMENT ON VIEW mart.scanner_direction_availability IS
+    'Runtime scanner/direction gate, source, reason, and effective status.';
 
 -- =============================================
 -- 3. scanner_candidates_pipeline — Pipeline

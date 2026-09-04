@@ -11,7 +11,7 @@ Tests verify:
 from __future__ import annotations
 
 import types
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -224,7 +224,22 @@ class TestPaperCycleResilience:
 
 
 # ---------------------------------------------------------------------------
-# Test 6 — schema not applied by both runners at startup
+# Test 6 — durable safety-gate runtime mode
+# ---------------------------------------------------------------------------
+
+class TestPaperSafetyGateModePersistence:
+    def test_set_paper_safety_gate_mode_commits_after_upsert(self):
+        repo = _make_pg_repo()
+
+        repo.set_paper_safety_gate_mode("observe")
+
+        assert repo._conn.mock_calls[-1] == call.commit()
+        repo._conn.cursor().execute.assert_called_once()
+        repo._conn.commit.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Test 7 — schema not applied by both runners at startup
 # ---------------------------------------------------------------------------
 
 class TestNoSchemaInStartupFlow:

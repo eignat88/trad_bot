@@ -5,10 +5,11 @@ import logging
 import time
 from datetime import datetime, timezone
 from functools import wraps
-from typing import Any, Callable, Literal, Mapping, TypeVar
+from typing import Any, Callable, Iterable, Literal, Mapping, TypeVar
 from uuid import UUID
 
 from app.paper.exit_reasons import PAPER_TRADE_EXIT_REASONS, PaperTradeExitReason
+from app.scanners.direction_gate import ScannerDirectionGate
 from app.scanners.models import SetupCandidate, SetupState
 from app.scanners.outcome import SignalOutcome
 from app.storage.safe_jsonl import atomic_rewrite, file_lock, read_records
@@ -455,6 +456,139 @@ class ScannerRepository:
             }
             for r in cursor.fetchall()
         ]
+
+    # ----------------------------------------------------------------
+    # SCANNER DIRECTION CONFIGURATION
+    # ----------------------------------------------------------------
+    def get_scanner_direction_gates(self) -> list[ScannerDirectionGate]:
+        """Load the complete runtime gate snapshot once for a processing cycle.
+
+        The caller deliberately owns fallback selection: a DB failure must not
+        silently turn into an allow-all policy.
+        """
+        if not self._use_pg:
+            raise RuntimeError("scanner direction gates require PostgreSQL")
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT scanner_name, direction, status, allowed_regimes, reason "
+                "FROM config.scanner_direction_gate"
+            )
+            return [
+                ScannerDirectionGate(
+                    scanner_name=str(row[0]).upper(),
+                    direction=str(row[1]).upper(),
+                    status=str(row[2]).upper(),
+                    allowed_regimes=tuple(str(item).upper() for item in (row[3] or ())),
+                    reason=row[4],
+                )
+                for row in cursor.fetchall()
+            ]
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            raise
+
+    def get_scanner_direction_gate(
+        self, scanner_name: str, direction: str
+    ) -> ScannerDirectionGate | None:
+        """Return one gate for administrative or diagnostic callers."""
+        for gate in self.get_scanner_direction_gates():
+            if (gate.scanner_name, gate.direction) == (scanner_name.upper(), direction.upper()):
+                return gate
+        return None
+
+    def sync_scanner_direction_config(
+        self,
+        *,
+        active_scanners: Iterable[str],
+        blocked_scanner_directions: Iterable[tuple[str, str]],
+        scanner_regime_whitelist: Mapping[str, Mapping[str, Iterable[str]]],
+    ) -> dict[str, int]:
+        """Persist the complete scanner×direction runtime configuration snapshot.
+
+        ``config.yaml`` is the sole source of this snapshot.  Explicit blocks
+        take precedence over regime allow-lists; all other active directions
+        are persisted as enabled.  The delete/insert transaction intentionally
+        removes renamed or no-longer-registered scanners as well.
+        """
+        if not self._use_pg:
+            raise RuntimeError(
+                "scanner direction config synchronization requires PostgreSQL"
+            )
+
+        scanners = sorted({str(name).upper() for name in active_scanners})
+        blocked = {
+            (str(scanner_name).upper(), str(direction).upper())
+            for scanner_name, direction in blocked_scanner_directions
+        }
+        whitelist = {
+            str(scanner_name).upper(): {
+                str(direction).upper(): tuple(str(regime).upper() for regime in regimes)
+                for direction, regimes in directions.items()
+            }
+            for scanner_name, directions in scanner_regime_whitelist.items()
+        }
+
+        snapshot: list[tuple[str, str, bool, str | None, list[str] | None]] = []
+        counts = {"scanners": len(scanners), "combinations": 0, "blocked": 0,
+                  "regime": 0, "enabled": 0}
+        for scanner_name in scanners:
+            for direction in ("LONG", "SHORT"):
+                key = (scanner_name, direction)
+                if key in blocked:
+                    row = (scanner_name, direction, False, "config_block", None)
+                    counts["blocked"] += 1
+                elif direction in whitelist.get(scanner_name, {}):
+                    row = (
+                        scanner_name, direction, False, "regime_filter",
+                        list(whitelist[scanner_name][direction]),
+                    )
+                    counts["regime"] += 1
+                else:
+                    row = (scanner_name, direction, True, None, None)
+                    counts["enabled"] += 1
+                snapshot.append(row)
+        counts["combinations"] = len(snapshot)
+
+        def _do_sync() -> None:
+            cursor = self._conn.cursor()
+            # One transaction makes the table an all-or-nothing runtime snapshot.
+            cursor.execute("DELETE FROM dds.scanner_direction_config")
+            for row in snapshot:
+                cursor.execute(
+                    """
+                    INSERT INTO dds.scanner_direction_config (
+                        scanner_name, direction, enabled, block_reason,
+                        regime_whitelist, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, now())
+                    """,
+                    row,
+                )
+            self._conn.commit()
+
+        self._with_retry(_do_sync, label="sync_scanner_direction_config")
+        logger.info(
+            "scanner direction config synchronized: scanners=%d combinations=%d "
+            "blocked=%d regime=%d enabled=%d",
+            counts["scanners"], counts["combinations"], counts["blocked"],
+            counts["regime"], counts["enabled"],
+        )
+        for scanner_name, direction, enabled, block_reason, regimes in snapshot:
+            if enabled:
+                continue
+            if block_reason == "regime_filter":
+                logger.debug(
+                    "scanner direction: %s %s -> REGIME %s",
+                    scanner_name, direction, regimes,
+                )
+            else:
+                logger.debug(
+                    "scanner direction: %s %s -> BLOCKED", scanner_name, direction,
+                )
+        return counts
 
     # ----------------------------------------------------------------
     # SCANNER SETUP
@@ -1467,6 +1601,7 @@ class ScannerRepository:
                 """,
                 (safety_gate_mode,),
             )
+            self._conn.commit()
 
         self._with_retry(_do, label="set_paper_safety_gate_mode")
 
