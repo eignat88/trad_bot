@@ -55,4 +55,5 @@ SELECT
     END                                             AS avg_loss_r
 FROM dds.paper_trade pt
 WHERE pt.status = 'CLOSED'
+  AND config.is_scanner_visible(pt.scanner_name)
 GROUP BY pt.scanner_name, pt.direction;

@@ -27,4 +27,5 @@ SELECT
 FROM dds.paper_trade pt
 WHERE pt.status = 'CLOSED'
   AND pt.closed_at IS NOT NULL
+  AND config.is_scanner_visible(pt.scanner_name)
 GROUP BY DATE(pt.closed_at), pt.scanner_name, pt.direction;

@@ -71,6 +71,7 @@ scanner_summary AS (
     FROM dds.scanner_run_stat srs
     JOIN dds.scanner_run sr ON sr.run_id = srs.run_id
     WHERE sr.run_id = (SELECT run_id FROM dds.scanner_run ORDER BY started_at DESC LIMIT 1)
+      AND config.is_scanner_visible(srs.scanner_name)
 )
 SELECT
     lr.last_scanner_run,

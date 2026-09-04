@@ -26,6 +26,7 @@ per_scanner AS (
         lr.symbols_total
     FROM dds.scanner_run_stat srs
     JOIN latest_run lr ON srs.run_id = (SELECT run_id FROM dds.scanner_run ORDER BY started_at DESC LIMIT 1)
+    WHERE config.is_scanner_visible(srs.scanner_name)
 )
 SELECT
     scanner_name,
@@ -74,6 +75,7 @@ SELECT
     END AS effective_status
 FROM config.scanner_direction_gate gate
 LEFT JOIN current_regime ON TRUE
+WHERE gate.show_in_grafana = TRUE
 ORDER BY gate.scanner_name, gate.direction;
 
 CREATE OR REPLACE VIEW mart.scanner_direction_status AS
@@ -98,6 +100,7 @@ SELECT
 FROM (
     SELECT DISTINCT scanner_name
     FROM dds.scanner_run_stat
+    WHERE config.is_scanner_visible(scanner_name)
 ) run_stats
 LEFT JOIN (
     SELECT DISTINCT scanner_name
@@ -135,6 +138,7 @@ SELECT
     END                                                    AS conversion_pct
 FROM dds.scanner_run_stat srs
 JOIN latest_run lr ON srs.run_id = lr.run_id
+WHERE config.is_scanner_visible(srs.scanner_name)
 ORDER BY srs.scanner_name;
 
 COMMENT ON VIEW mart.scanner_candidates_pipeline IS 'Candidates to Setups pipeline for latest run.';

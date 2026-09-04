@@ -74,10 +74,12 @@ SELECT
     ROUND(MAX(gap_r) FILTER (WHERE event_type = 'STOP_LOSS_GAP'), 4) AS max_gap_r,
     MAX(event_at) AS last_event_at
 FROM dds.paper_safety_event
+WHERE config.is_scanner_visible(scanner_name)
 GROUP BY scanner_name, symbol, direction;
 
 CREATE OR REPLACE VIEW mart.paper_safety_recent_events AS
 SELECT event_at, symbol, scanner_name, direction, event_type, severity,
        expected_stop_net_r, actual_net_r, gap_r, would_block, gate_blocked
 FROM dds.paper_safety_event
+WHERE config.is_scanner_visible(scanner_name)
 ORDER BY event_at DESC;
