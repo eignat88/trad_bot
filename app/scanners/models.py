@@ -41,6 +41,8 @@ class IndicatorSnapshot:
     bb_lower: float = 0.0
     bb_width: float = 0.0
     volume_sma: float = 0.0
+    adx: float = 0.0
+    ema50_slope: float = 0.0
 
 
 @dataclass(frozen=True)
