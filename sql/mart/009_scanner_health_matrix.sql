@@ -78,14 +78,36 @@ ORDER BY gate.scanner_name, gate.direction;
 
 CREATE OR REPLACE VIEW mart.scanner_direction_status AS
 SELECT
-    scanner_name,
-    MAX(status) FILTER (WHERE direction = 'LONG') AS long_status,
-    MAX(reason) FILTER (WHERE direction = 'LONG') AS long_reason,
-    MAX(status) FILTER (WHERE direction = 'SHORT') AS short_status,
-    MAX(reason) FILTER (WHERE direction = 'SHORT') AS short_reason
-FROM mart.scanner_direction_availability
-GROUP BY scanner_name
-ORDER BY scanner_name;
+    COALESCE(avail.scanner_name, run_stats.scanner_name) AS scanner_name,
+    CASE
+        WHEN avail.scanner_name IS NULL                THEN 'CONFIG_MISSING'
+        WHEN avail_long.status IS NULL                 THEN 'CONFIG_MISSING'
+        WHEN avail_long.effective_status = 'ENABLED'   THEN 'ENABLED'
+        WHEN avail_long.effective_status = 'BLOCKED_BY_REGIME' THEN 'REGIME'
+        WHEN avail_long.status = 'BLOCKED'             THEN 'BLOCKED'
+        ELSE avail_long.effective_status
+    END AS long_status,
+    CASE
+        WHEN avail.scanner_name IS NULL                THEN 'CONFIG_MISSING'
+        WHEN avail_short.status IS NULL                THEN 'CONFIG_MISSING'
+        WHEN avail_short.effective_status = 'ENABLED'  THEN 'ENABLED'
+        WHEN avail_short.effective_status = 'BLOCKED_BY_REGIME' THEN 'REGIME'
+        WHEN avail_short.status = 'BLOCKED'            THEN 'BLOCKED'
+        ELSE avail_short.effective_status
+    END AS short_status
+FROM (
+    SELECT DISTINCT scanner_name
+    FROM dds.scanner_run_stat
+) run_stats
+LEFT JOIN (
+    SELECT DISTINCT scanner_name
+    FROM mart.scanner_direction_availability
+) avail ON avail.scanner_name = run_stats.scanner_name
+LEFT JOIN mart.scanner_direction_availability avail_long
+    ON avail_long.scanner_name = run_stats.scanner_name AND avail_long.direction = 'LONG'
+LEFT JOIN mart.scanner_direction_availability avail_short
+    ON avail_short.scanner_name = run_stats.scanner_name AND avail_short.direction = 'SHORT'
+ORDER BY run_stats.scanner_name;
 
 COMMENT ON VIEW mart.scanner_direction_availability IS
     'Runtime scanner/direction gate, source, reason, and effective status.';

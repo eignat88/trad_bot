@@ -1810,6 +1810,71 @@ class ScannerRepository:
 
         self._with_retry(_do, label="save_paper_account_snapshot")
 
+    # ----------------------------------------------------------------
+    # SCANNER DIRECTION CONFIG SYNC
+    # ----------------------------------------------------------------
+    def sync_scanner_direction_config(
+        self,
+        registered_scanners: list[str],
+        blocked_combinations: frozenset[tuple[str, str]],
+        regime_whitelist: dict[str, dict[str, tuple[str, ...]]] | None = None,
+    ) -> int:
+        """Synchronise dds.scanner_direction_config from runtime state.
+
+        For every registered scanner × (LONG, SHORT), ensures a row exists:
+        - If the combination is in *blocked_combinations* → enabled=FALSE, block_reason='config_block'
+        - If the combination is in *regime_whitelist* → enabled=TRUE, block_reason='regime_filter'
+        - Otherwise → enabled=TRUE, block_reason=NULL
+
+        Rows for scanners no longer in *registered_scanners* are left untouched
+        (they remain visible for historical auditing).  Returns the total number
+        of rows upserted.
+        """
+        if not self._use_pg:
+            return 0
+
+        whitelist = regime_whitelist or {}
+        directions = ("LONG", "SHORT")
+        rows: list[tuple[str, str, bool, str | None, list[str] | None]] = []
+
+        for scanner_name in registered_scanners:
+            for direction in directions:
+                # Determine enabled / block_reason
+                if (scanner_name, direction) in blocked_combinations:
+                    enabled = False
+                    block_reason = "config_block"
+                    regimes: list[str] | None = None
+                elif direction in whitelist.get(scanner_name, {}):
+                    enabled = True
+                    block_reason = "regime_filter"
+                    regimes = list(whitelist[scanner_name][direction])
+                else:
+                    enabled = True
+                    block_reason = None
+                    regimes = None
+                rows.append((scanner_name, direction, enabled, block_reason, regimes))
+
+        def _do():
+            cursor = self._conn.cursor()
+            for scanner_name, direction, enabled, block_reason, regimes in rows:
+                cursor.execute(
+                    """
+                    INSERT INTO dds.scanner_direction_config
+                        (scanner_name, direction, enabled, block_reason, regime_whitelist, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, now())
+                    ON CONFLICT (scanner_name, direction) DO UPDATE SET
+                        enabled        = EXCLUDED.enabled,
+                        block_reason   = EXCLUDED.block_reason,
+                        regime_whitelist = EXCLUDED.regime_whitelist,
+                        updated_at     = now()
+                    """,
+                    (scanner_name, direction, enabled, block_reason, regimes),
+                )
+            self._conn.commit()
+            return len(rows)
+
+        return self._with_retry(_do, label="sync_scanner_direction_config")
+
     def close(self) -> None:
         if self._conn:
             self._conn.close()
