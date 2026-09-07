@@ -178,6 +178,36 @@ def _load_dotenv(path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
+_TRUE_VALUES: frozenset[str] = frozenset({"true", "1", "yes", "on"})
+_FALSE_VALUES: frozenset[str] = frozenset({"false", "0", "no", "off"})
+
+# Tracks where DCA enabled flag was sourced from (last load_settings call).
+_last_dca_source: str = "config"
+
+
+def get_dca_source() -> str:
+    """Return the source of the DCA enabled flag from the last load_settings call."""
+    return _last_dca_source
+
+
+def _parse_bool_env(value: str, env_name: str) -> bool:
+    """Parse a boolean environment variable.  Fail-fast on invalid values.
+
+    Accepted truthy: true, 1, yes, on (case-insensitive).
+    Accepted falsy:  false, 0, no, off (case-insensitive).
+    Anything else raises ValueError to prevent silent misconfiguration.
+    """
+    normalised = value.strip().lower()
+    if normalised in _TRUE_VALUES:
+        return True
+    if normalised in _FALSE_VALUES:
+        return False
+    raise ValueError(
+        f"Invalid {env_name}={value!r}. "
+        f"Expected one of: true/1/yes/on or false/0/no/off (case-insensitive)."
+    )
+
+
 def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env") -> Settings:
     _load_dotenv(Path(env_file))
     raw: dict[str, Any] = {}
@@ -236,11 +266,28 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
             ) from exc
     # DCA settings: load from nested "dca" key in config
     dca_raw = raw.get("dca", {})
+    dca_source = "config"
     if dca_raw and isinstance(dca_raw, dict):
         dca_allowed = DCASettings.__dataclass_fields__.keys()
         dca_values = {k: v for k, v in dca_raw.items() if k in dca_allowed}
+        # ENV override: DCA_ENABLED takes priority over config.yaml
+        dca_enabled_env = os.getenv("DCA_ENABLED")
+        if dca_enabled_env is not None:
+            dca_values["enabled"] = _parse_bool_env(dca_enabled_env, "DCA_ENABLED")
+            dca_source = "env"
         values["dca"] = DCASettings(**dca_values)
+    else:
+        # No DCA config in config.yaml — check env anyway
+        dca_enabled_env = os.getenv("DCA_ENABLED")
+        if dca_enabled_env is not None:
+            dca_values = {"enabled": _parse_bool_env(dca_enabled_env, "DCA_ENABLED")}
+            dca_source = "env"
+            values["dca"] = DCASettings(**dca_values)
     settings = Settings(**values)
+    # Expose the DCA config source via module-level variable.
+    # Used by paper_runner for startup logging.
+    global _last_dca_source
+    _last_dca_source = dca_source
     if settings.category != "linear":
         raise ValueError("Price/OI strategy requires category=linear")
     if settings.trading_mode not in {"paper", "live"}:
