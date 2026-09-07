@@ -1875,6 +1875,102 @@ class ScannerRepository:
 
         return self._with_retry(_do, label="sync_scanner_direction_config")
 
+    # ----------------------------------------------------------------
+    # DCA STATE PERSISTENCE
+    # ----------------------------------------------------------------
+    def save_dca_state(self, trade_id: int | None, dca_data: dict) -> None:
+        """Persist DCA position state as structured columns + JSONB.
+
+        ``dca_data`` is the full serialised DCAPositionState dict.
+        Critical fields are also written as top-level columns for SQL querying.
+        """
+        if not self._use_pg or trade_id is None:
+            return
+
+        def _do():
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                UPDATE dds.paper_trade SET
+                    dca_enabled = %s,
+                    dca_state = %s,
+                    dca_data = %s::jsonb,
+                    atr_at_entry = %s,
+                    dca_level_atr = %s,
+                    dca_price = %s,
+                    initial_fill_price = %s,
+                    initial_fill_qty = %s,
+                    dca_fill_price = %s,
+                    dca_fill_qty = %s,
+                    dca_filled_at = %s,
+                    avg_entry_price = %s,
+                    original_tp = %s,
+                    active_tp = %s,
+                    tp_mode = %s,
+                    initial_entry_pct = %s,
+                    dca_target_pct = %s,
+                    stop_price = %s,
+                    dca_fee = %s,
+                    dca_slippage = %s,
+                    updated_at = now()
+                WHERE trade_id = %s
+                """,
+                (
+                    dca_data.get("dca_enabled", False),
+                    dca_data.get("state"),
+                    json.dumps(dca_data),
+                    dca_data.get("atr_at_entry"),
+                    dca_data.get("dca_level_atr"),
+                    dca_data.get("dca_price"),
+                    dca_data.get("initial_fill_price"),
+                    dca_data.get("initial_fill_qty"),
+                    dca_data.get("dca_fill_price") or None,
+                    dca_data.get("dca_fill_qty") or None,
+                    dca_data.get("dca_filled_at") or None,
+                    dca_data.get("avg_entry_price"),
+                    dca_data.get("original_tp"),
+                    dca_data.get("active_tp"),
+                    dca_data.get("tp_mode", "scanner"),
+                    dca_data.get("initial_entry_pct"),
+                    dca_data.get("dca_target_pct"),
+                    dca_data.get("stop_price"),
+                    dca_data.get("initial_fee", 0.0) + dca_data.get("dca_fee", 0.0),
+                    dca_data.get("initial_slippage", 0.0) + dca_data.get("dca_slippage", 0.0),
+                    trade_id,
+                ),
+            )
+            self._conn.commit()
+
+        try:
+            self._with_retry(_do, label="save_dca_state")
+        except Exception:
+            logger.exception("save_dca_state failed for trade_id=%s", trade_id)
+
+    def load_dca_state(self, trade_id: int | None) -> dict | None:
+        """Load the DCA JSONB state for an open position.
+
+        Returns the full dca_data dict, or None if not found / no DCA.
+        """
+        if not self._use_pg or trade_id is None:
+            return None
+
+        def _do():
+            cursor = self._conn.cursor()
+            cursor.execute(
+                "SELECT dca_data FROM dds.paper_trade WHERE trade_id = %s",
+                (trade_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            data = row[0]
+            if isinstance(data, str):
+                return json.loads(data)
+            # pg8000 may return the dict directly
+            return data if data else None
+
+        return self._with_retry(_do, label="load_dca_state")
+
     def close(self) -> None:
         if self._conn:
             self._conn.close()

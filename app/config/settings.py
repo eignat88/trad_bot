@@ -20,6 +20,23 @@ class ScannerUniverseSettings:
 
 
 @dataclass(frozen=True)
+class DCASettings:
+    """DCA (Dollar Cost Averaging) Breakeven configuration.
+
+    Applied to all active scanner/direction combinations when enabled.
+    Operates at the position management level — not inside scanners.
+    """
+    enabled: bool = False
+    level_atr: float = 0.75
+    initial_entry_pct: float = 0.50
+    dca_entry_pct: float = 0.50
+    exit_mode: str = "breakeven"
+    stop_loss_atr: float = 1.5
+    stop_reference: str = "initial_entry"
+    max_dca_count: int = 1
+
+
+@dataclass(frozen=True)
 class Settings:
     # --- PostgreSQL database configuration ---
     db_host: str = "localhost"
@@ -146,6 +163,8 @@ class Settings:
     # Controls how often open positions are checked for SL/TP/trailing
     # in the background thread.  Independent of paper_scan_interval.
     position_monitor_interval: int = 10
+    # DCA Breakeven configuration
+    dca: DCASettings = field(default_factory=DCASettings)
 
 
 def _load_dotenv(path: Path) -> None:
@@ -215,6 +234,12 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
             raise ValueError(
                 "scanner_regime_whitelist must map scanner names to direction/regime lists"
             ) from exc
+    # DCA settings: load from nested "dca" key in config
+    dca_raw = raw.get("dca", {})
+    if dca_raw and isinstance(dca_raw, dict):
+        dca_allowed = DCASettings.__dataclass_fields__.keys()
+        dca_values = {k: v for k, v in dca_raw.items() if k in dca_allowed}
+        values["dca"] = DCASettings(**dca_values)
     settings = Settings(**values)
     if settings.category != "linear":
         raise ValueError("Price/OI strategy requires category=linear")
@@ -284,4 +309,22 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         raise ValueError("setup_ttl_multiplier must be positive")
     if settings.paper_consecutive_loss_cooldown_minutes < 0:
         raise ValueError("paper_consecutive_loss_cooldown_minutes cannot be negative")
+    # DCA validation
+    dca = settings.dca
+    if not 0 < dca.initial_entry_pct <= 1:
+        raise ValueError("dca.initial_entry_pct must be in (0, 1]")
+    if not 0 < dca.dca_entry_pct <= 1:
+        raise ValueError("dca.dca_entry_pct must be in (0, 1]")
+    if abs(dca.initial_entry_pct + dca.dca_entry_pct - 1.0) > 0.001:
+        raise ValueError("dca.initial_entry_pct + dca.dca_entry_pct must equal 1.0")
+    if dca.level_atr <= 0:
+        raise ValueError("dca.level_atr must be positive")
+    if dca.stop_loss_atr <= 0:
+        raise ValueError("dca.stop_loss_atr must be positive")
+    if dca.exit_mode not in {"breakeven"}:
+        raise ValueError("dca.exit_mode must be 'breakeven'")
+    if dca.stop_reference not in {"initial_entry"}:
+        raise ValueError("dca.stop_reference must be 'initial_entry'")
+    if dca.max_dca_count < 0:
+        raise ValueError("dca.max_dca_count must be non-negative")
     return settings

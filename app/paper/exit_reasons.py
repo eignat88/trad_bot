@@ -20,6 +20,8 @@ PaperTradeExitReason: TypeAlias = Literal[
     "TIMEOUT",
     "MANUAL",
     "RISK_LIMIT",
+    "DCA_BREAKEVEN",
+    "DCA_STOP",
 ]
 
 PAPER_TRADE_EXIT_REASONS: Final[frozenset[PaperTradeExitReason]] = frozenset({
@@ -34,6 +36,8 @@ PAPER_TRADE_EXIT_REASONS: Final[frozenset[PaperTradeExitReason]] = frozenset({
     "TIMEOUT",
     "MANUAL",
     "RISK_LIMIT",
+    "DCA_BREAKEVEN",
+    "DCA_STOP",
 })
 
 # Reasons emitted by PaperTradingEngine.  The wider contract also retains
@@ -46,6 +50,8 @@ PAPER_ENGINE_EXIT_REASONS: Final[frozenset[PaperTradeExitReason]] = frozenset({
     "TRAILING_STOP",
     "EXPIRED",
     "EXPIRED_PROFITABLE",
+    "DCA_BREAKEVEN",
+    "DCA_STOP",
 })
 
 EXPIRED_EXIT_REASONS: Final[frozenset[PaperTradeExitReason]] = frozenset({
