@@ -1,5 +1,6 @@
 """Unit tests for TREND_PULLBACK_V2 scanner."""
 import pytest
+from dataclasses import replace
 
 from app.models import Candle
 from app.scanners.models import IndicatorSnapshot, MarketContext, MarketLevels, SetupCandidate
@@ -23,13 +24,13 @@ def _make_indicators(**overrides):
     return IndicatorSnapshot(**{**base.__dict__, **overrides})
 
 
-def _make_candles(n=60, base_price=10000, base_ts=1_000_000):
+def _make_candles(n=60, base_price=10000, base_ts=1_000_000, low_offset=10):
     candles = []
     for i in range(n):
         ts = base_ts + i * 60_000
         o = base_price + i * 0.5
         h = o + 10
-        l = o - 10
+        l = o - low_offset
         c = o + 5
         candles.append(Candle(ts, o, h, l, c, 100))
     return tuple(candles)
@@ -105,7 +106,11 @@ def test_v2_generates_long_in_trend_up():
     # candles_5m last close = 10000 + 19*0.5 + 5 = 10014.5
     # near_ema20: |10014.5 - 10080| / 10080 = 0.0065 < 0.012 ✓
     # pullback_quality = 1 - min(0.0065/0.012, 1) = 0.458 <= 0.75 ✓
+    # low_offset=50 ensures stop is well below entry_zone_low so target > entry_zone_high
     ctx = _make_context(indicators=ind)
+    # Override 5m candles with wider range so risk > 0.4% of price (required for target_r=0.5)
+    wide_candles = _make_candles(20, 10000, low_offset=50)
+    ctx = replace(ctx, candles_5m=wide_candles)
     scanner = TrendPullbackScannerV2()
     results = scanner.scan(ctx)
     # Should produce at least one LONG setup in TREND_UP

@@ -57,14 +57,24 @@ class TrendPullbackScannerV2:
         invalidation = min(c.low for c in candles_5m[-3:]) * (1 - self.stop_buffer)
         atr = ind.atr if ind.atr > 0 else (current_price * 0.015)
 
-        # Compute targets using target_r ratio if specified
-        risk = abs(current_price - invalidation)
+        # Entry zone: ±0.2% around current_price (anchored to fill price, not EMA).
+        entry_zone_low = current_price * 0.998
+        entry_zone_high = current_price * 1.002
+
+        # Target: risk-reward based (consistent with V1/V3), not ATR-based.
+        risk = current_price - invalidation  # LONG: entry > stop
+        if risk <= 0 or invalidation >= entry_zone_low:
+            return None
         if self.target_r is not None:
-            target_1 = current_price + atr * self.target_r * 2  # Scale by ATR for consistency
+            target_1 = current_price + risk * self.target_r
             target_2 = None
         else:
             target_1 = current_price + atr * 2
             target_2 = current_price + atr * 3.5
+
+        # Internal geometry validation: reject before emitting candidate.
+        if target_1 <= entry_zone_high:
+            return None
 
         ema_distance = min(abs(current_price - ind.ema20) / ind.ema20,
                            abs(current_price - ind.ema50) / ind.ema50)
@@ -79,14 +89,16 @@ class TrendPullbackScannerV2:
             scanner_name=self.name, scanner_version=self.version, symbol=ctx.symbol,
             direction=ScannerDirection.LONG.value, htf_timeframe="1h", setup_timeframe="15m", entry_timeframe="5m",
             detected_at=ctx.evaluated_at, setup_started_at=datetime.now(timezone.utc),
-            reference_price=current_price, entry_zone_low=min(ind.ema20, ind.ema50) * 0.998,
-            entry_zone_high=max(ind.ema20, ind.ema50) * 1.002, invalidation_price=invalidation,
+            reference_price=current_price, entry_zone_low=entry_zone_low,
+            entry_zone_high=entry_zone_high, invalidation_price=invalidation,
             target_1=target_1, target_2=target_2,
             market_regime=ctx.market_regime, state=SetupState.SETUP_READY,
             features={"htf_context": True, "trend_alignment": True,
                       "pullback_to_ema": True, "pullback_quality": pullback_quality,
                       "rsi_cool": True, "rsi_confirmation": rsi_confirmation,
                       "stop_distance_ok": True,
+                      "target_r": self.target_r,
+                      "risk_r": risk,
                       "recommended_expiry_policy": "BREAKEVEN"},
         )
 
@@ -111,14 +123,24 @@ class TrendPullbackScannerV2:
         invalidation = max(c.high for c in candles_5m[-3:]) * (1 + self.stop_buffer)
         atr = ind.atr if ind.atr > 0 else (current_price * 0.015)
 
-        # Compute targets using target_r ratio if specified
-        risk = abs(current_price - invalidation)
+        # Entry zone: ±0.2% around current_price (anchored to fill price, not EMA).
+        entry_zone_low = current_price * 0.998
+        entry_zone_high = current_price * 1.002
+
+        # Target: risk-reward based (consistent with V1/V3), not ATR-based.
+        risk = invalidation - current_price  # SHORT: stop > entry
+        if risk <= 0 or invalidation <= entry_zone_high:
+            return None
         if self.target_r is not None:
-            target_1 = current_price - atr * self.target_r * 2  # Scale by ATR for consistency
+            target_1 = current_price - risk * self.target_r
             target_2 = None
         else:
             target_1 = current_price - atr * 2
             target_2 = current_price - atr * 3.5
+
+        # Internal geometry validation: reject before emitting candidate.
+        if target_1 >= entry_zone_low:
+            return None
 
         ema_distance = min(abs(current_price - ind.ema20) / ind.ema20,
                            abs(current_price - ind.ema50) / ind.ema50)
@@ -133,14 +155,16 @@ class TrendPullbackScannerV2:
             scanner_name=self.name, scanner_version=self.version, symbol=ctx.symbol,
             direction=ScannerDirection.SHORT.value, htf_timeframe="1h", setup_timeframe="15m", entry_timeframe="5m",
             detected_at=ctx.evaluated_at, setup_started_at=datetime.now(timezone.utc),
-            reference_price=current_price, entry_zone_low=min(ind.ema20, ind.ema50) * 0.998,
-            entry_zone_high=max(ind.ema20, ind.ema50) * 1.002, invalidation_price=invalidation,
+            reference_price=current_price, entry_zone_low=entry_zone_low,
+            entry_zone_high=entry_zone_high, invalidation_price=invalidation,
             target_1=target_1, target_2=target_2,
             market_regime=ctx.market_regime, state=SetupState.SETUP_READY,
             features={"htf_context": True, "trend_alignment": True,
                       "pullback_to_ema": True, "pullback_quality": pullback_quality,
                       "rsi_cool": True, "rsi_confirmation": rsi_confirmation,
                       "stop_distance_ok": True,
+                      "target_r": self.target_r,
+                      "risk_r": risk,
                       "recommended_expiry_policy": "BREAKEVEN"},
         )
 
