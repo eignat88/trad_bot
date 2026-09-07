@@ -56,7 +56,7 @@
   "paper_severe_execution_extra_r": 0.15,
   "position_monitor_interval": 10,
   "dca": {
-    "enabled": true,
+    "enabled": false,
     "level_atr": 0.75,
     "initial_entry_pct": 0.50,
     "dca_entry_pct": 0.50,
