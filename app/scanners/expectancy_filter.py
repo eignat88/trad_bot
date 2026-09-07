@@ -1,7 +1,13 @@
 """Filter scanner signals by historical expectancy.
 
-Loads expected R per (scanner_name, direction) from the database and rejects
-candidates whose historical avg_r_after_costs is below a configurable threshold.
+Loads expected R per (scanner_name, direction) from ``dds.scanner_expectancy``
+(built on ``dds.signal_outcome``) and rejects candidates whose historical
+``avg_r_after_costs`` is below a configurable threshold.
+
+The source of truth is ``dds.scanner_expectancy`` which counts only entries
+where ``entry_touched = true``, excluding NO_ENTRY and EXPIRED-only signals.
+This avoids pollution from ``dds.paper_trade_stats`` which aggregates over
+all paper-trade rows including entries that never actually opened.
 """
 from __future__ import annotations
 
@@ -16,7 +22,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Minimum outcomes needed before we trust the average.
+# Minimum *entries* (signals that touched the entry zone) needed before we
+# trust the computed expectancy.  At least this many real entries are required
+# before the filter begins rejecting candidates on statistical grounds.
 DEFAULT_MIN_SAMPLES = 30
 
 
@@ -24,11 +32,11 @@ DEFAULT_MIN_SAMPLES = 30
 class ExpectancyRecord:
     scanner_name: str
     direction: str
-    samples: int
+    samples: int          # entries (entry_touched) from signal_outcome
     avg_r_after_costs: float
     win_rate: float
     profit_factor: float = 0.0
-    net_pnl: float = 0.0
+    net_pnl: float = 0.0  # retained for logging only, not used in gate
 
 
 @dataclass
@@ -56,6 +64,14 @@ class ExpectancyFilter:
         In PAPER mode, combinations with insufficient samples are allowed
         through for bootstrap data collection.  LIVE mode always enforces
         the full evidence gate.
+
+        Gate criteria (when enough samples exist):
+          * avg_r_after_costs > min_avg_r
+          * profit_factor >= min_profit_factor
+
+        ``net_pnl`` is intentionally excluded from the gate — it is a
+        position-size-dependent absolute metric and does not reflect
+        normalized expectancy.
         """
         key = (scanner_name, direction)
         rec = self.records.get(key)
@@ -67,7 +83,6 @@ class ExpectancyFilter:
         return (
             rec.avg_r_after_costs > min_avg_r
             and rec.profit_factor >= min_profit_factor
-            and rec.net_pnl > min_net_pnl
         )
 
     def reason_for(self, scanner_name: str, direction: str) -> str:
@@ -78,7 +93,8 @@ class ExpectancyFilter:
         if rec.samples < DEFAULT_MIN_SAMPLES:
             return f"INSUFFICIENT_DATA({rec.samples})"
         return (
-            f"AVG_R={rec.avg_r_after_costs:.4f},PF={rec.profit_factor:.4f},"
+            f"AVG_R_AFTER_COSTS={rec.avg_r_after_costs:.4f},"
+            f"PF={rec.profit_factor:.4f},"
             f"NET_PNL={rec.net_pnl:.2f}"
         )
 
@@ -88,14 +104,20 @@ class ExpectancyFilter:
 
 
 def load_expectancy(repository: ScannerRepository) -> ExpectancyFilter:
-    """Load scanner expectancy from PostgreSQL."""
+    """Load scanner expectancy from ``dds.scanner_expectancy``.
+
+    This view is built on ``dds.signal_outcome`` and counts only signals
+    where ``entry_touched = true``, computing R-multiples after fees and
+    slippage.  It is the canonical source for runtime expectancy gating.
+    """
     if not repository._use_pg:
         return ExpectancyFilter()
     cursor = repository._conn.cursor()
     cursor.execute("""
-        SELECT scanner_name, direction, closed, avg_r, win_rate,
-               profit_factor, total_pnl_usdt
-        FROM dds.paper_trade_stats
+        SELECT scanner_name, direction,
+               entries, avg_r_after_costs, win_rate_on_entries,
+               profit_factor
+        FROM dds.scanner_expectancy
     """)
     f = ExpectancyFilter()
     for row in cursor.fetchall():
@@ -107,9 +129,12 @@ def load_expectancy(repository: ScannerRepository) -> ExpectancyFilter:
             avg_r_after_costs=float(row[3] or 0),
             win_rate=float(row[4] or 0),
             profit_factor=float(row[5] or 0),
-            net_pnl=float(row[6] or 0),
         )
-    logger.info("loaded expectancy filter: %d scanner/direction records", len(f.records))
+    logger.info(
+        "loaded expectancy filter: %d scanner/direction records "
+        "(source: dds.scanner_expectancy)",
+        len(f.records),
+    )
     return f
 
 
@@ -158,9 +183,21 @@ def filter_candidates(
             accepted.append(c)
         else:
             rejected += 1
-            logger.info(
-                "expectancy filter rejected: %s %s %s (reason: %s)",
-                c.symbol, c.scanner_name, c.direction,
-                expectancy.reason_for(c.scanner_name, c.direction),
-            )
+            rec = expectancy.records.get((c.scanner_name, c.direction))
+            if rec is not None and rec.samples < min_samples:
+                logger.info(
+                    "expectancy filter bypass: %s %s %s "
+                    "(entries=%d, min_samples=%d, reason=INSUFFICIENT_SAMPLES)",
+                    c.symbol, c.scanner_name, c.direction,
+                    rec.samples, min_samples,
+                )
+            else:
+                logger.info(
+                    "expectancy filter rejected: %s %s %s "
+                    "(entries=%s, avg_r_after_costs=%s, pf=%s, reason=NEGATIVE_EXPECTANCY)",
+                    c.symbol, c.scanner_name, c.direction,
+                    rec.samples if rec else "N/A",
+                    f"{rec.avg_r_after_costs:.4f}" if rec else "N/A",
+                    f"{rec.profit_factor:.4f}" if rec else "N/A",
+                )
     return accepted, rejected
