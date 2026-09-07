@@ -164,7 +164,12 @@ def test_orchestrator_applies_expectancy_filter():
     assert stats2["TREND_PULLBACK"]["setups_saved"] == 1
 
 
-def test_expectancy_requires_30_samples_pf_expectancy_and_net_pnl():
+def test_expectancy_requires_30_samples_pf_and_avg_r():
+    """Gate: entries >= 30, avg_r_after_costs > 0, PF >= 1.2.
+
+    net_pnl is intentionally excluded from the gate — it is an absolute
+    position-size-dependent metric and does not reflect normalized expectancy.
+    """
     def allowed(samples=30, avg_r=0.1, pf=1.2, net=1.0):
         f = ExpectancyFilter({
             ("TEST", "LONG"): ExpectancyRecord(
@@ -178,7 +183,33 @@ def test_expectancy_requires_30_samples_pf_expectancy_and_net_pnl():
     assert allowed(samples=30)
     assert not allowed(pf=1.19)
     assert not allowed(avg_r=0.0)
-    assert not allowed(net=0.0)
+    # net_pnl no longer affects the gate — even zero is allowed
+    assert allowed(net=0.0)
+
+
+def test_net_pnl_does_not_affect_gate():
+    """net_pnl is logging-only; negative net_pnl does not block."""
+    f = ExpectancyFilter(records={
+        ("TEST", "LONG"): ExpectancyRecord(
+            scanner_name="TEST", direction="LONG",
+            samples=40, avg_r_after_costs=0.15, win_rate=0.4,
+            profit_factor=1.3, net_pnl=-100.0,
+        ),
+    })
+    # Despite large negative net_pnl, positive avg_r + PF ≥ 1.2 → ALLOW
+    assert f.is_profitable("TEST", "LONG", trading_mode="live") is True
+
+
+def test_negative_avg_r_with_high_pf_still_blocks():
+    """PF alone is not enough — avg_r must be positive."""
+    f = ExpectancyFilter(records={
+        ("TEST", "SHORT"): ExpectancyRecord(
+            scanner_name="TEST", direction="SHORT",
+            samples=35, avg_r_after_costs=-0.05, win_rate=0.2,
+            profit_factor=2.0, net_pnl=50.0,
+        ),
+    })
+    assert f.is_profitable("TEST", "SHORT", trading_mode="live") is False
 
 
 # ---------------------------------------------------------------------------
@@ -296,3 +327,72 @@ def test_live_safety_gate_not_weakened_by_paper_bootstrap():
     accepted, rejected = filter_candidates(cands, f_bad, trading_mode="live")
     assert len(accepted) == 0
     assert rejected == 1
+
+
+# ---------------------------------------------------------------------------
+# Momentum Exhaustion SHORT regression test
+# ---------------------------------------------------------------------------
+
+def test_momentum_exhaustion_short_with_scanner_expectancy_source():
+    """Regression: MOMENTUM_EXHAUSTION SHORT should use signal_outcome data.
+
+    Before the fix, the filter read dds.paper_trade_stats which included
+    NO_ENTRY / EXPIRED artifacts, yielding avg_r=-0.2895, PF=0.516.
+
+    After the fix, the filter reads dds.scanner_expectancy which uses only
+    entry_touched signals: entries=17, avg_r_after_costs=+0.0594,
+    PF=1.2336.  With 17 entries (< 30 min_samples) the filter should
+    ALLOW in paper mode (bootstrap) and block in live mode (insufficient data).
+    """
+    f = ExpectancyFilter(records={
+        ("MOMENTUM_EXHAUSTION", "SHORT"): ExpectancyRecord(
+            scanner_name="MOMENTUM_EXHAUSTION", direction="SHORT",
+            samples=17,
+            avg_r_after_costs=0.0594,
+            win_rate=0.1765,
+            profit_factor=1.2336,
+        ),
+    })
+    # Paper mode: insufficient entries → bootstrap ALLOW
+    assert f.is_profitable("MOMENTUM_EXHAUSTION", "SHORT", trading_mode="paper") is True
+    # Live mode: insufficient entries → BLOCK
+    assert f.is_profitable("MOMENTUM_EXHAUSTION", "SHORT", trading_mode="live") is False
+    # reason_for should show INSUFFICIENT_DATA
+    reason = f.reason_for("MOMENTUM_EXHAUSTION", "SHORT")
+    assert "INSUFFICIENT_DATA" in reason
+    assert "17" in reason
+
+
+def test_momentum_exhaustion_short_passes_with_enough_entries():
+    """If MOMENTUM_EXHAUSTION SHORT accumulates ≥ 30 entries with the same
+    positive expectancy, it should be allowed in live mode too.
+    """
+    f = ExpectancyFilter(records={
+        ("MOMENTUM_EXHAUSTION", "SHORT"): ExpectancyRecord(
+            scanner_name="MOMENTUM_EXHAUSTION", direction="SHORT",
+            samples=35,
+            avg_r_after_costs=0.0594,
+            win_rate=0.1765,
+            profit_factor=1.2336,
+        ),
+    })
+    assert f.is_profitable("MOMENTUM_EXHAUSTION", "SHORT", trading_mode="live") is True
+
+
+# ---------------------------------------------------------------------------
+# Logging format tests
+# ---------------------------------------------------------------------------
+
+def test_reason_for_shows_avg_r_after_costs_not_raw_avg_r():
+    """reason_for should use avg_r_after_costs label."""
+    f = ExpectancyFilter(records={
+        ("TEST", "LONG"): ExpectancyRecord(
+            scanner_name="TEST", direction="LONG",
+            samples=40, avg_r_after_costs=0.1234, win_rate=0.5,
+            profit_factor=1.5, net_pnl=42.0,
+        ),
+    })
+    reason = f.reason_for("TEST", "LONG")
+    assert "AVG_R_AFTER_COSTS=0.1234" in reason
+    assert "PF=1.5000" in reason
+    assert "NET_PNL=42.00" in reason
