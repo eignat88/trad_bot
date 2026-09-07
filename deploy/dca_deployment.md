@@ -1,29 +1,20 @@
 # DCA Breakeven VPS Deployment Guide
 
-## Phase 1: Deploy code + migration with DCA OFF
+DCA operational flag is controlled via `DCA_ENABLED` environment variable,
+not via `config.yaml`. This means `git pull` never overwrites the DCA toggle.
 
-### 1. Update code on VPS
+## Initial VPS Setup
+
+### 1. Deploy code
 
 ```bash
 cd /opt/trad_bot
-git status
-git switch main
 git fetch origin
+git switch main
 git pull --ff-only origin main
-git log -5 --oneline
 ```
 
-**Expected**: HEAD should show `c3bd553 chore: set dca.enabled=false for initial VPS deployment`
-
-### 2. Confirm DCA is disabled in config
-
-```bash
-grep -A 10 '"dca"' config.yaml
-```
-
-**Expected**: `"enabled": false`
-
-### 3. Apply migration 007
+### 2. Apply migration (idempotent)
 
 ```bash
 sudo -u postgres psql \
@@ -32,37 +23,7 @@ sudo -u postgres psql \
   -f sql/migrations/007_dca_breakeven.sql
 ```
 
-**Expected**: ALTER TABLE statements complete without errors.
-
-### 4. Verify DCA columns exist
-
-```bash
-sudo -u postgres psql -d trad_bot -P pager=off -c "
-SELECT column_name, data_type, column_default, is_nullable
-FROM information_schema.columns
-WHERE table_schema = 'dds'
-  AND table_name = 'paper_trade'
-  AND column_name LIKE '%dca%'
-   OR column_name IN ('atr_at_entry', 'avg_entry_price', 'original_tp', 'active_tp', 'tp_mode')
-ORDER BY ordinal_position;
-"
-```
-
-### 5. Verify existing positions are NOT DCA-enabled
-
-```bash
-sudo -u postgres psql -d trad_bot -P pager=off -c "
-SELECT trade_id, symbol, scanner_name, direction, status, entered_at,
-       dca_enabled, dca_state
-FROM dds.paper_trade
-WHERE status = 'OPEN'
-ORDER BY entered_at DESC;
-"
-```
-
-**Expected**: All existing open positions show `dca_enabled = false` or `NULL`.
-
-### 6. Apply mart views
+### 3. Apply mart views (idempotent)
 
 ```bash
 sudo -u postgres psql \
@@ -71,101 +32,130 @@ sudo -u postgres psql \
   -f sql/mart/dca_performance.sql
 ```
 
-### 7. Verify mart views
+### 4. Create environment file for paper service
 
 ```bash
-sudo -u postgres psql -d trad_bot -P pager=off -c "SELECT * FROM mart.dca_overview;"
-sudo -u postgres psql -d trad_bot -P pager=off -c "SELECT * FROM mart.dca_performance ORDER BY scanner_name, direction;"
+sudo mkdir -p /etc/trad-bot
+printf 'DCA_ENABLED=false\n' | sudo tee /etc/trad-bot/paper.env
 ```
 
-**Expected**: Empty/zero results (no DCA trades yet). No SQL errors.
+### 5. Ensure systemd unit uses the env file
 
-### 8. Restart paper service (DCA OFF)
+Add `EnvironmentFile=-/etc/trad-bot/paper.env` to `trad-bot-paper.service`.
+The `-` prefix means the file is optional (service starts without it).
 
+After editing the unit file:
 ```bash
-sudo systemctl restart trad-bot-paper
-sudo systemctl status trad-bot-paper --no-pager -l
-journalctl -u trad-bot-paper --since "5 minutes ago" --no-pager -l
+sudo systemctl daemon-reload
 ```
 
-**Expected**:
-- Service is RUNNING
-- Existing trades restored from DB
-- No DCA orders created (feature disabled)
-- No errors related to DCA columns
+### 6. Verify config.yaml has DCA disabled as default
 
-### 9. Monitor for 24 hours (Phase 1)
+The Git-tracked `config.yaml` should have `"enabled": false` in the `dca` section.
+This is the safe default — DCA is enabled only via env override.
 
-Watch for:
-- No DCA-related log messages
-- Existing positions continue normally
-- New positions are created without DCA
-- No DB/schema errors
-
----
-
-## Phase 2: Enable DCA
-
-**Only after Phase 1 is confirmed stable.**
-
-### 10. Enable DCA
-
-Edit `/opt/trad_bot/config.yaml`:
-
-Change:
-```json
-"dca": {
-    "enabled": false,
-```
-
-To:
-```json
-"dca": {
-    "enabled": true,
-```
-
-### 11. Restart paper service (DCA ON)
+### 7. Start service
 
 ```bash
 sudo systemctl restart trad-bot-paper
 sudo systemctl status trad-bot-paper --no-pager -l
-journalctl -u trad-bot-paper --since "5 minutes ago" --no-pager -l
 ```
 
-**Search logs for**: `DCA`, `DCA_ENTRY`, `DCA_FILLED`, `DCA_BREAKEVEN`
-
-### 12. Monitor DCA activity
+### 8. Verify effective config in logs
 
 ```bash
-# Check new DCA-enabled positions
-sudo -u postgres psql -d trad_bot -P pager=off -c "
-SELECT trade_id, symbol, scanner_name, direction,
-       dca_enabled, dca_state, dca_price, avg_entry_price
-FROM dds.paper_trade
-WHERE dca_enabled = TRUE
-ORDER BY entered_at DESC
-LIMIT 10;
-"
+journalctl -u trad-bot-paper --since "2 minutes ago" --no-pager -l | grep "DCA config"
+```
 
-# DCA overview
-sudo -u postgres psql -d trad_bot -P pager=off -c "SELECT * FROM mart.dca_overview;"
+Expected:
+```
+DCA config: enabled=false source=env level_atr=0.75 ...
 ```
 
 ---
 
-## Rollback (Emergency)
-
-At any time, if issues arise:
+## Enable DCA
 
 ```bash
-# Edit config
-sudo sed -i 's/"enabled": true/"enabled": false/' /opt/trad_bot/config.yaml
-
-# Restart
+printf 'DCA_ENABLED=true\n' | sudo tee /etc/trad-bot/paper.env
 sudo systemctl restart trad-bot-paper
-
-# Verify
-grep '"enabled"' /opt/trad_bot/config.yaml
+journalctl -u trad-bot-paper --since "2 minutes ago" --no-pager -l | grep "DCA config"
 ```
 
-**Existing DCA positions continue to be managed safely.** Only new positions stop getting DCA.
+Expected:
+```
+DCA config: enabled=true source=env level_atr=0.75 ...
+```
+
+## Disable / Rollback DCA
+
+```bash
+printf 'DCA_ENABLED=false\n' | sudo tee /etc/trad-bot/paper.env
+sudo systemctl restart trad-bot-paper
+journalctl -u trad-bot-paper --since "2 minutes ago" --no-pager -l | grep "DCA config"
+```
+
+Existing DCA-enabled positions continue to be managed safely.
+Only new positions stop getting DCA.
+
+## Verify Git Status Stays Clean
+
+After toggling DCA via env:
+```bash
+cd /opt/trad_bot
+git status
+```
+
+Must show `nothing to commit, working tree clean`.
+The `config.yaml` is NOT modified.
+
+## Deploy After Updates
+
+```bash
+cd /opt/trad_bot
+git pull --ff-only origin main
+
+sudo -u postgres psql -v ON_ERROR_STOP=1 -d trad_bot \
+  -f sql/migrations/007_dca_breakeven.sql
+
+sudo -u postgres psql -v ON_ERROR_STOP=1 -d trad_bot \
+  -f sql/mart/dca_performance.sql
+
+sudo systemctl restart trad-bot-paper
+```
+
+`DCA_ENABLED=true` persists in `/etc/trad-bot/paper.env` — no manual re-enablement needed.
+
+## Priority Order
+
+```
+DCA_ENABLED env var  →  highest priority
+config.yaml dca.enabled  →  fallback
+DCASettings default (false)  →  safety net
+```
+
+## Accepted Values for DCA_ENABLED
+
+Truthy: `true`, `1`, `yes`, `on` (case-insensitive)
+Falsy:  `false`, `0`, `no`, `off` (case-insensitive)
+
+Invalid values cause a **fail-fast** error at startup (ValueError).
+
+## Monitoring
+
+```sql
+-- Overview KPIs
+SELECT * FROM mart.dca_overview;
+
+-- Per scanner/direction
+SELECT * FROM mart.dca_performance ORDER BY scanner_name, direction;
+```
+
+## Rollback (No Code/DB Changes Needed)
+
+```bash
+printf 'DCA_ENABLED=false\n' | sudo tee /etc/trad-bot/paper.env
+sudo systemctl restart trad-bot-paper
+```
+
+Do NOT drop DCA columns or mart views during operational rollback.

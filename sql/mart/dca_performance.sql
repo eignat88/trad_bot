@@ -40,9 +40,9 @@ SELECT
             WHERE dca_state = 'DCA_FILLED' AND status = 'CLOSED'
         )
         / NULLIF(
-            ABS(SUM(LEAST(pnl_usdt, 0))) FILTER (
+            ABS(SUM(LEAST(pnl_usdt, 0)) FILTER (
                 WHERE dca_state = 'DCA_FILLED' AND status = 'CLOSED'
-            ),
+            )),
             0
         ),
         4

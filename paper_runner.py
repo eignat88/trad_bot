@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import Settings, load_settings
+from app.config.settings import get_dca_source
 from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
 from app.paper.engine import PaperTradingEngine
@@ -69,6 +70,17 @@ def _load_settings() -> Settings:
         "paper config: initial_balance=%.0f risk_per_trade=%.3f max_positions=%d",
         settings.initial_balance, settings.risk_per_trade,
         settings.max_open_positions,
+    )
+    # Log effective DCA configuration with source
+    dca = settings.dca
+    dca_source = get_dca_source()
+    logger.info(
+        "DCA config: enabled=%s source=%s level_atr=%.2f "
+        "initial_entry_pct=%.2f dca_entry_pct=%.2f exit_mode=%s "
+        "stop_loss_atr=%.2f max_dca_count=%d",
+        dca.enabled, dca_source, dca.level_atr,
+        dca.initial_entry_pct, dca.dca_entry_pct, dca.exit_mode,
+        dca.stop_loss_atr, dca.max_dca_count,
     )
     return settings
 

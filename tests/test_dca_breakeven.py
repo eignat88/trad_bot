@@ -21,12 +21,15 @@ Covers:
 from __future__ import annotations
 
 import math
+import os
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.config.settings import DCASettings, Settings
+from app.config.settings import DCASettings, Settings, get_dca_source
 from app.paper.dca import (
     DCAState,
     DCAPositionState,
@@ -1116,3 +1119,157 @@ class TestProductionSizingPath:
         filled2 = DCAStateManager.fill_dca(filled, 9990.0, 0.5)
         assert filled2.dca_fill_count == 1  # unchanged
         assert filled2.dca_fill_price == 9992.5  # first fill price preserved
+
+
+# ======================================================================
+# DCA_ENABLED ENV OVERRIDE TESTS
+# ======================================================================
+
+class TestDCAEnabledEnvOverride:
+    """Test DCA_ENABLED environment variable override behavior."""
+
+    def _base_config(self, dca_enabled=False):
+        return {
+            "trading_mode": "paper",
+            "initial_balance": 10000,
+            "risk_per_trade": 0.005,
+            "max_open_positions": 3,
+            "max_daily_loss": 0.03,
+            "max_consecutive_losses": 4,
+            "max_symbol_exposure": 0.20,
+            "atr_stop_multiple": 1.5,
+            "reward_risk": 2.0,
+            "paper_min_forward_days": 14,
+            "paper_min_closed_trades": 100,
+            "paper_min_avg_r": 0.0,
+            "paper_min_profit_factor": 1.0,
+            "paper_max_drawdown": 0.10,
+            "paper_max_loss_r_per_trade": 1.2,
+            "paper_severe_stop_gap_r": 0.20,
+            "paper_severe_execution_extra_r": 0.15,
+            "paper_safety_gate_mode": "enforce",
+            "paper_funding_interval_hours": 8,
+            "paper_scan_interval": 300,
+            "setup_ttl_multiplier": 2.0,
+            "paper_consecutive_loss_cooldown_minutes": 5,
+            "dca": {
+                "enabled": dca_enabled,
+                "level_atr": 0.75,
+                "initial_entry_pct": 0.50,
+                "dca_entry_pct": 0.50,
+                "exit_mode": "breakeven",
+                "stop_loss_atr": 1.5,
+                "stop_reference": "initial_entry",
+                "max_dca_count": 1,
+            },
+        }
+
+    def _load(self, config, env_override=None):
+        from app.config.settings import load_settings
+        import json
+        from pathlib import Path
+
+        tmp = Path(tempfile.mktemp(suffix=".yaml"))
+        try:
+            tmp.write_text(json.dumps(config), encoding="utf-8")
+            if env_override is not None:
+                os.environ["DCA_ENABLED"] = env_override
+            else:
+                os.environ.pop("DCA_ENABLED", None)
+            settings = load_settings(path=tmp)
+            return settings
+        finally:
+            os.environ.pop("DCA_ENABLED", None)
+            tmp.unlink(missing_ok=True)
+
+    # --- Core priority tests ---
+
+    def test_config_false_no_env(self):
+        """config=false + no ENV → false"""
+        s = self._load(self._base_config(dca_enabled=False))
+        assert s.dca.enabled is False
+        assert get_dca_source() == "config"
+
+    def test_config_true_no_env(self):
+        """config=true + no ENV → true"""
+        s = self._load(self._base_config(dca_enabled=True))
+        assert s.dca.enabled is True
+        assert get_dca_source() == "config"
+
+    def test_config_false_env_true(self):
+        """config=false + DCA_ENABLED=true → true (ENV wins)"""
+        s = self._load(self._base_config(dca_enabled=False), env_override="true")
+        assert s.dca.enabled is True
+        assert get_dca_source() == "env"
+
+    def test_config_true_env_false(self):
+        """config=true + DCA_ENABLED=false → false (ENV wins)"""
+        s = self._load(self._base_config(dca_enabled=True), env_override="false")
+        assert s.dca.enabled is False
+        assert get_dca_source() == "env"
+
+    # --- Boolean parsing ---
+
+    def test_env_TRUE_uppercase(self):
+        s = self._load(self._base_config(), env_override="TRUE")
+        assert s.dca.enabled is True
+
+    def test_env_1(self):
+        s = self._load(self._base_config(), env_override="1")
+        assert s.dca.enabled is True
+
+    def test_env_yes(self):
+        s = self._load(self._base_config(), env_override="yes")
+        assert s.dca.enabled is True
+
+    def test_env_on(self):
+        s = self._load(self._base_config(), env_override="on")
+        assert s.dca.enabled is True
+
+    def test_env_OFF(self):
+        s = self._load(self._base_config(), env_override="OFF")
+        assert s.dca.enabled is False
+
+    def test_env_0(self):
+        s = self._load(self._base_config(), env_override="0")
+        assert s.dca.enabled is False
+
+    def test_env_no(self):
+        s = self._load(self._base_config(), env_override="no")
+        assert s.dca.enabled is False
+
+    def test_env_whitespace(self):
+        s = self._load(self._base_config(), env_override="  true  ")
+        assert s.dca.enabled is True
+
+    def test_env_invalid_raises(self):
+        """DCA_ENABLED=abc should fail-fast."""
+        with pytest.raises(ValueError, match="Invalid DCA_ENABLED"):
+            self._load(self._base_config(), env_override="abc")
+
+    def test_env_invalid_random_raises(self):
+        with pytest.raises(ValueError, match="Invalid DCA_ENABLED"):
+            self._load(self._base_config(), env_override="maybe")
+
+    # --- Other DCA params unaffected ---
+
+    def test_other_dca_params_unchanged_by_env(self):
+        """ENV override only changes 'enabled', not strategy params."""
+        s = self._load(self._base_config(dca_enabled=False), env_override="true")
+        assert s.dca.enabled is True
+        assert s.dca.level_atr == 0.75
+        assert s.dca.initial_entry_pct == 0.50
+        assert s.dca.dca_entry_pct == 0.50
+        assert s.dca.exit_mode == "breakeven"
+        assert s.dca.stop_loss_atr == 1.5
+        assert s.dca.max_dca_count == 1
+
+    # --- Missing dca section in config ---
+
+    def test_no_dca_section_in_config_env_enables(self):
+        """If config.yaml has no dca section, DCA_ENABLED=true still works."""
+        config = self._base_config()
+        del config["dca"]
+        s = self._load(config, env_override="true")
+        assert s.dca.enabled is True
+        assert get_dca_source() == "env"
