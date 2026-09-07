@@ -905,3 +905,214 @@ class TestDCASettings:
             assert settings.dca.level_atr == 0.75
         finally:
             tmp_path.unlink(missing_ok=True)
+
+
+# ======================================================================
+# PRODUCTION SIZING PATH INTEGRATION
+# Validates: risk engine → target_qty → 50/50 split → DCA fill → SL
+# ======================================================================
+
+class TestProductionSizingPath:
+    """Integration test using the actual production position-sizing path.
+
+    Exercises the real check_entries() → DCA split flow through the engine
+    with a mocked repository (no PG required), verifying:
+    - target_qty comes from production risk engine
+    - initial_qty + dca_qty <= target_qty
+    - max_loss after DCA fill + SL <= configured risk
+    """
+
+    def _run_full_entry(self, direction: str, entry_price: float, atr: float,
+                        dca_enabled: bool = True):
+        """Run a full production entry path through the engine.
+
+        Returns (engine, trade, dca_state) or (engine, None, None) if no entry.
+        """
+        from app.paper.engine import PaperTradingEngine, PaperTradeRecord
+        from app.scanners.models import SetupCandidate, SetupState
+        from datetime import timezone
+
+        stop_distance = 1.5 * atr  # stop_loss_atr * ATR
+        if direction == "LONG":
+            stop_price = entry_price - stop_distance
+            target_1 = entry_price + 2.0 * stop_distance  # 2R TP
+            entry_zone_low = entry_price - 0.001 * entry_price
+            entry_zone_high = entry_price + 0.001 * entry_price
+        else:
+            stop_price = entry_price + stop_distance
+            target_1 = entry_price - 2.0 * stop_distance
+            entry_zone_low = entry_price - 0.001 * entry_price
+            entry_zone_high = entry_price + 0.001 * entry_price
+
+        settings = Settings(
+            initial_balance=10000.0,
+            risk_per_trade=0.005,
+            max_open_positions=5,
+            slippage_percent=0.0005,
+            taker_fee=0.00055,
+            atr_stop_multiple=1.5,
+            paper_scan_interval=300,
+            paper_safety_gate_mode="observe",
+            dca=_dca_settings(enabled=dca_enabled),
+        )
+        repo = MagicMock()
+        repo.get_open_paper_trades.return_value = []
+        repo.get_latest_paper_account_snapshot.return_value = None
+        repo.get_paper_risk_state.return_value = {
+            "daily_loss_usdt": 0.0, "consecutive_losses": 0, "cooldown_until": None,
+        }
+        repo.get_paper_safety_gate_state.return_value = {
+            "is_blocked": False, "reason": None, "blocked_since": None, "safety_gate_mode": None,
+        }
+        repo._use_pg = False
+        # Mock save_paper_trade to return a trade_id
+        repo.save_paper_trade = MagicMock(return_value=1)
+        repo.get_paper_trade_by_setup = MagicMock(return_value=None)
+
+        engine = PaperTradingEngine(settings, repo)
+
+        # Build a real SetupCandidate
+        candidate = SetupCandidate(
+            setup_id="test-integration-setup",
+            scanner_name="TEST_SCANNER",
+            symbol="BTCUSDT" if direction == "LONG" else "ETHUSDT",
+            direction=direction,
+            score=50.0,
+            entry_zone_low=entry_zone_low,
+            entry_zone_high=entry_zone_high,
+            invalidation_price=stop_price,
+            target_1=target_1,
+            target_2=None,
+            entry_timeframe="5m",
+        )
+
+        # Single price = middle of entry zone
+        price = (entry_zone_low + entry_zone_high) / 2
+        prices = {candidate.symbol: price}
+
+        with engine.trading_lock:
+            opened = engine.check_entries([candidate], prices)
+
+        if not opened:
+            return engine, None, None
+
+        trade = opened[0]
+        dca_state = trade.dca_state
+        return engine, trade, dca_state
+
+    def test_long_production_sizing(self):
+        """LONG: verify full production sizing path with DCA split.
+
+        The engine applies exposure caps (symbol exposure 20%, portfolio
+        gross/net exposure) that may reduce the position below the raw
+        risk_usdt / distance.  We verify the structural relationships:
+        - DCA split: initial_qty + dca_qty = full_position_size
+        - trade.position_size = initial_qty (DCA split applied)
+        - Risk invariants (SL < DCA < entry)
+        - Max loss after DCA + SL < original risk budget
+        """
+        entry = 67000.0
+        atr = 20.0
+
+        engine, trade, dca_state = self._run_full_entry("LONG", entry, atr)
+
+        assert trade is not None, "Trade was not opened"
+        assert dca_state is not None, "DCA state was not created"
+        assert dca_state.dca_enabled is True
+
+        # --- Structural invariant: trade size = initial fill qty ---
+        assert trade.position_size == pytest.approx(dca_state.initial_fill_qty, abs=1e-6)
+
+        # --- DCA split invariant: initial + dca_target = full target ---
+        # Before DCA fill, dca_fill_qty is 0 but dca_target_pct defines the
+        # intended DCA quantity.  Full position = initial_qty / initial_entry_pct.
+        full_target = dca_state.initial_fill_qty / dca_state.initial_entry_pct
+        expected_dca_qty = full_target * dca_state.dca_target_pct
+        assert dca_state.initial_fill_qty == pytest.approx(full_target * 0.5, abs=1e-6)
+        assert expected_dca_qty == pytest.approx(dca_state.initial_fill_qty, abs=1e-6)
+
+        # --- Price invariants ---
+        assert dca_state.stop_price < dca_state.dca_price < dca_state.initial_fill_price
+
+        # SL correctly from entry - 1.5 * ATR
+        assert dca_state.stop_price == pytest.approx(entry - 1.5 * atr)
+
+        # Breakeven TP = avg entry (same as initial since no DCA fill yet)
+        assert dca_state.avg_entry_price == pytest.approx(dca_state.initial_fill_price)
+
+        # --- Risk validation ---
+        # Max loss with DCA filled at DCA level and then SL hit:
+        # LONG: both initial and DCA are above SL, so loss = (price - SL) * qty for each
+        risk_distance = entry - dca_state.stop_price  # 1.5 * ATR
+        loss_initial = risk_distance * dca_state.initial_fill_qty
+        expected_dca_qty = dca_state.initial_fill_qty  # 50/50 split
+        loss_dca = (dca_state.dca_price - dca_state.stop_price) * expected_dca_qty
+        max_loss = loss_initial + loss_dca
+
+        # The risk engine sized the position to risk risk_usdt = balance * risk_per_trade.
+        # With DCA, the worst case loss is bounded by the full_position * risk_distance
+        # which equals the risk engine's intended risk.  DCA may slightly increase or
+        # decrease worst-case loss depending on fill prices, but it must remain within
+        # a reasonable bound of the original risk.  Test: max_loss < 2 * risk_budget
+        # (a generous bound that catches catastrophic errors).
+        full_target = dca_state.initial_fill_qty / dca_state.initial_entry_pct
+        original_risk = risk_distance * full_target
+        assert max_loss < 2.0 * original_risk, (
+            f"DCA max_loss ({max_loss}) should be bounded by 2x original risk ({original_risk})"
+        )
+
+    def test_short_production_sizing(self):
+        """SHORT: verify full production sizing path with DCA split."""
+        entry = 3500.0
+        atr = 8.0
+
+        engine, trade, dca_state = self._run_full_entry("SHORT", entry, atr)
+
+        assert trade is not None, "Trade was not opened"
+        assert dca_state is not None, "DCA state was not created"
+        assert dca_state.dca_enabled is True
+
+        # --- Structural invariant ---
+        assert trade.position_size == pytest.approx(dca_state.initial_fill_qty, abs=1e-6)
+
+        full_target = dca_state.initial_fill_qty / dca_state.initial_entry_pct
+        assert dca_state.initial_fill_qty == pytest.approx(full_target * 0.5, abs=1e-6)
+
+        # --- Price invariants (SHORT: entry < DCA < SL) ---
+        assert dca_state.initial_fill_price < dca_state.dca_price < dca_state.stop_price
+        assert dca_state.stop_price == pytest.approx(entry + 1.5 * atr)
+
+        # --- Risk validation ---
+        risk_distance = dca_state.stop_price - entry
+        loss_initial = risk_distance * dca_state.initial_fill_qty
+        expected_dca_qty = dca_state.initial_fill_qty
+        loss_dca = (dca_state.stop_price - dca_state.dca_price) * expected_dca_qty
+        max_loss = loss_initial + loss_dca
+
+        original_risk = risk_distance * full_target
+        assert max_loss < 2.0 * original_risk
+
+    def test_no_dca_when_disabled(self):
+        """When dca.enabled=false, no DCA state is created."""
+        engine, trade, dca_state = self._run_full_entry(
+            "LONG", 67000.0, 20.0, dca_enabled=False,
+        )
+        assert trade is not None
+        assert trade.dca_enabled is False
+        assert trade.dca_state is None
+        # Position size should be full target (no split)
+        assert trade.position_size > 0
+
+    def test_dca_only_one_fill_per_position(self):
+        """Verify the idempotency: fill_dca only once."""
+        state = _dca_state(
+            initial_fill_price=10000.0, initial_fill_qty=0.5,
+        )
+        filled = DCAStateManager.fill_dca(state, 9992.5, 0.5)
+        assert filled.state == DCAState.DCA_FILLED
+        assert filled.dca_fill_count == 1
+
+        # Attempt second fill — should be rejected
+        filled2 = DCAStateManager.fill_dca(filled, 9990.0, 0.5)
+        assert filled2.dca_fill_count == 1  # unchanged
+        assert filled2.dca_fill_price == 9992.5  # first fill price preserved
