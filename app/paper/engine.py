@@ -1,10 +1,15 @@
-"""Paper Trading Engine — Phase 5: simulate trades from filtered scanner setups.
+"""Paper Trading Engine — Phase 6: simulate trades with DCA Breakeven.
 
 Lifecycle:
   1. Polls dds.scanner_setup for READY_TO_TRADE setups.
   2. When price enters the entry zone → opens a paper position (dds.paper_trade).
-  3. Monitors open positions: TP1/TP2/trailing stop/expiry.
-  4. Closes and records P&L.
+  3. If DCA is enabled: splits position 50/50, calculates DCA level, monitors.
+  4. Monitors open positions: SL → DCA fill → breakeven TP → trailing → expiry.
+  5. Closes and records P&L.
+
+DCA (Dollar Cost Averaging) Breakeven operates at the position management
+level and applies automatically to ALL active scanner/direction combinations.
+Scanners remain responsible only for finding entry points.
 """
 from __future__ import annotations
 
@@ -16,6 +21,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from app.config import Settings
+from app.paper.dca import (
+    DCAState,
+    DCAPositionState,
+    DCAPolicy,
+    DCAStateManager,
+    TERMINAL_STATES,
+)
 from app.paper.exit_reasons import EXPIRED_EXIT_REASONS, PaperTradeExitReason
 from app.scanners.models import SetupCandidate
 
@@ -67,6 +79,32 @@ class PaperTradeRecord:
     partial_tp_hit: bool = False
     funding_paid: float = 0.0
     funding_periods_charged: int = 0
+    # DCA Breakeven fields
+    dca_enabled: bool = False
+    dca_state: DCAPositionState | None = None
+
+    @property
+    def is_dca_active(self) -> bool:
+        """True if this position has DCA enabled and DCA hasn't been cancelled."""
+        return (
+            self.dca_enabled
+            and self.dca_state is not None
+            and self.dca_state.state not in TERMINAL_STATES
+        )
+
+    @property
+    def effective_stop_price(self) -> float:
+        """The active stop price (DCA stop or original scanner stop)."""
+        if self.dca_enabled and self.dca_state is not None:
+            return self.dca_state.stop_price
+        return self.stop_price
+
+    @property
+    def effective_tp(self) -> float | None:
+        """The active take-profit level (DCA breakeven or scanner original)."""
+        if self.dca_enabled and self.dca_state is not None:
+            return DCAStateManager.get_active_tp(self.dca_state)
+        return self.target_1
 
 
 class PaperTradingEngine:
@@ -408,6 +446,58 @@ class PaperTradingEngine:
                 entry, stop, quantity, risk_usdt,
             )
 
+            # --- DCA Breakeven: create DCA state if enabled ---
+            if DCAPolicy.should_apply(self.settings.dca):
+                # Calculate ATR from stop distance: stop_distance = atr_stop_multiple * ATR
+                # The scanner's invalidation_price gives us the stop distance
+                atr_at_entry = distance / self.settings.atr_stop_multiple if self.settings.atr_stop_multiple > 0 else 0.0
+
+                if atr_at_entry > 0:
+                    # Split position: 50/50 (or configured split)
+                    initial_qty, dca_qty = DCAPolicy.calculate_position_split(
+                        quantity,
+                        self.settings.dca.initial_entry_pct,
+                        self.settings.dca.dca_entry_pct,
+                    )
+
+                    if initial_qty > 0 and dca_qty > 0:
+                        # The entry price used for DCA level calculation is the
+                        # market entry (before slippage), not the slippaged entry.
+                        dca_state = DCAStateManager.create_initial_state(
+                            position_id=trade_id,
+                            initial_fill_price=entry,
+                            initial_fill_qty=initial_qty,
+                            atr_at_entry=atr_at_entry,
+                            dca_settings=self.settings.dca,
+                            direction=c.direction,
+                            original_tp=c.target_1 or 0.0,
+                            entry_price_for_dca=entry,
+                        )
+
+                        if dca_state.dca_enabled:
+                            # Update position size to initial_qty only
+                            trade.position_size = initial_qty
+                            trade.risk_usdt = distance * initial_qty
+                            trade.dca_enabled = True
+                            trade.dca_state = dca_state
+
+                            # Re-save with updated position_size and DCA state
+                            dca_state.position_id = trade_id
+                            self.repo.save_dca_state(trade_id, dca_state.to_dict())
+
+                            logger.info(
+                                "DCA_ENTRY: %s %s initial_qty=%.6f dca_qty=%.6f "
+                                "atr=%.4f dca_price=%.4f sl=%.4f tp_mode=%s",
+                                c.symbol, c.direction, initial_qty, dca_qty,
+                                atr_at_entry, dca_state.dca_price,
+                                dca_state.stop_price, dca_state.tp_mode,
+                            )
+                        else:
+                            logger.warning(
+                                "DCA cancelled for %s %s: invariants violated",
+                                c.symbol, c.direction,
+                            )
+
         return opened
 
     # ------------------------------------------------------------------
@@ -459,51 +549,101 @@ class PaperTradingEngine:
 
             result = None
 
-            # 1. Stop loss check
-            if is_long and price <= trade.stop_price:
-                gap = price < trade.stop_price
-                exit_price = price if gap else trade.stop_price
-                exit_reason = "STOP_LOSS_GAP" if gap else "STOP_LOSS"
+            # 1. Stop loss check (uses DCA stop if DCA is active)
+            active_stop = trade.effective_stop_price
+            if is_long and price <= active_stop:
+                gap = price < active_stop
+                exit_price = price if gap else active_stop
+                # Determine exit reason based on DCA state
+                if trade.dca_enabled and trade.dca_state is not None:
+                    if trade.dca_state.state == DCAState.DCA_FILLED:
+                        exit_reason = "DCA_STOP"
+                    else:
+                        exit_reason = "STOP_LOSS_GAP" if gap else "STOP_LOSS"
+                else:
+                    exit_reason = "STOP_LOSS_GAP" if gap else "STOP_LOSS"
                 result = self._close_trade(trade, exit_price, exit_reason)
-                if gap:
+                if gap and exit_reason != "DCA_STOP":
                     self._record_stop_gap_event(
                         trade,
-                        trade.stop_price,
+                        active_stop,
                         price,
                         self._stop_gap_execution_metrics(trade, price, result.net_pnl),
                     )
-            elif not is_long and price >= trade.stop_price:
-                gap = price > trade.stop_price
-                exit_price = price if gap else trade.stop_price
-                exit_reason = "STOP_LOSS_GAP" if gap else "STOP_LOSS"
+            elif not is_long and price >= active_stop:
+                gap = price > active_stop
+                exit_price = price if gap else active_stop
+                if trade.dca_enabled and trade.dca_state is not None:
+                    if trade.dca_state.state == DCAState.DCA_FILLED:
+                        exit_reason = "DCA_STOP"
+                    else:
+                        exit_reason = "STOP_LOSS_GAP" if gap else "STOP_LOSS"
+                else:
+                    exit_reason = "STOP_LOSS_GAP" if gap else "STOP_LOSS"
                 result = self._close_trade(trade, exit_price, exit_reason)
-                if gap:
+                if gap and exit_reason != "DCA_STOP":
                     self._record_stop_gap_event(
                         trade,
-                        trade.stop_price,
+                        active_stop,
                         price,
                         self._stop_gap_execution_metrics(trade, price, result.net_pnl),
                     )
 
-            # 2. Take profit 1 check (full close)
+            # 2. DCA fill check (only if DCA is active and price reached DCA level)
+            if result is None and trade.is_dca_active:
+                if DCAStateManager.check_dca_level(trade.dca_state, price, trade.direction):
+                    # Conservative: if SL could also have been touched in this
+                    # candle, the SL check above already took priority.
+                    # Here the DCA level was reached without SL being hit.
+                    slip = self.settings.slippage_percent
+                    dca_fill_price = price * (1 + slip if trade.direction == "LONG" else 1 - slip)
+                    dca_fill_qty = trade.dca_state.dca_target_pct / trade.dca_state.initial_entry_pct * trade.dca_state.initial_fill_qty
+                    # Cap to remaining position size
+                    remaining = trade.position_size - trade.dca_state.initial_fill_qty
+                    dca_fill_qty = min(dca_fill_qty, max(0.0, remaining))
+                    if dca_fill_qty > 0:
+                        trade.dca_state = DCAStateManager.fill_dca(
+                            trade.dca_state, dca_fill_price, dca_fill_qty,
+                        )
+                        # Expand position size to full (initial + DCA)
+                        trade.position_size = trade.dca_state.initial_fill_qty + trade.dca_state.dca_fill_qty
+                        # Update risk_usdt based on the full position
+                        risk_distance = abs(trade.entry_price - trade.stop_price)
+                        trade.risk_usdt = risk_distance * trade.position_size
+                        # Deduct DCA entry fee from balance
+                        dca_fee = dca_fill_price * dca_fill_qty * self.settings.taker_fee
+                        dca_slippage_cost = abs(dca_fill_price - price) * dca_fill_qty
+                        self.balance -= dca_fee + dca_slippage_cost
+                        # Persist updated DCA state
+                        self.repo.save_dca_state(trade.trade_id, trade.dca_state.to_dict())
+                        # Deactivate original TP — breakeven TP now active
+                        trade.target_1 = None  # scanner TP no longer active
+
+            # 3. Breakeven TP check (after DCA fill)
+            if result is None and trade.dca_enabled and trade.dca_state is not None:
+                if DCAStateManager.check_breakeven_tp(trade.dca_state, price, trade.direction):
+                    avg_entry = trade.dca_state.avg_entry_price
+                    result = self._close_trade(trade, avg_entry, "DCA_BREAKEVEN")
+
+            # 4. Take profit 1 check (only for non-DCA or pre-DCA positions)
             if result is None and trade.target_1 is not None:
                 if is_long and price >= trade.target_1:
                     result = self._close_trade(trade, trade.target_1, "TAKE_PROFIT_1")
                 elif not is_long and price <= trade.target_1:
                     result = self._close_trade(trade, trade.target_1, "TAKE_PROFIT_1")
 
-            # 3. Take profit 2 check
+            # 5. Take profit 2 check
             if result is None and trade.target_2 is not None:
                 if is_long and price >= trade.target_2:
                     result = self._close_trade(trade, trade.target_2, "TAKE_PROFIT_2")
                 elif not is_long and price <= trade.target_2:
                     result = self._close_trade(trade, trade.target_2, "TAKE_PROFIT_2")
 
-            # 4. Trailing stop logic
-            if result is None:
+            # 6. Trailing stop logic (only for non-DCA or pre-DCA positions)
+            if result is None and not (trade.dca_enabled and trade.dca_state is not None and trade.dca_state.state == DCAState.DCA_FILLED):
                 result = self._check_trailing_stop(trade, price)
 
-            # 5. Timeout check (setup expired)
+            # 7. Timeout check (setup expired)
             if result is None and self._is_expired(trade):
                 gross = self._unrealized_gross(trade, price)
                 reason = "EXPIRED_PROFITABLE" if gross > 0 else "EXPIRED"
@@ -912,6 +1052,11 @@ class PaperTradingEngine:
             trade.entry_price, adjusted_exit, net_pnl, r_multiple, self.balance,
         )
 
+        # --- DCA: close DCA state if this position had DCA enabled ---
+        if trade.dca_enabled and trade.dca_state is not None and trade.dca_state.state not in TERMINAL_STATES:
+            trade.dca_state = DCAStateManager.close_position(trade.dca_state, reason)
+            self.repo.save_dca_state(trade.trade_id, trade.dca_state.to_dict())
+
         return PaperTradeRecord(
             trade_id=trade.trade_id,
             setup_id=trade.setup_id,
@@ -1046,10 +1191,25 @@ class PaperTradingEngine:
         """Load any existing OPEN paper trades from the DB on startup.
 
         When no account snapshot exists yet, reconstruct balance from the
-        earliest open trade and its entry fees.
+        earliest open trade and its entry fees.  DCA state is restored from
+        the dca_data JSONB column when present.
         """
         rows = self.repo.get_open_paper_trades()
         for row in rows:
+            # Load DCA state from JSONB if present
+            dca_state_obj = None
+            dca_enabled = bool(row.get("dca_enabled", False))
+            dca_data_raw = row.get("dca_data")
+            if dca_enabled and dca_data_raw:
+                if isinstance(dca_data_raw, str):
+                    import json as _json
+                    dca_data = _json.loads(dca_data_raw)
+                elif isinstance(dca_data_raw, dict):
+                    dca_data = dca_data_raw
+                else:
+                    dca_data = {}
+                dca_state_obj = DCAPositionState.from_dict(dca_data)
+
             trade = PaperTradeRecord(
                 trade_id=row["trade_id"],
                 setup_id=row["setup_id"],
@@ -1076,6 +1236,8 @@ class PaperTradingEngine:
                 entry_timeframe=str(row.get("entry_timeframe", "5m")),
                 funding_paid=float(row.get("funding_paid", 0.0)),
                 funding_periods_charged=int(row.get("funding_periods", 0)),
+                dca_enabled=dca_enabled,
+                dca_state=dca_state_obj,
             )
             self.open_trades[trade.symbol] = trade
 
