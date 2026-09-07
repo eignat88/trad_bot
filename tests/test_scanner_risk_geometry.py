@@ -70,27 +70,28 @@ def test_trend_pullback_v2_returned_candidate_has_valid_geometry(direction):
 
 
 @pytest.mark.parametrize(("direction", "recent_extreme"), [("LONG", 100), ("SHORT", 100)])
-def test_trend_pullback_v2_stop_inside_entry_zone_not_rejected_internally(direction, recent_extreme):
-    """V2 does not reject bad geometry internally; it relies on the orchestrator."""
+def test_trend_pullback_v2_stop_inside_entry_zone_rejected_internally(direction, recent_extreme):
+    """V2 now rejects bad geometry internally (unlike before the fix)."""
     scanner = trend_pullback_scanner_v2(direction)
     candidate = getattr(scanner, f"_scan_{direction.lower()}")(
         trend_context_v2(direction, recent_extreme=recent_extreme),
     )
-    # V2 returns a candidate; the orchestrator's validate_risk_geometry rejects it.
-    assert candidate is not None
-    assert validate_risk_geometry(candidate)[0] is False
+    # V2 no longer emits candidates with stop inside entry zone.
+    if candidate is not None:
+        assert validate_risk_geometry(candidate)[0] is True
 
 
 @pytest.mark.parametrize("direction", ["LONG", "SHORT"])
-def test_trend_pullback_v2_target_zero_produces_valid_candidate(direction):
-    """With target_r=0, V2 produces a candidate (target validation is external)."""
+def test_trend_pullback_v2_target_zero_rejected_internally(direction):
+    """With target_r=0, target_1 == current_price which is inside entry zone → rejected."""
     scanner = TrendPullbackScannerV2(
         allowed_regimes=("TREND_UP",) if direction == "LONG" else ("TREND_DOWN",),
         target_r=0,
     )
     candidate = getattr(scanner, f"_scan_{direction.lower()}")(trend_context_v2(direction))
-    # V2 doesn't reject target inside entry zone internally
-    assert candidate is not None
+    # V2 now rejects target inside entry zone internally.
+    # target_1 == current_price falls inside entry zone → None.
+    assert candidate is None
 
 
 # ---------------------------------------------------------------------------

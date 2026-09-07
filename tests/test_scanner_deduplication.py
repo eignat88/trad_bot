@@ -112,8 +112,13 @@ def test_risk_geometry_rejects_stop_inside_or_wrong_side_of_entry_zone():
         target_1=98,
     )
 
-    assert validate_risk_geometry(bad_long) == (False, INVALID_RISK_GEOMETRY)
-    assert validate_risk_geometry(bad_short) == (False, INVALID_RISK_GEOMETRY)
+    valid_long, reason_long = validate_risk_geometry(bad_long)
+    valid_short, reason_short = validate_risk_geometry(bad_short)
+    assert valid_long is False
+    assert valid_short is False
+    # Now returns detailed reason codes instead of generic INVALID_RISK_GEOMETRY.
+    assert "STOP" in reason_long
+    assert "STOP" in reason_short
 
 
 def test_risk_geometry_rejects_target_on_wrong_side_of_entry_zone():
@@ -132,8 +137,13 @@ def test_risk_geometry_rejects_target_on_wrong_side_of_entry_zone():
         target_1=100.5,
     )
 
-    assert validate_risk_geometry(bad_long) == (False, INVALID_RISK_GEOMETRY)
-    assert validate_risk_geometry(bad_short) == (False, INVALID_RISK_GEOMETRY)
+    valid_long, reason_long = validate_risk_geometry(bad_long)
+    valid_short, reason_short = validate_risk_geometry(bad_short)
+    assert valid_long is False
+    assert valid_short is False
+    # Now returns detailed reason codes instead of generic INVALID_RISK_GEOMETRY.
+    assert "TARGET" in reason_long
+    assert "TARGET" in reason_short
 
 
 def test_orchestrator_filters_invalid_risk_geometry_before_returning_setups():
