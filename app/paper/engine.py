@@ -521,16 +521,11 @@ class PaperTradingEngine:
                 continue
             self._mark_prices[symbol] = price
 
-            # An outage can leave a trade past its lifetime before the next
-            # quote arrives. In that case, the recovery quote is the only
-            # executable price: do not turn it into a stop/target fill at an
-            # earlier historical level.
-            if self._is_expired(trade):
-                gross = self._unrealized_gross(trade, price)
-                reason = "EXPIRED_PROFITABLE" if gross > 0 else "EXPIRED"
-                closed.append(self._close_trade(trade, price, reason))
-                to_remove.append(symbol)
-                continue
+            # NOTE: expiry check was previously here (before SL), which caused
+            # trades to be closed as EXPIRED even when stop was already breached.
+            # Expiry now runs AFTER the full stop/TP/trailing chain (see below).
+            # This ensures protective risk exits always take priority over
+            # administrative time-based exits.
 
             funding_rate = (funding_rates_percent or {}).get(symbol, 0.0)
             self._apply_funding(trade, funding_rate)
@@ -597,10 +592,20 @@ class PaperTradingEngine:
                     # Here the DCA level was reached without SL being hit.
                     slip = self.settings.slippage_percent
                     dca_fill_price = price * (1 + slip if trade.direction == "LONG" else 1 - slip)
-                    dca_fill_qty = trade.dca_state.dca_target_pct / trade.dca_state.initial_entry_pct * trade.dca_state.initial_fill_qty
-                    # Cap to remaining position size
-                    remaining = trade.position_size - trade.dca_state.initial_fill_qty
-                    dca_fill_qty = min(dca_fill_qty, max(0.0, remaining))
+                    # Calculate DCA fill qty from the split configuration.
+                    # IMPORTANT: do NOT use trade.position_size here — it was
+                    # already reduced to initial_fill_qty at entry time.
+                    # Instead, derive the intended second-leg qty from the
+                    # configured split percentages.
+                    dca_fill_qty = (
+                        trade.dca_state.dca_target_pct
+                        / trade.dca_state.initial_entry_pct
+                        * trade.dca_state.initial_fill_qty
+                    )
+                    # Safety cap: never exceed the planned full position
+                    planned_total = trade.dca_state.initial_fill_qty + dca_fill_qty
+                    current_total = trade.position_size  # = initial_fill_qty
+                    dca_fill_qty = max(0.0, min(dca_fill_qty, planned_total - current_total))
                     if dca_fill_qty > 0:
                         trade.dca_state = DCAStateManager.fill_dca(
                             trade.dca_state, dca_fill_price, dca_fill_qty,

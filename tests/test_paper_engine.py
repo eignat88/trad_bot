@@ -176,7 +176,12 @@ def test_trade_expiry_uses_the_setup_entry_timeframe():
     assert "BTCUSDT" in engine.open_trades
 
 
-def test_overdue_trade_closes_at_first_recovery_price_not_stop_price():
+def test_overdue_trade_stop_takes_priority_over_expiry():
+    """When both stop and expiry are breached, stop must fire first.
+
+    Regression: previously EXPIRED was checked before STOP, which allowed
+    trades to close at worse-than-stop prices when both conditions were true.
+    """
     repo = FakeRepository()
     engine = PaperTradingEngine(Settings(slippage_percent=0.0), repo)
     trade = engine.check_entries(
@@ -187,11 +192,33 @@ def test_overdue_trade_closes_at_first_recovery_price_not_stop_price():
     trade.entry_timeframe = "4h"
     trade.entered_at = datetime.now(timezone.utc) - timedelta(hours=33)
 
+    # Price is beyond stop (110) AND trade is expired
     closed = engine.check_exits({"BTCUSDT": 111.0})
 
     assert len(closed) == 1
-    assert repo.closed[0]["exit_reason"] == "EXPIRED"
+    # STOP must take priority — NOT EXPIRED
+    assert repo.closed[0]["exit_reason"] == "STOP_LOSS_GAP"
     assert repo.closed[0]["exit_price"] == 111.0
+    assert "BTCUSDT" not in engine.open_trades
+
+
+def test_overdue_trade_without_stop_breach_expires_normally():
+    """When only expiry is reached (stop not breached), EXPIRED fires."""
+    repo = FakeRepository()
+    engine = PaperTradingEngine(Settings(slippage_percent=0.0), repo)
+    trade = engine.check_entries(
+        [_candidate(direction="SHORT", invalidation_price=110.0, target_1=None)],
+        {"BTCUSDT": 100.0},
+    )[0]
+    trade.entry_timeframe = "4h"
+    trade.entered_at = datetime.now(timezone.utc) - timedelta(hours=33)
+
+    # Price is below stop (110), only expiry is breached
+    closed = engine.check_exits({"BTCUSDT": 105.0})
+
+    assert len(closed) == 1
+    assert repo.closed[0]["exit_reason"] == "EXPIRED"
+    assert repo.closed[0]["exit_price"] == 105.0
     assert "BTCUSDT" not in engine.open_trades
 
 
