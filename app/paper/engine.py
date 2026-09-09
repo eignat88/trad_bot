@@ -548,7 +548,13 @@ class PaperTradingEngine:
             active_stop = trade.effective_stop_price
             if is_long and price <= active_stop:
                 gap = price < active_stop
-                exit_price = price if gap else active_stop
+                # Stop-market simulation: when the stop level is breached,
+                # execute at stop_price ± configured slippage — NOT at the
+                # current market price.  A real stop-market order triggers
+                # when the trigger price is reached and fills near that level.
+                # Only model worst-case slippage, not arbitrary market drift.
+                slip = self.settings.slippage_percent
+                exit_price = active_stop * (1 - slip)
                 # Determine exit reason based on DCA state
                 if trade.dca_enabled and trade.dca_state is not None:
                     if trade.dca_state.state == DCAState.DCA_FILLED:
@@ -567,7 +573,8 @@ class PaperTradingEngine:
                     )
             elif not is_long and price >= active_stop:
                 gap = price > active_stop
-                exit_price = price if gap else active_stop
+                slip = self.settings.slippage_percent
+                exit_price = active_stop * (1 + slip)
                 if trade.dca_enabled and trade.dca_state is not None:
                     if trade.dca_state.state == DCAState.DCA_FILLED:
                         exit_reason = "DCA_STOP"

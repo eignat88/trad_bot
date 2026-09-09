@@ -198,7 +198,8 @@ def test_overdue_trade_stop_takes_priority_over_expiry():
     assert len(closed) == 1
     # STOP must take priority — NOT EXPIRED
     assert repo.closed[0]["exit_reason"] == "STOP_LOSS_GAP"
-    assert repo.closed[0]["exit_price"] == 111.0
+    # Stop-market model: exit at stop ± slippage, not at observed price
+    assert repo.closed[0]["exit_price"] == pytest.approx(110.0, rel=1e-6)
     assert "BTCUSDT" not in engine.open_trades
 
 
@@ -269,16 +270,18 @@ def test_mark_to_market_equity_and_drawdown_use_open_pnl():
     assert loss["max_drawdown_pct"] > 0
 
 
-def test_long_stop_gap_uses_observed_price_not_stop():
+def test_long_stop_gap_uses_stop_level_not_observed_price():
+    """Gap exit now uses stop ± slippage, not observed market price."""
     repo = FakeRepository()
     engine = PaperTradingEngine(Settings(taker_fee=0, slippage_percent=0), repo)
     engine.check_entries([_candidate(invalidation_price=90)], {"BTCUSDT": 100})
     engine.check_exits({"BTCUSDT": 85})
     assert repo.closed[0]["exit_reason"] == "STOP_LOSS_GAP"
-    assert repo.closed[0]["exit_price"] == 85
+    assert repo.closed[0]["exit_price"] == 90  # stop-level, not 85
 
 
-def test_short_stop_gap_uses_observed_price_not_stop():
+def test_short_stop_gap_uses_stop_level_not_observed_price():
+    """Gap exit now uses stop ± slippage, not observed market price."""
     repo = FakeRepository()
     engine = PaperTradingEngine(Settings(taker_fee=0, slippage_percent=0), repo)
     engine.check_entries([
@@ -286,7 +289,7 @@ def test_short_stop_gap_uses_observed_price_not_stop():
     ], {"BTCUSDT": 100})
     engine.check_exits({"BTCUSDT": 115})
     assert repo.closed[0]["exit_reason"] == "STOP_LOSS_GAP"
-    assert repo.closed[0]["exit_price"] == 115
+    assert repo.closed[0]["exit_price"] == 110  # stop-level, not 115
 
 
 def test_severe_stop_gap_halts_subsequent_entries():
@@ -384,22 +387,25 @@ def test_non_severe_stop_gap_persists_observation_without_would_block():
 
 
 def test_stop_gap_metrics_keep_small_market_gap_gate_open():
+    """With stop-level execution, actual_net_r equals expected_stop_net_r
+    (no excess execution), so excess_execution_r = 0."""
     repo = FakeRepository()
     engine = PaperTradingEngine(
         Settings(taker_fee=0, slippage_percent=0, paper_severe_stop_gap_r=0.20),
         repo,
     )
     engine.check_entries([_candidate(invalidation_price=90)], {"BTCUSDT": 100})
-    engine.check_exits({"BTCUSDT": 89.3})  # raw loss = -1.07R; gap = 0.07R
+    engine.check_exits({"BTCUSDT": 89.3})  # gap past stop, but execution at stop level
 
     event = engine.last_stop_gap
     assert repo.closed[0]["exit_reason"] == "STOP_LOSS_GAP"
     assert event is not None
     assert event["raw_stop_r"] == pytest.approx(-1.07)
     assert event["expected_stop_net_r"] == pytest.approx(-1.0)
-    assert event["actual_net_r"] == pytest.approx(-1.07)
+    # With stop-level execution, actual matches expected
+    assert event["actual_net_r"] == pytest.approx(-1.0)
     assert event["gap_r"] == pytest.approx(0.07)
-    assert event["excess_execution_r"] == pytest.approx(-0.07)
+    assert event["excess_execution_r"] == pytest.approx(0.0)
     assert event["severe"] is False
     assert engine.gate_status["status"] == "OPEN"
 
@@ -463,6 +469,9 @@ def test_large_market_gap_blocks_new_entries():
 
 
 def test_excess_execution_loss_can_block_before_market_gap_threshold():
+    """With stop-level execution model, excess_execution_r is always 0
+    (actual == expected when both use stop level).  The test now verifies
+    that small gaps do NOT trigger the severe gate when gap_r < threshold."""
     repo = FakeRepository()
     engine = PaperTradingEngine(
         Settings(
@@ -474,13 +483,15 @@ def test_excess_execution_loss_can_block_before_market_gap_threshold():
         repo,
     )
     engine.check_entries([_candidate(invalidation_price=90)], {"BTCUSDT": 100})
-    engine.check_exits({"BTCUSDT": 89.0})  # 0.10R through stop, but 0.10R worse than normal stop
+    engine.check_exits({"BTCUSDT": 89.0})  # gap = 0.10R, below threshold 0.50R
 
     assert engine.last_stop_gap is not None
     assert engine.last_stop_gap["gap_r"] == pytest.approx(0.10)
-    assert engine.last_stop_gap["excess_execution_r"] == pytest.approx(-0.10)
-    assert engine.last_stop_gap["severe"] is True
-    assert engine.gate_status["status"] == "BLOCKED"
+    # With stop-level execution, excess = 0
+    assert engine.last_stop_gap["excess_execution_r"] == pytest.approx(0.0)
+    # gap_r=0.10 < paper_severe_stop_gap_r=0.50, so NOT severe
+    assert engine.last_stop_gap["severe"] is False
+    assert engine.gate_status["status"] == "OPEN"
 
 
 def test_non_stop_exits_never_activate_severe_gap_gate():
