@@ -31,6 +31,10 @@ class StageStatus(enum.Enum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
+    
+    # Database-compatible values for data_quality_result
+    PASS = "PASS"
+    FAIL = "FAIL"
 
 
 class Severity(enum.Enum):

@@ -41,31 +41,31 @@ class AnalyticsRepository:
                     source_watermarks, started_at, finished_at, created_at, updated_at,
                     error_code, error_message
                 ) VALUES (
-                    %(run_id)s, %(business_date)s, %(schedule_timezone)s, %(analysis_from)s, %(analysis_to)s,
-                    %(observation_cutoff)s, %(post_exit_horizon)s, %(maturity)s, %(status)s, %(pipeline_version)s,
-                    %(source_watermarks)s, %(started_at)s, %(finished_at)s, %(created_at)s, %(updated_at)s,
-                    %(error_code)s, %(error_message)s
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s
                 )
                 """,
-                {
-                    "run_id": str(run.run_id),
-                    "business_date": run.business_date,
-                    "schedule_timezone": run.schedule_timezone,
-                    "analysis_from": run.analysis_from,
-                    "analysis_to": run.analysis_to,
-                    "observation_cutoff": run.observation_cutoff,
-                    "post_exit_horizon": run.post_exit_horizon,
-                    "maturity": run.maturity.value,
-                    "status": run.status.value,
-                    "pipeline_version": run.pipeline_version,
-                    "source_watermarks": json.dumps(run.source_watermarks),
-                    "started_at": run.started_at,
-                    "finished_at": run.finished_at,
-                    "created_at": run.created_at,
-                    "updated_at": run.updated_at,
-                    "error_code": run.error_code,
-                    "error_message": run.error_message,
-                },
+                (
+                    str(run.run_id),
+                    run.business_date,
+                    run.schedule_timezone,
+                    run.analysis_from,
+                    run.analysis_to,
+                    run.observation_cutoff,
+                    run.post_exit_horizon,
+                    run.maturity.value,
+                    run.status.value,
+                    run.pipeline_version,
+                    json.dumps(run.source_watermarks),
+                    run.started_at,
+                    run.finished_at,
+                    run.created_at,
+                    run.updated_at,
+                    run.error_code,
+                    run.error_message,
+                ),
             )
             self._conn.commit()
             logger.info("Created analysis run: %s for date: %s", run.run_id, run.business_date)
@@ -122,25 +122,25 @@ class AnalyticsRepository:
             cursor.execute(
                 """
                 UPDATE analytics.analysis_run SET
-                    maturity = %(maturity)s,
-                    status = %(status)s,
-                    started_at = %(started_at)s,
-                    finished_at = %(finished_at)s,
-                    updated_at = %(updated_at)s,
-                    error_code = %(error_code)s,
-                    error_message = %(error_message)s
-                WHERE run_id = %(run_id)s
+                    maturity = %s,
+                    status = %s,
+                    started_at = %s,
+                    finished_at = %s,
+                    updated_at = %s,
+                    error_code = %s,
+                    error_message = %s
+                WHERE run_id = %s
                 """,
-                {
-                    "run_id": str(run.run_id),
-                    "maturity": run.maturity.value,
-                    "status": run.status.value,
-                    "started_at": run.started_at,
-                    "finished_at": run.finished_at,
-                    "updated_at": datetime.now(timezone.utc),
-                    "error_code": run.error_code,
-                    "error_message": run.error_message,
-                },
+                (
+                    run.maturity.value,
+                    run.status.value,
+                    run.started_at,
+                    run.finished_at,
+                    datetime.now(timezone.utc),
+                    run.error_code,
+                    run.error_message,
+                    str(run.run_id),
+                ),
             )
             self._conn.commit()
             logger.info("Updated analysis run: %s", run.run_id)
@@ -160,25 +160,25 @@ class AnalyticsRepository:
                     run_id, stage_name, attempt, status, input_rows, output_rows,
                     watermark, result_json, started_at, finished_at, error_code, error_message
                 ) VALUES (
-                    %(run_id)s, %(stage_name)s, %(attempt)s, %(status)s, %(input_rows)s, %(output_rows)s,
-                    %(watermark)s, %(result_json)s, %(started_at)s, %(finished_at)s, %(error_code)s, %(error_message)s
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s
                 )
                 RETURNING stage_run_id
                 """,
-                {
-                    "run_id": str(stage_run.run_id),
-                    "stage_name": stage_run.stage_name,
-                    "attempt": stage_run.attempt,
-                    "status": stage_run.status.value,
-                    "input_rows": stage_run.input_rows,
-                    "output_rows": stage_run.output_rows,
-                    "watermark": stage_run.watermark,
-                    "result_json": json.dumps(stage_run.result_json) if stage_run.result_json else None,
-                    "started_at": stage_run.started_at,
-                    "finished_at": stage_run.finished_at,
-                    "error_code": stage_run.error_code,
-                    "error_message": stage_run.error_message,
-                },
+                (
+                    str(stage_run.run_id),
+                    stage_run.stage_name,
+                    stage_run.attempt,
+                    stage_run.status.value,
+                    stage_run.input_rows,
+                    stage_run.output_rows,
+                    stage_run.watermark,
+                    json.dumps(stage_run.result_json) if stage_run.result_json else None,
+                    stage_run.started_at,
+                    stage_run.finished_at,
+                    stage_run.error_code,
+                    stage_run.error_message,
+                ),
             )
             stage_run.stage_run_id = cursor.fetchone()[0]
             self._conn.commit()
@@ -200,29 +200,29 @@ class AnalyticsRepository:
             cursor.execute(
                 """
                 UPDATE analytics.analysis_stage_run SET
-                    status = %(status)s,
-                    input_rows = %(input_rows)s,
-                    output_rows = %(output_rows)s,
-                    watermark = %(watermark)s,
-                    result_json = %(result_json)s,
-                    started_at = %(started_at)s,
-                    finished_at = %(finished_at)s,
-                    error_code = %(error_code)s,
-                    error_message = %(error_message)s
-                WHERE stage_run_id = %(stage_run_id)s
+                    status = %s,
+                    input_rows = %s,
+                    output_rows = %s,
+                    watermark = %s,
+                    result_json = %s,
+                    started_at = %s,
+                    finished_at = %s,
+                    error_code = %s,
+                    error_message = %s
+                WHERE stage_run_id = %s
                 """,
-                {
-                    "stage_run_id": stage_run.stage_run_id,
-                    "status": stage_run.status.value,
-                    "input_rows": stage_run.input_rows,
-                    "output_rows": stage_run.output_rows,
-                    "watermark": stage_run.watermark,
-                    "result_json": json.dumps(stage_run.result_json) if stage_run.result_json else None,
-                    "started_at": stage_run.started_at,
-                    "finished_at": stage_run.finished_at,
-                    "error_code": stage_run.error_code,
-                    "error_message": stage_run.error_message,
-                },
+                (
+                    stage_run.status.value,
+                    stage_run.input_rows,
+                    stage_run.output_rows,
+                    stage_run.watermark,
+                    json.dumps(stage_run.result_json) if stage_run.result_json else None,
+                    stage_run.started_at,
+                    stage_run.finished_at,
+                    stage_run.error_code,
+                    stage_run.error_message,
+                    stage_run.stage_run_id,
+                ),
             )
             self._conn.commit()
             logger.info("Updated stage run: %s", stage_run.stage_run_id)
@@ -243,27 +243,27 @@ class AnalyticsRepository:
                     severity, status, expected_value, actual_value,
                     affected_entity_count, affected_entity_ids, checked_at, details
                 ) VALUES (
-                    %(run_id)s, %(stage_name)s, %(check_name)s, %(scope_type)s, %(scope_id)s,
-                    %(severity)s, %(status)s, %(expected_value)s, %(actual_value)s,
-                    %(affected_entity_count)s, %(affected_entity_ids)s, %(checked_at)s, %(details)s
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s
                 )
                 RETURNING quality_result_id
                 """,
-                {
-                    "run_id": str(result.run_id),
-                    "stage_name": result.stage_name,
-                    "check_name": result.check_name,
-                    "scope_type": result.scope_type,
-                    "scope_id": result.scope_id,
-                    "severity": result.severity.value,
-                    "status": result.status.value,
-                    "expected_value": json.dumps(result.expected_value) if result.expected_value else None,
-                    "actual_value": json.dumps(result.actual_value) if result.actual_value else None,
-                    "affected_entity_count": result.affected_entity_count,
-                    "affected_entity_ids": json.dumps(result.affected_entity_ids) if result.affected_entity_ids else None,
-                    "checked_at": result.checked_at,
-                    "details": json.dumps(result.details) if result.details else None,
-                },
+                (
+                    str(result.run_id),
+                    result.stage_name,
+                    result.check_name,
+                    result.scope_type,
+                    result.scope_id,
+                    result.severity.value,
+                    result.status.value,
+                    json.dumps(result.expected_value) if result.expected_value else None,
+                    json.dumps(result.actual_value) if result.actual_value else None,
+                    result.affected_entity_count,
+                    json.dumps(result.affected_entity_ids) if result.affected_entity_ids else None,
+                    result.checked_at,
+                    json.dumps(result.details) if result.details else None,
+                ),
             )
             result.quality_result_id = cursor.fetchone()[0]
             self._conn.commit()
@@ -303,9 +303,9 @@ class AnalyticsRepository:
                     close_time, open, high, low, close, volume, turnover,
                     is_closed, source, source_received_at, ingested_at, quality_status
                 ) VALUES (
-                    %(exchange)s, %(market_type)s, %(instrument_id)s, %(timeframe)s, %(open_time)s,
-                    %(close_time)s, %(open)s, %(high)s, %(low)s, %(close)s, %(volume)s, %(turnover)s,
-                    %(is_closed)s, %(source)s, %(source_received_at)s, %(ingested_at)s, %(quality_status)s
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (exchange, market_type, instrument_id, timeframe, open_time)
                 DO UPDATE SET
@@ -322,25 +322,25 @@ class AnalyticsRepository:
                     ingested_at = EXCLUDED.ingested_at,
                     quality_status = EXCLUDED.quality_status
                 """,
-                {
-                    "exchange": candle.exchange,
-                    "market_type": candle.market_type,
-                    "instrument_id": candle.instrument_id,
-                    "timeframe": candle.timeframe,
-                    "open_time": candle.open_time,
-                    "close_time": candle.close_time,
-                    "open": candle.open,
-                    "high": candle.high,
-                    "low": candle.low,
-                    "close": candle.close,
-                    "volume": candle.volume,
-                    "turnover": candle.turnover,
-                    "is_closed": candle.is_closed,
-                    "source": candle.source,
-                    "source_received_at": candle.source_received_at,
-                    "ingested_at": candle.ingested_at,
-                    "quality_status": candle.quality_status.value,
-                },
+                (
+                    candle.exchange,
+                    candle.market_type,
+                    candle.instrument_id,
+                    candle.timeframe,
+                    candle.open_time,
+                    candle.close_time,
+                    candle.open,
+                    candle.high,
+                    candle.low,
+                    candle.close,
+                    candle.volume,
+                    candle.turnover,
+                    candle.is_closed,
+                    candle.source,
+                    candle.source_received_at,
+                    candle.ingested_at,
+                    candle.quality_status.value,
+                ),
             )
             self._conn.commit()
             return True
@@ -483,8 +483,14 @@ class AnalyticsRepository:
 
     def _row_to_analysis_run(self, row: tuple) -> AnalysisRun:
         """Convert a database row to AnalysisRun."""
+        # Handle UUID - pg8000 may return UUID object or string
+        run_id = row[0]
+        if isinstance(run_id, str):
+            run_id = UUID(run_id)
+        # If it's already a UUID object, use it directly
+        
         return AnalysisRun(
-            run_id=UUID(row[0]),
+            run_id=run_id,
             business_date=row[1],
             schedule_timezone=row[2],
             analysis_from=row[3],
