@@ -125,7 +125,7 @@ class AnalyticsRunner:
             AnalysisRun with FINAL maturity
         """
         if business_date is None:
-            business_date = self._get_business_date()
+            business_date = self._get_previous_business_date()
         
         logger.info(
             "Starting FINAL analytics for date: %s",
@@ -140,6 +140,15 @@ class AnalyticsRunner:
         if provisional_run.maturity == Maturity.FINAL:
             logger.info("FINAL run already exists for date: %s", business_date)
             return provisional_run
+        
+        # Safety guard: FINAL must not execute before analysis_to
+        now_utc = datetime.now(timezone.utc)
+        if now_utc < provisional_run.analysis_to:
+            raise ValueError(
+                f"FINAL_NOT_READY: analysis_to={provisional_run.analysis_to.isoformat()}, "
+                f"current_time={now_utc.isoformat()}. "
+                f"Cannot finalize before the analysis window is complete."
+            )
         
         # Acquire advisory lock
         lock_id = self._calculate_lock_id(business_date)
@@ -192,6 +201,14 @@ class AnalyticsRunner:
         tz_sofia = ZoneInfo("Europe/Sofia")
         now_sofia = datetime.now(tz_sofia)
         return now_sofia.date()
+
+    def _get_previous_business_date(self) -> date:
+        """Get previous business date in Europe/Sofia timezone.
+        
+        Used by finalize command: the previous day's PROVISIONAL run
+        should be finalized.
+        """
+        return self._get_business_date() - timedelta(days=1)
 
     @staticmethod
     def _prepare_run_for_execution(run: AnalysisRun, maturity: Maturity) -> AnalysisRun:

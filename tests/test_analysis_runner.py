@@ -257,13 +257,15 @@ class TestAnalyticsRunner:
         # Mock repository
         self.mock_repo.acquire_advisory_lock.return_value = True
         self.mock_repo.release_advisory_lock.return_value = True
+        # analysis_to must be in the past for FINAL to proceed
+        now = datetime.now(timezone.utc)
         self.mock_repo.get_analysis_run_by_date.return_value = AnalysisRun(
             run_id=uuid4(),
             business_date=date(2026, 9, 12),
             maturity=Maturity.PROVISIONAL,
-            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
-            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
-            observation_cutoff=datetime.now(timezone.utc),
+            analysis_from=now - timedelta(hours=20),
+            analysis_to=now - timedelta(hours=2),
+            observation_cutoff=now,
         )
         
         # Mock cursor for post_exit_backfill (no trades)
@@ -380,6 +382,266 @@ class TestObservationCutoffPropagation:
         self.mock_candle_sync.reconcile_candles.assert_called_once()
         call_kwargs = self.mock_candle_sync.reconcile_candles.call_args[1]
         assert call_kwargs["observation_cutoff"] == cutoff
+
+
+class TestFinalBusinessDateResolution:
+    """Tests for FINAL command business-date resolution."""
+
+    def setup_method(self):
+        self.mock_settings = Mock(spec=Settings)
+        self.mock_settings.analytics_post_exit_hours = 4
+        self.mock_settings.analytics_candle_retention_days = 180
+        self.mock_repo = Mock(spec=AnalyticsRepository)
+        self.mock_conn = MagicMock()
+        self.mock_repo._conn = self.mock_conn
+        self.mock_candle_sync = MagicMock()
+        self.mock_quality_gate = Mock(spec=DataQualityGate)
+        self.mock_retention = Mock(spec=CandleRetention)
+        self.runner = AnalyticsRunner(
+            settings=self.mock_settings,
+            repository=self.mock_repo,
+            candle_sync=self.mock_candle_sync,
+            quality_gate=self.mock_quality_gate,
+            retention=self.mock_retention,
+        )
+
+    def test_provisional_default_date(self):
+        """Test: run command without --date uses current Sofia date."""
+        result_date = self.runner._get_business_date()
+        
+        # Should be today in Europe/Sofia
+        from zoneinfo import ZoneInfo
+        tz_sofia = ZoneInfo("Europe/Sofia")
+        expected = datetime.now(tz_sofia).date()
+        assert result_date == expected
+
+    def test_finalize_default_date(self):
+        """Test: finalize command without --date uses previous Sofia date."""
+        result_date = self.runner._get_previous_business_date()
+        
+        # Should be yesterday in Europe/Sofia
+        from zoneinfo import ZoneInfo
+        tz_sofia = ZoneInfo("Europe/Sofia")
+        expected = (datetime.now(tz_sofia) - timedelta(days=1)).date()
+        assert result_date == expected
+
+    def test_finalize_explicit_date(self):
+        """Test: finalize --date YYYY-MM-DD uses exactly the supplied date."""
+        explicit_date = date(2026, 9, 11)
+        
+        # Create a FINAL run that already exists
+        self.mock_repo.get_analysis_run_by_date.return_value = AnalysisRun(
+            run_id=uuid4(),
+            business_date=explicit_date,
+            maturity=Maturity.FINAL,
+        )
+        
+        result = self.runner.run_final(explicit_date)
+        
+        # Should query for the explicit date, not previous
+        self.mock_repo.get_analysis_run_by_date.assert_called_with(explicit_date)
+        assert result.maturity == Maturity.FINAL
+
+    def test_finalize_previous_date_by_default(self):
+        """Test: finalize without --date queries previous Sofia date."""
+        # Create a PROVISIONAL run for previous date
+        previous_date = self.runner._get_previous_business_date()
+        now = datetime.now(timezone.utc)
+        
+        self.mock_repo.get_analysis_run_by_date.return_value = AnalysisRun(
+            run_id=uuid4(),
+            business_date=previous_date,
+            maturity=Maturity.PROVISIONAL,
+            analysis_from=now - timedelta(hours=20),
+            analysis_to=now - timedelta(hours=2),
+            observation_cutoff=now,
+        )
+        
+        # run_final with no args should use previous date
+        # We need to mock the lock and stages
+        self.mock_repo.acquire_advisory_lock.return_value = True
+        self.mock_repo.release_advisory_lock.return_value = True
+        
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = []
+        self.mock_conn.cursor.return_value = mock_cursor
+        
+        self.mock_quality_gate.run_quality_checks.return_value = (True, [])
+        self.mock_quality_gate.get_blocking_failures.return_value = []
+        
+        result = self.runner.run_final()  # No business_date argument
+        
+        # Should have queried for previous date
+        self.mock_repo.get_analysis_run_by_date.assert_called_with(previous_date)
+
+    def test_final_before_analysis_to_rejected(self):
+        """Test: FINAL before analysis_to is rejected."""
+        now = datetime.now(timezone.utc)
+        # Run whose analysis_to is in the future
+        future_analysis_to = now + timedelta(hours=1)
+        
+        self.mock_repo.get_analysis_run_by_date.return_value = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 11),
+            maturity=Maturity.PROVISIONAL,
+            analysis_from=now - timedelta(hours=20),
+            analysis_to=future_analysis_to,
+            observation_cutoff=now,
+        )
+        
+        with pytest.raises(ValueError, match="FINAL_NOT_READY"):
+            self.runner.run_final(date(2026, 9, 11))
+
+    def test_final_exactly_at_analysis_to_allowed(self):
+        """Test: FINAL exactly at analysis_to is allowed."""
+        now = datetime.now(timezone.utc)
+        # analysis_to is NOW (or just past)
+        analysis_to = now - timedelta(seconds=1)
+        
+        self.mock_repo.get_analysis_run_by_date.return_value = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 11),
+            maturity=Maturity.PROVISIONAL,
+            analysis_from=now - timedelta(hours=20),
+            analysis_to=analysis_to,
+            observation_cutoff=now,
+        )
+        
+        # Mock lock and stages
+        self.mock_repo.acquire_advisory_lock.return_value = True
+        self.mock_repo.release_advisory_lock.return_value = True
+        
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = []
+        self.mock_conn.cursor.return_value = mock_cursor
+        
+        self.mock_quality_gate.run_quality_checks.return_value = (True, [])
+        self.mock_quality_gate.get_blocking_failures.return_value = []
+        
+        result = self.runner.run_final(date(2026, 9, 11))
+        
+        # Should succeed
+        assert result.status == RunStatus.SUCCEEDED
+        assert result.maturity == Maturity.FINAL
+
+    def test_final_after_analysis_to_allowed(self):
+        """Test: FINAL after analysis_to is allowed."""
+        now = datetime.now(timezone.utc)
+        # analysis_to is well in the past
+        analysis_to = now - timedelta(hours=2)
+        
+        self.mock_repo.get_analysis_run_by_date.return_value = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 11),
+            maturity=Maturity.PROVISIONAL,
+            analysis_from=now - timedelta(hours=20),
+            analysis_to=analysis_to,
+            observation_cutoff=now,
+        )
+        
+        # Mock lock and stages
+        self.mock_repo.acquire_advisory_lock.return_value = True
+        self.mock_repo.release_advisory_lock.return_value = True
+        
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = []
+        self.mock_conn.cursor.return_value = mock_cursor
+        
+        self.mock_quality_gate.run_quality_checks.return_value = (True, [])
+        self.mock_quality_gate.get_blocking_failures.return_value = []
+        
+        result = self.runner.run_final(date(2026, 9, 11))
+        
+        assert result.status == RunStatus.SUCCEEDED
+        assert result.maturity == Maturity.FINAL
+
+    def test_missing_provisional_run_clear_failure(self):
+        """Test: missing PROVISIONAL run fails clearly."""
+        self.mock_repo.get_analysis_run_by_date.return_value = None
+        
+        with pytest.raises(ValueError, match="No PROVISIONAL run found"):
+            self.runner.run_final(date(2026, 9, 11))
+
+    def test_existing_final_run_idempotent(self):
+        """Test: existing FINAL run is returned idempotently."""
+        self.mock_repo.get_analysis_run_by_date.return_value = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 11),
+            maturity=Maturity.FINAL,
+        )
+        
+        result = self.runner.run_final(date(2026, 9, 11))
+        
+        assert result.maturity == Maturity.FINAL
+        # Should not acquire lock or run stages
+        self.mock_repo.acquire_advisory_lock.assert_not_called()
+
+    def test_provisional_retry_semantics(self):
+        """Test: failed PROVISIONAL retry still uses current date."""
+        # Create a failed run
+        failed_run = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 12),
+            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
+            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
+            observation_cutoff=datetime(2026, 9, 12, 11, 0, tzinfo=timezone.utc),
+            status=RunStatus.FAILED,
+            maturity=Maturity.FAILED,
+            error_code="STAGE_FAILED",
+            error_message="old error",
+        )
+        
+        self.mock_repo.acquire_advisory_lock.return_value = True
+        self.mock_repo.release_advisory_lock.return_value = True
+        self.mock_repo.get_analysis_run_by_date.return_value = failed_run
+        
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = []
+        self.mock_conn.cursor.return_value = mock_cursor
+        
+        self.mock_quality_gate.run_quality_checks.return_value = (True, [])
+        self.mock_retention.run_retention.return_value = {"total_deleted": 0}
+        
+        # Retry PROVISIONAL for the same date
+        result = self.runner.run_provisional(date(2026, 9, 12))
+        
+        # Should use current date for business_date
+        self.mock_repo.get_analysis_run_by_date.assert_called_with(date(2026, 9, 12))
+        assert result.status == RunStatus.SUCCEEDED
+
+    def test_dst_safe_date_resolution(self):
+        """Test: dates resolve correctly across DST boundaries."""
+        from zoneinfo import ZoneInfo
+        
+        tz_sofia = ZoneInfo("Europe/Sofia")
+        
+        # Test during CET (winter)
+        with patch("app.analytics.runner.ZoneInfo", return_value=tz_sofia):
+            with patch("app.analytics.runner.datetime") as mock_dt:
+                # Winter time: CET (UTC+2)
+                mock_dt.now.return_value = datetime(2026, 1, 15, 12, 0, tzinfo=tz_sofia)
+                mock_dt.combine = datetime.combine
+                mock_dt.min = datetime.min
+                
+                result = self.runner._get_business_date()
+                assert result == date(2026, 1, 15)
+                
+                prev = self.runner._get_previous_business_date()
+                assert prev == date(2026, 1, 14)
+        
+        # Test during CEST (summer)
+        with patch("app.analytics.runner.ZoneInfo", return_value=tz_sofia):
+            with patch("app.analytics.runner.datetime") as mock_dt:
+                # Summer time: CEST (UTC+3)
+                mock_dt.now.return_value = datetime(2026, 7, 15, 12, 0, tzinfo=tz_sofia)
+                mock_dt.combine = datetime.combine
+                mock_dt.min = datetime.min
+                
+                result = self.runner._get_business_date()
+                assert result == date(2026, 7, 15)
+                
+                prev = self.runner._get_previous_business_date()
+                assert prev == date(2026, 7, 14)
 
     def test_post_exit_backfill_passes_observation_cutoff(self):
         """Test that _stage_post_exit_backfill passes observation_cutoff."""
