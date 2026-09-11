@@ -225,8 +225,8 @@ class AnalyticsRunner:
         # Observation cutoff: current time
         observation_cutoff = now_sofia
         
-        # Post-exit horizon
-        post_exit_horizon = f"{self._settings.analytics_post_exit_hours} hours"
+        # Post-exit horizon as timedelta
+        post_exit_horizon = timedelta(hours=self._settings.analytics_post_exit_hours)
         
         run = AnalysisRun(
             business_date=business_date,

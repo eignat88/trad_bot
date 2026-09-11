@@ -10,7 +10,7 @@ from app.analytics.models import (
     AnalysisRun,
     DataQualityResult,
     Severity,
-    StageStatus,
+    QualityCheckStatus,
 )
 from app.analytics.repository import AnalyticsRepository
 
@@ -64,7 +64,7 @@ class DataQualityGate:
         
         # Determine if all BLOCKING checks passed
         passed = all(
-            result.status == StageStatus.PASS
+            result.status == QualityCheckStatus.PASS
             for result in results
             if result.severity == Severity.BLOCKING
         )
@@ -76,7 +76,7 @@ class DataQualityGate:
         logger.info(
             "Quality checks completed for run %s: passed=%d/%d",
             run.run_id,
-            sum(1 for r in results if r.status == StageStatus.PASS),
+            sum(1 for r in results if r.status == QualityCheckStatus.PASS),
             len(results),
         )
         
@@ -97,7 +97,7 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="postgresql_availability",
                 severity=Severity.BLOCKING,
-                status=StageStatus.PASS,
+                status=QualityCheckStatus.PASS,
                 details={"message": "PostgreSQL is available"},
             )
         except Exception as e:
@@ -108,7 +108,7 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="postgresql_availability",
                 severity=Severity.BLOCKING,
-                status=StageStatus.FAILED,
+                status=QualityCheckStatus.FAIL,
                 actual_value={"error": str(e)},
                 details={"message": "PostgreSQL is not available"},
             )
@@ -135,7 +135,7 @@ class DataQualityGate:
                     stage_name=stage_name,
                     check_name="source_timestamps",
                     severity=Severity.BLOCKING,
-                    status=StageStatus.FAILED,
+                    status=QualityCheckStatus.FAIL,
                     actual_value={"future_candle_count": future_candle_count},
                     details={"message": f"Found {future_candle_count} candles with timestamps after observation cutoff"},
                 )
@@ -145,7 +145,7 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="source_timestamps",
                 severity=Severity.BLOCKING,
-                status=StageStatus.PASS,
+                status=QualityCheckStatus.PASS,
                 details={"message": "Source timestamps are within acceptable range"},
             )
         except Exception as e:
@@ -156,7 +156,7 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="source_timestamps",
                 severity=Severity.BLOCKING,
-                status=StageStatus.FAILED,
+                status=QualityCheckStatus.FAIL,
                 actual_value={"error": str(e)},
                 details={"message": "Source timestamps check failed"},
             )
@@ -188,7 +188,7 @@ class DataQualityGate:
                     stage_name=stage_name,
                     check_name="duplicate_candles",
                     severity=Severity.BLOCKING,
-                    status=StageStatus.FAILED,
+                    status=QualityCheckStatus.FAIL,
                     actual_value={"duplicate_count": duplicate_count},
                     details={"message": f"Found {duplicate_count} duplicate candle groups"},
                 )
@@ -198,7 +198,7 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="duplicate_candles",
                 severity=Severity.BLOCKING,
-                status=StageStatus.PASS,
+                status=QualityCheckStatus.PASS,
                 details={"message": "No duplicate candles found"},
             )
         except Exception as e:
@@ -209,7 +209,7 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="duplicate_candles",
                 severity=Severity.BLOCKING,
-                status=StageStatus.FAILED,
+                status=QualityCheckStatus.FAIL,
                 actual_value={"error": str(e)},
                 details={"message": "Duplicate candles check failed"},
             )
@@ -242,7 +242,7 @@ class DataQualityGate:
                     stage_name=stage_name,
                     check_name="ohlc_validation",
                     severity=Severity.BLOCKING,
-                    status=StageStatus.FAILED,
+                    status=QualityCheckStatus.FAIL,
                     actual_value={"invalid_candle_count": invalid_count},
                     details={"message": f"Found {invalid_count} candles with invalid OHLC"},
                 )
@@ -252,7 +252,7 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="ohlc_validation",
                 severity=Severity.BLOCKING,
-                status=StageStatus.PASS,
+                status=QualityCheckStatus.PASS,
                 details={"message": "All candles have valid OHLC"},
             )
         except Exception as e:
@@ -263,7 +263,7 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="ohlc_validation",
                 severity=Severity.BLOCKING,
-                status=StageStatus.FAILED,
+                status=QualityCheckStatus.FAIL,
                 actual_value={"error": str(e)},
                 details={"message": "OHLC validation check failed"},
             )
@@ -306,7 +306,7 @@ class DataQualityGate:
                     stage_name=stage_name,
                     check_name="closed_candle_intervals",
                     severity=Severity.BLOCKING,
-                    status=StageStatus.FAILED,
+                    status=QualityCheckStatus.FAIL,
                     actual_value={"invalid_interval_count": invalid_interval_count},
                     details={"message": f"Found {invalid_interval_count} candles with incorrect intervals"},
                 )
@@ -316,7 +316,7 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="closed_candle_intervals",
                 severity=Severity.BLOCKING,
-                status=StageStatus.PASS,
+                status=QualityCheckStatus.PASS,
                 details={"message": "Closed candle intervals are correct"},
             )
         except Exception as e:
@@ -327,7 +327,7 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="closed_candle_intervals",
                 severity=Severity.BLOCKING,
-                status=StageStatus.FAILED,
+                status=QualityCheckStatus.FAIL,
                 actual_value={"error": str(e)},
                 details={"message": "Closed candle intervals check failed"},
             )
@@ -363,17 +363,17 @@ class DataQualityGate:
                     stage_name=stage_name,
                     check_name="post_exit_coverage",
                     severity=Severity.WARNING if run.maturity.value == "PROVISIONAL" else Severity.BLOCKING,
-                    status=StageStatus.PASS,
+                    status=QualityCheckStatus.PASS,
                     details={"message": "No trades found requiring post-exit coverage"},
                 )
             
-            # Parse post_exit_horizon from run
-            post_exit_hours = int(run.post_exit_horizon.split()[0]) if run.post_exit_horizon else 4
+            # Use post_exit_horizon directly as timedelta
+            post_exit_horizon = run.post_exit_horizon if run.post_exit_horizon else timedelta(hours=4)
             
             missing_coverage = []
             for trade in trades:
                 symbol, closed_at, entry_timeframe, trade_count = trade
-                post_exit_end = closed_at + timedelta(hours=post_exit_hours)
+                post_exit_end = closed_at + post_exit_horizon
                 
                 # Check if we have candles covering the post-exit period
                 # Note: market.candle uses instrument_id, not symbol
@@ -427,7 +427,7 @@ class DataQualityGate:
                     stage_name=stage_name,
                     check_name="post_exit_coverage",
                     severity=severity,
-                    status=StageStatus.FAILED,
+                    status=QualityCheckStatus.FAIL,
                     affected_entity_count=len(missing_coverage),
                     actual_value={"missing_coverage": missing_coverage},
                     details={"message": f"Found {len(missing_coverage)} trades with incomplete post-exit coverage"},
@@ -438,7 +438,7 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="post_exit_coverage",
                 severity=Severity.WARNING if run.maturity.value == "PROVISIONAL" else Severity.BLOCKING,
-                status=StageStatus.PASS,
+                status=QualityCheckStatus.PASS,
                 details={"message": "Post-exit coverage is sufficient for all trades"},
             )
         except Exception as e:
@@ -449,7 +449,7 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="post_exit_coverage",
                 severity=Severity.WARNING if run.maturity.value == "PROVISIONAL" else Severity.BLOCKING,
-                status=StageStatus.FAILED,
+                status=QualityCheckStatus.FAIL,
                 actual_value={"error": str(e)},
                 details={"message": "Post-exit coverage check failed"},
             )
@@ -492,7 +492,7 @@ class DataQualityGate:
                         stage_name=stage_name,
                         check_name="lifecycle_timestamps",
                         severity=Severity.BLOCKING,
-                        status=StageStatus.FAILED,
+                        status=QualityCheckStatus.FAIL,
                         actual_value={
                             "started_at": run.started_at.isoformat(),
                             "finished_at": run.finished_at.isoformat(),
@@ -505,7 +505,7 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="lifecycle_timestamps",
                 severity=Severity.BLOCKING,
-                status=StageStatus.PASS,
+                status=QualityCheckStatus.PASS,
                 details={"message": "Lifecycle timestamps are valid"},
             )
         except Exception as e:
@@ -516,7 +516,7 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="lifecycle_timestamps",
                 severity=Severity.BLOCKING,
-                status=StageStatus.FAILED,
+                status=QualityCheckStatus.FAIL,
                 actual_value={"error": str(e)},
                 details={"message": "Lifecycle timestamps check failed"},
             )
@@ -544,7 +544,7 @@ class DataQualityGate:
                     stage_name=stage_name,
                     check_name="data_freshness",
                     severity=Severity.WARNING,
-                    status=StageStatus.SKIPPED,
+                    status=QualityCheckStatus.SKIPPED,
                     details={"message": "No candles found to check freshness"},
                 )
             
@@ -583,7 +583,7 @@ class DataQualityGate:
                     stage_name=stage_name,
                     check_name="data_freshness",
                     severity=Severity.WARNING,
-                    status=StageStatus.FAILED,
+                    status=QualityCheckStatus.FAIL,
                     actual_value={
                         "latest_candle": latest_candle.isoformat(),
                         "freshness_minutes": freshness_minutes,
@@ -598,7 +598,7 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="data_freshness",
                 severity=Severity.WARNING,
-                status=StageStatus.PASS,
+                status=QualityCheckStatus.PASS,
                 actual_value={
                     "latest_candle": latest_candle.isoformat(),
                     "freshness_minutes": freshness_minutes,
@@ -614,7 +614,7 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="data_freshness",
                 severity=Severity.WARNING,
-                status=StageStatus.FAILED,
+                status=QualityCheckStatus.FAIL,
                 actual_value={"error": str(e)},
                 details={"message": "Data freshness check failed"},
             )
@@ -623,7 +623,7 @@ class DataQualityGate:
         """Check if any BLOCKING checks failed."""
         return any(
             result.severity == Severity.BLOCKING
-            and result.status == StageStatus.FAILED
+            and result.status == QualityCheckStatus.FAIL
             for result in results
         )
 
@@ -633,20 +633,20 @@ class DataQualityGate:
             result
             for result in results
             if result.severity == Severity.BLOCKING
-            and result.status == StageStatus.FAILED
+            and result.status == QualityCheckStatus.FAIL
         ]
 
     def get_summary(self, results: list[DataQualityResult]) -> dict[str, Any]:
         """Get summary of quality check results."""
         total = len(results)
-        passed = sum(1 for r in results if r.status == StageStatus.PASS)
-        failed = sum(1 for r in results if r.status == StageStatus.FAILED)
-        skipped = sum(1 for r in results if r.status == StageStatus.SKIPPED)
+        passed = sum(1 for r in results if r.status == QualityCheckStatus.PASS)
+        failed = sum(1 for r in results if r.status == QualityCheckStatus.FAIL)
+        skipped = sum(1 for r in results if r.status == QualityCheckStatus.SKIPPED)
         
         blocking_failed = sum(
             1
             for r in results
-            if r.severity == Severity.BLOCKING and r.status == StageStatus.FAILED
+            if r.severity == Severity.BLOCKING and r.status == QualityCheckStatus.FAIL
         )
         
         return {

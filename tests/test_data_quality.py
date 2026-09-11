@@ -13,6 +13,7 @@ from app.analytics.models import (
     Maturity,
     Severity,
     StageStatus,
+    QualityCheckStatus,
 )
 from app.analytics.repository import AnalyticsRepository
 
@@ -47,7 +48,7 @@ class TestDataQualityGate:
         )
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.PASS
+        assert result.status == QualityCheckStatus.PASS
 
     def test_check_postgresql_availability_failure(self):
         """Test PostgreSQL availability check failure."""
@@ -59,7 +60,7 @@ class TestDataQualityGate:
         )
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.FAILED
+        assert result.status == QualityCheckStatus.FAIL
 
     def test_check_source_timestamps(self):
         """Test source timestamps check."""
@@ -69,7 +70,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_source_timestamps(self.run, "quality_gate")
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.PASS
+        assert result.status == QualityCheckStatus.PASS
 
     def test_check_source_timestamps_failure(self):
         """Test source timestamps check failure."""
@@ -79,7 +80,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_source_timestamps(self.run, "quality_gate")
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.FAILED
+        assert result.status == QualityCheckStatus.FAIL
         assert result.actual_value["future_candle_count"] == 5
 
     def test_check_duplicate_candles(self):
@@ -90,7 +91,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_duplicate_candles(self.run, "quality_gate")
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.PASS
+        assert result.status == QualityCheckStatus.PASS
 
     def test_check_duplicate_candles_failure(self):
         """Test duplicate candles check failure."""
@@ -100,7 +101,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_duplicate_candles(self.run, "quality_gate")
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.FAILED
+        assert result.status == QualityCheckStatus.FAIL
         assert result.actual_value["duplicate_count"] == 3
 
     def test_check_ohlc_validation(self):
@@ -111,7 +112,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_ohlc_validation(self.run, "quality_gate")
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.PASS
+        assert result.status == QualityCheckStatus.PASS
 
     def test_check_ohlc_validation_failure(self):
         """Test OHLC validation check failure."""
@@ -121,7 +122,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_ohlc_validation(self.run, "quality_gate")
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.FAILED
+        assert result.status == QualityCheckStatus.FAIL
         assert result.actual_value["invalid_candle_count"] == 2
 
     def test_check_closed_candle_intervals(self):
@@ -132,7 +133,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_closed_candle_intervals(self.run, "quality_gate")
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.PASS
+        assert result.status == QualityCheckStatus.PASS
 
     def test_check_closed_candle_intervals_failure(self):
         """Test closed candle intervals check failure."""
@@ -142,7 +143,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_closed_candle_intervals(self.run, "quality_gate")
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.FAILED
+        assert result.status == QualityCheckStatus.FAIL
         assert result.actual_value["invalid_interval_count"] == 1
 
     def test_check_post_exit_coverage(self):
@@ -154,7 +155,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_post_exit_coverage(self.run, "quality_gate")
         
         assert result.severity == Severity.WARNING
-        assert result.status == StageStatus.PASS
+        assert result.status == QualityCheckStatus.PASS
 
     def test_check_post_exit_coverage_failure(self):
         """Test post-exit coverage check failure."""
@@ -173,7 +174,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_post_exit_coverage(self.run, "quality_gate")
         
         assert result.severity == Severity.WARNING
-        assert result.status == StageStatus.FAILED
+        assert result.status == QualityCheckStatus.FAIL
 
     def test_check_lifecycle_timestamps(self):
         """Test lifecycle timestamps check."""
@@ -184,7 +185,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_lifecycle_timestamps(self.run, "quality_gate")
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.PASS
+        assert result.status == QualityCheckStatus.PASS
 
     def test_check_lifecycle_timestamps_failure(self):
         """Test lifecycle timestamps check failure."""
@@ -195,7 +196,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_lifecycle_timestamps(self.run, "quality_gate")
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.FAILED
+        assert result.status == QualityCheckStatus.FAIL
 
     def test_check_data_freshness(self):
         """Test data freshness check."""
@@ -208,7 +209,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_data_freshness(self.run, "quality_gate")
         
         assert result.severity == Severity.WARNING
-        assert result.status == StageStatus.PASS
+        assert result.status == QualityCheckStatus.PASS
 
     def test_check_data_freshness_failure(self):
         """Test data freshness check failure."""
@@ -221,7 +222,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_data_freshness(self.run, "quality_gate")
         
         assert result.severity == Severity.WARNING
-        assert result.status == StageStatus.FAILED
+        assert result.status == QualityCheckStatus.FAIL
 
     def test_has_blocking_failures(self):
         """Test has_blocking_failures method."""
@@ -231,14 +232,14 @@ class TestDataQualityGate:
                 stage_name="quality_gate",
                 check_name="test1",
                 severity=Severity.BLOCKING,
-                status=StageStatus.SUCCEEDED,
+                status=QualityCheckStatus.PASS,
             ),
             DataQualityResult(
                 run_id=self.run.run_id,
                 stage_name="quality_gate",
                 check_name="test2",
                 severity=Severity.BLOCKING,
-                status=StageStatus.FAILED,
+                status=QualityCheckStatus.FAIL,
             ),
         ]
         
@@ -252,21 +253,21 @@ class TestDataQualityGate:
                 stage_name="quality_gate",
                 check_name="test1",
                 severity=Severity.BLOCKING,
-                status=StageStatus.SUCCEEDED,
+                status=QualityCheckStatus.PASS,
             ),
             DataQualityResult(
                 run_id=self.run.run_id,
                 stage_name="quality_gate",
                 check_name="test2",
                 severity=Severity.BLOCKING,
-                status=StageStatus.FAILED,
+                status=QualityCheckStatus.FAIL,
             ),
             DataQualityResult(
                 run_id=self.run.run_id,
                 stage_name="quality_gate",
                 check_name="test3",
                 severity=Severity.WARNING,
-                status=StageStatus.FAILED,
+                status=QualityCheckStatus.FAIL,
             ),
         ]
         
@@ -283,21 +284,21 @@ class TestDataQualityGate:
                 stage_name="quality_gate",
                 check_name="test1",
                 severity=Severity.BLOCKING,
-                status=StageStatus.PASS,
+                status=QualityCheckStatus.PASS,
             ),
             DataQualityResult(
                 run_id=self.run.run_id,
                 stage_name="quality_gate",
                 check_name="test2",
                 severity=Severity.BLOCKING,
-                status=StageStatus.FAILED,
+                status=QualityCheckStatus.FAIL,
             ),
             DataQualityResult(
                 run_id=self.run.run_id,
                 stage_name="quality_gate",
                 check_name="test3",
                 severity=Severity.WARNING,
-                status=StageStatus.SKIPPED,
+                status=QualityCheckStatus.SKIPPED,
             ),
         ]
         

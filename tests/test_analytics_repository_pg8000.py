@@ -17,6 +17,7 @@ from app.analytics.models import (
     RunStatus,
     StageStatus,
     Severity,
+    QualityCheckStatus,
     QualityStatus,
 )
 from app.analytics.repository import AnalyticsRepository
@@ -41,6 +42,12 @@ def pg8000_conn():
 @pytest.fixture
 def repository(pg8000_conn):
     """Create AnalyticsRepository with real pg8000 connection."""
+    # First, rollback any aborted transaction
+    try:
+        pg8000_conn.rollback()
+    except Exception:
+        pass
+    
     # Clean up before each test
     cursor = pg8000_conn.cursor()
     cursor.execute("DELETE FROM analytics.data_quality_result")
@@ -53,6 +60,11 @@ def repository(pg8000_conn):
     yield repo
     
     # Clean up after each test
+    try:
+        pg8000_conn.rollback()
+    except Exception:
+        pass
+    
     cursor = pg8000_conn.cursor()
     cursor.execute("DELETE FROM analytics.data_quality_result")
     cursor.execute("DELETE FROM analytics.analysis_stage_run")
@@ -210,7 +222,7 @@ class TestAnalyticsRepositoryPG8000:
             stage_name="quality_gate",
             check_name="postgresql_availability",
             severity=Severity.BLOCKING,
-            status=StageStatus.PASS,  # Use PASS for data_quality_result
+            status=QualityCheckStatus.PASS,
             details={"message": "PostgreSQL is available"},
         )
         
@@ -471,3 +483,190 @@ class TestPG8000PlaceholderRegression:
             # If there are any placeholders, they should all be positional
             if positional_count + named_count > 0:
                 assert named_count == 0, f"Method {name} has {named_count} named placeholders"
+
+
+class TestPostExitHorizonRoundTrip:
+    """Tests for post_exit_horizon timedelta round-trip through PostgreSQL."""
+
+    def test_interval_round_trip(self, repository):
+        """Test INTERVAL round-trip: create AnalysisRun with 4 hour horizon,
+        persist, reload, execute post-exit coverage — no string parsing error."""
+        from datetime import timedelta
+
+        horizon = timedelta(hours=4)
+        run = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 12),
+            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
+            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
+            observation_cutoff=datetime.now(timezone.utc),
+            post_exit_horizon=horizon,
+        )
+
+        # Persist
+        repository.create_analysis_run(run)
+
+        # Reload
+        reloaded = repository.get_analysis_run(run.run_id)
+        assert reloaded is not None
+        assert isinstance(reloaded.post_exit_horizon, timedelta)
+        assert reloaded.post_exit_horizon == horizon
+
+        # Execute post-exit coverage — should not raise AttributeError
+        from app.analytics.quality import DataQualityGate
+        gate = DataQualityGate(repository)
+        result = gate._check_post_exit_coverage(reloaded, "quality_gate")
+        assert result is not None
+        assert result.check_name == "post_exit_coverage"
+
+    def test_interval_default_when_none(self, repository):
+        """Test that model default of 4 hours is used when no explicit value given."""
+        from datetime import timedelta
+
+        # Create with explicit 4 hour horizon (the default)
+        run = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 12),
+            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
+            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
+            observation_cutoff=datetime.now(timezone.utc),
+            # post_exit_horizon defaults to timedelta(hours=4)
+        )
+
+        repository.create_analysis_run(run)
+        reloaded = repository.get_analysis_run(run.run_id)
+        assert reloaded is not None
+        assert reloaded.post_exit_horizon == timedelta(hours=4)
+
+    def test_interval_6_hours_round_trip(self, repository):
+        """Test non-default interval round-trip."""
+        from datetime import timedelta
+
+        horizon = timedelta(hours=6)
+        run = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 12),
+            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
+            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
+            observation_cutoff=datetime.now(timezone.utc),
+            post_exit_horizon=horizon,
+        )
+
+        repository.create_analysis_run(run)
+        reloaded = repository.get_analysis_run(run.run_id)
+        assert reloaded.post_exit_horizon == horizon
+
+
+class TestQualityCheckStatusValues:
+    """Tests that verify database quality_result status values."""
+
+    def test_quality_result_pass_persists(self, repository):
+        """Test that PASS status is accepted by database."""
+        run = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 12),
+            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
+            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
+            observation_cutoff=datetime.now(timezone.utc),
+        )
+        repository.create_analysis_run(run)
+
+        result = DataQualityResult(
+            run_id=run.run_id,
+            stage_name="quality_gate",
+            check_name="test_pass",
+            severity=Severity.BLOCKING,
+            status=QualityCheckStatus.PASS,
+            details={"message": "test"},
+        )
+        created = repository.create_quality_result(result)
+        assert created.quality_result_id is not None
+
+    def test_quality_result_fail_persists(self, repository):
+        """Test that FAIL status is accepted by database."""
+        run = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 12),
+            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
+            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
+            observation_cutoff=datetime.now(timezone.utc),
+        )
+        repository.create_analysis_run(run)
+
+        result = DataQualityResult(
+            run_id=run.run_id,
+            stage_name="quality_gate",
+            check_name="test_fail",
+            severity=Severity.WARNING,
+            status=QualityCheckStatus.FAIL,
+            details={"message": "test failure"},
+        )
+        created = repository.create_quality_result(result)
+        assert created.quality_result_id is not None
+
+    def test_quality_result_skipped_persists(self, repository):
+        """Test that SKIPPED status is accepted by database."""
+        run = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 12),
+            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
+            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
+            observation_cutoff=datetime.now(timezone.utc),
+        )
+        repository.create_analysis_run(run)
+
+        result = DataQualityResult(
+            run_id=run.run_id,
+            stage_name="quality_gate",
+            check_name="test_skipped",
+            severity=Severity.WARNING,
+            status=QualityCheckStatus.SKIPPED,
+            details={"message": "skipped"},
+        )
+        created = repository.create_quality_result(result)
+        assert created.quality_result_id is not None
+
+    def test_quality_result_failed_not_accepted(self, repository):
+        """Test that StageStatus.FAILED is NOT accepted by database."""
+        run = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 12),
+            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
+            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
+            observation_cutoff=datetime.now(timezone.utc),
+        )
+        repository.create_analysis_run(run)
+
+        # Intentionally use wrong status type
+        result = DataQualityResult(
+            run_id=run.run_id,
+            stage_name="quality_gate",
+            check_name="test_wrong_status",
+            severity=Severity.WARNING,
+            status="FAILED",  # Raw string, not QualityCheckStatus
+            details={"message": "wrong"},
+        )
+        with pytest.raises(Exception):
+            repository.create_quality_result(result)
+
+    def test_quality_result_succeeded_not_accepted(self, repository):
+        """Test that StageStatus.SUCCEEDED is NOT accepted by database."""
+        run = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 12),
+            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
+            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
+            observation_cutoff=datetime.now(timezone.utc),
+        )
+        repository.create_analysis_run(run)
+
+        result = DataQualityResult(
+            run_id=run.run_id,
+            stage_name="quality_gate",
+            check_name="test_wrong_status",
+            severity=Severity.WARNING,
+            status="SUCCEEDED",  # Raw string, not QualityCheckStatus
+            details={"message": "wrong"},
+        )
+        with pytest.raises(Exception):
+            repository.create_quality_result(result)

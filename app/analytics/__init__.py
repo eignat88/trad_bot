@@ -7,6 +7,7 @@ from .models import (
     RunStatus,
     StageStatus,
     Severity,
+    QualityCheckStatus,
     QualityStatus,
 )
 from .repository import AnalyticsRepository
@@ -25,6 +26,7 @@ __all__ = [
     "RunStatus",
     "StageStatus",
     "Severity",
+    "QualityCheckStatus",
     "QualityStatus",
     "AnalyticsRepository",
     "CandleSync",

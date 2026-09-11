@@ -15,6 +15,7 @@ from app.analytics.models import (
     RunStatus,
     StageStatus,
     Severity,
+    QualityCheckStatus,
     QualityStatus,
     Watermark,
 )
@@ -487,7 +488,17 @@ class AnalyticsRepository:
         run_id = row[0]
         if isinstance(run_id, str):
             run_id = UUID(run_id)
-        # If it's already a UUID object, use it directly
+        
+        # Handle INTERVAL → timedelta conversion
+        # pg8000 returns Python datetime.timedelta for PostgreSQL INTERVAL
+        post_exit_horizon = row[6]
+        if isinstance(post_exit_horizon, str):
+            # Fallback: parse string "4 hours" → timedelta
+            parts = post_exit_horizon.split()
+            hours = int(parts[0]) if parts else 4
+            post_exit_horizon = timedelta(hours=hours)
+        elif not isinstance(post_exit_horizon, timedelta):
+            post_exit_horizon = timedelta(hours=4)
         
         return AnalysisRun(
             run_id=run_id,
@@ -496,7 +507,7 @@ class AnalyticsRepository:
             analysis_from=row[3],
             analysis_to=row[4],
             observation_cutoff=row[5],
-            post_exit_horizon=row[6],
+            post_exit_horizon=post_exit_horizon,
             maturity=Maturity(row[7]),
             status=RunStatus(row[8]),
             pipeline_version=row[9],

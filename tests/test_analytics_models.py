@@ -14,6 +14,7 @@ from app.analytics.models import (
     RunStatus,
     StageStatus,
     Severity,
+    QualityCheckStatus,
     QualityStatus,
     CandleRange,
     Gap,
@@ -121,12 +122,12 @@ class TestDataQualityResult:
             stage_name="quality_gate",
             check_name="postgresql_availability",
             severity=Severity.BLOCKING,
-            status=StageStatus.SUCCEEDED,
+            status=QualityCheckStatus.PASS,
         )
         
         assert result.check_name == "postgresql_availability"
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.SUCCEEDED
+        assert result.status == QualityCheckStatus.PASS
 
     def test_severity_levels(self):
         """Test all severity levels."""
@@ -136,7 +137,7 @@ class TestDataQualityResult:
                 stage_name="test_stage",
                 check_name="test_check",
                 severity=severity,
-                status=StageStatus.SUCCEEDED,
+                status=QualityCheckStatus.PASS,
             )
             assert result.severity == severity
 

@@ -16,6 +16,7 @@ from app.analytics.models import (
     RunStatus,
     StageStatus,
     Severity,
+    QualityCheckStatus,
     QualityStatus,
 )
 
@@ -160,7 +161,7 @@ class TestAnalyticsRepository:
             stage_run_id=1,
             run_id=uuid4(),
             stage_name="candle_reconciliation",
-            status=StageStatus.SUCCEEDED,
+            status=QualityCheckStatus.PASS,
             input_rows=100,
             output_rows=95,
         )
@@ -170,7 +171,7 @@ class TestAnalyticsRepository:
         
         result = self.repository.update_stage_run(stage_run)
         
-        assert result.status == StageStatus.SUCCEEDED
+        assert result.status == QualityCheckStatus.PASS
         self.mock_conn.commit.assert_called_once()
 
     def test_create_quality_result(self):
@@ -180,7 +181,7 @@ class TestAnalyticsRepository:
             stage_name="quality_gate",
             check_name="postgresql_availability",
             severity=Severity.BLOCKING,
-            status=StageStatus.SUCCEEDED,
+            status=QualityCheckStatus.PASS,
         )
         
         # Mock cursor

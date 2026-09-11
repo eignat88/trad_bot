@@ -14,6 +14,7 @@ from app.analytics.models import (
     RunStatus,
     StageStatus,
     Severity,
+    QualityCheckStatus,
 )
 from app.analytics.quality import DataQualityGate
 from app.analytics.repository import AnalyticsRepository
@@ -97,7 +98,7 @@ class TestPostExitCoverageProduction:
         
         result = quality_gate._check_post_exit_coverage(run, "quality_gate")
         
-        assert result.status == StageStatus.PASS
+        assert result.status == QualityCheckStatus.PASS
         assert result.check_name == "post_exit_coverage"
 
     def test_closed_trade_with_full_coverage(self, quality_gate, repository, pg8000_conn):
@@ -191,7 +192,7 @@ class TestPostExitCoverageProduction:
         result = quality_gate._check_post_exit_coverage(run, "quality_gate")
 
         # Full coverage → PASS
-        assert result.status == StageStatus.PASS
+        assert result.status == QualityCheckStatus.PASS
         assert result.check_name == "post_exit_coverage"
 
     def test_closed_trade_with_missing_coverage(self, quality_gate, repository, pg8000_conn):
@@ -265,7 +266,7 @@ class TestPostExitCoverageProduction:
         result = quality_gate._check_post_exit_coverage(run, "quality_gate")
 
         # Missing candles → FAIL with WARNING severity (PROVISIONAL)
-        assert result.status == StageStatus.FAILED
+        assert result.status == QualityCheckStatus.FAIL
         assert result.severity == Severity.WARNING
         assert result.affected_entity_count == 1
 
@@ -301,7 +302,7 @@ class TestTransactionRecovery:
             stage_name="quality_gate",
             check_name="test_check",
             severity=Severity.BLOCKING,
-            status=StageStatus.PASS,
+            status=QualityCheckStatus.PASS,
             details={"message": "Test check"},
         )
         

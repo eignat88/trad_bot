@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
@@ -24,17 +24,23 @@ class RunStatus(enum.Enum):
     SKIPPED = "SKIPPED"
 
 
+class QualityCheckStatus(enum.Enum):
+    """Status for data quality check results.
+    
+    This is distinct from StageStatus which tracks pipeline stage execution.
+    """
+    PASS = "PASS"
+    FAIL = "FAIL"
+    SKIPPED = "SKIPPED"
+
+
 class StageStatus(enum.Enum):
-    """Status of analysis stages."""
+    """Status of analysis pipeline stages (execution tracking)."""
     CREATED = "CREATED"
     RUNNING = "RUNNING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
-    
-    # Database-compatible values for data_quality_result
-    PASS = "PASS"
-    FAIL = "FAIL"
 
 
 class Severity(enum.Enum):
@@ -60,7 +66,7 @@ class AnalysisRun:
     analysis_from: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     analysis_to: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     observation_cutoff: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    post_exit_horizon: str = "4 hours"
+    post_exit_horizon: timedelta = field(default_factory=lambda: timedelta(hours=4))
     maturity: Maturity = Maturity.PROVISIONAL
     status: RunStatus = RunStatus.CREATED
     pipeline_version: str = "1.0.0"
@@ -123,7 +129,7 @@ class DataQualityResult:
     scope_type: Optional[str] = None
     scope_id: Optional[str] = None
     severity: Severity = Severity.WARNING
-    status: StageStatus = StageStatus.CREATED
+    status: QualityCheckStatus = QualityCheckStatus.PASS
     expected_value: Optional[dict[str, Any]] = None
     actual_value: Optional[dict[str, Any]] = None
     affected_entity_count: Optional[int] = None
