@@ -99,6 +99,9 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- 5. Add trigger for candle validation
+DROP TRIGGER IF EXISTS validate_candle_data
+    ON market.candle;
+
 CREATE TRIGGER validate_candle_data
     BEFORE INSERT OR UPDATE ON market.candle
     FOR EACH ROW
@@ -197,8 +200,8 @@ CREATE OR REPLACE FUNCTION market.check_candle_coverage(
 ) AS $$
 DECLARE
     timeframe_minutes INTEGER;
-    current_time TIMESTAMPTZ;
-    next_time TIMESTAMPTZ;
+    v_current_time TIMESTAMPTZ;
+    v_next_time TIMESTAMPTZ;
     candle_exists BOOLEAN;
 BEGIN
     -- Convert timeframe to minutes
@@ -220,27 +223,26 @@ BEGIN
     END CASE;
     
     -- Check each time slot
-    current_time := p_from;
-    WHILE current_time < p_to LOOP
-        next_time := current_time + (timeframe_minutes || ' minutes')::INTERVAL;
-        
-        -- Check if candle exists for this time slot
+    v_current_time := p_from;
+    WHILE v_current_time < p_to LOOP
+        v_next_time := v_current_time + (timeframe_minutes || ' minutes')::INTERVAL;
+
         SELECT EXISTS(
             SELECT 1 FROM market.candle
             WHERE instrument_id = p_instrument_id
-            AND timeframe = p_timeframe
-            AND open_time = current_time
-            AND is_closed = TRUE
+              AND timeframe = p_timeframe
+              AND open_time = v_current_time
+              AND is_closed = TRUE
         ) INTO candle_exists;
-        
+
         IF NOT candle_exists THEN
-            gap_start := current_time;
-            gap_end := next_time;
-            gap_duration := next_time - current_time;
+            gap_start := v_current_time;
+            gap_end := v_next_time;
+            gap_duration := v_next_time - v_current_time;
             RETURN NEXT;
         END IF;
-        
-        current_time := next_time;
+
+        v_current_time := v_next_time;
     END LOOP;
 END;
 $$ LANGUAGE plpgsql;

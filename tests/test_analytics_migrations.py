@@ -5,6 +5,9 @@ import pytest
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from pathlib import Path
+import subprocess
+
 from app.analytics.models import (
     AnalysisRun,
     AnalysisStageRun,
@@ -16,6 +19,33 @@ from app.analytics.models import (
     Severity,
     QualityStatus,
 )
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+MIGRATION_008 = ROOT / "sql" / "migrations" / "008_analytics_foundation.sql"
+MIGRATION_009 = ROOT / "sql" / "migrations" / "009_market_candle.sql"
+
+
+def run_psql_migration(path: Path) -> subprocess.CompletedProcess[str]:
+    """Run a migration against the isolated PostgreSQL 17 test database."""
+    psql = Path(r"C:\Program Files\PostgreSQL\17\bin\psql.exe")
+
+    return subprocess.run(
+        [
+            str(psql),
+            "-U", "postgres",
+            "-h", "localhost",
+            "-p", "5432",
+            "-d", "trad_bot_migration_test",
+            "-v", "ON_ERROR_STOP=1",
+            "-f", str(path),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
 class TestAnalyticsMigrations:
@@ -112,22 +142,97 @@ class TestAnalyticsMigrations:
         assert result is not None
 
     def test_migration_008_is_idempotent(self, db_session):
-        """Test that migration 008 can be run multiple times."""
-        # This test would run the migration twice and verify no errors
-        # In practice, this would be tested with a real database
-        pass
+        """Migration 008 can be executed repeatedly without errors."""
+        first = run_psql_migration(MIGRATION_008)
+        assert first.returncode == 0, first.stderr
+
+        second = run_psql_migration(MIGRATION_008)
+        assert second.returncode == 0, second.stderr
+
+        cursor = db_session.cursor()
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.triggers
+            WHERE event_object_schema = 'analytics'
+              AND event_object_table = 'analysis_run'
+              AND trigger_name = 'update_analysis_run_updated_at'
+            """
+        )
+        assert cursor.fetchone()[0] == 1
 
     def test_migration_009_is_idempotent(self, db_session):
-        """Test that migration 009 can be run multiple times."""
-        # This test would run the migration twice and verify no errors
-        # In practice, this would be tested with a real database
-        pass
+        """Migration 009 can be executed repeatedly without errors."""
+        first = run_psql_migration(MIGRATION_009)
+        assert first.returncode == 0, first.stderr
+
+        second = run_psql_migration(MIGRATION_009)
+        assert second.returncode == 0, second.stderr
+
+        cursor = db_session.cursor()
+        cursor.execute(
+            """
+            SELECT COUNT(DISTINCT trigger_name)
+            FROM information_schema.triggers
+            WHERE event_object_schema = 'market'
+              AND event_object_table = 'candle'
+              AND trigger_name = 'validate_candle_data'
+            """
+        )
+        assert cursor.fetchone()[0] == 1
 
     def test_migration_preserves_existing_data(self, db_session):
-        """Test that migrations don't damage existing data."""
-        # This test would verify that existing tables and data are not affected
-        # In practice, this would be tested with a real database
-        pass
+        """Analytics migrations must not modify existing DDS/config/mart objects."""
+        cursor = db_session.cursor()
+
+        cursor.execute(
+            """
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_schema IN ('dds', 'config', 'mart')
+            ORDER BY table_schema, table_name
+            """
+        )
+        before_tables = cursor.fetchall()
+
+        cursor.execute(
+            """
+            SELECT schemaname, tablename, indexname
+            FROM pg_indexes
+            WHERE schemaname IN ('dds', 'config', 'mart')
+            ORDER BY schemaname, tablename, indexname
+            """
+        )
+        before_indexes = cursor.fetchall()
+
+        result_008 = run_psql_migration(MIGRATION_008)
+        assert result_008.returncode == 0, result_008.stderr
+
+        result_009 = run_psql_migration(MIGRATION_009)
+        assert result_009.returncode == 0, result_009.stderr
+
+        cursor.execute(
+            """
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_schema IN ('dds', 'config', 'mart')
+            ORDER BY table_schema, table_name
+            """
+        )
+        after_tables = cursor.fetchall()
+
+        cursor.execute(
+            """
+            SELECT schemaname, tablename, indexname
+            FROM pg_indexes
+            WHERE schemaname IN ('dds', 'config', 'mart')
+            ORDER BY schemaname, tablename, indexname
+            """
+        )
+        after_indexes = cursor.fetchall()
+
+        assert after_tables == before_tables
+        assert after_indexes == before_indexes
 
     def test_migration_creates_indexes(self, db_session):
         """Test that migrations create proper indexes."""

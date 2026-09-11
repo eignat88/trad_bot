@@ -113,6 +113,9 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- 10. Add trigger to analysis_run
+DROP TRIGGER IF EXISTS update_analysis_run_updated_at
+    ON analytics.analysis_run;
+
 CREATE TRIGGER update_analysis_run_updated_at
     BEFORE UPDATE ON analytics.analysis_run
     FOR EACH ROW
