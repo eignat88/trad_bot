@@ -12,7 +12,7 @@ from app.analytics.models import (
     Severity,
     QualityCheckStatus,
 )
-from app.analytics.candle_sync import normalize_timeframe
+from app.analytics.candle_sync import normalize_timeframe, align_to_grid
 from app.analytics.repository import AnalyticsRepository
 
 logger = logging.getLogger(__name__)
@@ -406,6 +406,10 @@ class DataQualityGate:
                 
                 instrument_id = instrument_row[0]
                 
+                # Align range to candle grid boundaries
+                aligned_from = align_to_grid(closed_at, normalized_timeframe)
+                aligned_to = align_to_grid(post_exit_end, normalized_timeframe)
+                
                 cursor.execute(
                     """
                     SELECT COUNT(*) FROM market.candle
@@ -415,12 +419,14 @@ class DataQualityGate:
                     AND open_time < %s
                     AND is_closed = TRUE
                     """,
-                    (instrument_id, normalized_timeframe, closed_at, post_exit_end),
+                    (instrument_id, normalized_timeframe, aligned_from, aligned_to),
                 )
                 candle_count = cursor.fetchone()[0]
                 
-                # Calculate expected candles based on normalized timeframe
-                expected_candles = self._calculate_expected_candles(normalized_timeframe, closed_at, post_exit_end)
+                # Calculate expected candles based on aligned range
+                expected_candles = self._calculate_expected_candles(
+                    normalized_timeframe, aligned_from, aligned_to
+                )
                 
                 if candle_count < expected_candles:
                     missing_coverage.append({

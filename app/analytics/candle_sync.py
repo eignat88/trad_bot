@@ -52,6 +52,55 @@ def normalize_timeframe(raw: str) -> str:
     raise ValueError(f"Unrecognized timeframe: {raw!r}")
 
 
+def _timeframe_to_minutes_canonical(timeframe: str) -> int:
+    """Convert a normalized timeframe string to minutes.
+    
+    Only accepts canonical forms: "1", "5", "15", "60", "D", etc.
+    """
+    mapping = {
+        "1": 1, "3": 3, "5": 5, "15": 15, "30": 30,
+        "60": 60, "120": 120, "240": 240, "360": 360, "720": 720,
+        "D": 1440, "W": 10080, "M": 43200,
+    }
+    return mapping.get(timeframe, 5)
+
+
+def align_to_grid(dt: datetime, timeframe: str) -> datetime:
+    """Align a timestamp DOWN to the canonical candle open-time boundary.
+    
+    Alignment is always performed in UTC because candles are stored
+    with UTC open_times.
+    
+    For 5m: 11:12:15 UTC -> 11:10:00 UTC
+    For 15m: 11:22:00 UTC -> 11:15:00 UTC
+    For 1h: 11:22:00 UTC -> 11:00:00 UTC
+    For D: Sep 15 03:00 UTC -> Sep 15 00:00 UTC
+    """
+    minutes = _timeframe_to_minutes_canonical(timeframe)
+    
+    # Convert to UTC for alignment
+    dt_utc = dt.astimezone(timezone.utc)
+    
+    # For daily/weekly/monthly, align to midnight UTC
+    if minutes >= 1440:
+        return dt_utc.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+    
+    # For minute/hour timeframes, align down to the nearest boundary in UTC
+    total_minutes = dt_utc.hour * 60 + dt_utc.minute
+    aligned_minutes = (total_minutes // minutes) * minutes
+    
+    aligned_hour = aligned_minutes // 60
+    aligned_minute = aligned_minutes % 60
+    
+    return dt_utc.replace(
+        hour=aligned_hour,
+        minute=aligned_minute,
+        second=0,
+        microsecond=0,
+        tzinfo=timezone.utc,
+    )
+
+
 class CandleSync:
     """Synchronizes candle data from Bybit to PostgreSQL."""
 

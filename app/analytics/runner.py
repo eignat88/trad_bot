@@ -332,7 +332,8 @@ class AnalyticsRunner:
         """
         logger.info("Running candle reconciliation for run %s", run.run_id)
         
-        from app.analytics.candle_sync import normalize_timeframe, CandleRange
+        from app.analytics.candle_sync import normalize_timeframe, align_to_grid, CandleRange
+        from app.analytics.candle_ranges import CandleRangePlanner
         
         # 1. Query relevant trades from dds.paper_trade
         cursor = self._repo._conn.cursor()
@@ -393,13 +394,16 @@ class AnalyticsRunner:
             instrument_id = instrument_map[symbol]
             key = (instrument_id, symbol, timeframe)
             
-            # Build required range: entered_at → closed_at + post_exit_horizon
+            # Build required range with grid-aligned boundaries
             trade_end = closed_at + run.post_exit_horizon
+            aligned_from = align_to_grid(entered_at, timeframe)
+            aligned_to = align_to_grid(trade_end, timeframe)
+            
             range_ = CandleRange(
                 instrument_id=instrument_id,
                 timeframe=timeframe,
-                from_time=entered_at,
-                to_time=trade_end,
+                from_time=aligned_from,
+                to_time=aligned_to,
             )
             
             if key not in ranges_by_key:
@@ -501,7 +505,8 @@ class AnalyticsRunner:
         """
         logger.info("Running post-exit backfill for FINAL run %s", run.run_id)
         
-        from app.analytics.candle_sync import normalize_timeframe, CandleRange
+        from app.analytics.candle_sync import normalize_timeframe, align_to_grid, CandleRange
+        from app.analytics.candle_ranges import CandleRangePlanner
         
         # 1. Query trades that need post-exit data
         cursor = self._repo._conn.cursor()
@@ -566,11 +571,15 @@ class AnalyticsRunner:
             # Only backfill up to observation_cutoff for safety
             effective_end = min(post_exit_end, run.observation_cutoff)
             
+            # Align to candle grid boundaries
+            aligned_from = align_to_grid(closed_at, timeframe)
+            aligned_to = align_to_grid(effective_end, timeframe)
+            
             range_ = CandleRange(
                 instrument_id=instrument_id,
                 timeframe=timeframe,
-                from_time=closed_at,
-                to_time=effective_end,
+                from_time=aligned_from,
+                to_time=aligned_to,
             )
             
             if key not in ranges_by_key:

@@ -935,9 +935,13 @@ class TestPostExitCoverageTimeframeNormalization:
             (trade_id_1, setup_id, unique_sym, closed_at - timedelta(hours=5), closed_at),
         )
 
-        # 4. Insert candles with timeframe = '5' (internal format)
-        for i in range(48):
-            candle_from = closed_at + timedelta(minutes=i * 5)
+        # 4. Insert candles with timeframe = '5' (internal format), grid-aligned
+        from app.analytics.candle_sync import align_to_grid
+        aligned_start = align_to_grid(closed_at, "5")
+        aligned_end = align_to_grid(closed_at + timedelta(hours=4), "5")
+        num_candles = int((aligned_end - aligned_start).total_seconds() / 300) + 2
+        for i in range(num_candles):
+            candle_from = aligned_start + timedelta(minutes=i * 5)
             candle_to = candle_from + timedelta(minutes=5)
             cursor.execute(
                 """
