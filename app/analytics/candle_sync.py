@@ -116,22 +116,34 @@ class CandleSync:
         timeframe: str,
         from_time: datetime,
         to_time: datetime,
+        observation_cutoff: Optional[datetime] = None,
         workers: int = 2,
         retry_count: int = 3,
     ) -> tuple[int, int, int, list[dict[str, Any]]]:
         """Fetch candles from Bybit and store them.
+        
+        observation_cutoff: If provided, no candle with close_time > cutoff
+        will be stored as closed.  Fetch ranges are also clamped to this limit.
         
         Returns:
             Tuple of (inserted, updated, rejected, failed_ranges).
             failed_ranges contains dicts with from_time/to_time/error for
             any batch that could not be fetched after all retries.
         """
+        # Clamp to_time to observation_cutoff for point-in-time safety
+        if observation_cutoff is not None and to_time > observation_cutoff:
+            to_time = observation_cutoff
+        
+        if from_time >= to_time:
+            return 0, 0, 0, []
+        
         logger.info(
-            "Fetching candles for %s %s from %s to %s",
+            "Fetching candles for %s %s from %s to %s (cutoff=%s)",
             symbol,
             timeframe,
             from_time,
             to_time,
+            observation_cutoff,
         )
         
         all_candles = []
@@ -159,7 +171,8 @@ class CandleSync:
                 for raw_candle in candles:
                     try:
                         candle = self._parse_candle(
-                            raw_candle, instrument_id, timeframe
+                            raw_candle, instrument_id, timeframe,
+                            observation_cutoff=observation_cutoff,
                         )
                         if candle:
                             all_candles.append(candle)
@@ -265,8 +278,13 @@ class CandleSync:
         raw_candle: list[Any],
         instrument_id: int,
         timeframe: str,
+        observation_cutoff: Optional[datetime] = None,
     ) -> Optional[Candle]:
-        """Parse a raw Bybit candle into a Candle object."""
+        """Parse a raw Bybit candle into a Candle object.
+        
+        Only persists candles whose close_time <= observation_cutoff.
+        This prevents storing incomplete/current candles as closed.
+        """
         try:
             # Bybit format: [timestamp, open, high, low, close, volume, turnover]
             if len(raw_candle) < 7:
@@ -279,6 +297,15 @@ class CandleSync:
             # Calculate close_time based on timeframe
             timeframe_minutes = self._timeframe_to_minutes(timeframe)
             close_time = open_time + timedelta(minutes=timeframe_minutes)
+            
+            # Point-in-time safety: skip candles whose close_time
+            # is after the observation cutoff (still forming / incomplete)
+            if observation_cutoff is not None and close_time > observation_cutoff:
+                logger.debug(
+                    "Skipping candle %s: close_time %s > observation_cutoff %s",
+                    open_time, close_time, observation_cutoff,
+                )
+                return None
             
             candle = Candle(
                 exchange="bybit",
@@ -351,6 +378,7 @@ class CandleSync:
         timeframe: str,
         required_ranges: list[CandleRange],
         watermark: Optional[Watermark] = None,
+        observation_cutoff: Optional[datetime] = None,
     ) -> tuple[list[Gap], int, int, int, list[dict[str, Any]]]:
         """Reconcile candle data for required ranges.
         
@@ -406,6 +434,7 @@ class CandleSync:
                 timeframe=timeframe,
                 from_time=gap.gap_start,
                 to_time=gap.gap_end,
+                observation_cutoff=observation_cutoff,
             )
             total_inserted += inserted
             total_updated += updated

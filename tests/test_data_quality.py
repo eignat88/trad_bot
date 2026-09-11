@@ -74,14 +74,14 @@ class TestDataQualityGate:
 
     def test_check_source_timestamps_failure(self):
         """Test source timestamps check failure."""
-        # Mock future candles found
-        self.mock_conn.cursor.return_value.fetchone.return_value = [5]
+        # Mock future candles found (first query returns 5, second returns 0)
+        self.mock_conn.cursor.return_value.fetchone.side_effect = [[5], [0]]
         
         result = self.quality_gate._check_source_timestamps(self.run, "quality_gate")
         
         assert result.severity == Severity.BLOCKING
         assert result.status == QualityCheckStatus.FAIL
-        assert result.actual_value["future_candle_count"] == 5
+        assert result.actual_value["future_open_count"] == 5
 
     def test_check_duplicate_candles(self):
         """Test duplicate candles check."""

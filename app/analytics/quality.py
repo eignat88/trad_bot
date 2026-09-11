@@ -117,9 +117,16 @@ class DataQualityGate:
     def _check_source_timestamps(
         self, run: AnalysisRun, stage_name: str
     ) -> DataQualityResult:
-        """Check if source timestamps are not later than observation cutoff."""
+        """Check if source timestamps are not later than observation cutoff.
+        
+        Validates:
+        - No candle open_time from the future (after observation_cutoff)
+        - No candle marked is_closed=TRUE with close_time > observation_cutoff
+        """
         try:
             cursor = self._repo._conn.cursor()
+            
+            # Check 1: No candle open_time from the future
             cursor.execute(
                 """
                 SELECT COUNT(*) FROM market.candle
@@ -128,17 +135,40 @@ class DataQualityGate:
                 """,
                 (run.observation_cutoff, run.started_at or run.created_at),
             )
-            future_candle_count = cursor.fetchone()[0]
+            future_open_count = cursor.fetchone()[0]
             
-            if future_candle_count > 0:
+            # Check 2: No candle marked closed with close_time > cutoff
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM market.candle
+                WHERE is_closed = TRUE
+                AND close_time > %s
+                AND ingested_at >= %s
+                """,
+                (run.observation_cutoff, run.started_at or run.created_at),
+            )
+            closed_past_cutoff_count = cursor.fetchone()[0]
+            
+            total_violations = future_open_count + closed_past_cutoff_count
+            
+            if total_violations > 0:
                 return DataQualityResult(
                     run_id=run.run_id,
                     stage_name=stage_name,
                     check_name="source_timestamps",
                     severity=Severity.BLOCKING,
                     status=QualityCheckStatus.FAIL,
-                    actual_value={"future_candle_count": future_candle_count},
-                    details={"message": f"Found {future_candle_count} candles with timestamps after observation cutoff"},
+                    actual_value={
+                        "future_open_count": future_open_count,
+                        "closed_past_cutoff_count": closed_past_cutoff_count,
+                    },
+                    details={
+                        "message": (
+                            f"Found {future_open_count} candles with open_time after cutoff "
+                            f"and {closed_past_cutoff_count} closed candles with close_time "
+                            f"after observation cutoff"
+                        )
+                    },
                 )
             
             return DataQualityResult(
