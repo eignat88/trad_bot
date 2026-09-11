@@ -64,7 +64,7 @@ class DataQualityGate:
         
         # Determine if all BLOCKING checks passed
         passed = all(
-            result.status == StageStatus.SUCCEEDED
+            result.status == StageStatus.PASS
             for result in results
             if result.severity == Severity.BLOCKING
         )
@@ -76,7 +76,7 @@ class DataQualityGate:
         logger.info(
             "Quality checks completed for run %s: passed=%d/%d",
             run.run_id,
-            sum(1 for r in results if r.status == StageStatus.SUCCEEDED),
+            sum(1 for r in results if r.status == StageStatus.PASS),
             len(results),
         )
         
@@ -97,10 +97,12 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="postgresql_availability",
                 severity=Severity.BLOCKING,
-                status=StageStatus.SUCCEEDED,
+                status=StageStatus.PASS,
                 details={"message": "PostgreSQL is available"},
             )
         except Exception as e:
+            # Rollback the aborted transaction
+            self._repo._conn.rollback()
             return DataQualityResult(
                 run_id=run_id,
                 stage_name=stage_name,
@@ -143,10 +145,12 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="source_timestamps",
                 severity=Severity.BLOCKING,
-                status=StageStatus.SUCCEEDED,
+                status=StageStatus.PASS,
                 details={"message": "Source timestamps are within acceptable range"},
             )
         except Exception as e:
+            # Rollback the aborted transaction
+            self._repo._conn.rollback()
             return DataQualityResult(
                 run_id=run.run_id,
                 stage_name=stage_name,
@@ -194,10 +198,12 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="duplicate_candles",
                 severity=Severity.BLOCKING,
-                status=StageStatus.SUCCEEDED,
+                status=StageStatus.PASS,
                 details={"message": "No duplicate candles found"},
             )
         except Exception as e:
+            # Rollback the aborted transaction
+            self._repo._conn.rollback()
             return DataQualityResult(
                 run_id=run.run_id,
                 stage_name=stage_name,
@@ -246,10 +252,12 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="ohlc_validation",
                 severity=Severity.BLOCKING,
-                status=StageStatus.SUCCEEDED,
+                status=StageStatus.PASS,
                 details={"message": "All candles have valid OHLC"},
             )
         except Exception as e:
+            # Rollback the aborted transaction
+            self._repo._conn.rollback()
             return DataQualityResult(
                 run_id=run.run_id,
                 stage_name=stage_name,
@@ -308,10 +316,12 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="closed_candle_intervals",
                 severity=Severity.BLOCKING,
-                status=StageStatus.SUCCEEDED,
+                status=StageStatus.PASS,
                 details={"message": "Closed candle intervals are correct"},
             )
         except Exception as e:
+            # Rollback the aborted transaction
+            self._repo._conn.rollback()
             return DataQualityResult(
                 run_id=run.run_id,
                 stage_name=stage_name,
@@ -328,19 +338,20 @@ class DataQualityGate:
         """Check post-exit coverage for all trades."""
         try:
             # Get all closed trades that need post-exit coverage
+            # Using production schema: symbol, closed_at, entry_timeframe
             cursor = self._repo._conn.cursor()
             cursor.execute(
                 """
                 SELECT 
-                    pt.instrument_id,
-                    pt.exit_time,
-                    pt.timeframe,
+                    pt.symbol,
+                    pt.closed_at,
+                    pt.entry_timeframe,
                     COUNT(*) as trade_count
                 FROM dds.paper_trade pt
-                WHERE pt.exit_time IS NOT NULL
-                AND pt.exit_time >= %s
-                AND pt.exit_time < %s
-                GROUP BY pt.instrument_id, pt.exit_time, pt.timeframe
+                WHERE pt.closed_at IS NOT NULL
+                AND pt.closed_at >= %s
+                AND pt.closed_at < %s
+                GROUP BY pt.symbol, pt.closed_at, pt.entry_timeframe
                 """,
                 (run.analysis_from, run.analysis_to),
             )
@@ -352,7 +363,7 @@ class DataQualityGate:
                     stage_name=stage_name,
                     check_name="post_exit_coverage",
                     severity=Severity.WARNING if run.maturity.value == "PROVISIONAL" else Severity.BLOCKING,
-                    status=StageStatus.SUCCEEDED,
+                    status=StageStatus.PASS,
                     details={"message": "No trades found requiring post-exit coverage"},
                 )
             
@@ -361,10 +372,28 @@ class DataQualityGate:
             
             missing_coverage = []
             for trade in trades:
-                instrument_id, exit_time, timeframe, trade_count = trade
-                post_exit_end = exit_time + timedelta(hours=post_exit_hours)
+                symbol, closed_at, entry_timeframe, trade_count = trade
+                post_exit_end = closed_at + timedelta(hours=post_exit_hours)
                 
                 # Check if we have candles covering the post-exit period
+                # Note: market.candle uses instrument_id, not symbol
+                # We need to look up instrument_id from dds.instrument
+                cursor.execute(
+                    """
+                    SELECT i.instrument_id 
+                    FROM dds.instrument i 
+                    WHERE i.symbol = %s 
+                    LIMIT 1
+                    """,
+                    (symbol,),
+                )
+                instrument_row = cursor.fetchone()
+                if not instrument_row:
+                    logger.warning("Instrument not found for symbol: %s", symbol)
+                    continue
+                
+                instrument_id = instrument_row[0]
+                
                 cursor.execute(
                     """
                     SELECT COUNT(*) FROM market.candle
@@ -374,18 +403,18 @@ class DataQualityGate:
                     AND open_time < %s
                     AND is_closed = TRUE
                     """,
-                    (instrument_id, timeframe, exit_time, post_exit_end),
+                    (instrument_id, entry_timeframe, closed_at, post_exit_end),
                 )
                 candle_count = cursor.fetchone()[0]
                 
                 # Calculate expected candles based on timeframe
-                expected_candles = self._calculate_expected_candles(timeframe, exit_time, post_exit_end)
+                expected_candles = self._calculate_expected_candles(entry_timeframe, closed_at, post_exit_end)
                 
                 if candle_count < expected_candles:
                     missing_coverage.append({
-                        "instrument_id": instrument_id,
-                        "exit_time": exit_time.isoformat(),
-                        "timeframe": timeframe,
+                        "symbol": symbol,
+                        "closed_at": closed_at.isoformat(),
+                        "entry_timeframe": entry_timeframe,
                         "expected_candles": expected_candles,
                         "actual_candles": candle_count,
                         "coverage_ratio": candle_count / expected_candles if expected_candles > 0 else 0,
@@ -409,10 +438,12 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="post_exit_coverage",
                 severity=Severity.WARNING if run.maturity.value == "PROVISIONAL" else Severity.BLOCKING,
-                status=StageStatus.SUCCEEDED,
+                status=StageStatus.PASS,
                 details={"message": "Post-exit coverage is sufficient for all trades"},
             )
         except Exception as e:
+            # Rollback the aborted transaction
+            self._repo._conn.rollback()
             return DataQualityResult(
                 run_id=run.run_id,
                 stage_name=stage_name,
@@ -474,10 +505,12 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="lifecycle_timestamps",
                 severity=Severity.BLOCKING,
-                status=StageStatus.SUCCEEDED,
+                status=StageStatus.PASS,
                 details={"message": "Lifecycle timestamps are valid"},
             )
         except Exception as e:
+            # Rollback the aborted transaction
+            self._repo._conn.rollback()
             return DataQualityResult(
                 run_id=run.run_id,
                 stage_name=stage_name,
@@ -565,7 +598,7 @@ class DataQualityGate:
                 stage_name=stage_name,
                 check_name="data_freshness",
                 severity=Severity.WARNING,
-                status=StageStatus.SUCCEEDED,
+                status=StageStatus.PASS,
                 actual_value={
                     "latest_candle": latest_candle.isoformat(),
                     "freshness_minutes": freshness_minutes,
@@ -574,6 +607,8 @@ class DataQualityGate:
                 details={"message": f"Data freshness ({freshness_minutes:.1f} min) is within SLA ({sla_minutes} min)"},
             )
         except Exception as e:
+            # Rollback the aborted transaction
+            self._repo._conn.rollback()
             return DataQualityResult(
                 run_id=run.run_id,
                 stage_name=stage_name,
@@ -604,7 +639,7 @@ class DataQualityGate:
     def get_summary(self, results: list[DataQualityResult]) -> dict[str, Any]:
         """Get summary of quality check results."""
         total = len(results)
-        passed = sum(1 for r in results if r.status == StageStatus.SUCCEEDED)
+        passed = sum(1 for r in results if r.status == StageStatus.PASS)
         failed = sum(1 for r in results if r.status == StageStatus.FAILED)
         skipped = sum(1 for r in results if r.status == StageStatus.SKIPPED)
         

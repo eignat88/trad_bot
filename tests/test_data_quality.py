@@ -47,7 +47,7 @@ class TestDataQualityGate:
         )
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.SUCCEEDED
+        assert result.status == StageStatus.PASS
 
     def test_check_postgresql_availability_failure(self):
         """Test PostgreSQL availability check failure."""
@@ -69,7 +69,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_source_timestamps(self.run, "quality_gate")
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.SUCCEEDED
+        assert result.status == StageStatus.PASS
 
     def test_check_source_timestamps_failure(self):
         """Test source timestamps check failure."""
@@ -90,7 +90,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_duplicate_candles(self.run, "quality_gate")
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.SUCCEEDED
+        assert result.status == StageStatus.PASS
 
     def test_check_duplicate_candles_failure(self):
         """Test duplicate candles check failure."""
@@ -111,7 +111,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_ohlc_validation(self.run, "quality_gate")
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.SUCCEEDED
+        assert result.status == StageStatus.PASS
 
     def test_check_ohlc_validation_failure(self):
         """Test OHLC validation check failure."""
@@ -132,7 +132,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_closed_candle_intervals(self.run, "quality_gate")
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.SUCCEEDED
+        assert result.status == StageStatus.PASS
 
     def test_check_closed_candle_intervals_failure(self):
         """Test closed candle intervals check failure."""
@@ -154,7 +154,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_post_exit_coverage(self.run, "quality_gate")
         
         assert result.severity == Severity.WARNING
-        assert result.status == StageStatus.SUCCEEDED
+        assert result.status == StageStatus.PASS
 
     def test_check_post_exit_coverage_failure(self):
         """Test post-exit coverage check failure."""
@@ -184,7 +184,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_lifecycle_timestamps(self.run, "quality_gate")
         
         assert result.severity == Severity.BLOCKING
-        assert result.status == StageStatus.SUCCEEDED
+        assert result.status == StageStatus.PASS
 
     def test_check_lifecycle_timestamps_failure(self):
         """Test lifecycle timestamps check failure."""
@@ -208,7 +208,7 @@ class TestDataQualityGate:
         result = self.quality_gate._check_data_freshness(self.run, "quality_gate")
         
         assert result.severity == Severity.WARNING
-        assert result.status == StageStatus.SUCCEEDED
+        assert result.status == StageStatus.PASS
 
     def test_check_data_freshness_failure(self):
         """Test data freshness check failure."""
@@ -283,7 +283,7 @@ class TestDataQualityGate:
                 stage_name="quality_gate",
                 check_name="test1",
                 severity=Severity.BLOCKING,
-                status=StageStatus.SUCCEEDED,
+                status=StageStatus.PASS,
             ),
             DataQualityResult(
                 run_id=self.run.run_id,
