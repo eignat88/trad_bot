@@ -199,10 +199,12 @@ class AnalyticsRunner:
         
         Preserves run_id and stage history. Resets all terminal-state fields
         so a retry does not carry stale finished_at, error_code, or error_message.
+        Refreshes observation_cutoff to current execution time.
         """
         run.status = RunStatus.RUNNING
         run.maturity = maturity
         run.started_at = datetime.now(timezone.utc)
+        run.observation_cutoff = datetime.now(timezone.utc)
         run.finished_at = None
         run.error_code = None
         run.error_message = None

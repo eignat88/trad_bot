@@ -125,6 +125,7 @@ class AnalyticsRepository:
                 UPDATE analytics.analysis_run SET
                     maturity = %s,
                     status = %s,
+                    observation_cutoff = %s,
                     started_at = %s,
                     finished_at = %s,
                     updated_at = %s,
@@ -135,6 +136,7 @@ class AnalyticsRepository:
                 (
                     run.maturity.value,
                     run.status.value,
+                    run.observation_cutoff,
                     run.started_at,
                     run.finished_at,
                     datetime.now(timezone.utc),

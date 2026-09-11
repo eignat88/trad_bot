@@ -54,6 +54,9 @@ def repository(pg8000_conn):
     cursor.execute("DELETE FROM analytics.analysis_stage_run")
     cursor.execute("DELETE FROM analytics.analysis_run")
     cursor.execute("DELETE FROM market.candle")
+    cursor.execute("DELETE FROM dds.paper_trade WHERE trade_id >= 900000")
+    cursor.execute("DELETE FROM dds.scanner_setup WHERE setup_id LIKE 'setup_%'")
+    cursor.execute("DELETE FROM dds.instrument WHERE symbol LIKE 'TFTEST%'")
     pg8000_conn.commit()
     
     repo = AnalyticsRepository(pg8000_conn)
@@ -70,6 +73,9 @@ def repository(pg8000_conn):
     cursor.execute("DELETE FROM analytics.analysis_stage_run")
     cursor.execute("DELETE FROM analytics.analysis_run")
     cursor.execute("DELETE FROM market.candle")
+    cursor.execute("DELETE FROM dds.paper_trade WHERE trade_id >= 900000")
+    cursor.execute("DELETE FROM dds.scanner_setup WHERE setup_id LIKE 'setup_%'")
+    cursor.execute("DELETE FROM dds.instrument WHERE symbol LIKE 'TFTEST%'")
     pg8000_conn.commit()
 
 
@@ -822,3 +828,226 @@ class TestLifecycleRetryReset:
         gate = DataQualityGate(repository)
         result = gate._check_lifecycle_timestamps(run, "quality_gate")
         assert result.status == QualityCheckStatus.PASS
+
+    def test_retry_refreshes_observation_cutoff(self, repository):
+        """Test that retry refreshes observation_cutoff to current time."""
+        from app.analytics.runner import AnalyticsRunner
+        import time
+
+        old_cutoff = datetime(2026, 9, 11, 11, 0, tzinfo=timezone.utc)
+
+        # 1. Create a run with an old observation_cutoff
+        run = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 12),
+            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
+            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
+            observation_cutoff=old_cutoff,
+        )
+        repository.create_analysis_run(run)
+
+        # Verify old cutoff is persisted
+        reloaded = repository.get_analysis_run(run.run_id)
+        assert reloaded.observation_cutoff == old_cutoff
+
+        # 2. Simulate retry with a small delay to ensure time advances
+        time.sleep(0.01)
+        AnalyticsRunner._prepare_run_for_execution(run, Maturity.PROVISIONAL)
+        repository.update_analysis_run(run)
+
+        # 3. Verify observation_cutoff is refreshed
+        reloaded = repository.get_analysis_run(run.run_id)
+        reloaded_cutoff = reloaded.observation_cutoff
+        # Convert to UTC for comparison
+        if reloaded_cutoff.tzinfo is not None:
+            reloaded_cutoff_utc = reloaded_cutoff.astimezone(timezone.utc)
+        else:
+            reloaded_cutoff_utc = reloaded_cutoff.replace(tzinfo=timezone.utc)
+        
+        # The cutoff should be different from (and after) the old value
+        assert reloaded_cutoff_utc != old_cutoff, (
+            f"observation_cutoff was not refreshed: {reloaded_cutoff_utc} == {old_cutoff}"
+        )
+
+
+class TestPostExitCoverageTimeframeNormalization:
+    """Tests for post-exit coverage timeframe normalization."""
+
+    def test_normalized_timeframe_matches_candle_table(self, repository, pg8000_conn):
+        """Test that '5m' in paper_trade matches '5' in market.candle."""
+        from app.analytics.quality import DataQualityGate
+        from app.analytics.models import QualityCheckStatus, Severity, Maturity
+
+        cursor = pg8000_conn.cursor()
+        now = datetime.now(timezone.utc)
+        closed_at = now - timedelta(hours=1)
+        post_exit_end = closed_at + timedelta(hours=4)
+
+        # 1. Insert instrument
+        unique_sym = f"TFTEST1_{uuid4().hex[:8]}"
+        cursor.execute(
+            "INSERT INTO dds.instrument (symbol, base_asset, quote_asset, category, status) "
+            "VALUES (%s, 'TEST', 'USDT', 'linear', 'Trading') RETURNING instrument_id",
+            (unique_sym,),
+        )
+        instrument_id = cursor.fetchone()[0]
+
+        # 2. Insert scanner_setup
+        setup_id = f"setup_tf_{uuid4().hex[:8]}"
+        signal_candle_ts = int((closed_at - timedelta(hours=1)).timestamp() * 1000)
+        setup_time = closed_at - timedelta(hours=1)
+        cursor.execute(
+            """
+            INSERT INTO dds.scanner_setup (
+                setup_id, scanner_name, scanner_version, instrument_id,
+                direction, htf_timeframe, setup_timeframe, entry_timeframe,
+                setup_started_at, detected_at, reference_price, score,
+                status, reasons, features, created_at, signal_candle_open_time, updated_at
+            ) VALUES (
+                %s, 'TEST_SCANNER', '1.0', %s,
+                'LONG', '60', '5m', '5m',
+                %s, %s, 50000.0, 0.8,
+                'DETECTED', '[]', '{}', NOW(), %s, NOW()
+            )
+            """,
+            (setup_id, instrument_id, setup_time, setup_time, signal_candle_ts),
+        )
+
+        # 3. Insert paper_trade with entry_timeframe = '5m' (production format)
+        trade_id_1 = 910000 + int(uuid4().hex[:6], 16) % 100000
+        cursor.execute(
+            """
+            INSERT INTO dds.paper_trade (
+                trade_id, setup_id, symbol, scanner_name, direction,
+                score, entry_price, entry_fee, stop_price, position_size,
+                risk_usdt, exit_price, exit_reason, exit_fee, pnl_usdt,
+                pnl_r, pnl_percent, slippage, status, entered_at, closed_at,
+                duration_sec, balance_before, balance_after, entry_timeframe
+            ) VALUES (
+                %s, %s, %s, 'TEST_SCANNER', 'LONG',
+                0.8, 50000.0, 10.0, 49000.0, 0.1,
+                100.0, 51000.0, 'TAKE_PROFIT_1', 10.0, 100.0,
+                1.0, 2.0, 0.1, 'CLOSED',
+                %s, %s,
+                14400, 10000.0, 10100.0, '5m'
+            )
+            """,
+            (trade_id_1, setup_id, unique_sym, closed_at - timedelta(hours=5), closed_at),
+        )
+
+        # 4. Insert candles with timeframe = '5' (internal format)
+        for i in range(48):
+            candle_from = closed_at + timedelta(minutes=i * 5)
+            candle_to = candle_from + timedelta(minutes=5)
+            cursor.execute(
+                """
+                INSERT INTO market.candle (
+                    exchange, market_type, instrument_id, timeframe,
+                    open_time, close_time, open, high, low, close, volume,
+                    is_closed, source, ingested_at, quality_status
+                ) VALUES (
+                    'bybit', 'linear', %s, '5',
+                    %s, %s, 50000.0, 50100.0, 49900.0, 50050.0, 1000.0,
+                    TRUE, 'test', NOW(), 'validated'
+                )
+                """,
+                (instrument_id, candle_from, candle_to),
+            )
+        pg8000_conn.commit()
+
+        # 5. Create analysis run and check coverage
+        run = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date.today(),
+            analysis_from=now - timedelta(hours=6),
+            analysis_to=now,
+            observation_cutoff=now,
+        )
+        repository.create_analysis_run(run)
+
+        gate = DataQualityGate(repository)
+        result = gate._check_post_exit_coverage(run, "quality_gate")
+
+        # With normalized timeframe, candles should be found
+        assert result.status == QualityCheckStatus.PASS
+
+    def test_final_rejects_incomplete_coverage(self, repository, pg8000_conn):
+        """Test that FINAL rejects incomplete post-exit coverage."""
+        from app.analytics.quality import DataQualityGate
+        from app.analytics.models import QualityCheckStatus, Severity, Maturity
+
+        cursor = pg8000_conn.cursor()
+        now = datetime.now(timezone.utc)
+        closed_at = now - timedelta(hours=1)
+
+        # 1. Insert instrument
+        unique_sym = f"TFTEST2_{uuid4().hex[:8]}"
+        cursor.execute(
+            "INSERT INTO dds.instrument (symbol, base_asset, quote_asset, category, status) "
+            "VALUES (%s, 'TEST', 'USDT', 'linear', 'Trading') RETURNING instrument_id",
+            (unique_sym,),
+        )
+        instrument_id = cursor.fetchone()[0]
+
+        # 2. Insert scanner_setup
+        setup_id = f"setup_tf2_{uuid4().hex[:8]}"
+        signal_candle_ts = int((closed_at - timedelta(hours=1)).timestamp() * 1000)
+        setup_time = closed_at - timedelta(hours=1)
+        cursor.execute(
+            """
+            INSERT INTO dds.scanner_setup (
+                setup_id, scanner_name, scanner_version, instrument_id,
+                direction, htf_timeframe, setup_timeframe, entry_timeframe,
+                setup_started_at, detected_at, reference_price, score,
+                status, reasons, features, created_at, signal_candle_open_time, updated_at
+            ) VALUES (
+                %s, 'TEST_SCANNER', '1.0', %s,
+                'LONG', '60', '5m', '5m',
+                %s, %s, 50000.0, 0.8,
+                'DETECTED', '[]', '{}', NOW(), %s, NOW()
+            )
+            """,
+            (setup_id, instrument_id, setup_time, setup_time, signal_candle_ts),
+        )
+
+        # 3. Insert paper_trade — no candles will be created
+        trade_id_2 = 920000 + int(uuid4().hex[:6], 16) % 100000
+        cursor.execute(
+            """
+            INSERT INTO dds.paper_trade (
+                trade_id, setup_id, symbol, scanner_name, direction,
+                score, entry_price, entry_fee, stop_price, position_size,
+                risk_usdt, exit_price, exit_reason, exit_fee, pnl_usdt,
+                pnl_r, pnl_percent, slippage, status, entered_at, closed_at,
+                duration_sec, balance_before, balance_after, entry_timeframe
+            ) VALUES (
+                %s, %s, %s, 'TEST_SCANNER', 'LONG',
+                0.8, 50000.0, 10.0, 49000.0, 0.1,
+                100.0, 51000.0, 'TAKE_PROFIT_1', 10.0, 100.0,
+                1.0, 2.0, 0.1, 'CLOSED',
+                %s, %s,
+                14400, 10000.0, 10100.0, '5m'
+            )
+            """,
+            (trade_id_2, setup_id, unique_sym, closed_at - timedelta(hours=5), closed_at),
+        )
+        pg8000_conn.commit()
+
+        # 4. Create analysis run for FINAL
+        run = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date.today(),
+            analysis_from=now - timedelta(hours=6),
+            analysis_to=now,
+            observation_cutoff=now,
+            maturity=Maturity.FINAL,
+        )
+        repository.create_analysis_run(run)
+
+        gate = DataQualityGate(repository)
+        result = gate._check_post_exit_coverage(run, "quality_gate")
+
+        # FINAL must FAIL when coverage is missing
+        assert result.status == QualityCheckStatus.FAIL
+        assert result.severity == Severity.BLOCKING
+        assert result.affected_entity_count == 1

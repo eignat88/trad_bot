@@ -12,6 +12,7 @@ from app.analytics.models import (
     Severity,
     QualityCheckStatus,
 )
+from app.analytics.candle_sync import normalize_timeframe
 from app.analytics.repository import AnalyticsRepository
 
 logger = logging.getLogger(__name__)
@@ -373,6 +374,17 @@ class DataQualityGate:
             missing_coverage = []
             for trade in trades:
                 symbol, closed_at, entry_timeframe, trade_count = trade
+                
+                # Normalize production timeframe (e.g. "5m" -> "5")
+                try:
+                    normalized_timeframe = normalize_timeframe(entry_timeframe)
+                except ValueError:
+                    logger.warning(
+                        "Skipping trade for %s: unrecognizable timeframe %r",
+                        symbol, entry_timeframe,
+                    )
+                    continue
+                
                 post_exit_end = closed_at + post_exit_horizon
                 
                 # Check if we have candles covering the post-exit period
@@ -403,18 +415,19 @@ class DataQualityGate:
                     AND open_time < %s
                     AND is_closed = TRUE
                     """,
-                    (instrument_id, entry_timeframe, closed_at, post_exit_end),
+                    (instrument_id, normalized_timeframe, closed_at, post_exit_end),
                 )
                 candle_count = cursor.fetchone()[0]
                 
-                # Calculate expected candles based on timeframe
-                expected_candles = self._calculate_expected_candles(entry_timeframe, closed_at, post_exit_end)
+                # Calculate expected candles based on normalized timeframe
+                expected_candles = self._calculate_expected_candles(normalized_timeframe, closed_at, post_exit_end)
                 
                 if candle_count < expected_candles:
                     missing_coverage.append({
                         "symbol": symbol,
                         "closed_at": closed_at.isoformat(),
                         "entry_timeframe": entry_timeframe,
+                        "normalized_timeframe": normalized_timeframe,
                         "expected_candles": expected_candles,
                         "actual_candles": candle_count,
                         "coverage_ratio": candle_count / expected_candles if expected_candles > 0 else 0,
@@ -455,13 +468,21 @@ class DataQualityGate:
             )
     
     def _calculate_expected_candles(self, timeframe: str, start_time: datetime, end_time: datetime) -> int:
-        """Calculate expected number of candles for a time range."""
-        timeframe_minutes = self._timeframe_to_minutes(timeframe)
+        """Calculate expected number of candles for a time range.
+        
+        Accepts normalized timeframe strings ("5", "60", "D", etc.).
+        """
+        timeframe_minutes = self._normalized_timeframe_to_minutes(timeframe)
         total_minutes = (end_time - start_time).total_seconds() / 60
         return int(total_minutes / timeframe_minutes)
     
-    def _timeframe_to_minutes(self, timeframe: str) -> int:
-        """Convert timeframe to minutes."""
+    @staticmethod
+    def _normalized_timeframe_to_minutes(timeframe: str) -> int:
+        """Convert a normalized timeframe string to minutes.
+        
+        Only accepts canonical forms: "1", "5", "15", "60", "D", etc.
+        For production values like "5m", use normalize_timeframe() first.
+        """
         mapping = {
             "1": 1,
             "3": 3,
