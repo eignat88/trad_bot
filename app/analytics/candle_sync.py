@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
-from app.analytics.models import Candle, CandleRange, Gap, Watermark
+from app.analytics.models import Candle, CandleRange, Gap, Watermark, QualityStatus
 from app.analytics.repository import AnalyticsRepository
 from app.exchange.bybit_client import BybitClient
 
@@ -31,15 +31,8 @@ def normalize_timeframe(raw: str) -> str:
     if raw in direct:
         return direct[raw]
     
-    # Special timeframes
-    if raw in ("d", "1d", "day"):
-        return "D"
-    if raw in ("w", "1w", "week"):
-        return "W"
-    if raw in ("m", "1m", "month"):
-        return "M"
-    
     # Suffix forms: "5m" -> "5", "1h" -> "60", "4h" -> "240"
+    # Must check before special single-letter forms
     if raw.endswith("m") and raw[:-1].isdigit():
         minutes = int(raw[:-1])
         return str(minutes)
@@ -47,6 +40,14 @@ def normalize_timeframe(raw: str) -> str:
     if raw.endswith("h") and raw[:-1].isdigit():
         hours = int(raw[:-1])
         return str(hours * 60)
+    
+    # Special timeframes (after suffix checks)
+    if raw in ("d", "1d", "day"):
+        return "D"
+    if raw in ("w", "1w", "week"):
+        return "W"
+    if raw in ("m", "month"):
+        return "M"
     
     raise ValueError(f"Unrecognized timeframe: {raw!r}")
 
@@ -247,7 +248,7 @@ class CandleSync:
                 source="bybit_api",
                 source_received_at=datetime.now(timezone.utc),
                 ingested_at=datetime.now(timezone.utc),
-                quality_status="validated",
+                quality_status=QualityStatus.VALIDATED,
             )
             
             return candle
@@ -318,7 +319,7 @@ class CandleSync:
         merged_ranges = self._merge_ranges(required_ranges)
         
         # Check existing coverage
-        gaps: list[Gap] = []
+        all_raw_gaps: list[Gap] = []
         total_inserted = 0
         total_updated = 0
         total_rejected = 0
@@ -336,7 +337,7 @@ class CandleSync:
             
             # Add gaps to list
             for gap in existing_gaps:
-                gaps.append(
+                all_raw_gaps.append(
                     Gap(
                         instrument_id=instrument_id,
                         timeframe=timeframe,
@@ -344,25 +345,29 @@ class CandleSync:
                         gap_end=gap["gap_end"],
                     )
                 )
-            
-            # Fetch and store candles for gaps
-            for gap in existing_gaps:
-                inserted, updated, rejected, failed = self.fetch_and_store_candles(
-                    instrument_id=instrument_id,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    from_time=gap["gap_start"],
-                    to_time=gap["gap_end"],
-                )
-                total_inserted += inserted
-                total_updated += updated
-                total_rejected += rejected
-                all_failed_ranges.extend(failed)
+        
+        # Coalesce consecutive/per-candle gaps into contiguous ranges
+        gaps = self._coalesce_gaps(all_raw_gaps)
+        
+        # Fetch and store candles for coalesced gaps
+        for gap in gaps:
+            inserted, updated, rejected, failed = self.fetch_and_store_candles(
+                instrument_id=instrument_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                from_time=gap.gap_start,
+                to_time=gap.gap_end,
+            )
+            total_inserted += inserted
+            total_updated += updated
+            total_rejected += rejected
+            all_failed_ranges.extend(failed)
         
         logger.info(
-            "Reconciliation complete for %s %s: gaps=%d, inserted=%d, updated=%d, rejected=%d, failed=%d",
+            "Reconciliation complete for %s %s: raw_gaps=%d coalesced=%d inserted=%d updated=%d rejected=%d failed=%d",
             symbol,
             timeframe,
+            len(all_raw_gaps),
             len(gaps),
             total_inserted,
             total_updated,
@@ -371,6 +376,34 @@ class CandleSync:
         )
         
         return gaps, total_inserted, total_updated, total_rejected, all_failed_ranges
+
+    @staticmethod
+    def _coalesce_gaps(gaps: list[Gap]) -> list[Gap]:
+        """Coalesce adjacent/overlapping gaps into contiguous ranges.
+        
+        This is a safety net: even if the SQL function returns per-candle gaps,
+        this merges them before Bybit API calls.
+        """
+        if not gaps:
+            return []
+        
+        sorted_gaps = sorted(gaps, key=lambda g: g.gap_start)
+        coalesced: list[Gap] = [sorted_gaps[0]]
+        
+        for current in sorted_gaps[1:]:
+            last = coalesced[-1]
+            # Merge if current gap starts at or before the last gap ends
+            if current.gap_start <= last.gap_end:
+                coalesced[-1] = Gap(
+                    instrument_id=last.instrument_id,
+                    timeframe=last.timeframe,
+                    gap_start=last.gap_start,
+                    gap_end=max(last.gap_end, current.gap_end),
+                )
+            else:
+                coalesced.append(current)
+        
+        return coalesced
 
     def _merge_ranges(self, ranges: list[CandleRange]) -> list[CandleRange]:
         """Merge overlapping or adjacent ranges."""

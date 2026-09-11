@@ -188,6 +188,7 @@ COMMENT ON COLUMN market.candle.source IS 'Data source (bybit_api, manual, etc.)
 COMMENT ON COLUMN market.candle.quality_status IS 'Data quality status after validation';
 
 -- 10. Create function to check candle coverage for a time range
+-- Returns coalesced contiguous gaps (consecutive missing slots merged)
 CREATE OR REPLACE FUNCTION market.check_candle_coverage(
     p_instrument_id BIGINT,
     p_timeframe TEXT,
@@ -202,7 +203,10 @@ DECLARE
     timeframe_minutes INTEGER;
     v_current_time TIMESTAMPTZ;
     v_next_time TIMESTAMPTZ;
+    v_gap_start TIMESTAMPTZ;
+    v_gap_end TIMESTAMPTZ;
     candle_exists BOOLEAN;
+    in_gap BOOLEAN := FALSE;
 BEGIN
     -- Convert timeframe to minutes
     CASE p_timeframe
@@ -222,7 +226,7 @@ BEGIN
         ELSE timeframe_minutes := 5;
     END CASE;
     
-    -- Check each time slot
+    -- Scan each time slot and coalesce consecutive missing slots into contiguous gaps
     v_current_time := p_from;
     WHILE v_current_time < p_to LOOP
         v_next_time := v_current_time + (timeframe_minutes || ' minutes')::INTERVAL;
@@ -236,13 +240,33 @@ BEGIN
         ) INTO candle_exists;
 
         IF NOT candle_exists THEN
-            gap_start := v_current_time;
-            gap_end := v_next_time;
-            gap_duration := v_next_time - v_current_time;
-            RETURN NEXT;
+            IF NOT in_gap THEN
+                -- Start a new gap
+                v_gap_start := v_current_time;
+                in_gap := TRUE;
+            END IF;
+            -- Extend the gap end
+            v_gap_end := v_next_time;
+        ELSE
+            IF in_gap THEN
+                -- Gap ended — emit the coalesced gap
+                gap_start := v_gap_start;
+                gap_end := v_gap_end;
+                gap_duration := v_gap_end - v_gap_start;
+                RETURN NEXT;
+                in_gap := FALSE;
+            END IF;
         END IF;
 
         v_current_time := v_next_time;
     END LOOP;
+    
+    -- Emit any trailing gap
+    IF in_gap THEN
+        gap_start := v_gap_start;
+        gap_end := v_gap_end;
+        gap_duration := v_gap_end - v_gap_start;
+        RETURN NEXT;
+    END IF;
 END;
 $$ LANGUAGE plpgsql;
