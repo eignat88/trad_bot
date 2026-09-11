@@ -425,6 +425,7 @@ class AnalyticsRunner:
                 symbol=symbol,
                 timeframe=timeframe,
                 required_ranges=merged_ranges,
+                observation_cutoff=run.observation_cutoff,
             )
             
             total_inserted += inserted
@@ -601,6 +602,7 @@ class AnalyticsRunner:
                 symbol=symbol,
                 timeframe=timeframe,
                 required_ranges=merged_ranges,
+                observation_cutoff=run.observation_cutoff,
             )
             
             total_inserted += inserted
