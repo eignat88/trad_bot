@@ -118,21 +118,34 @@ FROM daily_stats
 ORDER BY business_date DESC;
 
 -- 6. Unresolved Gaps Summary
+-- This view shows gaps for all instruments and timeframes
+-- It uses a lateral join to call the function for each instrument/timeframe
 CREATE OR REPLACE VIEW mart.analytics_unresolved_gaps AS
+WITH instrument_timeframes AS (
+    -- Get distinct instrument_id and timeframe combinations from recent candles
+    SELECT DISTINCT 
+        instrument_id, 
+        timeframe
+    FROM market.candle
+    WHERE open_time >= NOW() - INTERVAL '7 days'
+      AND is_closed = TRUE
+)
 SELECT 
-    instrument_id,
-    timeframe,
+    it.instrument_id,
+    it.timeframe,
     COUNT(*) AS gap_count,
-    SUM(EXTRACT(EPOCH FROM (gap_end - gap_start)) / 60) AS total_gap_minutes,
-    MIN(gap_start) AS earliest_gap,
-    MAX(gap_end) AS latest_gap
-FROM market.check_candle_coverage(
-    (SELECT instrument_id FROM market.candle LIMIT 1),
-    '5',
+    SUM(EXTRACT(EPOCH FROM (g.gap_end - g.gap_start)) / 60) AS total_gap_minutes,
+    MIN(g.gap_start) AS earliest_gap,
+    MAX(g.gap_end) AS latest_gap
+FROM instrument_timeframes it
+CROSS JOIN LATERAL market.check_candle_coverage(
+    it.instrument_id,
+    it.timeframe,
     NOW() - INTERVAL '7 days',
     NOW()
-)
-GROUP BY instrument_id, timeframe;
+) g
+GROUP BY it.instrument_id, it.timeframe
+HAVING COUNT(*) > 0;
 
 -- 7. Key Performance Indicators
 CREATE OR REPLACE VIEW mart.analytics_kpis AS
