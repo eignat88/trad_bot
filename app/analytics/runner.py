@@ -323,18 +323,142 @@ class AnalyticsRunner:
     def _stage_candle_reconciliation(
         self, run: AnalysisRun, stage_run: AnalysisStageRun
     ) -> dict[str, Any]:
-        """Stage 1: Candle reconciliation."""
-        logger.info("Running candle reconciliation")
+        """Stage 1: Candle reconciliation.
         
-        # This is a placeholder - actual implementation would:
-        # 1. Get required candle ranges from trades
-        # 2. Reconcile with existing data
-        # 3. Fetch missing candles from Bybit
+        Fetches closed candles from Bybit for all relevant trades
+        within the analysis window.
+        """
+        logger.info("Running candle reconciliation for run %s", run.run_id)
         
-        return {
-            "output_rows": 0,
-            "message": "Candle reconciliation completed",
+        from app.analytics.candle_sync import normalize_timeframe, CandleRange
+        
+        # 1. Query relevant trades from dds.paper_trade
+        cursor = self._repo._conn.cursor()
+        cursor.execute(
+            """
+            SELECT 
+                pt.trade_id, pt.symbol, pt.entered_at, pt.closed_at, pt.entry_timeframe
+            FROM dds.paper_trade pt
+            WHERE pt.closed_at IS NOT NULL
+              AND pt.entered_at < %s
+            ORDER BY pt.entered_at
+            """,
+            (run.analysis_to,),
+        )
+        trades = cursor.fetchall()
+        
+        if not trades:
+            logger.info("No relevant trades found for candle reconciliation")
+            return {
+                "output_rows": 0,
+                "no_required_ranges": True,
+                "trades_considered": 0,
+                "instruments_considered": 0,
+                "ranges_requested": 0,
+                "gaps_detected": 0,
+                "inserted": 0,
+                "updated": 0,
+                "rejected": 0,
+                "failed_ranges": [],
+                "message": "No trades found — reconciliation succeeded with zero rows",
+            }
+        
+        # 2. Resolve symbol → instrument_id and build required ranges
+        # Group by (instrument_id, symbol, timeframe)
+        instrument_map: dict[str, int] = {}  # symbol → instrument_id
+        ranges_by_key: dict[tuple[int, str], list[CandleRange]] = {}
+        
+        for trade_id, symbol, entered_at, closed_at, raw_timeframe in trades:
+            # Normalize timeframe
+            try:
+                timeframe = normalize_timeframe(raw_timeframe)
+            except ValueError:
+                logger.warning("Skipping trade %s: unrecognizable timeframe %r", trade_id, raw_timeframe)
+                continue
+            
+            # Resolve symbol → instrument_id
+            if symbol not in instrument_map:
+                cursor.execute(
+                    "SELECT instrument_id FROM dds.instrument WHERE symbol = %s LIMIT 1",
+                    (symbol,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    logger.warning("Skipping trade %s: instrument not found for symbol %s", trade_id, symbol)
+                    continue
+                instrument_map[symbol] = row[0]
+            
+            instrument_id = instrument_map[symbol]
+            key = (instrument_id, symbol, timeframe)
+            
+            # Build required range: entered_at → closed_at + post_exit_horizon
+            trade_end = closed_at + run.post_exit_horizon
+            range_ = CandleRange(
+                instrument_id=instrument_id,
+                timeframe=timeframe,
+                from_time=entered_at,
+                to_time=trade_end,
+            )
+            
+            if key not in ranges_by_key:
+                ranges_by_key[key] = []
+            ranges_by_key[key].append(range_)
+        
+        # 3. For each unique (instrument_id, symbol, timeframe), merge and reconcile
+        total_inserted = 0
+        total_updated = 0
+        total_rejected = 0
+        total_gaps = 0
+        all_failed_ranges: list[dict[str, Any]] = []
+        
+        for (instrument_id, symbol, timeframe), ranges in ranges_by_key.items():
+            merged_ranges = self._candle_sync._merge_ranges(ranges)
+            
+            gaps, inserted, updated, rejected, failed = self._candle_sync.reconcile_candles(
+                instrument_id=instrument_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                required_ranges=merged_ranges,
+            )
+            
+            total_inserted += inserted
+            total_updated += updated
+            total_rejected += rejected
+            total_gaps += len(gaps)
+            all_failed_ranges.extend(failed)
+        
+        # 4. Check for blocking failures
+        if all_failed_ranges and total_inserted == 0 and total_updated == 0:
+            raise RuntimeError(
+                f"Candle fetch failed for all {len(all_failed_ranges)} ranges "
+                f"with no data stored"
+            )
+        
+        total_rows = total_inserted + total_updated
+        
+        result = {
+            "output_rows": total_rows,
+            "trades_considered": len(trades),
+            "instruments_considered": len(instrument_map),
+            "ranges_requested": sum(len(r) for r in ranges_by_key.values()),
+            "gaps_detected": total_gaps,
+            "inserted": total_inserted,
+            "updated": total_updated,
+            "rejected": total_rejected,
+            "failed_ranges": all_failed_ranges,
         }
+        
+        if all_failed_ranges:
+            result["message"] = (
+                f"Reconciliation completed with {len(all_failed_ranges)} failed fetch batches: "
+                f"inserted={total_inserted}, updated={total_updated}"
+            )
+        else:
+            result["message"] = (
+                f"Reconciliation complete: inserted={total_inserted}, updated={total_updated}"
+            )
+        
+        return result
 
     def _stage_quality_gate(
         self, run: AnalysisRun, stage_run: AnalysisStageRun
@@ -368,17 +492,133 @@ class AnalyticsRunner:
     def _stage_post_exit_backfill(
         self, run: AnalysisRun, stage_run: AnalysisStageRun
     ) -> dict[str, Any]:
-        """Stage 1: Post-exit candle backfill for FINAL."""
-        logger.info("Running post-exit backfill")
+        """Stage 1: Post-exit candle backfill for FINAL.
         
-        # This is a placeholder - actual implementation would:
-        # 1. Get trades that need post-exit data
-        # 2. Check coverage for each trade
-        # 3. Fetch missing post-exit candles
+        Ensures all post-exit windows are fully covered.
+        FINAL must not succeed if BLOCKING post-exit coverage is missing.
+        """
+        logger.info("Running post-exit backfill for FINAL run %s", run.run_id)
+        
+        from app.analytics.candle_sync import normalize_timeframe, CandleRange
+        
+        # 1. Query trades that need post-exit data
+        cursor = self._repo._conn.cursor()
+        cursor.execute(
+            """
+            SELECT 
+                pt.trade_id, pt.symbol, pt.closed_at, pt.entry_timeframe
+            FROM dds.paper_trade pt
+            WHERE pt.closed_at IS NOT NULL
+              AND pt.closed_at < %s
+            ORDER BY pt.closed_at
+            """,
+            (run.observation_cutoff,),
+        )
+        trades = cursor.fetchall()
+        
+        if not trades:
+            logger.info("No trades requiring post-exit backfill")
+            return {
+                "output_rows": 0,
+                "no_required_ranges": True,
+                "trades_considered": 0,
+                "instruments_considered": 0,
+                "ranges_requested": 0,
+                "gaps_detected": 0,
+                "inserted": 0,
+                "updated": 0,
+                "rejected": 0,
+                "failed_ranges": [],
+                "message": "No trades requiring post-exit backfill",
+            }
+        
+        # 2. Resolve symbols and build post-exit ranges
+        instrument_map: dict[str, int] = {}
+        ranges_by_key: dict[tuple[int, str], list[CandleRange]] = []
+        failed_symbols: list[str] = []
+        
+        for trade_id, symbol, closed_at, raw_timeframe in trades:
+            try:
+                timeframe = normalize_timeframe(raw_timeframe)
+            except ValueError:
+                logger.warning("Skipping trade %s: unrecognizable timeframe %r", trade_id, raw_timeframe)
+                continue
+            
+            if symbol not in instrument_map:
+                cursor.execute(
+                    "SELECT instrument_id FROM dds.instrument WHERE symbol = %s LIMIT 1",
+                    (symbol,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    logger.warning("Skipping trade %s: instrument not found for %s", trade_id, symbol)
+                    failed_symbols.append(symbol)
+                    continue
+                instrument_map[symbol] = row[0]
+            
+            instrument_id = instrument_map[symbol]
+            key = (instrument_id, symbol, timeframe)
+            
+            post_exit_end = closed_at + run.post_exit_horizon
+            
+            # Only backfill up to observation_cutoff for safety
+            effective_end = min(post_exit_end, run.observation_cutoff)
+            
+            range_ = CandleRange(
+                instrument_id=instrument_id,
+                timeframe=timeframe,
+                from_time=closed_at,
+                to_time=effective_end,
+            )
+            
+            if key not in ranges_by_key:
+                ranges_by_key[key] = []
+            ranges_by_key[key].append(range_)
+        
+        # 3. Reconcile each group
+        total_inserted = 0
+        total_updated = 0
+        total_rejected = 0
+        total_gaps = 0
+        all_failed_ranges: list[dict[str, Any]] = []
+        
+        for (instrument_id, symbol, timeframe), ranges in ranges_by_key.items():
+            merged_ranges = self._candle_sync._merge_ranges(ranges)
+            
+            gaps, inserted, updated, rejected, failed = self._candle_sync.reconcile_candles(
+                instrument_id=instrument_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                required_ranges=merged_ranges,
+            )
+            
+            total_inserted += inserted
+            total_updated += updated
+            total_rejected += rejected
+            total_gaps += len(gaps)
+            all_failed_ranges.extend(failed)
+        
+        # 4. FINAL must not succeed if fetch failures occurred
+        if all_failed_ranges:
+            raise RuntimeError(
+                f"Post-exit backfill failed for {len(all_failed_ranges)} ranges: "
+                f"incomplete post-exit coverage blocks FINAL"
+            )
+        
+        total_rows = total_inserted + total_updated
         
         return {
-            "output_rows": 0,
-            "message": "Post-exit backfill completed",
+            "output_rows": total_rows,
+            "trades_considered": len(trades),
+            "instruments_considered": len(instrument_map),
+            "ranges_requested": sum(len(r) for r in ranges_by_key.values()),
+            "gaps_detected": total_gaps,
+            "inserted": total_inserted,
+            "updated": total_updated,
+            "rejected": total_rejected,
+            "failed_ranges": all_failed_ranges,
+            "failed_symbols": failed_symbols,
+            "message": f"Post-exit backfill complete: inserted={total_inserted}, updated={total_updated}",
         }
 
     def _stage_final_quality_gate(

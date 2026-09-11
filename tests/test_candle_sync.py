@@ -37,7 +37,7 @@ class TestCandleSync:
         # Mock repository
         self.mock_repo.insert_candles_batch.return_value = (2, 0, 0)
         
-        inserted, updated, rejected = self.candle_sync.fetch_and_store_candles(
+        inserted, updated, rejected, failed = self.candle_sync.fetch_and_store_candles(
             instrument_id=1,
             symbol="BTCUSDT",
             timeframe="5",
@@ -48,6 +48,7 @@ class TestCandleSync:
         assert inserted == 2
         assert updated == 0
         assert rejected == 0
+        assert failed == []
         self.mock_repo.insert_candles_batch.assert_called_once()
 
     def test_parse_candle(self):
@@ -134,7 +135,7 @@ class TestCandleSync:
         ]
         
         # Mock fetch_and_store_candles to return success
-        self.candle_sync.fetch_and_store_candles = MagicMock(return_value=(12, 0, 0))
+        self.candle_sync.fetch_and_store_candles = MagicMock(return_value=(12, 0, 0, []))
         
         required_ranges = [
             CandleRange(
@@ -145,7 +146,7 @@ class TestCandleSync:
             )
         ]
         
-        gaps, inserted, updated, rejected = self.candle_sync.reconcile_candles(
+        gaps, inserted, updated, rejected, failed = self.candle_sync.reconcile_candles(
             instrument_id=1,
             symbol="BTCUSDT",
             timeframe="5",
@@ -156,6 +157,7 @@ class TestCandleSync:
         assert inserted == 12
         assert updated == 0
         assert rejected == 0
+        assert failed == []
 
     def test_check_post_exit_coverage(self):
         """Test post-exit coverage check."""

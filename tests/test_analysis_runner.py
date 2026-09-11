@@ -31,6 +31,8 @@ class TestAnalyticsRunner:
         self.mock_settings.analytics_candle_retention_days = 180
         
         self.mock_repo = Mock(spec=AnalyticsRepository)
+        self.mock_conn = MagicMock()
+        self.mock_repo._conn = self.mock_conn
         self.mock_candle_sync = Mock(spec=CandleSync)
         self.mock_quality_gate = Mock(spec=DataQualityGate)
         self.mock_retention = Mock(spec=CandleRetention)
@@ -131,7 +133,7 @@ class TestAnalyticsRunner:
             self.runner._execute_stage(run, "test_stage", mock_stage_func)
 
     def test_stage_candle_reconciliation(self):
-        """Test candle reconciliation stage."""
+        """Test candle reconciliation stage with no trades."""
         run = AnalysisRun(
             run_id=uuid4(),
             business_date=date(2026, 9, 12),
@@ -143,10 +145,16 @@ class TestAnalyticsRunner:
             stage_name="candle_reconciliation",
         )
         
+        # Mock cursor to return no trades
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = []
+        self.mock_conn.cursor.return_value = mock_cursor
+        
         result = self.runner._stage_candle_reconciliation(run, stage_run)
         
-        assert "output_rows" in result
-        assert "message" in result
+        assert result["output_rows"] == 0
+        assert result["no_required_ranges"] is True
+        assert result["trades_considered"] == 0
 
     def test_stage_quality_gate(self):
         """Test quality gate stage."""
@@ -218,7 +226,14 @@ class TestAnalyticsRunner:
         self.mock_repo.create_analysis_run.return_value = AnalysisRun(
             run_id=uuid4(),
             business_date=date(2026, 9, 12),
+            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
+            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
         )
+        
+        # Mock cursor for candle reconciliation (no trades)
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = []
+        self.mock_conn.cursor.return_value = mock_cursor
         
         # Mock stages
         self.mock_quality_gate.run_quality_checks.return_value = (True, [])
@@ -246,7 +261,15 @@ class TestAnalyticsRunner:
             run_id=uuid4(),
             business_date=date(2026, 9, 12),
             maturity=Maturity.PROVISIONAL,
+            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
+            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
+            observation_cutoff=datetime.now(timezone.utc),
         )
+        
+        # Mock cursor for post_exit_backfill (no trades)
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = []
+        self.mock_conn.cursor.return_value = mock_cursor
         
         # Mock stages
         self.mock_quality_gate.run_quality_checks.return_value = (True, [])

@@ -12,6 +12,45 @@ from app.exchange.bybit_client import BybitClient
 logger = logging.getLogger(__name__)
 
 
+def normalize_timeframe(raw: str) -> str:
+    """Normalize a timeframe string to the internal/Bybit canonical form.
+    
+    Handles production paper_trade values ("5m", "15m", "1h", "4h", "1D")
+    and internal values ("5", "15", "60", etc.).
+    
+    Returns the canonical string used by market.candle and Bybit API.
+    Raises ValueError for unrecognized formats.
+    """
+    raw = raw.strip().lower()
+    
+    # Direct numeric (already normalized)
+    direct = {
+        "1": "1", "3": "3", "5": "5", "15": "15", "30": "30",
+        "60": "60", "120": "120", "240": "240", "360": "360", "720": "720",
+    }
+    if raw in direct:
+        return direct[raw]
+    
+    # Special timeframes
+    if raw in ("d", "1d", "day"):
+        return "D"
+    if raw in ("w", "1w", "week"):
+        return "W"
+    if raw in ("m", "1m", "month"):
+        return "M"
+    
+    # Suffix forms: "5m" -> "5", "1h" -> "60", "4h" -> "240"
+    if raw.endswith("m") and raw[:-1].isdigit():
+        minutes = int(raw[:-1])
+        return str(minutes)
+    
+    if raw.endswith("h") and raw[:-1].isdigit():
+        hours = int(raw[:-1])
+        return str(hours * 60)
+    
+    raise ValueError(f"Unrecognized timeframe: {raw!r}")
+
+
 class CandleSync:
     """Synchronizes candle data from Bybit to PostgreSQL."""
 
@@ -29,11 +68,13 @@ class CandleSync:
         to_time: datetime,
         workers: int = 2,
         retry_count: int = 3,
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int, int, list[dict[str, Any]]]:
         """Fetch candles from Bybit and store them.
         
         Returns:
-            Tuple of (inserted, updated, rejected) counts.
+            Tuple of (inserted, updated, rejected, failed_ranges).
+            failed_ranges contains dicts with from_time/to_time/error for
+            any batch that could not be fetched after all retries.
         """
         logger.info(
             "Fetching candles for %s %s from %s to %s",
@@ -44,6 +85,7 @@ class CandleSync:
         )
         
         all_candles = []
+        failed_ranges: list[dict[str, Any]] = []
         current_from = from_time
         
         while current_from < to_time:
@@ -86,22 +128,36 @@ class CandleSync:
                     batch_end,
                     e,
                 )
+                failed_ranges.append({
+                    "from_time": current_from,
+                    "to_time": batch_end,
+                    "error": str(e),
+                })
                 current_from = batch_end
         
         # Store all candles
         if all_candles:
             inserted, updated, rejected = self._repo.insert_candles_batch(all_candles)
             logger.info(
-                "Stored candles for %s %s: inserted=%d, updated=%d, rejected=%d",
+                "Stored candles for %s %s: inserted=%d, updated=%d, rejected=%d, failed_batches=%d",
                 symbol,
                 timeframe,
                 inserted,
                 updated,
                 rejected,
+                len(failed_ranges),
             )
-            return inserted, updated, rejected
+            return inserted, updated, rejected, failed_ranges
         
-        return 0, 0, 0
+        if failed_ranges:
+            logger.warning(
+                "No candles fetched for %s %s: %d failed batches",
+                symbol,
+                timeframe,
+                len(failed_ranges),
+            )
+        
+        return 0, 0, 0, failed_ranges
 
     def _fetch_candles_batch(
         self,
@@ -245,11 +301,11 @@ class CandleSync:
         timeframe: str,
         required_ranges: list[CandleRange],
         watermark: Optional[Watermark] = None,
-    ) -> tuple[list[Gap], int, int, int]:
+    ) -> tuple[list[Gap], int, int, int, list[dict[str, Any]]]:
         """Reconcile candle data for required ranges.
         
         Returns:
-            Tuple of (gaps, inserted, updated, rejected).
+            Tuple of (gaps, inserted, updated, rejected, failed_ranges).
         """
         logger.info(
             "Reconciling candles for %s %s with %d ranges",
@@ -262,10 +318,11 @@ class CandleSync:
         merged_ranges = self._merge_ranges(required_ranges)
         
         # Check existing coverage
-        gaps = []
+        gaps: list[Gap] = []
         total_inserted = 0
         total_updated = 0
         total_rejected = 0
+        all_failed_ranges: list[dict[str, Any]] = []
         
         for range_ in merged_ranges:
             # Check coverage for this range
@@ -290,7 +347,7 @@ class CandleSync:
             
             # Fetch and store candles for gaps
             for gap in existing_gaps:
-                inserted, updated, rejected = self.fetch_and_store_candles(
+                inserted, updated, rejected, failed = self.fetch_and_store_candles(
                     instrument_id=instrument_id,
                     symbol=symbol,
                     timeframe=timeframe,
@@ -300,18 +357,20 @@ class CandleSync:
                 total_inserted += inserted
                 total_updated += updated
                 total_rejected += rejected
+                all_failed_ranges.extend(failed)
         
         logger.info(
-            "Reconciliation complete for %s %s: gaps=%d, inserted=%d, updated=%d, rejected=%d",
+            "Reconciliation complete for %s %s: gaps=%d, inserted=%d, updated=%d, rejected=%d, failed=%d",
             symbol,
             timeframe,
             len(gaps),
             total_inserted,
             total_updated,
             total_rejected,
+            len(all_failed_ranges),
         )
         
-        return gaps, total_inserted, total_updated, total_rejected
+        return gaps, total_inserted, total_updated, total_rejected, all_failed_ranges
 
     def _merge_ranges(self, ranges: list[CandleRange]) -> list[CandleRange]:
         """Merge overlapping or adjacent ranges."""
