@@ -165,6 +165,16 @@ class Settings:
     position_monitor_interval: int = 10
     # DCA Breakeven configuration
     dca: DCASettings = field(default_factory=DCASettings)
+    
+    # Analytics pipeline configuration
+    analytics_schedule_time: str = "06:00"
+    analytics_timezone: str = "Europe/Sofia"
+    analytics_post_exit_hours: int = 4
+    analytics_candle_retention_days: int = 180
+    analytics_candle_workers: int = 2
+    analytics_api_retry_count: int = 3
+    analytics_stage_timeout_seconds: int = 3600
+    analytics_enabled: bool = False
 
 
 def _load_dotenv(path: Path) -> None:

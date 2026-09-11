@@ -1,0 +1,23 @@
+[Unit]
+Description=Trad Bot Analytics Pipeline Finalize
+After=network.target postgresql.service trad-bot-analytics.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=tradbot-analytics
+Group=tradbot-analytics
+EnvironmentFile=/etc/trad-bot/analytics.env
+WorkingDirectory=/opt/trad_bot
+TimeoutStartSec=45min
+Nice=10
+CPUQuota=60%
+MemoryMax=1G
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+ExecStart=/opt/trad_bot/.venv/bin/python -m app.analytics.cli finalize
+
+[Install]
+WantedBy=multi-user.target
