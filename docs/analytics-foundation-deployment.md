@@ -23,6 +23,13 @@ sudo usermod -aG tradbot tradbot-analytics
 ### 3. PostgreSQL Role Creation
 Create a dedicated PostgreSQL role for the analytics pipeline:
 
+**Option A: Using migration 010_analytics_rbac.sql (Recommended)**
+```bash
+cd /opt/trad_bot
+sudo -u postgres psql -d trad_bot -f sql/migrations/010_analytics_rbac.sql
+```
+
+**Option B: Manual creation (if migration fails)**
 ```sql
 -- Connect as postgres
 sudo -u postgres psql
@@ -30,29 +37,44 @@ sudo -u postgres psql
 -- Create role without password (credential set separately)
 CREATE ROLE analytics_runner WITH LOGIN NOINHERIT;
 
+-- Set safe role attributes
+ALTER ROLE analytics_runner
+    NOSUPERUSER
+    NOCREATEDB
+    NOCREATEROLE
+    NOREPLICATION
+    NOBYPASSRLS;
+
 -- Grant permissions
 GRANT CONNECT ON DATABASE trad_bot TO analytics_runner;
-GRANT USAGE ON SCHEMA dds, config, market, analytics, mart TO analytics_runner;
+GRANT USAGE ON SCHEMA analytics, market, dds TO analytics_runner;
 
--- SELECT on production tables
-GRANT SELECT ON ALL TABLES IN SCHEMA dds TO analytics_runner;
-GRANT SELECT ON ALL TABLES IN SCHEMA config TO analytics_runner;
-GRANT SELECT ON ALL TABLES IN SCHEMA mart TO analytics_runner;
-
--- SELECT, INSERT, UPDATE on analytics tables
+-- Analytics schema: full CRUD
 GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA analytics TO analytics_runner;
-GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA market TO analytics_runner;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA analytics TO analytics_runner;
 
--- Sequence permissions
-GRANT USAGE ON ALL SEQUENCES IN SCHEMA analytics TO analytics_runner;
-GRANT USAGE ON ALL SEQUENCES IN SCHEMA market TO analytics_runner;
+-- Market schema: SELECT, INSERT, UPDATE on market.candle only
+GRANT SELECT, INSERT, UPDATE ON market.candle TO analytics_runner;
 
--- Revoke dangerous permissions
-REVOKE UPDATE, DELETE ON ALL TABLES IN SCHEMA dds FROM analytics_runner;
-REVOKE UPDATE, DELETE ON ALL TABLES IN SCHEMA config FROM analytics_runner;
-REVOKE UPDATE, DELETE ON ALL TABLES IN SCHEMA mart FROM analytics_runner;
-REVOKE ALL ON config.scanner_direction_gate FROM analytics_runner;
+-- DDS schema: SELECT only on dds.paper_trade
+GRANT SELECT ON dds.paper_trade TO analytics_runner;
+
+-- Explicitly deny write permissions on critical tables
+REVOKE UPDATE, INSERT, DELETE ON config.scanner_direction_gate FROM analytics_runner;
+REVOKE UPDATE, INSERT, DELETE ON config.scanner_grafana_visibility FROM analytics_runner;
+REVOKE UPDATE, INSERT, DELETE ON dds.paper_trade FROM analytics_runner;
+REVOKE UPDATE, INSERT, DELETE ON dds.paper_account FROM analytics_runner;
+REVOKE UPDATE, INSERT, DELETE ON dds.paper_trade_stats FROM analytics_runner;
 ```
+
+**Important:** The analytics_runner role has minimal permissions:
+- ✅ SELECT, INSERT, UPDATE on analytics.*
+- ✅ SELECT, INSERT, UPDATE on market.candle
+- ✅ SELECT on dds.paper_trade (for post-exit coverage check)
+- ❌ NO DELETE on any table
+- ❌ NO access to config.* (except read-only if needed)
+- ❌ NO write access to dds.* except market.candle
+- ❌ NO SUPERUSER, CREATEDB, CREATEROLE, REPLICATION, BYPASSRLS
 
 ### 4. Environment File
 Create `/etc/trad-bot/analytics.env`:
@@ -66,7 +88,7 @@ ANALYTICS_CANDLE_RETENTION_DAYS=180
 ANALYTICS_CANDLE_WORKERS=2
 ANALYTICS_API_RETRY_COUNT=3
 ANALYTICS_STAGE_TIMEOUT_SECONDS=3600
-ANALYTICS_ENABLED=true
+ANALYTICS_ENABLED=false
 
 # Database configuration
 DB_HOST=localhost
@@ -80,7 +102,10 @@ BYBIT_API_KEY=<SET_SEPARATELY>
 BYBIT_API_SECRET=<SET_SEPARATELY>
 ```
 
-**IMPORTANT**: Set the database password and API credentials securely. Never commit secrets to Git.
+**IMPORTANT**: 
+- Set the database password and API credentials securely. Never commit secrets to Git.
+- **Initial state:** `ANALYTICS_ENABLED=false` - only enable after migrations, DDL/grants verification, and manual smoke test.
+- **Enable only after:** All migrations applied, RBAC verified, manual test run successful.
 
 ## Deployment Steps
 

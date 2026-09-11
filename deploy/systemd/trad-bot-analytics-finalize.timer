@@ -3,7 +3,7 @@ Description=Trad Bot Analytics Pipeline Finalize Timer
 Requires=trad-bot-analytics-finalize.service
 
 [Timer]
-OnCalendar=*-*-* 10:05:00
+OnCalendar=*-*-* 10:05:00 Europe/Sofia
 Persistent=true
 RandomizedDelaySec=0
 AccuracySec=1min

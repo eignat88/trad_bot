@@ -45,14 +45,19 @@ class TestAnalyticsSystemd:
         assert "NoNewPrivileges=true" in content
 
     def test_timer_file_content(self):
-        """Test timer file content."""
+        """Test timer file content with Europe/Sofia timezone."""
         timer_file = Path("deploy/systemd/trad-bot-analytics.timer")
         content = timer_file.read_text()
         
-        assert "OnCalendar=*-*-* 06:00:00" in content
+        # Verify Europe/Sofia timezone is specified
+        assert "OnCalendar=*-*-* 06:00:00 Europe/Sofia" in content
         assert "Persistent=true" in content
         assert "RandomizedDelaySec=0" in content
         assert "AccuracySec=1min" in content
+        
+        # Verify DST-safe calendar expression
+        # The OnCalendar format handles DST automatically when timezone is specified
+        assert "Europe/Sofia" in content
 
     def test_finalize_service_file_content(self):
         """Test finalize service file content."""
@@ -71,14 +76,18 @@ class TestAnalyticsSystemd:
         assert "NoNewPrivileges=true" in content
 
     def test_finalize_timer_file_content(self):
-        """Test finalize timer file content."""
+        """Test finalize timer file content with Europe/Sofia timezone."""
         timer_file = Path("deploy/systemd/trad-bot-analytics-finalize.timer")
         content = timer_file.read_text()
         
-        assert "OnCalendar=*-*-* 10:05:00" in content
+        # Verify Europe/Sofia timezone is specified
+        assert "OnCalendar=*-*-* 10:05:00 Europe/Sofia" in content
         assert "Persistent=true" in content
         assert "RandomizedDelaySec=0" in content
         assert "AccuracySec=1min" in content
+        
+        # Verify DST-safe calendar expression
+        assert "Europe/Sofia" in content
 
     def test_service_file_has_correct_exec_start(self):
         """Test that service file has correct ExecStart."""
@@ -108,3 +117,31 @@ class TestAnalyticsSystemd:
         content = timer_file.read_text()
         
         assert "Requires=trad-bot-analytics.service" in content
+
+    def test_timer_dst_safe_calendar_expression(self):
+        """Test that timer uses DST-safe calendar expression."""
+        from zoneinfo import ZoneInfo
+        from datetime import datetime, timezone
+        
+        # Verify Europe/Sofia timezone exists and handles DST
+        tz_sofia = ZoneInfo("Europe/Sofia")
+        
+        # Test winter time (EET - Eastern European Time)
+        winter_time = datetime(2026, 1, 15, 6, 0, tzinfo=tz_sofia)
+        # Europe/Sofia is UTC+2 in winter (EET)
+        assert winter_time.utcoffset().total_seconds() == 7200  # UTC+2
+        
+        # Test summer time (EEST - Eastern European Summer Time)
+        summer_time = datetime(2026, 7, 15, 6, 0, tzinfo=tz_sofia)
+        # Europe/Sofia is UTC+3 in summer (EEST)
+        assert summer_time.utcoffset().total_seconds() == 10800  # UTC+3
+        
+        # Verify timer file specifies Europe/Sofia
+        timer_file = Path("deploy/systemd/trad-bot-analytics.timer")
+        content = timer_file.read_text()
+        assert "Europe/Sofia" in content
+        
+        # Verify finalize timer also specifies Europe/Sofia
+        finalize_timer_file = Path("deploy/systemd/trad-bot-analytics-finalize.timer")
+        finalize_content = finalize_timer_file.read_text()
+        assert "Europe/Sofia" in finalize_content
