@@ -670,3 +670,155 @@ class TestQualityCheckStatusValues:
         )
         with pytest.raises(Exception):
             repository.create_quality_result(result)
+
+
+class TestLifecycleRetryReset:
+    """Tests for lifecycle retry/reset semantics."""
+
+    def test_provisional_retry_resets_stale_fields(self, repository):
+        """Test that retrying a failed PROVISIONAL run resets terminal fields."""
+        from app.analytics.runner import AnalyticsRunner
+        from app.analytics.models import RunStatus, Maturity
+
+        # 1. Create an initial FAILED run
+        run = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 12),
+            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
+            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
+            observation_cutoff=datetime.now(timezone.utc),
+        )
+        repository.create_analysis_run(run)
+
+        # Simulate a failed first attempt
+        run.status = RunStatus.FAILED
+        run.maturity = Maturity.FAILED
+        run.started_at = datetime(2026, 9, 11, 12, 0, tzinfo=timezone.utc)
+        run.finished_at = datetime(2026, 9, 11, 12, 20, tzinfo=timezone.utc)
+        run.error_code = "STAGE_FAILED"
+        run.error_message = "old error message"
+        repository.update_analysis_run(run)
+
+        # Verify the failed state is persisted
+        reloaded = repository.get_analysis_run(run.run_id)
+        assert reloaded.status == RunStatus.FAILED
+        assert reloaded.maturity == Maturity.FAILED
+        assert reloaded.finished_at is not None
+        assert reloaded.error_code == "STAGE_FAILED"
+        assert reloaded.error_message == "old error message"
+
+        # 2. Simulate retry: _prepare_run_for_execution resets fields
+        now_before = datetime.now(timezone.utc)
+        AnalyticsRunner._prepare_run_for_execution(run, Maturity.PROVISIONAL)
+        repository.update_analysis_run(run)
+
+        # 3. Verify stale fields are cleared
+        reloaded = repository.get_analysis_run(run.run_id)
+        assert reloaded.status == RunStatus.RUNNING
+        assert reloaded.maturity == Maturity.PROVISIONAL
+        assert reloaded.started_at >= now_before
+        assert reloaded.finished_at is None
+        assert reloaded.error_code is None
+        assert reloaded.error_message is None
+        # run_id preserved
+        assert reloaded.run_id == run.run_id
+
+    def test_final_retry_resets_stale_fields(self, repository):
+        """Test that retrying a failed FINAL run resets terminal fields."""
+        from app.analytics.runner import AnalyticsRunner
+        from app.analytics.models import RunStatus, Maturity
+
+        # 1. Create a FAILED FINAL run
+        run = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 12),
+            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
+            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
+            observation_cutoff=datetime.now(timezone.utc),
+            maturity=Maturity.PROVISIONAL,
+        )
+        repository.create_analysis_run(run)
+
+        # Simulate a failed FINAL attempt
+        run.status = RunStatus.FAILED
+        run.maturity = Maturity.FAILED
+        run.started_at = datetime(2026, 9, 11, 12, 0, tzinfo=timezone.utc)
+        run.finished_at = datetime(2026, 9, 11, 12, 20, tzinfo=timezone.utc)
+        run.error_code = "FINAL_STAGE_FAILED"
+        run.error_message = "final error message"
+        repository.update_analysis_run(run)
+
+        # Verify the failed state
+        reloaded = repository.get_analysis_run(run.run_id)
+        assert reloaded.finished_at is not None
+        assert reloaded.error_code == "FINAL_STAGE_FAILED"
+
+        # 2. Simulate retry
+        now_before = datetime.now(timezone.utc)
+        AnalyticsRunner._prepare_run_for_execution(run, Maturity.PROVISIONAL)
+        repository.update_analysis_run(run)
+
+        # 3. Verify stale fields are cleared
+        reloaded = repository.get_analysis_run(run.run_id)
+        assert reloaded.status == RunStatus.RUNNING
+        assert reloaded.finished_at is None
+        assert reloaded.error_code is None
+        assert reloaded.error_message is None
+        assert reloaded.started_at >= now_before
+
+    def test_attempt_numbers_increment_on_retry(self, repository):
+        """Test that stage attempt numbers continue incrementing on retry."""
+        run = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 12),
+            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
+            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
+            observation_cutoff=datetime.now(timezone.utc),
+        )
+        repository.create_analysis_run(run)
+
+        # First attempt stages
+        for attempt in range(1, 4):
+            stage_run = AnalysisStageRun(
+                run_id=run.run_id,
+                stage_name="candle_reconciliation",
+                attempt=attempt,
+                status=StageStatus.SUCCEEDED,
+            )
+            repository.create_stage_run(stage_run)
+
+        # Verify attempt numbers
+        cursor = repository._conn.cursor()
+        cursor.execute(
+            "SELECT MAX(attempt) FROM analytics.analysis_stage_run WHERE run_id = %s AND stage_name = %s",
+            (str(run.run_id), "candle_reconciliation"),
+        )
+        max_attempt = cursor.fetchone()[0]
+        assert max_attempt == 3
+
+    def test_provisional_retry_lifecycle_timestamps(self, repository):
+        """Test that lifecycle_timestamps check passes after retry."""
+        from app.analytics.runner import AnalyticsRunner
+        from app.analytics.quality import DataQualityGate
+        from app.analytics.models import RunStatus, Maturity, QualityCheckStatus
+
+        # 1. Create a FAILED run with stale finished_at before started_at
+        run = AnalysisRun(
+            run_id=uuid4(),
+            business_date=date(2026, 9, 12),
+            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
+            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
+            observation_cutoff=datetime.now(timezone.utc),
+            started_at=datetime(2026, 9, 11, 12, 45, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 11, 12, 19, tzinfo=timezone.utc),  # before started_at!
+        )
+        repository.create_analysis_run(run)
+
+        # 2. Simulate retry
+        AnalyticsRunner._prepare_run_for_execution(run, Maturity.PROVISIONAL)
+        repository.update_analysis_run(run)
+
+        # 3. Verify lifecycle_timestamps check passes
+        gate = DataQualityGate(repository)
+        result = gate._check_lifecycle_timestamps(run, "quality_gate")
+        assert result.status == QualityCheckStatus.PASS

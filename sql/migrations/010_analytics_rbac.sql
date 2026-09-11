@@ -39,6 +39,8 @@ GRANT SELECT, INSERT, UPDATE ON market.candle TO analytics_runner;
 -- 7. DDS schema permissions (read-only on specific tables only)
 -- analytics_runner needs SELECT on dds.paper_trade for post-exit coverage check
 GRANT SELECT ON dds.paper_trade TO analytics_runner;
+-- analytics_runner needs SELECT on dds.instrument for symbol→instrument_id lookup
+GRANT SELECT ON dds.instrument TO analytics_runner;
 
 -- 8. Explicitly deny write permissions on critical tables
 -- This ensures no write access even if PUBLIC or other grants exist

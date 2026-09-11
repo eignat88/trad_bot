@@ -73,9 +73,8 @@ class AnalyticsRunner:
                 logger.info("FINAL run already exists for date: %s", business_date)
                 return run
             
-            # Update status to RUNNING
-            run.status = RunStatus.RUNNING
-            run.started_at = datetime.now(timezone.utc)
+            # Reset run for fresh execution (clears stale terminal-state fields)
+            self._prepare_run_for_execution(run, Maturity.PROVISIONAL)
             self._repo.update_analysis_run(run)
             
             # Execute stages
@@ -148,10 +147,8 @@ class AnalyticsRunner:
             raise RuntimeError(f"Could not acquire advisory lock {lock_id}")
         
         try:
-            # Update run
-            run = provisional_run
-            run.status = RunStatus.RUNNING
-            run.started_at = datetime.now(timezone.utc)
+            # Reset run for fresh execution (clears stale terminal-state fields)
+            run = self._prepare_run_for_execution(provisional_run, provisional_run.maturity)
             self._repo.update_analysis_run(run)
             
             # Execute stages
@@ -195,6 +192,21 @@ class AnalyticsRunner:
         tz_sofia = ZoneInfo("Europe/Sofia")
         now_sofia = datetime.now(tz_sofia)
         return now_sofia.date()
+
+    @staticmethod
+    def _prepare_run_for_execution(run: AnalysisRun, maturity: Maturity) -> AnalysisRun:
+        """Reset an existing run to a clean RUNNING state for execution.
+        
+        Preserves run_id and stage history. Resets all terminal-state fields
+        so a retry does not carry stale finished_at, error_code, or error_message.
+        """
+        run.status = RunStatus.RUNNING
+        run.maturity = maturity
+        run.started_at = datetime.now(timezone.utc)
+        run.finished_at = None
+        run.error_code = None
+        run.error_message = None
+        return run
 
     def _calculate_lock_id(self, business_date: date) -> int:
         """Calculate advisory lock ID for a business date."""

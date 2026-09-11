@@ -198,6 +198,30 @@ class TestAnalyticsRBAC:
         )
         assert cursor.fetchone()[0] is False
 
+    def test_dds_instrument_read_only(self, db_session):
+        """Test that analytics_runner has SELECT on dds.instrument (symbol lookup)."""
+        cursor = db_session.cursor()
+        
+        cursor.execute(
+            "SELECT has_table_privilege('analytics_runner', 'dds.instrument', 'SELECT')"
+        )
+        assert cursor.fetchone()[0] is True
+        
+        cursor.execute(
+            "SELECT has_table_privilege('analytics_runner', 'dds.instrument', 'INSERT')"
+        )
+        assert cursor.fetchone()[0] is False
+        
+        cursor.execute(
+            "SELECT has_table_privilege('analytics_runner', 'dds.instrument', 'UPDATE')"
+        )
+        assert cursor.fetchone()[0] is False
+        
+        cursor.execute(
+            "SELECT has_table_privilege('analytics_runner', 'dds.instrument', 'DELETE')"
+        )
+        assert cursor.fetchone()[0] is False
+
     def test_config_scanner_direction_gate_read_only(self, db_session):
         """Test that analytics_runner cannot modify config.scanner_direction_gate."""
         cursor = db_session.cursor()
