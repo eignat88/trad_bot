@@ -116,8 +116,28 @@ class DataQualityGate:
     ) -> DataQualityResult:
         """Check if source timestamps are not later than observation cutoff."""
         try:
-            # This is a placeholder - actual implementation would check
-            # that source data timestamps are not later than the observation cutoff
+            cursor = self._repo._conn.cursor()
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM market.candle
+                WHERE open_time > %s
+                AND ingested_at >= %s
+                """,
+                (run.observation_cutoff, run.started_at or run.created_at),
+            )
+            future_candle_count = cursor.fetchone()[0]
+            
+            if future_candle_count > 0:
+                return DataQualityResult(
+                    run_id=run.run_id,
+                    stage_name=stage_name,
+                    check_name="source_timestamps",
+                    severity=Severity.BLOCKING,
+                    status=StageStatus.FAILED,
+                    actual_value={"future_candle_count": future_candle_count},
+                    details={"message": f"Found {future_candle_count} candles with timestamps after observation cutoff"},
+                )
+            
             return DataQualityResult(
                 run_id=run.run_id,
                 stage_name=stage_name,
@@ -245,8 +265,44 @@ class DataQualityGate:
     ) -> DataQualityResult:
         """Check that closed candles have expected intervals."""
         try:
-            # This is a placeholder - actual implementation would check
-            # that closed candles have correct close_time based on timeframe
+            cursor = self._repo._conn.cursor()
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM market.candle
+                WHERE ingested_at >= %s
+                AND is_closed = TRUE
+                AND (
+                    -- Check that close_time matches expected interval
+                    (timeframe = '1' AND close_time != open_time + INTERVAL '1 minute') OR
+                    (timeframe = '3' AND close_time != open_time + INTERVAL '3 minutes') OR
+                    (timeframe = '5' AND close_time != open_time + INTERVAL '5 minutes') OR
+                    (timeframe = '15' AND close_time != open_time + INTERVAL '15 minutes') OR
+                    (timeframe = '30' AND close_time != open_time + INTERVAL '30 minutes') OR
+                    (timeframe = '60' AND close_time != open_time + INTERVAL '1 hour') OR
+                    (timeframe = '120' AND close_time != open_time + INTERVAL '2 hours') OR
+                    (timeframe = '240' AND close_time != open_time + INTERVAL '4 hours') OR
+                    (timeframe = '360' AND close_time != open_time + INTERVAL '6 hours') OR
+                    (timeframe = '720' AND close_time != open_time + INTERVAL '12 hours') OR
+                    (timeframe = 'D' AND close_time != open_time + INTERVAL '1 day') OR
+                    (timeframe = 'W' AND close_time != open_time + INTERVAL '7 days') OR
+                    (timeframe = 'M' AND close_time != open_time + INTERVAL '1 month')
+                )
+                """,
+                (run.started_at or run.created_at,),
+            )
+            invalid_interval_count = cursor.fetchone()[0]
+            
+            if invalid_interval_count > 0:
+                return DataQualityResult(
+                    run_id=run.run_id,
+                    stage_name=stage_name,
+                    check_name="closed_candle_intervals",
+                    severity=Severity.BLOCKING,
+                    status=StageStatus.FAILED,
+                    actual_value={"invalid_interval_count": invalid_interval_count},
+                    details={"message": f"Found {invalid_interval_count} candles with incorrect intervals"},
+                )
+            
             return DataQualityResult(
                 run_id=run.run_id,
                 stage_name=stage_name,
@@ -269,17 +325,92 @@ class DataQualityGate:
     def _check_post_exit_coverage(
         self, run: AnalysisRun, stage_name: str
     ) -> DataQualityResult:
-        """Check post-exit coverage."""
+        """Check post-exit coverage for all trades."""
         try:
-            # This is a placeholder - actual implementation would check
-            # that post-exit data is available for all trades
+            # Get all closed trades that need post-exit coverage
+            cursor = self._repo._conn.cursor()
+            cursor.execute(
+                """
+                SELECT 
+                    pt.instrument_id,
+                    pt.exit_time,
+                    pt.timeframe,
+                    COUNT(*) as trade_count
+                FROM dds.paper_trade pt
+                WHERE pt.exit_time IS NOT NULL
+                AND pt.exit_time >= %s
+                AND pt.exit_time < %s
+                GROUP BY pt.instrument_id, pt.exit_time, pt.timeframe
+                """,
+                (run.analysis_from, run.analysis_to),
+            )
+            trades = cursor.fetchall()
+            
+            if not trades:
+                return DataQualityResult(
+                    run_id=run.run_id,
+                    stage_name=stage_name,
+                    check_name="post_exit_coverage",
+                    severity=Severity.WARNING if run.maturity.value == "PROVISIONAL" else Severity.BLOCKING,
+                    status=StageStatus.SUCCEEDED,
+                    details={"message": "No trades found requiring post-exit coverage"},
+                )
+            
+            # Parse post_exit_horizon from run
+            post_exit_hours = int(run.post_exit_horizon.split()[0]) if run.post_exit_horizon else 4
+            
+            missing_coverage = []
+            for trade in trades:
+                instrument_id, exit_time, timeframe, trade_count = trade
+                post_exit_end = exit_time + timedelta(hours=post_exit_hours)
+                
+                # Check if we have candles covering the post-exit period
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM market.candle
+                    WHERE instrument_id = %s
+                    AND timeframe = %s
+                    AND open_time >= %s
+                    AND open_time < %s
+                    AND is_closed = TRUE
+                    """,
+                    (instrument_id, timeframe, exit_time, post_exit_end),
+                )
+                candle_count = cursor.fetchone()[0]
+                
+                # Calculate expected candles based on timeframe
+                expected_candles = self._calculate_expected_candles(timeframe, exit_time, post_exit_end)
+                
+                if candle_count < expected_candles:
+                    missing_coverage.append({
+                        "instrument_id": instrument_id,
+                        "exit_time": exit_time.isoformat(),
+                        "timeframe": timeframe,
+                        "expected_candles": expected_candles,
+                        "actual_candles": candle_count,
+                        "coverage_ratio": candle_count / expected_candles if expected_candles > 0 else 0,
+                    })
+            
+            if missing_coverage:
+                severity = Severity.WARNING if run.maturity.value == "PROVISIONAL" else Severity.BLOCKING
+                return DataQualityResult(
+                    run_id=run.run_id,
+                    stage_name=stage_name,
+                    check_name="post_exit_coverage",
+                    severity=severity,
+                    status=StageStatus.FAILED,
+                    affected_entity_count=len(missing_coverage),
+                    actual_value={"missing_coverage": missing_coverage},
+                    details={"message": f"Found {len(missing_coverage)} trades with incomplete post-exit coverage"},
+                )
+            
             return DataQualityResult(
                 run_id=run.run_id,
                 stage_name=stage_name,
                 check_name="post_exit_coverage",
                 severity=Severity.WARNING if run.maturity.value == "PROVISIONAL" else Severity.BLOCKING,
                 status=StageStatus.SUCCEEDED,
-                details={"message": "Post-exit coverage is sufficient"},
+                details={"message": "Post-exit coverage is sufficient for all trades"},
             )
         except Exception as e:
             return DataQualityResult(
@@ -291,6 +422,31 @@ class DataQualityGate:
                 actual_value={"error": str(e)},
                 details={"message": "Post-exit coverage check failed"},
             )
+    
+    def _calculate_expected_candles(self, timeframe: str, start_time: datetime, end_time: datetime) -> int:
+        """Calculate expected number of candles for a time range."""
+        timeframe_minutes = self._timeframe_to_minutes(timeframe)
+        total_minutes = (end_time - start_time).total_seconds() / 60
+        return int(total_minutes / timeframe_minutes)
+    
+    def _timeframe_to_minutes(self, timeframe: str) -> int:
+        """Convert timeframe to minutes."""
+        mapping = {
+            "1": 1,
+            "3": 3,
+            "5": 5,
+            "15": 15,
+            "30": 30,
+            "60": 60,
+            "120": 120,
+            "240": 240,
+            "360": 360,
+            "720": 720,
+            "D": 1440,
+            "W": 10080,
+            "M": 43200,
+        }
+        return mapping.get(timeframe, 5)
 
     def _check_lifecycle_timestamps(
         self, run: AnalysisRun, stage_name: str
@@ -335,17 +491,87 @@ class DataQualityGate:
     def _check_data_freshness(
         self, run: AnalysisRun, stage_name: str
     ) -> DataQualityResult:
-        """Check data freshness."""
+        """Check data freshness against SLA."""
         try:
-            # This is a placeholder - actual implementation would check
-            # that data is fresh according to SLA
+            # Get latest candle timestamp
+            cursor = self._repo._conn.cursor()
+            cursor.execute(
+                """
+                SELECT MAX(open_time) as latest_candle
+                FROM market.candle
+                WHERE is_closed = TRUE
+                """
+            )
+            result = cursor.fetchone()
+            latest_candle = result[0] if result else None
+            
+            if not latest_candle:
+                return DataQualityResult(
+                    run_id=run.run_id,
+                    stage_name=stage_name,
+                    check_name="data_freshness",
+                    severity=Severity.WARNING,
+                    status=StageStatus.SKIPPED,
+                    details={"message": "No candles found to check freshness"},
+                )
+            
+            # Calculate freshness: how old is the latest candle?
+            now = datetime.now(timezone.utc)
+            freshness_minutes = (now - latest_candle).total_seconds() / 60
+            
+            # Define SLA thresholds (in minutes)
+            sla_thresholds = {
+                "1": 5,      # 1m candles should be within 5 minutes
+                "5": 15,     # 5m candles should be within 15 minutes
+                "15": 45,    # 15m candles should be within 45 minutes
+                "60": 180,   # 1h candles should be within 3 hours
+                "D": 1440,   # Daily candles should be within 24 hours
+            }
+            
+            # Get the most common timeframe
+            cursor.execute(
+                """
+                SELECT timeframe, COUNT(*) as cnt
+                FROM market.candle
+                WHERE open_time >= NOW() - INTERVAL '24 hours'
+                GROUP BY timeframe
+                ORDER BY cnt DESC
+                LIMIT 1
+                """
+            )
+            result = cursor.fetchone()
+            primary_timeframe = result[0] if result else "5"
+            
+            sla_minutes = sla_thresholds.get(primary_timeframe, 60)
+            
+            if freshness_minutes > sla_minutes:
+                return DataQualityResult(
+                    run_id=run.run_id,
+                    stage_name=stage_name,
+                    check_name="data_freshness",
+                    severity=Severity.WARNING,
+                    status=StageStatus.FAILED,
+                    actual_value={
+                        "latest_candle": latest_candle.isoformat(),
+                        "freshness_minutes": freshness_minutes,
+                        "sla_minutes": sla_minutes,
+                        "primary_timeframe": primary_timeframe,
+                    },
+                    details={"message": f"Data freshness ({freshness_minutes:.1f} min) exceeds SLA ({sla_minutes} min)"},
+                )
+            
             return DataQualityResult(
                 run_id=run.run_id,
                 stage_name=stage_name,
                 check_name="data_freshness",
                 severity=Severity.WARNING,
                 status=StageStatus.SUCCEEDED,
-                details={"message": "Data freshness is within SLA"},
+                actual_value={
+                    "latest_candle": latest_candle.isoformat(),
+                    "freshness_minutes": freshness_minutes,
+                    "sla_minutes": sla_minutes,
+                },
+                details={"message": f"Data freshness ({freshness_minutes:.1f} min) is within SLA ({sla_minutes} min)"},
             )
         except Exception as e:
             return DataQualityResult(
