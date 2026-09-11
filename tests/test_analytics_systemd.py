@@ -75,7 +75,7 @@ class TestAnalyticsSystemd:
         timer_file = Path("deploy/systemd/trad-bot-analytics-finalize.timer")
         content = timer_file.read_text()
         
-        assert "OnCalendar=*-*-* 10:00:00" in content
+        assert "OnCalendar=*-*-* 10:05:00" in content
         assert "Persistent=true" in content
         assert "RandomizedDelaySec=0" in content
         assert "AccuracySec=1min" in content

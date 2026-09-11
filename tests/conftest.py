@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 from uuid import uuid4
 
+import pg8000
 import pytest
 
 
@@ -27,3 +28,20 @@ def tmp_path() -> Path:
         yield path
     finally:
         shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.fixture(scope="session")
+def db_session():
+    """Create a test database session."""
+    # Connect to PostgreSQL
+    conn = pg8000.connect(
+        host="localhost",
+        port=5432,
+        database="trad_bot",
+        user="postgres",
+        password="",
+    )
+    
+    yield conn
+    
+    conn.close()

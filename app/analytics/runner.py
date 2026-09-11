@@ -7,6 +7,7 @@ import traceback
 from datetime import datetime, timezone, timedelta, date
 from typing import Any, Optional
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from app.analytics.models import (
     AnalysisRun,
@@ -190,12 +191,8 @@ class AnalyticsRunner:
 
     def _get_business_date(self) -> date:
         """Get current business date in Europe/Sofia timezone."""
-        # This is a simplified implementation
-        # In production, use pytz or zoneinfo for proper timezone handling
-        from datetime import timezone as tz
-        import pytz
-        
-        tz_sofia = pytz.timezone("Europe/Sofia")
+        # Use zoneinfo for proper timezone handling (Python 3.9+)
+        tz_sofia = ZoneInfo("Europe/Sofia")
         now_sofia = datetime.now(tz_sofia)
         return now_sofia.date()
 
@@ -211,8 +208,8 @@ class AnalyticsRunner:
         if existing_run:
             return existing_run
         
-        # Calculate analysis window
-        tz_sofia = pytz.timezone("Europe/Sofia")
+        # Calculate analysis window using zoneinfo
+        tz_sofia = ZoneInfo("Europe/Sofia")
         now_sofia = datetime.now(tz_sofia)
         
         # Analysis from: start of business day

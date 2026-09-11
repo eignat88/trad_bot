@@ -122,6 +122,8 @@ class TestAnalyticsRepository:
         run = AnalysisRun(
             run_id=uuid4(),
             business_date=date(2026, 9, 12),
+            analysis_from=datetime(2026, 9, 12, 6, 0, tzinfo=timezone.utc),
+            analysis_to=datetime(2026, 9, 13, 10, 0, tzinfo=timezone.utc),
             status=RunStatus.SUCCEEDED,
             maturity=Maturity.PROVISIONAL,
         )
