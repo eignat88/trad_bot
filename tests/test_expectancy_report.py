@@ -29,8 +29,8 @@ class TestExpectancyViewsExist:
     """Verify new expectancy views are created by schema apply."""
 
     def test_schema_applies_without_error(self):
-        from app.db.repository import ScannerRepository
-        r = ScannerRepository(backend="postgres")
+        from conftest import make_scanner_repo
+        r = make_scanner_repo()
         try:
             r.ensure_schema()
             cursor = r._conn.cursor()
