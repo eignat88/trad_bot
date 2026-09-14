@@ -109,13 +109,11 @@ CREATE TABLE IF NOT EXISTS analytics.entry_attempt_fact (
     rejection_reason  TEXT,
     observed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     source_event_key  TEXT,
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-    UNIQUE (run_id, setup_id)
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 COMMENT ON TABLE analytics.entry_attempt_fact
-    IS 'Canonical entry attempt record — separates setup signal from actual fill';
+    IS 'Canonical entry attempt record — separates setup signal from actual fill. Grain: attempt_id (allows multiple attempts per setup).';
 
 CREATE INDEX IF NOT EXISTS idx_entry_attempt_trade
     ON analytics.entry_attempt_fact (trade_id);
@@ -221,7 +219,7 @@ CREATE INDEX IF NOT EXISTS idx_trade_fact_run
 -- 6. TRADE EVENT JOURNAL — append-only execution event log
 -- ============================================================
 CREATE TABLE IF NOT EXISTS analytics.trade_event (
-    event_id          BIGSERIAL PRIMARY KEY,
+    event_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     trade_id          BIGINT NOT NULL,
     setup_id          TEXT NOT NULL,
     event_type        TEXT NOT NULL CHECK (event_type IN (
@@ -243,7 +241,7 @@ CREATE TABLE IF NOT EXISTS analytics.trade_event (
 );
 
 COMMENT ON TABLE analytics.trade_event
-    IS 'Append-only trade event journal — never UPDATEd, corrections via compensating events';
+    IS 'Append-only trade event journal — never UPDATEd or DELETEd, corrections via compensating events';
 COMMENT ON COLUMN analytics.trade_event.source_event_key
     IS 'Idempotency key — prevents duplicate event recording';
 COMMENT ON COLUMN analytics.trade_event.payload_json
@@ -264,6 +262,7 @@ CREATE INDEX IF NOT EXISTS idx_trade_event_source_key
 -- 7. TRADE HORIZON METRIC — forward-looking metrics at fixed horizons
 -- ============================================================
 CREATE TABLE IF NOT EXISTS analytics.trade_horizon_metric (
+    run_id            UUID NOT NULL REFERENCES analytics.analysis_run(run_id),
     trade_id          BIGINT NOT NULL,
     anchor            TEXT NOT NULL CHECK (anchor IN ('signal', 'entry', 'dca_fill', 'exit')),
     horizon           TEXT NOT NULL,
@@ -279,11 +278,11 @@ CREATE TABLE IF NOT EXISTS analytics.trade_horizon_metric (
     coverage_status    TEXT NOT NULL DEFAULT 'COMPLETE',
     created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    PRIMARY KEY (trade_id, anchor, horizon, metric_version)
+    PRIMARY KEY (run_id, trade_id, anchor, horizon, metric_version)
 );
 
 COMMENT ON TABLE analytics.trade_horizon_metric
-    IS 'Horizon-based forward metrics anchored to signal/entry/dca/exit timestamps';
+    IS 'Horizon-based forward metrics anchored to signal/entry/dca/exit timestamps, scoped by run_id';
 
 CREATE INDEX IF NOT EXISTS idx_horizon_metric_trade
     ON analytics.trade_horizon_metric (trade_id);
@@ -294,6 +293,7 @@ CREATE INDEX IF NOT EXISTS idx_horizon_metric_anchor
 -- 8. TRADE REPLAY METRIC — scenario-based simulation results
 -- ============================================================
 CREATE TABLE IF NOT EXISTS analytics.trade_replay_metric (
+    run_id              UUID NOT NULL REFERENCES analytics.analysis_run(run_id),
     trade_id              BIGINT NOT NULL,
     scenario              TEXT NOT NULL,
     metric_version        TEXT NOT NULL DEFAULT '1.0.0',
@@ -310,11 +310,11 @@ CREATE TABLE IF NOT EXISTS analytics.trade_replay_metric (
     ambiguity_status      TEXT NOT NULL DEFAULT 'CLEAR',
     created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    PRIMARY KEY (trade_id, scenario, metric_version)
+    PRIMARY KEY (run_id, trade_id, scenario, metric_version)
 );
 
 COMMENT ON TABLE analytics.trade_replay_metric
-    IS 'Scenario replay results — ACTUAL, WHAT-IF, DIAGNOSTIC scenarios';
+    IS 'Scenario replay results scoped by run_id — ACTUAL, WHAT-IF, DIAGNOSTIC scenarios';
 
 CREATE INDEX IF NOT EXISTS idx_replay_metric_trade
     ON analytics.trade_replay_metric (trade_id);
@@ -325,6 +325,7 @@ CREATE INDEX IF NOT EXISTS idx_replay_metric_family
 -- 9. SETUP COUNTERFACTUAL — what-if analysis for rejected/expired setups
 -- ============================================================
 CREATE TABLE IF NOT EXISTS analytics.setup_counterfactual (
+    run_id            UUID NOT NULL REFERENCES analytics.analysis_run(run_id),
     setup_id          TEXT NOT NULL,
     scenario          TEXT NOT NULL,
     metric_version    TEXT NOT NULL DEFAULT '1.0.0',
@@ -340,11 +341,11 @@ CREATE TABLE IF NOT EXISTS analytics.setup_counterfactual (
     coverage_status   TEXT NOT NULL DEFAULT 'COMPLETE',
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    PRIMARY KEY (setup_id, scenario, metric_version)
+    PRIMARY KEY (run_id, setup_id, scenario, metric_version)
 );
 
 COMMENT ON TABLE analytics.setup_counterfactual
-    IS 'Counterfactual analysis for rejected/expired setups — evaluates filter quality';
+    IS 'Counterfactual analysis for rejected/expired setups scoped by run_id — evaluates filter quality';
 
 CREATE INDEX IF NOT EXISTS idx_counterfactual_setup
     ON analytics.setup_counterfactual (setup_id);
@@ -411,24 +412,31 @@ COMMENT ON TABLE analytics.metric_registry
 -- ============================================================
 -- 12. HELPER: append-only enforcement for trade_event
 -- ============================================================
-CREATE OR REPLACE FUNCTION analytics.block_trade_event_update()
+CREATE OR REPLACE FUNCTION analytics.block_trade_event_mutation()
 RETURNS TRIGGER AS $$
 BEGIN
-    RAISE EXCEPTION 'trade_event is append-only — UPDATE is not permitted. '
-                     'Use compensating events or new dataset version.';
+    RAISE EXCEPTION 'trade_event is append-only — % is not permitted. '
+                     'Use compensating events or new dataset version.',
+                     TG_OP;
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 
-COMMENT ON FUNCTION analytics.block_trade_event_update()
-    IS 'Blocks UPDATE on trade_event to enforce append-only invariant';
+COMMENT ON FUNCTION analytics.block_trade_event_mutation()
+    IS 'Blocks UPDATE and DELETE on trade_event to enforce append-only invariant';
 
 DROP TRIGGER IF EXISTS trg_trade_event_no_update ON analytics.trade_event;
+DROP TRIGGER IF EXISTS trg_trade_event_no_delete ON analytics.trade_event;
 
 CREATE TRIGGER trg_trade_event_no_update
     BEFORE UPDATE ON analytics.trade_event
     FOR EACH ROW
-    EXECUTE FUNCTION analytics.block_trade_event_update();
+    EXECUTE FUNCTION analytics.block_trade_event_mutation();
+
+CREATE TRIGGER trg_trade_event_no_delete
+    BEFORE DELETE ON analytics.trade_event
+    FOR EACH ROW
+    EXECUTE FUNCTION analytics.block_trade_event_mutation();
 
 -- ============================================================
 -- Done

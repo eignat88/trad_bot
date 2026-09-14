@@ -328,7 +328,6 @@ class TestAppendOnly:
 
     def test_update_blocked(self, db_conn):
         """UPDATE on trade_event raises an exception (append-only trigger)."""
-        # Recover from any poisoned transaction state (failed function calls)
         try:
             db_conn.rollback()
         except Exception:
@@ -357,8 +356,12 @@ class TestAppendOnly:
             )
             db_conn.commit()
 
-        # Connection is in aborted transaction after the trigger exception — rollback
+        # Connection is in aborted transaction — rollback
         db_conn.rollback()
 
-        cur.execute("DELETE FROM analytics.trade_event WHERE event_id=%s", (eid,))
-        db_conn.commit()
+        # DELETE should also be blocked
+        with pytest.raises(Exception, match="append-only"):
+            cur.execute("DELETE FROM analytics.trade_event WHERE event_id=%s", (eid,))
+            db_conn.commit()
+
+        db_conn.rollback()

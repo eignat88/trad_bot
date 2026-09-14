@@ -19,12 +19,13 @@ DECLARE
     v_inserted BIGINT := 0;
 BEGIN
     INSERT INTO analytics.trade_replay_metric (
-        trade_id, scenario, metric_version,
+        run_id, trade_id, scenario, metric_version,
         simulated_pnl_r, simulated_exit_price, simulated_exit_at, simulated_exit_reason,
         scenario_family, scenario_params,
         coverage_status, ambiguity_status
     )
     SELECT
+        p_run_id,
         tf.trade_id,
         'ACTUAL',
         '1.0.0',
@@ -40,7 +41,7 @@ BEGIN
     WHERE tf.run_id = p_run_id
       AND tf.status IN ('CLOSED', 'EXPIRED')
       AND tf.pnl_r IS NOT NULL
-    ON CONFLICT (trade_id, scenario, metric_version) DO UPDATE SET
+    ON CONFLICT (run_id, trade_id, scenario, metric_version) DO UPDATE SET
         simulated_pnl_r = EXCLUDED.simulated_pnl_r,
         simulated_exit_price = EXCLUDED.simulated_exit_price,
         simulated_exit_at = EXCLUDED.simulated_exit_at,
@@ -62,12 +63,13 @@ DECLARE
     v_inserted BIGINT := 0;
 BEGIN
     INSERT INTO analytics.trade_replay_metric (
-        trade_id, scenario, metric_version,
+        run_id, trade_id, scenario, metric_version,
         simulated_pnl_r, simulated_exit_price, simulated_exit_at, simulated_exit_reason,
         scenario_family, scenario_params,
         coverage_status, ambiguity_status
     )
     SELECT
+        p_run_id,
         tf.trade_id,
         'FIXED_TP_' || REPLACE(p_tp_multiplier::TEXT, '.', '_'),
         '1.0.0',
@@ -83,17 +85,17 @@ BEGIN
             WHEN 'LONG' THEN tf.reference_price + p_tp_multiplier * tf.initial_risk_distance
             WHEN 'SHORT' THEN tf.reference_price - p_tp_multiplier * tf.initial_risk_distance
         END,
-        tf.entered_at + INTERVAL '1 hour',  -- placeholder: actual candle-based simulation needed
+        tf.entered_at + INTERVAL '1 hour',  -- placeholder: candle-based simulation not yet implemented
         'FIXED_TP',
         'exit',
         jsonb_build_object('tp_multiplier', p_tp_multiplier),
-        'COMPLETE',
+        'INCOMPLETE',  -- requires candle replay for accurate exit_at
         'CLEAR'
     FROM analytics.trade_fact tf
     WHERE tf.run_id = p_run_id
       AND tf.status IN ('CLOSED', 'EXPIRED')
       AND tf.initial_risk_distance > 0
-    ON CONFLICT (trade_id, scenario, metric_version) DO UPDATE SET
+    ON CONFLICT (run_id, trade_id, scenario, metric_version) DO UPDATE SET
         simulated_pnl_r = EXCLUDED.simulated_pnl_r,
         simulated_exit_price = EXCLUDED.simulated_exit_price;
 
@@ -112,27 +114,28 @@ DECLARE
     v_inserted BIGINT := 0;
 BEGIN
     INSERT INTO analytics.trade_replay_metric (
-        trade_id, scenario, metric_version,
+        run_id, trade_id, scenario, metric_version,
         simulated_pnl_r, simulated_exit_price, simulated_exit_at, simulated_exit_reason,
         scenario_family, scenario_params,
         coverage_status, ambiguity_status
     )
     SELECT
+        p_run_id,
         tf.trade_id,
         'BREAKEVEN',
         '1.0.0',
         0.0,  -- breakeven = 0 R
         tf.reference_price,  -- exit at reference price
-        tf.entered_at + INTERVAL '30 minutes',  -- placeholder
+        tf.entered_at + INTERVAL '30 minutes',  -- placeholder: candle-based simulation not yet implemented
         'BREAKEVEN',
         'exit',
         '{}'::jsonb,
-        'COMPLETE',
+        'INCOMPLETE',  -- requires candle replay for accurate exit_at
         'CLEAR'
     FROM analytics.trade_fact tf
     WHERE tf.run_id = p_run_id
       AND tf.status IN ('CLOSED', 'EXPIRED')
-    ON CONFLICT (trade_id, scenario, metric_version) DO UPDATE SET
+    ON CONFLICT (run_id, trade_id, scenario, metric_version) DO UPDATE SET
         simulated_pnl_r = EXCLUDED.simulated_pnl_r,
         simulated_exit_price = EXCLUDED.simulated_exit_price;
 
@@ -151,12 +154,13 @@ DECLARE
     v_inserted BIGINT := 0;
 BEGIN
     INSERT INTO analytics.trade_replay_metric (
-        trade_id, scenario, metric_version,
+        run_id, trade_id, scenario, metric_version,
         simulated_pnl_r, simulated_exit_price, simulated_exit_at, simulated_exit_reason,
         scenario_family, scenario_params,
         coverage_status, ambiguity_status
     )
     SELECT
+        p_run_id,
         tf.trade_id,
         'RISK_NORMALIZED_NO_DCA',
         '1.0.0',
@@ -181,7 +185,7 @@ BEGIN
       AND tf.status IN ('CLOSED', 'EXPIRED')
       AND tf.dca_filled_at IS NOT NULL  -- only for trades that had DCA
       AND tf.initial_risk_distance > 0
-    ON CONFLICT (trade_id, scenario, metric_version) DO UPDATE SET
+    ON CONFLICT (run_id, trade_id, scenario, metric_version) DO UPDATE SET
         simulated_pnl_r = EXCLUDED.simulated_pnl_r,
         simulated_exit_price = EXCLUDED.simulated_exit_price;
 
@@ -201,12 +205,13 @@ DECLARE
     v_inserted BIGINT := 0;
 BEGIN
     INSERT INTO analytics.trade_replay_metric (
-        trade_id, scenario, metric_version,
+        run_id, trade_id, scenario, metric_version,
         simulated_pnl_r, simulated_exit_price, simulated_exit_at, simulated_exit_reason,
         scenario_family, scenario_params,
         coverage_status, ambiguity_status
     )
     SELECT
+        p_run_id,
         tf.trade_id,
         'WIDER_STOP_' || REPLACE(p_wider_multiplier::TEXT, '.', '_'),
         '1.0.0',
@@ -216,13 +221,13 @@ BEGIN
         tf.exit_reason,
         'stop',
         jsonb_build_object('wider_multiplier', p_wider_multiplier, 'diagnostic_only', TRUE),
-        'COMPLETE',
+        'INCOMPLETE',  -- requires candle replay for accurate wider-stop simulation
         'CLEAR'
     FROM analytics.trade_fact tf
     WHERE tf.run_id = p_run_id
       AND tf.status IN ('CLOSED', 'EXPIRED')
       AND tf.exit_reason LIKE '%STOP%'
-    ON CONFLICT (trade_id, scenario, metric_version) DO NOTHING;
+    ON CONFLICT (run_id, trade_id, scenario, metric_version) DO NOTHING;
 
     GET DIAGNOSTICS v_inserted = ROW_COUNT;
     RETURN v_inserted;

@@ -111,9 +111,13 @@ DECLARE
     v_result RECORD;
     v_instrument_id BIGINT;
     v_inserted BIGINT := 0;
-    v_anchor_price NUMERIC;
-    v_anchor_time TIMESTAMPTZ;
+    v_cutoff TIMESTAMPTZ;
 BEGIN
+    -- Get observation_cutoff for PIT enforcement
+    SELECT observation_cutoff INTO v_cutoff
+    FROM analytics.analysis_run
+    WHERE run_id = p_run_id;
+
     -- Get instrument_id mapping
     FOR v_trade IN
         SELECT tf.trade_id, tf.symbol, tf.direction,
@@ -152,17 +156,17 @@ BEGIN
                         v_trade.trade_id, v_anchor.anchor, v_horizon,
                         v_anchor.anchor_price, v_anchor.anchor_time,
                         v_trade.direction, v_trade.initial_risk_distance,
-                        v_instrument_id, NOW()
+                        v_instrument_id, v_cutoff
                     );
 
                     INSERT INTO analytics.trade_horizon_metric (
-                        trade_id, anchor, horizon, metric_version,
+                        run_id, trade_id, anchor, horizon, metric_version,
                         favorable_move_r, adverse_move_r, coverage_status
                     ) VALUES (
-                        v_trade.trade_id, v_anchor.anchor, v_horizon, '1.0.0',
+                        p_run_id, v_trade.trade_id, v_anchor.anchor, v_horizon, '1.0.0',
                         v_result.favorable_move_r, v_result.adverse_move_r, v_result.coverage_status
                     )
-                    ON CONFLICT (trade_id, anchor, horizon, metric_version) DO UPDATE SET
+                    ON CONFLICT (run_id, trade_id, anchor, horizon, metric_version) DO UPDATE SET
                         favorable_move_r = EXCLUDED.favorable_move_r,
                         adverse_move_r = EXCLUDED.adverse_move_r,
                         coverage_status = EXCLUDED.coverage_status;
@@ -179,17 +183,17 @@ BEGIN
                         v_trade.trade_id, v_anchor.anchor, v_horizon,
                         v_anchor.anchor_price, v_anchor.anchor_time,
                         v_trade.direction, v_trade.initial_risk_distance,
-                        v_instrument_id, NOW()
+                        v_instrument_id, v_cutoff
                     );
 
                     INSERT INTO analytics.trade_horizon_metric (
-                        trade_id, anchor, horizon, metric_version,
+                        run_id, trade_id, anchor, horizon, metric_version,
                         favorable_move_r, adverse_move_r, coverage_status
                     ) VALUES (
-                        v_trade.trade_id, v_anchor.anchor, v_horizon, '1.0.0',
+                        p_run_id, v_trade.trade_id, v_anchor.anchor, v_horizon, '1.0.0',
                         v_result.favorable_move_r, v_result.adverse_move_r, v_result.coverage_status
                     )
-                    ON CONFLICT (trade_id, anchor, horizon, metric_version) DO UPDATE SET
+                    ON CONFLICT (run_id, trade_id, anchor, horizon, metric_version) DO UPDATE SET
                         favorable_move_r = EXCLUDED.favorable_move_r,
                         adverse_move_r = EXCLUDED.adverse_move_r,
                         coverage_status = EXCLUDED.coverage_status;
@@ -206,17 +210,17 @@ BEGIN
                         v_trade.trade_id, v_anchor.anchor, v_horizon,
                         v_anchor.anchor_price, v_anchor.anchor_time,
                         v_trade.direction, v_trade.initial_risk_distance,
-                        v_instrument_id, NOW()
+                        v_instrument_id, v_cutoff
                     );
 
                     INSERT INTO analytics.trade_horizon_metric (
-                        trade_id, anchor, horizon, metric_version,
+                        run_id, trade_id, anchor, horizon, metric_version,
                         favorable_move_r, adverse_move_r, coverage_status
                     ) VALUES (
-                        v_trade.trade_id, v_anchor.anchor, v_horizon, '1.0.0',
+                        p_run_id, v_trade.trade_id, v_anchor.anchor, v_horizon, '1.0.0',
                         v_result.favorable_move_r, v_result.adverse_move_r, v_result.coverage_status
                     )
-                    ON CONFLICT (trade_id, anchor, horizon, metric_version) DO UPDATE SET
+                    ON CONFLICT (run_id, trade_id, anchor, horizon, metric_version) DO UPDATE SET
                         favorable_move_r = EXCLUDED.favorable_move_r,
                         adverse_move_r = EXCLUDED.adverse_move_r,
                         coverage_status = EXCLUDED.coverage_status;
@@ -233,17 +237,17 @@ BEGIN
                         v_trade.trade_id, v_anchor.anchor, v_horizon,
                         v_anchor.anchor_price, v_anchor.anchor_time,
                         v_trade.direction, v_trade.initial_risk_distance,
-                        v_instrument_id, NOW()
+                        v_instrument_id, v_cutoff
                     );
 
                     INSERT INTO analytics.trade_horizon_metric (
-                        trade_id, anchor, horizon, metric_version,
+                        run_id, trade_id, anchor, horizon, metric_version,
                         favorable_move_r, adverse_move_r, coverage_status
                     ) VALUES (
-                        v_trade.trade_id, v_anchor.anchor, v_horizon, '1.0.0',
+                        p_run_id, v_trade.trade_id, v_anchor.anchor, v_horizon, '1.0.0',
                         v_result.favorable_move_r, v_result.adverse_move_r, v_result.coverage_status
                     )
-                    ON CONFLICT (trade_id, anchor, horizon, metric_version) DO UPDATE SET
+                    ON CONFLICT (run_id, trade_id, anchor, horizon, metric_version) DO UPDATE SET
                         favorable_move_r = EXCLUDED.favorable_move_r,
                         adverse_move_r = EXCLUDED.adverse_move_r,
                         coverage_status = EXCLUDED.coverage_status;

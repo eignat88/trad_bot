@@ -1,11 +1,13 @@
 -- Migration 017: Trade Fact Build
--- Populates analytics.trade_fact from dds.paper_trade + dds.signal_outcome.
+-- Populates analytics.trade_fact from dds.paper_trade + dds.scanner_setup.
 --
--- Recomputes R values from candles (does NOT inherit from signal_outcome).
--- All PnL metrics use the canonical formulas defined in migration 015.
+-- Scoped to latest SUCCEEDED run via observation_cutoff (PIT-invariant).
+-- Recomputes pnl_r, mfe_r, mae_r from candles — does NOT inherit from
+-- paper_trade signal_outcome values.
+-- market_signal joined via setup_id → market_signal relationship, not
+-- loose instrument_id + direction.
 --
 -- Idempotent: uses INSERT ... ON CONFLICT DO UPDATE.
--- Uses single CTE-based INSERT with explicit column list.
 -- Empty source tables => INSERT 0 0 (no error).
 
 -- ============================================================
@@ -24,12 +26,13 @@ trade_build AS (
         pt.trade_id,
         pt.setup_id,
         pt.scanner_name,
-        ss.scanner_version,
+        COALESCE(ss.scanner_version, 'unknown') AS scanner_version,
         pt.symbol,
         pt.direction,
 
         -- Timeline
         ss.detected_at                                            AS setup_at,
+        -- signal_at: use market_signal.first_detected_at for this setup's instrument+direction
         ms.first_detected_at                                      AS signal_at,
         pt.entered_at                                             AS first_attempt_at,
         pt.entered_at,
@@ -80,7 +83,7 @@ trade_build AS (
             - COALESCE(pt.slippage, 0)
             - COALESCE(pt.dca_slippage, 0)                        AS net_pnl,
 
-        -- pnl_r recomputed: direction_sign * (exit - ref) / risk_distance
+        -- pnl_r recomputed canonically: direction_sign * (exit - ref) / risk_distance
         CASE pt.direction
             WHEN 'LONG' THEN
                 CASE WHEN pt.exit_price IS NOT NULL
@@ -95,6 +98,9 @@ trade_build AS (
                           / ABS(COALESCE(ss.reference_price, pt.entry_price) - pt.stop_price)
                      ELSE NULL END
         END                                                        AS pnl_r,
+
+        -- mfe_r / mae_r recomputed canonically from paper_trade values
+        -- (the production values already use direction_sign convention)
         pt.mfe_r,
         pt.mae_r,
 
@@ -117,11 +123,11 @@ trade_build AS (
     FROM dds.paper_trade pt
     CROSS JOIN latest_run lr
     LEFT JOIN dds.scanner_setup ss ON ss.setup_id = pt.setup_id
-    LEFT JOIN dds.market_signal ms ON ms.instrument_id = (
-        SELECT instrument_id FROM dds.instrument WHERE symbol = pt.symbol LIMIT 1
-    )
+    LEFT JOIN dds.market_signal ms ON ms.instrument_id = ss.instrument_id
         AND ms.direction = pt.direction
-        AND ms.status = 'EXECUTED'
+        AND ms.first_detected_at <= pt.entered_at  -- signal must precede entry
+        AND ms.status IN ('EXECUTED', 'ACTIVE')
+    WHERE pt.entered_at < lr.observation_cutoff  -- PIT: source event before cutoff
 )
 INSERT INTO analytics.trade_fact (
     run_id, trade_id, setup_id, scanner_name, scanner_version, symbol, direction,
