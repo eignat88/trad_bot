@@ -38,29 +38,24 @@ def analytics_runner_role():
     """Create analytics_runner role for testing.
 
     Runs ONCE before any test in this module via autouse=True.
-    Ensures migration 010 is applied before privilege-introspection
-    tests execute — they depend on the role existing.
+    Applies migrations 010 and 026 to establish correct RBAC state.
 
-    Also revokes analytics_runner's SELECT on config tables so that
-    the role has NO direct privileges (SELECT/INSERT/UPDATE/DELETE = False).
-    This matches the production architecture where Stage 2 consumes
-    analytics.config_snapshot instead of config.* directly.
-    Revoked grants are restored on teardown.
+    Migration 010 creates the role and grants base permissions.
+    Migration 026 revokes analytics_runner's access to config tables
+    and USAGE on the config schema, enforcing the Stage 2 boundary:
+    analytics_runner → config.* has SELECT/INSERT/UPDATE/DELETE = False.
+
+    RBAC state is migration-driven only — no GRANT/REVOKE in tests.
     """
-    # Apply RBAC migration (idempotent - can be run multiple times)
+    # Apply RBAC migrations (idempotent)
     result = run_psql_migration(MIGRATION_010)
-    assert result.returncode == 0, f"RBAC migration failed: {result.stderr}"
+    assert result.returncode == 0, f"RBAC migration 010 failed: {result.stderr}"
 
-    # Revoke SELECT on config tables that migration 010 left accessible
-    # via PUBLIC USAGE inheritance.  Stage 2 must not depend on config.*.
-    run_psql("REVOKE SELECT ON config.scanner_direction_gate FROM analytics_runner;")
-    run_psql("REVOKE SELECT ON config.scanner_grafana_visibility FROM analytics_runner;")
+    migration_026 = ROOT / "sql" / "migrations" / "026_analytics_config_rbac_boundary.sql"
+    result = run_psql_migration(migration_026)
+    assert result.returncode == 0, f"RBAC migration 026 failed: {result.stderr}"
 
     yield "analytics_runner"
-
-    # Restore SELECT (other test modules or production may depend on it)
-    run_psql("GRANT SELECT ON config.scanner_direction_gate TO analytics_runner;")
-    run_psql("GRANT SELECT ON config.scanner_grafana_visibility TO analytics_runner;")
 
     # Cleanup: drop the role (after all tests)
     run_psql("DROP ROLE IF EXISTS analytics_runner;")
