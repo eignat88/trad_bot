@@ -22,12 +22,9 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def _connect_pg():
-    """Return a psycopg2 connection or skip if PostgreSQL unavailable."""
-    from conftest import connect_test_db_psycopg2
-    try:
-        return connect_test_db_psycopg2()
-    except Exception:
-        pytest.skip("PostgreSQL not available")
+    """Return a pg8000 connection via TEST_DB_* env vars."""
+    from conftest import connect_test_db
+    return connect_test_db()
 
 
 def _ensure_migration(conn) -> None:

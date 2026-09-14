@@ -71,32 +71,6 @@ def connect_test_db(
     )
 
 
-def connect_test_db_psycopg2(
-    *,
-    database: Optional[str] = None,
-    user: Optional[str] = None,
-):
-    """Open a psycopg2 connection using env-derived parameters.
-
-    Supports unix socket (TEST_DB_UNIX_SOCK → host=/var/run/postgresql)
-    and TCP (TEST_DB_HOST/TEST_DB_PORT).
-    """
-    import psycopg2
-
-    _unix_sock = os.getenv("TEST_DB_UNIX_SOCK")
-    _host = os.getenv("TEST_DB_HOST", "localhost")
-    _port = int(os.getenv("TEST_DB_PORT", "5432"))
-    _database = database or os.getenv("TEST_DB_NAME", "trad_bot_migration_test")
-    _user = user or os.getenv("TEST_DB_USER", "postgres")
-
-    if _unix_sock:
-        # psycopg2 uses host=<socket_dir> for peer auth
-        from pathlib import Path as _P
-        return psycopg2.connect(host=str(_P(_unix_sock).parent), database=_database, user=_user)
-
-    return psycopg2.connect(host=_host, port=_port, database=_database, user=_user)
-
-
 def make_scanner_repo(*, database: Optional[str] = None, user: Optional[str] = None):
     """Create a ScannerRepository using TEST_DB_* env vars.
 
