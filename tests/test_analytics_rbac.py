@@ -229,51 +229,61 @@ class TestAnalyticsRBAC:
         )
         assert cursor.fetchone()[0] is False
 
-    def test_config_scanner_direction_gate_read_only(self, db_session):
-        """Test that analytics_runner cannot modify config.scanner_direction_gate."""
+    def test_config_scanner_direction_gate_no_direct_access(self, db_session):
+        """Test analytics_runner write-denied on config.scanner_direction_gate.
+
+        SELECT is allowed (inherited via PUBLIC USAGE on config schema).
+        INSERT/UPDATE/DELETE are explicitly denied — analytics_runner must
+        never modify operational config.  Stage 2 consumes
+        analytics.config_snapshot instead.
+        """
         cursor = db_session.cursor()
-        
-        # Check config.scanner_direction_gate permissions
+
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_direction_gate', 'SELECT')"
         )
         assert cursor.fetchone()[0] is True
-        
+
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_direction_gate', 'INSERT')"
         )
         assert cursor.fetchone()[0] is False
-        
+
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_direction_gate', 'UPDATE')"
         )
         assert cursor.fetchone()[0] is False
-        
+
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_direction_gate', 'DELETE')"
         )
         assert cursor.fetchone()[0] is False
 
-    def test_config_scanner_grafana_visibility_read_only(self, db_session):
-        """Test that analytics_runner cannot modify config.scanner_grafana_visibility."""
+    def test_config_scanner_grafana_visibility_no_direct_access(self, db_session):
+        """Test analytics_runner write-denied on config.scanner_grafana_visibility.
+
+        SELECT is allowed (inherited via PUBLIC USAGE on config schema).
+        INSERT/UPDATE/DELETE are explicitly denied — analytics_runner must
+        never modify operational config.  Stage 2 consumes
+        analytics.config_snapshot instead.
+        """
         cursor = db_session.cursor()
-        
-        # Check config.scanner_grafana_visibility permissions
+
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_grafana_visibility', 'SELECT')"
         )
         assert cursor.fetchone()[0] is True
-        
+
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_grafana_visibility', 'INSERT')"
         )
         assert cursor.fetchone()[0] is False
-        
+
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_grafana_visibility', 'UPDATE')"
         )
         assert cursor.fetchone()[0] is False
-        
+
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_grafana_visibility', 'DELETE')"
         )
