@@ -48,11 +48,41 @@ def analytics_runner_role():
 
 @pytest.fixture
 def analytics_conn(analytics_runner_role) -> Generator[pg8000.Connection, None, None]:
-    """Create a connection as analytics_runner."""
-    conn = connect_test_db(user=analytics_runner_role)
-    
+    """Create a connection and SET ROLE to analytics_runner.
+
+    Authenticates as postgres (or TEST_DB_USER) but executes all
+    subsequent SQL with analytics_runner privileges.  This works on
+    VPS with peer authentication where direct login as analytics_runner
+    is not possible.
+    """
+    conn = connect_test_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SET ROLE analytics_runner")
+        # Verify the role switch took effect
+        cur.execute("SELECT current_user")
+        current = cur.fetchone()[0]
+        assert current == "analytics_runner", (
+            f"SET ROLE failed: current_user is {current!r}, expected 'analytics_runner'"
+        )
+        conn.commit()
+    except Exception:
+        conn.close()
+        raise
+
     yield conn
-    
+
+    # Cleanup: rollback any uncommitted work, then RESET ROLE
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+    try:
+        cur = conn.cursor()
+        cur.execute("RESET ROLE")
+        conn.commit()
+    except Exception:
+        pass
     conn.close()
 
 
@@ -72,7 +102,7 @@ class TestAnalyticsRBAC:
         """Test that analytics_runner can connect to database."""
         cursor = db_session.cursor()
         cursor.execute(
-            "SELECT has_database_privilege('analytics_runner', 'trad_bot', 'CONNECT')"
+            "SELECT has_database_privilege('analytics_runner', current_database(), 'CONNECT')"
         )
         result = cursor.fetchone()
         assert result[0] is True
