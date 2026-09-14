@@ -18,18 +18,13 @@ from app.analytics.models import (
 )
 from app.analytics.quality import DataQualityGate
 from app.analytics.repository import AnalyticsRepository
+from conftest import connect_test_db
 
 
 @pytest.fixture(scope="module")
 def pg8000_conn():
     """Create a real pg8000 connection to test database."""
-    conn = pg8000.connect(
-        host="localhost",
-        port=5432,
-        database="trad_bot_migration_test",
-        user="postgres",
-        password="",
-    )
+    conn = connect_test_db()
     
     yield conn
     

@@ -8,25 +8,19 @@ from typing import Generator
 
 import pg8000
 
+from conftest import connect_test_db, run_psql_file, psql_args
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_010 = ROOT / "sql" / "migrations" / "010_analytics_rbac.sql"
 
 
-def run_psql(sql: str, database: str = "trad_bot_migration_test", user: str = "postgres") -> subprocess.CompletedProcess[str]:
+def run_psql(sql: str, database: str | None = None, user: str = "postgres") -> subprocess.CompletedProcess[str]:
     """Run SQL against the test database."""
-    psql = Path(r"C:\Program Files\PostgreSQL\17\bin\psql.exe")
-    
+    args = psql_args(database=database, user=user)
+    args.extend(["-v", "ON_ERROR_STOP=1", "-c", sql])
     return subprocess.run(
-        [
-            str(psql),
-            "-U", user,
-            "-h", "localhost",
-            "-p", "5432",
-            "-d", database,
-            "-v", "ON_ERROR_STOP=1",
-            "-c", sql,
-        ],
+        args,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -35,24 +29,8 @@ def run_psql(sql: str, database: str = "trad_bot_migration_test", user: str = "p
 
 
 def run_psql_migration(path: Path) -> subprocess.CompletedProcess[str]:
-    """Run a migration against the isolated PostgreSQL 17 test database."""
-    psql = Path(r"C:\Program Files\PostgreSQL\17\bin\psql.exe")
-    
-    return subprocess.run(
-        [
-            str(psql),
-            "-U", "postgres",
-            "-h", "localhost",
-            "-p", "5432",
-            "-d", "trad_bot_migration_test",
-            "-v", "ON_ERROR_STOP=1",
-            "-f", str(path),
-        ],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    """Run a migration against the test database."""
+    return run_psql_file(path)
 
 
 @pytest.fixture(scope="module")
@@ -71,13 +49,7 @@ def analytics_runner_role():
 @pytest.fixture
 def analytics_conn(analytics_runner_role) -> Generator[pg8000.Connection, None, None]:
     """Create a connection as analytics_runner."""
-    conn = pg8000.connect(
-        host="localhost",
-        port=5432,
-        database="trad_bot_migration_test",
-        user=analytics_runner_role,
-        password="",
-    )
+    conn = connect_test_db(user=analytics_runner_role)
     
     yield conn
     

@@ -21,59 +21,7 @@ from uuid import uuid4
 import pg8000
 import pytest
 
-
-# ======================================================================
-# Connection helper — single source of truth
-# ======================================================================
-
-def _connect_test_db() -> pg8000.Connection:
-    """Connect to the test database via unix socket or TCP.
-
-    Resolved in priority order:
-      1. TEST_DB_UNIX_SOCK  → unix_sock=...
-      2. TEST_DB_HOST        → host=..., port=...
-
-    All connection / auth / socket errors propagate as real exceptions.
-    """
-    database = os.getenv("TEST_DB_NAME", "trad_bot_stage2_test")
-    user = os.getenv("TEST_DB_USER", "postgres")
-    password = os.getenv("TEST_DB_PASSWORD", "")
-
-    unix_sock = os.getenv("TEST_DB_UNIX_SOCK")
-
-    if unix_sock:
-        return pg8000.connect(
-            unix_sock=unix_sock,
-            database=database,
-            user=user,
-            password=password,
-        )
-
-    host = os.getenv("TEST_DB_HOST", "localhost")
-    port = int(os.getenv("TEST_DB_PORT", "5432"))
-    return pg8000.connect(
-        host=host,
-        port=port,
-        database=database,
-        user=user,
-        password=password,
-    )
-
-
-def _stage2_tables_exist(conn: pg8000.Connection) -> bool:
-    """Check whether the canonical analytics tables exist.
-
-    Must be called with an ALREADY-OPEN connection so that connection
-    errors are never swallowed.
-    """
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT EXISTS ("
-        "  SELECT 1 FROM information_schema.tables"
-        "  WHERE table_schema = 'analytics' AND table_name = 'trade_fact'"
-        ")"
-    )
-    return cur.fetchone()[0]
+from conftest import connect_test_db
 
 
 # ======================================================================
@@ -89,13 +37,20 @@ def db_conn():
     """
     # --- 1. Establish connection (errors propagate) ---
     try:
-        conn = _connect_test_db()
+        conn = connect_test_db()
     except Exception as exc:
         pytest.fail(f"Database connection failed — check env vars and server: {exc}")
 
     # --- 2. Check Stage 2 tables ---
     try:
-        available = _stage2_tables_exist(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT EXISTS ("
+            "  SELECT 1 FROM information_schema.tables"
+            "  WHERE table_schema = 'analytics' AND table_name = 'trade_fact'"
+            ")"
+        )
+        available = cur.fetchone()[0]
     except Exception as exc:
         conn.close()
         pytest.fail(f"Schema introspection failed: {exc}")

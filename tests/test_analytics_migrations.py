@@ -19,6 +19,7 @@ from app.analytics.models import (
     Severity,
     QualityStatus,
 )
+from conftest import run_psql_file as _run_psql_file
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,24 +29,8 @@ MIGRATION_009 = ROOT / "sql" / "migrations" / "009_market_candle.sql"
 
 
 def run_psql_migration(path: Path) -> subprocess.CompletedProcess[str]:
-    """Run a migration against the isolated PostgreSQL 17 test database."""
-    psql = Path(r"C:\Program Files\PostgreSQL\17\bin\psql.exe")
-
-    return subprocess.run(
-        [
-            str(psql),
-            "-U", "postgres",
-            "-h", "localhost",
-            "-p", "5432",
-            "-d", "trad_bot_migration_test",
-            "-v", "ON_ERROR_STOP=1",
-            "-f", str(path),
-        ],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    """Run a migration against the test database."""
+    return _run_psql_file(path)
 
 
 class TestAnalyticsMigrations:
