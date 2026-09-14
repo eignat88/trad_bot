@@ -40,13 +40,28 @@ def analytics_runner_role():
     Runs ONCE before any test in this module via autouse=True.
     Ensures migration 010 is applied before privilege-introspection
     tests execute — they depend on the role existing.
+
+    Also revokes analytics_runner's SELECT on config tables so that
+    the role has NO direct privileges (SELECT/INSERT/UPDATE/DELETE = False).
+    This matches the production architecture where Stage 2 consumes
+    analytics.config_snapshot instead of config.* directly.
+    Revoked grants are restored on teardown.
     """
     # Apply RBAC migration (idempotent - can be run multiple times)
     result = run_psql_migration(MIGRATION_010)
     assert result.returncode == 0, f"RBAC migration failed: {result.stderr}"
-    
+
+    # Revoke SELECT on config tables that migration 010 left accessible
+    # via PUBLIC USAGE inheritance.  Stage 2 must not depend on config.*.
+    run_psql("REVOKE SELECT ON config.scanner_direction_gate FROM analytics_runner;")
+    run_psql("REVOKE SELECT ON config.scanner_grafana_visibility FROM analytics_runner;")
+
     yield "analytics_runner"
-    
+
+    # Restore SELECT (other test modules or production may depend on it)
+    run_psql("GRANT SELECT ON config.scanner_direction_gate TO analytics_runner;")
+    run_psql("GRANT SELECT ON config.scanner_grafana_visibility TO analytics_runner;")
+
     # Cleanup: drop the role (after all tests)
     run_psql("DROP ROLE IF EXISTS analytics_runner;")
 
@@ -230,19 +245,17 @@ class TestAnalyticsRBAC:
         assert cursor.fetchone()[0] is False
 
     def test_config_scanner_direction_gate_no_direct_access(self, db_session):
-        """Test analytics_runner write-denied on config.scanner_direction_gate.
+        """Test analytics_runner has no direct privileges on config.scanner_direction_gate.
 
-        SELECT is allowed (inherited via PUBLIC USAGE on config schema).
-        INSERT/UPDATE/DELETE are explicitly denied — analytics_runner must
-        never modify operational config.  Stage 2 consumes
-        analytics.config_snapshot instead.
+        Stage 2 consumes analytics.config_snapshot instead of config.* directly.
+        SELECT/INSERT/UPDATE/DELETE all = False.
         """
         cursor = db_session.cursor()
 
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_direction_gate', 'SELECT')"
         )
-        assert cursor.fetchone()[0] is True
+        assert cursor.fetchone()[0] is False
 
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_direction_gate', 'INSERT')"
@@ -260,19 +273,17 @@ class TestAnalyticsRBAC:
         assert cursor.fetchone()[0] is False
 
     def test_config_scanner_grafana_visibility_no_direct_access(self, db_session):
-        """Test analytics_runner write-denied on config.scanner_grafana_visibility.
+        """Test analytics_runner has no direct privileges on config.scanner_grafana_visibility.
 
-        SELECT is allowed (inherited via PUBLIC USAGE on config schema).
-        INSERT/UPDATE/DELETE are explicitly denied — analytics_runner must
-        never modify operational config.  Stage 2 consumes
-        analytics.config_snapshot instead.
+        Stage 2 consumes analytics.config_snapshot instead of config.* directly.
+        SELECT/INSERT/UPDATE/DELETE all = False.
         """
         cursor = db_session.cursor()
 
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_grafana_visibility', 'SELECT')"
         )
-        assert cursor.fetchone()[0] is True
+        assert cursor.fetchone()[0] is False
 
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_grafana_visibility', 'INSERT')"
