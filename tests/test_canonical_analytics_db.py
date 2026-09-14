@@ -59,7 +59,8 @@ def db_conn():
         conn.close()
         pytest.skip(
             "Stage 2 canonical tables not found — "
-            "run migrations 014-025 on the test database first"
+            "run migrations 014-025 on the test database first. "
+            "Set TEST_DB_NAME to a database with Stage 2 applied."
         )
 
     yield conn

@@ -17,12 +17,14 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 import pg8000
 import pytest
+
+_TMP_ROOT = Path(__file__).parent / ".tmp"
 
 
 # ======================================================================
@@ -139,17 +141,24 @@ def run_psql_file(
 
 
 # ======================================================================
-# Temp directory — portable across Windows / Linux / VPS
+# Temp directory — workspace-local scratch root
 # ======================================================================
 
 @pytest.fixture
 def tmp_path() -> Path:
-    """Provide an isolated temporary directory.
+    """Provide an isolated temporary directory without pytest's 0700 factory.
 
-    Uses the system temp directory so it works regardless of who runs
-    pytest (root, postgres, CI runner).  No /opt/trad_bot依赖.
+    On Windows, pytest's built-in ``tmp_path`` creates directories with mode
+    ``0700``.  That ACL is unusable in the constrained runner used by this
+    project, while ordinary workspace directories are writable.  Use a
+    per-test directory under the ignored test scratch root instead.
+
+    Uses workspace-local .tmp/ to avoid OS temp directory permission issues
+    with file locking (fcntl/lockf work reliably on local filesystem).
     """
-    path = Path(tempfile.mkdtemp(prefix="tradbot_test_"))
+    _TMP_ROOT.mkdir(exist_ok=True)
+    path = _TMP_ROOT / uuid4().hex
+    path.mkdir()
     try:
         yield path
     finally:
