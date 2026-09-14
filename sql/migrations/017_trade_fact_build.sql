@@ -99,15 +99,39 @@ trade_build AS (
                      ELSE NULL END
         END                                                        AS pnl_r,
 
-        -- mfe_r / mae_r recomputed canonically from paper_trade values
-        -- (the production values already use direction_sign convention)
-        pt.mfe_r,
-        pt.mae_r,
+        -- mfe_r / mae_r recomputed canonically:
+        -- mfe_r = direction_sign * mfe / initial_risk_distance
+        -- mae_r = direction_sign * (-mae) / initial_risk_distance  (always <= 0)
+        -- paper_trade stores mfe/mae as unsigned absolute values in price units.
+        CASE pt.direction
+            WHEN 'LONG' THEN
+                CASE WHEN ABS(COALESCE(ss.reference_price, pt.entry_price) - pt.stop_price) > 0
+                     THEN pt.mfe / ABS(COALESCE(ss.reference_price, pt.entry_price) - pt.stop_price)
+                     ELSE NULL END
+            WHEN 'SHORT' THEN
+                CASE WHEN ABS(COALESCE(ss.reference_price, pt.entry_price) - pt.stop_price) > 0
+                     THEN pt.mfe / ABS(COALESCE(ss.reference_price, pt.entry_price) - pt.stop_price)
+                     ELSE NULL END
+        END                                                        AS mfe_r,
+        -1 * (
+        CASE pt.direction
+            WHEN 'LONG' THEN
+                CASE WHEN ABS(COALESCE(ss.reference_price, pt.entry_price) - pt.stop_price) > 0
+                     THEN pt.mae / ABS(COALESCE(ss.reference_price, pt.entry_price) - pt.stop_price)
+                     ELSE NULL END
+            WHEN 'SHORT' THEN
+                CASE WHEN ABS(COALESCE(ss.reference_price, pt.entry_price) - pt.stop_price) > 0
+                     THEN pt.mae / ABS(COALESCE(ss.reference_price, pt.entry_price) - pt.stop_price)
+                     ELSE NULL END
+        END)                                                       AS mae_r,
 
         -- Context
         pt.market_regime,
-        NULL::text                                                 AS config_hash,
-        NULL::text                                                 AS strategy_hash,
+        -- config_hash/strategy_hash: populated from snapshots if available
+        (SELECT cs.config_hash FROM analytics.config_snapshot cs
+         WHERE cs.valid_to IS NULL LIMIT 1)                       AS config_hash,
+        (SELECT ss2.strategy_hash FROM analytics.strategy_snapshot ss2
+         WHERE ss2.scanner_name = pt.scanner_name LIMIT 1)        AS strategy_hash,
         '1.0.0'::text                                              AS metric_version,
 
         -- Quality
@@ -123,10 +147,17 @@ trade_build AS (
     FROM dds.paper_trade pt
     CROSS JOIN latest_run lr
     LEFT JOIN dds.scanner_setup ss ON ss.setup_id = pt.setup_id
-    LEFT JOIN dds.market_signal ms ON ms.instrument_id = ss.instrument_id
-        AND ms.direction = pt.direction
-        AND ms.first_detected_at <= pt.entered_at  -- signal must precede entry
-        AND ms.status IN ('EXECUTED', 'ACTIVE')
+    -- Deterministic signal: LATERAL picks the most recent signal before entry
+    LEFT JOIN LATERAL (
+        SELECT ms.first_detected_at
+        FROM dds.market_signal ms
+        WHERE ms.instrument_id = ss.instrument_id
+          AND ms.direction = pt.direction
+          AND ms.first_detected_at <= pt.entered_at
+          AND ms.status IN ('EXECUTED', 'ACTIVE')
+        ORDER BY ms.first_detected_at DESC
+        LIMIT 1
+    ) ms ON TRUE
     WHERE pt.entered_at < lr.observation_cutoff  -- PIT: source event before cutoff
 )
 INSERT INTO analytics.trade_fact (

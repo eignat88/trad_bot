@@ -21,7 +21,8 @@ CREATE OR REPLACE FUNCTION analytics.compute_horizon_metric(
     p_direction TEXT,
     p_initial_risk_distance NUMERIC,
     p_instrument_id BIGINT,
-    p_cutoff TIMESTAMPTZ
+    p_cutoff TIMESTAMPTZ,
+    p_entry_time TIMESTAMPTZ DEFAULT NULL  -- used for 'entry_time' horizon
 ) RETURNS TABLE (
     favorable_move_r NUMERIC,
     adverse_move_r NUMERIC,
@@ -35,21 +36,24 @@ DECLARE
     candle_count BIGINT;
     direction_sign NUMERIC;
 BEGIN
-    -- Convert horizon string to interval
-    CASE p_horizon
-        WHEN '1m' THEN horizon_interval := INTERVAL '1 minute';
-        WHEN '3m' THEN horizon_interval := INTERVAL '3 minutes';
-        WHEN '5m' THEN horizon_interval := INTERVAL '5 minutes';
-        WHEN '15m' THEN horizon_interval := INTERVAL '15 minutes';
-        WHEN '30m' THEN horizon_interval := INTERVAL '30 minutes';
-        WHEN '1h' THEN horizon_interval := INTERVAL '1 hour';
-        WHEN '2h' THEN horizon_interval := INTERVAL '2 hours';
-        WHEN '4h' THEN horizon_interval := INTERVAL '4 hours';
-        WHEN 'entry_time' THEN horizon_interval := INTERVAL '0 minutes';  -- special case
-        ELSE horizon_interval := INTERVAL '5 minutes';
-    END CASE;
-
-    end_time := p_anchor_time + horizon_interval;
+    -- For 'entry_time' horizon, use actual entry time as endpoint
+    IF p_horizon = 'entry_time' AND p_entry_time IS NOT NULL THEN
+        end_time := p_entry_time;
+    ELSE
+        -- Convert horizon string to interval
+        CASE p_horizon
+            WHEN '1m' THEN horizon_interval := INTERVAL '1 minute';
+            WHEN '3m' THEN horizon_interval := INTERVAL '3 minutes';
+            WHEN '5m' THEN horizon_interval := INTERVAL '5 minutes';
+            WHEN '15m' THEN horizon_interval := INTERVAL '15 minutes';
+            WHEN '30m' THEN horizon_interval := INTERVAL '30 minutes';
+            WHEN '1h' THEN horizon_interval := INTERVAL '1 hour';
+            WHEN '2h' THEN horizon_interval := INTERVAL '2 hours';
+            WHEN '4h' THEN horizon_interval := INTERVAL '4 hours';
+            ELSE horizon_interval := INTERVAL '5 minutes';
+        END CASE;
+        end_time := p_anchor_time + horizon_interval;
+    END IF;
 
     -- Direction sign: LONG=+1, SHORT=-1
     direction_sign := CASE p_direction WHEN 'LONG' THEN 1.0 ELSE -1.0 END;
@@ -148,15 +152,16 @@ BEGIN
             ) AS t(anchor, anchor_time, anchor_price)
             WHERE t.anchor_time IS NOT NULL AND t.anchor_price IS NOT NULL
         LOOP
-            -- Signal horizons
+            -- Signal horizons: fixed time intervals + entry_time (signal→entry delta)
             IF v_anchor.anchor = 'signal' THEN
-                FOREACH v_horizon IN ARRAY ARRAY['1m', '3m', '5m', '15m', '30m'] LOOP
+                FOREACH v_horizon IN ARRAY ARRAY['1m', '3m', '5m', '15m', '30m', 'entry_time'] LOOP
                     SELECT * INTO v_result
                     FROM analytics.compute_horizon_metric(
                         v_trade.trade_id, v_anchor.anchor, v_horizon,
                         v_anchor.anchor_price, v_anchor.anchor_time,
                         v_trade.direction, v_trade.initial_risk_distance,
-                        v_instrument_id, v_cutoff
+                        v_instrument_id, v_cutoff,
+                        v_trade.entered_at  -- p_entry_time for 'entry_time' horizon
                     );
 
                     INSERT INTO analytics.trade_horizon_metric (

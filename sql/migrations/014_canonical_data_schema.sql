@@ -220,6 +220,7 @@ CREATE INDEX IF NOT EXISTS idx_trade_fact_run
 -- ============================================================
 CREATE TABLE IF NOT EXISTS analytics.trade_event (
     event_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_id            UUID NOT NULL REFERENCES analytics.analysis_run(run_id),
     trade_id          BIGINT NOT NULL,
     setup_id          TEXT NOT NULL,
     event_type        TEXT NOT NULL CHECK (event_type IN (
@@ -241,7 +242,7 @@ CREATE TABLE IF NOT EXISTS analytics.trade_event (
 );
 
 COMMENT ON TABLE analytics.trade_event
-    IS 'Append-only trade event journal — never UPDATEd or DELETEd, corrections via compensating events';
+    IS 'Append-only trade event journal scoped by run_id — never UPDATEd or DELETEd';
 COMMENT ON COLUMN analytics.trade_event.source_event_key
     IS 'Idempotency key — prevents duplicate event recording';
 COMMENT ON COLUMN analytics.trade_event.payload_json
