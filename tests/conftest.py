@@ -101,6 +101,7 @@ def make_scanner_repo(*, database: Optional[str] = None, user: Optional[str] = N
     """Create a ScannerRepository using TEST_DB_* env vars.
 
     For integration tests that need to write to config/dds tables.
+    Passes unix_sock directly to ScannerRepository — no path mangling.
     """
     from app.db.repository import ScannerRepository
 
@@ -110,15 +111,9 @@ def make_scanner_repo(*, database: Optional[str] = None, user: Optional[str] = N
     _database = database or os.getenv("TEST_DB_NAME", "trad_bot_migration_test")
     _user = user or os.getenv("TEST_DB_USER", "postgres")
 
-    if _unix_sock:
-        from pathlib import Path as _P
-        host = str(_P(_unix_sock).parent)
-    else:
-        host = _host
-
     return ScannerRepository(
-        host=host, port=_port, database=_database,
-        user=_user, backend="postgres",
+        host=_host, port=_port, database=_database,
+        user=_user, backend="postgres", unix_sock=_unix_sock,
     )
 
 

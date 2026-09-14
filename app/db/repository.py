@@ -46,6 +46,7 @@ class ScannerRepository:
         password: str | None = None,
         jsonl_path: str = "data/scanner_setups.jsonl",
         backend: Literal["auto", "postgres", "jsonl"] = "auto",
+        unix_sock: str | None = None,
     ) -> None:
         if backend not in {"auto", "postgres", "jsonl"}:
             raise ValueError("backend must be 'auto', 'postgres', or 'jsonl'")
@@ -54,6 +55,7 @@ class ScannerRepository:
         self._database = database
         self._user = user
         self._password = password or None
+        self._unix_sock = unix_sock
         self._jsonl_path = jsonl_path
         self._conn: Any = None
         self._use_pg = False
@@ -67,15 +69,28 @@ class ScannerRepository:
 
         try:
             import pg8000
-            self._conn = pg8000.connect(
-                host=host, port=port, database=database, user=user,
-                password=self._password,
-            )
+            if unix_sock:
+                self._conn = pg8000.connect(
+                    unix_sock=unix_sock,
+                    database=database, user=user,
+                    password=self._password,
+                )
+            else:
+                self._conn = pg8000.connect(
+                    host=host, port=port, database=database, user=user,
+                    password=self._password,
+                )
             self._use_pg = True
-            logger.info(
-                "PostgreSQL connected: %s:%d/%s user=%s",
-                host, port, database, user,
-            )
+            if unix_sock:
+                logger.info(
+                    "PostgreSQL connected via unix_sock: %s user=%s",
+                    unix_sock, user,
+                )
+            else:
+                logger.info(
+                    "PostgreSQL connected: %s:%d/%s user=%s",
+                    host, port, database, user,
+                )
         except ImportError:
             if backend == "postgres":
                 raise
@@ -116,11 +131,18 @@ class ScannerRepository:
             except Exception:
                 pass
             import pg8000
-            self._conn = pg8000.connect(
-                host=self._host, port=self._port,
-                database=self._database, user=self._user,
-                password=self._password,
-            )
+            if self._unix_sock:
+                self._conn = pg8000.connect(
+                    unix_sock=self._unix_sock,
+                    database=self._database, user=self._user,
+                    password=self._password,
+                )
+            else:
+                self._conn = pg8000.connect(
+                    host=self._host, port=self._port,
+                    database=self._database, user=self._user,
+                    password=self._password,
+                )
             logger.info("PostgreSQL connection reset after transaction failure")
             return True
         except Exception:
