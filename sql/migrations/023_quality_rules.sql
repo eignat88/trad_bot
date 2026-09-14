@@ -15,9 +15,9 @@
 --
 -- PIT violation => run FAILED
 --
--- IMPORTANT: jsonb_agg with LIMIT is not valid PostgreSQL syntax.
--- All functions use CTE/subquery pattern to separate COUNT(*) from
--- the sample LIMIT 10 aggregation.
+-- NOTE: CTEs (WITH ... AS) inside PL/pgSQL RETURN QUERY do NOT share scope.
+-- Each function uses DECLARE variables + separate COUNT / sample SELECTs
+-- to avoid the "relation sample does not exist" bug.
 
 -- ============================================================
 -- 1. Check: duplicate trade grain
@@ -32,30 +32,34 @@ CREATE OR REPLACE FUNCTION analytics.check_duplicate_trade_grain(
     details JSONB
 ) AS $$
 DECLARE
-    v_total BIGINT;
-    v_dupes BIGINT;
-    v_samples JSONB;
+    v_total    BIGINT;
+    v_dupes    BIGINT;
+    v_samples  JSONB;
 BEGIN
-    -- Duplicates = trade_id appears more than once in the same run
+    SELECT COUNT(*) INTO v_total
+    FROM analytics.trade_fact
+    WHERE run_id = p_run_id;
+
     WITH numbered AS (
         SELECT trade_id,
                ROW_NUMBER() OVER (PARTITION BY run_id, trade_id ORDER BY created_at) AS rn
         FROM analytics.trade_fact
         WHERE run_id = p_run_id
-    ),
-    affected AS (
-        SELECT trade_id FROM numbered WHERE rn > 1
-    ),
-    sample AS (
-        SELECT trade_id FROM affected LIMIT 10
     )
-    SELECT
-        COUNT(*) INTO v_dupes
-    FROM affected;
+    SELECT COUNT(*) INTO v_dupes FROM numbered WHERE rn > 1;
 
-    SELECT COUNT(*) INTO v_total FROM analytics.trade_fact WHERE run_id = p_run_id;
-
-    SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples FROM sample;
+    SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples
+    FROM (
+        SELECT trade_id
+        FROM (
+            SELECT trade_id,
+                   ROW_NUMBER() OVER (PARTITION BY run_id, trade_id ORDER BY created_at) AS rn
+            FROM analytics.trade_fact
+            WHERE run_id = p_run_id
+        ) t
+        WHERE rn > 1
+        LIMIT 10
+    ) sub;
 
     RETURN QUERY SELECT
         'duplicate_trade_grain'::TEXT,
@@ -67,7 +71,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ============================================================
--- 2. Check: orphan setup (setup_fact without trade_fact)
+-- 2. Check: orphan setup (setup_fact without entry_attempt_fact)
 -- ============================================================
 CREATE OR REPLACE FUNCTION analytics.check_orphan_setup(
     p_run_id UUID
@@ -79,23 +83,26 @@ CREATE OR REPLACE FUNCTION analytics.check_orphan_setup(
     details JSONB
 ) AS $$
 DECLARE
-    v_count BIGINT;
+    v_count   BIGINT;
     v_samples JSONB;
 BEGIN
-    WITH affected AS (
+    SELECT COUNT(*) INTO v_count
+    FROM analytics.setup_fact sf
+    LEFT JOIN analytics.entry_attempt_fact eaf
+        ON eaf.run_id = sf.run_id AND eaf.setup_id = sf.setup_id
+    WHERE sf.run_id = p_run_id
+      AND eaf.attempt_id IS NULL;
+
+    SELECT COALESCE(jsonb_agg(setup_id), '[]'::jsonb) INTO v_samples
+    FROM (
         SELECT sf.setup_id
         FROM analytics.setup_fact sf
         LEFT JOIN analytics.entry_attempt_fact eaf
             ON eaf.run_id = sf.run_id AND eaf.setup_id = sf.setup_id
         WHERE sf.run_id = p_run_id
           AND eaf.attempt_id IS NULL
-    ),
-    sample AS (
-        SELECT setup_id FROM affected LIMIT 10
-    )
-    SELECT COUNT(*) INTO v_count FROM affected;
-
-    SELECT COALESCE(jsonb_agg(setup_id), '[]'::jsonb) INTO v_samples FROM sample;
+        LIMIT 10
+    ) sub;
 
     RETURN QUERY SELECT
         'orphan_setup'::TEXT,
@@ -119,23 +126,26 @@ CREATE OR REPLACE FUNCTION analytics.check_orphan_trade(
     details JSONB
 ) AS $$
 DECLARE
-    v_count BIGINT;
+    v_count   BIGINT;
     v_samples JSONB;
 BEGIN
-    WITH affected AS (
+    SELECT COUNT(*) INTO v_count
+    FROM analytics.trade_fact tf
+    LEFT JOIN analytics.setup_fact sf
+        ON sf.run_id = tf.run_id AND sf.setup_id = tf.setup_id
+    WHERE tf.run_id = p_run_id
+      AND sf.setup_id IS NULL;
+
+    SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples
+    FROM (
         SELECT tf.trade_id
         FROM analytics.trade_fact tf
         LEFT JOIN analytics.setup_fact sf
             ON sf.run_id = tf.run_id AND sf.setup_id = tf.setup_id
         WHERE tf.run_id = p_run_id
           AND sf.setup_id IS NULL
-    ),
-    sample AS (
-        SELECT trade_id FROM affected LIMIT 10
-    )
-    SELECT COUNT(*) INTO v_count FROM affected;
-
-    SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples FROM sample;
+        LIMIT 10
+    ) sub;
 
     RETURN QUERY SELECT
         'orphan_trade'::TEXT,
@@ -159,25 +169,28 @@ CREATE OR REPLACE FUNCTION analytics.check_entered_without_fill(
     details JSONB
 ) AS $$
 DECLARE
-    v_count BIGINT;
+    v_count   BIGINT;
     v_samples JSONB;
 BEGIN
-    WITH affected AS (
+    SELECT COUNT(*) INTO v_count
+    FROM analytics.trade_fact tf
+    LEFT JOIN analytics.trade_event te
+        ON te.trade_id = tf.trade_id AND te.event_type = 'ENTRY_FILLED'
+    WHERE tf.run_id = p_run_id
+      AND tf.entered_at IS NOT NULL
+      AND te.event_id IS NULL;
+
+    SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples
+    FROM (
         SELECT tf.trade_id
         FROM analytics.trade_fact tf
         LEFT JOIN analytics.trade_event te
-            ON te.trade_id = tf.trade_id
-            AND te.event_type = 'ENTRY_FILLED'
+            ON te.trade_id = tf.trade_id AND te.event_type = 'ENTRY_FILLED'
         WHERE tf.run_id = p_run_id
           AND tf.entered_at IS NOT NULL
           AND te.event_id IS NULL
-    ),
-    sample AS (
-        SELECT trade_id FROM affected LIMIT 10
-    )
-    SELECT COUNT(*) INTO v_count FROM affected;
-
-    SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples FROM sample;
+        LIMIT 10
+    ) sub;
 
     RETURN QUERY SELECT
         'entered_without_fill'::TEXT,
@@ -201,25 +214,28 @@ CREATE OR REPLACE FUNCTION analytics.check_closed_without_exit_event(
     details JSONB
 ) AS $$
 DECLARE
-    v_count BIGINT;
+    v_count   BIGINT;
     v_samples JSONB;
 BEGIN
-    WITH affected AS (
+    SELECT COUNT(*) INTO v_count
+    FROM analytics.trade_fact tf
+    LEFT JOIN analytics.trade_event te
+        ON te.trade_id = tf.trade_id AND te.event_type = 'TRADE_CLOSED'
+    WHERE tf.run_id = p_run_id
+      AND tf.status = 'CLOSED'
+      AND te.event_id IS NULL;
+
+    SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples
+    FROM (
         SELECT tf.trade_id
         FROM analytics.trade_fact tf
         LEFT JOIN analytics.trade_event te
-            ON te.trade_id = tf.trade_id
-            AND te.event_type = 'TRADE_CLOSED'
+            ON te.trade_id = tf.trade_id AND te.event_type = 'TRADE_CLOSED'
         WHERE tf.run_id = p_run_id
           AND tf.status = 'CLOSED'
           AND te.event_id IS NULL
-    ),
-    sample AS (
-        SELECT trade_id FROM affected LIMIT 10
-    )
-    SELECT COUNT(*) INTO v_count FROM affected;
-
-    SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples FROM sample;
+        LIMIT 10
+    ) sub;
 
     RETURN QUERY SELECT
         'closed_without_exit_event'::TEXT,
@@ -243,26 +259,30 @@ CREATE OR REPLACE FUNCTION analytics.check_dca_state_consistency(
     details JSONB
 ) AS $$
 DECLARE
-    v_count BIGINT;
+    v_count   BIGINT;
     v_samples JSONB;
 BEGIN
-    WITH affected AS (
+    SELECT COUNT(*) INTO v_count
+    FROM analytics.trade_fact tf
+    WHERE tf.run_id = p_run_id
+      AND tf.dca_filled_at IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM analytics.trade_event te
+          WHERE te.trade_id = tf.trade_id AND te.event_type = 'DCA_FILLED'
+      );
+
+    SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples
+    FROM (
         SELECT tf.trade_id
         FROM analytics.trade_fact tf
         WHERE tf.run_id = p_run_id
           AND tf.dca_filled_at IS NOT NULL
           AND NOT EXISTS (
               SELECT 1 FROM analytics.trade_event te
-              WHERE te.trade_id = tf.trade_id
-                AND te.event_type = 'DCA_FILLED'
+              WHERE te.trade_id = tf.trade_id AND te.event_type = 'DCA_FILLED'
           )
-    ),
-    sample AS (
-        SELECT trade_id FROM affected LIMIT 10
-    )
-    SELECT COUNT(*) INTO v_count FROM affected;
-
-    SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples FROM sample;
+        LIMIT 10
+    ) sub;
 
     RETURN QUERY SELECT
         'dca_state_inconsistency'::TEXT,
@@ -286,25 +306,24 @@ CREATE OR REPLACE FUNCTION analytics.check_mfe_mae_sign(
     details JSONB
 ) AS $$
 DECLARE
-    v_count BIGINT;
+    v_count   BIGINT;
     v_samples JSONB;
 BEGIN
-    WITH affected AS (
-        SELECT trade_id
-        FROM analytics.trade_fact
-        WHERE run_id = p_run_id
-          AND status = 'CLOSED'
-          AND (
-              mfe_r < 0   -- MFE should always be >= 0
-              OR mae_r > 0 -- MAE should always be <= 0
-          )
-    ),
-    sample AS (
-        SELECT trade_id FROM affected LIMIT 10
-    )
-    SELECT COUNT(*) INTO v_count FROM affected;
+    SELECT COUNT(*) INTO v_count
+    FROM analytics.trade_fact tf
+    WHERE tf.run_id = p_run_id
+      AND tf.status = 'CLOSED'
+      AND (tf.mfe_r < 0 OR tf.mae_r > 0);
 
-    SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples FROM sample;
+    SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples
+    FROM (
+        SELECT trade_id
+        FROM analytics.trade_fact tf2
+        WHERE tf2.run_id = p_run_id
+          AND tf2.status = 'CLOSED'
+          AND (tf2.mfe_r < 0 OR tf2.mae_r > 0)
+        LIMIT 10
+    ) sub;
 
     RETURN QUERY SELECT
         'invalid_mfe_mae_sign'::TEXT,
@@ -330,13 +349,10 @@ CREATE OR REPLACE FUNCTION analytics.check_missing_config_hash(
 DECLARE
     v_count BIGINT;
 BEGIN
-    WITH affected AS (
-        SELECT trade_id
-        FROM analytics.trade_fact
-        WHERE run_id = p_run_id
-          AND config_hash IS NULL
-    )
-    SELECT COUNT(*) INTO v_count FROM affected;
+    SELECT COUNT(*) INTO v_count
+    FROM analytics.trade_fact tf
+    WHERE tf.run_id = p_run_id
+      AND tf.config_hash IS NULL;
 
     RETURN QUERY SELECT
         'missing_config_hash'::TEXT,
@@ -360,23 +376,26 @@ CREATE OR REPLACE FUNCTION analytics.check_candle_coverage(
     details JSONB
 ) AS $$
 DECLARE
-    v_count BIGINT;
+    v_count   BIGINT;
     v_samples JSONB;
 BEGIN
-    WITH affected AS (
+    SELECT COUNT(*) INTO v_count
+    FROM analytics.trade_horizon_metric thm
+    WHERE thm.trade_id IN (
+        SELECT trade_id FROM analytics.trade_fact WHERE run_id = p_run_id
+    )
+      AND thm.coverage_status != 'COMPLETE';
+
+    SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples
+    FROM (
         SELECT thm.trade_id
         FROM analytics.trade_horizon_metric thm
         WHERE thm.trade_id IN (
             SELECT trade_id FROM analytics.trade_fact WHERE run_id = p_run_id
         )
           AND thm.coverage_status != 'COMPLETE'
-    ),
-    sample AS (
-        SELECT trade_id FROM affected LIMIT 10
-    )
-    SELECT COUNT(*) INTO v_count FROM affected;
-
-    SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples FROM sample;
+        LIMIT 10
+    ) sub;
 
     RETURN QUERY SELECT
         'incomplete_candle_coverage'::TEXT,
@@ -400,30 +419,27 @@ CREATE OR REPLACE FUNCTION analytics.check_pit_violation(
     details JSONB
 ) AS $$
 DECLARE
-    v_cutoff TIMESTAMPTZ;
-    v_count BIGINT;
+    v_cutoff  TIMESTAMPTZ;
+    v_count   BIGINT;
     v_samples JSONB;
 BEGIN
     SELECT observation_cutoff INTO v_cutoff
     FROM analytics.analysis_run
     WHERE run_id = p_run_id;
 
-    WITH affected AS (
+    SELECT COUNT(*) INTO v_count
+    FROM analytics.trade_fact
+    WHERE run_id = p_run_id
+      AND (entered_at > v_cutoff OR closed_at > v_cutoff OR dca_filled_at > v_cutoff);
+
+    SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples
+    FROM (
         SELECT trade_id
         FROM analytics.trade_fact
         WHERE run_id = p_run_id
-          AND (
-              entered_at > v_cutoff
-              OR closed_at > v_cutoff
-              OR dca_filled_at > v_cutoff
-          )
-    ),
-    sample AS (
-        SELECT trade_id FROM affected LIMIT 10
-    )
-    SELECT COUNT(*) INTO v_count FROM affected;
-
-    SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples FROM sample;
+          AND (entered_at > v_cutoff OR closed_at > v_cutoff OR dca_filled_at > v_cutoff)
+        LIMIT 10
+    ) sub;
 
     RETURN QUERY SELECT
         'pit_violation'::TEXT,
@@ -486,13 +502,13 @@ BEGIN
     RETURN QUERY
     SELECT
         NOT EXISTS (
-            SELECT 1 FROM analytics.run_quality_checks(p_run_id)
-            WHERE severity = 'BLOCKING' AND status = 'FAIL'
+            SELECT 1 FROM analytics.run_quality_checks(p_run_id) q
+            WHERE q.severity = 'BLOCKING' AND q.status = 'FAIL'
         ) AS passed,
-        COUNT(*) FILTER (WHERE severity = 'BLOCKING' AND status = 'FAIL')::BIGINT,
-        COUNT(*) FILTER (WHERE severity = 'DEGRADED' AND status = 'FAIL')::BIGINT,
-        COUNT(*) FILTER (WHERE severity = 'WARNING' AND status = 'FAIL')::BIGINT,
+        COUNT(*) FILTER (WHERE q.severity = 'BLOCKING' AND q.status = 'FAIL')::BIGINT,
+        COUNT(*) FILTER (WHERE q.severity = 'DEGRADED' AND q.status = 'FAIL')::BIGINT,
+        COUNT(*) FILTER (WHERE q.severity = 'WARNING' AND q.status = 'FAIL')::BIGINT,
         COUNT(*)::BIGINT
-    FROM analytics.run_quality_checks(p_run_id);
+    FROM analytics.run_quality_checks(p_run_id) q;
 END;
 $$ LANGUAGE plpgsql;
