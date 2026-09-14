@@ -32,10 +32,8 @@ from app.scanners.orchestrator import ScannerOrchestrator
 
 def _make_pg_repo() -> ScannerRepository:
     """Create a PostgreSQL-backed repository for integration tests."""
-    repo = ScannerRepository(
-        host="localhost", port=5432, database="trad_bot",
-        user="postgres", backend="postgres",
-    )
+    from conftest import make_scanner_repo
+    repo = make_scanner_repo()
     if not repo.ping():
         pytest.skip("PostgreSQL not available")
     return repo
@@ -439,22 +437,17 @@ def _ensure_gate_table(pg_conn) -> None:
 
 def _connect_pg():
     """Return a psycopg2 connection or skip if PostgreSQL unavailable."""
-    import psycopg2
+    from conftest import connect_test_db_psycopg2
     try:
-        conn = psycopg2.connect(
-            host="localhost", port=5432, database="trad_bot", user="postgres",
-        )
-        return conn
+        return connect_test_db_psycopg2()
     except Exception:
         pytest.skip("PostgreSQL not available")
 
 
 def _make_gate_repo():
     """Create a fresh ScannerRepository for gate tests."""
-    return ScannerRepository(
-        host="localhost", port=5432, database="trad_bot",
-        user="postgres", backend="postgres",
-    )
+    from conftest import make_scanner_repo
+    return make_scanner_repo()
 
 
 def test_manual_block_survives_service_restart():
