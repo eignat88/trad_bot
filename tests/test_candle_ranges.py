@@ -33,17 +33,20 @@ class TestCandleRangePlanner:
         assert ranges[0].to_time > datetime.now(timezone.utc)
 
     def test_calculate_required_ranges_with_exit(self):
-        """Test calculating required ranges with exit time."""
+        """Test calculating required ranges with exit time and explicit entry_time."""
+        entry_time = datetime(2026, 9, 12, 8, 0, tzinfo=timezone.utc)
         exit_time = datetime(2026, 9, 12, 10, 0, tzinfo=timezone.utc)
-        
+
         ranges = self.planner.calculate_required_ranges(
             instrument_id=1,
             timeframe="5",
+            entry_time=entry_time,
             exit_time=exit_time,
             post_exit_horizon=timedelta(hours=4),
         )
-        
+
         assert len(ranges) == 1
+        assert ranges[0].from_time == entry_time - timedelta(hours=24)
         assert ranges[0].to_time == exit_time + timedelta(hours=4)
 
     def test_merge_overlapping_ranges(self):

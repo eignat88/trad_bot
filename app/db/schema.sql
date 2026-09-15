@@ -61,9 +61,6 @@ CREATE TABLE IF NOT EXISTS dds.scanner_run_stat (
     PRIMARY KEY (run_id, scanner_name)
 );
 
-ALTER TABLE dds.scanner_run_stat
-    ALTER COLUMN duration_ms TYPE NUMERIC(12,3) USING duration_ms::NUMERIC(12,3);
-
 -- Immutable membership snapshot for each dynamic or static run universe.
 CREATE TABLE IF NOT EXISTS dds.scanner_run_instrument (
     run_id BIGINT NOT NULL REFERENCES dds.scanner_run(run_id) ON DELETE CASCADE,

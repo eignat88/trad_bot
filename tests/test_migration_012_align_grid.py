@@ -8,6 +8,8 @@ from pathlib import Path
 import pg8000
 import pytest
 
+from conftest import connect_test_db, run_psql_file as _run_psql_file
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_012 = ROOT / "sql" / "migrations" / "012_align_candle_coverage_grid.sql"
@@ -15,34 +17,13 @@ MIGRATION_012 = ROOT / "sql" / "migrations" / "012_align_candle_coverage_grid.sq
 
 def run_psql_file(path: Path) -> subprocess.CompletedProcess[str]:
     """Execute a SQL file against the test database."""
-    psql = Path(r"C:\Program Files\PostgreSQL\17\bin\psql.exe")
-    return subprocess.run(
-        [
-            str(psql),
-            "-U", "postgres",
-            "-h", "localhost",
-            "-p", "5432",
-            "-d", "trad_bot_migration_test",
-            "-v", "ON_ERROR_STOP=1",
-            "-f", str(path),
-        ],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    return _run_psql_file(path)
 
 
 @pytest.fixture(scope="module")
 def db_conn():
     """Create a real pg8000 connection."""
-    conn = pg8000.connect(
-        host="localhost",
-        port=5432,
-        database="trad_bot_migration_test",
-        user="postgres",
-        password="",
-    )
+    conn = connect_test_db()
     yield conn
     conn.close()
 
