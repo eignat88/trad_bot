@@ -559,7 +559,7 @@ class AnalyticsRunner:
         
         # 2. Resolve symbols and build post-exit ranges
         instrument_map: dict[str, int] = {}
-        ranges_by_key: dict[tuple[int, str], list[CandleRange]] = []
+        ranges_by_key: dict[tuple[int, str], list[CandleRange]] = {}
         failed_symbols: list[str] = []
         
         for trade_id, symbol, closed_at, raw_timeframe in trades:
