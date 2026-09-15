@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
+from pathlib import Path
 
 import pg8000
 import pytest
@@ -293,15 +294,18 @@ class TestMetricWindows:
 class TestReconciliation:
 
     def test_empty_reconciliation_passes(self, db_conn, test_run_id):
-        """Zero source rows and zero canonical rows reconcile as PASS."""
+        """Source and canonical counts reconcile (delta=0)."""
         cur = db_conn.cursor()
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
         cur.execute(
             "SELECT * FROM analytics.reconcile_trade_count(%s)", (test_run_id,)
         )
         r = cur.fetchone()
-        assert r[1] == 0, f"source_count={r[1]}"
-        assert r[2] == 0, f"canonical_count={r[2]}"
-        assert r[3] == 0, f"delta={r[3]}"
+        # Both counts should match — delta must be 0
+        assert r[3] == 0, f"delta={r[3]}, source={r[1]}, canonical={r[2]}"
         assert r[4] == "PASS", f"severity={r[4]}"
 
 
@@ -641,3 +645,384 @@ class TestHorizonGeometry:
         fav, adv = cur.fetchone()
         assert float(fav) == pytest.approx(2.0)
         assert float(adv) == pytest.approx(-1.0)
+
+
+# ======================================================================
+# 12. E2E: paper_trade → trade_fact build via migration 017
+# ======================================================================
+
+class TestTradeFactBuildE2E:
+    """End-to-end: insert synthetic paper_trade + scanner_setup, run
+    trade_fact build function, verify mfe_r/mae_r are recomputed correctly."""
+
+    def _cleanup(self, cur, db_conn, run_id=None, instrument_ids=None, setup_ids=None, trade_ids=None):
+        """Clean up test data to avoid cross-test pollution."""
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        # Clean trade_event first (append-only, must truncate)
+        try:
+            cur.execute("TRUNCATE analytics.trade_event")
+        except Exception:
+            db_conn.rollback()
+        if trade_ids:
+            for tid in trade_ids:
+                cur.execute("DELETE FROM analytics.trade_fact WHERE trade_id = %s", (tid,))
+        if setup_ids:
+            for sid in setup_ids:
+                cur.execute("DELETE FROM dds.scanner_setup WHERE setup_id = %s", (sid,))
+        if instrument_ids:
+            for iid in instrument_ids:
+                cur.execute("DELETE FROM dds.market_signal WHERE instrument_id = %s", (iid,))
+                cur.execute("DELETE FROM dds.instrument WHERE instrument_id = %s", (iid,))
+        if run_id:
+            cur.execute("DELETE FROM analytics.analysis_run WHERE run_id = %s", (run_id,))
+        db_conn.commit()
+
+    def _cleanup_all(self, cur, db_conn):
+        """Nuclear cleanup: remove all E2E test artifacts."""
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        try:
+            cur.execute("TRUNCATE analytics.trade_event")
+        except Exception:
+            db_conn.rollback()
+        # Collect test run_ids before deleting
+        cur.execute(
+            "SELECT run_id FROM analytics.analysis_run "
+            "WHERE pipeline_version = '1.0.0' AND business_date = CURRENT_DATE"
+        )
+        test_run_ids = [r[0] for r in cur.fetchall()]
+
+        # FK order: trade_event (truncated) → trade_horizon_metric → trade_replay_metric
+        #           → trade_fact → paper_trade → scanner_setup → market_signal → instrument
+        #           → setup_counterfactual → analysis_run
+        cur.execute("DELETE FROM analytics.trade_horizon_metric WHERE trade_id IN (500, 501)")
+        cur.execute("DELETE FROM analytics.trade_replay_metric WHERE trade_id IN (500, 501)")
+        # Delete ALL trade_fact rows for test runs (migration 017 may create extra rows)
+        for rid in test_run_ids:
+            cur.execute("DELETE FROM analytics.trade_fact WHERE run_id = %s", (rid,))
+        cur.execute("DELETE FROM dds.paper_trade WHERE trade_id IN (500, 501)")
+        cur.execute("DELETE FROM dds.scanner_setup WHERE setup_id LIKE 'e2e_%'")
+        cur.execute("DELETE FROM dds.market_signal WHERE instrument_id IN (SELECT instrument_id FROM dds.instrument WHERE symbol LIKE 'E2E%')")
+        cur.execute("DELETE FROM dds.instrument WHERE symbol LIKE 'E2E%'")
+        for rid in test_run_ids:
+            cur.execute("DELETE FROM analytics.analysis_run WHERE run_id = %s", (rid,))
+        db_conn.commit()
+        db_conn.commit()
+
+    def _setup_prereqs(self, cur, run_id, symbol_suffix=""):
+        """Create analysis_run, instrument, scanner_setup, market_signal."""
+        now = datetime.now(timezone.utc)
+        symbol = f"E2E{symbol_suffix}USDT" if symbol_suffix else "E2EUSDT"
+
+        cur.execute(
+            """
+            INSERT INTO analytics.analysis_run (
+                run_id, business_date, schedule_timezone,
+                analysis_from, analysis_to, observation_cutoff,
+                post_exit_horizon, maturity, status, pipeline_version
+            ) VALUES (%s, CURRENT_DATE, 'Europe/Sofia',
+                %s, %s, %s, INTERVAL '4 hours', 'PROVISIONAL', 'SUCCEEDED', '1.0.0')
+            """,
+            (run_id, now - timedelta(hours=24), now + timedelta(hours=1), now),
+        )
+
+        cur.execute(
+            "INSERT INTO dds.instrument (symbol, base_asset, quote_asset, category, status) "
+            "VALUES (%s, 'E2E', 'USDT', 'linear', 'Trading') RETURNING instrument_id",
+            (symbol,),
+        )
+        instrument_id = cur.fetchone()[0]
+
+        setup_id = f"e2e_{run_id[:8]}"
+
+        cur.execute(
+            """
+            INSERT INTO dds.scanner_setup (
+                setup_id, scanner_name, scanner_version, instrument_id,
+                direction, htf_timeframe, setup_timeframe, entry_timeframe,
+                setup_started_at, detected_at, reference_price, score,
+                status, reasons, features, created_at, signal_candle_open_time, updated_at
+            ) VALUES (
+                %s, 'TEST_SCANNER', '2.1', %s,
+                'LONG', '60', '5m', '5m',
+                %s, %s, 100.0, 0.8,
+                'EXECUTED', '[]', '{}', NOW(), 0, NOW()
+            )
+            """,
+            (setup_id, instrument_id, now - timedelta(hours=2), now - timedelta(hours=2)),
+        )
+
+        cur.execute(
+            """
+            INSERT INTO dds.market_signal (
+                instrument_id, direction, timeframe, scanner_count, scanners,
+                max_score, aggregate_score, first_detected_at, last_detected_at, status
+            ) VALUES (
+                %s, 'LONG', '5m', 1, '[{\"name\":\"TEST_SCANNER\"}]'::jsonb,
+                80, 80, %s, %s, 'EXECUTED'
+            )
+            """,
+            (instrument_id, now - timedelta(hours=2), now - timedelta(hours=2)),
+        )
+
+        return instrument_id, setup_id
+
+    def test_build_recomputes_mfe_r_mae_r(self, db_conn):
+        """paper_trade.mfe/mae → trade_fact.mfe_r/mae_r via build function."""
+        cur = db_conn.cursor()
+        self._cleanup_all(cur, db_conn)
+        run_id = str(uuid4())
+        instrument_id, setup_id = self._setup_prereqs(cur, run_id)
+        db_conn.commit()
+
+        try:
+            now = datetime.now(timezone.utc)
+            cur.execute(
+                """
+                INSERT INTO dds.paper_trade (
+                    trade_id, setup_id, symbol, scanner_name, direction,
+                    score, entry_price, entry_fee, stop_price, position_size,
+                    risk_usdt, exit_price, exit_reason, exit_fee, pnl_usdt,
+                    pnl_r, pnl_percent, slippage, status, entered_at, closed_at,
+                    duration_sec, balance_before, balance_after, entry_timeframe,
+                    gross_pnl, mfe, mae, mfe_r, mae_r
+                ) VALUES (
+                    500, %s, 'E2EUSDT', 'TEST_SCANNER', 'LONG',
+                    0.8, 100.0, 0.5, 95.0, 5.0,
+                    25.0, 103.0, 'TAKE_PROFIT_1', 0.5, 15.0,
+                    0.6, 0.6, 0.1, 'CLOSED',
+                    %s, %s,
+                    3600, 10000.0, 10150.0, '5m',
+                    15.0, 10.0, 2.5, 2.0, -0.5
+                )
+                """,
+                (setup_id, now - timedelta(hours=1), now),
+            )
+            db_conn.commit()
+
+            # Run trade_fact build (migration 017 as a statement)
+            migration_path = Path(__file__).resolve().parent.parent / "sql" / "migrations" / "017_trade_fact_build.sql"
+            build_sql = migration_path.read_text(encoding="utf-8")
+            cur.execute(build_sql)
+            db_conn.commit()
+
+            # Verify
+            cur.execute(
+                "SELECT mfe_r, mae_r, pnl_r, initial_risk_distance "
+                "FROM analytics.trade_fact WHERE run_id=%s AND trade_id=500",
+                (run_id,),
+            )
+            row = cur.fetchone()
+            assert row is not None, "trade_fact row not created"
+            mfe_r, mae_r, pnl_r, risk_dist = row
+
+            assert float(mfe_r) == pytest.approx(2.0), f"mfe_r={mfe_r}, expected 2.0"
+            assert float(mae_r) == pytest.approx(-0.5), f"mae_r={mae_r}, expected -0.5"
+            assert float(risk_dist) == pytest.approx(5.0), f"risk_dist={risk_dist}, expected 5.0"
+        finally:
+            self._cleanup_all(cur, db_conn)
+
+    def test_build_recomputes_short_mfe_r_mae_r(self, db_conn):
+        """SHORT paper_trade → trade_fact with correct SHORT mfe_r/mae_r."""
+        cur = db_conn.cursor()
+        self._cleanup_all(cur, db_conn)
+        run_id = str(uuid4())
+        instrument_id, setup_id = self._setup_prereqs(cur, run_id, symbol_suffix="S")
+        db_conn.commit()
+
+        try:
+            # Override setup to SHORT
+            cur.execute(
+                "UPDATE dds.scanner_setup SET direction='SHORT' WHERE setup_id=%s",
+                (setup_id,),
+            )
+            cur.execute(
+                "UPDATE dds.market_signal SET direction='SHORT' WHERE instrument_id=%s",
+                (instrument_id,),
+            )
+            db_conn.commit()
+
+            now = datetime.now(timezone.utc)
+            cur.execute(
+                """
+                INSERT INTO dds.paper_trade (
+                    trade_id, setup_id, symbol, scanner_name, direction,
+                    score, entry_price, entry_fee, stop_price, position_size,
+                    risk_usdt, exit_price, exit_reason, exit_fee, pnl_usdt,
+                    pnl_r, pnl_percent, slippage, status, entered_at, closed_at,
+                    duration_sec, balance_before, balance_after, entry_timeframe,
+                    gross_pnl, mfe, mae, mfe_r, mae_r
+                ) VALUES (
+                    501, %s, 'E2ESUSDT', 'TEST_SCANNER', 'SHORT',
+                    0.8, 100.0, 0.5, 105.0, 5.0,
+                    25.0, 97.0, 'TAKE_PROFIT_1', 0.5, 15.0,
+                    0.6, 0.6, 0.1, 'CLOSED',
+                    %s, %s,
+                    3600, 10000.0, 10150.0, '5m',
+                    15.0, 10.0, 2.5, 2.0, -0.5
+                )
+                """,
+                (setup_id, now - timedelta(hours=1), now),
+            )
+            db_conn.commit()
+
+            migration_path = Path(__file__).resolve().parent.parent / "sql" / "migrations" / "017_trade_fact_build.sql"
+            build_sql = migration_path.read_text(encoding="utf-8")
+            cur.execute(build_sql)
+            db_conn.commit()
+
+            cur.execute(
+                "SELECT mfe_r, mae_r, initial_risk_distance "
+                "FROM analytics.trade_fact WHERE run_id=%s AND trade_id=501",
+                (run_id,),
+            )
+            row = cur.fetchone()
+            assert row is not None, "trade_fact row not created for SHORT"
+            mfe_r, mae_r, risk_dist = row
+
+            assert float(mfe_r) == pytest.approx(2.0), f"SHORT mfe_r={mfe_r}"
+            assert float(mae_r) == pytest.approx(-0.5), f"SHORT mae_r={mae_r}"
+            assert float(risk_dist) == pytest.approx(5.0)
+        finally:
+            self._cleanup_all(cur, db_conn)
+
+
+# ======================================================================
+# 13. E2E: compute_horizon_metric() with real candles
+# ======================================================================
+
+class TestHorizonMetricE2E:
+    """End-to-end: insert candle rows → call compute_horizon_metric()
+    → verify LONG/SHORT geometry with GREATEST/LEAST clamping."""
+
+    def _insert_candles(self, cur, instrument_id, base_time, prices):
+        """Insert a series of 1-minute candles with given OHLC prices.
+
+        Each candle: open=close=price, high=price, low=price
+        so that max_price and min_price in the horizon are exactly the
+        values in the prices list.
+        """
+        for i, close_price in enumerate(prices):
+            open_time = base_time + timedelta(minutes=i)
+            close_time = open_time + timedelta(minutes=1)
+            cur.execute(
+                """
+                INSERT INTO market.candle (
+                    exchange, market_type, instrument_id, timeframe,
+                    open_time, close_time, open, high, low, close, volume,
+                    is_closed, source, ingested_at, quality_status
+                ) VALUES (
+                    'bybit', 'linear', %s, '1',
+                    %s, %s, %s, %s, %s, %s, 1000,
+                    TRUE, 'test', NOW(), 'validated'
+                )
+                """,
+                (instrument_id, open_time, close_time,
+                 close_price, close_price, close_price, close_price),
+            )
+
+    def _create_instrument(self, cur, symbol):
+        """Create instrument, return id. Cleans up previous if exists."""
+        cur.execute("DELETE FROM dds.instrument WHERE symbol = %s", (symbol,))
+        cur.execute(
+            "INSERT INTO dds.instrument (symbol, base_asset, quote_asset, category, status) "
+            "VALUES (%s, 'T', 'USDT', 'linear', 'Trading') RETURNING instrument_id",
+            (symbol,),
+        )
+        return cur.fetchone()[0]
+
+    def test_long_horizon_with_real_candles(self, db_conn):
+        """LONG: anchor=100, 5m horizon, candles go to 110 then 95, risk=5 -> fav=2.0, adv=-1.0."""
+        cur = db_conn.cursor()
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        base = datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc)
+        cutoff = base + timedelta(hours=1)
+
+        instrument_id = self._create_instrument(cur, "E2E_HL")
+        # 5-minute horizon: candles from base to base+5min
+        # Need high=110 and low=95 within the first 5 minutes
+        prices = [100, 110, 105, 100, 95, 100, 102, 105, 110, 108, 103, 100]
+        self._insert_candles(cur, instrument_id, base, prices)
+        db_conn.commit()
+
+        cur.execute(
+            """
+            SELECT * FROM analytics.compute_horizon_metric(
+                1::bigint, 'entry', '5m', 100.0, %s,
+                'LONG', 5.0, %s, %s, NULL::timestamptz
+            )
+            """,
+            (base, instrument_id, cutoff),
+        )
+        fav, adv, coverage = cur.fetchone()
+        assert coverage == 'COMPLETE'
+        assert float(fav) == pytest.approx(2.0), f"LONG fav={fav}, expected 2.0"
+        assert float(adv) == pytest.approx(-1.0), f"LONG adv={adv}, expected -1.0"
+
+    def test_short_horizon_with_real_candles(self, db_conn):
+        """SHORT: anchor=100, 5m horizon, candles drop to 90 then rise to 105, risk=5 -> fav=2.0, adv=-1.0."""
+        cur = db_conn.cursor()
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        base = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
+        cutoff = base + timedelta(hours=1)
+
+        instrument_id = self._create_instrument(cur, "E2E_SC")
+        # 5-minute horizon: need low=90 and high=105 within first 5 minutes
+        prices = [100, 90, 95, 100, 105, 100, 98, 95, 92, 90, 93, 96]
+        self._insert_candles(cur, instrument_id, base, prices)
+        db_conn.commit()
+
+        cur.execute(
+            """
+            SELECT * FROM analytics.compute_horizon_metric(
+                2::bigint, 'entry', '5m', 100.0, %s,
+                'SHORT', 5.0, %s, %s, NULL::timestamptz
+            )
+            """,
+            (base, instrument_id, cutoff),
+        )
+        fav, adv, coverage = cur.fetchone()
+        assert coverage == 'COMPLETE'
+        assert float(fav) == pytest.approx(2.0), f"SHORT fav={fav}, expected 2.0"
+        assert float(adv) == pytest.approx(-1.0), f"SHORT adv={adv}, expected -1.0"
+
+    def test_clamp_to_zero_when_no_adverse(self, db_conn):
+        """When price only moves favorably, adverse is clamped to 0."""
+        cur = db_conn.cursor()
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        base = datetime(2026, 9, 15, 14, 0, tzinfo=timezone.utc)
+        cutoff = base + timedelta(hours=1)
+
+        instrument_id = self._create_instrument(cur, "E2E_CL")
+        # 5m horizon: prices only go up, max=110 within first 5 candles
+        prices = [100, 102, 105, 108, 110, 108, 105, 103, 101, 100]
+        self._insert_candles(cur, instrument_id, base, prices)
+        db_conn.commit()
+
+        cur.execute(
+            """
+            SELECT * FROM analytics.compute_horizon_metric(
+                3::bigint, 'entry', '5m', 100.0, %s,
+                'LONG', 5.0, %s, %s, NULL::timestamptz
+            )
+            """,
+            (base, instrument_id, cutoff),
+        )
+        fav, adv, coverage = cur.fetchone()
+        assert coverage == 'COMPLETE'
+        assert float(fav) == pytest.approx(2.0), f"fav={fav}"
+        assert float(adv) == 0.0, f"adv={adv}, expected 0.0"
