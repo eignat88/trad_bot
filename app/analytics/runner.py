@@ -311,7 +311,7 @@ class AnalyticsRunner:
             logger.info("Stage %s completed successfully", stage_name)
             
         except Exception as e:
-            logger.error("Stage %s failed: %s", stage_name, e)
+            logger.exception("Stage %s failed: %s", stage_name, e)
             stage_run.status = StageStatus.FAILED
             stage_run.finished_at = datetime.now(timezone.utc)
             stage_run.error_code = "STAGE_FAILED"
