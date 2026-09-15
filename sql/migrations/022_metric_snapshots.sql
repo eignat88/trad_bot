@@ -2,13 +2,20 @@
 -- Computes period aggregates with semi-open windows [from, to).
 --
 -- Segments:
---   scanner, direction, scanner+direction, symbol, market_regime,
---   exit_reason, dca_state
+--   scanner          — scanner_name = value
+--   direction        — direction = value
+--   scanner_direction — scanner_name || ':' || direction = value
+--   symbol           — symbol = value
+--   regime           — COALESCE(market_regime, 'UNKNOWN') = value
+--   exit_reason      — COALESCE(exit_reason, 'UNKNOWN') = value
+--
+-- NOTE: dca_state segment is deferred to a future migration (027)
+--       because analytics.trade_fact does not yet have dca_state column.
 --
 -- Idempotent: uses INSERT ... ON CONFLICT DO UPDATE.
 
 -- ============================================================
--- Helper: compute metric snapshot for a period
+-- Helper: compute metric snapshot for a period, filtered by segment
 -- ============================================================
 CREATE OR REPLACE FUNCTION analytics.compute_metric_snapshot(
     p_run_id UUID,
@@ -31,13 +38,37 @@ DECLARE
 BEGIN
     v_segment := p_segment_prefix || ':' || p_segment_value;
 
-    -- Basic counts
+    -- ================================================================
+    -- Segment filtering: each aggregate query must include the matching
+    -- WHERE clause so that metrics are scoped to the requested segment.
+    --
+    -- Unknown prefix => return 0 (no metrics) rather than silently
+    -- computing global aggregates that would be mislabelled.
+    -- ================================================================
+
+    IF p_segment_prefix NOT IN (
+        'scanner', 'direction', 'scanner_direction',
+        'symbol', 'regime', 'exit_reason'
+    ) THEN
+        -- Unknown segment prefix — do not compute global metrics.
+        RETURN 0;
+    END IF;
+
+    -- Basic counts — with segment filter
     SELECT COUNT(*) INTO v_count
-    FROM analytics.trade_fact
-    WHERE run_id = p_run_id
-      AND status IN ('CLOSED', 'EXPIRED')
-      AND closed_at >= p_window_from
-      AND closed_at < p_window_to;  -- semi-open [from, to)
+    FROM analytics.trade_fact tf
+    WHERE tf.run_id = p_run_id
+      AND tf.status IN ('CLOSED', 'EXPIRED')
+      AND tf.closed_at >= p_window_from
+      AND tf.closed_at < p_window_to  -- semi-open [from, to)
+      AND (
+          (p_segment_prefix = 'scanner' AND tf.scanner_name = p_segment_value)
+          OR (p_segment_prefix = 'direction' AND tf.direction = p_segment_value)
+          OR (p_segment_prefix = 'scanner_direction' AND (tf.scanner_name || ':' || tf.direction) = p_segment_value)
+          OR (p_segment_prefix = 'symbol' AND tf.symbol = p_segment_value)
+          OR (p_segment_prefix = 'regime' AND COALESCE(tf.market_regime, 'UNKNOWN') = p_segment_value)
+          OR (p_segment_prefix = 'exit_reason' AND COALESCE(tf.exit_reason, 'UNKNOWN') = p_segment_value)
+      );
 
     IF v_count = 0 THEN
         RETURN 0;
@@ -45,61 +76,109 @@ BEGIN
 
     -- Win rate
     SELECT
-        COUNT(CASE WHEN pnl_r > 0 THEN 1 END)::NUMERIC / v_count
+        COUNT(CASE WHEN tf.pnl_r > 0 THEN 1 END)::NUMERIC / v_count
     INTO v_win_rate
-    FROM analytics.trade_fact
-    WHERE run_id = p_run_id
-      AND status IN ('CLOSED', 'EXPIRED')
-      AND closed_at >= p_window_from
-      AND closed_at < p_window_to;
+    FROM analytics.trade_fact tf
+    WHERE tf.run_id = p_run_id
+      AND tf.status IN ('CLOSED', 'EXPIRED')
+      AND tf.closed_at >= p_window_from
+      AND tf.closed_at < p_window_to
+      AND (
+          (p_segment_prefix = 'scanner' AND tf.scanner_name = p_segment_value)
+          OR (p_segment_prefix = 'direction' AND tf.direction = p_segment_value)
+          OR (p_segment_prefix = 'scanner_direction' AND (tf.scanner_name || ':' || tf.direction) = p_segment_value)
+          OR (p_segment_prefix = 'symbol' AND tf.symbol = p_segment_value)
+          OR (p_segment_prefix = 'regime' AND COALESCE(tf.market_regime, 'UNKNOWN') = p_segment_value)
+          OR (p_segment_prefix = 'exit_reason' AND COALESCE(tf.exit_reason, 'UNKNOWN') = p_segment_value)
+      );
 
     -- Profit factor
     SELECT
-        SUM(CASE WHEN pnl_r > 0 THEN pnl_r ELSE 0 END)
-        / NULLIF(ABS(SUM(CASE WHEN pnl_r < 0 THEN pnl_r ELSE 0 END)), 0)
+        SUM(CASE WHEN tf.pnl_r > 0 THEN tf.pnl_r ELSE 0 END)
+        / NULLIF(ABS(SUM(CASE WHEN tf.pnl_r < 0 THEN tf.pnl_r ELSE 0 END)), 0)
     INTO v_profit_factor
-    FROM analytics.trade_fact
-    WHERE run_id = p_run_id
-      AND status IN ('CLOSED', 'EXPIRED')
-      AND closed_at >= p_window_from
-      AND closed_at < p_window_to;
+    FROM analytics.trade_fact tf
+    WHERE tf.run_id = p_run_id
+      AND tf.status IN ('CLOSED', 'EXPIRED')
+      AND tf.closed_at >= p_window_from
+      AND tf.closed_at < p_window_to
+      AND (
+          (p_segment_prefix = 'scanner' AND tf.scanner_name = p_segment_value)
+          OR (p_segment_prefix = 'direction' AND tf.direction = p_segment_value)
+          OR (p_segment_prefix = 'scanner_direction' AND (tf.scanner_name || ':' || tf.direction) = p_segment_value)
+          OR (p_segment_prefix = 'symbol' AND tf.symbol = p_segment_value)
+          OR (p_segment_prefix = 'regime' AND COALESCE(tf.market_regime, 'UNKNOWN') = p_segment_value)
+          OR (p_segment_prefix = 'exit_reason' AND COALESCE(tf.exit_reason, 'UNKNOWN') = p_segment_value)
+      );
 
     -- Average R
-    SELECT AVG(pnl_r) INTO v_avg_r
-    FROM analytics.trade_fact
-    WHERE run_id = p_run_id
-      AND status IN ('CLOSED', 'EXPIRED')
-      AND closed_at >= p_window_from
-      AND closed_at < p_window_to;
+    SELECT AVG(tf.pnl_r) INTO v_avg_r
+    FROM analytics.trade_fact tf
+    WHERE tf.run_id = p_run_id
+      AND tf.status IN ('CLOSED', 'EXPIRED')
+      AND tf.closed_at >= p_window_from
+      AND tf.closed_at < p_window_to
+      AND (
+          (p_segment_prefix = 'scanner' AND tf.scanner_name = p_segment_value)
+          OR (p_segment_prefix = 'direction' AND tf.direction = p_segment_value)
+          OR (p_segment_prefix = 'scanner_direction' AND (tf.scanner_name || ':' || tf.direction) = p_segment_value)
+          OR (p_segment_prefix = 'symbol' AND tf.symbol = p_segment_value)
+          OR (p_segment_prefix = 'regime' AND COALESCE(tf.market_regime, 'UNKNOWN') = p_segment_value)
+          OR (p_segment_prefix = 'exit_reason' AND COALESCE(tf.exit_reason, 'UNKNOWN') = p_segment_value)
+      );
 
     -- Total PnL
-    SELECT SUM(net_pnl) INTO v_total_pnl
-    FROM analytics.trade_fact
-    WHERE run_id = p_run_id
-      AND status IN ('CLOSED', 'EXPIRED')
-      AND closed_at >= p_window_from
-      AND closed_at < p_window_to;
+    SELECT SUM(tf.net_pnl) INTO v_total_pnl
+    FROM analytics.trade_fact tf
+    WHERE tf.run_id = p_run_id
+      AND tf.status IN ('CLOSED', 'EXPIRED')
+      AND tf.closed_at >= p_window_from
+      AND tf.closed_at < p_window_to
+      AND (
+          (p_segment_prefix = 'scanner' AND tf.scanner_name = p_segment_value)
+          OR (p_segment_prefix = 'direction' AND tf.direction = p_segment_value)
+          OR (p_segment_prefix = 'scanner_direction' AND (tf.scanner_name || ':' || tf.direction) = p_segment_value)
+          OR (p_segment_prefix = 'symbol' AND tf.symbol = p_segment_value)
+          OR (p_segment_prefix = 'regime' AND COALESCE(tf.market_regime, 'UNKNOWN') = p_segment_value)
+          OR (p_segment_prefix = 'exit_reason' AND COALESCE(tf.exit_reason, 'UNKNOWN') = p_segment_value)
+      );
 
     -- Sharpe approximation
     SELECT
-        AVG(pnl_r) / NULLIF(STDDEV(pnl_r), 0)
+        AVG(tf.pnl_r) / NULLIF(STDDEV(tf.pnl_r), 0)
     INTO v_sharpe
-    FROM analytics.trade_fact
-    WHERE run_id = p_run_id
-      AND status IN ('CLOSED', 'EXPIRED')
-      AND closed_at >= p_window_from
-      AND closed_at < p_window_to;
+    FROM analytics.trade_fact tf
+    WHERE tf.run_id = p_run_id
+      AND tf.status IN ('CLOSED', 'EXPIRED')
+      AND tf.closed_at >= p_window_from
+      AND tf.closed_at < p_window_to
+      AND (
+          (p_segment_prefix = 'scanner' AND tf.scanner_name = p_segment_value)
+          OR (p_segment_prefix = 'direction' AND tf.direction = p_segment_value)
+          OR (p_segment_prefix = 'scanner_direction' AND (tf.scanner_name || ':' || tf.direction) = p_segment_value)
+          OR (p_segment_prefix = 'symbol' AND tf.symbol = p_segment_value)
+          OR (p_segment_prefix = 'regime' AND COALESCE(tf.market_regime, 'UNKNOWN') = p_segment_value)
+          OR (p_segment_prefix = 'exit_reason' AND COALESCE(tf.exit_reason, 'UNKNOWN') = p_segment_value)
+      );
 
     -- Expectancy
     SELECT
-        v_win_rate * AVG(CASE WHEN pnl_r > 0 THEN pnl_r END)
-        + (1 - v_win_rate) * AVG(CASE WHEN pnl_r < 0 THEN pnl_r END)
+        v_win_rate * AVG(CASE WHEN tf.pnl_r > 0 THEN tf.pnl_r END)
+        + (1 - v_win_rate) * AVG(CASE WHEN tf.pnl_r < 0 THEN tf.pnl_r END)
     INTO v_expectancy
-    FROM analytics.trade_fact
-    WHERE run_id = p_run_id
-      AND status IN ('CLOSED', 'EXPIRED')
-      AND closed_at >= p_window_from
-      AND closed_at < p_window_to;
+    FROM analytics.trade_fact tf
+    WHERE tf.run_id = p_run_id
+      AND tf.status IN ('CLOSED', 'EXPIRED')
+      AND tf.closed_at >= p_window_from
+      AND tf.closed_at < p_window_to
+      AND (
+          (p_segment_prefix = 'scanner' AND tf.scanner_name = p_segment_value)
+          OR (p_segment_prefix = 'direction' AND tf.direction = p_segment_value)
+          OR (p_segment_prefix = 'scanner_direction' AND (tf.scanner_name || ':' || tf.direction) = p_segment_value)
+          OR (p_segment_prefix = 'symbol' AND tf.symbol = p_segment_value)
+          OR (p_segment_prefix = 'regime' AND COALESCE(tf.market_regime, 'UNKNOWN') = p_segment_value)
+          OR (p_segment_prefix = 'exit_reason' AND COALESCE(tf.exit_reason, 'UNKNOWN') = p_segment_value)
+      );
 
     -- Insert all metrics
     INSERT INTO analytics.metric_snapshot

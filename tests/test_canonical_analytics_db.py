@@ -91,6 +91,8 @@ def test_run_id(db_conn):
     )
     db_conn.commit()
     yield run_id
+    # Clean up metric_snapshot first (FK constraint on analysis_run)
+    cur.execute("DELETE FROM analytics.metric_snapshot WHERE run_id = %s", (run_id,))
     cur.execute("DELETE FROM analytics.analysis_run WHERE run_id = %s", (run_id,))
     db_conn.commit()
 
@@ -450,6 +452,88 @@ class TestCrossRunEventIsolation:
         db_conn.commit()
 
 
+    def test_candle_coverage_is_run_scoped(self, db_conn):
+        """Incomplete horizon rows from run A must not contaminate run B."""
+        cur = db_conn.cursor()
+        run_a = str(uuid4())
+        run_b = str(uuid4())
+        trade_id = 101
+        now = datetime.now(timezone.utc)
+
+        for rid in (run_a, run_b):
+            cur.execute(
+                """
+                INSERT INTO analytics.analysis_run (
+                    run_id, business_date, schedule_timezone,
+                    analysis_from, analysis_to, observation_cutoff,
+                    post_exit_horizon, maturity, status, pipeline_version
+                ) VALUES (
+                    %s, CURRENT_DATE, 'Europe/Sofia',
+                    %s, %s, %s,
+                    INTERVAL '4 hours', 'PROVISIONAL', 'RUNNING', '1.0.0'
+                )
+                """,
+                (rid, now - timedelta(hours=24), now, now),
+            )
+
+            cur.execute(
+                """
+                INSERT INTO analytics.trade_fact (
+                    run_id, trade_id, setup_id, scanner_name, scanner_version,
+                    symbol, direction, reference_price, initial_stop,
+                    risk_usdt, initial_risk_distance, status, dataset_version
+                ) VALUES (
+                    %s, %s, %s, 'T', '1',
+                    'X', 'LONG', 100, 95,
+                    50, 5, 'CLOSED', '0'
+                )
+                """,
+                (rid, trade_id, 'setup_cov_' + rid),
+            )
+
+        cur.execute(
+            """
+            INSERT INTO analytics.trade_horizon_metric (
+                run_id, trade_id, anchor, horizon, metric_version,
+                favorable_move_r, adverse_move_r, coverage_status
+            ) VALUES (
+                %s, %s, 'entry', '30m', '1.0.0',
+                NULL, NULL, 'INCOMPLETE'
+            )
+            """,
+            (run_a, trade_id),
+        )
+        db_conn.commit()
+
+        try:
+            cur.execute(
+                "SELECT * FROM analytics.check_candle_coverage(%s)",
+                (run_b,),
+            )
+            row = cur.fetchone()
+
+            assert row[2] == "PASS"
+            assert row[3] == 0
+        finally:
+            db_conn.rollback()
+            cur.execute(
+                "DELETE FROM analytics.trade_horizon_metric "
+                "WHERE run_id IN (%s, %s) AND trade_id = %s",
+                (run_a, run_b, trade_id),
+            )
+            cur.execute(
+                "DELETE FROM analytics.trade_fact "
+                "WHERE run_id IN (%s, %s) AND trade_id = %s",
+                (run_a, run_b, trade_id),
+            )
+            cur.execute(
+                "DELETE FROM analytics.analysis_run "
+                "WHERE run_id IN (%s, %s)",
+                (run_a, run_b),
+            )
+            db_conn.commit()
+
+
 # ======================================================================
 # 10. MFE/MAE CONTRACT
 # ======================================================================
@@ -708,6 +792,9 @@ class TestTradeFactBuildE2E:
         # Delete ALL trade_fact rows for test runs (migration 017 may create extra rows)
         for rid in test_run_ids:
             cur.execute("DELETE FROM analytics.trade_fact WHERE run_id = %s", (rid,))
+        # Delete metric_snapshot rows before analysis_run (FK constraint)
+        for rid in test_run_ids:
+            cur.execute("DELETE FROM analytics.metric_snapshot WHERE run_id = %s", (rid,))
         cur.execute("DELETE FROM dds.paper_trade WHERE trade_id IN (500, 501)")
         cur.execute("DELETE FROM dds.scanner_setup WHERE setup_id LIKE 'e2e_%'")
         cur.execute("DELETE FROM dds.market_signal WHERE instrument_id IN (SELECT instrument_id FROM dds.instrument WHERE symbol LIKE 'E2E%')")
@@ -816,17 +903,19 @@ class TestTradeFactBuildE2E:
 
             # Verify
             cur.execute(
-                "SELECT mfe_r, mae_r, pnl_r, initial_risk_distance "
+                "SELECT mfe_r, mae_r, pnl_r, initial_risk_distance, initial_stop, final_stop "
                 "FROM analytics.trade_fact WHERE run_id=%s AND trade_id=500",
                 (run_id,),
             )
             row = cur.fetchone()
             assert row is not None, "trade_fact row not created"
-            mfe_r, mae_r, pnl_r, risk_dist = row
+            mfe_r, mae_r, pnl_r, risk_dist, initial_stop, final_stop = row
 
             assert float(mfe_r) == pytest.approx(2.0), f"mfe_r={mfe_r}, expected 2.0"
             assert float(mae_r) == pytest.approx(-0.5), f"mae_r={mae_r}, expected -0.5"
             assert float(risk_dist) == pytest.approx(5.0), f"risk_dist={risk_dist}, expected 5.0"
+            assert float(initial_stop) == pytest.approx(95.0)
+            assert final_stop is None
         finally:
             self._cleanup_all(cur, db_conn)
 
@@ -896,6 +985,53 @@ class TestTradeFactBuildE2E:
 
 
 # ======================================================================
+
+    def test_no_dca_replay_is_incomplete_without_candle_replay(self, db_conn):
+        cur = db_conn.cursor()
+        self._cleanup_all(cur, db_conn)
+        run_id = str(uuid4())
+        _, setup_id = self._setup_prereqs(cur, run_id)
+        now = datetime.now(timezone.utc)
+
+        try:
+            cur.execute(
+                """
+                INSERT INTO analytics.trade_fact (
+                    run_id, trade_id, setup_id, scanner_name, scanner_version,
+                    symbol, direction, reference_price, initial_fill_price,
+                    initial_stop, risk_usdt, initial_risk_distance,
+                    dca_filled_at, exit_price, closed_at, status, dataset_version
+                ) VALUES (
+                    %s, 500, %s, 'TEST_SCANNER', '2.1',
+                    'E2EUSDT', 'LONG', 100, 100,
+                    95, 25, 5,
+                    %s, 103, %s, 'CLOSED', '0'
+                )
+                """,
+                (run_id, setup_id, now - timedelta(minutes=30), now),
+            )
+            db_conn.commit()
+
+            cur.execute("SELECT analytics.build_replay_no_dca(%s)", (run_id,))
+            db_conn.commit()
+
+            cur.execute(
+                """
+                SELECT coverage_status, simulated_exit_price
+                FROM analytics.trade_replay_metric
+                WHERE run_id=%s
+                  AND trade_id=500
+                  AND scenario='RISK_NORMALIZED_NO_DCA'
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+
+            assert row is not None
+            assert row[0] == "INCOMPLETE"
+            assert float(row[1]) == pytest.approx(103.0)
+        finally:
+            self._cleanup_all(cur, db_conn)
 # 13. E2E: compute_horizon_metric() with real candles
 # ======================================================================
 
@@ -1029,3 +1165,398 @@ class TestHorizonMetricE2E:
         assert coverage == 'COMPLETE'
         assert float(fav) == pytest.approx(2.0), f"fav={fav}"
         assert float(adv) == 0.0, f"adv={adv}, expected 0.0"
+
+    def test_incomplete_30m_horizon_is_not_complete(self, db_conn):
+        cur = db_conn.cursor()
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+
+        base = datetime(2026, 9, 15, 16, 0, 27, tzinfo=timezone.utc)
+        cutoff = base + timedelta(hours=1)
+
+        instrument_id = self._create_instrument(cur, "E2E_INC30")
+        self._insert_candles(
+            cur,
+            instrument_id,
+            base + timedelta(seconds=33),
+            [100, 101, 102, 103, 104],
+        )
+        db_conn.commit()
+
+        cur.execute(
+            """
+            SELECT * FROM analytics.compute_horizon_metric(
+                4::bigint, 'entry', '30m', 100.0, %s,
+                'LONG', 5.0, %s, %s, NULL::timestamptz
+            )
+            """,
+            (base, instrument_id, cutoff),
+        )
+        fav, adv, coverage = cur.fetchone()
+
+        assert coverage == "INCOMPLETE"
+        assert fav is None
+        assert adv is None
+
+    def test_build_horizon_metrics_end_to_end(self, db_conn):
+        cur = db_conn.cursor()
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+
+        run_id = str(uuid4())
+        base = datetime(2026, 9, 15, 18, 0, 0, tzinfo=timezone.utc)
+        cutoff = base + timedelta(hours=5)
+        instrument_id = self._create_instrument(cur, "E2E_BUPLD")
+
+        cur.execute(
+            """
+            INSERT INTO analytics.analysis_run (
+                run_id, business_date, schedule_timezone,
+                analysis_from, analysis_to, observation_cutoff,
+                post_exit_horizon, maturity, status, pipeline_version
+            ) VALUES (
+                %s, CURRENT_DATE, 'Europe/Sofia',
+                %s, %s, %s,
+                INTERVAL '4 hours', 'PROVISIONAL', 'RUNNING', '1.0.0'
+            )
+            """,
+            (run_id, base - timedelta(hours=1), cutoff, cutoff),
+        )
+
+        cur.execute(
+            """
+            INSERT INTO analytics.trade_fact (
+                run_id, trade_id, setup_id, scanner_name, scanner_version,
+                symbol, direction, reference_price, initial_fill_price,
+                avg_entry_price, initial_stop, risk_usdt, initial_risk_distance,
+                signal_at, entered_at, dca_filled_at, closed_at, exit_price,
+                status, dataset_version
+            ) VALUES (
+                %s, 900, 'setup_builder', 'TEST_SCANNER', '1',
+                'E2E_BUPLD', 'LONG', 100, 100,
+                101, 95, 25, 5,
+                %s, %s, %s, %s, 103,
+                'CLOSED', '0'
+            )
+            """,
+            (
+                run_id,
+                base,
+                base + timedelta(minutes=1),
+                base + timedelta(minutes=2),
+                base + timedelta(minutes=10),
+            ),
+        )
+
+        self._insert_candles(cur, instrument_id, base, [100, 101, 102, 103, 104, 105, 106, 105, 104, 103, 102, 101, 100, 100, 100])
+        db_conn.commit()
+
+        cur.execute("SELECT analytics.build_horizon_metrics(%s)", (run_id,))
+        count = cur.fetchone()[0]
+        db_conn.commit()
+
+        assert count > 0
+
+        cur.execute(
+            """
+            SELECT anchor, horizon, coverage_status
+            FROM analytics.trade_horizon_metric
+            WHERE run_id=%s AND trade_id=900
+            ORDER BY anchor, horizon
+            """,
+            (run_id,),
+        )
+        rows = cur.fetchall()
+
+        anchors = {r[0] for r in rows}
+        assert {"entry", "dca_fill", "exit"} <= anchors
+        assert all(r[2] in {"COMPLETE", "INCOMPLETE", "NO_DATA"} for r in rows)
+
+        cur.execute("DELETE FROM analytics.trade_horizon_metric WHERE run_id=%s", (run_id,))
+        cur.execute("DELETE FROM analytics.trade_fact WHERE run_id=%s", (run_id,))
+        cur.execute("DELETE FROM analytics.analysis_run WHERE run_id=%s", (run_id,))
+        db_conn.commit()
+
+
+# ======================================================================
+# METRIC SNAPSHOT SEGMENTATION — Regression Tests (Migration 022)
+# ======================================================================
+
+class TestMetricSnapshotSegmentation:
+    """Regression tests for migration 022: metric snapshots must be
+    filtered by segment, not globally computed.
+
+    Each test inserts trade_fact rows with different segment attributes
+    (scanner_name, direction, etc.) and verifies that compute_metric_snapshot()
+    returns segment-scoped metrics, not global aggregates.
+    """
+
+    def _create_run(self, cur):
+        """Create a disposable analysis_run and return its UUID."""
+        run_id = str(uuid4())
+        cur.execute(
+            """
+            INSERT INTO analytics.analysis_run (
+                run_id, business_date, schedule_timezone,
+                analysis_from, analysis_to, observation_cutoff,
+                post_exit_horizon, maturity, status, pipeline_version
+            ) VALUES (
+                %s, CURRENT_DATE, 'Europe/Sofia',
+                NOW() - INTERVAL '30 days', NOW(),
+                NOW(),
+                INTERVAL '4 hours',
+                'PROVISIONAL', 'RUNNING', '1.0.0'
+            )
+            """,
+            (run_id,),
+        )
+        return run_id
+
+    def _insert_trade(self, cur, run_id, *, trade_id, scanner_name, direction,
+                      symbol='BTCUSDT', market_regime=None, exit_reason=None,
+                      pnl_r, net_pnl, closed_at_offset_min=10):
+        """Insert a single trade_fact row."""
+        closed_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        cur.execute(
+            """
+            INSERT INTO analytics.trade_fact (
+                run_id, trade_id, setup_id, scanner_name, scanner_version,
+                symbol, direction, reference_price, initial_fill_price,
+                avg_entry_price, initial_stop, risk_usdt, initial_risk_distance,
+                entered_at, closed_at, exit_price,
+                pnl_r, net_pnl, mfe_r, mae_r,
+                status, market_regime, exit_reason, dataset_version
+            ) VALUES (
+                %s, %s, 'setup_seg', %s, '1',
+                %s, %s, 100, 100,
+                100, 95, 25, 5,
+                NOW() - INTERVAL '30 minutes', %s, 105,
+                %s, %s, 2.0, -0.5,
+                'CLOSED', %s, %s, '0'
+            )
+            """,
+            (run_id, trade_id, scanner_name, symbol, direction,
+             closed_at, pnl_r, net_pnl, market_regime, exit_reason),
+        )
+
+    def _get_metric(self, cur, run_id, segment, metric_name, period='24h'):
+        """Read a single metric value from metric_snapshot."""
+        cur.execute(
+            """
+            SELECT metric_value, sample_count
+            FROM analytics.metric_snapshot
+            WHERE run_id = %s AND segment = %s AND metric_name = %s AND period = %s
+            """,
+            (run_id, segment, metric_name, period),
+        )
+        row = cur.fetchone()
+        return (row[0], row[1]) if row else (None, None)
+
+    def test_scanner_segments_differ(self, db_conn):
+        """scanner:A and scanner:B with different pnl_r must give different avg_r."""
+        cur = db_conn.cursor()
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+
+        run_id = self._create_run(cur)
+        # scanner A: avg_r = (3.0 + 1.0) / 2 = 2.0
+        self._insert_trade(cur, run_id, trade_id=1001, scanner_name='scannerA',
+                           direction='LONG', pnl_r=3.0, net_pnl=150)
+        self._insert_trade(cur, run_id, trade_id=1002, scanner_name='scannerA',
+                           direction='LONG', pnl_r=1.0, net_pnl=50)
+        # scanner B: avg_r = (-1.0 + -2.0) / 2 = -1.5
+        self._insert_trade(cur, run_id, trade_id=1003, scanner_name='scannerB',
+                           direction='LONG', pnl_r=-1.0, net_pnl=-50)
+        self._insert_trade(cur, run_id, trade_id=1004, scanner_name='scannerB',
+                           direction='LONG', pnl_r=-2.0, net_pnl=-100)
+        db_conn.commit()
+
+        cur.execute("SELECT analytics.build_metric_snapshots(%s)", (run_id,))
+        db_conn.commit()
+
+        avg_r_a, count_a = self._get_metric(cur, run_id, 'scanner:scannerA', 'avg_r')
+        avg_r_b, count_b = self._get_metric(cur, run_id, 'scanner:scannerB', 'avg_r')
+
+        assert avg_r_a is not None, "scanner:scannerA avg_r should exist"
+        assert avg_r_b is not None, "scanner:scannerB avg_r should exist"
+        assert count_a == 2
+        assert count_b == 2
+        assert float(avg_r_a) == pytest.approx(2.0, abs=0.001), f"Expected avg_r ~2.0, got {avg_r_a}"
+        assert float(avg_r_b) == pytest.approx(-1.5, abs=0.001), f"Expected avg_r ~-1.5, got {avg_r_b}"
+        assert avg_r_a != avg_r_b, "Segments must differ"
+
+        cur.execute("DELETE FROM analytics.metric_snapshot WHERE run_id=%s", (run_id,))
+        cur.execute("DELETE FROM analytics.trade_fact WHERE run_id=%s", (run_id,))
+        cur.execute("DELETE FROM analytics.analysis_run WHERE run_id=%s", (run_id,))
+        db_conn.commit()
+
+    def test_direction_segments_independent(self, db_conn):
+        """LONG and SHORT must have independent sample_count and metrics."""
+        cur = db_conn.cursor()
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+
+        run_id = self._create_run(cur)
+        # LONG: 3 trades
+        for tid in range(2001, 2004):
+            self._insert_trade(cur, run_id, trade_id=tid, scanner_name='test_scanner',
+                               direction='LONG', pnl_r=1.0, net_pnl=50)
+        # SHORT: 1 trade
+        self._insert_trade(cur, run_id, trade_id=2010, scanner_name='test_scanner',
+                           direction='SHORT', pnl_r=2.0, net_pnl=100)
+        db_conn.commit()
+
+        cur.execute("SELECT analytics.build_metric_snapshots(%s)", (run_id,))
+        db_conn.commit()
+
+        _, count_long = self._get_metric(cur, run_id, 'direction:LONG', 'win_rate')
+        _, count_short = self._get_metric(cur, run_id, 'direction:SHORT', 'win_rate')
+
+        assert count_long == 3, f"Expected LONG sample_count=3, got {count_long}"
+        assert count_short == 1, f"Expected SHORT sample_count=1, got {count_short}"
+
+        # Verify they have different total_pnl_usdt
+        pnl_long, _ = self._get_metric(cur, run_id, 'direction:LONG', 'total_pnl_usdt')
+        pnl_short, _ = self._get_metric(cur, run_id, 'direction:SHORT', 'total_pnl_usdt')
+        assert pnl_long != pnl_short
+
+        cur.execute("DELETE FROM analytics.metric_snapshot WHERE run_id=%s", (run_id,))
+        cur.execute("DELETE FROM analytics.trade_fact WHERE run_id=%s", (run_id,))
+        cur.execute("DELETE FROM analytics.analysis_run WHERE run_id=%s", (run_id,))
+        db_conn.commit()
+
+    def test_scanner_direction_intersection(self, db_conn):
+        """scanner_direction must select only the matching combination."""
+        cur = db_conn.cursor()
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+
+        run_id = self._create_run(cur)
+        # scannerA+LONG: pnl_r = 4.0
+        self._insert_trade(cur, run_id, trade_id=3001, scanner_name='scannerA',
+                           direction='LONG', pnl_r=4.0, net_pnl=200)
+        # scannerA+SHORT: pnl_r = -1.0
+        self._insert_trade(cur, run_id, trade_id=3002, scanner_name='scannerA',
+                           direction='SHORT', pnl_r=-1.0, net_pnl=-50)
+        # scannerB+LONG: pnl_r = 0.5
+        self._insert_trade(cur, run_id, trade_id=3003, scanner_name='scannerB',
+                           direction='LONG', pnl_r=0.5, net_pnl=25)
+        db_conn.commit()
+
+        cur.execute("SELECT analytics.build_metric_snapshots(%s)", (run_id,))
+        db_conn.commit()
+
+        avg_r_a_long, count_a_long = self._get_metric(
+            cur, run_id, 'scanner_direction:scannerA:LONG', 'avg_r')
+        avg_r_a_short, count_a_short = self._get_metric(
+            cur, run_id, 'scanner_direction:scannerA:SHORT', 'avg_r')
+        avg_r_b_long, count_b_long = self._get_metric(
+            cur, run_id, 'scanner_direction:scannerB:LONG', 'avg_r')
+
+        assert avg_r_a_long is not None
+        assert count_a_long == 1
+        assert float(avg_r_a_long) == pytest.approx(4.0, abs=0.001)
+
+        assert avg_r_a_short is not None
+        assert count_a_short == 1
+        assert float(avg_r_a_short) == pytest.approx(-1.0, abs=0.001)
+
+        assert avg_r_b_long is not None
+        assert count_b_long == 1
+        assert float(avg_r_b_long) == pytest.approx(0.5, abs=0.001)
+
+        cur.execute("DELETE FROM analytics.metric_snapshot WHERE run_id=%s", (run_id,))
+        cur.execute("DELETE FROM analytics.trade_fact WHERE run_id=%s", (run_id,))
+        cur.execute("DELETE FROM analytics.analysis_run WHERE run_id=%s", (run_id,))
+        db_conn.commit()
+
+    def test_unknown_regime_and_exit_reason(self, db_conn):
+        """NULL market_regime / exit_reason should map to UNKNOWN segment."""
+        cur = db_conn.cursor()
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+
+        run_id = self._create_run(cur)
+        # Trade with NULL market_regime and NULL exit_reason
+        self._insert_trade(cur, run_id, trade_id=4001, scanner_name='test_scanner',
+                           direction='LONG', pnl_r=1.0, net_pnl=50,
+                           market_regime=None, exit_reason=None)
+        # Trade with specific regime and exit_reason
+        self._insert_trade(cur, run_id, trade_id=4002, scanner_name='test_scanner',
+                           direction='LONG', pnl_r=2.0, net_pnl=100,
+                           market_regime='TRENDING', exit_reason='TP_HIT')
+        db_conn.commit()
+
+        cur.execute("SELECT analytics.build_metric_snapshots(%s)", (run_id,))
+        db_conn.commit()
+
+        # regime:UNKNOWN should have sample_count=1
+        _, count_unknown_regime = self._get_metric(
+            cur, run_id, 'regime:UNKNOWN', 'avg_r')
+        _, count_trending = self._get_metric(
+            cur, run_id, 'regime:TRENDING', 'avg_r')
+
+        assert count_unknown_regime == 1, f"Expected 1, got {count_unknown_regime}"
+        assert count_trending == 1, f"Expected 1, got {count_trending}"
+
+        # exit_reason:UNKNOWN
+        _, count_unknown_exit = self._get_metric(
+            cur, run_id, 'exit_reason:UNKNOWN', 'avg_r')
+        _, count_tp_hit = self._get_metric(
+            cur, run_id, 'exit_reason:TP_HIT', 'avg_r')
+
+        assert count_unknown_exit == 1
+        assert count_tp_hit == 1
+
+        cur.execute("DELETE FROM analytics.metric_snapshot WHERE run_id=%s", (run_id,))
+        cur.execute("DELETE FROM analytics.trade_fact WHERE run_id=%s", (run_id,))
+        cur.execute("DELETE FROM analytics.analysis_run WHERE run_id=%s", (run_id,))
+        db_conn.commit()
+
+    def test_unknown_segment_prefix_returns_zero(self, db_conn):
+        """An unknown segment prefix must NOT return global metrics."""
+        cur = db_conn.cursor()
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+
+        run_id = self._create_run(cur)
+        self._insert_trade(cur, run_id, trade_id=5001, scanner_name='test_scanner',
+                           direction='LONG', pnl_r=3.0, net_pnl=150)
+        self._insert_trade(cur, run_id, trade_id=5002, scanner_name='test_scanner',
+                           direction='SHORT', pnl_r=-1.0, net_pnl=-50)
+        db_conn.commit()
+
+        cur.execute(
+            "SELECT analytics.compute_metric_snapshot(%s, '24h', 'unknown_prefix', 'test', NOW() - INTERVAL '1 day', NOW())",
+            (run_id,),
+        )
+        result = cur.fetchone()[0]
+        db_conn.commit()
+
+        assert result == 0, f"Unknown prefix should return 0 rows inserted, got {result}"
+
+        # Verify nothing was inserted into metric_snapshot
+        cur.execute(
+            "SELECT COUNT(*) FROM analytics.metric_snapshot WHERE run_id = %s",
+            (run_id,),
+        )
+        count = cur.fetchone()[0]
+        assert count == 0, f"Unknown prefix should not insert any rows, found {count}"
+
+        cur.execute("DELETE FROM analytics.trade_fact WHERE run_id=%s", (run_id,))
+        cur.execute("DELETE FROM analytics.analysis_run WHERE run_id=%s", (run_id,))
+        db_conn.commit()

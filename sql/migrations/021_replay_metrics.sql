@@ -10,7 +10,7 @@
 -- Idempotent: uses INSERT ... ON CONFLICT DO UPDATE.
 
 -- ============================================================
--- 1. ACTUAL scenario — mirrors the real trade outcome
+-- 1. ACTUAL scenario вЂ” mirrors the real trade outcome
 -- ============================================================
 CREATE OR REPLACE FUNCTION analytics.build_replay_actual(
     p_run_id UUID
@@ -53,7 +53,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ============================================================
--- 2. FIXED_TP scenario — what if we used a fixed TP?
+-- 2. FIXED_TP scenario вЂ” what if we used a fixed TP?
 -- ============================================================
 CREATE OR REPLACE FUNCTION analytics.build_replay_fixed_tp(
     p_run_id UUID,
@@ -105,7 +105,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ============================================================
--- 3. BREAKEVEN scenario — what if we exited at breakeven?
+-- 3. BREAKEVEN scenario вЂ” what if we exited at breakeven?
 -- ============================================================
 CREATE OR REPLACE FUNCTION analytics.build_replay_breakeven(
     p_run_id UUID
@@ -145,7 +145,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ============================================================
--- 4. RISK_NORMALIZED_NO_DCA scenario — what if DCA was disabled?
+-- 4. RISK_NORMALIZED_NO_DCA scenario вЂ” what if DCA was disabled?
 -- ============================================================
 CREATE OR REPLACE FUNCTION analytics.build_replay_no_dca(
     p_run_id UUID
@@ -178,7 +178,7 @@ BEGIN
         tf.exit_reason,
         'dca',
         jsonb_build_object('dca_enabled_original', tf.dca_filled_at IS NOT NULL),
-        'COMPLETE',
+        'INCOMPLETE',  -- counterfactual exit path requires candle replay
         'CLEAR'
     FROM analytics.trade_fact tf
     WHERE tf.run_id = p_run_id
@@ -195,7 +195,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ============================================================
--- 5. WIDER_STOP_DIAGNOSTIC — what if stop was wider?
+-- 5. WIDER_STOP_DIAGNOSTIC вЂ” what if stop was wider?
 -- ============================================================
 CREATE OR REPLACE FUNCTION analytics.build_replay_wider_stop(
     p_run_id UUID,

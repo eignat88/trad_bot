@@ -154,7 +154,7 @@ DECLARE
 BEGIN
     SELECT COUNT(*) INTO v_source
     FROM dds.paper_trade pt
-    WHERE pt.dca_enabled = TRUE
+    WHERE pt.dca_filled_at IS NOT NULL
       AND pt.entered_at < (SELECT observation_cutoff FROM analytics.analysis_run WHERE run_id = p_run_id);
 
     SELECT COUNT(*) INTO v_canonical

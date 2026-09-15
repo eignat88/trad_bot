@@ -381,18 +381,14 @@ DECLARE
 BEGIN
     SELECT COUNT(*) INTO v_count
     FROM analytics.trade_horizon_metric thm
-    WHERE thm.trade_id IN (
-        SELECT trade_id FROM analytics.trade_fact WHERE run_id = p_run_id
-    )
+    WHERE thm.run_id = p_run_id
       AND thm.coverage_status != 'COMPLETE';
 
     SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples
     FROM (
         SELECT thm.trade_id
         FROM analytics.trade_horizon_metric thm
-        WHERE thm.trade_id IN (
-            SELECT trade_id FROM analytics.trade_fact WHERE run_id = p_run_id
-        )
+        WHERE thm.run_id = p_run_id
           AND thm.coverage_status != 'COMPLETE'
         LIMIT 10
     ) sub;

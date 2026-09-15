@@ -2,16 +2,16 @@
 -- Populates analytics.trade_fact from dds.paper_trade + dds.scanner_setup.
 --
 -- Scoped to latest SUCCEEDED run via observation_cutoff (PIT-invariant).
--- Recomputes pnl_r, mfe_r, mae_r from candles — does NOT inherit from
+-- Recomputes pnl_r, mfe_r, mae_r from candles вЂ” does NOT inherit from
 -- paper_trade signal_outcome values.
--- market_signal joined via setup_id → market_signal relationship, not
+-- market_signal joined via setup_id в†’ market_signal relationship, not
 -- loose instrument_id + direction.
 --
 -- Idempotent: uses INSERT ... ON CONFLICT DO UPDATE.
 -- Empty source tables => INSERT 0 0 (no error).
 
 -- ============================================================
--- Main trade_fact build — single statement, explicit columns
+-- Main trade_fact build вЂ” single statement, explicit columns
 -- ============================================================
 WITH latest_run AS (
     SELECT run_id, observation_cutoff
@@ -47,7 +47,7 @@ trade_build AS (
         pt.dca_fill_price,
         pt.avg_entry_price,
         pt.stop_price                                             AS initial_stop,
-        pt.stop_price                                             AS final_stop,
+        NULL::NUMERIC                          AS final_stop,
         pt.target_1,
         pt.target_2,
         pt.exit_price,

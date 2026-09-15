@@ -12,6 +12,8 @@
 -- ============================================================
 -- Helper: compute horizon metric for a single trade
 -- ============================================================
+DROP FUNCTION IF EXISTS analytics.compute_horizon_metric(BIGINT, TEXT, TEXT, NUMERIC, TIMESTAMPTZ, TEXT, NUMERIC, BIGINT, TIMESTAMPTZ);
+
 CREATE OR REPLACE FUNCTION analytics.compute_horizon_metric(
     p_trade_id BIGINT,
     p_anchor TEXT,
@@ -34,6 +36,9 @@ DECLARE
     max_price NUMERIC;
     min_price NUMERIC;
     candle_count BIGINT;
+    expected_candle_count BIGINT;
+    coverage_start TIMESTAMPTZ;
+    coverage_end TIMESTAMPTZ;
     direction_sign NUMERIC;
 BEGIN
     -- For 'entry_time' horizon, use actual entry time as endpoint
@@ -67,23 +72,49 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Get max/min prices from closed candles in the horizon window
+    -- Restrict horizon metrics to fully-contained canonical 1m candles.
+    coverage_start := date_trunc('minute', p_anchor_time);
+    IF coverage_start < p_anchor_time THEN
+        coverage_start := coverage_start + INTERVAL '1 minute';
+    END IF;
+
+    coverage_end := date_trunc('minute', end_time);
+
+    expected_candle_count := GREATEST(
+        0,
+        FLOOR(EXTRACT(EPOCH FROM (coverage_end - coverage_start)) / 60)::BIGINT
+    );
+
     SELECT
         MAX(high),
         MIN(low),
         COUNT(*)
     INTO max_price, min_price, candle_count
     FROM market.candle
-    WHERE instrument_id = p_instrument_id
-      AND open_time >= p_anchor_time
+    WHERE exchange = 'bybit'
+      AND market_type = 'linear'
+      AND instrument_id = p_instrument_id
+      AND timeframe = '1'
+      AND open_time >= coverage_start
+      AND open_time < coverage_end
+      AND close_time = open_time + INTERVAL '1 minute'
       AND close_time <= end_time
       AND is_closed = TRUE;
 
-    -- Check coverage
-    IF candle_count = 0 THEN
+    -- No fully-contained 1m candle fits inside the requested horizon.
+    IF expected_candle_count = 0 OR candle_count = 0 THEN
         favorable_move_r := NULL;
         adverse_move_r := NULL;
         coverage_status := 'NO_DATA';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    -- Partial candle coverage must never be published as COMPLETE.
+    IF candle_count < expected_candle_count THEN
+        favorable_move_r := NULL;
+        adverse_move_r := NULL;
+        coverage_status := 'INCOMPLETE';
         RETURN NEXT;
         RETURN;
     END IF;
@@ -134,6 +165,7 @@ BEGIN
     FOR v_trade IN
         SELECT tf.trade_id, tf.symbol, tf.direction,
                tf.initial_risk_distance, tf.reference_price,
+               tf.avg_entry_price, tf.exit_price,
                tf.entered_at, tf.dca_filled_at, tf.closed_at,
                tf.signal_at
         FROM analytics.trade_fact tf
