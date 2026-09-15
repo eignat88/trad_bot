@@ -326,8 +326,8 @@ class TestQualityGate:
 
 class TestAppendOnly:
 
-    def test_update_blocked(self, db_conn):
-        """UPDATE on trade_event raises an exception (append-only trigger)."""
+    def test_update_blocked(self, db_conn, test_run_id):
+        """UPDATE and DELETE on trade_event raise exceptions (append-only triggers)."""
         try:
             db_conn.rollback()
         except Exception:
@@ -337,31 +337,129 @@ class TestAppendOnly:
         cur.execute(
             """
             INSERT INTO analytics.trade_event (
-                trade_id, setup_id, event_type, event_at,
+                run_id, trade_id, setup_id, event_type, event_at,
                 source_event_key, payload_json
             ) VALUES (
-                1, 'ao_test', 'ENTRY_FILLED', NOW(),
+                %s, 1, 'ao_test', 'ENTRY_FILLED', NOW(),
                 'ao:' || md5(random()::text), '{}'::jsonb
             )
             RETURNING event_id
             """,
+            (test_run_id,),
         )
         eid = cur.fetchone()[0]
         db_conn.commit()
 
+        # UPDATE should be blocked
         with pytest.raises(Exception, match="append-only"):
             cur.execute(
                 "UPDATE analytics.trade_event SET price=999 WHERE event_id=%s",
                 (eid,),
             )
             db_conn.commit()
-
-        # Connection is in aborted transaction — rollback
         db_conn.rollback()
 
         # DELETE should also be blocked
         with pytest.raises(Exception, match="append-only"):
             cur.execute("DELETE FROM analytics.trade_event WHERE event_id=%s", (eid,))
             db_conn.commit()
-
         db_conn.rollback()
+
+        # Cleanup via TRUNCATE (only safe way for append-only table)
+        cur.execute("TRUNCATE analytics.trade_event")
+        db_conn.commit()
+
+
+# ======================================================================
+# 9. CROSS-RUN TRADE EVENT ISOLATION
+# ======================================================================
+
+class TestCrossRunEventIsolation:
+    """Verify quality checks scope events by run_id."""
+
+    def test_entered_without_fill_is_run_scoped(self, db_conn):
+        """Event from run A should not satisfy quality check for run B."""
+        cur = db_conn.cursor()
+
+        # Create two analysis runs
+        run_a = str(uuid4())
+        run_b = str(uuid4())
+        now = datetime.now(timezone.utc)
+
+        for rid in (run_a, run_b):
+            cur.execute(
+                """
+                INSERT INTO analytics.analysis_run (
+                    run_id, business_date, schedule_timezone,
+                    analysis_from, analysis_to, observation_cutoff,
+                    post_exit_horizon, maturity, status, pipeline_version
+                ) VALUES (%s, CURRENT_DATE, 'Europe/Sofia',
+                    %s, %s, %s, INTERVAL '4 hours', 'PROVISIONAL', 'RUNNING', '1.0.0')
+                """,
+                (rid, now - timedelta(hours=24), now, now),
+            )
+        db_conn.commit()
+
+        # Insert trade_fact in run A with entered_at set
+        cur.execute(
+            """
+            INSERT INTO analytics.trade_fact (
+                run_id, trade_id, setup_id, scanner_name, scanner_version,
+                symbol, direction, reference_price, initial_stop, risk_usdt,
+                initial_risk_distance, status, entered_at, dataset_version
+            ) VALUES (%s, 100, 'setup_iso', 'T', '1', 'X', 'LONG', 100, 95, 50, 5, 'CLOSED', %s, '0')
+            """,
+            (run_a, now - timedelta(hours=2)),
+        )
+        # Insert the ENTRY_FILLED event in run B (different run!)
+        cur.execute(
+            """
+            INSERT INTO analytics.trade_event (
+                run_id, trade_id, setup_id, event_type, event_at,
+                source_event_key, payload_json
+            ) VALUES (%s, 100, 'setup_iso', 'ENTRY_FILLED', %s,
+                %s, '{}'::jsonb)
+            """,
+            (run_b, now - timedelta(hours=2), 'iso_fill:' + run_b),
+        )
+        db_conn.commit()
+
+        # Run A should FAIL: trade has entered_at but no ENTRY_FILLED in run A
+        cur.execute("SELECT * FROM analytics.check_entered_without_fill(%s)", (run_a,))
+        row = cur.fetchone()
+        assert row[2] == "FAIL", f"Run A should fail, got {row[2]}"
+
+        # Cleanup — must remove trade_event rows before analysis_run (FK constraint)
+        # trade_event is append-only (no DELETE/UPDATE), so TRUNCATE is the
+        # only way to clean up test data.
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+
+        cur.execute("TRUNCATE analytics.trade_event")
+        cur.execute("DELETE FROM analytics.trade_fact WHERE run_id IN (%s, %s) AND trade_id = 100", (run_a, run_b))
+        cur.execute("DELETE FROM analytics.analysis_run WHERE run_id IN (%s, %s)", (run_a, run_b))
+        db_conn.commit()
+
+
+# ======================================================================
+# 10. MFE/MAE CONTRACT
+# ======================================================================
+
+class TestMfeMaeContract:
+    """Verify mfe_r/mae_r canonical formulas match paper_trade semantics."""
+
+    def test_mfe_non_negative_mae_non_positive(self, db_conn):
+        """mfe_r >= 0 and mae_r <= 0 for all closed trades in trade_fact."""
+        cur = db_conn.cursor()
+        cur.execute(
+            """
+            SELECT trade_id, mfe_r, mae_r
+            FROM analytics.trade_fact
+            WHERE status = 'CLOSED' AND mfe_r IS NOT NULL AND mae_r IS NOT NULL
+            """
+        )
+        for trade_id, mfe_r, mae_r in cur.fetchall():
+            assert float(mfe_r) >= 0, f"trade {trade_id}: mfe_r={mfe_r} < 0"
+            assert float(mae_r) <= 0, f"trade {trade_id}: mae_r={mae_r} > 0"

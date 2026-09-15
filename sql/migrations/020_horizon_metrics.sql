@@ -88,10 +88,18 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Compute R metrics
+    -- Compute R metrics: LONG/SHORT explicit geometry
+    -- Invariant: favorable_move_r >= 0, adverse_move_r <= 0
     IF p_initial_risk_distance > 0 THEN
-        favorable_move_r := direction_sign * (max_price - p_anchor_price) / p_initial_risk_distance;
-        adverse_move_r := direction_sign * (min_price - p_anchor_price) / p_initial_risk_distance;
+        IF p_direction = 'LONG' THEN
+            -- LONG: price up = favorable, price down = adverse
+            favorable_move_r := (max_price - p_anchor_price) / p_initial_risk_distance;
+            adverse_move_r   := (min_price - p_anchor_price) / p_initial_risk_distance;
+        ELSE
+            -- SHORT: price down = favorable, price up = adverse
+            favorable_move_r := (p_anchor_price - min_price) / p_initial_risk_distance;
+            adverse_move_r   := (p_anchor_price - max_price) / p_initial_risk_distance;
+        END IF;
     ELSE
         favorable_move_r := NULL;
         adverse_move_r := NULL;

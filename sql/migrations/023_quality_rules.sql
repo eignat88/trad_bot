@@ -175,7 +175,7 @@ BEGIN
     SELECT COUNT(*) INTO v_count
     FROM analytics.trade_fact tf
     LEFT JOIN analytics.trade_event te
-        ON te.trade_id = tf.trade_id AND te.event_type = 'ENTRY_FILLED'
+        ON te.run_id = tf.run_id AND te.trade_id = tf.trade_id AND te.event_type = 'ENTRY_FILLED'
     WHERE tf.run_id = p_run_id
       AND tf.entered_at IS NOT NULL
       AND te.event_id IS NULL;
@@ -185,7 +185,7 @@ BEGIN
         SELECT tf.trade_id
         FROM analytics.trade_fact tf
         LEFT JOIN analytics.trade_event te
-            ON te.trade_id = tf.trade_id AND te.event_type = 'ENTRY_FILLED'
+            ON te.run_id = tf.run_id AND te.trade_id = tf.trade_id AND te.event_type = 'ENTRY_FILLED'
         WHERE tf.run_id = p_run_id
           AND tf.entered_at IS NOT NULL
           AND te.event_id IS NULL
@@ -220,7 +220,7 @@ BEGIN
     SELECT COUNT(*) INTO v_count
     FROM analytics.trade_fact tf
     LEFT JOIN analytics.trade_event te
-        ON te.trade_id = tf.trade_id AND te.event_type = 'TRADE_CLOSED'
+        ON te.run_id = tf.run_id AND te.trade_id = tf.trade_id AND te.event_type = 'TRADE_CLOSED'
     WHERE tf.run_id = p_run_id
       AND tf.status = 'CLOSED'
       AND te.event_id IS NULL;
@@ -230,7 +230,7 @@ BEGIN
         SELECT tf.trade_id
         FROM analytics.trade_fact tf
         LEFT JOIN analytics.trade_event te
-            ON te.trade_id = tf.trade_id AND te.event_type = 'TRADE_CLOSED'
+            ON te.run_id = tf.run_id AND te.trade_id = tf.trade_id AND te.event_type = 'TRADE_CLOSED'
         WHERE tf.run_id = p_run_id
           AND tf.status = 'CLOSED'
           AND te.event_id IS NULL
@@ -268,7 +268,7 @@ BEGIN
       AND tf.dca_filled_at IS NOT NULL
       AND NOT EXISTS (
           SELECT 1 FROM analytics.trade_event te
-          WHERE te.trade_id = tf.trade_id AND te.event_type = 'DCA_FILLED'
+          WHERE te.run_id = tf.run_id AND te.trade_id = tf.trade_id AND te.event_type = 'DCA_FILLED'
       );
 
     SELECT COALESCE(jsonb_agg(trade_id), '[]'::jsonb) INTO v_samples
@@ -279,7 +279,7 @@ BEGIN
           AND tf.dca_filled_at IS NOT NULL
           AND NOT EXISTS (
               SELECT 1 FROM analytics.trade_event te
-              WHERE te.trade_id = tf.trade_id AND te.event_type = 'DCA_FILLED'
+              WHERE te.run_id = tf.run_id AND te.trade_id = tf.trade_id AND te.event_type = 'DCA_FILLED'
           )
         LIMIT 10
     ) sub;

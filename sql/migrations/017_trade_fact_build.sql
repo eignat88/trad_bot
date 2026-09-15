@@ -127,11 +127,17 @@ trade_build AS (
 
         -- Context
         pt.market_regime,
-        -- config_hash/strategy_hash: populated from snapshots if available
+        -- config_hash/strategy_hash: PIT-safe lookup from snapshots active at observation_cutoff
         (SELECT cs.config_hash FROM analytics.config_snapshot cs
-         WHERE cs.valid_to IS NULL LIMIT 1)                       AS config_hash,
+         WHERE cs.valid_from <= lr.observation_cutoff
+           AND (cs.valid_to IS NULL OR cs.valid_to > lr.observation_cutoff)
+         ORDER BY cs.valid_from DESC, cs.captured_at DESC, cs.config_hash
+         LIMIT 1)                                                 AS config_hash,
         (SELECT ss2.strategy_hash FROM analytics.strategy_snapshot ss2
-         WHERE ss2.scanner_name = pt.scanner_name LIMIT 1)        AS strategy_hash,
+         WHERE ss2.scanner_name = pt.scanner_name
+           AND ss2.captured_at <= lr.observation_cutoff
+         ORDER BY ss2.captured_at DESC, ss2.strategy_hash
+         LIMIT 1)                                                 AS strategy_hash,
         '1.0.0'::text                                              AS metric_version,
 
         -- Quality
