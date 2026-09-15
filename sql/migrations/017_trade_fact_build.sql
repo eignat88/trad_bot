@@ -135,6 +135,7 @@ trade_build AS (
          LIMIT 1)                                                 AS config_hash,
         (SELECT ss2.strategy_hash FROM analytics.strategy_snapshot ss2
          WHERE ss2.scanner_name = pt.scanner_name
+           AND ss2.scanner_version = COALESCE(ss.scanner_version, 'unknown')
            AND ss2.captured_at <= lr.observation_cutoff
          ORDER BY ss2.captured_at DESC, ss2.strategy_hash
          LIMIT 1)                                                 AS strategy_hash,

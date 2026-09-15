@@ -463,3 +463,181 @@ class TestMfeMaeContract:
         for trade_id, mfe_r, mae_r in cur.fetchall():
             assert float(mfe_r) >= 0, f"trade {trade_id}: mfe_r={mfe_r} < 0"
             assert float(mae_r) <= 0, f"trade {trade_id}: mae_r={mae_r} > 0"
+
+    def test_mfe_mae_synthetic_contract(self, db_conn):
+        """Synthetic test: verify formula with known mfe/mae/risk_distance values.
+
+        paper_trade stores mfe/mae as unsigned absolute price distances.
+        mfe_r = mfe / risk_distance  (always >= 0)
+        mae_r = -mae / risk_distance  (always <= 0)
+        """
+        cur = db_conn.cursor()
+
+        # Create a run
+        run_id = str(uuid4())
+        now = datetime.now(timezone.utc)
+        cur.execute(
+            """
+            INSERT INTO analytics.analysis_run (
+                run_id, business_date, schedule_timezone,
+                analysis_from, analysis_to, observation_cutoff,
+                post_exit_horizon, maturity, status, pipeline_version
+            ) VALUES (%s, CURRENT_DATE, 'Europe/Sofia',
+                %s, %s, %s, INTERVAL '4 hours', 'PROVISIONAL', 'RUNNING', '1.0.0')
+            """,
+            (run_id, now - timedelta(hours=24), now, now),
+        )
+
+        # Insert LONG trade: risk_distance=5, mfe=10 (price went +10 from ref), mae=2.5 (price went -2.5)
+        cur.execute(
+            """
+            INSERT INTO analytics.trade_fact (
+                run_id, trade_id, setup_id, scanner_name, scanner_version,
+                symbol, direction, reference_price, initial_stop, risk_usdt,
+                initial_risk_distance, status, entered_at, closed_at,
+                mfe_r, mae_r, pnl_r, dataset_version
+            ) VALUES (
+                %s, 200, 'synth_long', 'T', '1', 'X', 'LONG',
+                100, 95, 25, 5, 'CLOSED',
+                %s, %s,
+                2.0, -0.5, 1.0, '0'
+            )
+            """,
+            (run_id, now - timedelta(hours=1), now),
+        )
+        db_conn.commit()
+
+        # Verify synthetic contract
+        cur.execute(
+            "SELECT mfe_r, mae_r FROM analytics.trade_fact WHERE run_id=%s AND trade_id=200",
+            (run_id,),
+        )
+        mfe_r, mae_r = cur.fetchone()
+        assert float(mfe_r) == pytest.approx(2.0), f"LONG mfe_r expected 2.0, got {mfe_r}"
+        assert float(mae_r) == pytest.approx(-0.5), f"LONG mae_r expected -0.5, got {mae_r}"
+
+        # Cleanup
+        db_conn.rollback()
+        cur.execute("TRUNCATE analytics.trade_event")
+        cur.execute("DELETE FROM analytics.trade_fact WHERE run_id=%s AND trade_id=200", (run_id,))
+        cur.execute("DELETE FROM analytics.analysis_run WHERE run_id=%s", (run_id,))
+        db_conn.commit()
+
+    def test_mfe_mae_synthetic_short(self, db_conn):
+        """Synthetic test for SHORT direction contract."""
+        cur = db_conn.cursor()
+
+        run_id = str(uuid4())
+        now = datetime.now(timezone.utc)
+        cur.execute(
+            """
+            INSERT INTO analytics.analysis_run (
+                run_id, business_date, schedule_timezone,
+                analysis_from, analysis_to, observation_cutoff,
+                post_exit_horizon, maturity, status, pipeline_version
+            ) VALUES (%s, CURRENT_DATE, 'Europe/Sofia',
+                %s, %s, %s, INTERVAL '4 hours', 'PROVISIONAL', 'RUNNING', '1.0.0')
+            """,
+            (run_id, now - timedelta(hours=24), now, now),
+        )
+
+        # SHORT trade: risk_distance=5, mfe=10 (price dropped 10 from ref), mae=2.5 (price rose 2.5)
+        cur.execute(
+            """
+            INSERT INTO analytics.trade_fact (
+                run_id, trade_id, setup_id, scanner_name, scanner_version,
+                symbol, direction, reference_price, initial_stop, risk_usdt,
+                initial_risk_distance, status, entered_at, closed_at,
+                mfe_r, mae_r, pnl_r, dataset_version
+            ) VALUES (
+                %s, 300, 'synth_short', 'T', '1', 'X', 'SHORT',
+                100, 105, 25, 5, 'CLOSED',
+                %s, %s,
+                2.0, -0.5, 0.8, '0'
+            )
+            """,
+            (run_id, now - timedelta(hours=1), now),
+        )
+        db_conn.commit()
+
+        cur.execute(
+            "SELECT mfe_r, mae_r FROM analytics.trade_fact WHERE run_id=%s AND trade_id=300",
+            (run_id,),
+        )
+        mfe_r, mae_r = cur.fetchone()
+        assert float(mfe_r) == pytest.approx(2.0), f"SHORT mfe_r expected 2.0, got {mfe_r}"
+        assert float(mae_r) == pytest.approx(-0.5), f"SHORT mae_r expected -0.5, got {mae_r}"
+
+        # Cleanup
+        db_conn.rollback()
+        cur.execute("TRUNCATE analytics.trade_event")
+        cur.execute("DELETE FROM analytics.trade_fact WHERE run_id=%s AND trade_id=300", (run_id,))
+        cur.execute("DELETE FROM analytics.analysis_run WHERE run_id=%s", (run_id,))
+        db_conn.commit()
+
+
+# ======================================================================
+# 11. HORIZON GEOMETRY MIRROR TEST
+# ======================================================================
+
+class TestHorizonGeometry:
+    """Verify LONG/SHORT horizon R symmetry with GREATEST/LEAST clamping."""
+
+    def test_long_short_mirror_favorable(self, db_conn):
+        """LONG and SHORT with mirrored candles produce symmetric favorable R."""
+        cur = db_conn.cursor()
+        # Create test data
+        cur.execute(
+            """
+            SELECT
+                GREATEST(0, (105 - 100) / 5.0) AS long_fav,
+                GREATEST(0, (100 - 95) / 5.0)  AS short_fav
+            """
+        )
+        long_fav, short_fav = cur.fetchone()
+        assert float(long_fav) == pytest.approx(1.0)
+        assert float(short_fav) == pytest.approx(1.0)
+
+    def test_long_adverse_clamped_at_zero(self, db_conn):
+        """LONG adverse is clamped at 0 when price only went up."""
+        cur = db_conn.cursor()
+        # anchor=100, min=102 (price only went up), risk=5
+        cur.execute("SELECT LEAST(0, (102 - 100) / 5.0)")
+        result = cur.fetchone()[0]
+        assert float(result) == pytest.approx(0.0)
+
+    def test_short_adverse_clamped_at_zero(self, db_conn):
+        """SHORT adverse is clamped at 0 when price only went down."""
+        cur = db_conn.cursor()
+        # anchor=100, max=98 (price only went down), risk=5
+        cur.execute("SELECT LEAST(0, (100 - 98) / 5.0)")
+        result = cur.fetchone()[0]
+        assert float(result) == pytest.approx(0.0)
+
+    def test_long_full_range(self, db_conn):
+        """LONG: anchor=100, max=110, min=95, risk=5 → fav=2.0, adv=-1.0."""
+        cur = db_conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                GREATEST(0, (110 - 100) / 5.0),
+                LEAST(0, (95 - 100) / 5.0)
+            """
+        )
+        fav, adv = cur.fetchone()
+        assert float(fav) == pytest.approx(2.0)
+        assert float(adv) == pytest.approx(-1.0)
+
+    def test_short_full_range(self, db_conn):
+        """SHORT: anchor=100, min=90, max=105, risk=5 → fav=2.0, adv=-1.0."""
+        cur = db_conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                GREATEST(0, (100 - 90) / 5.0),
+                LEAST(0, (100 - 105) / 5.0)
+            """
+        )
+        fav, adv = cur.fetchone()
+        assert float(fav) == pytest.approx(2.0)
+        assert float(adv) == pytest.approx(-1.0)

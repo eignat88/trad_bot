@@ -88,17 +88,17 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Compute R metrics: LONG/SHORT explicit geometry
+    -- Compute R metrics: LONG/SHORT explicit geometry with invariant enforcement
     -- Invariant: favorable_move_r >= 0, adverse_move_r <= 0
+    -- GREATEST/LEAST clamp: price that didn't move favorably contributes 0,
+    -- price that didn't move adversely contributes 0.
     IF p_initial_risk_distance > 0 THEN
         IF p_direction = 'LONG' THEN
-            -- LONG: price up = favorable, price down = adverse
-            favorable_move_r := (max_price - p_anchor_price) / p_initial_risk_distance;
-            adverse_move_r   := (min_price - p_anchor_price) / p_initial_risk_distance;
+            favorable_move_r := GREATEST(0, (max_price - p_anchor_price) / p_initial_risk_distance);
+            adverse_move_r   := LEAST(0,   (min_price - p_anchor_price) / p_initial_risk_distance);
         ELSE
-            -- SHORT: price down = favorable, price up = adverse
-            favorable_move_r := (p_anchor_price - min_price) / p_initial_risk_distance;
-            adverse_move_r   := (p_anchor_price - max_price) / p_initial_risk_distance;
+            favorable_move_r := GREATEST(0, (p_anchor_price - min_price) / p_initial_risk_distance);
+            adverse_move_r   := LEAST(0,   (p_anchor_price - max_price) / p_initial_risk_distance);
         END IF;
     ELSE
         favorable_move_r := NULL;
