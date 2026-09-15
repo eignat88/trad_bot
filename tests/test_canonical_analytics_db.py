@@ -176,28 +176,31 @@ class TestPITCutoff:
 
 class TestHorizonCoverage:
 
-    def test_incomplete_coverage_not_published(self, db_conn):
+    def test_incomplete_coverage_not_published(self, db_conn, test_run_id):
         """Incomplete horizon coverage is detectable."""
         cur = db_conn.cursor()
         cur.execute(
             """
             INSERT INTO analytics.trade_horizon_metric (
-                trade_id, anchor, horizon, metric_version,
+                run_id, trade_id, anchor, horizon, metric_version,
                 favorable_move_r, adverse_move_r, coverage_status
-            ) VALUES (777777, 'entry', '5m', '1.0.0', 1.5, -0.5, 'INCOMPLETE')
-            ON CONFLICT (trade_id, anchor, horizon, metric_version) DO NOTHING
+            ) VALUES (%s, 777777, 'entry', '5m', '1.0.0', 1.5, -0.5, 'INCOMPLETE')
+            ON CONFLICT (run_id, trade_id, anchor, horizon, metric_version) DO NOTHING
             """,
+            (test_run_id,),
         )
         db_conn.commit()
 
         cur.execute(
             "SELECT COUNT(*) FROM analytics.trade_horizon_metric"
-            " WHERE trade_id=777777 AND coverage_status != 'COMPLETE'"
+            " WHERE run_id=%s AND trade_id=777777 AND coverage_status != 'COMPLETE'",
+            (test_run_id,),
         )
         assert cur.fetchone()[0] > 0
 
         cur.execute(
-            "DELETE FROM analytics.trade_horizon_metric WHERE trade_id=777777"
+            "DELETE FROM analytics.trade_horizon_metric WHERE run_id=%s AND trade_id=777777",
+            (test_run_id,),
         )
         db_conn.commit()
 
