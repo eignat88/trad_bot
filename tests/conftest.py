@@ -5,8 +5,9 @@ import shutil
 from pathlib import Path
 from uuid import uuid4
 
+import pg8000
 import pytest
-
+import os
 
 _TMP_ROOT = Path(__file__).parent / ".tmp"
 
@@ -27,3 +28,21 @@ def tmp_path() -> Path:
         yield path
     finally:
         shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.fixture(scope="session")
+def db_session():
+    """Create a test database session."""
+    database = os.getenv("TEST_DB_NAME", "trad_bot_migration_test")
+
+    conn = pg8000.connect(
+        host=os.getenv("TEST_DB_HOST", "localhost"),
+        port=int(os.getenv("TEST_DB_PORT", "5432")),
+        database=database,
+        user=os.getenv("TEST_DB_USER", "postgres"),
+        password=os.getenv("TEST_DB_PASSWORD", ""),
+    )
+
+    yield conn
+
+    conn.close()
