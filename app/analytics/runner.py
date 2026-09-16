@@ -1005,7 +1005,7 @@ class AnalyticsRunner:
                 "quality_gate(%s) returned NULL/empty".format(str(run.run_id))
             )
 
-        passed, blocking_count, degraded_count, total_checks = row
+        passed, blocking_count, degraded_count, warning_count, total_checks = row
         self._repo._conn.commit()
 
         # Determine quality status
