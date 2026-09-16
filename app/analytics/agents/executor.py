@@ -18,11 +18,11 @@ from typing import Any, Optional
 
 from app.analytics.agents.models import (
     AgentDefinition, AgentInputManifest, AgentResult,
-    AgentRunStatus, ValidationStatus,
+    AgentRunStatus, AgentType, ValidationStatus,
 )
 from app.analytics.agents.llm_client import AgentModelClient, ModelResponse
 from app.analytics.agents.contracts.schema_validator import (
-    validate_input, validate_specialist_output,
+    validate_input, validate_specialist_output, validate_chief_output,
 )
 from app.analytics.agents.evidence import EvidenceCatalog
 from app.analytics.agents.errors import (
@@ -52,6 +52,20 @@ class AgentExecutor:
     ):
         self._model_client = model_client
         self._prompt_builder = prompt_builder
+
+    @staticmethod
+    def _validate_output_schema(
+        definition: AgentDefinition,
+        parsed: dict,
+    ) -> list[str]:
+        """Validate LLM output against the correct schema for this agent type.
+
+        CHIEF agents use chief_output.schema.json.
+        SPECIALIST agents use specialist_output.schema.json.
+        """
+        if definition.agent_type == AgentType.CHIEF:
+            return validate_chief_output(parsed)
+        return validate_specialist_output(parsed)
 
     @staticmethod
     def _apply_confidence_policy(
@@ -165,8 +179,8 @@ class AgentExecutor:
             else:
                 parsed = response.parsed_json
 
-            # 4. Schema validation
-            schema_errors = validate_specialist_output(parsed)
+            # 4. Schema validation — contract-aware
+            schema_errors = self._validate_output_schema(definition, parsed)
             if schema_errors:
                 return AgentExecutionResult(
                     status=AgentRunStatus.FAILED,
@@ -283,7 +297,7 @@ class AgentExecutor:
             else:
                 parsed = response.parsed_json
 
-            schema_errors = validate_specialist_output(parsed)
+            schema_errors = self._validate_output_schema(definition, parsed)
             if schema_errors:
                 return AgentExecutionResult(
                     status=AgentRunStatus.FAILED,

@@ -681,9 +681,9 @@ class TestChiefOrchestratorIntegration:
             available_agents=(), missing_agents=(), blockers=(),
         )
 
-        error = orch._validate_chief_output(result, chief_input, eligibility)
-        assert error is not None
-        assert "unknown evidence" in error.lower()
+        result = orch._post_validate_chief(result, chief_input, eligibility)
+        assert result.status == AgentRunStatus.FAILED
+        assert result.error_code == AgentErrorCode.EVIDENCE_VALIDATION_ERROR
 
 
 # ── Daily Report Supersession Test ────────────────────────────────────
