@@ -224,6 +224,122 @@ class TestDataQualityGate:
         assert result.severity == Severity.WARNING
         assert result.status == QualityCheckStatus.FAIL
 
+    def test_check_data_freshness_uses_observation_cutoff(self):
+        """Test that data freshness uses observation_cutoff instead of now().
+        
+        This is the key fix for the issue where FINAL runs were failing
+        because they compared against current time instead of the analysis window.
+        """
+        # Set observation_cutoff to a specific time in the past
+        observation_cutoff = datetime(2026, 9, 15, 3, 0, tzinfo=timezone.utc)
+        self.run.observation_cutoff = observation_cutoff
+        
+        # Mock data that is fresh relative to observation_cutoff
+        # Latest candle is 2 minutes before cutoff
+        latest_candle = observation_cutoff - timedelta(minutes=2)
+        
+        self.mock_conn.cursor.return_value.fetchone.side_effect = [
+            [latest_candle],  # latest candle
+            ["5", 100],  # primary timeframe
+        ]
+        
+        result = self.quality_gate._check_data_freshness(self.run, "quality_gate")
+        
+        assert result.severity == Severity.WARNING
+        assert result.status == QualityCheckStatus.PASS
+        # Verify reference_time is observation_cutoff, not now()
+        assert result.actual_value["reference_time"] == observation_cutoff.isoformat()
+
+    def test_check_data_freshness_final_run_historical(self):
+        """Test data freshness for a FINAL run with historical cutoff.
+        
+        This simulates the case where a FINAL run is executed hours/days after
+        the analysis period. The check should use observation_cutoff, not now().
+        """
+        # Set observation_cutoff to a time in the past (simulating historical run)
+        observation_cutoff = datetime(2026, 9, 15, 3, 0, tzinfo=timezone.utc)
+        self.run.observation_cutoff = observation_cutoff
+        self.run.maturity = Maturity.FINAL
+        
+        # Mock data that is fresh relative to observation_cutoff
+        # Latest candle is 5 minutes before cutoff (well within 15-minute SLA)
+        latest_candle = observation_cutoff - timedelta(minutes=5)
+        
+        self.mock_conn.cursor.return_value.fetchone.side_effect = [
+            [latest_candle],  # latest candle
+            ["5", 100],  # primary timeframe
+        ]
+        
+        result = self.quality_gate._check_data_freshness(self.run, "quality_gate")
+        
+        assert result.severity == Severity.WARNING
+        assert result.status == QualityCheckStatus.PASS
+        # Freshness should be 5 minutes (relative to cutoff), not hours/days
+        assert result.actual_value["freshness_minutes"] == 5.0
+
+    def test_check_data_freshness_final_run_gap_before_cutoff(self):
+        """Test data freshness for a FINAL run with gap before cutoff.
+        
+        This simulates the case where there's a real data gap before the cutoff.
+        The check should FAIL even though the gap is relative to cutoff.
+        """
+        # Set observation_cutoff
+        observation_cutoff = datetime(2026, 9, 15, 3, 0, tzinfo=timezone.utc)
+        self.run.observation_cutoff = observation_cutoff
+        self.run.maturity = Maturity.FINAL
+        
+        # Mock data with a real gap: latest candle is 30 minutes before cutoff
+        # This exceeds the 15-minute SLA for 5m candles
+        latest_candle = observation_cutoff - timedelta(minutes=30)
+        
+        self.mock_conn.cursor.return_value.fetchone.side_effect = [
+            [latest_candle],  # latest candle
+            ["5", 100],  # primary timeframe
+        ]
+        
+        result = self.quality_gate._check_data_freshness(self.run, "quality_gate")
+        
+        assert result.severity == Severity.WARNING
+        assert result.status == QualityCheckStatus.FAIL
+        assert result.actual_value["freshness_minutes"] == 30.0
+        assert result.actual_value["sla_minutes"] == 15
+
+    def test_check_data_freshness_provisional_run(self):
+        """Test data freshness for a PROVISIONAL run.
+        
+        PROVISIONAL runs should also use observation_cutoff for consistency.
+        """
+        # Set observation_cutoff to recent time
+        observation_cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+        self.run.observation_cutoff = observation_cutoff
+        self.run.maturity = Maturity.PROVISIONAL
+        
+        # Mock fresh data relative to cutoff
+        latest_candle = observation_cutoff - timedelta(minutes=2)
+        
+        self.mock_conn.cursor.return_value.fetchone.side_effect = [
+            [latest_candle],  # latest candle
+            ["5", 100],  # primary timeframe
+        ]
+        
+        result = self.quality_gate._check_data_freshness(self.run, "quality_gate")
+        
+        assert result.severity == Severity.WARNING
+        assert result.status == QualityCheckStatus.PASS
+
+    def test_check_data_freshness_no_candles(self):
+        """Test data freshness when no candles exist."""
+        # Mock no candles
+        self.mock_conn.cursor.return_value.fetchone.side_effect = [
+            [None],  # no candles
+        ]
+        
+        result = self.quality_gate._check_data_freshness(self.run, "quality_gate")
+        
+        assert result.severity == Severity.WARNING
+        assert result.status == QualityCheckStatus.SKIPPED
+        assert "No candles found" in result.details["message"]
+
     def test_has_blocking_failures(self):
         """Test has_blocking_failures method."""
         results = [
