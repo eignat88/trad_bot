@@ -145,6 +145,15 @@ class OpenAICompatibleClient(AgentModelClient):
 
             choice = data["choices"][0]
             content = choice.get("message", {}).get("content", "")
+            finish_reason = choice.get("finish_reason", "unknown")
+
+            # ── Tool-call rejection (fail closed — no tool access in Stage 3) ──
+            tool_calls = choice.get("message", {}).get("tool_calls")
+            if tool_calls:
+                raise TerminalError(
+                    AgentErrorCode.SECURITY_POLICY_ERROR,
+                    "Tool/function calls forbidden: Stage 3 agents have no tool access",
+                )
 
             if not content:
                 raise TerminalError(
