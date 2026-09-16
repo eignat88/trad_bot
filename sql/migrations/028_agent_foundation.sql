@@ -32,6 +32,8 @@ COMMENT ON COLUMN analytics.agent_definition.contract_version
     IS 'Schema version of the agent''s input/output contract (e.g. ''v1'')';
 COMMENT ON COLUMN analytics.agent_definition.prompt_version
     IS 'Version of the system prompt template (e.g. ''v1'')';
+COMMENT ON COLUMN analytics.agent_definition.model
+    IS 'LLM model identifier for this agent (e.g. ''gpt-4o'', ''claude-sonnet-4-20250514''). NULL means use agent_name as fallback.';
 
 -- updated_at trigger (reuses analytics.update_updated_at_column from 008)
 DROP TRIGGER IF EXISTS trg_agent_definition_updated_at

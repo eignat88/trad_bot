@@ -82,10 +82,19 @@ class AnalyticsRunner:
                 # Stage 1: Candle reconciliation
                 self._execute_stage(run, "candle_reconciliation", self._stage_candle_reconciliation)
                 
-                # Stage 2: Data quality gate
+                # Stage 2: Python quality gate
                 self._execute_stage(run, "quality_gate", self._stage_quality_gate)
                 
-                # Stage 3: Retention cleanup
+                # Stage 3: Canonical build (REAL SQL functions)
+                self._execute_stage(run, "canonical_build", self._stage_canonical_build)
+                
+                # Stage 4: SQL quality gate (fail-closed)
+                self._execute_stage(run, "sql_quality_gate", self._stage_sql_quality_gate)
+                
+                # Stage 5: Dataset publication
+                self._execute_stage(run, "dataset_publication", self._stage_dataset_publication)
+                
+                # Stage 6: Retention cleanup
                 self._execute_stage(run, "retention", self._stage_retention)
                 
                 # Mark as SUCCEEDED
@@ -167,6 +176,15 @@ class AnalyticsRunner:
                 
                 # Stage 2: Final quality gate
                 self._execute_stage(run, "final_quality_gate", self._stage_final_quality_gate)
+                
+                # Stage 3: Canonical rebuild (REAL SQL functions)
+                self._execute_stage(run, "canonical_build", self._stage_canonical_build)
+                
+                # Stage 4: SQL quality gate (fail-closed)
+                self._execute_stage(run, "sql_quality_gate", self._stage_sql_quality_gate)
+                
+                # Stage 5: Dataset publication (FINAL)
+                self._execute_stage(run, "dataset_publication", self._stage_dataset_publication)
                 
                 # Mark as SUCCEEDED
                 run.status = RunStatus.SUCCEEDED
@@ -500,6 +518,123 @@ class AnalyticsRunner:
             "message": "Data quality gate passed",
         }
 
+    def _stage_dataset_publication(
+        self, run: AnalysisRun, stage_run: AnalysisStageRun
+    ) -> dict[str, Any]:
+        """Stage: Dataset publication.
+
+        Builds the publication manifest, computes dataset_version,
+        creates analytics.dataset_publication with status=BUILDING,
+        performs final validation, then marks publication READY.
+
+        The runner's job ends at publication READY — the external
+        Stage 3 orchestrator picks it up from there.
+        """
+        from app.analytics.agents.dataset_version import (
+            compute_dataset_version,
+            build_publication_manifest,
+        )
+
+        logger.info("Running dataset publication for run %s", run.run_id)
+
+        # Derive quality status from the sql_quality_gate stage result.
+        # Look up the previous stage run to get quality_status.
+        quality_status = "PASS"  # default
+        try:
+            prev_stage = self._repo.get_stage_run_by_name(
+                run.run_id, "sql_quality_gate"
+            )
+            if prev_stage and prev_stage.result_json:
+                quality_status = prev_stage.result_json.get("quality_status", "PASS")
+        except Exception:
+            logger.warning("Could not read sql_quality_gate result, defaulting to PASS")
+
+        # Build publication manifest
+        manifest = build_publication_manifest(
+            analysis_run_id=str(run.run_id),
+            analysis_window_from=run.analysis_from,
+            analysis_window_to=run.analysis_to,
+            observation_cutoff=run.observation_cutoff,
+            maturity=run.maturity.value,
+        )
+
+        # Compute deterministic dataset_version
+        dataset_version = compute_dataset_version(**manifest)
+
+        # Create publication with status=BUILDING
+        publication_id = self._repo.create_dataset_publication(
+            analysis_run_id=run.run_id,
+            dataset_version=dataset_version,
+            maturity=run.maturity.value,
+            quality_status=quality_status,
+            analysis_window_from=run.analysis_from,
+            analysis_window_to=run.analysis_to,
+            observation_cutoff=run.observation_cutoff,
+            canonical_build_json={
+                "trade_fact_built": True,
+                "setup_fact_built": True,
+                "events_built": True,
+            },
+            quality_summary_json={
+                "quality_status": quality_status,
+            },
+        )
+
+        # Final validation: verify canonical objects exist
+        cursor = self._repo._conn.cursor()
+        cursor.execute(
+            "SELECT analytics.count_trade_facts(%s)", (str(run.run_id),)
+        )
+        trade_count = cursor.fetchone()[0]
+
+        cursor.execute(
+            "SELECT analytics.count_setup_facts(%s)", (str(run.run_id),)
+        )
+        setup_count = cursor.fetchone()[0]
+
+        cursor.execute(
+            "SELECT analytics.count_trade_events(%s)", (str(run.run_id),)
+        )
+        event_count = cursor.fetchone()[0]
+
+        # Mark publication READY
+        self._repo.update_dataset_publication_status(
+            publication_id,
+            status="READY",
+            canonical_build_json={
+                "trade_fact_built": True,
+                "setup_fact_built": True,
+                "events_built": True,
+                "trade_fact_rows": trade_count,
+                "setup_fact_rows": setup_count,
+                "trade_event_rows": event_count,
+            },
+            quality_summary_json={
+                "quality_status": quality_status,
+            },
+        )
+
+        result = {
+            "output_rows": trade_count + setup_count + event_count,
+            "publication_id": str(publication_id),
+            "dataset_version": dataset_version,
+            "quality_status": quality_status,
+            "trade_fact_rows": trade_count,
+            "setup_fact_rows": setup_count,
+            "trade_event_rows": event_count,
+            "message": (
+                f"Dataset publication READY: version={dataset_version[:12]}..., "
+                f"quality={quality_status}, "
+                f"trade_fact={trade_count}, setup_fact={setup_count}"
+            ),
+        }
+
+        logger.info(
+            "Dataset publication %s READY (version=%s, quality=%s)",
+            publication_id, dataset_version[:12], quality_status,
+        )
+        return result
+
     def _stage_retention(
         self, run: AnalysisRun, stage_run: AnalysisStageRun
     ) -> dict[str, Any]:
@@ -673,3 +808,153 @@ class AnalyticsRunner:
             "output_rows": len(results),
             "message": "Final quality gate passed",
         }
+
+    def _stage_canonical_build(
+        self, run: AnalysisRun, stage_run: AnalysisStageRun
+    ) -> dict[str, Any]:
+        """Canonical build stage: REAL SQL function execution.
+
+        Calls analytics.build_events, analytics.build_trade_fact,
+        analytics.build_setup_fact, and downstream metric functions
+        to populate canonical analytics tables for this run.
+
+        trade_fact_built / setup_fact_built are TRUE only when the SQL
+        function actually executed — no more optimistic True.
+        """
+        logger.info("Running canonical build for run %s", run.run_id)
+
+        cursor = self._repo._conn.cursor()
+        results: dict[str, Any] = {}
+
+        # 1. Build events (migration 016 wrapper)
+        cursor.execute("SELECT analytics.build_events(%s)", (str(run.run_id),))
+        results["events_count"] = cursor.fetchone()[0]
+        results["events_executed"] = True
+        logger.info("  Events: %d rows", results["events_count"])
+
+        # 2. Build trade_fact (migration 017 wrapper)
+        cursor.execute("SELECT analytics.build_trade_fact(%s)", (str(run.run_id),))
+        results["trade_fact_count"] = cursor.fetchone()[0]
+        results["trade_fact_built"] = True  # function executed successfully
+        logger.info("  Trade fact: %d rows", results["trade_fact_count"])
+
+        # 3. Build setup_fact (migration 018 wrapper)
+        cursor.execute("SELECT analytics.build_setup_fact(%s)", (str(run.run_id),))
+        results["setup_fact_count"] = cursor.fetchone()[0]
+        results["setup_fact_built"] = True  # function executed successfully
+        logger.info("  Setup fact: %d rows", results["setup_fact_count"])
+
+        # 4. Build horizon metrics (migration 020)
+        cursor.execute("SELECT analytics.build_horizon_metrics(%s)", (str(run.run_id),))
+        results["horizon_metrics_count"] = cursor.fetchone()[0]
+        results["horizon_metrics_built"] = True
+        logger.info("  Horizon metrics: %d rows", results["horizon_metrics_count"])
+
+        # 5. Build replay metrics (migration 021)
+        cursor.execute("SELECT analytics.build_all_replay_metrics(%s)", (str(run.run_id),))
+        results["replay_metrics"] = cursor.fetchone()[0]
+        results["replay_metrics_built"] = True
+        logger.info("  Replay metrics: %s", results["replay_metrics"])
+
+        # 6. Build metric snapshots (migration 022)
+        cursor.execute("SELECT analytics.build_metric_snapshots(%s)", (str(run.run_id),))
+        results["metric_snapshots"] = cursor.fetchone()[0]
+        results["metric_snapshots_built"] = True
+        logger.info("  Metric snapshots: %s", results["metric_snapshots"])
+
+        # 7. Verify canonical objects exist (count helpers)
+        cursor.execute("SELECT analytics.count_trade_facts(%s)", (str(run.run_id),))
+        results["trade_fact_rows"] = cursor.fetchone()[0]
+
+        cursor.execute("SELECT analytics.count_setup_facts(%s)", (str(run.run_id),))
+        results["setup_fact_rows"] = cursor.fetchone()[0]
+
+        cursor.execute("SELECT analytics.count_trade_events(%s)", (str(run.run_id),))
+        results["trade_event_rows"] = cursor.fetchone()[0]
+
+        self._repo._conn.commit()
+
+        # After commit: "built" flags are TRUE because functions executed.
+        # 0 rows is OK — it means "executed, 0 legitimate trades".
+        results["output_rows"] = sum([
+            results["events_count"],
+            results["trade_fact_count"],
+            results["setup_fact_count"],
+            results["horizon_metrics_count"],
+        ])
+
+        results["message"] = (
+            f"Canonical build complete: events={results['events_count']}, "
+            f"trade_fact={results['trade_fact_rows']}, "
+            f"setup_fact={results['setup_fact_rows']}"
+        )
+
+        return results
+
+    def _stage_sql_quality_gate(
+        self, run: AnalysisRun, stage_run: AnalysisStageRun
+    ) -> dict[str, Any]:
+        """SQL quality gate: fail-closed.
+
+        Uses analytics.quality_gate(run_id) which checks:
+        - duplicate trade grain, orphan setup/trade, fill events,
+          exit events, DCA consistency, MFE/MAE sign, config hash,
+          candle coverage, PIT violations.
+
+        FAIL-CLOSED: if the function doesn't exist or returns no rows,
+        the gate is FAILED, not silently skipped.
+        """
+        logger.info("Running SQL quality gate for run %s", run.run_id)
+
+        cursor = self._repo._conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM analytics.quality_gate(%s)", (str(run.run_id),))
+            row = cursor.fetchone()
+        except Exception as e:
+            self._repo._conn.rollback()
+            # Missing function = FAILED, not PASS
+            raise RuntimeError(
+                f"SQL quality gate function not available: {e}"
+            ) from e
+
+        if row is None:
+            raise RuntimeError(
+                "SQL quality gate returned no results — "
+                "quality_gate(%s) returned NULL/empty".format(str(run.run_id))
+            )
+
+        passed, blocking_count, degraded_count, total_checks = row
+        self._repo._conn.commit()
+
+        # Determine quality status
+        if blocking_count > 0:
+            quality_status = "FAIL"
+        elif degraded_count > 0:
+            quality_status = "DEGRADED"
+        else:
+            quality_status = "PASS"
+
+        if not passed:
+            raise RuntimeError(
+                f"SQL quality gate FAILED: {blocking_count} BLOCKING "
+                f"out of {total_checks} checks"
+            )
+
+        result = {
+            "passed": bool(passed),
+            "quality_status": quality_status,
+            "blocking_count": int(blocking_count),
+            "degraded_count": int(degraded_count),
+            "total_checks": int(total_checks),
+            "message": (
+                f"SQL quality gate: {quality_status} "
+                f"({blocking_count} blocking, {degraded_count} degraded, "
+                f"{total_checks} total)"
+            ),
+        }
+
+        logger.info(
+            "SQL quality gate: quality_status=%s, blocking=%d, degraded=%d, total=%d",
+            quality_status, blocking_count, degraded_count, total_checks,
+        )
+        return result

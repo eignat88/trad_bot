@@ -86,6 +86,7 @@ class AgentDefinition:
     agent_type: AgentType = AgentType.SPECIALIST
     contract_version: str = "v1"
     prompt_version: str = "v1"
+    model: Optional[str] = None  # LLM model identifier (separate from agent_name)
     enabled: bool = True
     description: Optional[str] = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))

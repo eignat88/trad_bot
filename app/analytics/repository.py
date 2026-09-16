@@ -632,25 +632,27 @@ class AnalyticsRepository:
                 """
                 INSERT INTO analytics.agent_definition (
                     agent_name, agent_type, contract_version, prompt_version,
-                    enabled, description
+                    model, enabled, description
                 ) VALUES (
                     %s, %s, %s, %s,
-                    %s, %s
+                    %s, %s, %s
                 )
                 ON CONFLICT (agent_name) DO UPDATE SET
                     agent_type = EXCLUDED.agent_type,
                     contract_version = EXCLUDED.contract_version,
                     prompt_version = EXCLUDED.prompt_version,
+                    model = EXCLUDED.model,
                     enabled = EXCLUDED.enabled,
                     description = EXCLUDED.description
                 RETURNING agent_name, agent_type, contract_version, prompt_version,
-                          enabled, description, created_at, updated_at
+                          model, enabled, description, created_at, updated_at
                 """,
                 (
                     defn.agent_name,
                     defn.agent_type.value,
                     defn.contract_version,
                     defn.prompt_version,
+                    defn.model,
                     defn.enabled,
                     defn.description,
                 ),
@@ -662,10 +664,11 @@ class AnalyticsRepository:
                 agent_type=AgentType(row[1]),
                 contract_version=row[2],
                 prompt_version=row[3],
-                enabled=row[4],
-                description=row[5],
-                created_at=row[6],
-                updated_at=row[7],
+                model=row[4],
+                enabled=row[5],
+                description=row[6],
+                created_at=row[7],
+                updated_at=row[8],
             )
             logger.info("Created/upserted agent definition: %s", defn.agent_name)
             return result
@@ -681,7 +684,7 @@ class AnalyticsRepository:
             cursor.execute(
                 """
                 SELECT agent_name, agent_type, contract_version, prompt_version,
-                       enabled, description, created_at, updated_at
+                       model, enabled, description, created_at, updated_at
                 FROM analytics.agent_definition
                 WHERE agent_name = %s
                 """,
@@ -695,10 +698,11 @@ class AnalyticsRepository:
                 agent_type=AgentType(row[1]),
                 contract_version=row[2],
                 prompt_version=row[3],
-                enabled=row[4],
-                description=row[5],
-                created_at=row[6],
-                updated_at=row[7],
+                model=row[4],
+                enabled=row[5],
+                description=row[6],
+                created_at=row[7],
+                updated_at=row[8],
             )
         except Exception as e:
             logger.error("Failed to get agent definition: %s", e)
@@ -712,7 +716,7 @@ class AnalyticsRepository:
                 cursor.execute(
                     """
                     SELECT agent_name, agent_type, contract_version, prompt_version,
-                           enabled, description, created_at, updated_at
+                           model, enabled, description, created_at, updated_at
                     FROM analytics.agent_definition
                     WHERE enabled = TRUE
                     ORDER BY agent_name
@@ -722,7 +726,7 @@ class AnalyticsRepository:
                 cursor.execute(
                     """
                     SELECT agent_name, agent_type, contract_version, prompt_version,
-                           enabled, description, created_at, updated_at
+                           model, enabled, description, created_at, updated_at
                     FROM analytics.agent_definition
                     ORDER BY agent_name
                     """
@@ -734,10 +738,11 @@ class AnalyticsRepository:
                     agent_type=AgentType(r[1]),
                     contract_version=r[2],
                     prompt_version=r[3],
-                    enabled=r[4],
-                    description=r[5],
-                    created_at=r[6],
-                    updated_at=r[7],
+                    model=r[4],
+                    enabled=r[5],
+                    description=r[6],
+                    created_at=r[7],
+                    updated_at=r[8],
                 )
                 for r in rows
             ]
@@ -1272,3 +1277,359 @@ class AnalyticsRepository:
             agent_run_ids=json.loads(row[14]) if row[14] else [],
             created_at=row[15],
         )
+
+    # ============================================================
+    # Dataset Publication
+    # ============================================================
+
+    def create_dataset_publication(
+        self,
+        analysis_run_id: UUID,
+        dataset_version: str,
+        maturity: str,
+        quality_status: str,
+        analysis_window_from: datetime,
+        analysis_window_to: datetime,
+        observation_cutoff: datetime,
+        canonical_build_json: Optional[dict] = None,
+        quality_summary_json: Optional[dict] = None,
+    ) -> UUID:
+        """Create a new dataset publication. Returns publication_id.
+
+        Also inserts an initial CREATED event into the publication log.
+        """
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO analytics.dataset_publication (
+                    analysis_run_id, dataset_version, maturity,
+                    status, quality_status,
+                    analysis_window_from, analysis_window_to,
+                    observation_cutoff,
+                    canonical_build_json, quality_summary_json
+                ) VALUES (
+                    %s, %s, %s,
+                    'BUILDING', %s,
+                    %s, %s,
+                    %s,
+                    %s, %s
+                )
+                RETURNING publication_id
+                """,
+                (
+                    str(analysis_run_id),
+                    dataset_version,
+                    maturity,
+                    quality_status,
+                    analysis_window_from,
+                    analysis_window_to,
+                    observation_cutoff,
+                    json.dumps(canonical_build_json) if canonical_build_json else "{}",
+                    json.dumps(quality_summary_json) if quality_summary_json else "{}",
+                ),
+            )
+            row = cursor.fetchone()
+            publication_id = row[0]
+
+            # Log the creation event
+            cursor.execute(
+                """
+                INSERT INTO analytics.dataset_publication_log (
+                    publication_id, event_type, event_json
+                ) VALUES (%s, 'CREATED', %s)
+                """,
+                (
+                    str(publication_id),
+                    json.dumps({
+                        "dataset_version": dataset_version,
+                        "maturity": maturity,
+                        "quality_status": quality_status,
+                    }),
+                ),
+            )
+
+            self._conn.commit()
+            logger.info(
+                "Created dataset publication %s for run %s (maturity=%s)",
+                publication_id, analysis_run_id, maturity,
+            )
+            return publication_id
+        except Exception as e:
+            self._conn.rollback()
+            logger.error("Failed to create dataset publication: %s", e)
+            raise
+
+    def get_dataset_publication(
+        self, analysis_run_id: UUID, maturity: str
+    ) -> Optional[dict]:
+        """Get dataset publication by analysis_run_id and maturity."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT publication_id, analysis_run_id, dataset_version,
+                       maturity, status, quality_status,
+                       canonical_schema_version,
+                       analysis_window_from, analysis_window_to,
+                       observation_cutoff,
+                       canonical_build_json, quality_summary_json,
+                       published_at, created_at, updated_at
+                FROM analytics.dataset_publication
+                WHERE analysis_run_id = %s AND maturity = %s
+                """,
+                (str(analysis_run_id), maturity),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            return {
+                "publication_id": row[0],
+                "analysis_run_id": row[1],
+                "dataset_version": row[2],
+                "maturity": row[3],
+                "status": row[4],
+                "quality_status": row[5],
+                "canonical_schema_version": row[6],
+                "analysis_window_from": row[7],
+                "analysis_window_to": row[8],
+                "observation_cutoff": row[9],
+                "canonical_build_json": row[10],
+                "quality_summary_json": row[11],
+                "published_at": row[12],
+                "created_at": row[13],
+                "updated_at": row[14],
+            }
+        except Exception as e:
+            logger.error("Failed to get dataset publication: %s", e)
+            raise
+
+    def get_dataset_publication_by_version(
+        self, dataset_version: str
+    ) -> Optional[dict]:
+        """Get dataset publication by version hash."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT publication_id, analysis_run_id, dataset_version,
+                       maturity, status, quality_status,
+                       canonical_schema_version,
+                       analysis_window_from, analysis_window_to,
+                       observation_cutoff,
+                       canonical_build_json, quality_summary_json,
+                       published_at, created_at, updated_at
+                FROM analytics.dataset_publication
+                WHERE dataset_version = %s
+                """,
+                (dataset_version,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            return {
+                "publication_id": row[0],
+                "analysis_run_id": row[1],
+                "dataset_version": row[2],
+                "maturity": row[3],
+                "status": row[4],
+                "quality_status": row[5],
+                "canonical_schema_version": row[6],
+                "analysis_window_from": row[7],
+                "analysis_window_to": row[8],
+                "observation_cutoff": row[9],
+                "canonical_build_json": row[10],
+                "quality_summary_json": row[11],
+                "published_at": row[12],
+                "created_at": row[13],
+                "updated_at": row[14],
+            }
+        except Exception as e:
+            logger.error("Failed to get dataset publication by version: %s", e)
+            raise
+
+    def update_dataset_publication_status(
+        self,
+        publication_id: UUID,
+        status: str,
+        quality_status: Optional[str] = None,
+        canonical_build_json: Optional[dict] = None,
+        quality_summary_json: Optional[dict] = None,
+    ) -> None:
+        """Update publication status. Also logs the event.
+
+        Sets ``published_at`` to ``NOW()`` when status transitions to READY.
+        """
+        try:
+            cursor = self._conn.cursor()
+
+            set_parts: list[str] = ["status = %s"]
+            params: list[Any] = [status]
+
+            if quality_status is not None:
+                set_parts.append("quality_status = %s")
+                params.append(quality_status)
+            if canonical_build_json is not None:
+                set_parts.append("canonical_build_json = %s")
+                params.append(json.dumps(canonical_build_json))
+            if quality_summary_json is not None:
+                set_parts.append("quality_summary_json = %s")
+                params.append(json.dumps(quality_summary_json))
+            if status == "READY":
+                set_parts.append("published_at = NOW()")
+
+            params.append(str(publication_id))
+
+            cursor.execute(
+                f"""
+                UPDATE analytics.dataset_publication
+                SET {', '.join(set_parts)}
+                WHERE publication_id = %s
+                """,
+                params,
+            )
+
+            # Determine log event type from the new status
+            event_type_map = {
+                "READY": "PUBLISHED",
+                "FAILED": "FAILED",
+                "BUILDING": "STATUS_CHANGE",
+            }
+            event_type = event_type_map.get(status, "STATUS_CHANGE")
+
+            event_payload: dict[str, Any] = {"new_status": status}
+            if quality_status is not None:
+                event_payload["quality_status"] = quality_status
+            if canonical_build_json is not None:
+                event_payload["canonical_build_json"] = canonical_build_json
+            if quality_summary_json is not None:
+                event_payload["quality_summary_json"] = quality_summary_json
+
+            cursor.execute(
+                """
+                INSERT INTO analytics.dataset_publication_log (
+                    publication_id, event_type, event_json
+                ) VALUES (%s, %s, %s)
+                """,
+                (str(publication_id), event_type, json.dumps(event_payload)),
+            )
+
+            self._conn.commit()
+            logger.info(
+                "Updated dataset publication %s status to %s",
+                publication_id, status,
+            )
+        except Exception as e:
+            self._conn.rollback()
+            logger.error("Failed to update dataset publication status: %s", e)
+            raise
+
+    def log_publication_event(
+        self,
+        publication_id: UUID,
+        event_type: str,
+        event_json: Optional[dict] = None,
+    ) -> None:
+        """Log a publication event to the append-only log."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO analytics.dataset_publication_log (
+                    publication_id, event_type, event_json
+                ) VALUES (%s, %s, %s)
+                """,
+                (str(publication_id), event_type, json.dumps(event_json) if event_json else "{}"),
+            )
+            self._conn.commit()
+            logger.info(
+                "Logged publication event '%s' for publication %s",
+                event_type, publication_id,
+            )
+        except Exception as e:
+            self._conn.rollback()
+            logger.error("Failed to log publication event: %s", e)
+            raise
+
+    def get_stage_run_by_name(
+        self, run_id: UUID, stage_name: str
+    ) -> Optional[AnalysisStageRun]:
+        """Get the latest stage run for a given stage name within an analysis run."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT stage_run_id, run_id, stage_name, attempt, status,
+                       input_rows, output_rows, watermark, result_json,
+                       started_at, finished_at, error_code, error_message
+                FROM analytics.analysis_stage_run
+                WHERE run_id = %s AND stage_name = %s
+                ORDER BY attempt DESC
+                LIMIT 1
+                """,
+                (str(run_id), stage_name),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            stage_run_id = row[0]
+            if isinstance(stage_run_id, str):
+                stage_run_id = UUID(stage_run_id)
+
+            run_id_val = row[1]
+            if isinstance(run_id_val, str):
+                run_id_val = UUID(run_id_val)
+
+            return AnalysisStageRun(
+                stage_run_id=stage_run_id,
+                run_id=run_id_val,
+                stage_name=row[2],
+                attempt=row[3],
+                status=StageStatus(row[4]),
+                input_rows=row[5],
+                output_rows=row[6],
+                watermark=row[7],
+                result_json=json.loads(row[8]) if row[8] else None,
+                started_at=row[9],
+                finished_at=row[10],
+                error_code=row[11],
+                error_message=row[12],
+            )
+        except Exception as e:
+            logger.error("Failed to get stage run by name: %s", e)
+            raise
+
+    def get_stale_agent_runs(
+        self, stale_timeout_seconds: int = 3600
+    ) -> list[dict]:
+        """Find agent runs stuck in RUNNING state for longer than timeout.
+
+        Returns a list of dicts with keys: agent_run_id, agent_name, started_at.
+        """
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT agent_run_id, agent_name, started_at
+                FROM analytics.agent_run
+                WHERE status = 'RUNNING'
+                  AND started_at < NOW() - make_interval(secs => %s)
+                ORDER BY started_at ASC
+                """,
+                (stale_timeout_seconds,),
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    "agent_run_id": row[0],
+                    "agent_name": row[1],
+                    "started_at": row[2],
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            logger.error("Failed to get stale agent runs: %s", e)
+            raise
