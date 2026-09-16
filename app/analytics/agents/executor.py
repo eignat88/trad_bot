@@ -58,8 +58,13 @@ class AgentExecutor:
         definition: AgentDefinition,
         manifest: AgentInputManifest,
         timeout_s: float = 120.0,
+        prompt_builder_override: Optional[Any] = None,
     ) -> AgentExecutionResult:
-        """Execute a single agent invocation."""
+        """Execute a single agent invocation.
+        
+        prompt_builder_override allows the orchestrator to inject a
+        specialist-specific prompt builder instead of the default one.
+        """
         try:
             # 0. Validate model is configured (fail-closed)
             if not definition.model or not definition.model.strip():
@@ -73,8 +78,9 @@ class AgentExecutor:
                     ),
                 )
 
-            # 1. Build prompt
-            prompt_data = self._prompt_builder(definition, manifest)
+            # 1. Build prompt (use override if provided, else default)
+            prompt_builder = prompt_builder_override or self._prompt_builder
+            prompt_data = prompt_builder(definition, manifest)
 
             # 2. Call LLM — model comes from definition.model (validated above)
             response = await self._model_client.generate(

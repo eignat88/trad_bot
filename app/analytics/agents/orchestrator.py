@@ -131,11 +131,15 @@ class AgentOrchestrator:
         executor: AgentExecutor,
         readiness_gate: Optional[DataReadinessGate] = None,
         retry_policy: Optional[RetryPolicyV1] = None,
+        data_repo: Optional[Any] = None,
+        specialist_registry: Optional[dict[str, Any]] = None,
     ):
         self._repo = repository
         self._executor = executor
         self._readiness = readiness_gate or DataReadinessGate()
         self._retry_policy = retry_policy or RetryPolicyV1()
+        self._data_repo = data_repo
+        self._specialist_registry = specialist_registry or {}
 
     # ── Public entry point ────────────────────────────────────────────
 
@@ -311,6 +315,7 @@ class AgentOrchestrator:
         """Run a single specialist agent with retry and repair logic.
         
         Each retry/repair attempt creates a NEW agent_run (separate execution).
+        Uses the specialist registry to find assembler and prompt builder.
         """
         logger.info("Running specialist: %s", agent_name)
 
@@ -324,6 +329,16 @@ class AgentOrchestrator:
                 prompt_version="v1",
             )
             self._repo.create_agent_definition(definition)
+
+        # Check if agent is enabled
+        if not definition.enabled:
+            logger.info("Agent %s is disabled — skipping", agent_name)
+            return AgentExecutionResult(
+                status=AgentRunStatus.SKIPPED,
+                result=None,
+                error_code=AgentErrorCode.DATASET_NOT_READY,
+                error_message=f"Agent {agent_name} is disabled",
+            )
 
         # ── Idempotency check (Fix #9) ───────────────────────────────
         existing_runs = self._repo.get_agent_runs_for_analysis(analysis_run_id)
@@ -349,6 +364,37 @@ class AgentOrchestrator:
                             result=result,
                         )
 
+        # ── Assemble specialist input ─────────────────────────────────
+        specialist_input = None
+        if self._data_repo and agent_name in self._specialist_registry:
+            reg = self._specialist_registry[agent_name]
+            assembler_cls = reg.get("assembler_class")
+            if assembler_cls and callable(assembler_cls):
+                try:
+                    assembler = assembler_cls(self._data_repo)
+                    specialist_input = assembler.assemble(
+                        run_id=analysis_run_id,
+                        dataset_version=dataset_version,
+                        maturity=maturity,
+                        quality_status=readiness.quality_status,
+                        limitations=list(readiness.limitations),
+                        analysis_window_from=str(readiness.analysis_window_from),
+                        analysis_window_to=str(readiness.analysis_window_to),
+                    )
+                    logger.info(
+                        "Assembled input for %s: %d metrics, %d segments, %d cases, %d evidence",
+                        agent_name,
+                        len(specialist_input.metrics),
+                        len(specialist_input.segments),
+                        len(specialist_input.cases),
+                        len(specialist_input.evidence_ids),
+                    )
+                except Exception as e:
+                    logger.error("Input assembly failed for %s: %s", agent_name, e)
+
+        # ── Build prompt builder that uses assembled input ─────────────
+        prompt_builder = self._make_prompt_builder(agent_name, specialist_input)
+
         # ── Execute with retry (each attempt = new agent_run) ─────────
         policy = self._retry_policy
         final_result = None
@@ -362,6 +408,7 @@ class AgentOrchestrator:
                 dataset_version=dataset_version,
                 maturity=maturity,
                 readiness=readiness,
+                specialist_input=specialist_input,
             )
             manifest = self._repo.create_input_manifest(manifest)
 
@@ -372,8 +419,11 @@ class AgentOrchestrator:
                 started_at=datetime.now(timezone.utc),
             )
 
-            # Execute
-            result = await self._executor.execute(definition=definition, manifest=manifest)
+            # Execute with specialist-specific prompt builder
+            result = await self._executor.execute(
+                definition=definition, manifest=manifest,
+                prompt_builder_override=prompt_builder,
+            )
 
             if result.status in (AgentRunStatus.SUCCEEDED, AgentRunStatus.DEGRADED):
                 # Atomic persist: result + terminal status
@@ -497,20 +547,40 @@ class AgentOrchestrator:
 
     # ── Manifest builder (Fix #8) ────────────────────────────────────
 
+    def _make_prompt_builder(self, agent_name: str, specialist_input: Any = None):
+        """Create a prompt builder for a specialist agent.
+        
+        Uses the specialist registry to find the prompt builder function.
+        Returns a callable that takes (definition, manifest) and returns
+        the prompt dict.
+        """
+        reg = self._specialist_registry.get(agent_name, {})
+        prompt_fn = reg.get("prompt_builder")
+        
+        if prompt_fn and specialist_input:
+            # Registry prompt builder takes specialist_input, not (definition, manifest)
+            def _build(definition, manifest):
+                return prompt_fn(specialist_input)
+            return _build
+        
+        # Fallback: use default prompt builder (returns empty prompt)
+        return self._executor._prompt_builder
+
     def _build_manifest(
         self,
         agent_run_id: UUID,
         dataset_version: str,
         maturity: str,
         readiness: DataReadinessResult,
+        specialist_input: Any = None,
     ) -> AgentInputManifest:
         """Build an immutable input manifest for an agent.
-
+        
         The ``input_hash`` is a SHA-256 fingerprint of the deterministic
         manifest fields, ensuring immutability can be verified downstream.
         
-        Fix #8: input_hash excludes agent_run_id — same business inputs 
-        produce same hash for retry detection.
+        If specialist_input is provided (from assembler), its evidence_ids,
+        metrics, segments, cases, and sample_sizes are included.
         """
         # input_hash = hash of BUSINESS inputs only
         business_data = {
@@ -525,10 +595,18 @@ class AgentOrchestrator:
             json.dumps(business_data, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
 
+        # Use assembled data if available, else empty defaults
+        evidence_ids = getattr(specialist_input, "evidence_ids", []) if specialist_input else []
+        sample_sizes = getattr(specialist_input, "sample_sizes", {}) if specialist_input else {}
+        metrics = getattr(specialist_input, "metrics", {}) if specialist_input else {}
+        segments = getattr(specialist_input, "segments", []) if specialist_input else []
+        cases = getattr(specialist_input, "cases", []) if specialist_input else []
+        limitations = list(getattr(specialist_input, "limitations", readiness.limitations) if specialist_input else readiness.limitations)
+
         return AgentInputManifest(
-            agent_run_id=agent_run_id,  # separate from hash
+            agent_run_id=agent_run_id,
             dataset_version=dataset_version,
-            input_hash=input_hash,  # same for retry with same business inputs
+            input_hash=input_hash,
             schema_version="v1",
             analysis_window_from=(
                 readiness.analysis_window_from or datetime.now(timezone.utc)
@@ -538,9 +616,13 @@ class AgentOrchestrator:
             ),
             maturity=maturity,
             data_quality_status=readiness.quality_status,
-            limitations=list(readiness.limitations),
+            limitations=limitations,
+            sample_sizes=sample_sizes,
+            metrics=metrics,
+            segments=segments,
+            cases=cases,
+            evidence_ids=evidence_ids,
             manifest_json=business_data,
-            evidence_ids=[],  # populated by input assembler in PR3
         )
 
     # ── Skip all agents (Fix #5) ─────────────────────────────────────
