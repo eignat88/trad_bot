@@ -195,9 +195,16 @@ class AgentOrchestrator:
         )
 
         # ── Step 1: Data Readiness Gate ───────────────────────────────
+        # Extract status as string for readiness gate
+        run_status_str = (
+            run.status.value
+            if hasattr(run.status, "value")
+            else str(run.status)
+        )
+        
         readiness = self._readiness.evaluate(
             run_id=analysis_run_id,
-            status=run.status,
+            status=run_status_str,
             maturity=maturity,
             dataset_version=dataset_version,
             publication_status=publication_status,
@@ -366,31 +373,55 @@ class AgentOrchestrator:
 
         # ── Assemble specialist input ─────────────────────────────────
         specialist_input = None
-        if self._data_repo and agent_name in self._specialist_registry:
-            reg = self._specialist_registry[agent_name]
-            assembler_cls = reg.get("assembler_class")
-            if assembler_cls and callable(assembler_cls):
-                try:
-                    assembler = assembler_cls(self._data_repo)
-                    specialist_input = assembler.assemble(
-                        run_id=analysis_run_id,
-                        dataset_version=dataset_version,
-                        maturity=maturity,
-                        quality_status=readiness.quality_status,
-                        limitations=list(readiness.limitations),
-                        analysis_window_from=str(readiness.analysis_window_from),
-                        analysis_window_to=str(readiness.analysis_window_to),
-                    )
-                    logger.info(
-                        "Assembled input for %s: %d metrics, %d segments, %d cases, %d evidence",
-                        agent_name,
-                        len(specialist_input.metrics),
-                        len(specialist_input.segments),
-                        len(specialist_input.cases),
-                        len(specialist_input.evidence_ids),
-                    )
-                except Exception as e:
-                    logger.error("Input assembly failed for %s: %s", agent_name, e)
+        reg = self._specialist_registry.get(agent_name)
+        
+        if reg and self._data_repo:
+            # Production path: registry entry found + data repo available
+            # Fail-closed: any infrastructure failure = FAILED
+            if not reg.assembler_class:
+                return AgentExecutionResult(
+                    status=AgentRunStatus.FAILED,
+                    result=None,
+                    error_code=AgentErrorCode.INVALID_INPUT,
+                    error_message=f"No assembler class for specialist {agent_name}",
+                )
+            if not reg.prompt_builder:
+                return AgentExecutionResult(
+                    status=AgentRunStatus.FAILED,
+                    result=None,
+                    error_code=AgentErrorCode.INVALID_INPUT,
+                    error_message=f"No prompt builder for specialist {agent_name}",
+                )
+            
+            try:
+                assembler = reg.assembler_class(self._data_repo)
+                specialist_input = assembler.assemble(
+                    run_id=analysis_run_id,
+                    dataset_version=dataset_version,
+                    maturity=maturity,
+                    quality_status=readiness.quality_status,
+                    limitations=list(readiness.limitations),
+                    analysis_window_from=str(readiness.analysis_window_from),
+                    analysis_window_to=str(readiness.analysis_window_to),
+                )
+                logger.info(
+                    "Assembled input for %s: %d metrics, %d segments, %d cases, %d evidence",
+                    agent_name,
+                    len(specialist_input.metrics),
+                    len(specialist_input.segments),
+                    len(specialist_input.cases),
+                    len(specialist_input.evidence_ids),
+                )
+            except Exception as e:
+                logger.exception("Input assembly failed for %s: %s", agent_name, e)
+                return AgentExecutionResult(
+                    status=AgentRunStatus.FAILED,
+                    result=None,
+                    error_code=AgentErrorCode.INPUT_ASSEMBLY_ERROR,
+                    error_message=f"Input assembly failed: {e}",
+                )
+        elif not reg:
+            logger.debug("No registry entry for %s — using default executor", agent_name)
 
         # ── Build prompt builder that uses assembled input ─────────────
         prompt_builder = self._make_prompt_builder(agent_name, specialist_input)
@@ -549,22 +580,25 @@ class AgentOrchestrator:
 
     def _make_prompt_builder(self, agent_name: str, specialist_input: Any = None):
         """Create a prompt builder for a specialist agent.
-        
+
         Uses the specialist registry to find the prompt builder function.
         Returns a callable that takes (definition, manifest) and returns
         the prompt dict.
+
+        Returns ``None`` when no registry entry or prompt builder is
+        available — production code must not fall back to an empty prompt.
         """
-        reg = self._specialist_registry.get(agent_name, {})
-        prompt_fn = reg.get("prompt_builder")
-        
-        if prompt_fn and specialist_input:
-            # Registry prompt builder takes specialist_input, not (definition, manifest)
+        reg = self._specialist_registry.get(agent_name)
+        if reg and reg.prompt_builder and specialist_input:
+            prompt_fn = reg.prompt_builder
+
             def _build(definition, manifest):
                 return prompt_fn(specialist_input)
+
             return _build
-        
-        # Fallback: use default prompt builder (returns empty prompt)
-        return self._executor._prompt_builder
+
+        # No fallback to empty prompt in production
+        return None
 
     def _build_manifest(
         self,
@@ -575,26 +609,16 @@ class AgentOrchestrator:
         specialist_input: Any = None,
     ) -> AgentInputManifest:
         """Build an immutable input manifest for an agent.
-        
+
         The ``input_hash`` is a SHA-256 fingerprint of the deterministic
         manifest fields, ensuring immutability can be verified downstream.
-        
+
         If specialist_input is provided (from assembler), its evidence_ids,
         metrics, segments, cases, and sample_sizes are included.
-        """
-        # input_hash = hash of BUSINESS inputs only
-        business_data = {
-            "dataset_version": dataset_version,
-            "maturity": maturity,
-            "quality_status": readiness.quality_status,
-            "limitations": list(readiness.limitations),
-            "analysis_window_from": str(readiness.analysis_window_from),
-            "analysis_window_to": str(readiness.analysis_window_to),
-        }
-        input_hash = hashlib.sha256(
-            json.dumps(business_data, sort_keys=True, default=str).encode("utf-8")
-        ).hexdigest()
 
+        The hash includes actual assembled content dimensions for
+        forensic reproducibility — not just dataset_version + maturity.
+        """
         # Use assembled data if available, else empty defaults
         evidence_ids = getattr(specialist_input, "evidence_ids", []) if specialist_input else []
         sample_sizes = getattr(specialist_input, "sample_sizes", {}) if specialist_input else {}
@@ -602,6 +626,24 @@ class AgentOrchestrator:
         segments = getattr(specialist_input, "segments", []) if specialist_input else []
         cases = getattr(specialist_input, "cases", []) if specialist_input else []
         limitations = list(getattr(specialist_input, "limitations", readiness.limitations) if specialist_input else readiness.limitations)
+
+        # Include assembled content in hash for forensic reproducibility
+        hash_content = {
+            "dataset_version": dataset_version,
+            "maturity": maturity,
+            "quality_status": readiness.quality_status,
+            "limitations": sorted(limitations),
+            "analysis_window_from": str(readiness.analysis_window_from),
+            "analysis_window_to": str(readiness.analysis_window_to),
+        }
+        if specialist_input:
+            hash_content["evidence_count"] = len(evidence_ids)
+            hash_content["metrics_count"] = len(metrics)
+            hash_content["segments_count"] = len(segments)
+            hash_content["cases_count"] = len(cases)
+        input_hash = hashlib.sha256(
+            json.dumps(hash_content, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
 
         return AgentInputManifest(
             agent_run_id=agent_run_id,
@@ -622,7 +664,7 @@ class AgentOrchestrator:
             segments=segments,
             cases=cases,
             evidence_ids=evidence_ids,
-            manifest_json=business_data,
+            manifest_json=hash_content,
         )
 
     # ── Skip all agents (Fix #5) ─────────────────────────────────────

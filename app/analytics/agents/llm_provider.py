@@ -1,7 +1,9 @@
 """Production OpenAI-compatible LLM client for Stage 3.
 
 Uses httpx for HTTP calls — no heavy SDK dependency.
-Falls back gracefully if provider is not configured.
+
+Fails closed: missing/invalid api_key raises ValueError at construction.
+Provider errors are classified into the Stage 3 error taxonomy.
 """
 from __future__ import annotations
 import json
@@ -17,6 +19,9 @@ logger = logging.getLogger(__name__)
 class OpenAICompatibleClient(AgentModelClient):
     """OpenAI-compatible API client using httpx.
 
+    Fails closed: missing/invalid api_key raises ValueError at construction.
+    Provider errors are classified into the Stage 3 error taxonomy.
+
     Works with OpenAI, Azure OpenAI, and compatible providers
     (vLLM, Ollama, etc.) that implement the /v1/chat/completions endpoint.
     """
@@ -31,7 +36,9 @@ class OpenAICompatibleClient(AgentModelClient):
         max_output_tokens: int = 4096,
         request_timeout_s: float = 120.0,
     ):
-        self._api_key = api_key
+        if not api_key or not api_key.strip():
+            raise ValueError("api_key is required and must not be empty/whitespace")
+        self._api_key = api_key.strip()
         self._base_url = base_url.rstrip("/")
         self._default_model = default_model
         self._temperature = temperature
@@ -47,8 +54,23 @@ class OpenAICompatibleClient(AgentModelClient):
         response_schema: Optional[Mapping[str, Any]] = None,
         timeout_s: float = 120.0,
     ) -> ModelResponse:
-        """Generate a response from the model."""
+        """Generate a response from the model.
+
+        Raises
+        ------
+        ValueError
+            If ``model`` is empty/missing.
+        RetryableError
+            For transient provider errors (timeout, rate-limit, 5xx).
+        TerminalError
+            For permanent failures (auth, empty response).
+        """
         import httpx
+        from app.analytics.agents.errors import AgentErrorCode, RetryableError, TerminalError
+
+        # model is required — no fallback
+        if not model:
+            raise ValueError("model parameter is required")
 
         effective_timeout = timeout_s or self._request_timeout_s
 
@@ -58,7 +80,7 @@ class OpenAICompatibleClient(AgentModelClient):
         ]
 
         payload: dict[str, Any] = {
-            "model": model or self._default_model,
+            "model": model,
             "messages": messages,
             "temperature": self._temperature,
             "max_tokens": self._max_output_tokens,
@@ -84,17 +106,52 @@ class OpenAICompatibleClient(AgentModelClient):
 
             latency_ms = int((time.monotonic() - start_time) * 1000)
 
-            if response.status_code != 200:
-                raise ConnectionError(
-                    f"LLM provider returned HTTP {response.status_code}: "
-                    f"{response.text[:200]}"
+            # ── HTTP error taxonomy ───────────────────────────────────
+            if response.status_code == 408 or response.status_code == 504:
+                raise RetryableError(
+                    AgentErrorCode.MODEL_TIMEOUT,
+                    f"HTTP {response.status_code}: request timed out",
+                )
+            elif response.status_code == 429:
+                raise RetryableError(
+                    AgentErrorCode.MODEL_RATE_LIMIT,
+                    f"HTTP 429: rate limit exceeded",
+                )
+            elif response.status_code in (500, 502, 503):
+                raise RetryableError(
+                    AgentErrorCode.MODEL_PROVIDER_ERROR,
+                    f"HTTP {response.status_code}: provider error",
+                )
+            elif response.status_code in (401, 403):
+                raise TerminalError(
+                    AgentErrorCode.SECURITY_POLICY_ERROR,
+                    f"HTTP {response.status_code}: auth failed — "
+                    "check api_key and permissions",
+                )
+            elif response.status_code != 200:
+                raise TerminalError(
+                    AgentErrorCode.MODEL_PROVIDER_ERROR,
+                    f"HTTP {response.status_code}: {response.text[:200]}",
                 )
 
             data = response.json()
 
-            # Extract content
-            choice = data.get("choices", [{}])[0]
+            # ── Empty response handling ───────────────────────────────
+            if not data.get("choices"):
+                raise TerminalError(
+                    AgentErrorCode.MODEL_EMPTY_RESPONSE,
+                    "No choices in response",
+                )
+
+            choice = data["choices"][0]
             content = choice.get("message", {}).get("content", "")
+
+            if not content:
+                raise TerminalError(
+                    AgentErrorCode.MODEL_EMPTY_RESPONSE,
+                    "Empty content in response",
+                )
+
             finish_reason = choice.get("finish_reason", "unknown")
 
             # Parse JSON

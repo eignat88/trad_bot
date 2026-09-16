@@ -137,6 +137,59 @@ class AgentExecutor:
                     model_response=response,
                 )
 
+            # 5b. Confidence policy enforcement
+            from app.analytics.agents.policies.confidence_v1 import ConfidencePolicyV1
+            from app.analytics.agents.models import ConfidenceLevel
+
+            policy = ConfidencePolicyV1()
+
+            # Compute max allowed confidence based on manifest context
+            total_sample = sum(manifest.sample_sizes.values()) if manifest.sample_sizes else 0
+            
+            # Count distinct analysis windows (24h, 7d, 30d) from metrics keys
+            window_periods = set()
+            for k in (manifest.metrics or {}).keys():
+                for period in ["24h", "7d", "30d"]:
+                    if period in str(k):
+                        window_periods.add(period)
+            windows_with_effect = len(window_periods)
+            has_gaps = any("gap" in lim.lower() for lim in (manifest.limitations or []))
+
+            allowed = policy.evaluate(
+                sample_size=total_sample,
+                maturity=manifest.maturity,
+                data_quality_status=manifest.data_quality_status,
+                windows_with_effect=windows_with_effect,
+                has_gaps=has_gaps,
+            )
+
+            # Downgrade if LLM confidence exceeds policy
+            reported = parsed.get("confidence", "LOW")
+            confidence_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+            if confidence_order.get(reported, 0) > confidence_order.get(allowed.value, 0):
+                downgrade_msg = (
+                    f"Confidence downgraded from {reported} to {allowed.value} "
+                    f"by ConfidencePolicyV1: sample_size={total_sample}, "
+                    f"maturity={manifest.maturity}, quality={manifest.data_quality_status}"
+                )
+                parsed["confidence"] = allowed.value
+                if "limitations" not in parsed:
+                    parsed["limitations"] = []
+                parsed["limitations"].append(downgrade_msg)
+                logger.info("Confidence downgraded: %s", downgrade_msg)
+
+                # Also downgrade observation-level confidence
+                for obs in parsed.get("observations", []):
+                    obs_conf = obs.get("confidence", "LOW")
+                    if confidence_order.get(obs_conf, 0) > confidence_order.get(allowed.value, 0):
+                        obs["confidence"] = allowed.value
+
+                # Also downgrade hypothesis-level confidence
+                for hyp in parsed.get("hypotheses", []):
+                    hyp_conf = hyp.get("confidence", "LOW")
+                    if confidence_order.get(hyp_conf, 0) > confidence_order.get(allowed.value, 0):
+                        hyp["confidence"] = allowed.value
+
             # 6. Compute result hash
             result_json = parsed
             result_hash = hashlib.sha256(
