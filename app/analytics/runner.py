@@ -216,6 +216,15 @@ class AnalyticsRunner:
                 run.status.value,
             )
             
+            # Stage 6: Agent orchestration (isolated — does NOT fail canonical)
+            if run.status == RunStatus.SUCCEEDED:
+                try:
+                    self._stage_agent_orchestration(run)
+                except Exception as e:
+                    logger.error(
+                        "Stage 3 agent orchestration failed for FINAL (canonical unaffected): %s", e
+                    )
+            
             return run
             
         finally:

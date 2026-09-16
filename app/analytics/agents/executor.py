@@ -53,6 +53,65 @@ class AgentExecutor:
         self._model_client = model_client
         self._prompt_builder = prompt_builder
 
+    @staticmethod
+    def _apply_confidence_policy(
+        parsed: dict[str, Any],
+        manifest: AgentInputManifest,
+    ) -> dict[str, Any]:
+        """Apply ConfidencePolicyV1 to the parsed LLM output.
+
+        Downgrades confidence at all levels (top-level, observations,
+        hypotheses) if LLM-reported confidence exceeds policy allowance.
+        Returns the (potentially modified) parsed dict.
+        """
+        from app.analytics.agents.policies.confidence_v1 import ConfidencePolicyV1
+
+        policy = ConfidencePolicyV1()
+
+        total_sample = sum(manifest.sample_sizes.values()) if manifest.sample_sizes else 0
+
+        window_periods: set[str] = set()
+        for k in (manifest.metrics or {}).keys():
+            for period in ["24h", "7d", "30d"]:
+                if period in str(k):
+                    window_periods.add(period)
+        windows_with_effect = len(window_periods)
+        has_gaps = any("gap" in lim.lower() for lim in (manifest.limitations or []))
+
+        allowed = policy.evaluate(
+            sample_size=total_sample,
+            maturity=manifest.maturity,
+            data_quality_status=manifest.data_quality_status,
+            windows_with_effect=windows_with_effect,
+            has_gaps=has_gaps,
+        )
+
+        reported = parsed.get("confidence", "LOW")
+        confidence_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+        if confidence_order.get(reported, 0) > confidence_order.get(allowed.value, 0):
+            downgrade_msg = (
+                f"Confidence downgraded from {reported} to {allowed.value} "
+                f"by ConfidencePolicyV1: sample_size={total_sample}, "
+                f"maturity={manifest.maturity}, quality={manifest.data_quality_status}"
+            )
+            parsed["confidence"] = allowed.value
+            if "limitations" not in parsed:
+                parsed["limitations"] = []
+            parsed["limitations"].append(downgrade_msg)
+            logger.info("Confidence downgraded: %s", downgrade_msg)
+
+            for obs in parsed.get("observations", []):
+                obs_conf = obs.get("confidence", "LOW")
+                if confidence_order.get(obs_conf, 0) > confidence_order.get(allowed.value, 0):
+                    obs["confidence"] = allowed.value
+
+            for hyp in parsed.get("hypotheses", []):
+                hyp_conf = hyp.get("confidence", "LOW")
+                if confidence_order.get(hyp_conf, 0) > confidence_order.get(allowed.value, 0):
+                    hyp["confidence"] = allowed.value
+
+        return parsed
+
     async def execute(
         self,
         definition: AgentDefinition,
@@ -138,57 +197,7 @@ class AgentExecutor:
                 )
 
             # 5b. Confidence policy enforcement
-            from app.analytics.agents.policies.confidence_v1 import ConfidencePolicyV1
-            from app.analytics.agents.models import ConfidenceLevel
-
-            policy = ConfidencePolicyV1()
-
-            # Compute max allowed confidence based on manifest context
-            total_sample = sum(manifest.sample_sizes.values()) if manifest.sample_sizes else 0
-            
-            # Count distinct analysis windows (24h, 7d, 30d) from metrics keys
-            window_periods = set()
-            for k in (manifest.metrics or {}).keys():
-                for period in ["24h", "7d", "30d"]:
-                    if period in str(k):
-                        window_periods.add(period)
-            windows_with_effect = len(window_periods)
-            has_gaps = any("gap" in lim.lower() for lim in (manifest.limitations or []))
-
-            allowed = policy.evaluate(
-                sample_size=total_sample,
-                maturity=manifest.maturity,
-                data_quality_status=manifest.data_quality_status,
-                windows_with_effect=windows_with_effect,
-                has_gaps=has_gaps,
-            )
-
-            # Downgrade if LLM confidence exceeds policy
-            reported = parsed.get("confidence", "LOW")
-            confidence_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
-            if confidence_order.get(reported, 0) > confidence_order.get(allowed.value, 0):
-                downgrade_msg = (
-                    f"Confidence downgraded from {reported} to {allowed.value} "
-                    f"by ConfidencePolicyV1: sample_size={total_sample}, "
-                    f"maturity={manifest.maturity}, quality={manifest.data_quality_status}"
-                )
-                parsed["confidence"] = allowed.value
-                if "limitations" not in parsed:
-                    parsed["limitations"] = []
-                parsed["limitations"].append(downgrade_msg)
-                logger.info("Confidence downgraded: %s", downgrade_msg)
-
-                # Also downgrade observation-level confidence
-                for obs in parsed.get("observations", []):
-                    obs_conf = obs.get("confidence", "LOW")
-                    if confidence_order.get(obs_conf, 0) > confidence_order.get(allowed.value, 0):
-                        obs["confidence"] = allowed.value
-
-                # Also downgrade hypothesis-level confidence
-                for hyp in parsed.get("hypotheses", []):
-                    hyp_conf = hyp.get("confidence", "LOW")
-                    if confidence_order.get(hyp_conf, 0) > confidence_order.get(allowed.value, 0):
-                        hyp["confidence"] = allowed.value
+            parsed = self._apply_confidence_policy(parsed, manifest)
 
             # 6. Compute result hash
             result_json = parsed
@@ -227,12 +236,13 @@ class AgentExecutor:
         manifest: AgentInputManifest,
         original_error: str,
         timeout_s: float = 120.0,
+        prompt_builder_override: Optional[Any] = None,
     ) -> AgentExecutionResult:
         """Attempt to repair a failed execution (schema validation error).
 
         Per spec: one repair attempt, then FAILED.
+        Uses the SAME input and specialist prompt as the original execution.
         """
-        # For repair, we add the error to the prompt and retry
         try:
             # Validate model (fail-closed)
             if not definition.model or not definition.model.strip():
@@ -243,7 +253,8 @@ class AgentExecutor:
                     error_message=f"Agent '{definition.agent_name}' has no model configured for repair.",
                 )
 
-            prompt_data = self._prompt_builder(definition, manifest)
+            prompt_builder = prompt_builder_override or self._prompt_builder
+            prompt_data = prompt_builder(definition, manifest)
             repair_prompt = (
                 prompt_data.get("system_prompt", "")
                 + f"\n\nIMPORTANT: Your previous response had validation errors: {original_error}. "
@@ -298,6 +309,9 @@ class AgentExecutor:
                     error_message=f"Repair evidence validation failed: {invalid_refs}",
                     model_response=response,
                 )
+
+            # Confidence enforcement (same as execute path)
+            parsed = self._apply_confidence_policy(parsed, manifest)
 
             result_hash = hashlib.sha256(
                 json.dumps(parsed, sort_keys=True, default=str).encode("utf-8")

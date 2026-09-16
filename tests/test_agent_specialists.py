@@ -873,14 +873,26 @@ class TestAssemblyFailClosed:
         assert agent_result["status"] == "FAILED"
         assert "INPUT_ASSEMBLY_ERROR" == agent_result["error_code"]
 
-    def test_missing_registry_uses_default_executor(self):
-        """#4: no registry entry → proceed with default executor (existing behavior)."""
-        from app.analytics.agents.orchestrator import AgentOrchestrator
+    def test_missing_registry_for_production_fails_closed(self):
+        """#15: no registry entry for production specialist → FAILED."""
+        from app.analytics.agents.orchestrator import AgentOrchestrator, SPECIALIST_AGENTS
         
-        repo = _make_repo_mock()
+        repo = MagicMock()
+        repo.get_analysis_run.return_value = _make_analysis_run()
+        repo.get_dataset_publication.return_value = _make_publication()
+        repo.get_quality_results.return_value = []
+        repo.get_agent_definition.return_value = AgentDefinition(
+            agent_name=SPECIALIST_AGENTS[0], agent_type="SPECIALIST", model="test",
+        )
+        repo.get_agent_runs_for_analysis.return_value = []
+        repo.get_next_attempt.return_value = 1
+        repo.create_agent_run.side_effect = lambda r: r
+        repo.create_input_manifest.side_effect = lambda m: m
+        repo.get_agent_result.return_value = None
+        repo.get_input_manifest.return_value = None
+        repo.get_stale_agent_runs.return_value = []
+        
         executor = AsyncMock(return_value=_make_success_result())
-        
-        # No specialist_registry → should use default executor path
         orch = AgentOrchestrator(
             repository=repo, executor=executor,
             data_repo=MagicMock(), specialist_registry={},
@@ -888,9 +900,11 @@ class TestAssemblyFailClosed:
         
         result = _run_async(orch.run(analysis_run_id=uuid4(), maturity="FINAL"))
         
-        # Should proceed with default executor
-        assert result["status"] == "COMPLETED"
-        executor.execute.assert_called()
+        # Production specialist with empty registry → FAILED
+        agent_result = result["agents"].get(SPECIALIST_AGENTS[0])
+        assert agent_result is not None
+        assert agent_result["status"] == "FAILED"
+        assert agent_result["error_code"] == "INVALID_INPUT"
 
 
 # ── PR3 CORRECTION: Confidence enforcement ─────────────────────────────

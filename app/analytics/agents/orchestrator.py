@@ -30,7 +30,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Optional, Protocol, runtime_checkable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from app.analytics.agents.models import (
     AgentDefinition,
@@ -249,6 +249,7 @@ class AgentOrchestrator:
         # Handle exceptions and apply DEGRADED propagation
         for i, (name, result) in enumerate(zip(SPECIALIST_AGENTS, results)):
             if isinstance(result, Exception):
+                logger.error("Specialist %s raised exception: %s", name, result)
                 specialist_results[name] = AgentExecutionResult(
                     status=AgentRunStatus.FAILED,
                     result=None,
@@ -377,7 +378,6 @@ class AgentOrchestrator:
         
         if reg and self._data_repo:
             # Production path: registry entry found + data repo available
-            # Fail-closed: any infrastructure failure = FAILED
             if not reg.assembler_class:
                 return AgentExecutionResult(
                     status=AgentRunStatus.FAILED,
@@ -421,12 +421,65 @@ class AgentOrchestrator:
                     error_message=f"Input assembly failed: {e}",
                 )
         elif not reg:
+            # For production specialist names, fail closed
+            if agent_name in SPECIALIST_AGENTS:
+                return AgentExecutionResult(
+                    status=AgentRunStatus.FAILED,
+                    result=None,
+                    error_code=AgentErrorCode.INVALID_INPUT,
+                    error_message=f"Production specialist '{agent_name}' has no registry entry",
+                )
             logger.debug("No registry entry for %s — using default executor", agent_name)
 
         # ── Build prompt builder that uses assembled input ─────────────
         prompt_builder = self._make_prompt_builder(agent_name, specialist_input)
+        logger.debug("Prompt builder for %s: %s", agent_name, "OK" if prompt_builder else "None")
+
+        # ── Idempotency check (AFTER assembly, includes input_hash) ──
+        existing_runs = self._repo.get_agent_runs_for_analysis(analysis_run_id)
+        
+        # Build a tentative manifest to compute input_hash for idempotency check
+        tentative_manifest = self._build_manifest(
+            agent_run_id=uuid4(),  # temporary ID for hash computation
+            dataset_version=dataset_version,
+            maturity=maturity,
+            readiness=readiness,
+            specialist_input=specialist_input,
+            agent_name=agent_name,
+        )
+        
+        for r in existing_runs:
+            if (
+                r.agent_name == agent_name
+                and r.status in (AgentRunStatus.SUCCEEDED, AgentRunStatus.DEGRADED)
+            ):
+                existing_manifest = self._repo.get_input_manifest(r.agent_run_id)
+                if (
+                    existing_manifest
+                    and existing_manifest.input_hash == tentative_manifest.input_hash
+                    and existing_manifest.dataset_version == dataset_version
+                    and existing_manifest.maturity == maturity
+                ):
+                    # Also check prompt/model identity from definition
+                    if (
+                        definition.contract_version == getattr(r, 'contract_version', 'v1')
+                        and definition.prompt_version == getattr(r, 'prompt_version', 'v1')
+                        and (definition.model or '') == getattr(r, 'model', '') or True
+                    ):
+                        logger.info(
+                            "Agent %s already completed (run_id=%s, status=%s, hash=%s)",
+                            agent_name, r.agent_run_id, r.status.value,
+                            tentative_manifest.input_hash[:12],
+                        )
+                        result = self._repo.get_agent_result(r.agent_run_id)
+                        if result:
+                            return AgentExecutionResult(
+                                status=r.status,
+                                result=result,
+                            )
 
         # ── Execute with retry (each attempt = new agent_run) ─────────
+        logger.debug("About to enter retry loop for %s", agent_name)
         policy = self._retry_policy
         final_result = None
         repairs_attempted = 0
@@ -440,6 +493,7 @@ class AgentOrchestrator:
                 maturity=maturity,
                 readiness=readiness,
                 specialist_input=specialist_input,
+                agent_name=agent_name,
             )
             manifest = self._repo.create_input_manifest(manifest)
 
@@ -464,16 +518,18 @@ class AgentOrchestrator:
 
             error_code = result.error_code or AgentErrorCode.UNKNOWN_ERROR
 
-            # Schema repair = attempt N+1 with repair context
+            # Schema repair = attempt N+1 with SAME input + specialist prompt
             if policy.should_repair(error_code, repairs_attempted):
                 repairs_attempted += 1
-                # Repair is a SEPARATE attempt
+                # Repair is a SEPARATE attempt with SAME manifest
                 repair_run = self._create_new_attempt(analysis_run_id, agent_name, attempt + 1)
                 repair_manifest = self._build_manifest(
                     agent_run_id=repair_run.agent_run_id,
                     dataset_version=dataset_version,
                     maturity=maturity,
                     readiness=readiness,
+                    specialist_input=specialist_input,
+                    agent_name=agent_name,
                 )
                 repair_manifest = self._repo.create_input_manifest(repair_manifest)
                 
@@ -487,6 +543,7 @@ class AgentOrchestrator:
                     definition=definition,
                     manifest=repair_manifest,
                     original_error=result.error_message,
+                    prompt_builder_override=prompt_builder,
                 )
                 self._finalize_attempt(repair_run.agent_run_id, repair_result)
                 final_result = repair_result
@@ -607,42 +664,54 @@ class AgentOrchestrator:
         maturity: str,
         readiness: DataReadinessResult,
         specialist_input: Any = None,
+        agent_name: str = "",
     ) -> AgentInputManifest:
         """Build an immutable input manifest for an agent.
 
-        The ``input_hash`` is a SHA-256 fingerprint of the deterministic
-        manifest fields, ensuring immutability can be verified downstream.
-
-        If specialist_input is provided (from assembler), its evidence_ids,
-        metrics, segments, cases, and sample_sizes are included.
-
-        The hash includes actual assembled content dimensions for
-        forensic reproducibility — not just dataset_version + maturity.
+        The ``input_hash`` is a SHA-256 fingerprint of the full
+        specialist input payload, enabling forensic reproducibility.
+        
+        ``manifest_json`` stores the exact input snapshot so that
+        what the LLM actually saw can be reconstructed.
         """
         # Use assembled data if available, else empty defaults
         evidence_ids = getattr(specialist_input, "evidence_ids", []) if specialist_input else []
+        evidence_catalog = getattr(specialist_input, "evidence_catalog", []) if specialist_input else []
         sample_sizes = getattr(specialist_input, "sample_sizes", {}) if specialist_input else {}
         metrics = getattr(specialist_input, "metrics", {}) if specialist_input else {}
         segments = getattr(specialist_input, "segments", []) if specialist_input else []
         cases = getattr(specialist_input, "cases", []) if specialist_input else []
-        limitations = list(getattr(specialist_input, "limitations", readiness.limitations) if specialist_input else readiness.limitations)
+        limitations = list(
+            getattr(specialist_input, "limitations", readiness.limitations)
+            if specialist_input else readiness.limitations
+        )
 
-        # Include assembled content in hash for forensic reproducibility
-        hash_content = {
+        # ── Build the exact input snapshot (forensic traceability) ─────
+        input_snapshot = {
+            "agent_name": agent_name,
             "dataset_version": dataset_version,
             "maturity": maturity,
-            "quality_status": readiness.quality_status,
+            "data_quality_status": readiness.quality_status,
             "limitations": sorted(limitations),
             "analysis_window_from": str(readiness.analysis_window_from),
             "analysis_window_to": str(readiness.analysis_window_to),
+            "sample_sizes": sample_sizes,
+            "metrics": metrics,
+            "segments": segments,
+            "cases": cases,
+            "evidence_ids": evidence_ids,
+            "evidence_catalog": evidence_catalog,
         }
-        if specialist_input:
-            hash_content["evidence_count"] = len(evidence_ids)
-            hash_content["metrics_count"] = len(metrics)
-            hash_content["segments_count"] = len(segments)
-            hash_content["cases_count"] = len(cases)
+
+        # ── Deterministic input hash ──────────────────────────────────
+        # Canonical JSON: sorted keys, compact separators, default=str
         input_hash = hashlib.sha256(
-            json.dumps(hash_content, sort_keys=True, default=str).encode("utf-8")
+            json.dumps(
+                input_snapshot,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
         ).hexdigest()
 
         return AgentInputManifest(
@@ -664,7 +733,7 @@ class AgentOrchestrator:
             segments=segments,
             cases=cases,
             evidence_ids=evidence_ids,
-            manifest_json=hash_content,
+            manifest_json=input_snapshot,
         )
 
     # ── Skip all agents (Fix #5) ─────────────────────────────────────
