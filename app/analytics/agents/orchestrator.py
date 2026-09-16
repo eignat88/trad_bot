@@ -30,7 +30,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Optional, Protocol, runtime_checkable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from app.analytics.agents.models import (
     AgentDefinition,
@@ -131,11 +131,15 @@ class AgentOrchestrator:
         executor: AgentExecutor,
         readiness_gate: Optional[DataReadinessGate] = None,
         retry_policy: Optional[RetryPolicyV1] = None,
+        data_repo: Optional[Any] = None,
+        specialist_registry: Optional[dict[str, Any]] = None,
     ):
         self._repo = repository
         self._executor = executor
         self._readiness = readiness_gate or DataReadinessGate()
         self._retry_policy = retry_policy or RetryPolicyV1()
+        self._data_repo = data_repo
+        self._specialist_registry = specialist_registry or {}
 
     # ── Public entry point ────────────────────────────────────────────
 
@@ -191,9 +195,16 @@ class AgentOrchestrator:
         )
 
         # ── Step 1: Data Readiness Gate ───────────────────────────────
+        # Extract status as string for readiness gate
+        run_status_str = (
+            run.status.value
+            if hasattr(run.status, "value")
+            else str(run.status)
+        )
+        
         readiness = self._readiness.evaluate(
             run_id=analysis_run_id,
-            status=run.status,
+            status=run_status_str,
             maturity=maturity,
             dataset_version=dataset_version,
             publication_status=publication_status,
@@ -238,6 +249,7 @@ class AgentOrchestrator:
         # Handle exceptions and apply DEGRADED propagation
         for i, (name, result) in enumerate(zip(SPECIALIST_AGENTS, results)):
             if isinstance(result, Exception):
+                logger.error("Specialist %s raised exception: %s", name, result)
                 specialist_results[name] = AgentExecutionResult(
                     status=AgentRunStatus.FAILED,
                     result=None,
@@ -311,6 +323,7 @@ class AgentOrchestrator:
         """Run a single specialist agent with retry and repair logic.
         
         Each retry/repair attempt creates a NEW agent_run (separate execution).
+        Uses the specialist registry to find assembler and prompt builder.
         """
         logger.info("Running specialist: %s", agent_name)
 
@@ -325,31 +338,136 @@ class AgentOrchestrator:
             )
             self._repo.create_agent_definition(definition)
 
-        # ── Idempotency check (Fix #9) ───────────────────────────────
+        # Check if agent is enabled
+        if not definition.enabled:
+            logger.info("Agent %s is disabled — skipping", agent_name)
+            return AgentExecutionResult(
+                status=AgentRunStatus.SKIPPED,
+                result=None,
+                error_code=AgentErrorCode.DATASET_NOT_READY,
+                error_message=f"Agent {agent_name} is disabled",
+            )
+
+        # ── Fail-closed: production specialist requires data_repo ─────
+        if agent_name in SPECIALIST_AGENTS and self._data_repo is None:
+            return AgentExecutionResult(
+                status=AgentRunStatus.FAILED,
+                result=None,
+                error_code=AgentErrorCode.INVALID_INPUT,
+                error_message=(
+                    f"Production specialist '{agent_name}' requires a data repository. "
+                    "Set data_repo in AgentOrchestrator."
+                ),
+            )
+
+        # ── Assemble specialist input ─────────────────────────────────
+        specialist_input = None
+        reg = self._specialist_registry.get(agent_name)
+
+        if reg and self._data_repo:
+            # Production path: registry entry found + data repo available
+            if not reg.assembler_class:
+                return AgentExecutionResult(
+                    status=AgentRunStatus.FAILED,
+                    result=None,
+                    error_code=AgentErrorCode.INVALID_INPUT,
+                    error_message=f"No assembler class for specialist {agent_name}",
+                )
+            if not reg.prompt_builder:
+                return AgentExecutionResult(
+                    status=AgentRunStatus.FAILED,
+                    result=None,
+                    error_code=AgentErrorCode.INVALID_INPUT,
+                    error_message=f"No prompt builder for specialist {agent_name}",
+                )
+
+            try:
+                assembler = reg.assembler_class(self._data_repo)
+                specialist_input = assembler.assemble(
+                    run_id=analysis_run_id,
+                    dataset_version=dataset_version,
+                    maturity=maturity,
+                    quality_status=readiness.quality_status,
+                    limitations=list(readiness.limitations),
+                    analysis_window_from=str(readiness.analysis_window_from),
+                    analysis_window_to=str(readiness.analysis_window_to),
+                )
+                logger.info(
+                    "Assembled input for %s: %d metrics, %d segments, %d cases, %d evidence",
+                    agent_name,
+                    len(specialist_input.metrics),
+                    len(specialist_input.segments),
+                    len(specialist_input.cases),
+                    len(specialist_input.evidence_ids),
+                )
+            except Exception as e:
+                logger.exception("Input assembly failed for %s: %s", agent_name, e)
+                return AgentExecutionResult(
+                    status=AgentRunStatus.FAILED,
+                    result=None,
+                    error_code=AgentErrorCode.INPUT_ASSEMBLY_ERROR,
+                    error_message=f"Input assembly failed: {e}",
+                )
+        elif not reg:
+            # For production specialist names, fail closed
+            if agent_name in SPECIALIST_AGENTS:
+                return AgentExecutionResult(
+                    status=AgentRunStatus.FAILED,
+                    result=None,
+                    error_code=AgentErrorCode.INVALID_INPUT,
+                    error_message=f"Production specialist '{agent_name}' has no registry entry",
+                )
+            logger.debug("No registry entry for %s — using default executor", agent_name)
+
+        # ── Build prompt builder ───────────────────────────────────────
+        prompt_builder = self._make_prompt_builder(agent_name, specialist_input)
+
+        # Fail-closed: production specialist must have prompt_builder
+        if agent_name in SPECIALIST_AGENTS and prompt_builder is None:
+            return AgentExecutionResult(
+                status=AgentRunStatus.FAILED,
+                result=None,
+                error_code=AgentErrorCode.INVALID_INPUT,
+                error_message=(
+                    f"Production specialist '{agent_name}' has no prompt builder. "
+                    "Cannot execute without specialist-specific prompt."
+                ),
+            )
+
+        # ── Idempotency check (AFTER assembly, includes input_hash) ──
         existing_runs = self._repo.get_agent_runs_for_analysis(analysis_run_id)
+
+        # Build a tentative manifest to compute input_hash for idempotency check
+        tentative_manifest = self._build_manifest(
+            agent_run_id=uuid4(),  # temporary ID for hash computation
+            dataset_version=dataset_version,
+            maturity=maturity,
+            readiness=readiness,
+            specialist_input=specialist_input,
+            agent_name=agent_name,
+            definition=definition,
+        )
+
+        # Evaluate each existing completed run for full identity match
         for r in existing_runs:
-            if (
-                r.agent_name == agent_name
-                and r.status in (AgentRunStatus.SUCCEEDED, AgentRunStatus.DEGRADED)
-                and r.attempt == 1
-            ):
-                # Also check that the manifest matches dataset_version + maturity
-                existing_manifest = self._repo.get_input_manifest(r.agent_run_id)
-                if (existing_manifest 
-                    and existing_manifest.dataset_version == dataset_version 
-                    and existing_manifest.maturity == maturity):
-                    logger.info(
-                        "Agent %s already completed (run_id=%s, status=%s)",
-                        agent_name, r.agent_run_id, r.status.value,
+            if not self._is_candidate_for_reuse(r, agent_name, definition):
+                continue
+            existing_manifest = self._repo.get_input_manifest(r.agent_run_id)
+            if self._verify_full_identity(existing_manifest, tentative_manifest):
+                logger.info(
+                    "Reusing completed run for %s (run_id=%s, status=%s, hash=%s)",
+                    agent_name, r.agent_run_id, r.status.value,
+                    tentative_manifest.input_hash[:12],
+                )
+                result = self._repo.get_agent_result(r.agent_run_id)
+                if result:
+                    return AgentExecutionResult(
+                        status=r.status,
+                        result=result,
                     )
-                    result = self._repo.get_agent_result(r.agent_run_id)
-                    if result:
-                        return AgentExecutionResult(
-                            status=r.status,
-                            result=result,
-                        )
 
         # ── Execute with retry (each attempt = new agent_run) ─────────
+        logger.debug("About to enter retry loop for %s", agent_name)
         policy = self._retry_policy
         final_result = None
         repairs_attempted = 0
@@ -362,6 +480,9 @@ class AgentOrchestrator:
                 dataset_version=dataset_version,
                 maturity=maturity,
                 readiness=readiness,
+                specialist_input=specialist_input,
+                agent_name=agent_name,
+                definition=definition,
             )
             manifest = self._repo.create_input_manifest(manifest)
 
@@ -372,8 +493,11 @@ class AgentOrchestrator:
                 started_at=datetime.now(timezone.utc),
             )
 
-            # Execute
-            result = await self._executor.execute(definition=definition, manifest=manifest)
+            # Execute with specialist-specific prompt builder
+            result = await self._executor.execute(
+                definition=definition, manifest=manifest,
+                prompt_builder_override=prompt_builder,
+            )
 
             if result.status in (AgentRunStatus.SUCCEEDED, AgentRunStatus.DEGRADED):
                 # Atomic persist: result + terminal status
@@ -383,16 +507,19 @@ class AgentOrchestrator:
 
             error_code = result.error_code or AgentErrorCode.UNKNOWN_ERROR
 
-            # Schema repair = attempt N+1 with repair context
+            # Schema repair = attempt N+1 with SAME input + specialist prompt
             if policy.should_repair(error_code, repairs_attempted):
                 repairs_attempted += 1
-                # Repair is a SEPARATE attempt
+                # Repair is a SEPARATE attempt with SAME manifest
                 repair_run = self._create_new_attempt(analysis_run_id, agent_name, attempt + 1)
                 repair_manifest = self._build_manifest(
                     agent_run_id=repair_run.agent_run_id,
                     dataset_version=dataset_version,
                     maturity=maturity,
                     readiness=readiness,
+                    specialist_input=specialist_input,
+                    agent_name=agent_name,
+                    definition=definition,
                 )
                 repair_manifest = self._repo.create_input_manifest(repair_manifest)
                 
@@ -406,6 +533,7 @@ class AgentOrchestrator:
                     definition=definition,
                     manifest=repair_manifest,
                     original_error=result.error_message,
+                    prompt_builder_override=prompt_builder,
                 )
                 self._finalize_attempt(repair_run.agent_run_id, repair_result)
                 final_result = repair_result
@@ -433,6 +561,45 @@ class AgentOrchestrator:
             result=None,
             error_code=AgentErrorCode.UNKNOWN_ERROR,
             error_message=f"Exhausted {policy.max_attempts} attempts",
+        )
+
+    # ── Idempotency predicate ────────────────────────────────────────
+
+    @staticmethod
+    def _is_candidate_for_reuse(
+        run: Any,
+        agent_name: str,
+        definition: AgentDefinition,
+    ) -> bool:
+        """Quick pre-check: agent_name, terminal status, and model match.
+
+        Full identity (input_hash, manifest content) is verified by the
+        caller after loading the persisted manifest.
+        """
+        return (
+            run.agent_name == agent_name
+            and run.status in (AgentRunStatus.SUCCEEDED, AgentRunStatus.DEGRADED)
+            and getattr(run, 'model', None) == definition.model
+        )
+
+    @staticmethod
+    def _verify_full_identity(
+        existing_manifest: Any,
+        tentative_manifest: Any,
+    ) -> bool:
+        """Verify full execution identity after loading the persisted manifest.
+
+        Requires exact match of:
+        - input_hash (content identity)
+        - dataset_version
+        - maturity
+        """
+        if existing_manifest is None:
+            return False
+        return (
+            existing_manifest.input_hash == tentative_manifest.input_hash
+            and existing_manifest.dataset_version == tentative_manifest.dataset_version
+            and existing_manifest.maturity == tentative_manifest.maturity
         )
 
     # ── Helper: create new agent_run attempt ──────────────────────────
@@ -497,38 +664,100 @@ class AgentOrchestrator:
 
     # ── Manifest builder (Fix #8) ────────────────────────────────────
 
+    def _make_prompt_builder(self, agent_name: str, specialist_input: Any = None):
+        """Create a prompt builder for a specialist agent.
+
+        Uses the specialist registry to find the prompt builder function.
+        Returns a callable that takes (definition, manifest) and returns
+        the prompt dict.
+
+        Returns ``None`` when no registry entry or prompt builder is
+        available — production code must not fall back to an empty prompt.
+        """
+        reg = self._specialist_registry.get(agent_name)
+        if reg and reg.prompt_builder and specialist_input:
+            prompt_fn = reg.prompt_builder
+
+            def _build(definition, manifest):
+                return prompt_fn(specialist_input)
+
+            return _build
+
+        # No fallback to empty prompt in production
+        return None
+
     def _build_manifest(
         self,
         agent_run_id: UUID,
         dataset_version: str,
         maturity: str,
         readiness: DataReadinessResult,
+        specialist_input: Any = None,
+        agent_name: str = "",
+        definition: Optional[AgentDefinition] = None,
     ) -> AgentInputManifest:
         """Build an immutable input manifest for an agent.
 
-        The ``input_hash`` is a SHA-256 fingerprint of the deterministic
-        manifest fields, ensuring immutability can be verified downstream.
-        
-        Fix #8: input_hash excludes agent_run_id — same business inputs 
-        produce same hash for retry detection.
+        The ``input_hash`` is a SHA-256 fingerprint of the full
+        specialist input payload INCLUDING execution identity
+        (agent_name, prompt_version, contract_version, model),
+        enabling forensic reproducibility.
+
+        ``manifest_json`` stores the exact input snapshot so that
+        what the LLM actually saw can be reconstructed.
         """
-        # input_hash = hash of BUSINESS inputs only
-        business_data = {
+        # Use assembled data if available, else empty defaults
+        evidence_ids = getattr(specialist_input, "evidence_ids", []) if specialist_input else []
+        evidence_catalog = getattr(specialist_input, "evidence_catalog", []) if specialist_input else []
+        sample_sizes = getattr(specialist_input, "sample_sizes", {}) if specialist_input else {}
+        metrics = getattr(specialist_input, "metrics", {}) if specialist_input else {}
+        segments = getattr(specialist_input, "segments", []) if specialist_input else []
+        cases = getattr(specialist_input, "cases", []) if specialist_input else []
+        limitations = list(
+            getattr(specialist_input, "limitations", readiness.limitations)
+            if specialist_input else readiness.limitations
+        )
+
+        # ── Execution identity from definition ────────────────────────
+        prompt_version = definition.prompt_version if definition else ""
+        contract_version = definition.contract_version if definition else ""
+        model = definition.model if definition else None
+
+        # ── Build the exact input snapshot (forensic traceability) ─────
+        input_snapshot = {
+            "agent_name": agent_name,
             "dataset_version": dataset_version,
             "maturity": maturity,
-            "quality_status": readiness.quality_status,
-            "limitations": list(readiness.limitations),
+            "prompt_version": prompt_version,
+            "contract_version": contract_version,
+            "model": model,
+            "data_quality_status": readiness.quality_status,
+            "limitations": sorted(limitations),
             "analysis_window_from": str(readiness.analysis_window_from),
             "analysis_window_to": str(readiness.analysis_window_to),
+            "sample_sizes": sample_sizes,
+            "metrics": metrics,
+            "segments": segments,
+            "cases": cases,
+            "evidence_ids": evidence_ids,
+            "evidence_catalog": evidence_catalog,
         }
+
+        # ── Deterministic input hash ──────────────────────────────────
+        # Canonical JSON: sorted keys, compact separators, default=str
         input_hash = hashlib.sha256(
-            json.dumps(business_data, sort_keys=True, default=str).encode("utf-8")
+            json.dumps(
+                input_snapshot,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
         ).hexdigest()
 
         return AgentInputManifest(
-            agent_run_id=agent_run_id,  # separate from hash
+            agent_run_id=agent_run_id,
             dataset_version=dataset_version,
-            input_hash=input_hash,  # same for retry with same business inputs
+            input_hash=input_hash,
             schema_version="v1",
             analysis_window_from=(
                 readiness.analysis_window_from or datetime.now(timezone.utc)
@@ -538,9 +767,13 @@ class AgentOrchestrator:
             ),
             maturity=maturity,
             data_quality_status=readiness.quality_status,
-            limitations=list(readiness.limitations),
-            manifest_json=business_data,
-            evidence_ids=[],  # populated by input assembler in PR3
+            limitations=limitations,
+            sample_sizes=sample_sizes,
+            metrics=metrics,
+            segments=segments,
+            cases=cases,
+            evidence_ids=evidence_ids,
+            manifest_json=input_snapshot,
         )
 
     # ── Skip all agents (Fix #5) ─────────────────────────────────────
@@ -632,6 +865,8 @@ class AgentOrchestrator:
             dataset_version=dataset_version,
             maturity=maturity,
             readiness=readiness,
+            agent_name=CHIEF_AGENT,
+            definition=definition,
         )
         manifest = self._repo.create_input_manifest(manifest)
 

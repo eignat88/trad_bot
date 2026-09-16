@@ -97,6 +97,15 @@ class AnalyticsRunner:
                 # Stage 6: Retention cleanup
                 self._execute_stage(run, "retention", self._stage_retention)
                 
+                # Stage 7: Stage 3 agent orchestration (isolated from canonical)
+                # Stage 3 failure must NOT fail the analysis_run —
+                # the canonical dataset publication is already READY.
+                try:
+                    self._stage_agent_orchestration(run)
+                except Exception as e:
+                    logger.error("Stage 3 agent orchestration failed: %s", e)
+                    # Do NOT mark analysis_run as FAILED — canonical data is still valid
+                
                 # Mark as SUCCEEDED
                 run.status = RunStatus.SUCCEEDED
                 run.maturity = Maturity.PROVISIONAL
@@ -206,6 +215,15 @@ class AnalyticsRunner:
                 business_date,
                 run.status.value,
             )
+            
+            # Stage 6: Agent orchestration (isolated — does NOT fail canonical)
+            if run.status == RunStatus.SUCCEEDED:
+                try:
+                    self._stage_agent_orchestration(run)
+                except Exception as e:
+                    logger.error(
+                        "Stage 3 agent orchestration failed for FINAL (canonical unaffected): %s", e
+                    )
             
             return run
             
@@ -635,10 +653,74 @@ class AnalyticsRunner:
         )
         return result
 
+    def _stage_agent_orchestration(self, run: AnalysisRun) -> dict[str, Any]:
+        """Stage 7: Stage 3 agent orchestration (isolated from canonical).
+
+        Invokes the AgentOrchestrator to run specialist agents against
+        the published dataset.  This stage is wrapped in a try/except
+        in the caller — failure here must NOT mark the analysis_run as
+        FAILED because the canonical dataset publication is already READY.
+
+        The orchestrator is constructed with the analytics repository and
+        specialist registry.  All LLM/provider errors are caught and
+        logged, not propagated.
+        """
+        import asyncio
+        from app.analytics.agents.orchestrator import AgentOrchestrator
+        from app.analytics.agents.executor import AgentExecutor
+        from app.analytics.agents.registry import SPECIALIST_REGISTRY
+
+        logger.info("Running Stage 3 agent orchestration for run %s", run.run_id)
+
+        # Build orchestrator dependencies
+        repo = self._repo
+        specialist_registry = SPECIALIST_REGISTRY
+
+        orchestrator = AgentOrchestrator(
+            repository=repo,
+            executor=None,  # Executor is created per-agent inside orchestrator
+            data_repo=repo,
+            specialist_registry=specialist_registry,
+        )
+
+        # Determine maturity string for orchestrator
+        maturity = run.maturity.value if run.maturity else "PROVISIONAL"
+
+        # Run orchestrator (async) — isolated from canonical pipeline
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Already in an async context — use a new thread
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    result = pool.submit(
+                        asyncio.run,
+                        orchestrator.run(
+                            analysis_run_id=run.run_id,
+                            maturity=maturity,
+                        ),
+                    ).result(timeout=300)
+            else:
+                result = loop.run_until_complete(
+                    orchestrator.run(
+                        analysis_run_id=run.run_id,
+                        maturity=maturity,
+                    )
+                )
+        except Exception as e:
+            logger.error("Stage 3 agent orchestration failed: %s", e)
+            raise
+
+        logger.info(
+            "Stage 3 agent orchestration completed for run %s: status=%s",
+            run.run_id, result.get("status"),
+        )
+        return result
+
     def _stage_retention(
         self, run: AnalysisRun, stage_run: AnalysisStageRun
     ) -> dict[str, Any]:
-        """Stage 3: Retention cleanup."""
+        """Stage 6: Retention cleanup."""
         logger.info("Running retention cleanup")
         
         stats = self._retention.run_retention(dry_run=False)

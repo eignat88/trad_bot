@@ -19,6 +19,7 @@ from app.analytics.agents.executor import AgentExecutionResult
 from app.analytics.agents.orchestrator import (
     AgentOrchestrator, SPECIALIST_AGENTS, CHIEF_AGENT,
 )
+from app.analytics.agents.registry import SPECIALIST_REGISTRY
 from app.analytics.agents.llm_client import ModelResponse
 
 
@@ -114,6 +115,35 @@ def _make_repo_mock():
     return repo
 
 
+def _mock_data_repo():
+    """Create a mock data repository for specialist input assembly."""
+    data_repo = MagicMock()
+    data_repo.get_funnel_data.return_value = []
+    data_repo.get_trade_cases.return_value = []
+    data_repo.get_metric_snapshots.return_value = []
+    data_repo.get_horizon_metrics.return_value = []
+    data_repo.get_replay_metrics.return_value = []
+    data_repo.get_quality_summary.return_value = {}
+    data_repo.detect_drift_candidates.return_value = []
+    return data_repo
+
+
+def _make_orchestrator(repo=None, executor=None, **kwargs):
+    """Create an AgentOrchestrator with defaults for specialist integration."""
+    if repo is None:
+        repo = _make_repo_mock()
+    if executor is None:
+        executor = AsyncMock(return_value=_make_success_result())
+    defaults = {
+        "repository": repo,
+        "executor": executor,
+        "data_repo": _mock_data_repo(),
+        "specialist_registry": SPECIALIST_REGISTRY,
+    }
+    defaults.update(kwargs)
+    return AgentOrchestrator(**defaults)
+
+
 # ── Constants tests ──────────────────────────────────────────────────
 
 class TestOrchestratorConstants:
@@ -140,7 +170,7 @@ class TestOrchestratorReadinessGate:
         repo = _make_repo_mock()
         repo.get_analysis_run.return_value = None
         executor = AsyncMock()
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         result = _run_async(orch.run(analysis_run_id=uuid4(), maturity="FINAL"))
 
@@ -152,7 +182,7 @@ class TestOrchestratorReadinessGate:
         repo = _make_repo_mock()
         repo.get_dataset_publication.return_value = None
         executor = AsyncMock()
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         result = _run_async(orch.run(analysis_run_id=uuid4(), maturity="FINAL"))
 
@@ -164,7 +194,7 @@ class TestOrchestratorReadinessGate:
         repo = _make_repo_mock()
         repo.get_dataset_publication.return_value = _make_publication(pub_status="BUILDING")
         executor = AsyncMock()
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         result = _run_async(orch.run(analysis_run_id=uuid4(), maturity="FINAL"))
 
@@ -176,7 +206,7 @@ class TestOrchestratorReadinessGate:
         repo = _make_repo_mock()
         repo.get_dataset_publication.return_value = _make_publication(quality_status="FAIL")
         executor = AsyncMock()
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         result = _run_async(orch.run(analysis_run_id=uuid4(), maturity="FINAL"))
 
@@ -188,7 +218,7 @@ class TestOrchestratorReadinessGate:
         repo = _make_repo_mock()
         repo.get_dataset_publication.return_value = _make_publication(canonical_build_json=None)
         executor = AsyncMock()
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         result = _run_async(orch.run(analysis_run_id=uuid4(), maturity="FINAL"))
 
@@ -199,7 +229,7 @@ class TestOrchestratorReadinessGate:
         repo = _make_repo_mock()
         repo.get_analysis_run.return_value = _make_analysis_run(status="FAILED")
         executor = AsyncMock()
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         result = _run_async(orch.run(analysis_run_id=uuid4(), maturity="FINAL"))
 
@@ -210,7 +240,7 @@ class TestOrchestratorReadinessGate:
         repo = _make_repo_mock()
         repo.get_dataset_publication.return_value = _make_publication(dataset_version="00000000.0")
         executor = AsyncMock()
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         result = _run_async(orch.run(analysis_run_id=uuid4(), maturity="FINAL"))
 
@@ -223,7 +253,7 @@ class TestOrchestratorExecution:
     def test_pass_runs_specialists(self):
         repo = _make_repo_mock()
         executor = AsyncMock(return_value=_make_success_result())
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         result = _run_async(orch.run(analysis_run_id=uuid4(), maturity="FINAL"))
 
@@ -241,7 +271,7 @@ class TestOrchestratorExecution:
         executor = AsyncMock()
         executor.execute = mock_execute
         executor.repair = AsyncMock(return_value=_make_failed_result(AgentErrorCode.REPAIR_FAILED))
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         result = _run_async(orch.run(analysis_run_id=uuid4(), maturity="FINAL"))
 
@@ -258,7 +288,7 @@ class TestOrchestratorExecution:
         repo = _make_repo_mock()
         call_count = [0]
 
-        async def execute_side_effect(definition, manifest, timeout_s=120.0):
+        async def execute_side_effect(definition, manifest, timeout_s=120.0, **kwargs):
             call_count[0] += 1
             # Fail only the first specialist (first 1-3 calls are specialists, 
             # call 4+ is chief)
@@ -269,7 +299,7 @@ class TestOrchestratorExecution:
         executor = AsyncMock()
         executor.execute = execute_side_effect
         executor.repair = AsyncMock(return_value=_make_failed_result(AgentErrorCode.REPAIR_FAILED))
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         result = _run_async(orch.run(analysis_run_id=uuid4(), maturity="FINAL"))
 
@@ -296,7 +326,7 @@ class TestDegradedPropagation:
         executor = AsyncMock()
         executor.execute = mock_execute
         executor.repair = AsyncMock(return_value=_make_failed_result(AgentErrorCode.REPAIR_FAILED))
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         result = _run_async(orch.run(analysis_run_id=uuid4(), maturity="FINAL"))
 
@@ -321,7 +351,7 @@ class TestRetryAttempts:
             return _make_success_result()
 
         executor = AsyncMock(side_effect=execute_side_effect)
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         # Mock create_agent_run to return proper AgentRun
         runs_created = []
@@ -350,7 +380,7 @@ class TestRetryAttempts:
         executor = AsyncMock()
         executor.execute = AsyncMock(side_effect=execute_side_effect)
         executor.repair = AsyncMock(side_effect=repair_side_effect)
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         runs_created = []
         def make_run(r):
@@ -387,7 +417,7 @@ class TestMaturityIndependence:
         repo.get_agent_runs_for_analysis.return_value = [prov_run]
         repo.get_input_manifest.return_value = prov_manifest
 
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         # Run FINAL with different dataset_version
         result = _run_async(orch.run(
@@ -423,7 +453,7 @@ class TestMaturityIndependence:
         repo.get_input_manifest.return_value = existing_manifest
         repo.get_agent_result.return_value = existing_result
 
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         # Create readiness with same dataset_version
         result = _run_async(orch.run(
@@ -480,7 +510,7 @@ class TestCrashRecovery:
              "started_at": datetime.now(timezone.utc)},
         ]
         executor = AsyncMock()
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         recovered = _run_async(orch.recover_stale_runs())
 
@@ -491,7 +521,7 @@ class TestCrashRecovery:
         repo = _make_repo_mock()
         repo.get_stale_agent_runs.return_value = []
         executor = AsyncMock()
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         recovered = _run_async(orch.recover_stale_runs())
 
@@ -505,7 +535,7 @@ class TestInputHash:
         """#8: same retry input → same semantic input_hash."""
         repo = _make_repo_mock()
         executor = AsyncMock(return_value=_make_success_result())
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         r1 = _make_readiness()
         manifest1 = orch._build_manifest(uuid4(), "v1", "FINAL", r1)
@@ -519,7 +549,7 @@ class TestInputHash:
         """#11: different dataset_version → new execution."""
         repo = _make_repo_mock()
         executor = AsyncMock(return_value=_make_success_result())
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         r1 = _make_readiness()
         manifest1 = orch._build_manifest(uuid4(), "v1", "FINAL", r1)
@@ -531,7 +561,7 @@ class TestInputHash:
         """#9-10: different maturity → different hash."""
         repo = _make_repo_mock()
         executor = AsyncMock(return_value=_make_success_result())
-        orch = AgentOrchestrator(repository=repo, executor=executor)
+        orch = _make_orchestrator(repo=repo, executor=executor)
 
         r1 = _make_readiness()
         manifest1 = orch._build_manifest(uuid4(), "v1", "PROVISIONAL", r1)
