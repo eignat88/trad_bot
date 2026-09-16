@@ -1,0 +1,53 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "trad_bot:analytics:agent_input:v1",
+  "title": "Agent Input Manifest v1",
+  "type": "object",
+  "required": ["run_id", "dataset_version", "analysis_window", "maturity", "data_quality", "evidence_catalog"],
+  "additionalProperties": false,
+  "properties": {
+    "run_id": {"type": "string", "format": "uuid"},
+    "dataset_version": {"type": "string", "minLength": 1},
+    "analysis_window": {
+      "type": "object",
+      "required": ["from", "to"],
+      "additionalProperties": false,
+      "properties": {
+        "from": {"type": "string", "format": "date-time"},
+        "to": {"type": "string", "format": "date-time"}
+      }
+    },
+    "maturity": {"type": "string", "enum": ["PROVISIONAL", "FINAL"]},
+    "data_quality": {
+      "type": "object",
+      "required": ["status", "limitations"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"type": "string", "enum": ["PASS", "DEGRADED"]},
+        "limitations": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "sample_sizes": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+    "metrics": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["value", "units", "metric_version", "population"],
+        "additionalProperties": false,
+        "properties": {
+          "value": {"type": ["number", "string", "null"]},
+          "units": {"type": "string"},
+          "metric_version": {"type": "string"},
+          "population": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "segments": {"type": "array", "items": {"type": "object"}},
+    "cases": {"type": "array", "items": {"type": "object"}},
+    "evidence_catalog": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "minItems": 1
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "trad_bot:analytics:chief_input:v1",
+  "title": "Chief Input v1",
+  "type": "object",
+  "required": ["run_id", "maturity", "specialist_results", "data_quality"],
+  "additionalProperties": false,
+  "properties": {
+    "run_id": {"type": "string", "format": "uuid"},
+    "maturity": {"type": "string", "enum": ["PROVISIONAL", "FINAL"]},
+    "specialist_results": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["agent_name", "status", "output"],
+        "additionalProperties": false,
+        "properties": {
+          "agent_name": {"type": "string"},
+          "status": {"type": "string", "enum": ["SUCCEEDED", "DEGRADED", "FAILED"]},
+          "output": {"type": ["object", "null"]}
+        }
+      }
+    },
+    "data_quality": {
+      "type": "object",
+      "required": ["status", "limitations"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"type": "string", "enum": ["PASS", "DEGRADED"]},
+        "limitations": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "missing_agents": {"type": "array", "items": {"type": "string"}}
+  }
+}

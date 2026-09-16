@@ -1,0 +1,59 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "trad_bot:analytics:chief_output:v1",
+  "title": "Chief Output v1",
+  "type": "object",
+  "required": ["executive_summary", "findings", "hypotheses", "proposed_experiments", "action_class", "limitations", "evidence_refs", "partial", "missing_agents"],
+  "additionalProperties": false,
+  "properties": {
+    "executive_summary": {"type": "string", "minLength": 1},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["section", "observation_code", "statement", "evidence_refs", "sample_size", "confidence"],
+        "additionalProperties": false,
+        "properties": {
+          "section": {"type": "string", "enum": ["WHAT_HAPPENED", "WHY", "NOISE_OR_REPEAT"]},
+          "observation_code": {"type": "string"},
+          "statement": {"type": "string", "minLength": 1},
+          "evidence_refs": {"type": "array", "items": {"type": "string"}},
+          "sample_size": {"type": "integer", "minimum": 0},
+          "confidence": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]}
+        }
+      }
+    },
+    "hypotheses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["hypothesis", "falsifiable_experiment", "required_data", "validation_criterion"],
+        "additionalProperties": false,
+        "properties": {
+          "hypothesis": {"type": "string", "minLength": 1},
+          "falsifiable_experiment": {"type": "string", "minLength": 1},
+          "required_data": {"type": "array", "items": {"type": "string"}},
+          "validation_criterion": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "proposed_experiments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["experiment", "required_data", "validation_criterion"],
+        "additionalProperties": false,
+        "properties": {
+          "experiment": {"type": "string", "minLength": 1},
+          "required_data": {"type": "array", "items": {"type": "string"}},
+          "validation_criterion": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "action_class": {"type": "string", "enum": ["NO_ACTION", "MONITOR", "INVESTIGATE", "BACKTEST", "DATA_FIX", "PRODUCTION_INCIDENT"]},
+    "limitations": {"type": "array", "items": {"type": "string"}},
+    "evidence_refs": {"type": "array", "items": {"type": "string"}},
+    "partial": {"type": "boolean"},
+    "missing_agents": {"type": "array", "items": {"type": "string"}}
+  }
+}

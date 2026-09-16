@@ -19,6 +19,18 @@ from app.analytics.models import (
     QualityStatus,
     Watermark,
 )
+from app.analytics.agents.models import (
+    AgentDefinition,
+    AgentRun,
+    AgentRunStatus,
+    AgentInputManifest,
+    AgentResult,
+    DailyTradingReport,
+    AgentType,
+    ValidationStatus,
+    ActionClass,
+    ReportStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -601,4 +613,662 @@ class AnalyticsRepository:
             affected_entity_ids=json.loads(row[11]) if row[11] else None,
             checked_at=row[12],
             details=json.loads(row[13]) if row[13] else None,
+        )
+
+    # ============================================================
+    # Agent Definition
+    # ============================================================
+
+    def create_agent_definition(self, defn: AgentDefinition) -> AgentDefinition:
+        """Register a new agent definition.
+        
+        Uses ON CONFLICT (agent_name) DO UPDATE to upsert — if the agent
+        already exists, its contract/prompt versions and description are updated.
+        Returns the definition with created_at/updated_at from DB.
+        """
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO analytics.agent_definition (
+                    agent_name, agent_type, contract_version, prompt_version,
+                    enabled, description
+                ) VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s
+                )
+                ON CONFLICT (agent_name) DO UPDATE SET
+                    agent_type = EXCLUDED.agent_type,
+                    contract_version = EXCLUDED.contract_version,
+                    prompt_version = EXCLUDED.prompt_version,
+                    enabled = EXCLUDED.enabled,
+                    description = EXCLUDED.description
+                RETURNING agent_name, agent_type, contract_version, prompt_version,
+                          enabled, description, created_at, updated_at
+                """,
+                (
+                    defn.agent_name,
+                    defn.agent_type.value,
+                    defn.contract_version,
+                    defn.prompt_version,
+                    defn.enabled,
+                    defn.description,
+                ),
+            )
+            row = cursor.fetchone()
+            self._conn.commit()
+            result = AgentDefinition(
+                agent_name=row[0],
+                agent_type=AgentType(row[1]),
+                contract_version=row[2],
+                prompt_version=row[3],
+                enabled=row[4],
+                description=row[5],
+                created_at=row[6],
+                updated_at=row[7],
+            )
+            logger.info("Created/upserted agent definition: %s", defn.agent_name)
+            return result
+        except Exception as e:
+            self._conn.rollback()
+            logger.error("Failed to create agent definition: %s", e)
+            raise
+
+    def get_agent_definition(self, agent_name: str) -> Optional[AgentDefinition]:
+        """Get agent definition by name."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT agent_name, agent_type, contract_version, prompt_version,
+                       enabled, description, created_at, updated_at
+                FROM analytics.agent_definition
+                WHERE agent_name = %s
+                """,
+                (agent_name,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return AgentDefinition(
+                agent_name=row[0],
+                agent_type=AgentType(row[1]),
+                contract_version=row[2],
+                prompt_version=row[3],
+                enabled=row[4],
+                description=row[5],
+                created_at=row[6],
+                updated_at=row[7],
+            )
+        except Exception as e:
+            logger.error("Failed to get agent definition: %s", e)
+            raise
+
+    def list_agent_definitions(self, enabled_only: bool = True) -> list[AgentDefinition]:
+        """List all agent definitions."""
+        try:
+            cursor = self._conn.cursor()
+            if enabled_only:
+                cursor.execute(
+                    """
+                    SELECT agent_name, agent_type, contract_version, prompt_version,
+                           enabled, description, created_at, updated_at
+                    FROM analytics.agent_definition
+                    WHERE enabled = TRUE
+                    ORDER BY agent_name
+                    """
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT agent_name, agent_type, contract_version, prompt_version,
+                           enabled, description, created_at, updated_at
+                    FROM analytics.agent_definition
+                    ORDER BY agent_name
+                    """
+                )
+            rows = cursor.fetchall()
+            return [
+                AgentDefinition(
+                    agent_name=r[0],
+                    agent_type=AgentType(r[1]),
+                    contract_version=r[2],
+                    prompt_version=r[3],
+                    enabled=r[4],
+                    description=r[5],
+                    created_at=r[6],
+                    updated_at=r[7],
+                )
+                for r in rows
+            ]
+        except Exception as e:
+            logger.error("Failed to list agent definitions: %s", e)
+            raise
+
+    # ============================================================
+    # Agent Run
+    # ============================================================
+
+    def create_agent_run(self, run: AgentRun) -> AgentRun:
+        """Create a new agent run."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO analytics.agent_run (
+                    agent_run_id, analysis_run_id, agent_name, attempt, model,
+                    status, started_at, finished_at, latency_ms,
+                    input_tokens, output_tokens, total_tokens,
+                    error_class, error_message
+                ) VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s
+                )
+                RETURNING agent_run_id
+                """,
+                (
+                    str(run.agent_run_id),
+                    str(run.analysis_run_id),
+                    run.agent_name,
+                    run.attempt,
+                    run.model,
+                    run.status.value,
+                    run.started_at,
+                    run.finished_at,
+                    run.latency_ms,
+                    run.input_tokens,
+                    run.output_tokens,
+                    run.total_tokens,
+                    run.error_class,
+                    run.error_message,
+                ),
+            )
+            run.agent_run_id = cursor.fetchone()[0]
+            self._conn.commit()
+            logger.info(
+                "Created agent run: %s for agent: %s (attempt %d)",
+                run.agent_run_id,
+                run.agent_name,
+                run.attempt,
+            )
+            return run
+        except Exception as e:
+            self._conn.rollback()
+            logger.error("Failed to create agent run: %s", e)
+            raise
+
+    def get_agent_run(self, agent_run_id: UUID) -> Optional[AgentRun]:
+        """Get agent run by ID."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT agent_run_id, analysis_run_id, agent_name, attempt, model,
+                       status, started_at, finished_at, latency_ms,
+                       input_tokens, output_tokens, total_tokens,
+                       error_class, error_message, created_at
+                FROM analytics.agent_run
+                WHERE agent_run_id = %s
+                """,
+                (str(agent_run_id),),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return self._row_to_agent_run(row)
+        except Exception as e:
+            logger.error("Failed to get agent run: %s", e)
+            raise
+
+    def get_agent_runs_for_analysis(self, analysis_run_id: UUID) -> list[AgentRun]:
+        """Get all agent runs for an analysis run."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT agent_run_id, analysis_run_id, agent_name, attempt, model,
+                       status, started_at, finished_at, latency_ms,
+                       input_tokens, output_tokens, total_tokens,
+                       error_class, error_message, created_at
+                FROM analytics.agent_run
+                WHERE analysis_run_id = %s
+                ORDER BY agent_name, attempt
+                """,
+                (str(analysis_run_id),),
+            )
+            rows = cursor.fetchall()
+            return [self._row_to_agent_run(r) for r in rows]
+        except Exception as e:
+            logger.error("Failed to get agent runs for analysis: %s", e)
+            raise
+
+    def update_agent_run_status(
+        self,
+        agent_run_id: UUID,
+        status: AgentRunStatus,
+        error_class: Optional[str] = None,
+        error_message: Optional[str] = None,
+        started_at: Optional[datetime] = None,
+        finished_at: Optional[datetime] = None,
+        latency_ms: Optional[int] = None,
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
+        total_tokens: Optional[int] = None,
+    ) -> None:
+        """Update agent run status and optional fields.
+        
+        Only non-None parameters are included in the SET clause, allowing
+        partial updates of the agent run record.
+        """
+        try:
+            cursor = self._conn.cursor()
+            set_parts = ["status = %s"]
+            params: list[Any] = [status.value]
+
+            if error_class is not None:
+                set_parts.append("error_class = %s")
+                params.append(error_class)
+            if error_message is not None:
+                set_parts.append("error_message = %s")
+                params.append(error_message)
+            if started_at is not None:
+                set_parts.append("started_at = %s")
+                params.append(started_at)
+            if finished_at is not None:
+                set_parts.append("finished_at = %s")
+                params.append(finished_at)
+            if latency_ms is not None:
+                set_parts.append("latency_ms = %s")
+                params.append(latency_ms)
+            if input_tokens is not None:
+                set_parts.append("input_tokens = %s")
+                params.append(input_tokens)
+            if output_tokens is not None:
+                set_parts.append("output_tokens = %s")
+                params.append(output_tokens)
+            if total_tokens is not None:
+                set_parts.append("total_tokens = %s")
+                params.append(total_tokens)
+
+            params.append(str(agent_run_id))
+
+            cursor.execute(
+                f"UPDATE analytics.agent_run SET {', '.join(set_parts)} WHERE agent_run_id = %s",
+                params,
+            )
+            self._conn.commit()
+            logger.info("Updated agent run %s status to %s", agent_run_id, status.value)
+        except Exception as e:
+            self._conn.rollback()
+            logger.error("Failed to update agent run status: %s", e)
+            raise
+
+    def get_next_attempt(self, analysis_run_id: UUID, agent_name: str) -> int:
+        """Get the next attempt number for an agent on a given analysis run.
+        
+        Returns 1 if no attempts exist yet, otherwise MAX(attempt) + 1.
+        """
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT COALESCE(MAX(attempt), 0) + 1
+                FROM analytics.agent_run
+                WHERE analysis_run_id = %s AND agent_name = %s
+                """,
+                (str(analysis_run_id), agent_name),
+            )
+            row = cursor.fetchone()
+            return row[0] if row else 1
+        except Exception as e:
+            logger.error("Failed to get next attempt: %s", e)
+            raise
+
+    # ============================================================
+    # Agent Input Manifest
+    # ============================================================
+
+    def create_input_manifest(self, manifest: AgentInputManifest) -> AgentInputManifest:
+        """Create an immutable input manifest."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO analytics.agent_input_manifest (
+                    agent_run_id, dataset_version, input_hash, schema_version,
+                    analysis_window_from, analysis_window_to,
+                    maturity, data_quality_status,
+                    limitations, sample_sizes, metrics, segments, cases,
+                    evidence_ids, manifest_json
+                ) VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s,
+                    %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s
+                )
+                """,
+                (
+                    str(manifest.agent_run_id),
+                    manifest.dataset_version,
+                    manifest.input_hash,
+                    manifest.schema_version,
+                    manifest.analysis_window_from,
+                    manifest.analysis_window_to,
+                    manifest.maturity,
+                    manifest.data_quality_status,
+                    json.dumps(manifest.limitations),
+                    json.dumps(manifest.sample_sizes),
+                    json.dumps(manifest.metrics),
+                    json.dumps(manifest.segments),
+                    json.dumps(manifest.cases),
+                    json.dumps(manifest.evidence_ids),
+                    json.dumps(manifest.manifest_json),
+                ),
+            )
+            self._conn.commit()
+            logger.info(
+                "Created input manifest for agent run: %s",
+                manifest.agent_run_id,
+            )
+            return manifest
+        except Exception as e:
+            self._conn.rollback()
+            logger.error("Failed to create input manifest: %s", e)
+            raise
+
+    def get_input_manifest(self, agent_run_id: UUID) -> Optional[AgentInputManifest]:
+        """Get input manifest by agent_run_id."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT agent_run_id, dataset_version, input_hash, schema_version,
+                       analysis_window_from, analysis_window_to,
+                       maturity, data_quality_status,
+                       limitations, sample_sizes, metrics, segments, cases,
+                       evidence_ids, manifest_json, created_at
+                FROM analytics.agent_input_manifest
+                WHERE agent_run_id = %s
+                """,
+                (str(agent_run_id),),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return AgentInputManifest(
+                agent_run_id=UUID(row[0]) if isinstance(row[0], str) else row[0],
+                dataset_version=row[1],
+                input_hash=row[2],
+                schema_version=row[3],
+                analysis_window_from=row[4],
+                analysis_window_to=row[5],
+                maturity=row[6],
+                data_quality_status=row[7],
+                limitations=json.loads(row[8]) if row[8] else [],
+                sample_sizes=json.loads(row[9]) if row[9] else {},
+                metrics=json.loads(row[10]) if row[10] else {},
+                segments=json.loads(row[11]) if row[11] else [],
+                cases=json.loads(row[12]) if row[12] else [],
+                evidence_ids=json.loads(row[13]) if row[13] else [],
+                manifest_json=json.loads(row[14]) if row[14] else {},
+                created_at=row[15],
+            )
+        except Exception as e:
+            logger.error("Failed to get input manifest: %s", e)
+            raise
+
+    # ============================================================
+    # Agent Result
+    # ============================================================
+
+    def create_agent_result(self, result: AgentResult) -> AgentResult:
+        """Create an immutable agent result."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO analytics.agent_result (
+                    agent_run_id, schema_version, result_json,
+                    result_hash, validation_status
+                ) VALUES (
+                    %s, %s, %s,
+                    %s, %s
+                )
+                """,
+                (
+                    str(result.agent_run_id),
+                    result.schema_version,
+                    json.dumps(result.result_json),
+                    result.result_hash,
+                    result.validation_status.value,
+                ),
+            )
+            self._conn.commit()
+            logger.info(
+                "Created agent result for run: %s",
+                result.agent_run_id,
+            )
+            return result
+        except Exception as e:
+            self._conn.rollback()
+            logger.error("Failed to create agent result: %s", e)
+            raise
+
+    def get_agent_result(self, agent_run_id: UUID) -> Optional[AgentResult]:
+        """Get agent result by agent_run_id."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT agent_run_id, schema_version, result_json,
+                       result_hash, validation_status, created_at
+                FROM analytics.agent_result
+                WHERE agent_run_id = %s
+                """,
+                (str(agent_run_id),),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return AgentResult(
+                agent_run_id=UUID(row[0]) if isinstance(row[0], str) else row[0],
+                schema_version=row[1],
+                result_json=json.loads(row[2]) if row[2] else {},
+                result_hash=row[3],
+                validation_status=ValidationStatus(row[4]),
+                created_at=row[5],
+            )
+        except Exception as e:
+            logger.error("Failed to get agent result: %s", e)
+            raise
+
+    # ============================================================
+    # Daily Trading Report
+    # ============================================================
+
+    def create_daily_report(self, report: DailyTradingReport) -> DailyTradingReport:
+        """Create a daily trading report."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO analytics.daily_trading_report (
+                    report_id, analysis_run_id, report_version, maturity,
+                    executive_summary, findings, hypotheses, proposed_experiments,
+                    action_class, limitations, evidence_refs, partial,
+                    missing_agents, status, agent_run_ids
+                ) VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s
+                )
+                RETURNING report_id
+                """,
+                (
+                    str(report.report_id),
+                    str(report.analysis_run_id),
+                    report.report_version,
+                    report.maturity,
+                    report.executive_summary,
+                    json.dumps(report.findings),
+                    json.dumps(report.hypotheses),
+                    json.dumps(report.proposed_experiments),
+                    report.action_class.value,
+                    json.dumps(report.limitations),
+                    json.dumps(report.evidence_refs),
+                    report.partial,
+                    json.dumps(report.missing_agents),
+                    report.status.value,
+                    json.dumps(report.agent_run_ids),
+                ),
+            )
+            report.report_id = cursor.fetchone()[0]
+            self._conn.commit()
+            logger.info(
+                "Created daily report: %s (version %d, maturity %s)",
+                report.report_id,
+                report.report_version,
+                report.maturity,
+            )
+            return report
+        except Exception as e:
+            self._conn.rollback()
+            logger.error("Failed to create daily report: %s", e)
+            raise
+
+    def get_daily_report(self, report_id: UUID) -> Optional[DailyTradingReport]:
+        """Get report by ID."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT report_id, analysis_run_id, report_version, maturity,
+                       executive_summary, findings, hypotheses, proposed_experiments,
+                       action_class, limitations, evidence_refs, partial,
+                       missing_agents, status, agent_run_ids, created_at
+                FROM analytics.daily_trading_report
+                WHERE report_id = %s
+                """,
+                (str(report_id),),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return self._row_to_daily_report(row)
+        except Exception as e:
+            logger.error("Failed to get daily report: %s", e)
+            raise
+
+    def get_latest_report(
+        self, analysis_run_id: UUID, maturity: str
+    ) -> Optional[DailyTradingReport]:
+        """Get latest report version for a given analysis run and maturity."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT report_id, analysis_run_id, report_version, maturity,
+                       executive_summary, findings, hypotheses, proposed_experiments,
+                       action_class, limitations, evidence_refs, partial,
+                       missing_agents, status, agent_run_ids, created_at
+                FROM analytics.daily_trading_report
+                WHERE analysis_run_id = %s AND maturity = %s
+                ORDER BY report_version DESC
+                LIMIT 1
+                """,
+                (str(analysis_run_id), maturity),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return self._row_to_daily_report(row)
+        except Exception as e:
+            logger.error("Failed to get latest report: %s", e)
+            raise
+
+    def list_reports_for_run(self, analysis_run_id: UUID) -> list[DailyTradingReport]:
+        """List all report versions for an analysis run."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT report_id, analysis_run_id, report_version, maturity,
+                       executive_summary, findings, hypotheses, proposed_experiments,
+                       action_class, limitations, evidence_refs, partial,
+                       missing_agents, status, agent_run_ids, created_at
+                FROM analytics.daily_trading_report
+                WHERE analysis_run_id = %s
+                ORDER BY report_version DESC
+                """,
+                (str(analysis_run_id),),
+            )
+            rows = cursor.fetchall()
+            return [self._row_to_daily_report(r) for r in rows]
+        except Exception as e:
+            logger.error("Failed to list reports for run: %s", e)
+            raise
+
+    # ============================================================
+    # Agent Row Converters (private)
+    # ============================================================
+
+    def _row_to_agent_run(self, row: tuple) -> AgentRun:
+        """Convert a database row to AgentRun."""
+        agent_run_id = row[0]
+        if isinstance(agent_run_id, str):
+            agent_run_id = UUID(agent_run_id)
+
+        analysis_run_id = row[1]
+        if isinstance(analysis_run_id, str):
+            analysis_run_id = UUID(analysis_run_id)
+
+        return AgentRun(
+            agent_run_id=agent_run_id,
+            analysis_run_id=analysis_run_id,
+            agent_name=row[2],
+            attempt=row[3],
+            model=row[4],
+            status=AgentRunStatus(row[5]),
+            started_at=row[6],
+            finished_at=row[7],
+            latency_ms=row[8],
+            input_tokens=row[9],
+            output_tokens=row[10],
+            total_tokens=row[11],
+            error_class=row[12],
+            error_message=row[13],
+            created_at=row[14],
+        )
+
+    def _row_to_daily_report(self, row: tuple) -> DailyTradingReport:
+        """Convert a database row to DailyTradingReport."""
+        report_id = row[0]
+        if isinstance(report_id, str):
+            report_id = UUID(report_id)
+
+        analysis_run_id = row[1]
+        if isinstance(analysis_run_id, str):
+            analysis_run_id = UUID(analysis_run_id)
+
+        return DailyTradingReport(
+            report_id=report_id,
+            analysis_run_id=analysis_run_id,
+            report_version=row[2],
+            maturity=row[3],
+            executive_summary=row[4],
+            findings=json.loads(row[5]) if row[5] else [],
+            hypotheses=json.loads(row[6]) if row[6] else [],
+            proposed_experiments=json.loads(row[7]) if row[7] else [],
+            action_class=ActionClass(row[8]),
+            limitations=json.loads(row[9]) if row[9] else [],
+            evidence_refs=json.loads(row[10]) if row[10] else [],
+            partial=row[11],
+            missing_agents=json.loads(row[12]) if row[12] else [],
+            status=ReportStatus(row[13]),
+            agent_run_ids=json.loads(row[14]) if row[14] else [],
+            created_at=row[15],
         )
