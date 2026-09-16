@@ -64,9 +64,9 @@ class AgentExecutor:
             # 1. Build prompt
             prompt_data = self._prompt_builder(definition, manifest)
 
-            # 2. Call LLM — model comes from definition, not contract_version
+            # 2. Call LLM — model comes from definition.model field (fallback to agent_name)
             response = await self._model_client.generate(
-                model=definition.agent_name,  # model identifier from agent definition
+                model=definition.model or definition.agent_name,  # use model field, fallback to agent_name
                 system_prompt=prompt_data.get("system_prompt", ""),
                 input_json=prompt_data.get("input_json", {}),
                 response_schema=prompt_data.get("response_schema"),
@@ -171,7 +171,7 @@ class AgentExecutor:
             )
 
             response = await self._model_client.generate(
-                model=definition.agent_name,
+                model=definition.model or definition.agent_name,  # use model field, fallback to agent_name
                 system_prompt=repair_prompt,
                 input_json=prompt_data.get("input_json", {}),
                 response_schema=prompt_data.get("response_schema"),

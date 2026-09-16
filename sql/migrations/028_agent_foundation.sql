@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS analytics.agent_definition (
     agent_type       TEXT NOT NULL CHECK (agent_type IN ('SPECIALIST', 'CHIEF')),
     contract_version TEXT NOT NULL,
     prompt_version   TEXT NOT NULL,
+    model            TEXT,  -- LLM model identifier (separate from agent_name)
     enabled          BOOLEAN NOT NULL DEFAULT TRUE,
     description      TEXT,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -32,6 +33,8 @@ COMMENT ON COLUMN analytics.agent_definition.contract_version
     IS 'Schema version of the agent''s input/output contract (e.g. ''v1'')';
 COMMENT ON COLUMN analytics.agent_definition.prompt_version
     IS 'Version of the system prompt template (e.g. ''v1'')';
+COMMENT ON COLUMN analytics.agent_definition.model
+    IS 'LLM model identifier for this agent (e.g. ''gpt-4o'', ''claude-sonnet-4-20250514''). NULL means use agent_name as fallback.';
 
 -- updated_at trigger (reuses analytics.update_updated_at_column from 008)
 DROP TRIGGER IF EXISTS trg_agent_definition_updated_at

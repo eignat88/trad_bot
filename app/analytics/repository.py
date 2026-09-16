@@ -632,25 +632,27 @@ class AnalyticsRepository:
                 """
                 INSERT INTO analytics.agent_definition (
                     agent_name, agent_type, contract_version, prompt_version,
-                    enabled, description
+                    model, enabled, description
                 ) VALUES (
                     %s, %s, %s, %s,
-                    %s, %s
+                    %s, %s, %s
                 )
                 ON CONFLICT (agent_name) DO UPDATE SET
                     agent_type = EXCLUDED.agent_type,
                     contract_version = EXCLUDED.contract_version,
                     prompt_version = EXCLUDED.prompt_version,
+                    model = EXCLUDED.model,
                     enabled = EXCLUDED.enabled,
                     description = EXCLUDED.description
                 RETURNING agent_name, agent_type, contract_version, prompt_version,
-                          enabled, description, created_at, updated_at
+                          model, enabled, description, created_at, updated_at
                 """,
                 (
                     defn.agent_name,
                     defn.agent_type.value,
                     defn.contract_version,
                     defn.prompt_version,
+                    defn.model,
                     defn.enabled,
                     defn.description,
                 ),
@@ -662,10 +664,11 @@ class AnalyticsRepository:
                 agent_type=AgentType(row[1]),
                 contract_version=row[2],
                 prompt_version=row[3],
-                enabled=row[4],
-                description=row[5],
-                created_at=row[6],
-                updated_at=row[7],
+                model=row[4],
+                enabled=row[5],
+                description=row[6],
+                created_at=row[7],
+                updated_at=row[8],
             )
             logger.info("Created/upserted agent definition: %s", defn.agent_name)
             return result
@@ -681,7 +684,7 @@ class AnalyticsRepository:
             cursor.execute(
                 """
                 SELECT agent_name, agent_type, contract_version, prompt_version,
-                       enabled, description, created_at, updated_at
+                       model, enabled, description, created_at, updated_at
                 FROM analytics.agent_definition
                 WHERE agent_name = %s
                 """,
@@ -695,10 +698,11 @@ class AnalyticsRepository:
                 agent_type=AgentType(row[1]),
                 contract_version=row[2],
                 prompt_version=row[3],
-                enabled=row[4],
-                description=row[5],
-                created_at=row[6],
-                updated_at=row[7],
+                model=row[4],
+                enabled=row[5],
+                description=row[6],
+                created_at=row[7],
+                updated_at=row[8],
             )
         except Exception as e:
             logger.error("Failed to get agent definition: %s", e)
@@ -712,7 +716,7 @@ class AnalyticsRepository:
                 cursor.execute(
                     """
                     SELECT agent_name, agent_type, contract_version, prompt_version,
-                           enabled, description, created_at, updated_at
+                           model, enabled, description, created_at, updated_at
                     FROM analytics.agent_definition
                     WHERE enabled = TRUE
                     ORDER BY agent_name
@@ -722,7 +726,7 @@ class AnalyticsRepository:
                 cursor.execute(
                     """
                     SELECT agent_name, agent_type, contract_version, prompt_version,
-                           enabled, description, created_at, updated_at
+                           model, enabled, description, created_at, updated_at
                     FROM analytics.agent_definition
                     ORDER BY agent_name
                     """
@@ -734,10 +738,11 @@ class AnalyticsRepository:
                     agent_type=AgentType(r[1]),
                     contract_version=r[2],
                     prompt_version=r[3],
-                    enabled=r[4],
-                    description=r[5],
-                    created_at=r[6],
-                    updated_at=r[7],
+                    model=r[4],
+                    enabled=r[5],
+                    description=r[6],
+                    created_at=r[7],
+                    updated_at=r[8],
                 )
                 for r in rows
             ]
@@ -1546,6 +1551,55 @@ class AnalyticsRepository:
         except Exception as e:
             self._conn.rollback()
             logger.error("Failed to log publication event: %s", e)
+            raise
+
+    def get_stage_run_by_name(
+        self, run_id: UUID, stage_name: str
+    ) -> Optional[AnalysisStageRun]:
+        """Get the latest stage run for a given stage name within an analysis run."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT stage_run_id, run_id, stage_name, attempt, status,
+                       input_rows, output_rows, watermark, result_json,
+                       started_at, finished_at, error_code, error_message
+                FROM analytics.analysis_stage_run
+                WHERE run_id = %s AND stage_name = %s
+                ORDER BY attempt DESC
+                LIMIT 1
+                """,
+                (str(run_id), stage_name),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            stage_run_id = row[0]
+            if isinstance(stage_run_id, str):
+                stage_run_id = UUID(stage_run_id)
+
+            run_id_val = row[1]
+            if isinstance(run_id_val, str):
+                run_id_val = UUID(run_id_val)
+
+            return AnalysisStageRun(
+                stage_run_id=stage_run_id,
+                run_id=run_id_val,
+                stage_name=row[2],
+                attempt=row[3],
+                status=StageStatus(row[4]),
+                input_rows=row[5],
+                output_rows=row[6],
+                watermark=row[7],
+                result_json=json.loads(row[8]) if row[8] else None,
+                started_at=row[9],
+                finished_at=row[10],
+                error_code=row[11],
+                error_message=row[12],
+            )
+        except Exception as e:
+            logger.error("Failed to get stage run by name: %s", e)
             raise
 
     def get_stale_agent_runs(
