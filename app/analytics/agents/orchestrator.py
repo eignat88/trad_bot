@@ -348,34 +348,22 @@ class AgentOrchestrator:
                 error_message=f"Agent {agent_name} is disabled",
             )
 
-        # ── Idempotency check (Fix #9) ───────────────────────────────
-        existing_runs = self._repo.get_agent_runs_for_analysis(analysis_run_id)
-        for r in existing_runs:
-            if (
-                r.agent_name == agent_name
-                and r.status in (AgentRunStatus.SUCCEEDED, AgentRunStatus.DEGRADED)
-                and r.attempt == 1
-            ):
-                # Also check that the manifest matches dataset_version + maturity
-                existing_manifest = self._repo.get_input_manifest(r.agent_run_id)
-                if (existing_manifest 
-                    and existing_manifest.dataset_version == dataset_version 
-                    and existing_manifest.maturity == maturity):
-                    logger.info(
-                        "Agent %s already completed (run_id=%s, status=%s)",
-                        agent_name, r.agent_run_id, r.status.value,
-                    )
-                    result = self._repo.get_agent_result(r.agent_run_id)
-                    if result:
-                        return AgentExecutionResult(
-                            status=r.status,
-                            result=result,
-                        )
+        # ── Fail-closed: production specialist requires data_repo ─────
+        if agent_name in SPECIALIST_AGENTS and self._data_repo is None:
+            return AgentExecutionResult(
+                status=AgentRunStatus.FAILED,
+                result=None,
+                error_code=AgentErrorCode.INVALID_INPUT,
+                error_message=(
+                    f"Production specialist '{agent_name}' requires a data repository. "
+                    "Set data_repo in AgentOrchestrator."
+                ),
+            )
 
         # ── Assemble specialist input ─────────────────────────────────
         specialist_input = None
         reg = self._specialist_registry.get(agent_name)
-        
+
         if reg and self._data_repo:
             # Production path: registry entry found + data repo available
             if not reg.assembler_class:
@@ -392,7 +380,7 @@ class AgentOrchestrator:
                     error_code=AgentErrorCode.INVALID_INPUT,
                     error_message=f"No prompt builder for specialist {agent_name}",
                 )
-            
+
             try:
                 assembler = reg.assembler_class(self._data_repo)
                 specialist_input = assembler.assemble(
@@ -431,13 +419,24 @@ class AgentOrchestrator:
                 )
             logger.debug("No registry entry for %s — using default executor", agent_name)
 
-        # ── Build prompt builder that uses assembled input ─────────────
+        # ── Build prompt builder ───────────────────────────────────────
         prompt_builder = self._make_prompt_builder(agent_name, specialist_input)
-        logger.debug("Prompt builder for %s: %s", agent_name, "OK" if prompt_builder else "None")
+
+        # Fail-closed: production specialist must have prompt_builder
+        if agent_name in SPECIALIST_AGENTS and prompt_builder is None:
+            return AgentExecutionResult(
+                status=AgentRunStatus.FAILED,
+                result=None,
+                error_code=AgentErrorCode.INVALID_INPUT,
+                error_message=(
+                    f"Production specialist '{agent_name}' has no prompt builder. "
+                    "Cannot execute without specialist-specific prompt."
+                ),
+            )
 
         # ── Idempotency check (AFTER assembly, includes input_hash) ──
         existing_runs = self._repo.get_agent_runs_for_analysis(analysis_run_id)
-        
+
         # Build a tentative manifest to compute input_hash for idempotency check
         tentative_manifest = self._build_manifest(
             agent_run_id=uuid4(),  # temporary ID for hash computation
@@ -447,36 +446,24 @@ class AgentOrchestrator:
             specialist_input=specialist_input,
             agent_name=agent_name,
         )
-        
+
+        # Evaluate each existing completed run for full identity match
         for r in existing_runs:
-            if (
-                r.agent_name == agent_name
-                and r.status in (AgentRunStatus.SUCCEEDED, AgentRunStatus.DEGRADED)
-            ):
-                existing_manifest = self._repo.get_input_manifest(r.agent_run_id)
-                if (
-                    existing_manifest
-                    and existing_manifest.input_hash == tentative_manifest.input_hash
-                    and existing_manifest.dataset_version == dataset_version
-                    and existing_manifest.maturity == maturity
-                ):
-                    # Also check prompt/model identity from definition
-                    if (
-                        definition.contract_version == getattr(r, 'contract_version', 'v1')
-                        and definition.prompt_version == getattr(r, 'prompt_version', 'v1')
-                        and (definition.model or '') == getattr(r, 'model', '') or True
-                    ):
-                        logger.info(
-                            "Agent %s already completed (run_id=%s, status=%s, hash=%s)",
-                            agent_name, r.agent_run_id, r.status.value,
-                            tentative_manifest.input_hash[:12],
-                        )
-                        result = self._repo.get_agent_result(r.agent_run_id)
-                        if result:
-                            return AgentExecutionResult(
-                                status=r.status,
-                                result=result,
-                            )
+            if not self._is_candidate_for_reuse(r, agent_name, definition):
+                continue
+            existing_manifest = self._repo.get_input_manifest(r.agent_run_id)
+            if self._verify_full_identity(existing_manifest, tentative_manifest):
+                logger.info(
+                    "Reusing completed run for %s (run_id=%s, status=%s, hash=%s)",
+                    agent_name, r.agent_run_id, r.status.value,
+                    tentative_manifest.input_hash[:12],
+                )
+                result = self._repo.get_agent_result(r.agent_run_id)
+                if result:
+                    return AgentExecutionResult(
+                        status=r.status,
+                        result=result,
+                    )
 
         # ── Execute with retry (each attempt = new agent_run) ─────────
         logger.debug("About to enter retry loop for %s", agent_name)
@@ -571,6 +558,45 @@ class AgentOrchestrator:
             result=None,
             error_code=AgentErrorCode.UNKNOWN_ERROR,
             error_message=f"Exhausted {policy.max_attempts} attempts",
+        )
+
+    # ── Idempotency predicate ────────────────────────────────────────
+
+    @staticmethod
+    def _is_candidate_for_reuse(
+        run: Any,
+        agent_name: str,
+        definition: AgentDefinition,
+    ) -> bool:
+        """Quick pre-check: agent_name, terminal status, and model match.
+
+        Full identity (input_hash, manifest content) is verified by the
+        caller after loading the persisted manifest.
+        """
+        return (
+            run.agent_name == agent_name
+            and run.status in (AgentRunStatus.SUCCEEDED, AgentRunStatus.DEGRADED)
+            and getattr(run, 'model', None) == definition.model
+        )
+
+    @staticmethod
+    def _verify_full_identity(
+        existing_manifest: Any,
+        tentative_manifest: Any,
+    ) -> bool:
+        """Verify full execution identity after loading the persisted manifest.
+
+        Requires exact match of:
+        - input_hash (content identity)
+        - dataset_version
+        - maturity
+        """
+        if existing_manifest is None:
+            return False
+        return (
+            existing_manifest.input_hash == tentative_manifest.input_hash
+            and existing_manifest.dataset_version == tentative_manifest.dataset_version
+            and existing_manifest.maturity == tentative_manifest.maturity
         )
 
     # ── Helper: create new agent_run attempt ──────────────────────────
