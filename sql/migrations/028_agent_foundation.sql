@@ -16,7 +16,6 @@ CREATE TABLE IF NOT EXISTS analytics.agent_definition (
     agent_type       TEXT NOT NULL CHECK (agent_type IN ('SPECIALIST', 'CHIEF')),
     contract_version TEXT NOT NULL,
     prompt_version   TEXT NOT NULL,
-    model            TEXT,  -- LLM model identifier (separate from agent_name)
     enabled          BOOLEAN NOT NULL DEFAULT TRUE,
     description      TEXT,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),

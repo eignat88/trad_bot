@@ -61,12 +61,24 @@ class AgentExecutor:
     ) -> AgentExecutionResult:
         """Execute a single agent invocation."""
         try:
+            # 0. Validate model is configured (fail-closed)
+            if not definition.model or not definition.model.strip():
+                return AgentExecutionResult(
+                    status=AgentRunStatus.FAILED,
+                    result=None,
+                    error_code=AgentErrorCode.INVALID_INPUT,
+                    error_message=(
+                        f"Agent '{definition.agent_name}' has no model configured. "
+                        "Set definition.model before execution."
+                    ),
+                )
+
             # 1. Build prompt
             prompt_data = self._prompt_builder(definition, manifest)
 
-            # 2. Call LLM — model comes from definition.model field (fallback to agent_name)
+            # 2. Call LLM — model comes from definition.model (validated above)
             response = await self._model_client.generate(
-                model=definition.model or definition.agent_name,  # use model field, fallback to agent_name
+                model=definition.model,
                 system_prompt=prompt_data.get("system_prompt", ""),
                 input_json=prompt_data.get("input_json", {}),
                 response_schema=prompt_data.get("response_schema"),
@@ -163,6 +175,15 @@ class AgentExecutor:
         """
         # For repair, we add the error to the prompt and retry
         try:
+            # Validate model (fail-closed)
+            if not definition.model or not definition.model.strip():
+                return AgentExecutionResult(
+                    status=AgentRunStatus.FAILED,
+                    result=None,
+                    error_code=AgentErrorCode.INVALID_INPUT,
+                    error_message=f"Agent '{definition.agent_name}' has no model configured for repair.",
+                )
+
             prompt_data = self._prompt_builder(definition, manifest)
             repair_prompt = (
                 prompt_data.get("system_prompt", "")
@@ -171,7 +192,7 @@ class AgentExecutor:
             )
 
             response = await self._model_client.generate(
-                model=definition.model or definition.agent_name,  # use model field, fallback to agent_name
+                model=definition.model,
                 system_prompt=repair_prompt,
                 input_json=prompt_data.get("input_json", {}),
                 response_schema=prompt_data.get("response_schema"),

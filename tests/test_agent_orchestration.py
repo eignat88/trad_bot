@@ -96,7 +96,7 @@ def _make_repo_mock():
     repo.get_quality_results.return_value = []
     repo.get_agent_definition.return_value = None
     repo.create_agent_definition.return_value = AgentDefinition(
-        agent_name="TEST", agent_type="SPECIALIST",
+        agent_name="TEST", agent_type="SPECIALIST", model="test-model",
     )
     repo.get_agent_runs_for_analysis.return_value = []
     repo.get_next_attempt.return_value = 1
@@ -447,8 +447,9 @@ class TestModelIdentifier:
             agent_type="SPECIALIST",
             contract_version="v1",
             prompt_version="v1",
+            model="gpt-4o",
         )
-        # model passed to generate should be agent_name, not contract_version
+        # model passed to generate should be model, not agent_name or contract_version
         mock_client = AsyncMock()
         mock_client.generate = AsyncMock(return_value=ModelResponse(
             content="{}", parsed_json={}, model="test",
@@ -463,8 +464,9 @@ class TestModelIdentifier:
         _run_async(executor.execute(definition=definition, manifest=manifest))
 
         call_kwargs = mock_client.generate.call_args
-        assert call_kwargs.kwargs["model"] == "FUNNEL_AND_PERFORMANCE"
+        assert call_kwargs.kwargs["model"] == "gpt-4o"
         assert call_kwargs.kwargs["model"] != "v1"
+        assert call_kwargs.kwargs["model"] != "FUNNEL_AND_PERFORMANCE"
 
 
 # ── Crash recovery ────────────────────────────────────────────────────

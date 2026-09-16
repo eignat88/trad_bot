@@ -1,12 +1,13 @@
 """Tests for PR2 final correction pass — canonical build, quality gate fail-closed,
 dataset publication, model identifier.
 """
+import asyncio
 import pytest
 from uuid import uuid4
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, AsyncMock
 
-from app.analytics.agents.models import AgentDefinition, AgentType
+from app.analytics.agents.models import AgentDefinition, AgentType, AgentRunStatus
 from app.analytics.agents.executor import AgentExecutor
 from app.analytics.agents.llm_client import ModelResponse
 from app.analytics.agents.dataset_version import compute_dataset_version
@@ -62,8 +63,8 @@ class TestModelIdentifier:
         call_kwargs = mock_client.generate.call_args
         assert call_kwargs.kwargs["model"] == "gpt-4o"
 
-    def test_executor_fallback_to_agent_name(self):
-        """#15: when model is None, falls back to agent_name."""
+    def test_executor_fails_without_model(self):
+        """#5: missing model → FAILED, LLM NOT called."""
         mock_client = AsyncMock()
         mock_client.generate = AsyncMock(return_value=ModelResponse(
             content="{}", parsed_json={}, model="test",
@@ -81,12 +82,15 @@ class TestModelIdentifier:
         manifest.evidence_ids = []
 
         import asyncio
-        asyncio.get_event_loop().run_until_complete(
+        result = asyncio.get_event_loop().run_until_complete(
             executor.execute(definition=defn, manifest=manifest)
         )
 
-        call_kwargs = mock_client.generate.call_args
-        assert call_kwargs.kwargs["model"] == "TEST_AGENT"
+        # Should fail without calling LLM
+        assert result.status == AgentRunStatus.FAILED
+        assert result.error_code.value == "INVALID_INPUT"
+        assert "no model configured" in result.error_message.lower()
+        mock_client.generate.assert_not_called()
 
 
 # ── Canonical build (mocked) ──────────────────────────────────────────
@@ -317,3 +321,148 @@ class TestDatasetPublication:
         # This is a design decision: 0 rows means "executed, 0 legitimate trades"
         # The "built" flag means "function executed", not "has data"
         assert True  # Documented in canonical build stage
+
+
+# ── Migration 031 tests ───────────────────────────────────────────────
+
+class TestMigration031ModelColumn:
+    def test_migration_file_exists(self):
+        """Migration 031 exists and is readable."""
+        from pathlib import Path
+        path = Path("sql/migrations/031_agent_definition_model.sql")
+        assert path.exists()
+        content = path.read_text()
+        assert "ADD COLUMN IF NOT EXISTS" in content
+        assert "agent_definition" in content
+        assert "model" in content
+
+    def test_migration_028_no_model_column(self):
+        """Migration 028 should NOT contain model column (moved to 031)."""
+        from pathlib import Path
+        content = Path("sql/migrations/028_agent_foundation.sql").read_text()
+        # Should not define model column in CREATE TABLE
+        # (it's OK if referenced elsewhere, but not in CREATE TABLE agent_definition)
+        lines = content.split("\n")
+        in_agent_def = False
+        for line in lines:
+            if "CREATE TABLE IF NOT EXISTS analytics.agent_definition" in line:
+                in_agent_def = True
+            if in_agent_def and "model" in line and "TEXT" in line:
+                pytest.fail("model column found in migration 028 — should be in 031")
+            if in_agent_def and line.strip().startswith(");"):
+                in_agent_def = False
+
+    def test_model_column_in_agent_definition_schema(self):
+        """AgentDefinition model field exists in Python model."""
+        defn = AgentDefinition(
+            agent_name="TEST",
+            agent_type=AgentType.SPECIALIST,
+            model="gpt-4o",
+        )
+        assert hasattr(defn, "model")
+        assert defn.model == "gpt-4o"
+
+
+# ── Fail-closed model enforcement ─────────────────────────────────────
+
+class TestModelFailClosed:
+    def test_missing_model_does_not_call_provider(self):
+        """#5: definition.model is None → FAILED, LLM NOT called."""
+        mock_client = AsyncMock()
+        executor = AgentExecutor(mock_client, lambda d, m: {"system_prompt": "", "input_json": {}})
+
+        defn = AgentDefinition(agent_name="TEST", agent_type=AgentType.SPECIALIST, model=None)
+        manifest = MagicMock()
+        manifest.evidence_ids = []
+
+        result = asyncio.get_event_loop().run_until_complete(
+            executor.execute(definition=defn, manifest=manifest)
+        )
+
+        assert result.status == AgentRunStatus.FAILED
+        assert result.error_code.value == "INVALID_INPUT"
+        mock_client.generate.assert_not_called()
+
+    def test_empty_model_string_does_not_call_provider(self):
+        """#5: definition.model is '' → FAILED, LLM NOT called."""
+        mock_client = AsyncMock()
+        executor = AgentExecutor(mock_client, lambda d, m: {"system_prompt": "", "input_json": {}})
+
+        defn = AgentDefinition(agent_name="TEST", agent_type=AgentType.SPECIALIST, model="  ")
+        manifest = MagicMock()
+        manifest.evidence_ids = []
+
+        result = asyncio.get_event_loop().run_until_complete(
+            executor.execute(definition=defn, manifest=manifest)
+        )
+
+        assert result.status == AgentRunStatus.FAILED
+        mock_client.generate.assert_not_called()
+
+    def test_configured_model_passed_exactly(self):
+        """Configured model passed exactly to AgentModelClient."""
+        mock_client = AsyncMock()
+        mock_client.generate = AsyncMock(return_value=ModelResponse(
+            content="{}", parsed_json={}, model="test",
+            input_tokens=100, output_tokens=200, total_tokens=300,
+            latency_ms=100, finish_reason="stop",
+        ))
+        executor = AgentExecutor(mock_client, lambda d, m: {"system_prompt": "", "input_json": {}})
+
+        defn = AgentDefinition(
+            agent_name="FUNNEL_AND_PERFORMANCE",
+            agent_type=AgentType.SPECIALIST,
+            model="claude-sonnet-4-20250514",
+        )
+        manifest = MagicMock()
+        manifest.evidence_ids = []
+
+        asyncio.get_event_loop().run_until_complete(
+            executor.execute(definition=defn, manifest=manifest)
+        )
+
+        call_kwargs = mock_client.generate.call_args
+        assert call_kwargs.kwargs["model"] == "claude-sonnet-4-20250514"
+
+    def test_agent_name_never_used_as_model(self):
+        """#16: agent_name is NEVER passed as model identifier."""
+        mock_client = AsyncMock()
+        mock_client.generate = AsyncMock(return_value=ModelResponse(
+            content="{}", parsed_json={}, model="test",
+            input_tokens=100, output_tokens=200, total_tokens=300,
+            latency_ms=100, finish_reason="stop",
+        ))
+        executor = AgentExecutor(mock_client, lambda d, m: {"system_prompt": "", "input_json": {}})
+
+        defn = AgentDefinition(
+            agent_name="FUNNEL_AND_PERFORMANCE",
+            agent_type=AgentType.SPECIALIST,
+            model="gpt-4o",
+        )
+        manifest = MagicMock()
+        manifest.evidence_ids = []
+
+        asyncio.get_event_loop().run_until_complete(
+            executor.execute(definition=defn, manifest=manifest)
+        )
+
+        call_kwargs = mock_client.generate.call_args
+        assert call_kwargs.kwargs["model"] == "gpt-4o"
+        assert call_kwargs.kwargs["model"] != "FUNNEL_AND_PERFORMANCE"
+
+    def test_repair_also_fails_without_model(self):
+        """Repair also requires configured model."""
+        mock_client = AsyncMock()
+        executor = AgentExecutor(mock_client, lambda d, m: {"system_prompt": "", "input_json": {}})
+
+        defn = AgentDefinition(agent_name="TEST", agent_type=AgentType.SPECIALIST, model=None)
+        manifest = MagicMock()
+        manifest.evidence_ids = []
+
+        result = asyncio.get_event_loop().run_until_complete(
+            executor.repair(definition=defn, manifest=manifest, original_error="bad schema")
+        )
+
+        assert result.status == AgentRunStatus.FAILED
+        assert "no model configured" in result.error_message.lower()
+        mock_client.generate.assert_not_called()
