@@ -445,6 +445,7 @@ class AgentOrchestrator:
             readiness=readiness,
             specialist_input=specialist_input,
             agent_name=agent_name,
+            definition=definition,
         )
 
         # Evaluate each existing completed run for full identity match
@@ -481,6 +482,7 @@ class AgentOrchestrator:
                 readiness=readiness,
                 specialist_input=specialist_input,
                 agent_name=agent_name,
+                definition=definition,
             )
             manifest = self._repo.create_input_manifest(manifest)
 
@@ -517,6 +519,7 @@ class AgentOrchestrator:
                     readiness=readiness,
                     specialist_input=specialist_input,
                     agent_name=agent_name,
+                    definition=definition,
                 )
                 repair_manifest = self._repo.create_input_manifest(repair_manifest)
                 
@@ -691,12 +694,15 @@ class AgentOrchestrator:
         readiness: DataReadinessResult,
         specialist_input: Any = None,
         agent_name: str = "",
+        definition: Optional[AgentDefinition] = None,
     ) -> AgentInputManifest:
         """Build an immutable input manifest for an agent.
 
         The ``input_hash`` is a SHA-256 fingerprint of the full
-        specialist input payload, enabling forensic reproducibility.
-        
+        specialist input payload INCLUDING execution identity
+        (agent_name, prompt_version, contract_version, model),
+        enabling forensic reproducibility.
+
         ``manifest_json`` stores the exact input snapshot so that
         what the LLM actually saw can be reconstructed.
         """
@@ -712,11 +718,19 @@ class AgentOrchestrator:
             if specialist_input else readiness.limitations
         )
 
+        # ── Execution identity from definition ────────────────────────
+        prompt_version = definition.prompt_version if definition else ""
+        contract_version = definition.contract_version if definition else ""
+        model = definition.model if definition else None
+
         # ── Build the exact input snapshot (forensic traceability) ─────
         input_snapshot = {
             "agent_name": agent_name,
             "dataset_version": dataset_version,
             "maturity": maturity,
+            "prompt_version": prompt_version,
+            "contract_version": contract_version,
+            "model": model,
             "data_quality_status": readiness.quality_status,
             "limitations": sorted(limitations),
             "analysis_window_from": str(readiness.analysis_window_from),
@@ -851,6 +865,8 @@ class AgentOrchestrator:
             dataset_version=dataset_version,
             maturity=maturity,
             readiness=readiness,
+            agent_name=CHIEF_AGENT,
+            definition=definition,
         )
         manifest = self._repo.create_input_manifest(manifest)
 
