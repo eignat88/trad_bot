@@ -66,14 +66,12 @@ class TestClassifyError:
         assert classify_error(ValueError("bad input")) == AgentErrorCode.INVALID_INPUT
 
     def test_permission_error(self):
-        """PermissionError is an OSError subclass, so it gets caught by the OSError check.
-        
-        Note: PermissionError inherits from OSError, and the classify_error function
-        has a check for `isinstance(error, (ConnectionError, OSError))` which returns
-        MODEL_PROVIDER_ERROR before reaching the PermissionError check.
+        """PermissionError → SECURITY_POLICY_ERROR (fix #20).
+
+        PermissionError is checked BEFORE OSError to ensure correct
+        security semantics — not just generic provider errors.
         """
-        # PermissionError → MODEL_PROVIDER_ERROR (because it's an OSError)
-        assert classify_error(PermissionError("denied")) == AgentErrorCode.MODEL_PROVIDER_ERROR
+        assert classify_error(PermissionError("denied")) == AgentErrorCode.SECURITY_POLICY_ERROR
 
     def test_generic_error(self):
         """RuntimeError should classify as UNKNOWN_ERROR."""

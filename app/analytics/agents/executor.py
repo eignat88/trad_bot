@@ -64,9 +64,9 @@ class AgentExecutor:
             # 1. Build prompt
             prompt_data = self._prompt_builder(definition, manifest)
 
-            # 2. Call LLM
+            # 2. Call LLM — model comes from definition, not contract_version
             response = await self._model_client.generate(
-                model=definition.contract_version,  # model identifier stored here
+                model=definition.agent_name,  # model identifier from agent definition
                 system_prompt=prompt_data.get("system_prompt", ""),
                 input_json=prompt_data.get("input_json", {}),
                 response_schema=prompt_data.get("response_schema"),
@@ -99,10 +99,10 @@ class AgentExecutor:
                     model_response=response,
                 )
 
-            # 5. Evidence validation
+            # 5. Evidence validation — build NEW list to avoid mutating parsed result
             catalog = EvidenceCatalog(manifest.evidence_ids)
-            evidence_refs = parsed.get("evidence_refs", [])
-            # Also collect from observations
+            evidence_refs: list[str] = list(parsed.get("evidence_refs", []))
+            # Also collect from observations and hypotheses (extend the copy, not original)
             for obs in parsed.get("observations", []):
                 evidence_refs.extend(obs.get("evidence_refs", []))
             for hyp in parsed.get("hypotheses", []):
@@ -171,7 +171,7 @@ class AgentExecutor:
             )
 
             response = await self._model_client.generate(
-                model=definition.contract_version,
+                model=definition.agent_name,
                 system_prompt=repair_prompt,
                 input_json=prompt_data.get("input_json", {}),
                 response_schema=prompt_data.get("response_schema"),
@@ -202,9 +202,9 @@ class AgentExecutor:
                     model_response=response,
                 )
 
-            # Evidence validation for repair
+            # Evidence validation for repair — NEW list to avoid mutating parsed
             catalog = EvidenceCatalog(manifest.evidence_ids)
-            evidence_refs = parsed.get("evidence_refs", [])
+            evidence_refs: list[str] = list(parsed.get("evidence_refs", []))
             for obs in parsed.get("observations", []):
                 evidence_refs.extend(obs.get("evidence_refs", []))
             for hyp in parsed.get("hypotheses", []):

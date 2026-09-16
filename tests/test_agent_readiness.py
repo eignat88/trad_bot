@@ -20,6 +20,8 @@ class TestDataReadinessGate:
             maturity="FINAL",
             dataset_version="20260916.F.abc123",
             quality_status="PASS",
+            publication_status="READY",
+            canonical_build_json={"trade_fact_built": True, "setup_fact_built": True},
         )
         assert r.ready is True
         assert r.dataset_state == "READY"
@@ -37,6 +39,8 @@ class TestDataReadinessGate:
             maturity="PROVISIONAL",
             dataset_version="20260916.P.def456",
             quality_status="DEGRADED",
+            publication_status="READY",
+            canonical_build_json={"trade_fact_built": True, "setup_fact_built": True},
         )
         assert r.ready is True
         assert r.quality_status == "DEGRADED"
@@ -50,9 +54,11 @@ class TestDataReadinessGate:
             maturity="FINAL",
             dataset_version="20260916.F.abc",
             quality_status="FAIL",
+            publication_status="READY",
+            canonical_build_json={"trade_fact_built": True, "setup_fact_built": True},
         )
         assert r.ready is False
-        assert "quality gate FAILED" in r.blockers[0]
+        assert any("quality gate FAILED" in b for b in r.blockers)
 
     def test_not_ready_canonical_missing(self, gate):
         """Test that missing canonical build blocks readiness."""
@@ -135,6 +141,8 @@ class TestDataReadinessGate:
             maturity="FINAL",
             dataset_version="v1",
             quality_status="DEGRADED",
+            publication_status="READY",
+            canonical_build_json={"trade_fact_built": True, "setup_fact_built": True},
             quality_limitations=["missing 7d candles for ETHUSDT"],
         )
         assert r.ready is True
@@ -177,6 +185,8 @@ class TestDataReadinessGate:
             maturity="FINAL",
             dataset_version="20260916.F.abc",
             quality_status="PASS",
+            publication_status="READY",
+            canonical_build_json={"trade_fact_built": True, "setup_fact_built": True},
         )
         assert r.ready is True
 

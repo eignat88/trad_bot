@@ -177,17 +177,20 @@ def classify_error(
         return AgentErrorCode.MODEL_PROVIDER_ERROR
 
     # Legacy exception-type classification
+    # PermissionError MUST be checked BEFORE OSError (it's a subclass)
     if error is not None:
         name = type(error).__name__
         if "timeout" in name.lower() or isinstance(error, TimeoutError):
             return AgentErrorCode.MODEL_TIMEOUT
         if "rate" in name.lower() and "limit" in name.lower():
             return AgentErrorCode.MODEL_RATE_LIMIT
-        if isinstance(error, (ConnectionError, OSError)):
+        if isinstance(error, PermissionError):
+            return AgentErrorCode.SECURITY_POLICY_ERROR
+        if isinstance(error, OSError):
+            return AgentErrorCode.MODEL_PROVIDER_ERROR
+        if isinstance(error, (ConnectionError,)):
             return AgentErrorCode.MODEL_PROVIDER_ERROR
         if isinstance(error, ValueError):
             return AgentErrorCode.INVALID_INPUT
-        if isinstance(error, PermissionError):
-            return AgentErrorCode.SECURITY_POLICY_ERROR
 
     return AgentErrorCode.UNKNOWN_ERROR

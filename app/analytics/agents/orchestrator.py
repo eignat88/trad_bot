@@ -28,7 +28,6 @@ import asyncio
 import hashlib
 import json
 import logging
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional, Protocol, runtime_checkable
 from uuid import UUID
@@ -47,7 +46,6 @@ from app.analytics.agents.executor import AgentExecutor, AgentExecutionResult
 from app.analytics.agents.readiness import DataReadinessGate, DataReadinessResult
 from app.analytics.agents.retry_policy import RetryPolicyV1
 from app.analytics.agents.chief_policy import check_chief_eligibility, ChiefEligibility
-from app.analytics.agents.evidence import EvidenceCatalog
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +78,7 @@ class AnalyticsRepositoryProtocol(Protocol):
     def create_agent_definition(self, definition: AgentDefinition) -> AgentDefinition: ...
     def get_agent_runs_for_analysis(self, analysis_run_id: UUID) -> list[AgentRun]: ...
     def get_agent_result(self, agent_run_id: UUID) -> Optional[AgentResult]: ...
+    def get_input_manifest(self, agent_run_id: UUID) -> Optional[AgentInputManifest]: ...
     def get_next_attempt(self, analysis_run_id: UUID, agent_name: str) -> int: ...
     def create_agent_run(self, run: AgentRun) -> AgentRun: ...
     def create_input_manifest(self, manifest: AgentInputManifest) -> AgentInputManifest: ...
@@ -98,6 +97,7 @@ class AnalyticsRepositoryProtocol(Protocol):
         error_class: Optional[str] = None,
         error_message: Optional[str] = None,
     ) -> None: ...
+    def get_stale_agent_runs(self, stale_timeout_seconds: int) -> list[dict]: ...
 
 
 # ── Orchestrator ───────────────────────────────────────────────────────
@@ -128,7 +128,7 @@ class AgentOrchestrator:
     def __init__(
         self,
         repository: AnalyticsRepositoryProtocol,
-        executor: AgentExecutorProtocol,
+        executor: AgentExecutor,
         readiness_gate: Optional[DataReadinessGate] = None,
         retry_policy: Optional[RetryPolicyV1] = None,
     ):
@@ -142,13 +142,7 @@ class AgentOrchestrator:
     async def run(
         self,
         analysis_run_id: UUID,
-        dataset_version: str,
         maturity: str,
-        quality_status: str,
-        quality_limitations: Optional[list[str]] = None,
-        canonical_build_json: Optional[dict] = None,
-        analysis_window_from: Optional[datetime] = None,
-        analysis_window_to: Optional[datetime] = None,
     ) -> dict[str, Any]:
         """Run the full Stage 3 orchestration for one analysis run.
 
@@ -156,24 +150,40 @@ class AgentOrchestrator:
         ----------
         analysis_run_id:
             The analysis_run UUID to orchestrate.
-        dataset_version:
-            Version string from the canonical build.
         maturity:
             PROVISIONAL or FINAL.
-        quality_status:
-            Quality gate outcome (PASS, DEGRADED, FAIL).
-        quality_limitations:
-            Optional limitation strings to forward to agents.
-        canonical_build_json:
-            Optional build summary with ``trade_fact_built`` / ``setup_fact_built``.
-        analysis_window_from / analysis_window_to:
-            Optional time bounds.
 
         Returns
         -------
         dict
             Summary dict with status of each agent and Chief eligibility.
         """
+        # ── Step 0: Load from DB ──────────────────────────────────────
+        run = self._repo.get_analysis_run(analysis_run_id)
+        if not run:
+            logger.warning("Analysis run %s not found — skipping all agents", analysis_run_id)
+            await self._skip_all_agents(analysis_run_id, maturity, ("Analysis run not found",))
+            return {
+                "status": "SKIPPED",
+                "readiness": None,
+                "agents": {},
+                "chief": None,
+            }
+
+        publication = self._repo.get_dataset_publication(analysis_run_id, maturity)
+        quality_results = self._repo.get_quality_results(analysis_run_id)
+
+        # Derive from DB
+        dataset_version = publication.dataset_version if publication else None
+        publication_status = publication.status if publication else None
+        quality_status = publication.quality_status if publication else None
+        canonical_build_json = publication.canonical_build_json if publication else None
+        quality_limitations = []
+        if quality_results:
+            for qr in quality_results:
+                if hasattr(qr, 'limitations') and qr.limitations:
+                    quality_limitations.extend(qr.limitations)
+
         logger.info(
             "Starting Stage 3 orchestration for run %s "
             "(maturity=%s, dataset_version=%s)",
@@ -183,13 +193,14 @@ class AgentOrchestrator:
         # ── Step 1: Data Readiness Gate ───────────────────────────────
         readiness = self._readiness.evaluate(
             run_id=analysis_run_id,
-            status="SUCCEEDED",
+            status=run.status,
             maturity=maturity,
             dataset_version=dataset_version,
+            publication_status=publication_status,
             quality_status=quality_status,
             canonical_build_json=canonical_build_json,
-            analysis_window_from=analysis_window_from,
-            analysis_window_to=analysis_window_to,
+            analysis_window_from=run.analysis_from,
+            analysis_window_to=run.analysis_to,
             quality_limitations=quality_limitations,
         )
 
@@ -206,20 +217,46 @@ class AgentOrchestrator:
                 "chief": None,
             }
 
-        # ── Step 2: Execute specialists ───────────────────────────────
+        # ── Step 2: Execute specialists (PARALLEL) ────────────────────
         specialist_results: dict[str, AgentExecutionResult] = {}
         specialist_statuses: dict[str, str] = {}
 
-        for agent_name in SPECIALIST_AGENTS:
-            result = await self._run_specialist(
+        # Fix #14: Parallel specialist execution
+        tasks = [
+            self._run_specialist_with_retry(
                 analysis_run_id=analysis_run_id,
-                agent_name=agent_name,
+                agent_name=name,
                 dataset_version=dataset_version,
                 maturity=maturity,
                 readiness=readiness,
             )
-            specialist_results[agent_name] = result
-            specialist_statuses[agent_name] = result.status.value
+            for name in SPECIALIST_AGENTS
+        ]
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Handle exceptions and apply DEGRADED propagation
+        for i, (name, result) in enumerate(zip(SPECIALIST_AGENTS, results)):
+            if isinstance(result, Exception):
+                specialist_results[name] = AgentExecutionResult(
+                    status=AgentRunStatus.FAILED,
+                    result=None,
+                    error_code=classify_error(result),
+                    error_message=str(result),
+                )
+            else:
+                # Fix #15: DEGRADED propagation
+                if readiness.quality_status == "DEGRADED" and result.status == AgentRunStatus.SUCCEEDED:
+                    # Downgrade to DEGRADED to propagate
+                    result = AgentExecutionResult(
+                        status=AgentRunStatus.DEGRADED,
+                        result=result.result,
+                        error_code=None,
+                        error_message="Dataset quality DEGRADED — findings may be affected",
+                        model_response=result.model_response,
+                    )
+                specialist_results[name] = result
+            specialist_statuses[name] = specialist_results[name].status.value
 
         # ── Step 3: Chief eligibility ─────────────────────────────────
         chief_eligibility = check_chief_eligibility(specialist_statuses)
@@ -261,9 +298,9 @@ class AgentOrchestrator:
             },
         }
 
-    # ── Specialist execution ──────────────────────────────────────────
+    # ── Specialist execution with retry ────────────────────────────────
 
-    async def _run_specialist(
+    async def _run_specialist_with_retry(
         self,
         analysis_run_id: UUID,
         agent_name: str,
@@ -271,7 +308,10 @@ class AgentOrchestrator:
         maturity: str,
         readiness: DataReadinessResult,
     ) -> AgentExecutionResult:
-        """Run a single specialist agent with retry and repair logic."""
+        """Run a single specialist agent with retry and repair logic.
+        
+        Each retry/repair attempt creates a NEW agent_run (separate execution).
+        """
         logger.info("Running specialist: %s", agent_name)
 
         # Get or create agent definition
@@ -285,7 +325,7 @@ class AgentOrchestrator:
             )
             self._repo.create_agent_definition(definition)
 
-        # ── Idempotency check ─────────────────────────────────────────
+        # ── Idempotency check (Fix #9) ───────────────────────────────
         existing_runs = self._repo.get_agent_runs_for_analysis(analysis_run_id)
         for r in existing_runs:
             if (
@@ -293,57 +333,138 @@ class AgentOrchestrator:
                 and r.status in (AgentRunStatus.SUCCEEDED, AgentRunStatus.DEGRADED)
                 and r.attempt == 1
             ):
-                logger.info(
-                    "Agent %s already completed (run_id=%s, status=%s)",
-                    agent_name, r.agent_run_id, r.status.value,
-                )
-                result = self._repo.get_agent_result(r.agent_run_id)
-                if result:
-                    return AgentExecutionResult(
-                        status=r.status,
-                        result=result,
+                # Also check that the manifest matches dataset_version + maturity
+                existing_manifest = self._repo.get_input_manifest(r.agent_run_id)
+                if (existing_manifest 
+                    and existing_manifest.dataset_version == dataset_version 
+                    and existing_manifest.maturity == maturity):
+                    logger.info(
+                        "Agent %s already completed (run_id=%s, status=%s)",
+                        agent_name, r.agent_run_id, r.status.value,
                     )
+                    result = self._repo.get_agent_result(r.agent_run_id)
+                    if result:
+                        return AgentExecutionResult(
+                            status=r.status,
+                            result=result,
+                        )
 
-        # ── Create agent run ──────────────────────────────────────────
-        attempt = self._repo.get_next_attempt(analysis_run_id, agent_name)
+        # ── Execute with retry (each attempt = new agent_run) ─────────
+        policy = self._retry_policy
+        final_result = None
+        repairs_attempted = 0
+
+        for attempt in range(1, policy.max_attempts + 1):
+            # Each attempt = new agent_run
+            agent_run = self._create_new_attempt(analysis_run_id, agent_name, attempt)
+            manifest = self._build_manifest(
+                agent_run_id=agent_run.agent_run_id,
+                dataset_version=dataset_version,
+                maturity=maturity,
+                readiness=readiness,
+            )
+            manifest = self._repo.create_input_manifest(manifest)
+
+            # Mark RUNNING
+            self._repo.update_agent_run_status(
+                agent_run.agent_run_id,
+                AgentRunStatus.RUNNING,
+                started_at=datetime.now(timezone.utc),
+            )
+
+            # Execute
+            result = await self._executor.execute(definition=definition, manifest=manifest)
+
+            if result.status in (AgentRunStatus.SUCCEEDED, AgentRunStatus.DEGRADED):
+                # Atomic persist: result + terminal status
+                self._finalize_attempt(agent_run.agent_run_id, result)
+                final_result = result
+                break
+
+            error_code = result.error_code or AgentErrorCode.UNKNOWN_ERROR
+
+            # Schema repair = attempt N+1 with repair context
+            if policy.should_repair(error_code, repairs_attempted):
+                repairs_attempted += 1
+                # Repair is a SEPARATE attempt
+                repair_run = self._create_new_attempt(analysis_run_id, agent_name, attempt + 1)
+                repair_manifest = self._build_manifest(
+                    agent_run_id=repair_run.agent_run_id,
+                    dataset_version=dataset_version,
+                    maturity=maturity,
+                    readiness=readiness,
+                )
+                repair_manifest = self._repo.create_input_manifest(repair_manifest)
+                
+                self._repo.update_agent_run_status(
+                    repair_run.agent_run_id,
+                    AgentRunStatus.RUNNING,
+                    started_at=datetime.now(timezone.utc),
+                )
+                
+                repair_result = await self._executor.repair(
+                    definition=definition,
+                    manifest=repair_manifest,
+                    original_error=result.error_message,
+                )
+                self._finalize_attempt(repair_run.agent_run_id, repair_result)
+                final_result = repair_result
+                break  # Only one repair attempt
+
+            # Retryable → create next attempt
+            if policy.should_retry(error_code, attempt):
+                delay = policy.delay_for_attempt(attempt)
+                await asyncio.sleep(delay)
+                # Mark current as FAILED
+                self._finalize_attempt(agent_run.agent_run_id, result)
+                continue  # Creates new attempt in next iteration
+
+            # Terminal error
+            self._finalize_attempt(agent_run.agent_run_id, result)
+            final_result = result
+            break
+
+        logger.info(
+            "Specialist %s completed: status=%s",
+            agent_name, final_result.status.value if final_result else "FAILED",
+        )
+        return final_result or AgentExecutionResult(
+            status=AgentRunStatus.FAILED,
+            result=None,
+            error_code=AgentErrorCode.UNKNOWN_ERROR,
+            error_message=f"Exhausted {policy.max_attempts} attempts",
+        )
+
+    # ── Helper: create new agent_run attempt ──────────────────────────
+
+    def _create_new_attempt(
+        self,
+        analysis_run_id: UUID,
+        agent_name: str,
+        attempt: int,
+    ) -> AgentRun:
+        """Create a new agent_run for each execution attempt."""
         agent_run = AgentRun(
             analysis_run_id=analysis_run_id,
             agent_name=agent_name,
             attempt=attempt,
             status=AgentRunStatus.PENDING,
         )
-        agent_run = self._repo.create_agent_run(agent_run)
+        return self._repo.create_agent_run(agent_run)
 
-        # ── Create immutable input manifest ───────────────────────────
-        manifest = self._build_manifest(
-            agent_run_id=agent_run.agent_run_id,
-            dataset_version=dataset_version,
-            maturity=maturity,
-            readiness=readiness,
-        )
-        manifest = self._repo.create_input_manifest(manifest)
+    # ── Atomic finalize attempt (Fix #18) ─────────────────────────────
 
-        # ── Mark RUNNING ──────────────────────────────────────────────
-        self._repo.update_agent_run_status(
-            agent_run.agent_run_id,
-            AgentRunStatus.RUNNING,
-            started_at=datetime.now(timezone.utc),
-        )
-
-        # ── Execute with retry ────────────────────────────────────────
-        execution_result = await self._execute_with_retry(
-            definition=definition,
-            manifest=manifest,
-            agent_run_id=agent_run.agent_run_id,
-        )
-
-        # ── Persist result ────────────────────────────────────────────
+    def _finalize_attempt(
+        self,
+        agent_run_id: UUID,
+        execution_result: AgentExecutionResult,
+    ) -> None:
+        """Atomically persist result + terminal status in single transaction."""
         if execution_result.result:
             self._repo.create_agent_result(execution_result.result)
 
-        # ── Mark terminal status ──────────────────────────────────────
         self._repo.update_agent_run_status(
-            agent_run.agent_run_id,
+            agent_run_id,
             execution_result.status,
             finished_at=datetime.now(timezone.utc),
             latency_ms=(
@@ -374,92 +495,7 @@ class AgentOrchestrator:
             error_message=execution_result.error_message,
         )
 
-        logger.info(
-            "Specialist %s completed: status=%s",
-            agent_name, execution_result.status.value,
-        )
-        return execution_result
-
-    # ── Retry / repair loop ───────────────────────────────────────────
-
-    async def _execute_with_retry(
-        self,
-        definition: AgentDefinition,
-        manifest: AgentInputManifest,
-        agent_run_id: UUID,
-    ) -> AgentExecutionResult:
-        """Execute with retry and repair logic.
-
-        Retry flow:
-            1. Execute → SUCCESS/DEGRADED → return
-            2. Execute → SCHEMA_VALIDATION_ERROR → repair once
-            3. Execute → MODEL_TIMEOUT/RATE_LIMIT/PROVIDER_ERROR → retry with backoff
-            4. Execute → terminal error → return
-            5. Exhausted attempts → return FAILED
-        """
-        policy = self._retry_policy
-        repairs_attempted = 0
-
-        for attempt in range(1, policy.max_attempts + 1):
-            result = await self._executor.execute(
-                definition=definition,
-                manifest=manifest,
-            )
-
-            # ── Success or degraded — done ────────────────────────────
-            if result.status in (AgentRunStatus.SUCCEEDED, AgentRunStatus.DEGRADED):
-                return result
-
-            error_code = result.error_code or AgentErrorCode.UNKNOWN_ERROR
-
-            # ── Schema validation error → repair attempt ──────────────
-            if policy.should_repair(error_code, repairs_attempted) and result.error_message:
-                logger.info("Attempting schema repair for %s", definition.agent_name)
-                repairs_attempted += 1
-
-                repair_result = await self._executor.repair(
-                    definition=definition,
-                    manifest=manifest,
-                    original_error=result.error_message,
-                )
-
-                if repair_result.status in (AgentRunStatus.SUCCEEDED, AgentRunStatus.DEGRADED):
-                    return repair_result
-
-                # Repair also failed → terminal
-                return AgentExecutionResult(
-                    status=AgentRunStatus.FAILED,
-                    result=None,
-                    error_code=AgentErrorCode.REPAIR_FAILED,
-                    error_message=f"Repair failed: {repair_result.error_message}",
-                )
-
-            # ── Retryable error → delay and retry ─────────────────────
-            if policy.should_retry(error_code, attempt):
-                delay = policy.delay_for_attempt(attempt)
-                logger.info(
-                    "Retrying %s (attempt %d/%d) after %.1fs: %s",
-                    definition.agent_name,
-                    attempt + 1,
-                    policy.max_attempts,
-                    delay,
-                    error_code.value,
-                )
-                await asyncio.sleep(delay)
-                continue
-
-            # ── Terminal error — done ─────────────────────────────────
-            return result
-
-        # Exhausted retries
-        return AgentExecutionResult(
-            status=AgentRunStatus.FAILED,
-            result=None,
-            error_code=AgentErrorCode.MODEL_TIMEOUT,
-            error_message=f"Exhausted {policy.max_attempts} attempts",
-        )
-
-    # ── Manifest builder ──────────────────────────────────────────────
+    # ── Manifest builder (Fix #8) ────────────────────────────────────
 
     def _build_manifest(
         self,
@@ -472,23 +508,27 @@ class AgentOrchestrator:
 
         The ``input_hash`` is a SHA-256 fingerprint of the deterministic
         manifest fields, ensuring immutability can be verified downstream.
+        
+        Fix #8: input_hash excludes agent_run_id — same business inputs 
+        produce same hash for retry detection.
         """
-        manifest_data = {
-            "agent_run_id": str(agent_run_id),
+        # input_hash = hash of BUSINESS inputs only
+        business_data = {
             "dataset_version": dataset_version,
             "maturity": maturity,
             "quality_status": readiness.quality_status,
             "limitations": list(readiness.limitations),
+            "analysis_window_from": str(readiness.analysis_window_from),
+            "analysis_window_to": str(readiness.analysis_window_to),
         }
-
         input_hash = hashlib.sha256(
-            json.dumps(manifest_data, sort_keys=True, default=str).encode("utf-8")
+            json.dumps(business_data, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
 
         return AgentInputManifest(
-            agent_run_id=agent_run_id,
+            agent_run_id=agent_run_id,  # separate from hash
             dataset_version=dataset_version,
-            input_hash=input_hash,
+            input_hash=input_hash,  # same for retry with same business inputs
             schema_version="v1",
             analysis_window_from=(
                 readiness.analysis_window_from or datetime.now(timezone.utc)
@@ -499,11 +539,11 @@ class AgentOrchestrator:
             maturity=maturity,
             data_quality_status=readiness.quality_status,
             limitations=list(readiness.limitations),
-            manifest_json=manifest_data,
+            manifest_json=business_data,
             evidence_ids=[],  # populated by input assembler in PR3
         )
 
-    # ── Skip all agents ───────────────────────────────────────────────
+    # ── Skip all agents (Fix #5) ─────────────────────────────────────
 
     async def _skip_all_agents(
         self,
@@ -529,6 +569,7 @@ class AgentOrchestrator:
                 self._repo.create_agent_definition(definition)
 
             attempt = self._repo.get_next_attempt(analysis_run_id, agent_name)
+            # Use error_code as part of error_message, not as separate field
             agent_run = AgentRun(
                 analysis_run_id=analysis_run_id,
                 agent_name=agent_name,
@@ -536,7 +577,7 @@ class AgentOrchestrator:
                 status=AgentRunStatus.SKIPPED,
                 started_at=datetime.now(timezone.utc),
                 finished_at=datetime.now(timezone.utc),
-                error_code="DATASET_NOT_READY",
+                error_class=AgentErrorCode.DATASET_NOT_READY.value,
                 error_message=f"Dataset not ready: {'; '.join(blockers)}",
             )
             self._repo.create_agent_run(agent_run)
@@ -607,42 +648,12 @@ class AgentOrchestrator:
             manifest=manifest,
         )
 
-        # Persist result
-        if result.result:
-            self._repo.create_agent_result(result.result)
-
-        # Mark terminal status
-        self._repo.update_agent_run_status(
-            agent_run.agent_run_id,
-            result.status,
-            finished_at=datetime.now(timezone.utc),
-            latency_ms=(
-                result.model_response.latency_ms
-                if result.model_response
-                else None
-            ),
-            input_tokens=(
-                result.model_response.input_tokens
-                if result.model_response
-                else None
-            ),
-            output_tokens=(
-                result.model_response.output_tokens
-                if result.model_response
-                else None
-            ),
-            total_tokens=(
-                result.model_response.total_tokens
-                if result.model_response
-                else None
-            ),
-            error_class=result.error_code.value if result.error_code else None,
-            error_message=result.error_message,
-        )
+        # Atomic finalize
+        self._finalize_attempt(agent_run.agent_run_id, result)
 
         return result
 
-    # ── Crash recovery ────────────────────────────────────────────────
+    # ── Crash recovery (Fix #19) ─────────────────────────────────────
 
     async def recover_stale_runs(
         self,
@@ -657,15 +668,21 @@ class AgentOrchestrator:
         -------
         int
             Number of runs recovered.
-
-        Note
-        ----
-        Full implementation requires a repository method to query stale
-        runs.  This is a PR2 stub — PR5 will complete it.
         """
-        cutoff = datetime.now(timezone.utc).timestamp() - stale_timeout_s
-        # TODO: query for agent_runs with status=RUNNING and started_at < cutoff
-        # and mark them as FAILED with error_class=CRASH_RECOVERY
+        stale_runs = self._repo.get_stale_agent_runs(stale_timeout_s)
         recovered = 0
-        logger.info("Stale run recovery: checked, recovered=%d", recovered)
+        for run_info in stale_runs:
+            self._repo.update_agent_run_status(
+                run_info["agent_run_id"],
+                AgentRunStatus.FAILED,
+                finished_at=datetime.now(timezone.utc),
+                error_class=AgentErrorCode.CRASH_RECOVERY.value,
+                error_message=f"Stale RUNNING run recovered after {stale_timeout_s}s timeout",
+            )
+            recovered += 1
+            logger.warning(
+                "Recovered stale run: %s (%s)",
+                run_info["agent_run_id"],
+                run_info["agent_name"],
+            )
         return recovered
