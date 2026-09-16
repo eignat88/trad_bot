@@ -873,32 +873,18 @@ class AgentOrchestrator:
             chief_eligibility=chief_eligibility,
         )
 
-        # ── Build Chief prompt ────────────────────────────────────────
-        from app.analytics.agents.prompts.chief_trading_analyst_v1 import build_chief_prompt
-        prompt_builder = lambda defn, manifest: build_chief_prompt(chief_input)
-
-        # ── Build manifest with full Chief input snapshot ─────────────
-        attempt = self._repo.get_next_attempt(analysis_run_id, CHIEF_AGENT)
-        agent_run = AgentRun(
-            analysis_run_id=analysis_run_id,
-            agent_name=CHIEF_AGENT,
-            attempt=attempt,
-            status=AgentRunStatus.PENDING,
-            model=definition.model,
-        )
-        agent_run = self._repo.create_agent_run(agent_run)
-
-        manifest = self._build_chief_manifest(
-            agent_run_id=agent_run.agent_run_id,
+        # ── Build tentative manifest (in-memory, no DB) ──────────────
+        # idempotency must be checked BEFORE any DB inserts
+        tentative_manifest = self._build_chief_manifest(
+            agent_run_id=uuid4(),  # temporary — not persisted yet
             dataset_version=dataset_version,
             maturity=maturity,
             readiness=readiness,
             definition=definition,
             chief_input=chief_input,
         )
-        manifest = self._repo.create_input_manifest(manifest)
 
-        # ── Chief idempotency check ───────────────────────────────────
+        # ── Chief idempotency check (BEFORE DB inserts) ──────────────
         existing_runs = self._repo.get_agent_runs_for_analysis(analysis_run_id)
         for r in existing_runs:
             if (
@@ -909,11 +895,12 @@ class AgentOrchestrator:
                 existing_manifest = self._repo.get_input_manifest(r.agent_run_id)
                 if (
                     existing_manifest
-                    and existing_manifest.input_hash == manifest.input_hash
+                    and existing_manifest.input_hash == tentative_manifest.input_hash
                 ):
                     logger.info(
-                        "Chief already completed (run_id=%s, status=%s)",
+                        "Chief already completed (run_id=%s, status=%s, hash=%s)",
                         r.agent_run_id, r.status.value,
+                        tentative_manifest.input_hash[:12],
                     )
                     result = self._repo.get_agent_result(r.agent_run_id)
                     if result:
@@ -921,6 +908,33 @@ class AgentOrchestrator:
                             status=r.status,
                             result=result,
                         )
+
+        # ── No reuse — create DB records ─────────────────────────────
+        # Build Chief prompt
+        from app.analytics.agents.prompts.chief_trading_analyst_v1 import build_chief_prompt
+        prompt_builder = lambda defn, manifest: build_chief_prompt(chief_input)
+
+        # Create AgentRun (only if no reuse found)
+        attempt = self._repo.get_next_attempt(analysis_run_id, CHIEF_AGENT)
+        agent_run = AgentRun(
+            analysis_run_id=analysis_run_id,
+            agent_name=CHIEF_AGENT,
+            attempt=attempt,
+            status=AgentRunStatus.PENDING,
+            model=definition.model,
+        )
+        agent_run = self._repo.create_agent_run(agent_run)
+
+        # Persist manifest with real agent_run_id
+        manifest = self._build_chief_manifest(
+            agent_run_id=agent_run.agent_run_id,
+            dataset_version=dataset_version,
+            maturity=maturity,
+            readiness=readiness,
+            definition=definition,
+            chief_input=chief_input,
+        )
+        manifest = self._repo.create_input_manifest(manifest)
 
         # ── Mark RUNNING ──────────────────────────────────────────────
         self._repo.update_agent_run_status(
@@ -1033,7 +1047,8 @@ class AgentOrchestrator:
     ) -> AgentExecutionResult:
         """Post-validate Chief output: evidence, action, confidence downgrade.
 
-        Returns updated result (possibly with downgraded confidence or FAILED status).
+        Schema validation is already handled by AgentExecutor (contract-aware).
+        This method handles policy-level validation only.
         """
         if not result.result or not result.result.result_json:
             return AgentExecutionResult(
@@ -1044,17 +1059,7 @@ class AgentOrchestrator:
 
         output = result.result.result_json
 
-        # 1. Schema validation (already done by executor, but verify here)
-        from app.analytics.agents.contracts.schema_validator import validate_chief_output
-        schema_errors = validate_chief_output(output)
-        if schema_errors:
-            return AgentExecutionResult(
-                status=AgentRunStatus.FAILED, result=None,
-                error_code=AgentErrorCode.SCHEMA_VALIDATION_ERROR,
-                error_message=f"Chief schema: {'; '.join(schema_errors)}",
-            )
-
-        # 2. Evidence validation
+        # 1. Evidence validation
         all_evidence = set(chief_input.aggregate_evidence_refs)
         from app.analytics.agents.evidence import EvidenceCatalog
         catalog = EvidenceCatalog(list(all_evidence))
