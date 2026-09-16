@@ -8,6 +8,7 @@ Pattern list covers common secret formats without being overly aggressive.
 from __future__ import annotations
 
 import re
+from typing import Any
 
 
 # Patterns that indicate a secret value
@@ -33,17 +34,17 @@ _PATTERNS: list[re.Pattern] = [
 
 def sanitize(text: str) -> str:
     """Replace secret patterns with [REDACTED] in the given text.
-    
+
     Returns the sanitized string. If no secrets found, returns original.
     Designed for error messages and log strings — not for structured data.
     """
     if not text:
         return text
-    
+
     result = text
     for pattern in _PATTERNS:
         result = pattern.sub("[REDACTED]", result)
-    
+
     return result
 
 
@@ -52,3 +53,17 @@ def contains_secret(text: str) -> bool:
     if not text:
         return False
     return any(pattern.search(text) for pattern in _PATTERNS)
+
+
+def contains_secret_in_object(obj: Any) -> bool:
+    """Recursively check if any string value in a nested structure contains a secret.
+
+    Handles dict, list, tuple, and str. Other types are ignored safely.
+    """
+    if isinstance(obj, str):
+        return contains_secret(obj)
+    elif isinstance(obj, dict):
+        return any(contains_secret_in_object(v) for v in obj.values())
+    elif isinstance(obj, (list, tuple)):
+        return any(contains_secret_in_object(item) for item in obj)
+    return False

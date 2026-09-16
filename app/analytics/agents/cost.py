@@ -60,6 +60,6 @@ def _find_pricing(model: str, execution_date: Optional[str] = None) -> Optional[
     applicable = [p for p in candidates if p.effective_from <= execution_date]
     if applicable:
         return max(applicable, key=lambda p: p.effective_from)
-    
-    # Use earliest pricing if execution_date is before all entries
-    return min(candidates, key=lambda p: p.effective_from)
+
+    # No applicable pricing — execution was before any known rate
+    return None
