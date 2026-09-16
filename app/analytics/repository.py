@@ -936,7 +936,13 @@ class AnalyticsRepository:
     # ============================================================
 
     def create_input_manifest(self, manifest: AgentInputManifest) -> AgentInputManifest:
-        """Create an immutable input manifest."""
+        """Create an immutable input manifest. Rejects if manifest contains secrets."""
+        from app.analytics.security.redaction import contains_secret_in_object
+        if contains_secret_in_object(manifest.manifest_json):
+            raise ValueError(
+                "SECURITY_POLICY_ERROR: manifest_json contains detected secret — "
+                "immutable artifacts must not store secrets"
+            )
         try:
             cursor = self._conn.cursor()
             cursor.execute(
@@ -1030,7 +1036,13 @@ class AnalyticsRepository:
     # ============================================================
 
     def create_agent_result(self, result: AgentResult) -> AgentResult:
-        """Create an immutable agent result."""
+        """Create an immutable agent result. Rejects if result contains secrets."""
+        from app.analytics.security.redaction import contains_secret_in_object
+        if contains_secret_in_object(result.result_json):
+            raise ValueError(
+                "SECURITY_POLICY_ERROR: result_json contains detected secret — "
+                "immutable artifacts must not store secrets"
+            )
         try:
             cursor = self._conn.cursor()
             cursor.execute(

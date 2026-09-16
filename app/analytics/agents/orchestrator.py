@@ -626,9 +626,14 @@ class AgentOrchestrator:
         agent_run_id: UUID,
         execution_result: AgentExecutionResult,
     ) -> None:
-        """Atomically persist result + terminal status in single transaction."""
+        """Atomically persist result + terminal status with error sanitization."""
+        from app.analytics.security.redaction import sanitize
+
         if execution_result.result:
             self._repo.create_agent_result(execution_result.result)
+
+        # Sanitize error_message (defense-in-depth)
+        sanitized_message = sanitize(execution_result.error_message) if execution_result.error_message else None
 
         self._repo.update_agent_run_status(
             agent_run_id,
@@ -659,7 +664,7 @@ class AgentOrchestrator:
                 if execution_result.error_code
                 else None
             ),
-            error_message=execution_result.error_message,
+            error_message=sanitized_message,
         )
 
     # ── Manifest builder (Fix #8) ────────────────────────────────────

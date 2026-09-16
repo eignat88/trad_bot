@@ -14,6 +14,12 @@ Nice=10
 CPUQuota=60%
 MemoryMax=1G
 NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/opt/trad_bot
 StandardOutput=journal
 StandardError=journal
 
