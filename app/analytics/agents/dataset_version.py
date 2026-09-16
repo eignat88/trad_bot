@@ -50,15 +50,18 @@ logger = logging.getLogger(__name__)
 
 # ── Canonical JSON helpers ───────────────────────────────────────────
 
-def _iso(dt: datetime) -> str:
+def _iso(dt: Any) -> str:
     """Normalise a datetime to a canonical ISO-8601 string.
 
-    Always produces UTC with ``+00:00`` suffix.  Naive datetimes are
-    assumed to be UTC.
+    Handles datetime objects and string representations from pg8000.
     """
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.isoformat()
+    if isinstance(dt, str):
+        return dt  # Already a string (e.g. from pg8000), pass through
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+    return str(dt)
 
 
 def _canonical_json(obj: Any) -> str:
