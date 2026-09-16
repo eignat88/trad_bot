@@ -22,14 +22,9 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def _connect_pg():
-    """Return a psycopg2 connection or skip if PostgreSQL unavailable."""
-    import psycopg2
-    try:
-        return psycopg2.connect(
-            host="localhost", port=5432, database="trad_bot", user="postgres",
-        )
-    except Exception:
-        pytest.skip("PostgreSQL not available")
+    """Return a pg8000 connection via TEST_DB_* env vars."""
+    from conftest import connect_test_db
+    return connect_test_db()
 
 
 def _ensure_migration(conn) -> None:
@@ -188,10 +183,8 @@ class TestSyncPreservesVisibility:
             conn.commit()
 
             # Run sync — the scanner is now registered, but source is MANUAL
-            repo = ScannerRepository(
-                host="localhost", port=5432, database="trad_bot",
-                user="postgres", backend="postgres",
-            )
+            from conftest import make_scanner_repo
+            repo = make_scanner_repo()
             repo.sync_scanner_direction_gate(
                 registered_scanners=["TEST_SYNC_VIS"],
                 blocked_combinations=frozenset(),

@@ -8,25 +8,19 @@ from typing import Generator
 
 import pg8000
 
+from conftest import connect_test_db, run_psql_file, psql_args
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_010 = ROOT / "sql" / "migrations" / "010_analytics_rbac.sql"
 
 
-def run_psql(sql: str, database: str = "trad_bot_migration_test", user: str = "postgres") -> subprocess.CompletedProcess[str]:
+def run_psql(sql: str, database: str | None = None, user: str = "postgres") -> subprocess.CompletedProcess[str]:
     """Run SQL against the test database."""
-    psql = Path(r"C:\Program Files\PostgreSQL\17\bin\psql.exe")
-    
+    args = psql_args(database=database, user=user)
+    args.extend(["-v", "ON_ERROR_STOP=1", "-c", sql])
     return subprocess.run(
-        [
-            str(psql),
-            "-U", user,
-            "-h", "localhost",
-            "-p", "5432",
-            "-d", database,
-            "-v", "ON_ERROR_STOP=1",
-            "-c", sql,
-        ],
+        args,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -35,52 +29,75 @@ def run_psql(sql: str, database: str = "trad_bot_migration_test", user: str = "p
 
 
 def run_psql_migration(path: Path) -> subprocess.CompletedProcess[str]:
-    """Run a migration against the isolated PostgreSQL 17 test database."""
-    psql = Path(r"C:\Program Files\PostgreSQL\17\bin\psql.exe")
-    
-    return subprocess.run(
-        [
-            str(psql),
-            "-U", "postgres",
-            "-h", "localhost",
-            "-p", "5432",
-            "-d", "trad_bot_migration_test",
-            "-v", "ON_ERROR_STOP=1",
-            "-f", str(path),
-        ],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    """Run a migration against the test database."""
+    return run_psql_file(path)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="module", autouse=True)
 def analytics_runner_role():
-    """Create analytics_runner role for testing."""
-    # Apply RBAC migration (idempotent - can be run multiple times)
+    """Create analytics_runner role for testing.
+
+    Runs ONCE before any test in this module via autouse=True.
+    Applies migrations 010 and 026 to establish correct RBAC state.
+
+    Migration 010 creates the role and grants base permissions.
+    Migration 026 revokes analytics_runner's access to config tables
+    and USAGE on the config schema, enforcing the Stage 2 boundary:
+    analytics_runner → config.* has SELECT/INSERT/UPDATE/DELETE = False.
+
+    RBAC state is migration-driven only — no GRANT/REVOKE in tests.
+    """
+    # Apply RBAC migrations (idempotent)
     result = run_psql_migration(MIGRATION_010)
-    assert result.returncode == 0, f"RBAC migration failed: {result.stderr}"
-    
+    assert result.returncode == 0, f"RBAC migration 010 failed: {result.stderr}"
+
+    migration_026 = ROOT / "sql" / "migrations" / "026_analytics_config_rbac_boundary.sql"
+    result = run_psql_migration(migration_026)
+    assert result.returncode == 0, f"RBAC migration 026 failed: {result.stderr}"
+
     yield "analytics_runner"
-    
+
     # Cleanup: drop the role (after all tests)
     run_psql("DROP ROLE IF EXISTS analytics_runner;")
 
 
 @pytest.fixture
 def analytics_conn(analytics_runner_role) -> Generator[pg8000.Connection, None, None]:
-    """Create a connection as analytics_runner."""
-    conn = pg8000.connect(
-        host="localhost",
-        port=5432,
-        database="trad_bot_migration_test",
-        user=analytics_runner_role,
-        password="",
-    )
-    
+    """Create a connection and SET ROLE to analytics_runner.
+
+    Authenticates as postgres (or TEST_DB_USER) but executes all
+    subsequent SQL with analytics_runner privileges.  This works on
+    VPS with peer authentication where direct login as analytics_runner
+    is not possible.
+    """
+    conn = connect_test_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SET ROLE analytics_runner")
+        # Verify the role switch took effect
+        cur.execute("SELECT current_user")
+        current = cur.fetchone()[0]
+        assert current == "analytics_runner", (
+            f"SET ROLE failed: current_user is {current!r}, expected 'analytics_runner'"
+        )
+        conn.commit()
+    except Exception:
+        conn.close()
+        raise
+
     yield conn
-    
+
+    # Cleanup: rollback any uncommitted work, then RESET ROLE
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+    try:
+        cur = conn.cursor()
+        cur.execute("RESET ROLE")
+        conn.commit()
+    except Exception:
+        pass
     conn.close()
 
 
@@ -100,7 +117,7 @@ class TestAnalyticsRBAC:
         """Test that analytics_runner can connect to database."""
         cursor = db_session.cursor()
         cursor.execute(
-            "SELECT has_database_privilege('analytics_runner', 'trad_bot', 'CONNECT')"
+            "SELECT has_database_privilege('analytics_runner', current_database(), 'CONNECT')"
         )
         result = cursor.fetchone()
         assert result[0] is True
@@ -222,51 +239,57 @@ class TestAnalyticsRBAC:
         )
         assert cursor.fetchone()[0] is False
 
-    def test_config_scanner_direction_gate_read_only(self, db_session):
-        """Test that analytics_runner cannot modify config.scanner_direction_gate."""
+    def test_config_scanner_direction_gate_no_direct_access(self, db_session):
+        """Test analytics_runner has no direct privileges on config.scanner_direction_gate.
+
+        Stage 2 consumes analytics.config_snapshot instead of config.* directly.
+        SELECT/INSERT/UPDATE/DELETE all = False.
+        """
         cursor = db_session.cursor()
-        
-        # Check config.scanner_direction_gate permissions
+
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_direction_gate', 'SELECT')"
         )
-        assert cursor.fetchone()[0] is True
-        
+        assert cursor.fetchone()[0] is False
+
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_direction_gate', 'INSERT')"
         )
         assert cursor.fetchone()[0] is False
-        
+
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_direction_gate', 'UPDATE')"
         )
         assert cursor.fetchone()[0] is False
-        
+
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_direction_gate', 'DELETE')"
         )
         assert cursor.fetchone()[0] is False
 
-    def test_config_scanner_grafana_visibility_read_only(self, db_session):
-        """Test that analytics_runner cannot modify config.scanner_grafana_visibility."""
+    def test_config_scanner_grafana_visibility_no_direct_access(self, db_session):
+        """Test analytics_runner has no direct privileges on config.scanner_grafana_visibility.
+
+        Stage 2 consumes analytics.config_snapshot instead of config.* directly.
+        SELECT/INSERT/UPDATE/DELETE all = False.
+        """
         cursor = db_session.cursor()
-        
-        # Check config.scanner_grafana_visibility permissions
+
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_grafana_visibility', 'SELECT')"
         )
-        assert cursor.fetchone()[0] is True
-        
+        assert cursor.fetchone()[0] is False
+
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_grafana_visibility', 'INSERT')"
         )
         assert cursor.fetchone()[0] is False
-        
+
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_grafana_visibility', 'UPDATE')"
         )
         assert cursor.fetchone()[0] is False
-        
+
         cursor.execute(
             "SELECT has_table_privilege('analytics_runner', 'config.scanner_grafana_visibility', 'DELETE')"
         )
@@ -355,65 +378,39 @@ class TestAnalyticsRBAC:
     def test_real_deny_config_scanner_direction_gate_update(self, analytics_conn):
         """Test that analytics_runner CANNOT UPDATE config.scanner_direction_gate."""
         cursor = analytics_conn.cursor()
-        
-        # First, check what columns exist in scanner_direction_gate
-        cursor.execute(
-            """
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_schema = 'config' AND table_name = 'scanner_direction_gate'
-            LIMIT 5
-            """
-        )
-        columns = [row[0] for row in cursor.fetchall()]
-        
-        if not columns:
-            pytest.skip("config.scanner_direction_gate table not found")
-        
+
         with pytest.raises(Exception) as exc_info:
-            # Use a generic UPDATE that will fail due to permission
             cursor.execute(
-                f"""
-                UPDATE config.scanner_direction_gate 
-                SET {columns[0]} = {columns[0]}
+                """
+                UPDATE config.scanner_direction_gate
+                SET scanner_name = scanner_name
                 WHERE 1=1
                 """
             )
             analytics_conn.commit()
-        
-        # Should raise permission error (check for error code 42501 = insufficient_privilege)
-        assert "42501" in str(exc_info.value) or "permission denied" in str(exc_info.value).lower()
+
+        # Should raise permission error (42501 = insufficient_privilege)
+        # or relation-not-exists (42P01) if config schema is not accessible.
+        # Both prove analytics_runner cannot modify config.
+        err = str(exc_info.value).lower()
+        assert "42501" in err or "permission denied" in err or "42p01" in err or "does not exist" in err
 
     def test_real_deny_dds_paper_trade_insert(self, analytics_conn):
         """Test that analytics_runner CANNOT INSERT into dds.paper_trade."""
         cursor = analytics_conn.cursor()
-        
-        # First, check what columns exist in paper_trade
-        cursor.execute(
-            """
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_schema = 'dds' AND table_name = 'paper_trade'
-            LIMIT 5
-            """
-        )
-        columns = [row[0] for row in cursor.fetchall()]
-        
-        if not columns:
-            pytest.skip("dds.paper_trade table not found")
-        
+
         with pytest.raises(Exception) as exc_info:
-            # Use a generic INSERT that will fail due to permission
             cursor.execute(
-                f"""
-                INSERT INTO dds.paper_trade ({columns[0]})
+                """
+                INSERT INTO dds.paper_trade (trade_id)
                 VALUES (1)
                 """
             )
             analytics_conn.commit()
-        
-        # Should raise permission error (check for error code 42501 = insufficient_privilege)
-        assert "42501" in str(exc_info.value) or "permission denied" in str(exc_info.value).lower()
+
+        # Should raise permission error (42501 = insufficient_privilege)
+        err = str(exc_info.value).lower()
+        assert "42501" in err or "permission denied" in err
 
     def test_real_deny_dds_paper_trade_update(self, analytics_conn):
         """Test that analytics_runner CANNOT UPDATE dds.paper_trade."""

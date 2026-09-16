@@ -8,30 +8,16 @@ from typing import Generator
 
 import pg8000
 
+from conftest import connect_test_db, run_psql_file
+
 
 ROOT = Path(__file__).resolve().parents[1]
 HEALTH_MART = ROOT / "sql" / "mart" / "analytics_health.sql"
 
 
-def run_psql_migration(path: Path, database: str = "trad_bot_migration_test") -> subprocess.CompletedProcess[str]:
+def run_psql_migration(path: Path, database: str | None = None) -> subprocess.CompletedProcess[str]:
     """Run a SQL file against the test database."""
-    psql = Path(r"C:\Program Files\PostgreSQL\17\bin\psql.exe")
-    
-    return subprocess.run(
-        [
-            str(psql),
-            "-U", "postgres",
-            "-h", "localhost",
-            "-p", "5432",
-            "-d", database,
-            "-v", "ON_ERROR_STOP=1",
-            "-f", str(path),
-        ],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    return run_psql_file(path, database=database)
 
 
 @pytest.fixture(scope="module")
@@ -42,13 +28,7 @@ def health_mart():
     assert result.returncode == 0, f"Health mart failed: {result.stderr}"
     
     # Connect to database
-    conn = pg8000.connect(
-        host="localhost",
-        port=5432,
-        database="trad_bot_migration_test",
-        user="postgres",
-        password="",
-    )
+    conn = connect_test_db()
     
     yield conn
     
