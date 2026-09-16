@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "trad_bot:analytics:specialist_output:v1",
+  "title": "Specialist Output v1",
+  "type": "object",
+  "required": ["summary", "observations", "hypotheses", "proposed_experiments", "anomalies", "confidence", "limitations", "evidence_refs"],
+  "additionalProperties": false,
+  "properties": {
+    "summary": {"type": "string", "minLength": 1},
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["observation_code", "scope", "statement", "metric_refs", "sample_size", "confidence", "evidence_refs"],
+        "additionalProperties": false,
+        "properties": {
+          "observation_code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]+$"},
+          "scope": {"type": "object"},
+          "statement": {"type": "string", "minLength": 1},
+          "metric_refs": {"type": "array", "items": {"type": "string"}},
+          "sample_size": {"type": "integer", "minimum": 0},
+          "confidence": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+          "evidence_refs": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "hypotheses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["hypothesis", "evidence_refs", "confidence"],
+        "additionalProperties": false,
+        "properties": {
+          "hypothesis": {"type": "string", "minLength": 1},
+          "evidence_refs": {"type": "array", "items": {"type": "string"}},
+          "confidence": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+          "proposed_experiment": {"type": "string"}
+        }
+      }
+    },
+    "proposed_experiments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["experiment", "required_data", "validation_criterion"],
+        "additionalProperties": false,
+        "properties": {
+          "experiment": {"type": "string", "minLength": 1},
+          "required_data": {"type": "array", "items": {"type": "string"}},
+          "validation_criterion": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "anomalies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "severity", "entities"],
+        "additionalProperties": false,
+        "properties": {
+          "code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]+$"},
+          "severity": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+          "entities": {"type": "array", "items": {"type": "string"}},
+          "description": {"type": "string"}
+        }
+      }
+    },
+    "confidence": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+    "limitations": {"type": "array", "items": {"type": "string"}},
+    "evidence_refs": {"type": "array", "items": {"type": "string"}}
+  }
+}
