@@ -70,9 +70,9 @@ class DataQualityGate:
             if result.severity == Severity.BLOCKING
         )
         
-        # Store results
+        # Store results (upsert to ensure idempotency)
         for result in results:
-            self._repo.create_quality_result(result)
+            self._repo.upsert_quality_result(result)
         
         logger.info(
             "Quality checks completed for run %s: passed=%d/%d",
@@ -581,8 +581,17 @@ class DataQualityGate:
     def _check_data_freshness(
         self, run: AnalysisRun, stage_name: str
     ) -> DataQualityResult:
-        """Check data freshness against SLA."""
+        """Check data freshness against SLA.
+        
+        Uses observation_cutoff from the analysis run instead of wall-clock now().
+        This ensures that freshness is evaluated relative to the analysis window,
+        not the current time. For historical/final runs, this prevents false FAILs
+        when the current time is significantly later than the analyzed period.
+        """
         try:
+            # Use observation_cutoff as reference time instead of now()
+            reference_time = run.observation_cutoff
+            
             # Get latest candle timestamp
             cursor = self._repo._conn.cursor()
             cursor.execute(
@@ -605,9 +614,12 @@ class DataQualityGate:
                     details={"message": "No candles found to check freshness"},
                 )
             
-            # Calculate freshness: how old is the latest candle?
-            now = datetime.now(timezone.utc)
-            freshness_minutes = (now - latest_candle).total_seconds() / 60
+            # Calculate freshness: how old is the latest candle relative to reference_time?
+            freshness_minutes = (reference_time - latest_candle).total_seconds() / 60
+            
+            # If latest_candle is in the future relative to reference_time,
+            # freshness will be negative, which is fine - it means data is fresh
+            # We only care if data is too old (positive freshness_minutes)
             
             # Define SLA thresholds (in minutes)
             sla_thresholds = {
@@ -642,6 +654,7 @@ class DataQualityGate:
                     severity=Severity.WARNING,
                     status=QualityCheckStatus.FAIL,
                     actual_value={
+                        "reference_time": reference_time.isoformat(),
                         "latest_candle": latest_candle.isoformat(),
                         "freshness_minutes": freshness_minutes,
                         "sla_minutes": sla_minutes,
@@ -657,6 +670,7 @@ class DataQualityGate:
                 severity=Severity.WARNING,
                 status=QualityCheckStatus.PASS,
                 actual_value={
+                    "reference_time": reference_time.isoformat(),
                     "latest_candle": latest_candle.isoformat(),
                     "freshness_minutes": freshness_minutes,
                     "sla_minutes": sla_minutes,

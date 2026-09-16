@@ -295,6 +295,68 @@ class AnalyticsRepository:
             logger.error("Failed to get quality results: %s", e)
             raise
 
+    def upsert_quality_result(self, result: DataQualityResult) -> DataQualityResult:
+        """Upsert a data quality result (insert or update if exists).
+        
+        Uses (run_id, check_name) as the logical key to ensure idempotency.
+        If a result already exists for the same run_id and check_name, it will be updated.
+        """
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO analytics.data_quality_result (
+                    run_id, stage_name, check_name, scope_type, scope_id,
+                    severity, status, expected_value, actual_value,
+                    affected_entity_count, affected_entity_ids, checked_at, details
+                ) VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s
+                )
+                ON CONFLICT (run_id, check_name) DO UPDATE SET
+                    stage_name = EXCLUDED.stage_name,
+                    scope_type = EXCLUDED.scope_type,
+                    scope_id = EXCLUDED.scope_id,
+                    severity = EXCLUDED.severity,
+                    status = EXCLUDED.status,
+                    expected_value = EXCLUDED.expected_value,
+                    actual_value = EXCLUDED.actual_value,
+                    affected_entity_count = EXCLUDED.affected_entity_count,
+                    affected_entity_ids = EXCLUDED.affected_entity_ids,
+                    checked_at = EXCLUDED.checked_at,
+                    details = EXCLUDED.details
+                RETURNING quality_result_id
+                """,
+                (
+                    str(result.run_id),
+                    result.stage_name,
+                    result.check_name,
+                    result.scope_type,
+                    result.scope_id,
+                    result.severity.value,
+                    result.status.value,
+                    json.dumps(result.expected_value) if result.expected_value else None,
+                    json.dumps(result.actual_value) if result.actual_value else None,
+                    result.affected_entity_count,
+                    json.dumps(result.affected_entity_ids) if result.affected_entity_ids else None,
+                    result.checked_at,
+                    json.dumps(result.details) if result.details else None,
+                ),
+            )
+            result.quality_result_id = cursor.fetchone()[0]
+            self._conn.commit()
+            logger.info(
+                "Upserted quality result: %s for check: %s",
+                result.quality_result_id,
+                result.check_name,
+            )
+            return result
+        except Exception as e:
+            self._conn.rollback()
+            logger.error("Failed to upsert quality result: %s", e)
+            raise
+
     def insert_candle(self, candle: Candle) -> bool:
         """Insert or update a candle (UPSERT)."""
         try:
