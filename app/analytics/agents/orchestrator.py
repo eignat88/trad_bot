@@ -826,11 +826,10 @@ class AgentOrchestrator:
         specialist_results: dict[str, AgentExecutionResult],
         chief_eligibility: ChiefEligibility,
     ) -> AgentExecutionResult:
-        """Run Chief Trading Analyst (stub in PR2, real in PR4).
+        """Run Chief Trading Analyst — production path.
 
-        The Chief receives all specialist outputs and synthesizes them
-        into a DailyTradingReport.  In PR2 this is a stub that persists
-        a placeholder run row.
+        The Chief synthesizes validated specialist outputs into a
+        DailyTradingReport. It does NOT read raw DB data.
         """
         logger.info(
             "Running Chief (partial=%s, missing=%s)",
@@ -838,7 +837,7 @@ class AgentOrchestrator:
             chief_eligibility.missing_agents,
         )
 
-        # Get or create definition
+        # ── Get or create definition ─────────────────────────────────
         definition = self._repo.get_agent_definition(CHIEF_AGENT)
         if not definition:
             definition = AgentDefinition(
@@ -849,7 +848,38 @@ class AgentOrchestrator:
             )
             self._repo.create_agent_definition(definition)
 
-        # Create agent run
+        # ── Assemble Chief input ──────────────────────────────────────
+        from app.analytics.agents.input.chief import ChiefInputAssembler
+
+        chief_assembler = ChiefInputAssembler()
+        chief_input = chief_assembler.assemble(
+            run_id=analysis_run_id,
+            dataset_version=dataset_version,
+            maturity=maturity,
+            quality_status=readiness.quality_status,
+            limitations=list(readiness.limitations),
+            analysis_window_from=str(readiness.analysis_window_from),
+            analysis_window_to=str(readiness.analysis_window_to),
+            specialist_results=specialist_results,
+            chief_eligibility=chief_eligibility,
+        )
+
+        # ── Build Chief prompt ────────────────────────────────────────
+        from app.analytics.agents.prompts.chief_trading_analyst_v1 import build_chief_prompt
+
+        prompt_builder = lambda defn, manifest: build_chief_prompt(chief_input)
+
+        # ── Validate chief model is configured ────────────────────────
+        if not definition.model or not definition.model.strip():
+            logger.error("Chief agent has no model configured")
+            return AgentExecutionResult(
+                status=AgentRunStatus.FAILED,
+                result=None,
+                error_code=AgentErrorCode.INVALID_INPUT,
+                error_message=f"Chief agent '{CHIEF_AGENT}' has no model configured",
+            )
+
+        # ── Build manifest with chief input ───────────────────────────
         attempt = self._repo.get_next_attempt(analysis_run_id, CHIEF_AGENT)
         agent_run = AgentRun(
             analysis_run_id=analysis_run_id,
@@ -859,7 +889,6 @@ class AgentOrchestrator:
         )
         agent_run = self._repo.create_agent_run(agent_run)
 
-        # Build manifest
         manifest = self._build_manifest(
             agent_run_id=agent_run.agent_run_id,
             dataset_version=dataset_version,
@@ -877,16 +906,216 @@ class AgentOrchestrator:
             started_at=datetime.now(timezone.utc),
         )
 
-        # Stub execution for PR2 — PR4 will implement real Chief logic
+        # ── Execute Chief ─────────────────────────────────────────────
         result = await self._executor.execute(
             definition=definition,
             manifest=manifest,
+            prompt_builder_override=prompt_builder,
         )
 
-        # Atomic finalize
+        # ── Validate Chief output ─────────────────────────────────────
+        if result.status in (AgentRunStatus.SUCCEEDED, AgentRunStatus.DEGRADED):
+            validation_error = self._validate_chief_output(
+                result=result,
+                chief_input=chief_input,
+                chief_eligibility=chief_eligibility,
+            )
+            if validation_error:
+                result = AgentExecutionResult(
+                    status=AgentRunStatus.FAILED,
+                    result=None,
+                    error_code=AgentErrorCode.SCHEMA_VALIDATION_ERROR,
+                    error_message=validation_error,
+                )
+
+        # ── Atomic finalize ───────────────────────────────────────────
         self._finalize_attempt(agent_run.agent_run_id, result)
 
+        # ── Persist DailyTradingReport ────────────────────────────────
+        if result.status in (AgentRunStatus.SUCCEEDED, AgentRunStatus.DEGRADED):
+            try:
+                await self._persist_daily_report(
+                    analysis_run_id=analysis_run_id,
+                    maturity=maturity,
+                    chief_result=result,
+                    chief_input=chief_input,
+                    specialist_results=specialist_results,
+                    chief_eligibility=chief_eligibility,
+                )
+            except Exception as e:
+                logger.error("Failed to persist daily report: %s", e)
+                # Report failure does not invalidate Chief result
+
         return result
+
+    # ── Chief output validation ───────────────────────────────────────
+
+    def _validate_chief_output(
+        self,
+        result: AgentExecutionResult,
+        chief_input: Any,
+        chief_eligibility: ChiefEligibility,
+    ) -> Optional[str]:
+        """Validate Chief output against schema, evidence, and action policy.
+        
+        Returns error message if validation fails, None if OK.
+        """
+        if not result.result or not result.result.result_json:
+            return "Chief output is empty"
+
+        output = result.result.result_json
+
+        # 1. Schema validation
+        from app.analytics.agents.contracts.schema_validator import validate_chief_output
+        schema_errors = validate_chief_output(output)
+        if schema_errors:
+            return f"Chief schema validation failed: {'; '.join(schema_errors)}"
+
+        # 2. Evidence validation — chief can only reference specialist evidence
+        all_evidence = set(chief_input.aggregate_evidence_refs)
+        from app.analytics.agents.evidence import EvidenceCatalog
+        catalog = EvidenceCatalog(list(all_evidence))
+
+        chief_evidence = list(output.get("evidence_refs", []))
+        for f in output.get("findings", []):
+            chief_evidence.extend(f.get("evidence_refs", []))
+        for h in output.get("hypotheses", []):
+            chief_evidence.extend(h.get("evidence_refs", []))
+
+        invalid = catalog.validate_refs(list(set(chief_evidence)))
+        if invalid:
+            return f"Chief references unknown evidence: {invalid}"
+
+        # 3. Action policy validation
+        from app.analytics.agents.policies.action_v1 import ActionPolicyV1
+        action_result = ActionPolicyV1.validate(
+            action_class=output.get("action_class", "NO_ACTION"),
+            findings=output.get("findings", []),
+            hypotheses=output.get("hypotheses", []),
+            proposed_experiments=output.get("proposed_experiments", []),
+            missing_agents=list(chief_eligibility.missing_agents),
+            data_quality_status=chief_input.data_quality_status,
+            limitations=chief_input.limitations,
+        )
+        if not action_result.valid:
+            return f"Chief action policy violation: {'; '.join(action_result.violations)}"
+
+        # 4. Confidence ceiling
+        from app.analytics.agents.policies.confidence_v1 import ConfidencePolicyV1
+        confidence = output.get("confidence", "LOW")
+        ceiling = self._compute_chief_confidence_ceiling(
+            chief_input=chief_input,
+            chief_eligibility=chief_eligibility,
+        )
+        confidence_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+        if confidence_order.get(confidence, 0) > confidence_order.get(ceiling.value, 0):
+            return f"Chief confidence {confidence} exceeds policy ceiling {ceiling.value}"
+
+        return None
+
+    # ── Chief confidence ceiling ──────────────────────────────────────
+
+    def _compute_chief_confidence_ceiling(self, chief_input, chief_eligibility):
+        """Compute maximum allowed Chief confidence deterministically."""
+        from app.analytics.agents.models import ConfidenceLevel
+
+        maturity = chief_input.maturity
+        quality = chief_input.data_quality_status
+        n_available = len(chief_input.specialists)
+        n_succeeded = sum(
+            1 for s in chief_input.specialists
+            if s.get("status") in ("SUCCEEDED", "DEGRADED") and s.get("output")
+        )
+
+        # Gather specialist confidence levels
+        specialist_confidences = []
+        for s in chief_input.specialists:
+            output = s.get("output")
+            if output and "confidence" in output:
+                specialist_confidences.append(output["confidence"])
+
+        has_critical_limitation = any(
+            "critical" in lim.lower() or "data corruption" in lim.lower()
+            for lim in chief_input.limitations
+        )
+
+        # HIGH: FINAL, PASS, all available, ≥2 support, supporting MEDIUM/HIGH
+        if (
+            maturity == "FINAL"
+            and quality == "PASS"
+            and n_succeeded == 3
+            and not has_critical_limitation
+            and not chief_eligibility.partial
+            and len(specialist_confidences) >= 2
+            and all(c in ("MEDIUM", "HIGH") for c in specialist_confidences)
+        ):
+            return ConfidenceLevel.HIGH
+
+        # LOW: partial, DEGRADED affecting, missing specialist, contradictory
+        if chief_eligibility.partial or quality == "DEGRADED":
+            return ConfidenceLevel.LOW
+
+        # MEDIUM: everything else with reasonable coverage
+        if n_succeeded >= 2 and len(specialist_confidences) >= 2:
+            return ConfidenceLevel.MEDIUM
+
+        return ConfidenceLevel.LOW
+
+    # ── Daily report persistence ──────────────────────────────────────
+
+    async def _persist_daily_report(
+        self,
+        analysis_run_id: UUID,
+        maturity: str,
+        chief_result: AgentExecutionResult,
+        chief_input: Any,
+        specialist_results: dict[str, AgentExecutionResult],
+        chief_eligibility: ChiefEligibility,
+    ) -> None:
+        """Create and persist the daily trading report."""
+        from app.analytics.agents.models import ActionClass, ReportStatus, DailyTradingReport
+
+        output = chief_result.result.result_json if chief_result.result else {}
+
+        # Supersede existing report for same maturity
+        existing_report = self._repo.get_latest_report(analysis_run_id, maturity)
+        if existing_report:
+            existing_report.status = ReportStatus.SUPERSEDED
+            self._repo.update_daily_report_status(existing_report.report_id, ReportStatus.SUPERSEDED)
+
+        # Determine report version
+        existing_reports = self._repo.list_reports_for_run(analysis_run_id)
+        same_maturity_reports = [r for r in existing_reports if r.maturity == maturity]
+        next_version = max((r.report_version for r in same_maturity_reports), default=0) + 1
+
+        # Collect agent_run_ids
+        agent_run_ids = []
+        for name, er in specialist_results.items():
+            if er.result and er.result.agent_run_id:
+                agent_run_ids.append(str(er.result.agent_run_id))
+
+        # Build report
+        report = DailyTradingReport(
+            report_id=uuid4(),
+            analysis_run_id=analysis_run_id,
+            report_version=next_version,
+            maturity=maturity,
+            executive_summary=output.get("executive_summary", ""),
+            findings=output.get("findings", []),
+            hypotheses=output.get("hypotheses", []),
+            proposed_experiments=output.get("proposed_experiments", []),
+            action_class=ActionClass(output.get("action_class", "NO_ACTION")),
+            limitations=output.get("limitations", []),
+            evidence_refs=output.get("evidence_refs", []),
+            partial=output.get("partial", chief_eligibility.partial),
+            missing_agents=output.get("missing_agents", list(chief_eligibility.missing_agents)),
+            status=ReportStatus.DRAFT,
+            agent_run_ids=agent_run_ids,
+        )
+
+        self._repo.create_daily_report(report)
+        logger.info("Daily report created: %s (version=%d, maturity=%s)",
+                     report.report_id, report.version if hasattr(report, 'version') else report.report_version, maturity)
 
     # ── Crash recovery (Fix #19) ─────────────────────────────────────
 

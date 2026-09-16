@@ -1217,6 +1217,23 @@ class AnalyticsRepository:
             logger.error("Failed to list reports for run: %s", e)
             raise
 
+    def update_daily_report_status(
+        self, report_id: UUID, status: str,
+    ) -> None:
+        """Update a daily trading report's status (e.g. SUPERSEDED)."""
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                "UPDATE analytics.daily_trading_report SET status = %s WHERE report_id = %s",
+                (status, str(report_id)),
+            )
+            self._conn.commit()
+            logger.info("Updated report %s status to %s", report_id, status)
+        except Exception as e:
+            self._conn.rollback()
+            logger.error("Failed to update report status: %s", e)
+            raise
+
     # ============================================================
     # Agent Row Converters (private)
     # ============================================================
