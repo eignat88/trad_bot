@@ -1163,7 +1163,7 @@ class ResearchRepository:
         fingerprint_hash: str,
         payload: dict,
     ) -> None:
-        """Insert or link a fingerprint to a finding.  Idempotent via ON CONFLICT."""
+        """Insert a fingerprint row. ON CONFLICT DO NOTHING (never change finding_id)."""
         try:
             cur = self._conn.cursor()
             cur.execute(
@@ -1173,8 +1173,7 @@ class ResearchRepository:
                     scanner_name, direction, normalized_segment,
                     metric_name, comparator, threshold_policy_version
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (fingerprint_hash) DO UPDATE
-                    SET finding_id = EXCLUDED.finding_id
+                ON CONFLICT (fingerprint_hash) DO NOTHING
                 """,
                 (
                     str(finding_id),
@@ -1188,9 +1187,7 @@ class ResearchRepository:
                     payload.get("threshold_policy_version", ""),
                 ),
             )
-            self._conn.commit()
         except Exception as exc:
-            self._conn.rollback()
             logger.error("Failed to upsert fingerprint: %s", exc)
             raise
 

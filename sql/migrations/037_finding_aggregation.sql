@@ -37,7 +37,7 @@ BEGIN
     END IF;
 END $$;
 
--- maturity: PROVISIONAL | CONFIRMED — controls escalation path
+-- maturity: PROVISIONAL | FINAL — controls escalation path
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -48,7 +48,7 @@ BEGIN
     ) THEN
         ALTER TABLE research.finding_occurrence
             ADD COLUMN maturity TEXT NOT NULL DEFAULT 'PROVISIONAL'
-            CHECK (maturity IN ('PROVISIONAL', 'CONFIRMED'));
+            CHECK (maturity IN ('PROVISIONAL', 'FINAL'));
     END IF;
 END $$;
 
@@ -91,6 +91,6 @@ COMMENT ON COLUMN research.finding_occurrence.agent_run_id
 COMMENT ON COLUMN research.finding_occurrence.business_date
     IS 'Trading date this occurrence relates to — used for repeat policy distinct-date counting (PR2)';
 COMMENT ON COLUMN research.finding_occurrence.maturity
-    IS 'PROVISIONAL or CONFIRMED — controls escalation and repeat policy thresholds (PR2)';
+    IS 'PROVISIONAL or FINAL — controls escalation and repeat policy thresholds (PR2)';
 COMMENT ON COLUMN research.finding_occurrence.source_agent_name
     IS 'Stage 3 agent that produced this occurrence (PR2)';

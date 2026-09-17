@@ -102,6 +102,7 @@ class Stage3FindingCandidateAdapter:
                 item_type="observation",
                 dataset_version=result_json.get("dataset_version", ""),
                 validated_evidence=validated_evidence,
+                result_json=result_json,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -114,6 +115,7 @@ class Stage3FindingCandidateAdapter:
                 item_type="anomaly",
                 dataset_version=result_json.get("dataset_version", ""),
                 validated_evidence=validated_evidence,
+                result_json=result_json,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -156,6 +158,7 @@ class Stage3FindingCandidateAdapter:
         item_type: str,
         dataset_version: str,
         validated_evidence: set[str],
+        result_json: dict | None = None,
     ) -> Optional[FindingCandidate]:
         """Extract a single FindingCandidate from an observation or anomaly dict.
 
@@ -213,6 +216,17 @@ class Stage3FindingCandidateAdapter:
         if not metric_name:
             logger.debug(
                 "Skipping %s: no metric_name", item_type
+            )
+            return None
+
+        # Check metric_name is in validated metric set from result
+        validated_metrics = self._build_validated_metric_set(result_json or {})
+        if validated_metrics and metric_name not in validated_metrics:
+            logger.warning(
+                "Rejecting %s: metric_name '%s' not found in "
+                "validated metric set",
+                item_type,
+                metric_name,
             )
             return None
 
@@ -281,3 +295,37 @@ class Stage3FindingCandidateAdapter:
             business_date=item.get("business_date"),
             maturity=item.get("maturity", "PROVISIONAL"),
         )
+
+    @staticmethod
+    def _build_validated_metric_set(result_json: dict) -> set[str]:
+        """Build set of validated metric names from the result JSON.
+
+        Looks in:
+        - result_json["metrics"] (dict keys)
+        - result_json["metric_refs"] (list)
+        - result_json["observations"][*]["metric_refs"] (union)
+
+        Returns empty set if no metric info found (adapter skips validation).
+        """
+        metrics: set[str] = set()
+
+        # Top-level metrics dict
+        top_metrics = result_json.get("metrics")
+        if isinstance(top_metrics, dict):
+            metrics.update(str(k) for k in top_metrics.keys())
+
+        # Top-level metric_refs list
+        top_refs = result_json.get("metric_refs")
+        if isinstance(top_refs, list):
+            for ref in top_refs:
+                if isinstance(ref, str):
+                    metrics.add(ref)
+
+        # Observation-level metric_refs
+        for obs in result_json.get("observations", []):
+            if isinstance(obs, dict):
+                for ref in obs.get("metric_refs", []):
+                    if isinstance(ref, str):
+                        metrics.add(ref)
+
+        return metrics
