@@ -843,6 +843,8 @@ class TestStage3AdapterSchemaVersion:
             result_json={
                 "schema_version": "agent-result-v1",
                 "dataset_version": "2024-01",
+                "validated_evidence": ["evidence://real/obs1", "evidence://1"],
+                "metrics": {"pnl_r": {"value": -0.5}},
                 "observations": [
                     {
                         "finding_type": "ENTRY",
@@ -872,6 +874,8 @@ class TestStage3AdapterSchemaVersion:
                 agent_name="TEST_AGENT",
                 result_json={
                     "schema_version": version,
+                    "validated_evidence": ["evidence://real/obs1", "evidence://1"],
+                    "metrics": {"pnl_r": {"value": -0.5}},
                     "observations": [
                         {
                             "finding_type": "ENTRY",
@@ -901,6 +905,8 @@ class TestStage3AdapterAnalysisRunIdLocked:
             agent_name="TEST_AGENT",
             result_json={
                 "schema_version": "agent-result-v1",
+                "validated_evidence": ["evidence://real/obs1", "evidence://1"],
+                "metrics": {"pnl_r": {"value": -0.5}},
                 "observations": [
                     {
                         "finding_type": "ENTRY",
@@ -926,6 +932,8 @@ class TestStage3AdapterAnalysisRunIdLocked:
             agent_name="TEST_AGENT",
             result_json={
                 "schema_version": "agent-result-v1",
+                "validated_evidence": ["evidence://real/obs1", "evidence://1"],
+                "metrics": {"pnl_r": {"value": -0.5}},
                 "observations": [
                     {
                         "finding_type": "ENTRY",
@@ -947,17 +955,17 @@ class TestStage3AdapterAnalysisRunIdLocked:
 
 class TestStage3AdapterEvidenceValidation:
     def test_empty_evidence_set_rejected(self):
-        """Empty validated evidence set → candidate rejected if evidence_refs present."""
+        """Empty validated_evidence set → entire result rejected (0 candidates)."""
         from app.analytics.agents.research.adapter import Stage3FindingCandidateAdapter
 
         adapter = Stage3FindingCandidateAdapter()
-        # No validated_evidence provided, and evidence_refs is empty → skipped
         result = adapter.extract_candidates(
             analysis_run_id=uuid4(),
             agent_name="TEST_AGENT",
             result_json={
                 "schema_version": "agent-result-v1",
                 "validated_evidence": [],
+                "metrics": {"pnl_r": {"value": -0.5}},
                 "observations": [
                     {
                         "finding_type": "ENTRY",
@@ -969,12 +977,8 @@ class TestStage3AdapterEvidenceValidation:
                 ],
             },
         )
-        # validated_evidence is empty set, so evidence validation is skipped
-        # (adapter only validates when validated_evidence is non-empty)
-        # The candidate has evidence_refs so it passes; but validated_evidence
-        # is an empty list → adapter treats it as empty set → no validation
-        # → candidate accepted (evidence_refs present, no validation enforced)
-        assert len(result) == 1
+        # validated_evidence is empty → adapter rejects entire result
+        assert len(result) == 0
 
     def test_evidence_ref_not_in_validated_set_rejected(self):
         """evidence_ref not in validated set → rejected."""
@@ -987,6 +991,7 @@ class TestStage3AdapterEvidenceValidation:
             result_json={
                 "schema_version": "agent-result-v1",
                 "validated_evidence": ["evidence://real/obs1", "evidence://real/obs2"],
+                "metrics": {"pnl_r": {"value": -0.5}},
                 "observations": [
                     {
                         "finding_type": "ENTRY",
@@ -1011,6 +1016,7 @@ class TestStage3AdapterEvidenceValidation:
             result_json={
                 "schema_version": "agent-result-v1",
                 "validated_evidence": ["evidence://real/obs1", "evidence://real/obs2"],
+                "metrics": {"pnl_r": {"value": -0.5}},
                 "observations": [
                     {
                         "finding_type": "ENTRY",
@@ -1033,6 +1039,8 @@ class TestStage3AdapterEvidenceValidation:
             agent_name="TEST_AGENT",
             result_json={
                 "schema_version": "agent-result-v1",
+                "validated_evidence": ["evidence://1"],
+                "metrics": {"pnl_r": {"value": -0.5}},
                 "observations": [
                     {
                         "finding_type": "ENTRY",
@@ -1062,6 +1070,7 @@ class TestStage3AdapterMetricValidation:
             agent_name="TEST_AGENT",
             result_json={
                 "schema_version": "agent-result-v1",
+                "validated_evidence": ["evidence://real/obs1", "evidence://1"],
                 "metrics": {"pnl_r": {"value": -0.5}, "win_rate": {"value": 0.3}},
                 "observations": [
                     {
@@ -1086,7 +1095,8 @@ class TestStage3AdapterMetricValidation:
             agent_name="TEST_AGENT",
             result_json={
                 "schema_version": "agent-result-v1",
-                "metrics": {"win_rate": {"value": 0.3}},
+                "validated_evidence": ["evidence://real/obs1", "evidence://1"],
+                "metrics": {"other_metric": {"value": 1.0}},
                 "observations": [
                     {
                         "finding_type": "ENTRY",
@@ -1100,8 +1110,8 @@ class TestStage3AdapterMetricValidation:
         )
         assert result == []
 
-    def test_no_metrics_in_result_skips_validation(self):
-        """No metrics in result → metric_name check skipped."""
+    def test_empty_metrics_rejects_result(self):
+        """Empty/missing metrics → entire result rejected (0 candidates)."""
         from app.analytics.agents.research.adapter import Stage3FindingCandidateAdapter
 
         adapter = Stage3FindingCandidateAdapter()
@@ -1110,7 +1120,8 @@ class TestStage3AdapterMetricValidation:
             agent_name="TEST_AGENT",
             result_json={
                 "schema_version": "agent-result-v1",
-                # No metrics key at all
+                "validated_evidence": ["evidence://1"],
+                # No metrics key at all → validated_metrics set is empty → rejected
                 "observations": [
                     {
                         "finding_type": "ENTRY",
@@ -1122,7 +1133,8 @@ class TestStage3AdapterMetricValidation:
                 ],
             },
         )
-        assert len(result) == 1
+        # Empty metrics → adapter rejects entire result
+        assert len(result) == 0
 
     def test_empty_metric_name_skipped(self):
         from app.analytics.agents.research.adapter import Stage3FindingCandidateAdapter
@@ -1133,6 +1145,8 @@ class TestStage3AdapterMetricValidation:
             agent_name="TEST_AGENT",
             result_json={
                 "schema_version": "agent-result-v1",
+                "validated_evidence": ["evidence://1"],
+                "metrics": {"pnl_r": {"value": -0.5}},
                 "observations": [
                     {
                         "finding_type": "ENTRY",
@@ -1856,6 +1870,8 @@ class TestStage3AdapterAnomalies:
             agent_name="TEST_AGENT",
             result_json={
                 "schema_version": "agent-result-v1",
+                "validated_evidence": ["evidence://real/obs1", "evidence://anom1"],
+                "metrics": {"score_mean": {"value": 0.5}},
                 "anomalies": [
                     {
                         "finding_type": "DRIFT",

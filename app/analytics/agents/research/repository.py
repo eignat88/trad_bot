@@ -120,6 +120,8 @@ class ResearchRepository:
         new_status: str,
         reason: str = "",
         actor: str = "system",
+        *,
+        commit: bool = True,
     ) -> None:
         try:
             cur = self._conn.cursor()
@@ -138,10 +140,12 @@ class ResearchRepository:
                 (new_status, str(finding_id)),
             )
             self._record_transition(cur, "finding", finding_id, old_status, new_status, actor, reason)
-            self._conn.commit()
+            if commit:
+                self._conn.commit()
             logger.info("Finding %s status: %s -> %s", finding_id, old_status, new_status)
         except Exception as exc:
-            self._conn.rollback()
+            if commit:
+                self._conn.rollback()
             logger.error("Failed to update finding status: %s", exc)
             raise
 

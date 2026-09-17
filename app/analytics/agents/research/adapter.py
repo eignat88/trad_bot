@@ -86,9 +86,24 @@ class Stage3FindingCandidateAdapter:
             return []
 
         # ── Build validated evidence set from result ──────────────────
-        # The result_json should contain a top-level validated_evidence
-        # list, or evidence_refs.  Items reference evidence by these.
         validated_evidence = self._build_validated_evidence_set(result_json)
+        if not validated_evidence:
+            # Empty validated evidence set → reject entire result
+            logger.warning(
+                "Skipping agent result: empty validated evidence set "
+                "(all candidates require validated evidence)"
+            )
+            return []
+
+        # ── Build validated metric set from result ────────────────────
+        validated_metrics = self._build_validated_metric_set(result_json)
+        if not validated_metrics:
+            # Empty validated metrics → reject entire result
+            logger.warning(
+                "Skipping agent result: empty validated metric set "
+                "(all candidates require validated metrics)"
+            )
+            return []
 
         # Extract observations and anomalies
         observations = result_json.get("observations", [])
@@ -102,6 +117,7 @@ class Stage3FindingCandidateAdapter:
                 item_type="observation",
                 dataset_version=result_json.get("dataset_version", ""),
                 validated_evidence=validated_evidence,
+                validated_metrics=validated_metrics,
                 result_json=result_json,
             )
             if candidate is not None:
@@ -115,6 +131,7 @@ class Stage3FindingCandidateAdapter:
                 item_type="anomaly",
                 dataset_version=result_json.get("dataset_version", ""),
                 validated_evidence=validated_evidence,
+                validated_metrics=validated_metrics,
                 result_json=result_json,
             )
             if candidate is not None:
@@ -158,6 +175,7 @@ class Stage3FindingCandidateAdapter:
         item_type: str,
         dataset_version: str,
         validated_evidence: set[str],
+        validated_metrics: set[str],
         result_json: dict | None = None,
     ) -> Optional[FindingCandidate]:
         """Extract a single FindingCandidate from an observation or anomaly dict.
@@ -190,7 +208,7 @@ class Stage3FindingCandidateAdapter:
                 )
                 return None
 
-        # ── Validate evidence refs ────────────────────────────────────
+        # ── Validate evidence refs (strict) ────────────────────────────
         evidence_refs = item.get("evidence_refs", [])
         if not evidence_refs or not isinstance(evidence_refs, list):
             logger.debug(
@@ -198,17 +216,16 @@ class Stage3FindingCandidateAdapter:
             )
             return None
 
-        # If we have a validated evidence set, check all refs exist
-        if validated_evidence:
-            for ref in evidence_refs:
-                if ref not in validated_evidence:
-                    logger.warning(
-                        "Rejecting %s: evidence_ref '%s' not found in "
-                        "validated evidence set",
-                        item_type,
-                        ref,
-                    )
-                    return None
+        # ALL evidence_refs must be members of validated evidence set
+        for ref in evidence_refs:
+            if ref not in validated_evidence:
+                logger.warning(
+                    "Rejecting %s: evidence_ref '%s' not found in "
+                    "validated evidence set",
+                    item_type,
+                    ref,
+                )
+                return None
 
         # ── Validate metric_name ──────────────────────────────────────
         # Must come from validated metric_refs, NOT from statement text.
@@ -219,9 +236,8 @@ class Stage3FindingCandidateAdapter:
             )
             return None
 
-        # Check metric_name is in validated metric set from result
-        validated_metrics = self._build_validated_metric_set(result_json or {})
-        if validated_metrics and metric_name not in validated_metrics:
+        # Check metric_name is in validated metric set (passed from caller)
+        if metric_name not in validated_metrics:
             logger.warning(
                 "Rejecting %s: metric_name '%s' not found in "
                 "validated metric set",

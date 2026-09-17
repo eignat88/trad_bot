@@ -93,12 +93,12 @@ class FindingIngestionService:
     ) -> FindingIngestionResult:
         """Ingest a single FindingCandidate.
 
-        Returns a FindingIngestionResult with full audit trail.
-
-        The entire method executes within a single logical transaction.
-        All repository calls within this method must NOT commit independently.
-        On any error the caller (or test mock) is responsible for rollback.
+        Owns the full transaction: BEGIN → work → COMMIT (or ROLLBACK on error).
+        All repository calls within execute WITHOUT independent commit/rollback.
+        Uses SAVEPOINT for concurrent fingerprint dedup.
         """
+        conn = self._repo._conn
+
         # 1. Validate — analysis_run_id is REQUIRED
         if candidate.analysis_run_id is None:
             raise ValueError(
@@ -117,7 +117,6 @@ class FindingIngestionService:
         # 3. Normalize → fingerprint payload
         payload = self._build_fingerprint_payload(candidate)
         if payload is None:
-            # Invalid candidate — cannot compute fingerprint
             return FindingIngestionResult(
                 finding_id=uuid4(),
                 fingerprint="",
@@ -127,66 +126,80 @@ class FindingIngestionService:
         # 4. Compute fingerprint
         fingerprint_hash = FindingFingerprintV1.compute(payload)
 
-        # 5. Lookup existing finding by fingerprint
-        existing_finding = self._repo.get_finding_by_fingerprint(fingerprint_hash)
+        # ── BEGIN transaction ─────────────────────────────────────────
+        try:
+            conn.cursor().execute("BEGIN")
 
-        created_finding = False
-        created_occurrence = False
-        idempotent_replay = False
+            # 5. Lookup existing finding by fingerprint
+            existing_finding = self._repo.get_finding_by_fingerprint(fingerprint_hash)
 
-        if existing_finding is not None:
-            # 6a. Link to existing finding
-            finding = existing_finding
-        else:
-            # 6b. Create new finding + fingerprint (handle UNIQUE conflict)
-            try:
-                finding = self._create_finding_from_candidate(candidate, fingerprint_hash)
-                created_finding = True
-            except Exception as exc:
-                # UNIQUE violation on fingerprint → another concurrent insert won
-                # Re-read the existing finding and continue
-                logger.info(
-                    "Concurrent fingerprint conflict for %s, re-reading: %s",
-                    fingerprint_hash[:12],
-                    exc,
-                )
-                finding = self._repo.get_finding_by_fingerprint(fingerprint_hash)
-                if finding is None:
-                    # Should not happen — if the insert failed, someone else
-                    # must have inserted.  If we can't find it, re-raise.
-                    raise ValueError(
-                        f"Fingerprint {fingerprint_hash[:12]} conflict but "
-                        f"finding not found on re-read"
-                    ) from exc
+            created_finding = False
+            created_occurrence = False
+            idempotent_replay = False
 
-        # 7. Create occurrence (idempotent)
-        occurrence, created_occurrence = self._create_occurrence(candidate, finding.finding_id)
-        if not created_occurrence:
-            idempotent_replay = True
+            if existing_finding is not None:
+                finding = existing_finding
+            else:
+                # 6. Create new finding + fingerprint with SAVEPOINT
+                sp_name = "sp_fingerprint_insert"
+                cur = conn.cursor()
+                cur.execute(f"SAVEPOINT {sp_name}")
+                try:
+                    finding = self._create_finding_from_candidate(candidate, fingerprint_hash)
+                    created_finding = True
+                except Exception as exc:
+                    # UNIQUE violation → rollback to savepoint, re-read
+                    cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                    logger.info(
+                        "Concurrent fingerprint conflict for %s, re-reading: %s",
+                        fingerprint_hash[:12],
+                        exc,
+                    )
+                    finding = self._repo.get_finding_by_fingerprint(fingerprint_hash)
+                    if finding is None:
+                        conn.cursor().execute("ROLLBACK")
+                        raise ValueError(
+                            f"Fingerprint {fingerprint_hash[:12]} conflict but "
+                            f"finding not found on re-read"
+                        ) from exc
+                finally:
+                    cur.execute(f"RELEASE SAVEPOINT {sp_name}")
 
-        # 8. Refresh aggregates (first_seen, last_seen, occurrence_count, evidence_summary)
-        self._repo.refresh_finding_aggregate(finding.finding_id)
+            # 7. Create occurrence (idempotent)
+            occurrence, created_occurrence = self._create_occurrence(candidate, finding.finding_id)
+            if not created_occurrence:
+                idempotent_replay = True
 
-        # 9. Evaluate repeat policy
-        all_occurrences = self._repo.list_occurrences_for_finding(finding.finding_id)
-        occ_dicts = [
-            {
-                "confidence": occ.confidence or "LOW",
-                "business_date": occ.business_date,
-                "analysis_run_id": str(occ.analysis_run_id) if occ.analysis_run_id else None,
-                "maturity": occ.maturity or "PROVISIONAL",
-            }
-            for occ in all_occurrences
-        ]
-        policy_action = FindingRepeatPolicyV1.evaluate(
-            self._config,
-            occ_dicts,
-            finding.status,
-        )
+            # 8. Refresh aggregates
+            self._repo.refresh_finding_aggregate(finding.finding_id)
 
-        # 10. Maybe transition status
-        old_status = finding.status
-        new_status = self._apply_policy_action(finding.finding_id, policy_action, finding.status)
+            # 9. Evaluate repeat policy
+            all_occurrences = self._repo.list_occurrences_for_finding(finding.finding_id)
+            occ_dicts = [
+                {
+                    "confidence": occ.confidence or "LOW",
+                    "business_date": occ.business_date,
+                    "analysis_run_id": str(occ.analysis_run_id) if occ.analysis_run_id else None,
+                    "maturity": occ.maturity or "PROVISIONAL",
+                }
+                for occ in all_occurrences
+            ]
+            policy_action = FindingRepeatPolicyV1.evaluate(
+                self._config,
+                occ_dicts,
+                finding.status,
+            )
+
+            # 10. Maybe transition status (within same transaction)
+            old_status = finding.status
+            new_status = self._apply_policy_action(finding.finding_id, policy_action, finding.status)
+
+            # ── COMMIT ───────────────────────────────────────────────
+            conn.cursor().execute("COMMIT")
+
+        except Exception:
+            conn.cursor().execute("ROLLBACK")
+            raise
 
         return FindingIngestionResult(
             finding_id=finding.finding_id,
@@ -376,14 +389,15 @@ class FindingIngestionService:
         policy_action: str,
         current_status: str,
     ) -> str:
-        """Apply the repeat policy action via the repository.
+        """Apply the repeat policy action within the caller's transaction.
 
+        Uses commit=False because the caller (ingest_candidate) owns the transaction.
         Returns the new status (or old status if no change).
         """
         if policy_action == MARK_REPEATED:
             try:
                 self._repo.update_finding_status(
-                    finding_id, "REPEATED", reason="repeat_policy"
+                    finding_id, "REPEATED", reason="repeat_policy", commit=False,
                 )
                 return "REPEATED"
             except ValueError as exc:
@@ -393,7 +407,7 @@ class FindingIngestionService:
         if policy_action == MARK_RESEARCH_REQUIRED:
             try:
                 self._repo.update_finding_status(
-                    finding_id, "RESEARCH_REQUIRED", reason="repeat_policy"
+                    finding_id, "RESEARCH_REQUIRED", reason="repeat_policy", commit=False,
                 )
                 return "RESEARCH_REQUIRED"
             except ValueError as exc:
