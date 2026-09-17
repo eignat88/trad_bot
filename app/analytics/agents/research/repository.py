@@ -1091,70 +1091,71 @@ class ResearchRepository:
         The fingerprint_payload dict must contain:
             fingerprint_hash, finding_type, scanner_name, direction,
             normalized_segment, metric_name, comparator, threshold_policy_version
+
+        May raise on UNIQUE constraint violation (fingerprint_hash collision).
+        The caller (ingestion service) handles concurrent conflict by
+        re-reading the existing finding.
+
+        NOTE: Does NOT auto-commit — designed to be called within an
+        external transaction managed by the ingestion service.
         """
-        try:
-            cur = self._conn.cursor()
-            # Insert finding
-            cur.execute(
-                """
-                INSERT INTO research.finding (
-                    finding_id, finding_type, title, fingerprint,
-                    scope_json, first_seen, last_seen, occurrence_count,
-                    status, confidence, evidence_summary,
-                    source_run_id, agent_name, created_at, updated_at
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """,
-                (
-                    str(finding.finding_id),
-                    finding.finding_type,
-                    finding.title,
-                    finding.fingerprint,
-                    json.dumps(finding.scope_json),
-                    finding.first_seen,
-                    finding.last_seen,
-                    finding.occurrence_count,
-                    finding.status,
-                    finding.confidence,
-                    json.dumps(finding.evidence_summary),
-                    str(finding.source_run_id) if finding.source_run_id else None,
-                    finding.agent_name,
-                    finding.created_at,
-                    finding.updated_at,
-                ),
-            )
-            # Insert fingerprint
-            cur.execute(
-                """
-                INSERT INTO research.fingerprint (
-                    finding_id, fingerprint_hash, finding_type,
-                    scanner_name, direction, normalized_segment,
-                    metric_name, comparator, threshold_policy_version
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (fingerprint_hash) DO NOTHING
-                """,
-                (
-                    str(finding.finding_id),
-                    fingerprint_payload["fingerprint_hash"],
-                    fingerprint_payload["finding_type"],
-                    fingerprint_payload["scanner_name"],
-                    fingerprint_payload["direction"],
-                    json.dumps(fingerprint_payload["normalized_segment"]),
-                    fingerprint_payload["metric_name"],
-                    fingerprint_payload["comparator"],
-                    fingerprint_payload["threshold_policy_version"],
-                ),
-            )
-            self._conn.commit()
-            logger.info(
-                "Created finding %s with fingerprint %s",
-                finding.finding_id,
-                fingerprint_payload["fingerprint_hash"][:12],
-            )
-            return finding
-        except Exception as exc:
-            self._conn.rollback()
-            logger.error("Failed to create finding with fingerprint: %s", exc)
-            raise
+        cur = self._conn.cursor()
+        # Insert finding
+        cur.execute(
+            """
+            INSERT INTO research.finding (
+                finding_id, finding_type, title, fingerprint,
+                scope_json, first_seen, last_seen, occurrence_count,
+                status, confidence, evidence_summary,
+                source_run_id, agent_name, created_at, updated_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (
+                str(finding.finding_id),
+                finding.finding_type,
+                finding.title,
+                finding.fingerprint,
+                json.dumps(finding.scope_json),
+                finding.first_seen,
+                finding.last_seen,
+                finding.occurrence_count,
+                finding.status,
+                finding.confidence,
+                json.dumps(finding.evidence_summary),
+                str(finding.source_run_id) if finding.source_run_id else None,
+                finding.agent_name,
+                finding.created_at,
+                finding.updated_at,
+            ),
+        )
+        # Insert fingerprint
+        cur.execute(
+            """
+            INSERT INTO research.fingerprint (
+                finding_id, fingerprint_hash, finding_type,
+                scanner_name, direction, normalized_segment,
+                metric_name, comparator, threshold_policy_version
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (fingerprint_hash) DO NOTHING
+            """,
+            (
+                str(finding.finding_id),
+                fingerprint_payload["fingerprint_hash"],
+                fingerprint_payload["finding_type"],
+                fingerprint_payload["scanner_name"],
+                fingerprint_payload["direction"],
+                json.dumps(fingerprint_payload["normalized_segment"]),
+                fingerprint_payload["metric_name"],
+                fingerprint_payload["comparator"],
+                fingerprint_payload["threshold_policy_version"],
+            ),
+        )
+        logger.info(
+            "Created finding %s with fingerprint %s",
+            finding.finding_id,
+            fingerprint_payload["fingerprint_hash"][:12],
+        )
+        return finding
 
     def upsert_fingerprint(
         self,
@@ -1193,48 +1194,50 @@ class ResearchRepository:
             logger.error("Failed to upsert fingerprint: %s", exc)
             raise
 
-    def create_occurrence_if_absent(self, occ: FindingOccurrence) -> FindingOccurrence:
+    def create_occurrence_if_absent(
+        self, occ: FindingOccurrence
+    ) -> tuple[FindingOccurrence, bool]:
         """Insert a finding_occurrence if not already present for this (finding_id, analysis_run_id).
 
         Uses ON CONFLICT ... DO NOTHING to guarantee idempotency.
-        Returns the occurrence (with occurrence_id set, even if it was a no-op insert).
+        Returns (occurrence, created: bool) — created=True if the row was
+        actually inserted, False if it was a no-op (duplicate).
+
+        NOTE: Does NOT auto-commit — designed to be called within an
+        external transaction managed by the ingestion service.
         """
-        try:
-            cur = self._conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO research.finding_occurrence (
-                    occurrence_id, finding_id, analysis_run_id, observed_at,
-                    metric_value, sample_size, confidence, evidence_refs,
-                    dataset_version, details_json, created_at,
-                    agent_run_id, business_date, maturity, source_agent_name
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (finding_id, analysis_run_id) DO NOTHING
-                """,
-                (
-                    str(occ.occurrence_id),
-                    str(occ.finding_id),
-                    str(occ.analysis_run_id) if occ.analysis_run_id else None,
-                    occ.observed_at,
-                    occ.metric_value,
-                    occ.sample_size,
-                    occ.confidence,
-                    json.dumps(occ.evidence_refs),
-                    occ.dataset_version,
-                    json.dumps(occ.details_json),
-                    occ.created_at,
-                    str(occ.agent_run_id) if occ.agent_run_id else None,
-                    occ.business_date,
-                    occ.maturity,
-                    occ.source_agent_name,
-                ),
-            )
-            self._conn.commit()
-            return occ
-        except Exception as exc:
-            self._conn.rollback()
-            logger.error("Failed to create occurrence if absent: %s", exc)
-            raise
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO research.finding_occurrence (
+                occurrence_id, finding_id, analysis_run_id, observed_at,
+                metric_value, sample_size, confidence, evidence_refs,
+                dataset_version, details_json, created_at,
+                agent_run_id, business_date, maturity, source_agent_name
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (finding_id, analysis_run_id) DO NOTHING
+            """,
+            (
+                str(occ.occurrence_id),
+                str(occ.finding_id),
+                str(occ.analysis_run_id) if occ.analysis_run_id else None,
+                occ.observed_at,
+                occ.metric_value,
+                occ.sample_size,
+                occ.confidence,
+                json.dumps(occ.evidence_refs),
+                occ.dataset_version,
+                json.dumps(occ.details_json),
+                occ.created_at,
+                str(occ.agent_run_id) if occ.agent_run_id else None,
+                occ.business_date,
+                occ.maturity,
+                occ.source_agent_name,
+            ),
+        )
+        # rowcount=1 means inserted; rowcount=0 means conflict (no-op)
+        created = cur.rowcount > 0
+        return occ, created
 
     def list_occurrences_for_finding(self, finding_id: UUID) -> list[FindingOccurrence]:
         """Return all occurrences for a finding, ordered by observed_at ASC."""
@@ -1250,36 +1253,61 @@ class ResearchRepository:
             raise
 
     def refresh_finding_aggregate(self, finding_id: UUID) -> None:
-        """Refresh first_seen, last_seen, occurrence_count for a finding.
+        """Refresh first_seen, last_seen, occurrence_count, and evidence_summary
+        for a finding.
 
         Called after inserting a new occurrence to keep aggregates current.
+        Evidence_summary is deduplicated across all occurrences.
+
+        NOTE: Does NOT auto-commit — designed to be called within an
+        external transaction managed by the ingestion service.
         """
-        try:
-            cur = self._conn.cursor()
-            cur.execute(
-                """
-                UPDATE research.finding
-                SET first_seen = COALESCE(sub.first_seen, first_seen),
-                    last_seen  = COALESCE(sub.last_seen, last_seen),
-                    occurrence_count = COALESCE(sub.cnt, occurrence_count),
-                    updated_at = NOW()
-                FROM (
-                    SELECT
-                        MIN(observed_at) AS first_seen,
-                        MAX(observed_at) AS last_seen,
-                        COUNT(*)         AS cnt
-                    FROM research.finding_occurrence
-                    WHERE finding_id = %s
-                ) sub
-                WHERE finding.finding_id = %s
-                """,
-                (str(finding_id), str(finding_id)),
-            )
-            self._conn.commit()
-        except Exception as exc:
-            self._conn.rollback()
-            logger.error("Failed to refresh finding aggregate: %s", exc)
-            raise
+        cur = self._conn.cursor()
+
+        # Step 1: Refresh first_seen, last_seen, occurrence_count
+        cur.execute(
+            """
+            UPDATE research.finding
+            SET first_seen = COALESCE(sub.first_seen, first_seen),
+                last_seen  = COALESCE(sub.last_seen, last_seen),
+                occurrence_count = COALESCE(sub.cnt, occurrence_count),
+                updated_at = NOW()
+            FROM (
+                SELECT
+                    MIN(observed_at) AS first_seen,
+                    MAX(observed_at) AS last_seen,
+                    COUNT(*)         AS cnt
+                FROM research.finding_occurrence
+                WHERE finding_id = %s
+            ) sub
+            WHERE finding.finding_id = %s
+            """,
+            (str(finding_id), str(finding_id)),
+        )
+
+        # Step 2: Refresh evidence_summary — deduplicated across all occurrences
+        cur.execute(
+            """
+            SELECT DISTINCT e.ref
+            FROM research.finding_occurrence fo,
+                 LATERAL jsonb_array_elements_text(
+                     COALESCE(fo.evidence_refs, '[]'::jsonb)
+                 ) AS e(ref)
+            WHERE fo.finding_id = %s
+            ORDER BY e.ref
+            """,
+            (str(finding_id),),
+        )
+        deduped_refs = [row[0] for row in cur.fetchall()]
+        cur.execute(
+            """
+            UPDATE research.finding
+            SET evidence_summary = %s,
+                updated_at = NOW()
+            WHERE finding_id = %s
+            """,
+            (json.dumps(deduped_refs), str(finding_id)),
+        )
 
     # ------------------------------------------------------------------
     # Row -> dataclass mappers

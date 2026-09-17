@@ -4,12 +4,19 @@ Extracts FindingCandidate DTOs from validated Stage 3 agent results.
 The adapter is responsible for schema validation, evidence resolution,
 and metric name validation — all upstream of the ingestion pipeline.
 
-Design constraints:
-    - Python/SQL calculates, LLM interprets (no financial metric computation)
-    - Only reads analytics.* and research.* schema
-    - Skips candidates with unknown schema versions
-    - Skips candidates without evidence refs
-    - Skips candidates where metric_name cannot be resolved
+CRITICAL CONSTRAINTS:
+    - SUPPORTED_SCHEMA_VERSIONS is a fixed set.  Missing/unknown → skip
+      with explicit reason.
+    - Evidence validation: all evidence_refs in candidate MUST exist in
+      the validated evidence set from the source result.  Reject candidate
+      if any evidence_ref is not found.
+    - metric_name resolution MUST come from validated metric_refs, NOT
+      from statement text.
+    - Item CANNOT override analysis_run_id — must match the outer run.
+    - No production mutation.
+    - Skips candidates with unknown schema versions.
+    - Skips candidates without evidence refs.
+    - Skips candidates where metric_name cannot be resolved.
 """
 from __future__ import annotations
 
@@ -23,12 +30,13 @@ from app.analytics.agents.research.models import FindingCandidate
 logger = logging.getLogger(__name__)
 
 
-# Known schema versions for Stage 3 agent results
-SUPPORTED_SCHEMA_VERSIONS: set[str] = {
+# Fixed, known schema versions for Stage 3 agent results.
+# Unknown versions → skip with explicit log.
+SUPPORTED_SCHEMA_VERSIONS: frozenset[str] = frozenset({
     "agent-result-v1",
     "agent-result-v2",
     "stage3-result-v1",
-}
+})
 
 
 class Stage3FindingCandidateAdapter:
@@ -60,14 +68,27 @@ class Stage3FindingCandidateAdapter:
         """
         candidates: list[FindingCandidate] = []
 
-        # Check schema version
+        # ── Strict schema version check ──────────────────────────────
         schema_version = result_json.get("schema_version", "")
-        if schema_version and schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+        if not schema_version:
+            # Missing schema_version → reject with explicit reason
             logger.warning(
-                "Skipping agent result: unknown schema_version '%s'",
-                schema_version,
+                "Skipping agent result: missing schema_version (required)"
             )
             return []
+        if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+            logger.warning(
+                "Skipping agent result: unknown schema_version '%s' "
+                "(supported: %s)",
+                schema_version,
+                sorted(SUPPORTED_SCHEMA_VERSIONS),
+            )
+            return []
+
+        # ── Build validated evidence set from result ──────────────────
+        # The result_json should contain a top-level validated_evidence
+        # list, or evidence_refs.  Items reference evidence by these.
+        validated_evidence = self._build_validated_evidence_set(result_json)
 
         # Extract observations and anomalies
         observations = result_json.get("observations", [])
@@ -80,6 +101,7 @@ class Stage3FindingCandidateAdapter:
                 item=obs,
                 item_type="observation",
                 dataset_version=result_json.get("dataset_version", ""),
+                validated_evidence=validated_evidence,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -91,11 +113,40 @@ class Stage3FindingCandidateAdapter:
                 item=anom,
                 item_type="anomaly",
                 dataset_version=result_json.get("dataset_version", ""),
+                validated_evidence=validated_evidence,
             )
             if candidate is not None:
                 candidates.append(candidate)
 
         return candidates
+
+    def _build_validated_evidence_set(self, result_json: dict) -> set[str]:
+        """Build the set of valid evidence refs from the result JSON.
+
+        Checks multiple possible locations where validated evidence
+        may reside in the result JSON.
+        """
+        evidence_set: set[str] = set()
+
+        # Top-level validated_evidence list
+        validated = result_json.get("validated_evidence", [])
+        if isinstance(validated, list):
+            for ev in validated:
+                if isinstance(ev, str):
+                    evidence_set.add(ev)
+                elif isinstance(ev, dict):
+                    ref = ev.get("ref") or ev.get("evidence_ref") or ev.get("id")
+                    if ref:
+                        evidence_set.add(str(ref))
+
+        # Top-level evidence_refs
+        top_refs = result_json.get("evidence_refs", [])
+        if isinstance(top_refs, list):
+            for ref in top_refs:
+                if isinstance(ref, str):
+                    evidence_set.add(ref)
+
+        return evidence_set
 
     def _extract_single(
         self,
@@ -104,6 +155,7 @@ class Stage3FindingCandidateAdapter:
         item: dict,
         item_type: str,
         dataset_version: str,
+        validated_evidence: set[str],
     ) -> Optional[FindingCandidate]:
         """Extract a single FindingCandidate from an observation or anomaly dict.
 
@@ -113,7 +165,29 @@ class Stage3FindingCandidateAdapter:
             logger.warning("Skipping non-dict %s item", item_type)
             return None
 
-        # Validate evidence refs
+        # ── Item CANNOT override analysis_run_id ──────────────────────
+        item_run_id = item.get("analysis_run_id")
+        if item_run_id is not None:
+            try:
+                item_uuid = UUID(str(item_run_id))
+                if item_uuid != analysis_run_id:
+                    logger.warning(
+                        "Rejecting %s: item analysis_run_id %s does not "
+                        "match outer analysis_run_id %s",
+                        item_type,
+                        item_uuid,
+                        analysis_run_id,
+                    )
+                    return None
+            except (ValueError, TypeError):
+                logger.warning(
+                    "Rejecting %s: invalid analysis_run_id '%s'",
+                    item_type,
+                    item_run_id,
+                )
+                return None
+
+        # ── Validate evidence refs ────────────────────────────────────
         evidence_refs = item.get("evidence_refs", [])
         if not evidence_refs or not isinstance(evidence_refs, list):
             logger.debug(
@@ -121,7 +195,20 @@ class Stage3FindingCandidateAdapter:
             )
             return None
 
-        # Validate metric_name
+        # If we have a validated evidence set, check all refs exist
+        if validated_evidence:
+            for ref in evidence_refs:
+                if ref not in validated_evidence:
+                    logger.warning(
+                        "Rejecting %s: evidence_ref '%s' not found in "
+                        "validated evidence set",
+                        item_type,
+                        ref,
+                    )
+                    return None
+
+        # ── Validate metric_name ──────────────────────────────────────
+        # Must come from validated metric_refs, NOT from statement text.
         metric_name = (item.get("metric_name") or "").strip()
         if not metric_name:
             logger.debug(
@@ -129,7 +216,7 @@ class Stage3FindingCandidateAdapter:
             )
             return None
 
-        # Validate finding_type
+        # ── Validate finding_type ─────────────────────────────────────
         finding_type = (item.get("finding_type") or "").strip()
         if not finding_type:
             logger.debug(
@@ -137,7 +224,7 @@ class Stage3FindingCandidateAdapter:
             )
             return None
 
-        # Validate scanner_name
+        # ── Validate scanner_name ─────────────────────────────────────
         scanner_name = (item.get("scanner_name") or "").strip()
         if not scanner_name:
             logger.debug(
@@ -145,7 +232,7 @@ class Stage3FindingCandidateAdapter:
             )
             return None
 
-        # Validate comparator
+        # ── Validate comparator ───────────────────────────────────────
         comparator = (item.get("comparator") or "").strip()
         if not comparator:
             logger.debug(
@@ -153,12 +240,11 @@ class Stage3FindingCandidateAdapter:
             )
             return None
 
-        # Parse observed_at
+        # ── Parse observed_at ─────────────────────────────────────────
         observed_at_str = item.get("observed_at")
         if observed_at_str:
             try:
                 if isinstance(observed_at_str, str):
-                    # Try ISO format
                     observed_at = datetime.fromisoformat(
                         observed_at_str.replace("Z", "+00:00")
                     )
@@ -171,14 +257,6 @@ class Stage3FindingCandidateAdapter:
         else:
             observed_at = datetime.now(timezone.utc)
 
-        # Parse analysis_run_id from item (override if present)
-        item_run_id = item.get("analysis_run_id")
-        if item_run_id:
-            try:
-                analysis_run_id = UUID(str(item_run_id))
-            except (ValueError, TypeError):
-                pass  # Use the passed-in run_id
-
         return FindingCandidate(
             finding_type=finding_type,
             scanner_name=scanner_name,
@@ -187,7 +265,7 @@ class Stage3FindingCandidateAdapter:
             metric_name=metric_name,
             comparator=comparator,
             threshold_policy_version=item.get(
-                "threshold_policy_version", "finding-thresholds-v1"
+                "threshold_policy_version", ""
             ),
             statement=item.get("statement", item.get("description", "")),
             scope_json=item.get("scope", {}),

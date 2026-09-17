@@ -326,7 +326,7 @@ class FindingCandidate:
     sample_size: int
     confidence: str
     evidence_refs: list[str]
-    analysis_run_id: Optional[UUID]
+    analysis_run_id: UUID  # REQUIRED, not Optional — ingestion rejects candidates without it
     agent_run_id: Optional[UUID]
     dataset_version: str
     observed_at: datetime

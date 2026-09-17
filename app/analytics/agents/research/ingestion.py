@@ -4,6 +4,12 @@ Transforms FindingCandidate DTOs into persisted research.finding +
 research.finding_occurrence rows, with fingerprint-based dedup and
 repeat-policy-driven status transitions.
 
+CRITICAL TRANSACTION DESIGN:
+    The entire ingest_candidate lifecycle runs within a single logical
+    transaction.  Repository helper methods called INSIDE ingest_candidate
+    must NOT commit independently — they must participate in the same
+    transaction managed by the caller.  On any error: ROLLBACK EVERYTHING.
+
 Design constraints:
     - Python/SQL calculates, LLM interprets (no financial metric computation)
     - Only writes to research.* schema
@@ -45,6 +51,7 @@ from app.analytics.agents.research.repeat_policy import (
     MARK_REPEATED,
     MARK_RESEARCH_REQUIRED,
     NO_CHANGE,
+    PROMOTION_DISABLED,
 )
 from app.analytics.agents.research.repository import ResearchRepository
 
@@ -54,17 +61,18 @@ logger = logging.getLogger(__name__)
 class FindingIngestionService:
     """Orchestrates the ingestion of FindingCandidate DTOs.
 
-    Lifecycle per candidate:
-        1. Validate & normalize inputs
-        2. Compute fingerprint
-        3. Lookup fingerprint → find existing finding
-        4. If found → link occurrence to existing finding
-        5. If not found → create finding + fingerprint
-        6. Insert occurrence (idempotent on finding_id + analysis_run_id)
-        7. Refresh aggregates (first_seen, last_seen, occurrence_count)
-        8. Evaluate repeat policy
-        9. Maybe transition status (via repository)
-        10. Return result
+    Lifecycle per candidate (single logical transaction):
+        1. Validate candidate (analysis_run_id required)
+        2. Normalize → fingerprint payload
+        3. Compute fingerprint
+        4. Lookup fingerprint → find/create finding (with unique-conflict handling)
+        5. Insert occurrence (with idempotency check)
+        6. Refresh aggregates
+        7. Evaluate repeat policy
+        8. Maybe transition status (via transition policy)
+        9. Record transition history
+        COMMIT
+        On any error: ROLLBACK EVERYTHING
     """
 
     def __init__(
@@ -73,7 +81,7 @@ class FindingIngestionService:
         policy_config: Optional[FindingRepeatPolicyConfig] = None,
     ) -> None:
         self._repo = repo
-        self._config = policy_config or FindingRepeatPolicyConfig()
+        self._config = policy_config  # None = promotion disabled
 
     # ------------------------------------------------------------------
     # Single candidate ingestion
@@ -86,8 +94,27 @@ class FindingIngestionService:
         """Ingest a single FindingCandidate.
 
         Returns a FindingIngestionResult with full audit trail.
+
+        The entire method executes within a single logical transaction.
+        All repository calls within this method must NOT commit independently.
+        On any error the caller (or test mock) is responsible for rollback.
         """
-        # 1. Validate & normalize
+        # 1. Validate — analysis_run_id is REQUIRED
+        if candidate.analysis_run_id is None:
+            raise ValueError(
+                "FindingCandidate.analysis_run_id is required — "
+                "candidates without an analysis_run_id are rejected"
+            )
+
+        # 2. Validate — threshold_policy_version must not silently default
+        threshold_version = (candidate.threshold_policy_version or "").strip()
+        if not threshold_version:
+            raise ValueError(
+                "FindingCandidate.threshold_policy_version is required — "
+                "candidates without a threshold_policy_version are rejected"
+            )
+
+        # 3. Normalize → fingerprint payload
         payload = self._build_fingerprint_payload(candidate)
         if payload is None:
             # Invalid candidate — cannot compute fingerprint
@@ -97,10 +124,10 @@ class FindingIngestionService:
                 policy_action="SKIPPED_INVALID",
             )
 
-        # 2. Compute fingerprint
+        # 4. Compute fingerprint
         fingerprint_hash = FindingFingerprintV1.compute(payload)
 
-        # 3. Lookup existing finding by fingerprint
+        # 5. Lookup existing finding by fingerprint
         existing_finding = self._repo.get_finding_by_fingerprint(fingerprint_hash)
 
         created_finding = False
@@ -108,29 +135,46 @@ class FindingIngestionService:
         idempotent_replay = False
 
         if existing_finding is not None:
-            # 4. Link to existing finding
+            # 6a. Link to existing finding
             finding = existing_finding
         else:
-            # 5. Create new finding + fingerprint
-            finding = self._create_finding_from_candidate(candidate, fingerprint_hash)
-            created_finding = True
+            # 6b. Create new finding + fingerprint (handle UNIQUE conflict)
+            try:
+                finding = self._create_finding_from_candidate(candidate, fingerprint_hash)
+                created_finding = True
+            except Exception as exc:
+                # UNIQUE violation on fingerprint → another concurrent insert won
+                # Re-read the existing finding and continue
+                logger.info(
+                    "Concurrent fingerprint conflict for %s, re-reading: %s",
+                    fingerprint_hash[:12],
+                    exc,
+                )
+                finding = self._repo.get_finding_by_fingerprint(fingerprint_hash)
+                if finding is None:
+                    # Should not happen — if the insert failed, someone else
+                    # must have inserted.  If we can't find it, re-raise.
+                    raise ValueError(
+                        f"Fingerprint {fingerprint_hash[:12]} conflict but "
+                        f"finding not found on re-read"
+                    ) from exc
 
-        # 6. Create occurrence (idempotent)
-        occurrence = self._create_occurrence(candidate, finding.finding_id)
-        if occurrence is not None:
-            created_occurrence = True
-        else:
+        # 7. Create occurrence (idempotent)
+        occurrence, created_occurrence = self._create_occurrence(candidate, finding.finding_id)
+        if not created_occurrence:
             idempotent_replay = True
 
-        # 7. Refresh aggregates
+        # 8. Refresh aggregates (first_seen, last_seen, occurrence_count, evidence_summary)
         self._repo.refresh_finding_aggregate(finding.finding_id)
 
-        # 8. Evaluate repeat policy
+        # 9. Evaluate repeat policy
         all_occurrences = self._repo.list_occurrences_for_finding(finding.finding_id)
         occ_dicts = [
             {
                 "confidence": occ.confidence or "LOW",
                 "business_date": occ.business_date,
+                "analysis_run_id": str(occ.analysis_run_id) if occ.analysis_run_id else None,
+                "maturity": occ.maturity or "PROVISIONAL",
             }
             for occ in all_occurrences
         ]
@@ -140,7 +184,7 @@ class FindingIngestionService:
             finding.status,
         )
 
-        # 9. Maybe transition status
+        # 10. Maybe transition status
         old_status = finding.status
         new_status = self._apply_policy_action(finding.finding_id, policy_action, finding.status)
 
@@ -164,9 +208,12 @@ class FindingIngestionService:
         self,
         candidates: list[FindingCandidate],
     ) -> IngestionBatchSummary:
-        """Ingest a batch of candidates.  Per-candidate transaction.
+        """Ingest a batch of candidates.
 
-        Returns an IngestionBatchSummary with aggregate counts.
+        Per-candidate transaction.  Malformed candidates are skipped
+        (increment skipped_invalid) but do NOT stop the batch.
+        DB/system failures propagate and stop the batch (raise).
+        Do NOT turn outages into summary.errors.
         """
         summary = IngestionBatchSummary(candidates_seen=len(candidates))
 
@@ -174,9 +221,13 @@ class FindingIngestionService:
             try:
                 result = self.ingest_candidate(candidate)
                 self._update_summary(summary, result)
-            except Exception as exc:
-                logger.error("Failed to ingest candidate: %s", exc)
-                summary.errors += 1
+            except ValueError as exc:
+                # Malformed candidate → continue batch
+                logger.warning("Skipping malformed candidate: %s", exc)
+                summary.skipped_invalid += 1
+            except Exception:
+                # DB/system failure → propagate, stop batch
+                raise
 
         return summary
 
@@ -231,10 +282,8 @@ class FindingIngestionService:
             )
             return None
 
-        # threshold_policy_version — use as-is, must not be empty
-        threshold_policy_version = (candidate.threshold_policy_version or "").strip()
-        if not threshold_policy_version:
-            threshold_policy_version = "finding-thresholds-v1"
+        # threshold_policy_version — already validated as non-empty above
+        threshold_policy_version = candidate.threshold_policy_version.strip()
 
         return FindingFingerprintPayload(
             finding_type=finding_type,
@@ -251,7 +300,10 @@ class FindingIngestionService:
         candidate: FindingCandidate,
         fingerprint_hash: str,
     ) -> Finding:
-        """Create a new finding record from a candidate."""
+        """Create a new finding record from a candidate.
+
+        May raise on UNIQUE constraint violation (caller handles conflict).
+        """
         now = datetime.now(timezone.utc)
         finding = Finding(
             finding_id=uuid4(),
@@ -282,9 +334,7 @@ class FindingIngestionService:
             ),
             "metric_name": (candidate.metric_name or "").strip().lower(),
             "comparator": ComparatorNormalizer.normalize(candidate.comparator) or "",
-            "threshold_policy_version": (
-                candidate.threshold_policy_version or "finding-thresholds-v1"
-            ),
+            "threshold_policy_version": candidate.threshold_policy_version.strip(),
         }
 
         return self._repo.create_finding_with_fingerprint(finding, fp_payload)
@@ -293,8 +343,12 @@ class FindingIngestionService:
         self,
         candidate: FindingCandidate,
         finding_id,
-    ) -> Optional[FindingOccurrence]:
-        """Create an occurrence record.  Returns None if idempotent replay (already exists)."""
+    ) -> tuple[Optional[FindingOccurrence], bool]:
+        """Create an occurrence record.
+
+        Returns (occurrence, created: bool).
+        created=False if the occurrence already exists (idempotent replay).
+        """
         now = datetime.now(timezone.utc)
         occurrence = FindingOccurrence(
             occurrence_id=uuid4(),
@@ -313,15 +367,8 @@ class FindingIngestionService:
             maturity=candidate.maturity,
             source_agent_name=candidate.source_agent_name,
         )
-        # ON CONFLICT DO NOTHING — check if occurrence already exists
-        existing = self._repo.list_occurrences_for_finding(finding_id)
-        for occ in existing:
-            if occ.analysis_run_id == candidate.analysis_run_id:
-                # Idempotent replay — already exists
-                return None
-        # Insert new occurrence
-        self._repo.create_occurrence_if_absent(occurrence)
-        return occurrence
+        # Delegate to repository — returns (occurrence, created: bool)
+        return self._repo.create_occurrence_if_absent(occurrence)
 
     def _apply_policy_action(
         self,
