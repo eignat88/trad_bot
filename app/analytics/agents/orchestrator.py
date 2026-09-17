@@ -480,9 +480,10 @@ class AgentOrchestrator:
         final_result = None
         repairs_attempted = 0
 
-        for attempt in range(1, policy.max_attempts + 1):
+        for _ in range(policy.max_attempts):
             # Each attempt = new agent_run
-            agent_run = self._create_new_attempt(analysis_run_id, agent_name, attempt)
+            attempt_num = self._repo.get_next_attempt(analysis_run_id, agent_name)
+            agent_run = self._create_new_attempt(analysis_run_id, agent_name, attempt_num)
             manifest = self._build_manifest(
                 agent_run_id=agent_run.agent_run_id,
                 dataset_version=dataset_version,
@@ -519,7 +520,8 @@ class AgentOrchestrator:
             if policy.should_repair(error_code, repairs_attempted):
                 repairs_attempted += 1
                 # Repair is a SEPARATE attempt with SAME manifest
-                repair_run = self._create_new_attempt(analysis_run_id, agent_name, attempt + 1)
+                repair_attempt_num = self._repo.get_next_attempt(analysis_run_id, agent_name)
+                repair_run = self._create_new_attempt(analysis_run_id, agent_name, repair_attempt_num)
                 repair_manifest = self._build_manifest(
                     agent_run_id=repair_run.agent_run_id,
                     dataset_version=dataset_version,
@@ -548,8 +550,8 @@ class AgentOrchestrator:
                 break  # Only one repair attempt
 
             # Retryable → create next attempt
-            if policy.should_retry(error_code, attempt):
-                delay = policy.delay_for_attempt(attempt)
+            if policy.should_retry(error_code, attempt_num):
+                delay = policy.delay_for_attempt(attempt_num)
                 await asyncio.sleep(delay)
                 # Mark current as FAILED
                 self._finalize_attempt(agent_run.agent_run_id, result)

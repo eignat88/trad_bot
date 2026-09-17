@@ -238,7 +238,7 @@ class TestSQLQualityGateFailClosed:
     def test_blocking_fails(self):
         """#7: blocking > 0 → FAIL."""
         mock_cursor = MagicMock()
-        mock_cursor.fetchone.return_value = [False, 2, 0, 10]  # passed, blocking, degraded, total
+        mock_cursor.fetchone.return_value = [False, 2, 0, 0, 10]  # passed, blocking, degraded, warning, total
 
         mock_conn = MagicMock()
         mock_conn.cursor.return_value = mock_cursor
@@ -261,7 +261,7 @@ class TestSQLQualityGateFailClosed:
     def test_degraded_no_blocking(self):
         """#8: degraded > 0, blocking=0 → DEGRADED."""
         mock_cursor = MagicMock()
-        mock_cursor.fetchone.return_value = [True, 0, 3, 10]  # passed, blocking, degraded, total
+        mock_cursor.fetchone.return_value = [True, 0, 3, 0, 10]  # passed, blocking, degraded, warning, total
 
         mock_conn = MagicMock()
         mock_conn.cursor.return_value = mock_cursor
@@ -285,7 +285,7 @@ class TestSQLQualityGateFailClosed:
     def test_zero_failures_pass(self):
         """#9: zero failures → PASS."""
         mock_cursor = MagicMock()
-        mock_cursor.fetchone.return_value = [True, 0, 0, 10]
+        mock_cursor.fetchone.return_value = [True, 0, 0, 0, 10]  # passed, blocking, degraded, warning, total
 
         mock_conn = MagicMock()
         mock_conn.cursor.return_value = mock_cursor
