@@ -693,9 +693,17 @@ class AnalyticsRunner:
         data_repo = SpecialistDataRepository(self._repo._conn)
         specialist_registry = SPECIALIST_REGISTRY
 
+        # Create executor with stub prompt builder (real prompts from registry)
+        from app.analytics.agents.llm_client import StubModelClient
+        stub_client = StubModelClient()
+        executor = AgentExecutor(
+            model_client=stub_client,
+            prompt_builder=lambda defn, manifest: {"system_prompt": "", "input_json": {}},
+        )
+
         orchestrator = AgentOrchestrator(
             repository=repo,
-            executor=None,  # Executor is created per-agent inside orchestrator
+            executor=executor,
             data_repo=data_repo,
             specialist_registry=specialist_registry,
         )
