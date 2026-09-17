@@ -248,10 +248,10 @@ class TestResearchModels:
     def test_monitoring_result_creation(self):
         mr = MonitoringResult(
             change_id=uuid4(),
-            window="24h",
+            window_label="24h",
             verdict="PASS",
         )
-        assert mr.window == "24h"
+        assert mr.window_label == "24h"
         assert mr.verdict == "PASS"
 
     def test_transition_record(self):
