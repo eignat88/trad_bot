@@ -82,6 +82,10 @@ class PaperTradeRecord:
     # DCA Breakeven fields
     dca_enabled: bool = False
     dca_state: DCAPositionState | None = None
+    # Execution policy fields (scanner-direction-specific)
+    execution_policy: str = "DEFAULT"
+    execution_policy_version: str = ""
+    planned_exit_at: datetime | None = None
 
     @property
     def is_dca_active(self) -> bool:
