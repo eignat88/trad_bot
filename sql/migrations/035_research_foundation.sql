@@ -328,7 +328,7 @@ COMMENT ON COLUMN research.production_change.affected_scanners_json
 CREATE TABLE IF NOT EXISTS research.monitoring_result (
     monitoring_result_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     change_id               UUID REFERENCES research.production_change(change_id),
-    window                  TEXT NOT NULL,
+    window_label           TEXT NOT NULL,
     observed_from           TIMESTAMPTZ NOT NULL,
     observed_to             TIMESTAMPTZ NOT NULL,
     sample_size             BIGINT DEFAULT 0,
@@ -342,12 +342,12 @@ CREATE TABLE IF NOT EXISTS research.monitoring_result (
 
 CREATE INDEX IF NOT EXISTS idx_mr_change       ON research.monitoring_result (change_id);
 CREATE INDEX IF NOT EXISTS idx_mr_verdict      ON research.monitoring_result (verdict);
-CREATE INDEX IF NOT EXISTS idx_mr_window       ON research.monitoring_result (window);
+CREATE INDEX IF NOT EXISTS idx_mr_window       ON research.monitoring_result (window_label);
 CREATE INDEX IF NOT EXISTS idx_mr_observed     ON research.monitoring_result (observed_from, observed_to);
 
 COMMENT ON TABLE  research.monitoring_result
     IS 'Post-deployment monitoring outcomes for production changes (migration 035)';
-COMMENT ON COLUMN research.monitoring_result.window
+COMMENT ON COLUMN research.monitoring_result.window_label
     IS 'Monitoring window label (e.g. 1h, 4h, 24h, 7d)';
 COMMENT ON COLUMN research.monitoring_result.primary_metric_actual
     IS 'Observed value of the primary metric in this window';

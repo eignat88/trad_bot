@@ -254,7 +254,7 @@ class MonitoringResult:
     """research.monitoring_result — post-deployment monitoring outcomes."""
     monitoring_result_id: UUID = field(default_factory=uuid4)
     change_id: Optional[UUID] = None
-    window: str = ""
+    window_label: str = ""
     observed_from: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     observed_to: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     sample_size: int = 0
