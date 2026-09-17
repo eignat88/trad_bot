@@ -230,10 +230,19 @@ def get_dca_source() -> str:
 
 
 def _load_execution_policies(settings: Settings, raw: dict) -> None:
-    """Parse execution_policies from config into typed ExecutionPolicyConfig objects."""
+    """Parse execution_policies from config + env overrides into typed configs.
+
+    Priority: ENV > config.yaml > application default.
+    Currently supports env override for MOMENTUM_EXHAUSTION SHORT enabled flag:
+        ME_SHORT_FIXED_240M_ENABLED
+    """
     raw_policies = raw.get("execution_policies", {})
     if not raw_policies or not isinstance(raw_policies, dict):
-        return
+        raw_policies = {}
+
+    # Environment override for ME SHORT FIXED_HORIZON_V1 enabled flag
+    me_short_env = os.getenv("ME_SHORT_FIXED_240M_ENABLED")
+
     parsed: dict[str, dict[str, ExecutionPolicyConfig]] = {}
     for scanner_name, directions in raw_policies.items():
         if not isinstance(directions, dict):
@@ -242,9 +251,18 @@ def _load_execution_policies(settings: Settings, raw: dict) -> None:
         for direction, policy_raw in directions.items():
             if not isinstance(policy_raw, dict):
                 continue
+            enabled = policy_raw.get("enabled", False)
+            config_source = "CONFIG"
+
+            # Apply env override for MOMENTUM_EXHAUSTION SHORT
+            if scanner_name == "MOMENTUM_EXHAUSTION" and direction == "SHORT":
+                if me_short_env is not None:
+                    enabled = _parse_bool_env(me_short_env, "ME_SHORT_FIXED_240M_ENABLED")
+                    config_source = "ENV"
+
             policy_config = ExecutionPolicyConfig(
                 policy=policy_raw.get("policy", "DEFAULT"),
-                enabled=policy_raw.get("enabled", False),
+                enabled=enabled,
                 hold_minutes=policy_raw.get("hold_minutes", 240),
                 dca_enabled=policy_raw.get("dca_enabled", False),
                 trailing_enabled=policy_raw.get("trailing_enabled", False),
@@ -258,6 +276,11 @@ def _load_execution_policies(settings: Settings, raw: dict) -> None:
                     f"must be positive, got {policy_config.hold_minutes}"
                 )
             parsed[scanner_name][direction] = policy_config
+            # Store config source for startup logging
+            if not hasattr(settings, "_execution_policy_sources"):
+                object.__setattr__(settings, "_execution_policy_sources", {})
+            settings._execution_policy_sources[(scanner_name, direction)] = config_source
+
     # Use object.__setattr__ because Settings is a frozen dataclass
     object.__setattr__(settings, "execution_policy_configs", parsed)
 

@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/trad_bot
 EnvironmentFile=/opt/trad_bot/.env
+EnvironmentFile=-/etc/trad_bot/paper.env
 ExecStart=/opt/trad_bot/.venv/bin/python /opt/trad_bot/paper_runner.py
 
 Restart=on-failure
