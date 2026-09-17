@@ -693,11 +693,27 @@ class AnalyticsRunner:
         data_repo = SpecialistDataRepository(self._repo._conn)
         specialist_registry = SPECIALIST_REGISTRY
 
-        # Create executor with stub prompt builder (real prompts from registry)
-        from app.analytics.agents.llm_client import StubModelClient
-        stub_client = StubModelClient()
+        # Create executor with real LLM provider
+        from app.config.analytics_settings import load_llm_settings
+        from app.analytics.agents.llm_provider import OpenAICompatibleClient
+
+        llm_settings = load_llm_settings()
+
+        if not llm_settings.api_key or not llm_settings.api_key.strip():
+            logger.warning("LLM_API_KEY not configured — Stage3 agents will fail")
+            # Still create executor so the pipeline structure is tested.
+            # The model check in executor.execute() will reject execution.
+
+        model_client = OpenAICompatibleClient(
+            api_key=llm_settings.api_key or "missing",
+            base_url=llm_settings.base_url,
+            temperature=llm_settings.temperature,
+            max_output_tokens=llm_settings.max_output_tokens,
+            request_timeout_s=llm_settings.request_timeout_s,
+        )
+
         executor = AgentExecutor(
-            model_client=stub_client,
+            model_client=model_client,
             prompt_builder=lambda defn, manifest: {"system_prompt": "", "input_json": {}},
         )
 
