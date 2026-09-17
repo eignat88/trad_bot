@@ -82,6 +82,16 @@ def _load_settings() -> Settings:
         dca.initial_entry_pct, dca.dca_entry_pct, dca.exit_mode,
         dca.stop_loss_atr, dca.max_dca_count,
     )
+    # Log execution policies
+    for scanner_name, directions in settings.execution_policy_configs.items():
+        for direction, policy in directions.items():
+            logger.info(
+                "Execution policy: %s %s policy=%s enabled=%s "
+                "hold_minutes=%d dca=%s trailing=%s tp=%s expiry=%s",
+                scanner_name, direction, policy.policy, policy.enabled,
+                policy.hold_minutes, policy.dca_enabled,
+                policy.trailing_enabled, policy.tp_enabled, policy.expiry_enabled,
+            )
     return settings
 
 
