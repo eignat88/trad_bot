@@ -36,6 +36,7 @@ from app.analytics.agents.research.models import (
     TransitionRecord,
     ValidationResult,
 )
+from app.analytics.agents.research.transition_policy import ResearchTransitionPolicyV1
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,12 @@ class ResearchRepository:
             cur.execute("SELECT status FROM research.finding WHERE finding_id = %s", (str(finding_id),))
             row = cur.fetchone()
             old_status = row[0] if row else None
+
+            if old_status is None:
+                raise ValueError(f"Finding {finding_id} not found")
+
+            # Validate transition policy BEFORE any writes
+            ResearchTransitionPolicyV1.validate("finding", old_status, new_status)
 
             cur.execute(
                 "UPDATE research.finding SET status = %s, updated_at = NOW() WHERE finding_id = %s",
@@ -287,6 +294,11 @@ class ResearchRepository:
             )
             row = cur.fetchone()
             old_status = row[0] if row else None
+
+            if old_status is None:
+                raise ValueError(f"Hypothesis {hypothesis_id} not found")
+
+            ResearchTransitionPolicyV1.validate("hypothesis", old_status, new_status)
 
             cur.execute(
                 "UPDATE research.hypothesis SET status = %s, updated_at = NOW() WHERE hypothesis_id = %s",
@@ -456,6 +468,11 @@ class ResearchRepository:
             row = cur.fetchone()
             old_status = row[0] if row else None
 
+            if old_status is None:
+                raise ValueError(f"Experiment {experiment_id} not found")
+
+            ResearchTransitionPolicyV1.validate("experiment", old_status, new_status)
+
             cur.execute(
                 "UPDATE research.experiment SET status = %s, updated_at = NOW() WHERE experiment_id = %s",
                 (new_status, str(experiment_id)),
@@ -551,6 +568,11 @@ class ResearchRepository:
             )
             row = cur.fetchone()
             old_status = row[0] if row else None
+
+            if old_status is None:
+                raise ValueError(f"ExperimentRun {experiment_run_id} not found")
+
+            ResearchTransitionPolicyV1.validate("experiment_run", old_status, new_status)
 
             cur.execute(
                 "UPDATE research.experiment_run SET status = %s WHERE experiment_run_id = %s",
@@ -702,6 +724,11 @@ class ResearchRepository:
             )
             row = cur.fetchone()
             old_status = row[0] if row else None
+
+            if old_status is None:
+                raise ValueError(f"ChangeCandidate {candidate_id} not found")
+
+            ResearchTransitionPolicyV1.validate("change_candidate", old_status, new_status)
 
             cur.execute(
                 "UPDATE research.change_candidate SET status = %s WHERE candidate_id = %s",

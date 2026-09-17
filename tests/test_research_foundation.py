@@ -85,7 +85,7 @@ class TestResearchEnums:
         assert HypothesisStatus.RESEARCH_REQUIRED.value == "RESEARCH_REQUIRED"
         assert HypothesisStatus.EXPERIMENT_DESIGNED.value == "EXPERIMENT_DESIGNED"
         assert HypothesisStatus.BACKTESTING.value == "BACKTESTING"
-        assert HypothesisStatus.OOS_VALIDATED.value == "OOS_VALIDATED"
+        assert HypothesisStatus.OOS_VALIDATION.value == "OOS_VALIDATION"
         assert HypothesisStatus.VALIDATED.value == "VALIDATED"
         assert HypothesisStatus.REJECTED.value == "REJECTED"
         assert HypothesisStatus.INCONCLUSIVE.value == "INCONCLUSIVE"
@@ -559,3 +559,172 @@ class TestInconclusiveSupport:
     def test_migration_hypothesis_inconclusive(self):
         content = MIGRATION_PATH.read_text()
         assert "'INCONCLUSIVE'" in content
+
+
+class TestTransitionPolicyV1:
+    """ResearchTransitionPolicyV1 — legal/illegal state transitions."""
+
+    def test_valid_finding_transition(self):
+        from app.analytics.agents.research.transition_policy import ResearchTransitionPolicyV1
+        # Should not raise
+        ResearchTransitionPolicyV1.validate("finding", "OPEN", "REPEATED")
+        ResearchTransitionPolicyV1.validate("finding", "REPEATED", "RESEARCH_REQUIRED")
+
+    def test_valid_finding_to_closed(self):
+        from app.analytics.agents.research.transition_policy import ResearchTransitionPolicyV1
+        for status in ("OPEN", "REPEATED", "RESEARCH_REQUIRED"):
+            ResearchTransitionPolicyV1.validate("finding", status, "CLOSED")
+
+    def test_invalid_finding_open_to_research_required(self):
+        from app.analytics.agents.research.transition_policy import (
+            ResearchTransitionPolicyV1,
+        )
+        with pytest.raises(ValueError, match="Illegal transition"):
+            ResearchTransitionPolicyV1.validate("finding", "OPEN", "RESEARCH_REQUIRED")
+
+    def test_invalid_finding_closed_is_terminal(self):
+        from app.analytics.agents.research.transition_policy import (
+            ResearchTransitionPolicyV1,
+        )
+        with pytest.raises(ValueError, match="No transitions allowed"):
+            ResearchTransitionPolicyV1.validate("finding", "CLOSED", "OPEN")
+
+    def test_valid_hypothesis_transition(self):
+        from app.analytics.agents.research.transition_policy import (
+            ResearchTransitionPolicyV1,
+        )
+        ResearchTransitionPolicyV1.validate("hypothesis", "DRAFT", "RESEARCH_REQUIRED")
+        ResearchTransitionPolicyV1.validate(
+            "hypothesis", "RESEARCH_REQUIRED", "EXPERIMENT_DESIGNED"
+        )
+        ResearchTransitionPolicyV1.validate("hypothesis", "BACKTESTING", "OOS_VALIDATION")
+        ResearchTransitionPolicyV1.validate("hypothesis", "OOS_VALIDATION", "VALIDATED")
+        ResearchTransitionPolicyV1.validate(
+            "hypothesis", "OOS_VALIDATION", "INCONCLUSIVE"
+        )
+
+    def test_invalid_hypothesis_draft_to_validated(self):
+        from app.analytics.agents.research.transition_policy import (
+            ResearchTransitionPolicyV1,
+        )
+        with pytest.raises(ValueError, match="Illegal transition"):
+            ResearchTransitionPolicyV1.validate("hypothesis", "DRAFT", "VALIDATED")
+
+    def test_invalid_hypothesis_terminal(self):
+        from app.analytics.agents.research.transition_policy import (
+            ResearchTransitionPolicyV1,
+        )
+        with pytest.raises(ValueError, match="No transitions allowed"):
+            ResearchTransitionPolicyV1.validate("hypothesis", "VALIDATED", "DRAFT")
+        with pytest.raises(ValueError, match="No transitions allowed"):
+            ResearchTransitionPolicyV1.validate("hypothesis", "REJECTED", "DRAFT")
+
+    def test_experiment_transitions(self):
+        from app.analytics.agents.research.transition_policy import (
+            ResearchTransitionPolicyV1,
+        )
+        ResearchTransitionPolicyV1.validate("experiment", "PROPOSED", "FROZEN")
+        ResearchTransitionPolicyV1.validate("experiment", "FROZEN", "RUNNING")
+        ResearchTransitionPolicyV1.validate("experiment", "RUNNING", "COMPLETED")
+
+    def test_unknown_entity_type(self):
+        from app.analytics.agents.research.transition_policy import (
+            ResearchTransitionPolicyV1,
+        )
+        with pytest.raises(ValueError, match="Unknown entity_type"):
+            ResearchTransitionPolicyV1.validate("unknown_entity", "A", "B")
+
+
+class TestPolicyInRepository:
+    """Verify that repository update_*_status checks transition policy."""
+
+    def test_invalid_transition_does_not_update(self):
+        """Failed policy check should leave status unchanged and create no history."""
+        from unittest.mock import MagicMock
+        from app.analytics.agents.research.repository import ResearchRepository
+
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        # First query returns current status
+        mock_cursor.fetchone.return_value = ("OPEN",)
+
+        repo = ResearchRepository(mock_conn)
+        finding_id = uuid4()
+
+        with pytest.raises(ValueError, match="Illegal transition"):
+            repo.update_finding_status(finding_id, "RESEARCH_REQUIRED")
+
+        # Should NOT have called commit (rollback on exception)
+        mock_conn.commit.assert_not_called()
+
+    def test_valid_transition_commits(self):
+        """Valid transition should commit and record history."""
+        from unittest.mock import MagicMock
+        from app.analytics.agents.research.repository import ResearchRepository
+
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        # Current status = OPEN
+        mock_cursor.fetchone.return_value = ("OPEN",)
+
+        repo = ResearchRepository(mock_conn)
+        finding_id = uuid4()
+
+        repo.update_finding_status(finding_id, "REPEATED", reason="3+ occurrences")
+        mock_conn.commit.assert_called_once()
+
+
+class TestEnumSqlParity:
+    """Verify Python enum values match SQL CHECK values exactly."""
+
+    def test_finding_status_matches_sql(self):
+        from pathlib import Path
+        content = Path("sql/migrations/035_research_foundation.sql").read_text()
+        python_values = {s.value for s in FindingStatus}
+        for val in python_values:
+            assert f"'{val}'" in content, f"FindingStatus.{val} not in SQL CHECK"
+
+    def test_hypothesis_status_matches_sql(self):
+        from pathlib import Path
+        content = Path("sql/migrations/035_research_foundation.sql").read_text()
+        python_values = {s.value for s in HypothesisStatus}
+        for val in python_values:
+            assert f"'{val}'" in content, f"HypothesisStatus.{val} not in SQL CHECK"
+
+    def test_finding_type_matches_sql(self):
+        from pathlib import Path
+        content = Path("sql/migrations/035_research_foundation.sql").read_text()
+        python_values = {t.value for t in FindingType}
+        for val in python_values:
+            assert f"'{val}'" in content, f"FindingType.{val} not in SQL CHECK"
+
+
+class TestRbacMigration:
+    """Verify RBAC migration enforces least privilege."""
+
+    def test_rbac_has_explicit_grants(self):
+        from pathlib import Path
+        content = Path("sql/migrations/036_research_rbac.sql").read_text()
+        assert "GRANT" in content
+        assert "analytics_runner" in content
+        assert "analytics_agent" in content
+
+    def test_rbac_denies_blanket_update(self):
+        from pathlib import Path
+        content = Path("sql/migrations/036_research_rbac.sql").read_text()
+        assert "REVOKE UPDATE" in content
+
+    def test_rbac_denies_delete(self):
+        from pathlib import Path
+        content = Path("sql/migrations/036_research_rbac.sql").read_text()
+        assert "REVOKE" in content
+        assert "DELETE" in content
+
+    def test_rbac_denies_transition_history_mutation(self):
+        from pathlib import Path
+        content = Path("sql/migrations/036_research_rbac.sql").read_text()
+        assert "REVOKE UPDATE" in content
+        assert "transition_history" in content
+
