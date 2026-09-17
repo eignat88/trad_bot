@@ -141,6 +141,11 @@ class FindingOccurrence:
     dataset_version: Optional[str] = None
     details_json: dict = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Extended fields from migration 037
+    agent_run_id: Optional[UUID] = None
+    business_date: Optional[str] = None
+    maturity: str = "PROVISIONAL"
+    source_agent_name: str = ""
 
 
 @dataclass
@@ -293,3 +298,68 @@ class TransitionRecord:
     reason: Optional[str] = None
     metadata: dict = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# ======================================================================
+# Stage 4 PR2 — Finding Aggregation DTOs
+# ======================================================================
+
+@dataclass
+class FindingCandidate:
+    """DTO representing a candidate finding from a Stage 3 agent.
+
+    This is the input to the ingestion pipeline.  The candidate carries all
+    information needed to compute a fingerprint, create or link a finding,
+    and record an occurrence.
+    """
+
+    finding_type: str
+    scanner_name: str
+    direction: str
+    normalized_segment: dict
+    metric_name: str
+    comparator: str
+    threshold_policy_version: str
+    statement: str
+    scope_json: dict
+    metric_value: Optional[float]
+    sample_size: int
+    confidence: str
+    evidence_refs: list[str]
+    analysis_run_id: UUID  # REQUIRED, not Optional — ingestion rejects candidates without it
+    agent_run_id: Optional[UUID]
+    dataset_version: str
+    observed_at: datetime
+    source_agent_name: str
+    business_date: Optional[str] = None
+    maturity: str = "PROVISIONAL"
+
+
+@dataclass
+class FindingIngestionResult:
+    """Result of ingesting a single FindingCandidate."""
+
+    finding_id: UUID
+    fingerprint: str
+    occurrence_id: Optional[UUID] = None
+    created_finding: bool = False
+    created_occurrence: bool = False
+    idempotent_replay: bool = False
+    old_status: Optional[str] = None
+    new_status: Optional[str] = None
+    policy_action: str = "NO_CHANGE"
+
+
+@dataclass
+class IngestionBatchSummary:
+    """Aggregate result of ingesting a batch of FindingCandidates."""
+
+    candidates_seen: int = 0
+    created_findings: int = 0
+    linked_findings: int = 0
+    created_occurrences: int = 0
+    idempotent_replays: int = 0
+    promoted_repeated: int = 0
+    promoted_research_required: int = 0
+    skipped_invalid: int = 0
+    errors: int = 0
