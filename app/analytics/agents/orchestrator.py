@@ -177,11 +177,17 @@ class AgentOrchestrator:
         publication = self._repo.get_dataset_publication(analysis_run_id, maturity)
         quality_results = self._repo.get_quality_results(analysis_run_id)
 
-        # Derive from DB
-        dataset_version = publication.dataset_version if publication else None
-        publication_status = publication.status if publication else None
-        quality_status = publication.quality_status if publication else None
-        canonical_build_json = publication.canonical_build_json if publication else None
+        # Extract from publication dict (DB returns dict, not object)
+        if publication:
+            dataset_version = publication.get("dataset_version")
+            publication_status = publication.get("status")
+            quality_status_from_pub = publication.get("quality_status")
+            canonical_build_json = publication.get("canonical_build_json")
+        else:
+            dataset_version = None
+            publication_status = None
+            quality_status_from_pub = None
+            canonical_build_json = None
         quality_limitations = []
         if quality_results:
             for qr in quality_results:
@@ -208,7 +214,7 @@ class AgentOrchestrator:
             maturity=maturity,
             dataset_version=dataset_version,
             publication_status=publication_status,
-            quality_status=quality_status,
+            quality_status=quality_status_from_pub,
             canonical_build_json=canonical_build_json,
             analysis_window_from=run.analysis_from,
             analysis_window_to=run.analysis_to,
