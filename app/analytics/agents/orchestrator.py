@@ -201,16 +201,18 @@ class AgentOrchestrator:
         )
 
         # ── Step 1: Data Readiness Gate ───────────────────────────────
-        # Extract status as string for readiness gate
+        # When called from runner (before run.status=SUCCEEDED), treat
+        # RUNNING as acceptable — canonical data is already READY.
         run_status_str = (
             run.status.value
             if hasattr(run.status, "value")
             else str(run.status)
         )
+        effective_status = "SUCCEEDED" if run_status_str == "RUNNING" else run_status_str
         
         readiness = self._readiness.evaluate(
             run_id=analysis_run_id,
-            status=run_status_str,
+            status=effective_status,
             maturity=maturity,
             dataset_version=dataset_version,
             publication_status=publication_status,
