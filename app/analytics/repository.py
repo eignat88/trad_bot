@@ -611,7 +611,7 @@ class AnalyticsRepository:
             scope_type=row[4],
             scope_id=row[5],
             severity=Severity(row[6]),
-            status=StageStatus(row[7]),
+            status=QualityCheckStatus(row[7]),
             expected_value=json.loads(row[8]) if row[8] else None,
             actual_value=json.loads(row[9]) if row[9] else None,
             affected_entity_count=row[10],
