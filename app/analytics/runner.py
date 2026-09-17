@@ -580,23 +580,38 @@ class AnalyticsRunner:
         dataset_version = compute_dataset_version(**manifest)
 
         # Create publication with status=BUILDING
-        publication_id = self._repo.create_dataset_publication(
-            analysis_run_id=run.run_id,
-            dataset_version=dataset_version,
-            maturity=run.maturity.value,
-            quality_status=quality_status,
-            analysis_window_from=run.analysis_from,
-            analysis_window_to=run.analysis_to,
-            observation_cutoff=run.observation_cutoff,
-            canonical_build_json={
-                "trade_fact_built": True,
-                "setup_fact_built": True,
-                "events_built": True,
-            },
-            quality_summary_json={
-                "quality_status": quality_status,
-            },
-        )
+        # Check if publication already exists (idempotent)
+        existing_pub = self._repo.get_dataset_publication(run.run_id, run.maturity.value)
+        
+        canonical_build_json = {
+            "trade_fact_built": True,
+            "setup_fact_built": True,
+            "events_built": True,
+        }
+        quality_summary_json = {"quality_status": quality_status}
+        
+        if existing_pub:
+            # Update existing publication
+            publication_id = existing_pub.get("publication_id")
+            self._repo.update_dataset_publication_status(
+                publication_id,
+                status="BUILDING",
+                quality_status=quality_status,
+                canonical_build_json=canonical_build_json,
+                quality_summary_json=quality_summary_json,
+            )
+        else:
+            publication_id = self._repo.create_dataset_publication(
+                analysis_run_id=run.run_id,
+                dataset_version=dataset_version,
+                maturity=run.maturity.value,
+                quality_status=quality_status,
+                analysis_window_from=run.analysis_from,
+                analysis_window_to=run.analysis_to,
+                observation_cutoff=run.observation_cutoff,
+                canonical_build_json=canonical_build_json,
+                quality_summary_json=quality_summary_json,
+            )
 
         # Final validation: verify canonical objects exist
         cursor = self._repo._conn.cursor()
