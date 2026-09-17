@@ -1,0 +1,225 @@
+-- Migration 035: Research foundation (Stage 4 PR1)
+-- Creates the `research` schema and core tracking tables for findings,
+-- hypotheses, experiments, transition history, and fingerprinting.
+--
+-- Idempotent: all CREATE TABLE IF NOT EXISTS; DO $$ blocks for triggers.
+
+-- ============================================================
+-- 0. Schema
+-- ============================================================
+CREATE SCHEMA IF NOT EXISTS research;
+
+-- ============================================================
+-- 0.1 Helper functions (idempotent)
+-- ============================================================
+CREATE OR REPLACE FUNCTION analytics.fn_set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION analytics.fn_block_mutation()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'Immutability violation: % on research.transition_history is not allowed', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================
+-- 1. research.finding
+-- ============================================================
+CREATE TABLE IF NOT EXISTS research.finding (
+    finding_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    finding_code       TEXT NOT NULL,
+    title              TEXT NOT NULL,
+    severity           TEXT NOT NULL CHECK (severity IN ('LOW', 'MEDIUM', 'HIGH')),
+    status             TEXT NOT NULL DEFAULT 'OPEN'
+                      CHECK (status IN ('OPEN', 'CONFIRMED', 'FALSE_POSITIVE', 'SUPERSEDED')),
+    source_run_id      UUID REFERENCES analytics.analysis_run(run_id),
+    agent_name         TEXT NOT NULL,
+    scope              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    sample_size        BIGINT NOT NULL DEFAULT 0,
+    confidence         TEXT NOT NULL CHECK (confidence IN ('LOW', 'MEDIUM', 'HIGH')),
+    evidence_refs      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    metric_refs        JSONB NOT NULL DEFAULT '[]'::jsonb,
+    statement          TEXT NOT NULL,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_finding_status ON research.finding (status);
+CREATE INDEX IF NOT EXISTS idx_finding_code ON research.finding (finding_code);
+CREATE INDEX IF NOT EXISTS idx_finding_source_run ON research.finding (source_run_id);
+CREATE INDEX IF NOT EXISTS idx_finding_severity ON research.finding (severity);
+
+COMMENT ON TABLE research.finding
+    IS 'Validated observations from Stage 3 agents that warrant tracking (migration 035)';
+
+-- ============================================================
+-- 2. research.finding_occurrence
+-- ============================================================
+CREATE TABLE IF NOT EXISTS research.finding_occurrence (
+    occurrence_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    finding_id         UUID NOT NULL REFERENCES research.finding(finding_id),
+    observed_run_id    UUID REFERENCES analytics.analysis_run(run_id),
+    observed_at        TIMESTAMPTZ NOT NULL,
+    sample_size        BIGINT NOT NULL DEFAULT 0,
+    confidence         TEXT NOT NULL CHECK (confidence IN ('LOW', 'MEDIUM', 'HIGH')),
+    evidence_refs      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    details            JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    UNIQUE (finding_id, observed_run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_finding_occurrence_finding ON research.finding_occurrence (finding_id);
+
+COMMENT ON TABLE research.finding_occurrence
+    IS 'Each observed instance of a finding across runs and dates (migration 035)';
+
+-- ============================================================
+-- 3. research.hypothesis
+-- ============================================================
+CREATE TABLE IF NOT EXISTS research.hypothesis (
+    hypothesis_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    finding_id         UUID REFERENCES research.finding(finding_id),
+    hypothesis_code    TEXT NOT NULL,
+    statement          TEXT NOT NULL,
+    falsifiable_experiment TEXT NOT NULL,
+    required_data      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    validation_criterion TEXT NOT NULL,
+    confidence         TEXT NOT NULL CHECK (confidence IN ('LOW', 'MEDIUM', 'HIGH')),
+    status             TEXT NOT NULL DEFAULT 'PROPOSED'
+                      CHECK (status IN ('PROPOSED', 'UNDER_TEST', 'CONFIRMED', 'REJECTED')),
+    source_run_id      UUID REFERENCES analytics.analysis_run(run_id),
+    agent_name         TEXT NOT NULL,
+    evidence_refs      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_hypothesis_status ON research.hypothesis (status);
+CREATE INDEX IF NOT EXISTS idx_hypothesis_finding ON research.hypothesis (finding_id);
+
+COMMENT ON TABLE research.hypothesis
+    IS 'Hypotheses generated by Stage 3 agents, linked to findings (migration 035)';
+
+-- ============================================================
+-- 4. research.experiment
+-- ============================================================
+CREATE TABLE IF NOT EXISTS research.experiment (
+    experiment_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    hypothesis_id      UUID REFERENCES research.hypothesis(hypothesis_id),
+    title              TEXT NOT NULL,
+    description        TEXT NOT NULL,
+    required_data      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    validation_criterion TEXT NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'PROPOSED'
+                      CHECK (status IN ('PROPOSED', 'FROZEN', 'RUNNING', 'COMPLETED', 'CANCELLED')),
+    source_run_id      UUID REFERENCES analytics.analysis_run(run_id),
+    agent_name         TEXT NOT NULL,
+    evidence_refs      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_experiment_status ON research.experiment (status);
+CREATE INDEX IF NOT EXISTS idx_experiment_hypothesis ON research.experiment (hypothesis_id);
+
+COMMENT ON TABLE research.experiment
+    IS 'Proposed and tracked experiments originating from Stage 3 proposals (migration 035)';
+
+-- ============================================================
+-- 5. research.transition_history
+-- ============================================================
+CREATE TABLE IF NOT EXISTS research.transition_history (
+    transition_id      BIGSERIAL PRIMARY KEY,
+    entity_type        TEXT NOT NULL CHECK (entity_type IN ('finding', 'hypothesis', 'experiment')),
+    entity_id          UUID NOT NULL,
+    from_status        TEXT,
+    to_status          TEXT NOT NULL,
+    actor              TEXT NOT NULL DEFAULT 'system',
+    reason             TEXT,
+    metadata           JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_transition_entity ON research.transition_history (entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_transition_created ON research.transition_history (created_at);
+
+COMMENT ON TABLE research.transition_history
+    IS 'Append-only audit trail for all research entity state changes (migration 035)';
+
+-- ============================================================
+-- 6. research.fingerprint
+-- ============================================================
+CREATE TABLE IF NOT EXISTS research.fingerprint (
+    fingerprint_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    finding_code       TEXT NOT NULL,
+    scanner            TEXT NOT NULL,
+    direction          TEXT NOT NULL,
+    metric_name        TEXT NOT NULL,
+    fingerprint_hash   TEXT NOT NULL,
+    finding_id         UUID NOT NULL REFERENCES research.finding(finding_id),
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    UNIQUE (fingerprint_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fingerprint_hash ON research.fingerprint (fingerprint_hash);
+CREATE INDEX IF NOT EXISTS idx_fingerprint_code ON research.fingerprint (finding_code);
+
+COMMENT ON TABLE research.fingerprint
+    IS 'Finding fingerprints for deduplication (migration 035)';
+
+-- ============================================================
+-- 7. Triggers
+-- ============================================================
+
+-- 7a. updated_at auto-touch for finding, hypothesis, experiment
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_finding_updated_at'
+    ) THEN
+        CREATE TRIGGER trg_finding_updated_at
+            BEFORE UPDATE ON research.finding
+            FOR EACH ROW
+            EXECUTE FUNCTION analytics.fn_set_updated_at();
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_hypothesis_updated_at'
+    ) THEN
+        CREATE TRIGGER trg_hypothesis_updated_at
+            BEFORE UPDATE ON research.hypothesis
+            FOR EACH ROW
+            EXECUTE FUNCTION analytics.fn_set_updated_at();
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_experiment_updated_at'
+    ) THEN
+        CREATE TRIGGER trg_experiment_updated_at
+            BEFORE UPDATE ON research.experiment
+            FOR EACH ROW
+            EXECUTE FUNCTION analytics.fn_set_updated_at();
+    END IF;
+END
+$$;
+
+-- 7b. Immutability guard on transition_history (block UPDATE/DELETE)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_transition_history_immutability'
+    ) THEN
+        CREATE TRIGGER trg_transition_history_immutability
+            BEFORE UPDATE OR DELETE ON research.transition_history
+            FOR EACH ROW
+            EXECUTE FUNCTION analytics.fn_block_mutation();
+    END IF;
+END
+$$;
