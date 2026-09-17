@@ -64,5 +64,19 @@
     "stop_loss_atr": 1.5,
     "stop_reference": "initial_entry",
     "max_dca_count": 1
+  },
+  "execution_policies": {
+    "MOMENTUM_EXHAUSTION": {
+      "SHORT": {
+        "policy": "FIXED_HORIZON_V1",
+        "enabled": false,
+        "hold_minutes": 240,
+        "dca_enabled": false,
+        "trailing_enabled": false,
+        "breakeven_enabled": false,
+        "tp_enabled": false,
+        "expiry_enabled": false
+      }
+    }
   }
 }
