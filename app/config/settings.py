@@ -37,6 +37,19 @@ class DCASettings:
 
 
 @dataclass(frozen=True)
+class ExecutionPolicyConfig:
+    """Scanner-direction-specific execution policy configuration."""
+    policy: str = "DEFAULT"
+    enabled: bool = False
+    hold_minutes: int = 240
+    dca_enabled: bool = False
+    trailing_enabled: bool = False
+    breakeven_enabled: bool = False
+    tp_enabled: bool = False
+    expiry_enabled: bool = False
+
+
+@dataclass(frozen=True)
 class Settings:
     # --- PostgreSQL database configuration ---
     db_host: str = "localhost"
@@ -165,8 +178,24 @@ class Settings:
     position_monitor_interval: int = 10
     # DCA Breakeven configuration
     dca: DCASettings = field(default_factory=DCASettings)
-    
-    # Analytics pipeline configuration
+    # Scanner-direction-specific execution policies.
+    # Key structure: { scanner_name: { direction: policy_config } }
+    # Example:
+    #   "MOMENTUM_EXHAUSTION": {
+    #       "SHORT": {
+    #           "policy": "FIXED_HORIZON_V1",
+    #           "hold_minutes": 240,
+    #           "dca_enabled": false,
+    #           "trailing_enabled": false,
+    #           "breakeven_enabled": false,
+    #           "tp_enabled": false,
+    #           "expiry_enabled": false
+    #       }
+    #   }
+    # Missing scanner/direction = DEFAULT existing behavior.
+    execution_policies: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
+    # Parsed execution policy configs (scanner_name → direction → ExecutionPolicyConfig)
+    execution_policy_configs: dict[str, dict[str, ExecutionPolicyConfig]] = field(default_factory=dict, repr=False)
     analytics_schedule_time: str = "06:00"
     analytics_timezone: str = "Europe/Sofia"
     analytics_post_exit_hours: int = 4
@@ -198,6 +227,39 @@ _last_dca_source: str = "config"
 def get_dca_source() -> str:
     """Return the source of the DCA enabled flag from the last load_settings call."""
     return _last_dca_source
+
+
+def _load_execution_policies(settings: Settings, raw: dict) -> None:
+    """Parse execution_policies from config into typed ExecutionPolicyConfig objects."""
+    raw_policies = raw.get("execution_policies", {})
+    if not raw_policies or not isinstance(raw_policies, dict):
+        return
+    parsed: dict[str, dict[str, ExecutionPolicyConfig]] = {}
+    for scanner_name, directions in raw_policies.items():
+        if not isinstance(directions, dict):
+            continue
+        parsed[scanner_name] = {}
+        for direction, policy_raw in directions.items():
+            if not isinstance(policy_raw, dict):
+                continue
+            policy_config = ExecutionPolicyConfig(
+                policy=policy_raw.get("policy", "DEFAULT"),
+                enabled=policy_raw.get("enabled", False),
+                hold_minutes=policy_raw.get("hold_minutes", 240),
+                dca_enabled=policy_raw.get("dca_enabled", False),
+                trailing_enabled=policy_raw.get("trailing_enabled", False),
+                breakeven_enabled=policy_raw.get("breakeven_enabled", False),
+                tp_enabled=policy_raw.get("tp_enabled", False),
+                expiry_enabled=policy_raw.get("expiry_enabled", False),
+            )
+            if policy_config.hold_minutes <= 0:
+                raise ValueError(
+                    f"execution_policies.{scanner_name}.{direction}.hold_minutes "
+                    f"must be positive, got {policy_config.hold_minutes}"
+                )
+            parsed[scanner_name][direction] = policy_config
+    # Use object.__setattr__ because Settings is a frozen dataclass
+    object.__setattr__(settings, "execution_policy_configs", parsed)
 
 
 def _parse_bool_env(value: str, env_name: str) -> bool:
@@ -298,6 +360,8 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
     # Used by paper_runner for startup logging.
     global _last_dca_source
     _last_dca_source = dca_source
+    # Load execution policies from config
+    _load_execution_policies(settings, raw)
     if settings.category != "linear":
         raise ValueError("Price/OI strategy requires category=linear")
     if settings.trading_mode not in {"paper", "live"}:

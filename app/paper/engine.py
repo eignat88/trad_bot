@@ -82,6 +82,10 @@ class PaperTradeRecord:
     # DCA Breakeven fields
     dca_enabled: bool = False
     dca_state: DCAPositionState | None = None
+    # Execution policy fields (scanner-direction-specific)
+    execution_policy: str = "DEFAULT"
+    execution_policy_version: str = ""
+    planned_exit_at: datetime | None = None
 
     @property
     def is_dca_active(self) -> bool:
@@ -389,6 +393,22 @@ class PaperTradingEngine:
                 continue
 
             now = self._clock()
+
+            # Resolve execution policy for this scanner/direction
+            exec_policy = self.settings.execution_policy_configs.get(
+                c.scanner_name, {}
+            ).get(c.direction)
+
+            # Set planned_exit_at if FIXED_HORIZON policy
+            planned_exit = None
+            policy_id = "DEFAULT"
+            policy_version = ""
+            if exec_policy is not None and exec_policy.enabled and exec_policy.policy == "FIXED_HORIZON_V1":
+                from datetime import timedelta
+                planned_exit = now + timedelta(minutes=exec_policy.hold_minutes)
+                policy_id = "FIXED_HORIZON_V1"
+                policy_version = f"hold={exec_policy.hold_minutes}m"
+
             trade = PaperTradeRecord(
                 trade_id=None,
                 setup_id=str(c.setup_id),
@@ -412,6 +432,9 @@ class PaperTradingEngine:
                 slippage_cost=round(entry_slippage_cost, 6),
                 highest_since_entry=price,
                 lowest_since_entry=price,
+                execution_policy=policy_id,
+                execution_policy_version=policy_version,
+                planned_exit_at=planned_exit,
             )
 
             # Do not re-execute a setup after runner restart or a terminal exit.
@@ -544,8 +567,20 @@ class PaperTradingEngine:
 
             result = None
 
+            # Determine if this trade uses a fixed-horizon execution policy
+            is_fixed_horizon = (
+                trade.execution_policy != "DEFAULT"
+                and self.settings.execution_policy_configs
+            )
+            policy_config = None
+            if is_fixed_horizon:
+                policy_config = self.settings.execution_policy_configs.get(
+                    trade.scanner_name, {}
+                ).get(trade.direction)
+
             # 1. Stop loss check (uses DCA stop if DCA is active)
-            active_stop = trade.effective_stop_price
+            # FIXED_HORIZON: stop always uses original stop_price (never widened)
+            active_stop = trade.stop_price if is_fixed_horizon else trade.effective_stop_price
             if is_long and price <= active_stop:
                 gap = price < active_stop
                 # Stop-market simulation: when the stop level is breached,
@@ -591,8 +626,24 @@ class PaperTradingEngine:
                         self._stop_gap_execution_metrics(trade, price, result.net_pnl),
                     )
 
-            # 2. DCA fill check (only if DCA is active and price reached DCA level)
-            if result is None and trade.is_dca_active:
+            # 2. FIXED_HORIZON time exit (highest priority after stop)
+            if result is None and is_fixed_horizon and trade.planned_exit_at is not None:
+                if self._clock() >= trade.planned_exit_at:
+                    slip = self.settings.slippage_percent
+                    exit_price = price * (1 + slip)  # SHORT exit: buy at ask
+                    result = self._close_trade(trade, exit_price, "FIXED_HORIZON")
+                    logger.info(
+                        "FIXED_HORIZON exit: %s %s trade_id=%s "
+                        "entered_at=%s planned_exit_at=%s hold_min=%.1f",
+                        trade.symbol, trade.direction, trade.trade_id,
+                        trade.entered_at.isoformat(),
+                        trade.planned_exit_at.isoformat(),
+                        (self._clock() - trade.entered_at).total_seconds() / 60,
+                    )
+
+            # 3. DCA fill check (only if DCA is active and price reached DCA level)
+            # FIXED_HORIZON: skip DCA if policy disables it
+            if result is None and trade.is_dca_active and not is_fixed_horizon:
                 if DCAStateManager.check_dca_level(trade.dca_state, price, trade.direction):
                     # Conservative: if SL could also have been touched in this
                     # candle, the SL check above already took priority.
@@ -631,32 +682,32 @@ class PaperTradingEngine:
                         # Deactivate original TP — breakeven TP now active
                         trade.target_1 = None  # scanner TP no longer active
 
-            # 3. Breakeven TP check (after DCA fill)
-            if result is None and trade.dca_enabled and trade.dca_state is not None:
+            # 3. Breakeven TP check (after DCA fill) — skip for FIXED_HORIZON
+            if result is None and trade.dca_enabled and trade.dca_state is not None and not is_fixed_horizon:
                 if DCAStateManager.check_breakeven_tp(trade.dca_state, price, trade.direction):
                     avg_entry = trade.dca_state.avg_entry_price
                     result = self._close_trade(trade, avg_entry, "DCA_BREAKEVEN")
 
-            # 4. Take profit 1 check (only for non-DCA or pre-DCA positions)
-            if result is None and trade.target_1 is not None:
+            # 4. Take profit 1 check — skip for FIXED_HORIZON
+            if result is None and trade.target_1 is not None and not is_fixed_horizon:
                 if is_long and price >= trade.target_1:
                     result = self._close_trade(trade, trade.target_1, "TAKE_PROFIT_1")
                 elif not is_long and price <= trade.target_1:
                     result = self._close_trade(trade, trade.target_1, "TAKE_PROFIT_1")
 
-            # 5. Take profit 2 check
-            if result is None and trade.target_2 is not None:
+            # 5. Take profit 2 check — skip for FIXED_HORIZON
+            if result is None and trade.target_2 is not None and not is_fixed_horizon:
                 if is_long and price >= trade.target_2:
                     result = self._close_trade(trade, trade.target_2, "TAKE_PROFIT_2")
                 elif not is_long and price <= trade.target_2:
                     result = self._close_trade(trade, trade.target_2, "TAKE_PROFIT_2")
 
-            # 6. Trailing stop logic (only for non-DCA or pre-DCA positions)
-            if result is None and not (trade.dca_enabled and trade.dca_state is not None and trade.dca_state.state == DCAState.DCA_FILLED):
+            # 6. Trailing stop logic — skip for FIXED_HORIZON
+            if result is None and not is_fixed_horizon and not (trade.dca_enabled and trade.dca_state is not None and trade.dca_state.state == DCAState.DCA_FILLED):
                 result = self._check_trailing_stop(trade, price)
 
-            # 7. Timeout check (setup expired)
-            if result is None and self._is_expired(trade):
+            # 7. Timeout check (setup expired) — skip for FIXED_HORIZON (uses planned_exit_at)
+            if result is None and not is_fixed_horizon and self._is_expired(trade):
                 gross = self._unrealized_gross(trade, price)
                 reason = "EXPIRED_PROFITABLE" if gross > 0 else "EXPIRED"
                 result = self._close_trade(trade, price, reason)

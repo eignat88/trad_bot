@@ -585,7 +585,7 @@ CREATE TABLE IF NOT EXISTS dds.paper_trade (
             'TAKE_PROFIT_1', 'TAKE_PROFIT_2', 'TAKE_PROFIT_SLIPPAGE',
             'STOP_LOSS', 'STOP_LOSS_GAP', 'TRAILING_STOP',
             'EXPIRED', 'EXPIRED_PROFITABLE', 'TIMEOUT', 'MANUAL', 'RISK_LIMIT',
-            'DCA_BREAKEVEN', 'DCA_STOP'
+            'DCA_BREAKEVEN', 'DCA_STOP', 'FIXED_HORIZON'
         )
     )
 );
@@ -611,7 +611,7 @@ ALTER TABLE dds.paper_trade ADD CONSTRAINT paper_trade_exit_reason_chk CHECK (
         'TAKE_PROFIT_1', 'TAKE_PROFIT_2', 'TAKE_PROFIT_SLIPPAGE',
         'STOP_LOSS', 'STOP_LOSS_GAP', 'TRAILING_STOP',
         'EXPIRED', 'EXPIRED_PROFITABLE', 'TIMEOUT', 'MANUAL', 'RISK_LIMIT',
-        'DCA_BREAKEVEN', 'DCA_STOP'
+        'DCA_BREAKEVEN', 'DCA_STOP', 'FIXED_HORIZON'
     )
 );
 
