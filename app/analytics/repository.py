@@ -299,7 +299,7 @@ class AnalyticsRepository:
             cursor = self._conn.cursor()
             cursor.execute(
                 "SELECT * FROM analytics.data_quality_result WHERE run_id = %s",
-                (str(run_id),),
+                (str(run_id) if not isinstance(run_id, str) else run_id,),
             )
             rows = cursor.fetchall()
             return [self._row_to_quality_result(row) for row in rows]
@@ -598,9 +598,14 @@ class AnalyticsRepository:
 
     def _row_to_quality_result(self, row: tuple) -> DataQualityResult:
         """Convert a database row to DataQualityResult."""
+        run_id_raw = row[1]
+        if isinstance(run_id_raw, str):
+            run_id_raw = UUID(run_id_raw)
+        # else: already a UUID from pg8000
+        
         return DataQualityResult(
             quality_result_id=row[0],
-            run_id=UUID(row[1]),
+            run_id=run_id_raw,
             stage_name=row[2],
             check_name=row[3],
             scope_type=row[4],
