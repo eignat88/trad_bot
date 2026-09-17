@@ -689,12 +689,14 @@ class AnalyticsRunner:
 
         # Build orchestrator dependencies
         repo = self._repo
+        from app.analytics.agents.data_repository import SpecialistDataRepository
+        data_repo = SpecialistDataRepository(self._repo._conn)
         specialist_registry = SPECIALIST_REGISTRY
 
         orchestrator = AgentOrchestrator(
             repository=repo,
             executor=None,  # Executor is created per-agent inside orchestrator
-            data_repo=repo,
+            data_repo=data_repo,
             specialist_registry=specialist_registry,
         )
 
