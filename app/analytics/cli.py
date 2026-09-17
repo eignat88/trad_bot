@@ -210,6 +210,14 @@ def main():
         password=settings.db_password,
     )
     
+    # Ensure analytics schema is in search_path for the role
+    try:
+        cur = conn.cursor()
+        cur.execute("SET search_path TO analytics, public")
+        conn.commit()
+    except Exception:
+        pass  # Non-critical — ALTER ROLE may have set it already
+    
     from app.analytics.repository import AnalyticsRepository
     from app.analytics.candle_sync import CandleSync
     from app.analytics.quality import DataQualityGate
