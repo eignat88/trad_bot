@@ -208,8 +208,11 @@ def main():
         database=settings.db_name,
         user=settings.db_user,
         password=settings.db_password,
-        search_path="analytics, public",
     )
+    
+    # Set search_path for the session so all analytics queries resolve
+    cur = conn.cursor()
+    cur.execute("SET search_path TO analytics, public")
     
     from app.analytics.repository import AnalyticsRepository
     from app.analytics.candle_sync import CandleSync
