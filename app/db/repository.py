@@ -1279,10 +1279,11 @@ class ScannerRepository:
                     setup_id, symbol, scanner_name, direction, score,
                     entry_price, entry_fee, stop_price, target_1, target_2,
                     entry_timeframe, position_size, risk_usdt, balance_before, market_regime,
-                    entry_market_price, slippage, status, entered_at
+                    entry_market_price, slippage, status, entered_at,
+                    execution_policy, planned_exit_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, 'OPEN', %s
+                    %s, %s, 'OPEN', %s, %s, %s
                 ) RETURNING trade_id
                 """,
                 (
@@ -1292,6 +1293,8 @@ class ScannerRepository:
                     trade.target_2, trade.entry_timeframe, trade.position_size,
                     trade.risk_usdt, trade.balance_before, trade.market_regime,
                     trade.entry_market_price, trade.entry_slippage_cost, trade.entered_at,
+                    getattr(trade, 'execution_policy', 'DEFAULT'),
+                    getattr(trade, 'planned_exit_at', None),
                 ),
             )
             row = cursor.fetchone()
