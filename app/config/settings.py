@@ -195,7 +195,7 @@ class Settings:
     # Missing scanner/direction = DEFAULT existing behavior.
     execution_policies: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
     # Parsed execution policy configs (scanner_name → direction → ExecutionPolicyConfig)
-    execution_policy_configs: dict[str, dict[str, ExecutionPolicyConfig]] = field(default_factory=dict)
+    execution_policy_configs: dict[str, dict[str, ExecutionPolicyConfig]] = field(default_factory=dict, repr=False)
     analytics_schedule_time: str = "06:00"
     analytics_timezone: str = "Europe/Sofia"
     analytics_post_exit_hours: int = 4
@@ -258,7 +258,8 @@ def _load_execution_policies(settings: Settings, raw: dict) -> None:
                     f"must be positive, got {policy_config.hold_minutes}"
                 )
             parsed[scanner_name][direction] = policy_config
-    settings.execution_policy_configs = parsed
+    # Use object.__setattr__ because Settings is a frozen dataclass
+    object.__setattr__(settings, "execution_policy_configs", parsed)
 
 
 def _parse_bool_env(value: str, env_name: str) -> bool:
