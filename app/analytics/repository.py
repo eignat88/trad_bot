@@ -612,12 +612,12 @@ class AnalyticsRepository:
             scope_id=row[5],
             severity=Severity(row[6]),
             status=QualityCheckStatus(row[7]),
-            expected_value=json.loads(row[8]) if row[8] else None,
-            actual_value=json.loads(row[9]) if row[9] else None,
+            expected_value=row[8] if isinstance(row[8], (dict, list)) else (json.loads(row[8]) if row[8] else None),
+            actual_value=row[9] if isinstance(row[9], (dict, list)) else (json.loads(row[9]) if row[9] else None),
             affected_entity_count=row[10],
-            affected_entity_ids=json.loads(row[11]) if row[11] else None,
+            affected_entity_ids=row[11] if isinstance(row[11], (dict, list)) else (json.loads(row[11]) if row[11] else None),
             checked_at=row[12],
-            details=json.loads(row[13]) if row[13] else None,
+            details=row[13] if isinstance(row[13], (dict, list)) else (json.loads(row[13]) if row[13] else None),
         )
 
     # ============================================================
