@@ -177,11 +177,17 @@ class AgentOrchestrator:
         publication = self._repo.get_dataset_publication(analysis_run_id, maturity)
         quality_results = self._repo.get_quality_results(analysis_run_id)
 
-        # Derive from DB
-        dataset_version = publication.dataset_version if publication else None
-        publication_status = publication.status if publication else None
-        quality_status = publication.quality_status if publication else None
-        canonical_build_json = publication.canonical_build_json if publication else None
+        # Extract from publication dict (DB returns dict, not object)
+        if publication:
+            dataset_version = publication.get("dataset_version")
+            publication_status = publication.get("status")
+            quality_status_from_pub = publication.get("quality_status")
+            canonical_build_json = publication.get("canonical_build_json")
+        else:
+            dataset_version = None
+            publication_status = None
+            quality_status_from_pub = None
+            canonical_build_json = None
         quality_limitations = []
         if quality_results:
             for qr in quality_results:
@@ -195,20 +201,22 @@ class AgentOrchestrator:
         )
 
         # ── Step 1: Data Readiness Gate ───────────────────────────────
-        # Extract status as string for readiness gate
+        # When called from runner (before run.status=SUCCEEDED), treat
+        # RUNNING as acceptable — canonical data is already READY.
         run_status_str = (
             run.status.value
             if hasattr(run.status, "value")
             else str(run.status)
         )
+        effective_status = "SUCCEEDED" if run_status_str == "RUNNING" else run_status_str
         
         readiness = self._readiness.evaluate(
             run_id=analysis_run_id,
-            status=run_status_str,
+            status=effective_status,
             maturity=maturity,
             dataset_version=dataset_version,
             publication_status=publication_status,
-            quality_status=quality_status,
+            quality_status=quality_status_from_pub,
             canonical_build_json=canonical_build_json,
             analysis_window_from=run.analysis_from,
             analysis_window_to=run.analysis_to,
@@ -472,9 +480,10 @@ class AgentOrchestrator:
         final_result = None
         repairs_attempted = 0
 
-        for attempt in range(1, policy.max_attempts + 1):
+        for _ in range(policy.max_attempts):
             # Each attempt = new agent_run
-            agent_run = self._create_new_attempt(analysis_run_id, agent_name, attempt)
+            attempt_num = self._repo.get_next_attempt(analysis_run_id, agent_name)
+            agent_run = self._create_new_attempt(analysis_run_id, agent_name, attempt_num)
             manifest = self._build_manifest(
                 agent_run_id=agent_run.agent_run_id,
                 dataset_version=dataset_version,
@@ -511,7 +520,8 @@ class AgentOrchestrator:
             if policy.should_repair(error_code, repairs_attempted):
                 repairs_attempted += 1
                 # Repair is a SEPARATE attempt with SAME manifest
-                repair_run = self._create_new_attempt(analysis_run_id, agent_name, attempt + 1)
+                repair_attempt_num = self._repo.get_next_attempt(analysis_run_id, agent_name)
+                repair_run = self._create_new_attempt(analysis_run_id, agent_name, repair_attempt_num)
                 repair_manifest = self._build_manifest(
                     agent_run_id=repair_run.agent_run_id,
                     dataset_version=dataset_version,
@@ -540,8 +550,8 @@ class AgentOrchestrator:
                 break  # Only one repair attempt
 
             # Retryable → create next attempt
-            if policy.should_retry(error_code, attempt):
-                delay = policy.delay_for_attempt(attempt)
+            if policy.should_retry(error_code, attempt_num):
+                delay = policy.delay_for_attempt(attempt_num)
                 await asyncio.sleep(delay)
                 # Mark current as FAILED
                 self._finalize_attempt(agent_run.agent_run_id, result)
@@ -626,9 +636,14 @@ class AgentOrchestrator:
         agent_run_id: UUID,
         execution_result: AgentExecutionResult,
     ) -> None:
-        """Atomically persist result + terminal status in single transaction."""
+        """Atomically persist result + terminal status with error sanitization."""
+        from app.analytics.security.redaction import sanitize
+
         if execution_result.result:
             self._repo.create_agent_result(execution_result.result)
+
+        # Sanitize error_message (defense-in-depth)
+        sanitized_message = sanitize(execution_result.error_message) if execution_result.error_message else None
 
         self._repo.update_agent_run_status(
             agent_run_id,
@@ -659,7 +674,7 @@ class AgentOrchestrator:
                 if execution_result.error_code
                 else None
             ),
-            error_message=execution_result.error_message,
+            error_message=sanitized_message,
         )
 
     # ── Manifest builder (Fix #8) ────────────────────────────────────

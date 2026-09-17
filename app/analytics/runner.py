@@ -580,23 +580,38 @@ class AnalyticsRunner:
         dataset_version = compute_dataset_version(**manifest)
 
         # Create publication with status=BUILDING
-        publication_id = self._repo.create_dataset_publication(
-            analysis_run_id=run.run_id,
-            dataset_version=dataset_version,
-            maturity=run.maturity.value,
-            quality_status=quality_status,
-            analysis_window_from=run.analysis_from,
-            analysis_window_to=run.analysis_to,
-            observation_cutoff=run.observation_cutoff,
-            canonical_build_json={
-                "trade_fact_built": True,
-                "setup_fact_built": True,
-                "events_built": True,
-            },
-            quality_summary_json={
-                "quality_status": quality_status,
-            },
-        )
+        # Check if publication already exists (idempotent)
+        existing_pub = self._repo.get_dataset_publication(run.run_id, run.maturity.value)
+        
+        canonical_build_json = {
+            "trade_fact_built": True,
+            "setup_fact_built": True,
+            "events_built": True,
+        }
+        quality_summary_json = {"quality_status": quality_status}
+        
+        if existing_pub:
+            # Update existing publication
+            publication_id = existing_pub.get("publication_id")
+            self._repo.update_dataset_publication_status(
+                publication_id,
+                status="BUILDING",
+                quality_status=quality_status,
+                canonical_build_json=canonical_build_json,
+                quality_summary_json=quality_summary_json,
+            )
+        else:
+            publication_id = self._repo.create_dataset_publication(
+                analysis_run_id=run.run_id,
+                dataset_version=dataset_version,
+                maturity=run.maturity.value,
+                quality_status=quality_status,
+                analysis_window_from=run.analysis_from,
+                analysis_window_to=run.analysis_to,
+                observation_cutoff=run.observation_cutoff,
+                canonical_build_json=canonical_build_json,
+                quality_summary_json=quality_summary_json,
+            )
 
         # Final validation: verify canonical objects exist
         cursor = self._repo._conn.cursor()
@@ -674,12 +689,38 @@ class AnalyticsRunner:
 
         # Build orchestrator dependencies
         repo = self._repo
+        from app.analytics.agents.data_repository import SpecialistDataRepository
+        data_repo = SpecialistDataRepository(self._repo._conn)
         specialist_registry = SPECIALIST_REGISTRY
+
+        # Create executor with real LLM provider
+        from app.config.analytics_settings import load_llm_settings
+        from app.analytics.agents.llm_provider import OpenAICompatibleClient
+
+        llm_settings = load_llm_settings()
+
+        if not llm_settings.api_key or not llm_settings.api_key.strip():
+            logger.warning("LLM_API_KEY not configured — Stage3 agents will fail")
+            # Still create executor so the pipeline structure is tested.
+            # The model check in executor.execute() will reject execution.
+
+        model_client = OpenAICompatibleClient(
+            api_key=llm_settings.api_key or "missing",
+            base_url=llm_settings.base_url,
+            temperature=llm_settings.temperature,
+            max_output_tokens=llm_settings.max_output_tokens,
+            request_timeout_s=llm_settings.request_timeout_s,
+        )
+
+        executor = AgentExecutor(
+            model_client=model_client,
+            prompt_builder=lambda defn, manifest: {"system_prompt": "", "input_json": {}},
+        )
 
         orchestrator = AgentOrchestrator(
             repository=repo,
-            executor=None,  # Executor is created per-agent inside orchestrator
-            data_repo=repo,
+            executor=executor,
+            data_repo=data_repo,
             specialist_registry=specialist_registry,
         )
 
@@ -1005,7 +1046,7 @@ class AnalyticsRunner:
                 "quality_gate(%s) returned NULL/empty".format(str(run.run_id))
             )
 
-        passed, blocking_count, degraded_count, total_checks = row
+        passed, blocking_count, degraded_count, warning_count, total_checks = row
         self._repo._conn.commit()
 
         # Determine quality status

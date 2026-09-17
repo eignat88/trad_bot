@@ -210,6 +210,10 @@ def main():
         password=settings.db_password,
     )
     
+    # Set search_path for the session so all analytics queries resolve
+    cur = conn.cursor()
+    cur.execute("SET search_path TO analytics, public")
+    
     from app.analytics.repository import AnalyticsRepository
     from app.analytics.candle_sync import CandleSync
     from app.analytics.quality import DataQualityGate

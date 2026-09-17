@@ -299,7 +299,7 @@ class AnalyticsRepository:
             cursor = self._conn.cursor()
             cursor.execute(
                 "SELECT * FROM analytics.data_quality_result WHERE run_id = %s",
-                (str(run_id),),
+                (str(run_id) if not isinstance(run_id, str) else run_id,),
             )
             rows = cursor.fetchall()
             return [self._row_to_quality_result(row) for row in rows]
@@ -598,21 +598,26 @@ class AnalyticsRepository:
 
     def _row_to_quality_result(self, row: tuple) -> DataQualityResult:
         """Convert a database row to DataQualityResult."""
+        run_id_raw = row[1]
+        if isinstance(run_id_raw, str):
+            run_id_raw = UUID(run_id_raw)
+        # else: already a UUID from pg8000
+        
         return DataQualityResult(
             quality_result_id=row[0],
-            run_id=UUID(row[1]),
+            run_id=run_id_raw,
             stage_name=row[2],
             check_name=row[3],
             scope_type=row[4],
             scope_id=row[5],
             severity=Severity(row[6]),
-            status=StageStatus(row[7]),
-            expected_value=json.loads(row[8]) if row[8] else None,
-            actual_value=json.loads(row[9]) if row[9] else None,
+            status=QualityCheckStatus(row[7]),
+            expected_value=row[8] if isinstance(row[8], (dict, list)) else (json.loads(row[8]) if row[8] else None),
+            actual_value=row[9] if isinstance(row[9], (dict, list)) else (json.loads(row[9]) if row[9] else None),
             affected_entity_count=row[10],
-            affected_entity_ids=json.loads(row[11]) if row[11] else None,
+            affected_entity_ids=row[11] if isinstance(row[11], (dict, list)) else (json.loads(row[11]) if row[11] else None),
             checked_at=row[12],
-            details=json.loads(row[13]) if row[13] else None,
+            details=row[13] if isinstance(row[13], (dict, list)) else (json.loads(row[13]) if row[13] else None),
         )
 
     # ============================================================
@@ -936,7 +941,13 @@ class AnalyticsRepository:
     # ============================================================
 
     def create_input_manifest(self, manifest: AgentInputManifest) -> AgentInputManifest:
-        """Create an immutable input manifest."""
+        """Create an immutable input manifest. Rejects if manifest contains secrets."""
+        from app.analytics.security.redaction import contains_secret_in_object
+        if contains_secret_in_object(manifest.manifest_json):
+            raise ValueError(
+                "SECURITY_POLICY_ERROR: manifest_json contains detected secret — "
+                "immutable artifacts must not store secrets"
+            )
         try:
             cursor = self._conn.cursor()
             cursor.execute(
@@ -1030,7 +1041,13 @@ class AnalyticsRepository:
     # ============================================================
 
     def create_agent_result(self, result: AgentResult) -> AgentResult:
-        """Create an immutable agent result."""
+        """Create an immutable agent result. Rejects if result contains secrets."""
+        from app.analytics.security.redaction import contains_secret_in_object
+        if contains_secret_in_object(result.result_json):
+            raise ValueError(
+                "SECURITY_POLICY_ERROR: result_json contains detected secret — "
+                "immutable artifacts must not store secrets"
+            )
         try:
             cursor = self._conn.cursor()
             cursor.execute(

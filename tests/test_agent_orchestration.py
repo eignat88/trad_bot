@@ -80,14 +80,16 @@ def _make_analysis_run(status="SUCCEEDED", maturity="FINAL"):
 
 
 def _make_publication(**overrides):
-    pub = MagicMock()
-    pub.dataset_version = overrides.get("dataset_version", "v1")
-    pub.status = overrides.get("pub_status", "READY")
-    pub.quality_status = overrides.get("quality_status", "PASS")
-    pub.canonical_build_json = overrides.get("canonical_build_json", {
-        "trade_fact_built": True, "setup_fact_built": True,
-    })
-    return pub
+    """Returns a dict matching what get_dataset_publication returns from DB."""
+    return {
+        "publication_id": uuid4(),
+        "dataset_version": overrides.get("dataset_version", "v1"),
+        "status": overrides.get("pub_status", "READY"),
+        "quality_status": overrides.get("quality_status", "PASS"),
+        "canonical_build_json": overrides.get("canonical_build_json", {
+            "trade_fact_built": True, "setup_fact_built": True,
+        }),
+    }
 
 
 def _make_repo_mock():

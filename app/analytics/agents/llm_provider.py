@@ -131,7 +131,7 @@ class OpenAICompatibleClient(AgentModelClient):
             elif response.status_code != 200:
                 raise TerminalError(
                     AgentErrorCode.MODEL_PROVIDER_ERROR,
-                    f"HTTP {response.status_code}: {response.text[:200]}",
+                    f"HTTP {response.status_code}: provider request rejected",
                 )
 
             data = response.json()
@@ -145,6 +145,23 @@ class OpenAICompatibleClient(AgentModelClient):
 
             choice = data["choices"][0]
             content = choice.get("message", {}).get("content", "")
+            finish_reason = choice.get("finish_reason", "unknown")
+
+            # ── Tool-call rejection (fail closed — no tool access in Stage 3) ──
+            tool_calls = choice.get("message", {}).get("tool_calls")
+            if tool_calls:
+                raise TerminalError(
+                    AgentErrorCode.SECURITY_POLICY_ERROR,
+                    "Tool/function calls forbidden: Stage 3 agents have no tool access",
+                )
+
+            # Legacy function_call rejection
+            function_call = choice.get("message", {}).get("function_call")
+            if function_call:
+                raise TerminalError(
+                    AgentErrorCode.SECURITY_POLICY_ERROR,
+                    "function_call forbidden: Stage 3 agents have no tool access",
+                )
 
             if not content:
                 raise TerminalError(
