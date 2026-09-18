@@ -380,6 +380,12 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         "bybit_api_secret": os.getenv("BYBIT_API_SECRET", ""),
         "telegram_token": os.getenv("TELEGRAM_TOKEN", ""),
         "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
+        "max_open_positions": int(
+            os.getenv(
+                "MAX_OPEN_POSITIONS",
+                str(raw.get("max_open_positions", 3)),
+            )
+        ),
         "paper_safety_gate_mode": str(os.getenv(
             "PAPER_SAFETY_GATE_MODE", raw.get("paper_safety_gate_mode", "enforce")
         )).strip().lower(),
