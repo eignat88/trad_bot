@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from app.paper.engine import PaperTradingEngine, PaperTradeRecord
+from app.paper.shadow_engine import ShadowPaperEngine
 
 logger = logging.getLogger(__name__)
 
@@ -48,12 +49,14 @@ class PositionMonitor:
         funding_fetcher: Callable[[list[str]], dict[str, float]] | None = None,
         interval_seconds: int = 10,
         clock: Callable[[], datetime] | None = None,
+        shadow_engine: ShadowPaperEngine | None = None,
     ) -> None:
         self.engine = engine
         self._price_fetcher = price_fetcher
         self._funding_fetcher = funding_fetcher
         self._interval = interval_seconds
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._shadow_engine = shadow_engine
 
         # Thread management
         self._thread: threading.Thread | None = None
@@ -131,7 +134,7 @@ class PositionMonitor:
         if self._last_check:
             last_check_age = (now - self._last_check).total_seconds()
 
-        return {
+        result = {
             "status": "RUNNING" if self.is_running else "STOPPED",
             "last_check": self._last_check.isoformat() if self._last_check else None,
             "last_check_age_sec": (
@@ -145,6 +148,10 @@ class PositionMonitor:
             "open_positions": len(self.engine.open_trades),
             "interval_seconds": self._interval,
         }
+        # Shadow engine status
+        if self._shadow_engine is not None:
+            result["shadow_engine"] = self._shadow_engine.snapshot()
+        return result
 
     def run_once(self) -> list[PaperTradeRecord]:
         """Run a single check cycle (for testing or manual invocation)."""
@@ -235,6 +242,14 @@ class PositionMonitor:
             if lock is not None:
                 lock.release()
         # --- RELEASE LOCK ---
+
+        # --- SHADOW ENGINE: check shadow exits ---
+        shadow_closed = []
+        if self._shadow_engine is not None and self._shadow_engine.is_enabled:
+            try:
+                shadow_closed = self._shadow_engine.check_shadow_exits(prices)
+            except Exception:
+                logger.exception("shadow engine: error checking shadow exits")
 
         self._total_closes += len(closed)
         self._last_check = self._clock()

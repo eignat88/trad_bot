@@ -78,5 +78,19 @@
         "expiry_enabled": false
       }
     }
+  },
+  "experimental_scanners": {
+    "ME_SHORT_REVERSE_LONG_V1": {
+      "enabled": false,
+      "mode": "shadow",
+      "source_scanner": "MOMENTUM_EXHAUSTION",
+      "source_direction": "SHORT",
+      "trade_direction": "LONG",
+      "stop_loss_pct": 2.5,
+      "take_profit_pct": 3.0,
+      "dca_enabled": false,
+      "trailing_enabled": false,
+      "breakeven_enabled": false
+    }
   }
 }
