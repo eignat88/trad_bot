@@ -153,6 +153,7 @@ class PaperTradingEngine:
 
         # Restore account/risk state before rebuilding any open positions.
         self._persist_safety_gate_mode()
+        self._log_execution_policies()
         self._load_account_state()
         self._load_open_trades()
         self._load_risk_state()
@@ -171,6 +172,33 @@ class PaperTradingEngine:
         mode = self.settings.paper_safety_gate_mode
         save_mode(mode)
         logger.info("Persisted Paper safety gate runtime mode: %s", mode)
+
+    def _log_execution_policies(self) -> None:
+        """Log effective execution policy configuration at startup.
+
+        Provides runtime visibility into which scanner/direction combos
+        have active policies, preventing silent DEFAULT fallback.
+        """
+        configs = self.settings.execution_policy_configs
+        sources = getattr(self.settings, "_execution_policy_sources", {})
+        if not configs:
+            logger.info("Execution policies: none configured (all trades use DEFAULT)")
+            return
+        for scanner_name, directions in configs.items():
+            for direction, policy in directions.items():
+                source = sources.get((scanner_name, direction), "CONFIG")
+                logger.info(
+                    "Execution policy: scanner=%s direction=%s "
+                    "policy=%s enabled=%s hold_minutes=%d "
+                    "tp_enabled=%s dca=%s trailing=%s breakeven=%s expiry=%s "
+                    "config_source=%s",
+                    scanner_name, direction,
+                    policy.policy, policy.enabled, policy.hold_minutes,
+                    policy.tp_enabled,
+                    policy.dca_enabled, policy.trailing_enabled,
+                    policy.breakeven_enabled, policy.expiry_enabled,
+                    source,
+                )
 
     def portfolio_exposure(self, prices: dict[str, float] | None = None) -> dict[str, float]:
         """Return gross, directional and net exposure as fractions of MTM equity."""
@@ -464,9 +492,15 @@ class PaperTradingEngine:
             opened.append(trade)
 
             logger.info(
-                "paper ENTRY: %s %s %s entry=%.4f stop=%.4f size=%.4f risk=$%.2f",
+                "paper ENTRY: %s %s %s entry=%.4f stop=%.4f "
+                "stop_dist=%.3f%% tp=%.4f size=%.4f risk=$%.2f "
+                "policy=%s planned_exit=%s",
                 c.symbol, c.direction, c.scanner_name,
-                entry, stop, quantity, risk_usdt,
+                entry, stop,
+                abs(entry - stop) / entry * 100 if entry > 0 else 0,
+                c.target_1 or 0, quantity, risk_usdt,
+                policy_id,
+                planned_exit.isoformat() if planned_exit else "none",
             )
 
             # --- DCA Breakeven: create DCA state if enabled ---
