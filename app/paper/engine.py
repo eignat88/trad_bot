@@ -399,14 +399,15 @@ class PaperTradingEngine:
                 c.scanner_name, {}
             ).get(c.direction)
 
-            # Set planned_exit_at if FIXED_HORIZON policy
+            # Set planned_exit_at if FIXED_HORIZON or FIXED_TP_SL_HORIZON policy
             planned_exit = None
             policy_id = "DEFAULT"
             policy_version = ""
-            if exec_policy is not None and exec_policy.enabled and exec_policy.policy == "FIXED_HORIZON_V1":
-                planned_exit = now + timedelta(minutes=exec_policy.hold_minutes)
-                policy_id = "FIXED_HORIZON_V1"
-                policy_version = f"hold={exec_policy.hold_minutes}m"
+            if exec_policy is not None and exec_policy.enabled:
+                if exec_policy.policy in ("FIXED_HORIZON_V1", "FIXED_TP_SL_HORIZON_V1"):
+                    planned_exit = now + timedelta(minutes=exec_policy.hold_minutes)
+                    policy_id = exec_policy.policy
+                    policy_version = f"hold={exec_policy.hold_minutes}m"
 
             trade = PaperTradeRecord(
                 trade_id=None,
@@ -571,6 +572,7 @@ class PaperTradingEngine:
                 trade.execution_policy != "DEFAULT"
                 and self.settings.execution_policy_configs
             )
+            is_fixed_tp_sl_horizon = trade.execution_policy == "FIXED_TP_SL_HORIZON_V1"
             policy_config = None
             if is_fixed_horizon:
                 policy_config = self.settings.execution_policy_configs.get(
@@ -629,7 +631,7 @@ class PaperTradingEngine:
             if result is None and is_fixed_horizon and trade.planned_exit_at is not None:
                 if self._clock() >= trade.planned_exit_at:
                     slip = self.settings.slippage_percent
-                    exit_price = price * (1 + slip)  # SHORT exit: buy at ask
+                    exit_price = price * (1 + slip if trade.direction == "LONG" else 1 - slip)
                     result = self._close_trade(trade, exit_price, "FIXED_HORIZON")
                     logger.info(
                         "FIXED_HORIZON exit: %s %s trade_id=%s "
@@ -687,12 +689,13 @@ class PaperTradingEngine:
                     avg_entry = trade.dca_state.avg_entry_price
                     result = self._close_trade(trade, avg_entry, "DCA_BREAKEVEN")
 
-            # 4. Take profit 1 check — skip for FIXED_HORIZON
-            if result is None and trade.target_1 is not None and not is_fixed_horizon:
-                if is_long and price >= trade.target_1:
-                    result = self._close_trade(trade, trade.target_1, "TAKE_PROFIT_1")
-                elif not is_long and price <= trade.target_1:
-                    result = self._close_trade(trade, trade.target_1, "TAKE_PROFIT_1")
+            # 4. Take profit 1 check — skip for FIXED_HORIZON, allow for FIXED_TP_SL_HORIZON
+            if result is None and trade.target_1 is not None:
+                if is_fixed_tp_sl_horizon or not is_fixed_horizon:
+                    if is_long and price >= trade.target_1:
+                        result = self._close_trade(trade, trade.target_1, "TAKE_PROFIT_1")
+                    elif not is_long and price <= trade.target_1:
+                        result = self._close_trade(trade, trade.target_1, "TAKE_PROFIT_1")
 
             # 5. Take profit 2 check — skip for FIXED_HORIZON
             if result is None and trade.target_2 is not None and not is_fixed_horizon:
@@ -701,11 +704,13 @@ class PaperTradingEngine:
                 elif not is_long and price <= trade.target_2:
                     result = self._close_trade(trade, trade.target_2, "TAKE_PROFIT_2")
 
-            # 6. Trailing stop logic — skip for FIXED_HORIZON
-            if result is None and not is_fixed_horizon and not (trade.dca_enabled and trade.dca_state is not None and trade.dca_state.state == DCAState.DCA_FILLED):
-                result = self._check_trailing_stop(trade, price)
+            # 6. Trailing stop logic — skip for FIXED_HORIZON, allow for FIXED_TP_SL_HORIZON
+            if result is None:
+                if is_fixed_tp_sl_horizon or not is_fixed_horizon:
+                    if not (trade.dca_enabled and trade.dca_state is not None and trade.dca_state.state == DCAState.DCA_FILLED):
+                        result = self._check_trailing_stop(trade, price)
 
-            # 7. Timeout check (setup expired) — skip for FIXED_HORIZON (uses planned_exit_at)
+            # 7. Timeout check (setup expired) — skip for FIXED_HORIZON and FIXED_TP_SL_HORIZON (uses planned_exit_at)
             if result is None and not is_fixed_horizon and self._is_expired(trade):
                 gross = self._unrealized_gross(trade, price)
                 reason = "EXPIRED_PROFITABLE" if gross > 0 else "EXPIRED"

@@ -19,7 +19,9 @@ EXPECTED_BLOCKED_COMBINATIONS = frozenset({
     ("BREAKOUT_RETEST", "LONG"),
     ("BREAKOUT_RETEST", "SHORT"),
     ("MOMENTUM_EXHAUSTION", "LONG"),
+    ("MOMENTUM_EXHAUSTION", "SHORT"),  # Blocked for reverse long experiment
     ("TREND_PULLBACK_V2", "SHORT"),
+    ("MOMENTUM_EXHAUSTION_REVERSE_LONG_V1", "SHORT"),  # Reverse long only trades LONG
 })
 
 
