@@ -404,7 +404,6 @@ class PaperTradingEngine:
             policy_id = "DEFAULT"
             policy_version = ""
             if exec_policy is not None and exec_policy.enabled and exec_policy.policy == "FIXED_HORIZON_V1":
-                from datetime import timedelta
                 planned_exit = now + timedelta(minutes=exec_policy.hold_minutes)
                 policy_id = "FIXED_HORIZON_V1"
                 policy_version = f"hold={exec_policy.hold_minutes}m"

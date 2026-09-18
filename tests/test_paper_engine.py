@@ -752,3 +752,111 @@ def test_cooldown_not_extended_on_each_cycle():
     for _ in range(5):
         engine.check_entries([_make_loss_candidate()], {"BTCUSDT": 100.0})
         assert engine._cooldown_until == original_until
+
+
+# ===================================================================
+# REGRESSION: UnboundLocalError for timedelta in check_entries
+#
+# When execution_policies configures FIXED_HORIZON_V1 for a scanner,
+# an inner `from datetime import timedelta` inside check_entries()
+# shadows the module-level import.  If the cooldown risk-gate branch
+# executes in the same call, Python sees `timedelta` as a local that
+# hasn't been assigned yet → UnboundLocalError.
+#
+# Root cause: redundant inner import on the FIXED_HORIZON_V1 path.
+# Fix: remove the inner import; the module-level import is sufficient.
+# ===================================================================
+
+def _me_short_candidate() -> SetupCandidate:
+    """ME SHORT candidate for fixed-horizon regression test."""
+    return _candidate(
+        scanner_name="MOMENTUM_EXHAUSTION",
+        direction="SHORT",
+        entry_zone_low=99.0,
+        entry_zone_high=101.0,
+        invalidation_price=102.0,
+        target_1=95.0,
+    )
+
+
+def test_cooldown_with_fixed_horizon_no_unbound_local():
+    """REGRESSION: cooldown activation must not raise UnboundLocalError
+    when FIXED_HORIZON_V1 execution policy is configured.
+
+    Before the fix, an inner `from datetime import timedelta` on the
+    FIXED_HORIZON_V1 path shadowed the module-level import.  Python's
+    compiler marks `timedelta` as a local for the ENTIRE function when
+    any `from ... import timedelta` appears in it.  The cooldown branch
+    (line ~287) then tries to use `timedelta` as a local before it has
+    been assigned → UnboundLocalError.
+
+    This happens when:
+    1. FIXED_HORIZON_V1 is configured for the candidate's scanner/direction
+    2. _consecutive_losses >= max AND _cooldown_until is None
+    → cooldown branch fires first, uses `timedelta`, but it's unbound
+    """
+    from app.config.settings import ExecutionPolicyConfig
+
+    # consecutive_losses at max, cooldown_until not yet set
+    repo = FakeCooldownRepository(
+        risk_state={"daily_loss_usdt": 0.0, "consecutive_losses": 4, "cooldown_until": None}
+    )
+    settings = _cooldown_settings(
+        max_consecutive_losses=4,
+        paper_consecutive_loss_cooldown_minutes=360,
+    )
+    # Configure FIXED_HORIZON_V1 for MOMENTUM_EXHAUSTION SHORT
+    object.__setattr__(settings, "execution_policy_configs", {
+        "MOMENTUM_EXHAUSTION": {
+            "SHORT": ExecutionPolicyConfig(
+                policy="FIXED_HORIZON_V1",
+                enabled=True,
+                hold_minutes=240,
+                dca_enabled=False,
+                trailing_enabled=False,
+                breakeven_enabled=False,
+            ),
+        },
+    })
+
+    engine = PaperTradingEngine(settings, repo)
+    # Pre-set losses at max so cooldown activates
+    engine._consecutive_losses = 4
+
+    # This must NOT raise UnboundLocalError for timedelta.
+    # The cooldown branch runs, sees _cooldown_until is None,
+    # sets it using timedelta(...), then falls through to entry.
+    opened = engine.check_entries([_me_short_candidate()], {"BTCUSDT": 100.0})
+
+    # Cooldown was activated (first activation doesn't break, only subsequent checks do)
+    assert engine._cooldown_until is not None
+    # Entry still went through this cycle (cooldown activates but doesn't block current cycle)
+    assert len(opened) == 1
+
+
+def test_fixed_horizon_still_sets_planned_exit():
+    """FIXED_HORIZON_V1 still creates planned_exit_at after the timedelta fix."""
+    from app.config.settings import ExecutionPolicyConfig
+
+    repo = FakeCooldownRepository()
+    settings = _cooldown_settings()
+    object.__setattr__(settings, "execution_policy_configs", {
+        "MOMENTUM_EXHAUSTION": {
+            "SHORT": ExecutionPolicyConfig(
+                policy="FIXED_HORIZON_V1",
+                enabled=True,
+                hold_minutes=240,
+            ),
+        },
+    })
+
+    engine = PaperTradingEngine(settings, repo)
+    opened = engine.check_entries([_me_short_candidate()], {"BTCUSDT": 100.0})
+
+    assert len(opened) == 1
+    trade = opened[0]
+    assert trade.execution_policy == "FIXED_HORIZON_V1"
+    assert trade.planned_exit_at is not None
+    # planned_exit_at should be ~240 minutes after entry
+    hold = trade.planned_exit_at - trade.entered_at
+    assert abs(hold.total_seconds() - 240 * 60) < 5  # within 5 seconds
