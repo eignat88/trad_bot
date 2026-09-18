@@ -31,6 +31,7 @@ from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
 from app.paper.engine import PaperTradingEngine
 from app.paper.position_monitor import PositionMonitor
+from app.paper.shadow_engine import ShadowPaperEngine
 from app.scanners.direction_gate import ScannerDirectionGatePolicy
 from app.scanners.expectancy_filter import ExpectancyFilter, filter_candidates, load_expectancy
 from app.scanners.orchestrator import ScannerOrchestrator
@@ -145,6 +146,7 @@ def run_entry_cycle(
     repo: ScannerRepository,
     expectancy_filter: ExpectancyFilter | None,
     settings: Settings,
+    shadow_engine: ShadowPaperEngine | None = None,
 ) -> dict[str, Any]:
     """Run one paper-trading entry cycle (runs every ~300 s).
 
@@ -238,6 +240,23 @@ def run_entry_cycle(
             opened = engine.check_entries(candidates, all_prices)
         stats["entries"] = len(opened)
 
+        # --- SHADOW ENGINE: create reverse LONG shadow for ME SHORT entries ---
+        if shadow_engine is not None and shadow_engine.is_enabled and opened:
+            shadow_entries = 0
+            for trade in opened:
+                price = all_prices.get(trade.symbol)
+                if price is None:
+                    continue
+                shadow_trade = shadow_engine.check_shadow_entries(trade, price)
+                if shadow_trade is not None:
+                    shadow_entries += 1
+            if shadow_entries > 0:
+                stats["shadow_entries"] = shadow_entries
+                logger.info(
+                    "shadow engine: %d reverse LONG shadow trades created this cycle",
+                    shadow_entries,
+                )
+
     # --- 2. EXPIRE OLD SETUPS (independently protected) ---
     try:
         expired = repo.expire_stale_setups(max_age_minutes=120)
@@ -322,6 +341,24 @@ def main() -> None:
 
     engine = PaperTradingEngine(settings, repo)
 
+    # --- Initialize shadow engine for experimental scanners ---
+    shadow_engine = None
+    me_reverse_config = settings.experimental_scanners.get("ME_SHORT_REVERSE_LONG_V1")
+    if me_reverse_config is not None and me_reverse_config.enabled:
+        shadow_engine = ShadowPaperEngine(settings, repo, me_reverse_config)
+        logger.info(
+            "shadow engine initialized: experiment=%s mode=%s "
+            "source_scanner=%s source_direction=%s trade_direction=%s "
+            "SL=%.1f%% TP=%.1f%% open_trades=%d",
+            "ME_SHORT_REVERSE_LONG_V1", me_reverse_config.mode,
+            me_reverse_config.source_scanner, me_reverse_config.source_direction,
+            me_reverse_config.trade_direction,
+            me_reverse_config.stop_loss_pct, me_reverse_config.take_profit_pct,
+            len(shadow_engine.open_trades),
+        )
+    else:
+        logger.info("shadow engine: disabled or not configured")
+
     # --- Create and start the FAST position monitor (background thread) ---
     monitor_interval = getattr(settings, "position_monitor_interval", 10)
     monitor = PositionMonitor(
@@ -329,6 +366,7 @@ def main() -> None:
         price_fetcher=lambda symbols: _get_prices(client, symbols),
         funding_fetcher=lambda symbols: _get_funding_rates(client, symbols),
         interval_seconds=monitor_interval,
+        shadow_engine=shadow_engine,
     )
     monitor.start()
 
@@ -363,6 +401,7 @@ def main() -> None:
         try:
             stats = run_entry_cycle(
                 engine, client, repo, expectancy_filter, settings,
+                shadow_engine=shadow_engine,
             )
             logger.info(
                 "cycle #%d: entries=%d open=%d balance=$%.2f",

@@ -50,6 +50,26 @@ class ExecutionPolicyConfig:
 
 
 @dataclass(frozen=True)
+class ExperimentalScannerConfig:
+    """Configuration for an experimental shadow/counterfactual scanner.
+
+    Shadow scanners derive trades from an existing scanner's signals but
+    test an alternative hypothesis (e.g. reversed direction, different
+    stop/target geometry) without affecting the paper balance or live trading.
+    """
+    enabled: bool = False
+    mode: str = "shadow"
+    source_scanner: str = ""
+    source_direction: str = "SHORT"
+    trade_direction: str = "LONG"
+    stop_loss_pct: float = 2.5
+    take_profit_pct: float = 3.0
+    dca_enabled: bool = False
+    trailing_enabled: bool = False
+    breakeven_enabled: bool = False
+
+
+@dataclass(frozen=True)
 class Settings:
     # --- PostgreSQL database configuration ---
     db_host: str = "localhost"
@@ -196,6 +216,9 @@ class Settings:
     execution_policies: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
     # Parsed execution policy configs (scanner_name → direction → ExecutionPolicyConfig)
     execution_policy_configs: dict[str, dict[str, ExecutionPolicyConfig]] = field(default_factory=dict, repr=False)
+    # Experimental scanners configuration (shadow/counterfactual strategies).
+    # Key structure: { scanner_name: ExperimentalScannerConfig }
+    experimental_scanners: dict[str, ExperimentalScannerConfig] = field(default_factory=dict, repr=False)
     analytics_schedule_time: str = "06:00"
     analytics_timezone: str = "Europe/Sofia"
     analytics_post_exit_hours: int = 4
@@ -283,6 +306,38 @@ def _load_execution_policies(settings: Settings, raw: dict) -> None:
 
     # Use object.__setattr__ because Settings is a frozen dataclass
     object.__setattr__(settings, "execution_policy_configs", parsed)
+
+
+def _load_experimental_scanners(settings: Settings, raw: dict) -> None:
+    """Parse experimental_scanners from config into typed ExperimentalScannerConfig.
+
+    Experimental scanners run as shadow/counterfactual strategies that derive
+    trades from existing scanner signals without affecting the paper balance.
+    """
+    raw_experimental = raw.get("experimental_scanners", {})
+    if not raw_experimental or not isinstance(raw_experimental, dict):
+        raw_experimental = {}
+
+    parsed: dict[str, ExperimentalScannerConfig] = {}
+    for scanner_name, config_raw in raw_experimental.items():
+        if not isinstance(config_raw, dict):
+            continue
+
+        parsed[scanner_name] = ExperimentalScannerConfig(
+            enabled=config_raw.get("enabled", False),
+            mode=config_raw.get("mode", "shadow"),
+            source_scanner=config_raw.get("source_scanner", ""),
+            source_direction=config_raw.get("source_direction", "SHORT"),
+            trade_direction=config_raw.get("trade_direction", "LONG"),
+            stop_loss_pct=config_raw.get("stop_loss_pct", 2.5),
+            take_profit_pct=config_raw.get("take_profit_pct", 3.0),
+            dca_enabled=config_raw.get("dca_enabled", False),
+            trailing_enabled=config_raw.get("trailing_enabled", False),
+            breakeven_enabled=config_raw.get("breakeven_enabled", False),
+        )
+
+    # Use object.__setattr__ because Settings is a frozen dataclass
+    object.__setattr__(settings, "experimental_scanners", parsed)
 
 
 def _parse_bool_env(value: str, env_name: str) -> bool:
@@ -385,6 +440,8 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
     _last_dca_source = dca_source
     # Load execution policies from config
     _load_execution_policies(settings, raw)
+    # Load experimental scanners from config
+    _load_experimental_scanners(settings, raw)
     if settings.category != "linear":
         raise ValueError("Price/OI strategy requires category=linear")
     if settings.trading_mode not in {"paper", "live"}:

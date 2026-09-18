@@ -1996,6 +1996,171 @@ class ScannerRepository:
 
         return self._with_retry(_do, label="load_dca_state")
 
+    # ------------------------------------------------------------------
+    # SHADOW TRADES (experimental counterfactual trades)
+    # ------------------------------------------------------------------
+
+    def save_shadow_trade(self, trade: Any) -> int | None:
+        """Persist a new shadow trade and return its shadow_trade_id."""
+        if not self._use_pg:
+            return None
+
+        def _do():
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO dds.paper_shadow_trade (
+                    experiment_id, source_trade_id, source_setup_id,
+                    source_scanner, source_direction,
+                    symbol, scanner_name, direction, score,
+                    entry_price, entry_fee, stop_price, target_1,
+                    entry_timeframe, position_size, risk_usdt,
+                    balance_before, market_regime, status, entered_at,
+                    entry_market_price, slippage, mfe, mae,
+                    funding_paid
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s
+                )
+                RETURNING shadow_trade_id
+                """,
+                (
+                    trade.experiment_id,
+                    trade.source_trade_id,
+                    trade.source_setup_id,
+                    trade.source_scanner,
+                    trade.source_direction,
+                    trade.symbol,
+                    trade.scanner_name,
+                    trade.direction,
+                    trade.score,
+                    trade.entry_price,
+                    trade.entry_fee,
+                    trade.stop_price,
+                    trade.target_1,
+                    "5m",  # entry_timeframe
+                    trade.position_size,
+                    trade.risk_usdt,
+                    0.0,  # balance_before (shadow has no real balance)
+                    trade.market_regime,
+                    trade.status,
+                    trade.entered_at,
+                    trade.entry_market_price,
+                    trade.entry_slippage_cost,
+                    trade.mfe,
+                    trade.mae,
+                    trade.funding_paid,
+                ),
+            )
+            row = cursor.fetchone()
+            self._conn.commit()
+            return row[0] if row else None
+
+        return self._with_retry(_do, label="save_shadow_trade")
+
+    def close_shadow_trade(
+        self,
+        shadow_trade_id: int | None,
+        exit_price: float,
+        exit_reason: str,
+        exit_fee: float,
+        pnl_usdt: float,
+        pnl_r: float,
+        pnl_percent: float,
+        slippage: float,
+        mfe: float,
+        mae: float,
+        mfe_r: float,
+        mae_r: float,
+        duration_sec: float,
+    ) -> None:
+        """Close a shadow trade and update P&L fields."""
+        if not self._use_pg or shadow_trade_id is None:
+            return
+
+        def _do():
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                UPDATE dds.paper_shadow_trade
+                SET status = 'CLOSED',
+                    exit_price = %s,
+                    exit_reason = %s,
+                    exit_fee = %s,
+                    pnl_usdt = %s,
+                    pnl_r = %s,
+                    pnl_percent = %s,
+                    slippage = %s,
+                    mfe = %s,
+                    mae = %s,
+                    mfe_r = %s,
+                    mae_r = %s,
+                    closed_at = now(),
+                    duration_sec = %s,
+                    updated_at = now()
+                WHERE shadow_trade_id = %s
+                """,
+                (
+                    exit_price, exit_reason, exit_fee,
+                    pnl_usdt, pnl_r, pnl_percent, slippage,
+                    mfe, mae, mfe_r, mae_r,
+                    duration_sec, shadow_trade_id,
+                ),
+            )
+            self._conn.commit()
+
+        try:
+            self._with_retry(_do, label="close_shadow_trade")
+        except Exception:
+            logger.exception("close_shadow_trade failed for id=%s", shadow_trade_id)
+
+    def get_open_shadow_trades(self) -> list[dict]:
+        """Load all OPEN shadow trades (for engine restart recovery)."""
+        if not self._use_pg:
+            return []
+
+        def _do():
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                SELECT shadow_trade_id, experiment_id, source_trade_id,
+                       source_setup_id, source_scanner, source_direction,
+                       symbol, scanner_name, direction, score,
+                       entry_price, entry_fee, stop_price, target_1,
+                       position_size, risk_usdt, entered_at,
+                       entry_market_price, slippage, mfe, mae,
+                       market_regime, funding_paid
+                FROM dds.paper_shadow_trade
+                WHERE status = 'OPEN'
+                ORDER BY entered_at DESC
+                """
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    "shadow_trade_id": r[0], "experiment_id": r[1],
+                    "source_trade_id": r[2], "source_setup_id": r[3],
+                    "source_scanner": r[4], "source_direction": r[5],
+                    "symbol": r[6], "scanner_name": r[7], "direction": r[8],
+                    "score": float(r[9]),
+                    "entry_price": float(r[10]), "entry_fee": float(r[11]),
+                    "stop_price": float(r[12]),
+                    "target_1": float(r[13]),
+                    "position_size": float(r[14]), "risk_usdt": float(r[15]),
+                    "entered_at": r[16],
+                    "entry_market_price": float(r[17] or r[10]),
+                    "slippage": float(r[18] or 0),
+                    "mfe": float(r[19] or 0),
+                    "mae": float(r[20] or 0),
+                    "market_regime": r[21],
+                    "funding_paid": float(r[22] or 0),
+                }
+                for r in rows
+            ]
+
+        return self._with_retry(_do, label="get_open_shadow_trades")
+
     def close(self) -> None:
         if self._conn:
             self._conn.close()
