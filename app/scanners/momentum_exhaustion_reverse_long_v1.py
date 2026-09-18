@@ -140,28 +140,27 @@ class MomentumExhaustionReverseLongV1Scanner:
         # Fixed SL: -2.5% from entry
         # Fixed TP: +3.0% from entry
         # Max hold: 240 minutes
-        
-        # Calculate fixed SL and TP based on V1 parameters
+
+        # Calculate fixed SL and TP based on V1 parameters.
+        # invalidation_price IS the effective stop — paper engine reads it
+        # as stop_price.  Earlier revisions computed a swing-based
+        # invalidation that overwrote the designed 2.5 % stop; this was
+        # the root cause of premature STOP_LOSS exits (e.g. trade 303).
         sl_pct = 0.025  # 2.5%
         tp_pct = 0.03   # 3.0%
-        
-        stop_price = current_price * (1 - sl_pct)
+
+        invalidation = current_price * (1 - sl_pct)
         target_1 = current_price * (1 + tp_pct)
-        
-        # Invalidation: below recent_low of the last 5 candles
-        # (if price drops below recent support the breakout is truly failing)
-        recent_low = min(c.low for c in candles_5m[-5:])
-        invalidation = recent_low * 0.998
-        
+
         # For lineage tracking: this setup came from MOMENTUM_EXHAUSTION SHORT detection
         source_scanner = "MOMENTUM_EXHAUSTION"
         source_direction = "SHORT"
-        
+
         features = self._build_long_features(
             candles_5m, prev_high, recent_high,
             current_price, invalidation, target_1, atr, ctx.indicators.rsi,
         )
-        
+
         # Add V1-specific parameters to features
         features["stop_loss_pct"] = sl_pct * 100  # 2.5%
         features["take_profit_pct"] = tp_pct * 100  # 3.0%

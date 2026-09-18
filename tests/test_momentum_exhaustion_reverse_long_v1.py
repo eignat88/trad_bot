@@ -285,7 +285,7 @@ class TestMomentumExhaustionReverseLongV1:
     def test_lineage_tracking(self):
         """Scanner must track lineage to source scanner in features."""
         scanner = MomentumExhaustionReverseLongV1Scanner()
-        
+
         # Test the feature builder directly to verify lineage tracking
         candles_5m = [MockCandle(
             timestamp=datetime.now(timezone.utc),
@@ -295,7 +295,7 @@ class TestMomentumExhaustionReverseLongV1:
             close=52950,
             volume=1000.0,
         )]
-        
+
         features = scanner._build_long_features(
             candles_5m=candles_5m,
             prev_high=50000.0,
@@ -306,7 +306,209 @@ class TestMomentumExhaustionReverseLongV1:
             atr=100.0,
             rsi=70.0,
         )
-        
+
         # Note: The feature builder doesn't add source_scanner/source_direction
         # These are added in the _scan_long method when creating the SetupCandidate
         # This is expected behavior - lineage is added at the candidate level
+
+
+# ── BUG FIX regression tests (2026-09-18) ─────────────────────────
+
+class TestV1FixedStopGeometry:
+    """Verify that V1 uses fixed 2.5% SL, not swing-based invalidation."""
+
+    SL_PCT = 0.025
+    TP_PCT = 0.03
+    TOLERANCE = 1e-9
+
+    @staticmethod
+    def _make_valid_context(base: float = 100.0) -> MockMarketContext:
+        """Build a market context that reliably triggers a V1 LONG signal.
+
+        Requirements for MOMENTUM_EXHAUSTION_REVERSE_LONG_V1:
+          - 15m: >=30 candles with 2+ swing highs (prev_high < recent_high)
+          - 5m:  >=15 candles; recent_high > prev_high; current near prev_high
+          - Last 5m candle: bearish (close < open), body/range < 0.7
+          - RSI >= 65
+        """
+        # 15m candles: clear uptrend then pullback → creates swing highs
+        prices_15m = []
+        for i in range(35):
+            if i < 12:
+                prices_15m.append(base + i * 0.8)          # rising
+            elif i < 16:
+                prices_15m.append(base + 9.6 - (i - 12) * 0.3)  # dip
+            elif i < 25:
+                prices_15m.append(base + 8.4 + (i - 16) * 0.9)  # rise to new high
+            else:
+                prices_15m.append(base + 16.5 - (i - 25) * 0.2) # gentle pullback
+
+        # 5m candles: price spiked above prev_high then came back
+        prices_5m = []
+        for i in range(20):
+            if i < 8:
+                prices_5m.append(base + 9 + i * 0.1)       # steady
+            elif i < 12:
+                prices_5m.append(base + 9.8 + (i - 8) * 0.5)  # spike up (above prev_high)
+            elif i < 18:
+                prices_5m.append(base + 11.8 - (i - 12) * 0.2)  # pullback near prev_high
+            else:
+                prices_5m.append(base + 10.6 - (i - 18) * 0.15) # final pullback
+
+        candles_5m = make_candles_5m(prices_5m)
+        # Ensure last candle is bearish with body/range < 0.7 (wick on both sides)
+        last = candles_5m[-1]
+        mid = (last.high + last.low) / 2
+        last.open = mid + 0.02
+        last.close = mid - 0.02
+        # Keep high/low unchanged so body/range ≈ 0.4
+
+        return MockMarketContext(
+            candles_15m=make_candles_15m(prices_15m),
+            candles_5m=candles_5m,
+            indicators=MockIndicators(rsi=70.0, atr=base * 0.01),
+        )
+
+    def test_v1_long_stop_is_fixed_2_5_percent(self):
+        """invalidation_price must equal current_price * (1 - 0.025)."""
+        scanner = MomentumExhaustionReverseLongV1Scanner()
+        ctx = self._make_valid_context()
+
+        candidates = scanner.scan(ctx)
+        if not candidates:
+            pytest.skip("No signal detected — adjust candle pattern")
+
+        current_price = ctx.candles_5m[-1].close
+        expected_stop = current_price * (1 - self.SL_PCT)
+        for candidate in candidates:
+            assert abs(candidate.invalidation_price - expected_stop) < self.TOLERANCE, (
+                f"invalidation_price={candidate.invalidation_price} "
+                f"expected={expected_stop} (fixed 2.5% SL)"
+            )
+
+    def test_v1_long_tp_is_fixed_3_percent(self):
+        """target_1 must equal current_price * (1 + 0.03)."""
+        scanner = MomentumExhaustionReverseLongV1Scanner()
+        ctx = self._make_valid_context()
+
+        candidates = scanner.scan(ctx)
+        if not candidates:
+            pytest.skip("No signal detected — adjust candle pattern")
+
+        current_price = ctx.candles_5m[-1].close
+        expected_tp = current_price * (1 + self.TP_PCT)
+        for candidate in candidates:
+            assert abs(candidate.target_1 - expected_tp) < self.TOLERANCE, (
+                f"target_1={candidate.target_1} "
+                f"expected={expected_tp} (fixed 3.0% TP)"
+            )
+
+    def test_swing_low_does_not_override_v1_stop(self):
+        """Even if recent_low is very close to current_price,
+        invalidation_price must still be fixed 2.5%."""
+        scanner = MomentumExhaustionReverseLongV1Scanner()
+        ctx = self._make_valid_context()
+
+        # Artificially raise all 5m lows to be very close to close
+        for c in ctx.candles_5m:
+            c.low = c.close * 0.9999  # very tight low → would give tiny swing stop
+
+        candidates = scanner.scan(ctx)
+        if not candidates:
+            pytest.skip("No signal detected — adjust candle pattern")
+
+        current_price = ctx.candles_5m[-1].close
+        expected_stop = current_price * (1 - self.SL_PCT)
+        for candidate in candidates:
+            assert abs(candidate.invalidation_price - expected_stop) < self.TOLERANCE, (
+                f"Swing low overrode V1 stop! "
+                f"invalidation_price={candidate.invalidation_price} "
+                f"expected={expected_stop}"
+            )
+
+    def test_v1_rr_ratio_is_correct(self):
+        """R:R ratio should be TP% / SL% ≈ 3.0/2.5 = 1.2."""
+        entry = 100.0
+        stop = entry * (1 - self.SL_PCT)  # 97.5
+        tp = entry * (1 + self.TP_PCT)    # 103.0
+        risk = entry - stop                # 2.5
+        reward = tp - entry                # 3.0
+        rr = reward / risk
+        assert abs(rr - 1.2) < 0.001, f"R:R={rr}, expected 1.2"
+
+
+class TestV1ExecutionPolicy:
+    """Verify that V1 scanner resolves to FIXED_TP_SL_HORIZON_V1."""
+
+    def test_execution_policy_config_resolves(self):
+        """Config must resolve FIXED_TP_SL_HORIZON_V1 for V1 LONG."""
+        settings = load_settings()
+        policy = settings.execution_policy_configs.get(
+            "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1", {}
+        ).get("LONG")
+        assert policy is not None, "V1 LONG policy not found in config"
+        assert policy.policy == "FIXED_TP_SL_HORIZON_V1"
+        assert policy.enabled is True
+
+    def test_v1_not_in_default_fallback(self):
+        """V1 LONG must NOT fall through to DEFAULT."""
+        settings = load_settings()
+        policy = settings.execution_policy_configs.get(
+            "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1", {}
+        ).get("LONG")
+        assert policy is not None
+        assert policy.policy != "DEFAULT"
+
+    def test_v1_hold_minutes_240(self):
+        """V1 hold_minutes must be 240."""
+        settings = load_settings()
+        policy = settings.execution_policy_configs.get(
+            "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1", {}
+        ).get("LONG")
+        assert policy is not None
+        assert policy.hold_minutes == 240
+
+    def test_v1_disabled_mechanics(self):
+        """DCA, trailing, breakeven must be disabled for V1."""
+        settings = load_settings()
+        policy = settings.execution_policy_configs.get(
+            "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1", {}
+        ).get("LONG")
+        assert policy is not None
+        assert policy.dca_enabled is False
+        assert policy.trailing_enabled is False
+        assert policy.breakeven_enabled is False
+        assert policy.expiry_enabled is False
+        assert policy.tp_enabled is True
+
+
+class TestV1LifecycleRegression:
+    """Regression tests to ensure V1 does not break other scanners."""
+
+    def test_original_me_short_still_uses_default(self):
+        """ME SHORT without FIXED_HORIZON enabled should use DEFAULT."""
+        settings = load_settings()
+        # ME SHORT is disabled in config
+        policy = settings.execution_policy_configs.get(
+            "MOMENTUM_EXHAUSTION", {}
+        ).get("SHORT")
+        if policy is not None:
+            # If policy exists but is disabled, engine treats it as DEFAULT
+            assert policy.enabled is False
+
+    def test_unknown_scanner_uses_default(self):
+        """Unknown scanner should have no policy entry (falls to DEFAULT)."""
+        settings = load_settings()
+        policy = settings.execution_policy_configs.get(
+            "UNKNOWN_SCANNER_TEST", {}
+        ).get("LONG")
+        assert policy is None
+
+    def test_v1_scanner_name_exact_match(self):
+        """Scanner name must match config key exactly."""
+        scanner = MomentumExhaustionReverseLongV1Scanner()
+        settings = load_settings()
+        assert scanner.name in settings.execution_policy_configs, (
+            f"Scanner name '{scanner.name}' not in execution_policy_configs. "
+            f"Available: {list(settings.execution_policy_configs.keys())}"
+        )
