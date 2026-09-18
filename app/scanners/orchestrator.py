@@ -14,6 +14,7 @@ from app.scanners.liquidity_sweep_choch import LiquiditySweepCHOCHScanner
 from app.scanners.models import MarketContext, SetupCandidate
 from app.scanners.momentum_exhaustion import MomentumExhaustionScanner
 from app.scanners.momentum_exhaustion_r import MomentumExhaustionRScanner
+from app.scanners.momentum_exhaustion_reverse_long_v1 import MomentumExhaustionReverseLongV1Scanner
 from app.scanners.expectancy_filter import ExpectancyFilter, filter_candidates
 from app.scanners.risk_geometry import validate_risk_geometry
 from app.scanners.scoring import score_candidate
@@ -56,6 +57,7 @@ class ScannerOrchestrator:
             "SUPPORT_RESISTANCE_REACTION": SupportResistanceScanner(),
             "MOMENTUM_EXHAUSTION": MomentumExhaustionScanner(),
             "MOMENTUM_EXHAUSTION_R": MomentumExhaustionRScanner(),
+            "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1": MomentumExhaustionReverseLongV1Scanner(),
         }
 
         if enabled_scanners is not None:
