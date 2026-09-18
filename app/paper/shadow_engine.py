@@ -8,15 +8,18 @@ or live trading.
 Key constraints:
   - Shadow trades are fully independent from the main PaperTradingEngine.
   - They do NOT consume balance, affect exposure limits, or block symbols.
-  - Each shadow trade is linked to a source setup via source_setup_id.
+  - Each shadow trade is linked to a source trade via source_trade_id.
   - Only SL and TP exits are supported (no DCA, no trailing, no BE).
   - Shadow trades persist to the dds.paper_shadow_trade table.
+  - Multiple shadow trades per symbol are allowed (keyed by source_trade_id).
+  - Shadow trades auto-expire after a configurable time horizon to prevent
+    indefinite holding.
 
 Lifecycle:
   1. When a ME SHORT signal is executed as a paper trade, the shadow engine
      creates a corresponding reverse LONG shadow trade.
   2. The shadow engine monitors prices independently and closes shadow trades
-     when SL or TP is hit.
+     when SL, TP, or timeout is hit.
   3. Shadow trades are persisted for paired analytics.
 """
 from __future__ import annotations
@@ -25,13 +28,17 @@ import logging
 import math
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from app.config import ExperimentalScannerConfig, Settings
-from app.scanners.models import SetupCandidate
 
 logger = logging.getLogger(__name__)
+
+# Default shadow trade time horizon in minutes.
+# After this duration, the shadow trade is expired (closed at market price).
+# This prevents indefinite holding when neither SL nor TP is reached.
+_SHADOW_EXPIRY_MINUTES_DEFAULT = 240  # 4 hours
 
 
 @dataclass
@@ -72,7 +79,9 @@ class ShadowPaperEngine:
     - No shared balance or exposure limits
     - No DCA, trailing, breakeven, or expiry
     - Fixed SL and TP geometry only
+    - Auto-expire after configurable horizon
     - Writes to dds.paper_shadow_trade (separate table)
+    - Multiple shadow trades per symbol (keyed by source_trade_id)
     """
 
     SCANNER_NAME = "MOMENTUM_EXHAUSTION_SHORT_REVERSE_LONG_V1"
@@ -89,9 +98,16 @@ class ShadowPaperEngine:
         self.config = config
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
-        # Shadow trades keyed by symbol (same one-per-symbol constraint)
-        self.open_trades: dict[str, ShadowTradeRecord] = {}
+        # Shadow trades keyed by source_trade_id (allows multiple per symbol)
+        self.open_trades: dict[int, ShadowTradeRecord] = {}
+        # Index: symbol → set of source_trade_ids for price lookup
+        self._symbol_index: dict[str, set[int]] = {}
         self._lock = threading.Lock()
+
+        # Configurable time horizon for shadow trades
+        self._expiry_minutes = getattr(
+            config, 'hold_minutes', _SHADOW_EXPIRY_MINUTES_DEFAULT,
+        ) if hasattr(config, 'hold_minutes') else _SHADOW_EXPIRY_MINUTES_DEFAULT
 
         # Reload existing open shadow trades from DB
         self._load_open_trades()
@@ -115,6 +131,10 @@ class ShadowPaperEngine:
         The shadow trade mirrors the source entry price but inverts direction
         and applies fixed SL/TP geometry.
 
+        Multiple shadows per symbol are allowed — the key is source_trade_id,
+        not symbol. This ensures that concurrent ME SHORT signals on the same
+        symbol each get their own paired shadow trade.
+
         Args:
             source_trade: The PaperTradeRecord of the original ME SHORT trade.
             price: Current market price at the time of source entry.
@@ -129,20 +149,11 @@ class ShadowPaperEngine:
                 or source_trade.direction != self.config.source_direction):
             return None
 
-        # Already have a shadow trade for this symbol? Skip.
-        if source_trade.symbol in self.open_trades:
+        # Already created a shadow for this exact source trade? Skip.
+        if source_trade.trade_id in self.open_trades:
             logger.info(
-                "shadow entry suppressed: symbol=%s already has open shadow trade",
-                source_trade.symbol,
-            )
-            return None
-
-        # Already created a shadow for this source setup? Skip.
-        existing = self._find_shadow_by_setup(source_trade.setup_id)
-        if existing is not None:
-            logger.info(
-                "shadow entry suppressed: source setup_id=%s already has shadow trade",
-                source_trade.setup_id,
+                "shadow entry suppressed: source_trade_id=%d already has shadow trade",
+                source_trade.trade_id,
             )
             return None
 
@@ -213,14 +224,16 @@ class ShadowPaperEngine:
         trade.shadow_trade_id = trade_id
 
         with self._lock:
-            self.open_trades[trade.symbol] = trade
+            self.open_trades[trade.source_trade_id] = trade
+            self._symbol_index.setdefault(trade.symbol, set()).add(trade.source_trade_id)
 
         logger.info(
             "shadow ENTRY: %s %s entry=%.4f stop=%.4f tp=%.4f size=%.4f risk=$%.2f "
-            "source_trade_id=%s source_setup_id=%s",
+            "source_trade_id=%s source_setup_id=%s open_for_symbol=%d",
             trade.symbol, trade.direction,
             entry, stop_price, target_1, quantity, risk_usdt,
             source_trade.trade_id, source_trade.setup_id,
+            len(self._symbol_index.get(trade.symbol, set())),
         )
 
         return trade
@@ -235,18 +248,22 @@ class ShadowPaperEngine:
     ) -> list[ShadowTradeRecord]:
         """Check all open shadow trades against current prices.
 
-        Only SL and TP exits are supported. No trailing, no DCA, no BE.
+        Exit priority:
+        1. STOP_LOSS / STOP_LOSS_GAP (protective)
+        2. TAKE_PROFIT_1 (target)
+        3. TIMEOUT (auto-expire after horizon)
+
         Returns list of trades that were closed in this cycle.
         """
         if not self.is_enabled:
             return []
 
         closed: list[ShadowTradeRecord] = []
-        to_remove: list[str] = []
+        to_remove: list[int] = []
 
         with self._lock:
-            for symbol, trade in self.open_trades.items():
-                price = prices.get(symbol)
+            for source_trade_id, trade in self.open_trades.items():
+                price = prices.get(trade.symbol)
                 if price is None:
                     continue
 
@@ -275,12 +292,31 @@ class ShadowPaperEngine:
                             trade, trade.target_1, "TAKE_PROFIT_1",
                         )
 
+                # 3. Timeout / expiry check
+                if result is None and self._expiry_minutes > 0:
+                    age_minutes = (self._clock() - trade.entered_at).total_seconds() / 60
+                    if age_minutes > self._expiry_minutes:
+                        # Close at market price with slippage
+                        slip = self.settings.slippage_percent
+                        exit_price = price * (1 - slip)  # LONG exit: sell at bid
+                        exit_reason = (
+                            "EXPIRED_PROFITABLE"
+                            if price > trade.entry_price
+                            else "EXPIRED"
+                        )
+                        result = self._close_shadow_trade(trade, exit_price, exit_reason)
+
                 if result is not None:
                     closed.append(result)
-                    to_remove.append(symbol)
+                    to_remove.append(source_trade_id)
 
-            for symbol in to_remove:
-                self.open_trades.pop(symbol, None)
+            for source_trade_id in to_remove:
+                trade = self.open_trades.pop(source_trade_id, None)
+                if trade is not None:
+                    sym_idx = self._symbol_index.get(trade.symbol, set())
+                    sym_idx.discard(source_trade_id)
+                    if not sym_idx:
+                        self._symbol_index.pop(trade.symbol, None)
 
         return closed
 
@@ -309,7 +345,9 @@ class ShadowPaperEngine:
         )
         duration = (self._clock() - trade.entered_at).total_seconds()
 
-        now = self._clock()
+        risk_distance = trade.risk_usdt / trade.position_size if trade.position_size > 0 else 0.0
+        mfe_r = trade.mfe / risk_distance if risk_distance > 0 else 0.0
+        mae_r = trade.mae / risk_distance if risk_distance > 0 else 0.0
 
         # Persist to DB
         self.repo.close_shadow_trade(
@@ -323,15 +361,17 @@ class ShadowPaperEngine:
             slippage=round(slippage_cost, 6),
             mfe=round(trade.mfe, 6),
             mae=round(trade.mae, 6),
-            mfe_r=round(trade.mfe / (trade.risk_usdt / trade.position_size) if trade.position_size > 0 and trade.risk_usdt > 0 else 0, 6),
-            mae_r=round(trade.mae / (trade.risk_usdt / trade.position_size) if trade.position_size > 0 and trade.risk_usdt > 0 else 0, 6),
+            mfe_r=round(mfe_r, 6),
+            mae_r=round(mae_r, 6),
             duration_sec=round(duration, 1),
         )
 
         logger.info(
-            "shadow EXIT: %s %s reason=%s entry=%.4f exit=%.4f pnl=$%.2f R=%.2f",
+            "shadow EXIT: %s %s reason=%s entry=%.4f exit=%.4f pnl=$%.2f R=%.2f "
+            "source_trade_id=%s duration=%.0fm",
             trade.symbol, trade.direction, reason,
             trade.entry_price, adjusted_exit, net_pnl, r_multiple,
+            trade.source_trade_id, duration / 60,
         )
 
         return ShadowTradeRecord(
@@ -366,13 +406,6 @@ class ShadowPaperEngine:
     # ------------------------------------------------------------------
     # INTERNAL HELPERS
     # ------------------------------------------------------------------
-
-    def _find_shadow_by_setup(self, source_setup_id: str) -> ShadowTradeRecord | None:
-        """Find an existing shadow trade by its source setup ID."""
-        for trade in self.open_trades.values():
-            if trade.source_setup_id == source_setup_id:
-                return trade
-        return None
 
     def _load_open_trades(self) -> None:
         """Load any existing OPEN shadow trades from the DB on startup."""
@@ -410,12 +443,14 @@ class ShadowPaperEngine:
                 market_regime=row.get("market_regime"),
                 funding_paid=float(row.get("funding_paid", 0.0)),
             )
-            self.open_trades[trade.symbol] = trade
+            if trade.source_trade_id is not None:
+                self.open_trades[trade.source_trade_id] = trade
+                self._symbol_index.setdefault(trade.symbol, set()).add(trade.source_trade_id)
 
         if rows:
             logger.info(
-                "shadow engine: loaded %d open shadow trades",
-                len(rows),
+                "shadow engine: loaded %d open shadow trades from %d symbols",
+                len(rows), len(self._symbol_index),
             )
 
     def snapshot(self) -> dict[str, Any]:
@@ -424,6 +459,8 @@ class ShadowPaperEngine:
             "experiment_id": "ME_SHORT_REVERSE_LONG_V1",
             "enabled": self.is_enabled,
             "open_shadow_trades": len(self.open_trades),
+            "expiry_minutes": self._expiry_minutes,
+            "symbols_with_open_shadows": len(self._symbol_index),
             "trades": [
                 {
                     "symbol": t.symbol,
@@ -431,7 +468,9 @@ class ShadowPaperEngine:
                     "entry": t.entry_price,
                     "stop": t.stop_price,
                     "tp": t.target_1,
+                    "source_trade_id": t.source_trade_id,
                     "source_setup_id": t.source_setup_id,
+                    "age_minutes": (self._clock() - t.entered_at).total_seconds() / 60,
                 }
                 for t in self.open_trades.values()
             ],

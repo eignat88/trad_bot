@@ -5,17 +5,19 @@ Covers:
   - SL = -2.5% from actual entry, TP = +3.0%
   - DCA ignored, trailing ignored, BE ignored
   - Original ME SHORT unchanged
-  - source_setup_id preserved (paired lineage)
+  - source_trade_id preserved (paired lineage)
   - Shadow trade doesn't affect main engine balance/exposure
   - Restart recovery for shadow trades
   - Configuration parsing
-  - Exit reasons: STOP_LOSS, STOP_LOSS_GAP, TAKE_PROFIT_1
+  - Exit reasons: STOP_LOSS, STOP_LOSS_GAP, TAKE_PROFIT_1, EXPIRED
+  - Same-symbol overlap: multiple shadows per symbol via source_trade_id
+  - Auto-expire timeout prevents indefinite holding
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -109,6 +111,11 @@ class _MockRepo:
 
     def get_open_shadow_trades(self) -> list[dict]:
         return []
+
+
+def _fixed_clock(t: datetime):
+    """Return a clock function that always returns t."""
+    return lambda: t
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +256,6 @@ class TestShadowEntry:
         engine = ShadowPaperEngine(settings, repo, config)
 
         source_trade = _make_source_trade()
-        initial_balance = settings.initial_balance
 
         shadow = engine.check_shadow_entries(source_trade, 100.0)
 
@@ -268,36 +274,40 @@ class TestShadowEntry:
         shadow = engine.check_shadow_entries(source_trade, 100.0)
 
         assert shadow is not None
-        # Main engine's open_trades is separate — shadow doesn't touch it
 
-    def test_shadow_suppresses_duplicate_source_setup(self):
-        """Same source setup_id → suppress duplicate shadow."""
+    def test_shadow_suppresses_duplicate_source_trade_id(self):
+        """Same source_trade_id → suppress duplicate shadow."""
         settings = _make_settings()
         config = _make_shadow_config()
         repo = _MockRepo()
         engine = ShadowPaperEngine(settings, repo, config)
 
-        source_trade = _make_source_trade(setup_id="dup-setup-001")
+        source_trade = _make_source_trade(trade_id=999)
         shadow1 = engine.check_shadow_entries(source_trade, 100.0)
         shadow2 = engine.check_shadow_entries(source_trade, 100.0)
 
         assert shadow1 is not None
         assert shadow2 is None
 
-    def test_shadow_suppresses_duplicate_symbol(self):
-        """Already open shadow for symbol → suppress."""
+    def test_multiple_shadows_per_symbol_allowed(self):
+        """Different source_trade_ids on the same symbol → each gets a shadow."""
         settings = _make_settings()
         config = _make_shadow_config()
         repo = _MockRepo()
         engine = ShadowPaperEngine(settings, repo, config)
 
-        trade1 = _make_source_trade(setup_id="s1", symbol="BTCUSDT")
-        trade2 = _make_source_trade(setup_id="s2", symbol="BTCUSDT")
+        trade1 = _make_source_trade(trade_id=100, setup_id="s1", symbol="SUIUSDT")
+        trade2 = _make_source_trade(trade_id=120, setup_id="s2", symbol="SUIUSDT")
+
         shadow1 = engine.check_shadow_entries(trade1, 100.0)
         shadow2 = engine.check_shadow_entries(trade2, 100.0)
 
         assert shadow1 is not None
-        assert shadow2 is None
+        assert shadow2 is not None
+        assert shadow1.source_trade_id == 100
+        assert shadow2.source_trade_id == 120
+        assert len(engine.open_trades) == 2
+        assert len(engine._symbol_index.get("SUIUSDT", set())) == 2
 
     def test_shadow_only_triggers_for_me_short(self):
         """Non-ME SHORT trades do NOT create shadow entries."""
@@ -348,23 +358,26 @@ class TestShadowEntry:
 # ---------------------------------------------------------------------------
 
 class TestShadowExit:
-    """Test shadow trade exit logic: SL and TP only."""
+    """Test shadow trade exit logic: SL, TP, and timeout."""
 
-    def _setup_engine_with_shadow(self, entry_price=100.0, stop_loss_pct=2.5, take_profit_pct=3.0):
+    def _setup_engine_with_shadow(self, entry_price=100.0, stop_loss_pct=2.5, take_profit_pct=3.0,
+                                   expiry_minutes=240):
         settings = _make_settings()
         config = _make_shadow_config(
             stop_loss_pct=stop_loss_pct,
             take_profit_pct=take_profit_pct,
         )
         repo = _MockRepo()
-        engine = ShadowPaperEngine(settings, repo, config)
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        engine = ShadowPaperEngine(settings, repo, config, clock=_fixed_clock(now))
+        engine._expiry_minutes = expiry_minutes
         source_trade = _make_source_trade(entry_price=entry_price)
         shadow = engine.check_shadow_entries(source_trade, entry_price)
-        return engine, shadow
+        return engine, shadow, now
 
     def test_stop_loss_exit(self):
         """Price drops to SL → STOP_LOSS exit."""
-        engine, shadow = self._setup_engine_with_shadow(entry_price=100.0)
+        engine, shadow, _ = self._setup_engine_with_shadow(entry_price=100.0)
         assert shadow is not None
 
         # Price drops to SL level
@@ -373,15 +386,13 @@ class TestShadowExit:
 
         assert len(closed) == 1
         assert closed[0].status == "CLOSED"
-        # The trade was closed via stop — verify repo received close call
         assert len(engine.repo._closed) == 1
         assert "STOP_LOSS" in engine.repo._closed[0]["exit_reason"]
-        # Verify the trade was removed from open_trades
-        assert "BTCUSDT" not in engine.open_trades
+        assert "BTCUSDT" not in engine._symbol_index
 
     def test_stop_loss_gap_exit(self):
         """Price gaps through SL → STOP_LOSS_GAP exit."""
-        engine, shadow = self._setup_engine_with_shadow(entry_price=100.0)
+        engine, shadow, _ = self._setup_engine_with_shadow(entry_price=100.0)
         assert shadow is not None
 
         # Price gaps well below SL
@@ -390,11 +401,10 @@ class TestShadowExit:
         closed = engine.check_shadow_exits({"BTCUSDT": gap_price})
 
         assert len(closed) == 1
-        # The exit reason should be STOP_LOSS_GAP (price gapped through)
 
     def test_take_profit_exit(self):
         """Price rises to TP → TAKE_PROFIT_1 exit."""
-        engine, shadow = self._setup_engine_with_shadow(entry_price=100.0)
+        engine, shadow, _ = self._setup_engine_with_shadow(entry_price=100.0)
         assert shadow is not None
 
         # Price rises to TP level
@@ -406,7 +416,7 @@ class TestShadowExit:
 
     def test_no_exit_in_normal_range(self):
         """Price between SL and TP → no exit."""
-        engine, shadow = self._setup_engine_with_shadow(entry_price=100.0)
+        engine, shadow, _ = self._setup_engine_with_shadow(entry_price=100.0)
         assert shadow is not None
 
         # Price in normal range
@@ -414,21 +424,20 @@ class TestShadowExit:
         closed = engine.check_shadow_exits({"BTCUSDT": mid_price})
 
         assert len(closed) == 0
-        assert "BTCUSDT" in engine.open_trades
+        assert 42 in engine.open_trades  # keyed by source_trade_id
 
     def test_no_dca_trailing_breakeven(self):
         """Shadow trades have no DCA, trailing, or breakeven logic."""
-        engine, shadow = self._setup_engine_with_shadow(entry_price=100.0)
+        engine, shadow, _ = self._setup_engine_with_shadow(entry_price=100.0)
         assert shadow is not None
 
-        # ShadowTradeRecord has no dca_enabled, trail_stop, etc.
         assert not hasattr(shadow, 'dca_enabled')
         assert not hasattr(shadow, 'trail_stop')
         assert not hasattr(shadow, 'dca_state')
 
     def test_sl_pct_exact(self):
         """Verify SL is exactly -2.5% from entry."""
-        engine, shadow = self._setup_engine_with_shadow(
+        engine, shadow, _ = self._setup_engine_with_shadow(
             entry_price=100.0, stop_loss_pct=2.5,
         )
         assert shadow is not None
@@ -438,7 +447,7 @@ class TestShadowExit:
 
     def test_tp_pct_exact(self):
         """Verify TP is exactly +3.0% from entry."""
-        engine, shadow = self._setup_engine_with_shadow(
+        engine, shadow, _ = self._setup_engine_with_shadow(
             entry_price=100.0, take_profit_pct=3.0,
         )
         assert shadow is not None
@@ -448,13 +457,77 @@ class TestShadowExit:
 
     def test_risk_reward_ratio(self):
         """R:R should be 3.0/2.5 = 1.2R."""
-        engine, shadow = self._setup_engine_with_shadow(entry_price=100.0)
+        engine, shadow, _ = self._setup_engine_with_shadow(entry_price=100.0)
         assert shadow is not None
 
         risk = shadow.entry_price - shadow.stop_price
         reward = shadow.target_1 - shadow.entry_price
         rr = reward / risk
         assert abs(rr - 1.2) < 0.01
+
+    def test_timeout_expiry_profitable(self):
+        """Shadow trade expires after horizon → EXPIRED_PROFITABLE."""
+        settings = _make_settings()
+        config = _make_shadow_config()
+        repo = _MockRepo()
+        base_time = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        engine = ShadowPaperEngine(settings, repo, config, clock=_fixed_clock(base_time))
+        engine._expiry_minutes = 240
+
+        source_trade = _make_source_trade(entry_price=100.0)
+        shadow = engine.check_shadow_entries(source_trade, 100.0)
+        assert shadow is not None
+
+        # Simulate 5 hours later (past 240m expiry), price above entry
+        future_time = base_time + timedelta(hours=5)
+        engine._clock = _fixed_clock(future_time)
+        closed = engine.check_shadow_exits({"BTCUSDT": 101.0})
+
+        assert len(closed) == 1
+        assert closed[0].status == "CLOSED"
+        assert engine.repo._closed[0]["exit_reason"] == "EXPIRED_PROFITABLE"
+
+    def test_timeout_expiry_losing(self):
+        """Shadow trade expires below entry → EXPIRED."""
+        settings = _make_settings()
+        config = _make_shadow_config()
+        repo = _MockRepo()
+        base_time = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        engine = ShadowPaperEngine(settings, repo, config, clock=_fixed_clock(base_time))
+        engine._expiry_minutes = 240
+
+        source_trade = _make_source_trade(entry_price=100.0)
+        shadow = engine.check_shadow_entries(source_trade, 100.0)
+        assert shadow is not None
+
+        # Simulate 5 hours later, price below entry
+        future_time = base_time + timedelta(hours=5)
+        engine._clock = _fixed_clock(future_time)
+        closed = engine.check_shadow_exits({"BTCUSDT": 99.0})
+
+        assert len(closed) == 1
+        assert engine.repo._closed[0]["exit_reason"] == "EXPIRED"
+
+    def test_no_expiry_within_horizon(self):
+        """Shadow trade does NOT expire within the horizon."""
+        settings = _make_settings()
+        config = _make_shadow_config()
+        repo = _MockRepo()
+        base_time = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        engine = ShadowPaperEngine(settings, repo, config, clock=_fixed_clock(base_time))
+        engine._expiry_minutes = 240
+
+        source_trade = _make_source_trade(entry_price=100.0)
+        shadow = engine.check_shadow_entries(source_trade, 100.0)
+        assert shadow is not None
+
+        # Simulate 3 hours later (within 240m horizon), price in normal range
+        future_time = base_time + timedelta(hours=3)
+        engine._clock = _fixed_clock(future_time)
+        mid_price = (shadow.stop_price + shadow.target_1) / 2
+        closed = engine.check_shadow_exits({"BTCUSDT": mid_price})
+
+        assert len(closed) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -549,11 +622,78 @@ class TestRestartRecovery:
         engine = ShadowPaperEngine(settings, repo, config)
 
         assert len(engine.open_trades) == 1
-        assert "BTCUSDT" in engine.open_trades
-        trade = engine.open_trades["BTCUSDT"]
+        assert 42 in engine.open_trades  # keyed by source_trade_id
+        trade = engine.open_trades[42]
         assert trade.shadow_trade_id == 10
         assert trade.status == "OPEN"
         assert trade.direction == "LONG"
+        assert "BTCUSDT" in engine._symbol_index
+
+    def test_load_multiple_shadows_same_symbol(self):
+        """Multiple shadows for the same symbol survive restart."""
+        settings = _make_settings()
+        config = _make_shadow_config()
+        repo = _MockRepo()
+
+        repo.get_open_shadow_trades = lambda: [
+            {
+                "shadow_trade_id": 10,
+                "experiment_id": "ME_SHORT_REVERSE_LONG_V1",
+                "source_trade_id": 100,
+                "source_setup_id": "setup-001",
+                "source_scanner": "MOMENTUM_EXHAUSTION",
+                "source_direction": "SHORT",
+                "symbol": "SUIUSDT",
+                "scanner_name": "ME_SHORT_REVERSE_LONG_V1",
+                "direction": "LONG",
+                "score": 65.0,
+                "entry_price": 100.05,
+                "entry_fee": 0.055,
+                "stop_price": 97.55,
+                "target_1": 103.05,
+                "position_size": 5.0,
+                "risk_usdt": 12.5,
+                "entered_at": datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+                "entry_market_price": 100.0,
+                "slippage": 0.025,
+                "mfe": 0.0,
+                "mae": 0.0,
+                "market_regime": "TREND_UP",
+                "funding_paid": 0.0,
+            },
+            {
+                "shadow_trade_id": 11,
+                "experiment_id": "ME_SHORT_REVERSE_LONG_V1",
+                "source_trade_id": 120,
+                "source_setup_id": "setup-002",
+                "source_scanner": "MOMENTUM_EXHAUSTION",
+                "source_direction": "SHORT",
+                "symbol": "SUIUSDT",
+                "scanner_name": "ME_SHORT_REVERSE_LONG_V1",
+                "direction": "LONG",
+                "score": 70.0,
+                "entry_price": 102.0,
+                "entry_fee": 0.056,
+                "stop_price": 99.45,
+                "target_1": 105.06,
+                "position_size": 4.0,
+                "risk_usdt": 10.2,
+                "entered_at": datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc),
+                "entry_market_price": 102.0,
+                "slippage": 0.051,
+                "mfe": 0.0,
+                "mae": 0.0,
+                "market_regime": "TREND_UP",
+                "funding_paid": 0.0,
+            },
+        ]
+
+        engine = ShadowPaperEngine(settings, repo, config)
+
+        assert len(engine.open_trades) == 2
+        assert 100 in engine.open_trades
+        assert 120 in engine.open_trades
+        assert len(engine._symbol_index.get("SUIUSDT", set())) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -590,6 +730,16 @@ class TestSnapshot:
         assert snap["trades"][0]["symbol"] == "BTCUSDT"
         assert snap["trades"][0]["direction"] == "LONG"
 
+    def test_snapshot_shows_expiry_minutes(self):
+        settings = _make_settings()
+        config = _make_shadow_config()
+        repo = _MockRepo()
+        engine = ShadowPaperEngine(settings, repo, config)
+        engine._expiry_minutes = 120
+
+        snap = engine.snapshot()
+        assert snap["expiry_minutes"] == 120
+
 
 # ---------------------------------------------------------------------------
 # Integration: original ME SHORT unchanged
@@ -599,18 +749,14 @@ class TestOriginalMeShortUnchanged:
     """Verify the original ME SHORT scanner is not modified."""
 
     def test_momentum_exhaustion_scanner_unchanged(self):
-        """The MOMENTUM_EXHAUSTION scanner class is not modified."""
         from app.scanners.momentum_exhaustion import MomentumExhaustionScanner
         scanner = MomentumExhaustionScanner()
         assert scanner.name == "MOMENTUM_EXHAUSTION"
 
     def test_scanner_directions_unchanged(self):
-        """ME SHORT still produces SHORT direction."""
         from app.scanners.momentum_exhaustion import MomentumExhaustionScanner
         scanner = MomentumExhaustionScanner()
-        # The scanner name is unchanged
         assert scanner.name == "MOMENTUM_EXHAUSTION"
-        # The version is unchanged
         assert scanner.version == "2.0.0"
 
 
@@ -631,33 +777,91 @@ class TestEdgeCases:
         source_trade = _make_source_trade(entry_price=100.0)
         shadow = engine.check_shadow_entries(source_trade, 100.0)
 
-        # With 0% SL, distance = 0, so entry should be suppressed
         assert shadow is None
 
     def test_shadow_trade_is_independent_of_main_engine(self):
-        """Shadow engine open_trades is completely separate."""
-        from app.paper.engine import PaperTradingEngine
-
+        """Shadow engine is completely separate from main engine."""
         settings = _make_settings()
         config = _make_shadow_config()
         repo = _MockRepo()
 
         shadow_engine = ShadowPaperEngine(settings, repo, config)
-        # They should have separate open_trades dicts
         assert shadow_engine.open_trades is not None
         assert isinstance(shadow_engine.open_trades, dict)
 
     def test_fees_accounted_in_shadow_pnl(self):
         """Shadow trades account for fees/slippage in P&L."""
-        engine, shadow = TestShadowExit()._setup_engine_with_shadow(entry_price=100.0)
+        settings = _make_settings()
+        config = _make_shadow_config()
+        repo = _MockRepo()
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        engine = ShadowPaperEngine(settings, repo, config, clock=_fixed_clock(now))
+        engine._expiry_minutes = 240
+
+        source_trade = _make_source_trade(entry_price=100.0)
+        shadow = engine.check_shadow_entries(source_trade, 100.0)
         assert shadow is not None
 
         # Price hits TP
         closed = engine.check_shadow_exits({"BTCUSDT": shadow.target_1 + 0.01})
         assert len(closed) == 1
-        # The P&L should be less than raw move due to fees
-        raw_move = shadow.target_1 - shadow.entry_price
-        raw_pnl = raw_move * shadow.position_size
-        # closed[0] has no net_pnl attr but the trade was persisted
-        # Verify the mock repo received close_shadow_trade call
         assert len(engine.repo._closed) == 1
+
+    def test_shadow_index_cleaned_after_close(self):
+        """Symbol index is cleaned when shadow trade closes."""
+        settings = _make_settings()
+        config = _make_shadow_config()
+        repo = _MockRepo()
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        engine = ShadowPaperEngine(settings, repo, config, clock=_fixed_clock(now))
+        engine._expiry_minutes = 240
+
+        source_trade = _make_source_trade(trade_id=42, symbol="BTCUSDT")
+        shadow = engine.check_shadow_entries(source_trade, 100.0)
+        assert shadow is not None
+        assert "BTCUSDT" in engine._symbol_index
+
+        # Close via SL
+        closed = engine.check_shadow_exits({"BTCUSDT": shadow.stop_price - 0.01})
+        assert len(closed) == 1
+        assert "BTCUSDT" not in engine._symbol_index
+        assert 42 not in engine.open_trades
+
+    def test_multiple_shadows_close_independently(self):
+        """Multiple shadows on same symbol close independently."""
+        settings = _make_settings()
+        config = _make_shadow_config()
+        repo = _MockRepo()
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        engine = ShadowPaperEngine(settings, repo, config, clock=_fixed_clock(now))
+        engine._expiry_minutes = 240
+
+        # Shadow1: entry=100, stop≈97.55, tp≈103.05
+        trade1 = _make_source_trade(trade_id=100, setup_id="s1", symbol="SUIUSDT",
+                                     entry_price=100.0)
+        # Shadow2: entry=200, stop≈195.09, tp≈206.10
+        trade2 = _make_source_trade(trade_id=120, setup_id="s2", symbol="SUIUSDT",
+                                     entry_price=200.0)
+
+        shadow1 = engine.check_shadow_entries(trade1, 100.0)
+        shadow2 = engine.check_shadow_entries(trade2, 200.0)
+        assert shadow1 is not None
+        assert shadow2 is not None
+
+        # Price = 198: above shadow2.stop (195.1) → no SL for shadow2
+        # but we need shadow1 to close. shadow1.stop ≈ 97.55.
+        # Price 198 is above shadow1.stop AND above shadow1.tp (103.05)
+        # → shadow1 closes via TAKE_PROFIT, shadow2 stays open.
+        closed = engine.check_shadow_exits({"SUIUSDT": 198.0})
+        assert len(closed) == 1
+        assert closed[0].source_trade_id == 100  # shadow1 closed via TP
+        # shadow2 should still be open
+        assert 120 in engine.open_trades
+        assert len(engine._symbol_index.get("SUIUSDT", set())) == 1
+
+        # Now close shadow2 via SL (price drops below its stop)
+        closed2 = engine.check_shadow_exits({"SUIUSDT": shadow2.stop_price - 0.01})
+        assert len(closed2) == 1
+        assert closed2[0].source_trade_id == 120
+        assert "SUIUSDT" not in engine._symbol_index
+        assert len(engine.open_trades) == 0
