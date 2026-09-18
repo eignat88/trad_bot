@@ -23,3 +23,9 @@ docs/VPS_DEPLOY.md
 monitoring/grafana/.env
 *.secret
 *.key
+
+.cache/
+.venv/
+backup/
+config.yaml.save
+config.yaml.save.*
