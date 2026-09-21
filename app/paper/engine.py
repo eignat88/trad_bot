@@ -416,6 +416,22 @@ class PaperTradingEngine:
             entry_fee = entry * quantity * self.settings.taker_fee
             entry_slippage_cost = abs(entry - entry_market) * quantity
 
+            # Minimum effective risk gate: reject tiny positions where
+            # exposure caps have shrunk the position so much that the
+            # actual risk is negligible compared to the requested risk.
+            requested_risk = self.balance * risk_fraction
+            effective_risk_ratio = risk_usdt / requested_risk if requested_risk > 0 else 0.0
+            if effective_risk_ratio < self.settings.min_effective_risk_ratio:
+                logger.info(
+                    "paper gate: tiny position rejected "
+                    "symbol=%s scanner=%s requested_risk=%.4f "
+                    "actual_risk=%.4f effective_risk_ratio=%.4f "
+                    "reason=MIN_EFFECTIVE_RISK",
+                    c.symbol, c.scanner_name, requested_risk,
+                    risk_usdt, effective_risk_ratio,
+                )
+                continue
+
             # Check daily loss / consecutive losses
             if self.balance - entry_fee - entry_slippage_cost <= 0:
                 continue
@@ -723,9 +739,15 @@ class PaperTradingEngine:
                     avg_entry = trade.dca_state.avg_entry_price
                     result = self._close_trade(trade, avg_entry, "DCA_BREAKEVEN")
 
-            # 4. Take profit 1 check — skip for FIXED_HORIZON, allow for FIXED_TP_SL_HORIZON
+            # 4. Take profit 1 check — skip for FIXED_HORIZON, allow for
+            # FIXED_TP_SL_HORIZON only when tp_enabled=True.
+            tp_allowed_for_policy = (
+                is_fixed_tp_sl_horizon
+                and policy_config is not None
+                and policy_config.tp_enabled is True
+            )
             if result is None and trade.target_1 is not None:
-                if is_fixed_tp_sl_horizon or not is_fixed_horizon:
+                if tp_allowed_for_policy or not is_fixed_horizon:
                     if is_long and price >= trade.target_1:
                         result = self._close_trade(trade, trade.target_1, "TAKE_PROFIT_1")
                     elif not is_long and price <= trade.target_1:
@@ -738,9 +760,18 @@ class PaperTradingEngine:
                 elif not is_long and price <= trade.target_2:
                     result = self._close_trade(trade, trade.target_2, "TAKE_PROFIT_2")
 
-            # 6. Trailing stop logic — skip for FIXED_HORIZON, allow for FIXED_TP_SL_HORIZON
+            # 6. Trailing stop logic — skip for FIXED_HORIZON.
+            # FIXED_TP_SL_HORIZON: only call trailing when policy config
+            # explicitly enables it; when trailing_enabled=false the stop
+            # must remain immutable until STOP_LOSS / TAKE_PROFIT_1 /
+            # FIXED_HORIZON fires.
             if result is None:
-                if is_fixed_tp_sl_horizon or not is_fixed_horizon:
+                trailing_allowed = (
+                    is_fixed_tp_sl_horizon
+                    and policy_config is not None
+                    and policy_config.trailing_enabled is True
+                ) or (not is_fixed_horizon)
+                if trailing_allowed:
                     if not (trade.dca_enabled and trade.dca_state is not None and trade.dca_state.state == DCAState.DCA_FILLED):
                         result = self._check_trailing_stop(trade, price)
 
