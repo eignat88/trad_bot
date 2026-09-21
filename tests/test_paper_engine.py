@@ -250,7 +250,8 @@ def test_funding_is_settled_once_per_completed_interval():
 def test_exposure_cap_recalculates_actual_risk():
     engine = PaperTradingEngine(
         Settings(initial_balance=1_000, risk_per_trade=0.10,
-                 max_symbol_exposure=0.10, taker_fee=0, slippage_percent=0),
+                 max_symbol_exposure=0.10, taker_fee=0, slippage_percent=0,
+                 min_effective_risk_ratio=0.0),
         FakeRepository(),
     )
     trade = engine.check_entries([_candidate(invalidation_price=90)], {"BTCUSDT": 100})[0]
@@ -509,6 +510,7 @@ def test_portfolio_exposure_limits_and_metrics():
         initial_balance=1_000, risk_per_trade=0.5, max_symbol_exposure=1,
         max_portfolio_gross_exposure=0.2, max_portfolio_net_exposure=0.1,
         taker_fee=0, slippage_percent=0,
+        min_effective_risk_ratio=0.0,
     )
     engine = PaperTradingEngine(settings, FakeRepository())
     trade = engine.check_entries([_candidate()], {"BTCUSDT": 100})[0]
