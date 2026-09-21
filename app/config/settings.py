@@ -187,6 +187,12 @@ class Settings:
     # Multiplier for setup TTL — doubles the default entry-timeout bars.
     # 2.0 means a 5m setup lives 2 hours instead of 1 hour.
     setup_ttl_multiplier: float = 2.0
+    # Minimum effective risk ratio for paper entries.  After all exposure
+    # caps are applied, if actual risk_usdt / requested_risk falls below
+    # this threshold the trade is rejected (position too small to be useful).
+    # 0.50 means the trade must retain at least 50 % of the originally
+    # requested risk amount.  Set to 0.0 to disable the gate (legacy behavior).
+    min_effective_risk_ratio: float = 0.50
     # When enabled, reject entries where direction conflicts with the
     # market regime (e.g. LONG in TREND_DOWN, SHORT in TREND_UP).
     regime_filter_enabled: bool = True
