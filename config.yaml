@@ -44,7 +44,8 @@
     ["MOMENTUM_EXHAUSTION", "LONG"],
     ["MOMENTUM_EXHAUSTION", "SHORT"],
     ["TREND_PULLBACK_V2", "SHORT"],
-    ["MOMENTUM_EXHAUSTION_REVERSE_LONG_V1", "SHORT"]
+    ["MOMENTUM_EXHAUSTION_REVERSE_LONG_V1", "SHORT"],
+    ["MOMENTUM_EXHAUSTION_REVERSE_LONG_V2", "SHORT"]
   ],
   "scanner_regime_whitelist": {
     "TREND_PULLBACK_V2": {"LONG": ["TREND_UP"]}
@@ -81,6 +82,18 @@
       }
     },
     "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1": {
+      "LONG": {
+        "policy": "FIXED_TP_SL_HORIZON_V1",
+        "enabled": true,
+        "hold_minutes": 240,
+        "dca_enabled": false,
+        "trailing_enabled": false,
+        "breakeven_enabled": false,
+        "tp_enabled": true,
+        "expiry_enabled": false
+      }
+    },
+    "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2": {
       "LONG": {
         "policy": "FIXED_TP_SL_HORIZON_V1",
         "enabled": true,

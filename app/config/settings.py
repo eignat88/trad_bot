@@ -156,6 +156,7 @@ class Settings:
         ("MOMENTUM_EXHAUSTION", "SHORT"),  # Block original ME SHORT for experiment
         ("TREND_PULLBACK_V2", "SHORT"),
         ("MOMENTUM_EXHAUSTION_REVERSE_LONG_V1", "SHORT"),  # Reverse long only trades LONG
+        ("MOMENTUM_EXHAUSTION_REVERSE_LONG_V2", "SHORT"),  # Reverse long V2 only trades LONG
     )
     # Optional scanner/direction regime allow-lists. Unspecified scanners use
     # the generic direction-conflict filter; an empty tuple blocks a direction.

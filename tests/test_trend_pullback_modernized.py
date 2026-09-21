@@ -112,6 +112,6 @@ def test_default_orchestrator_has_v2_and_no_legacy():
     assert "TREND_PULLBACK" not in orchestrator.scanners, (
         "Legacy TREND_PULLBACK must not be in default scanners"
     )
-    assert len(orchestrator.scanners) == 10, (
-        f"Expected 10 default scanners, got {len(orchestrator.scanners)}: {list(orchestrator.scanners)}"
+    assert len(orchestrator.scanners) == 11, (
+        f"Expected 11 default scanners, got {len(orchestrator.scanners)}: {list(orchestrator.scanners)}"
     )
