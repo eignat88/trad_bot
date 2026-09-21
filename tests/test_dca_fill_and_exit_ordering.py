@@ -64,6 +64,7 @@ def _make_engine(dca_enabled=True, dca_settings=None):
         atr_stop_multiple=1.5,
         paper_scan_interval=300,
         paper_safety_gate_mode="observe",
+        min_effective_risk_ratio=0.0,  # disabled: tests focus on DCA, not risk gate
         dca=dca_settings,
     )
     repo = MagicMock()
