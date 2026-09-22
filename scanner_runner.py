@@ -167,7 +167,6 @@ def run_scan_cycle(
                         regime_filter=settings.regime_filter_enabled,
                         scanner_regime_whitelist=settings.scanner_regime_whitelist,
                         trading_mode=settings.trading_mode,
-                        run_id=run_id,
                     )
                 else:
                     candidates, symbol_stats = orchestrator.scan_all_with_stats(
@@ -175,7 +174,6 @@ def run_scan_cycle(
                         gate_policy=gate_policy,
                         regime_filter=settings.regime_filter_enabled,
                         scanner_regime_whitelist=settings.scanner_regime_whitelist,
-                        run_id=run_id,
                     )
                 for name, values in symbol_stats.items():
                     stat = run_stats[name]
