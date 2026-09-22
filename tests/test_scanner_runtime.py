@@ -222,3 +222,92 @@ def test_dynamic_universe_preserves_liquidity_metadata():
 
     assert universe == [{"symbol": "BTCUSDT", "turnover_24h": 123.5,
                          "volume_24h": 4.25, "rank": 1}]
+
+
+def test_fvg_lifecycle_summary_called_once_per_cycle(monkeypatch):
+    """After 50 symbol scans, log_lifecycle_summary() called exactly once."""
+    log_calls = []
+
+    class FakeFVGScanner:
+        name = "FVG_REACTION_LONG_LOCAL_STRUCT_V1"
+
+        def scan(self, ctx):
+            return []
+
+        def log_lifecycle_summary(self):
+            log_calls.append(1)
+
+    class Orchestrator:
+        scanners = {
+            "FVG_REACTION_LONG_LOCAL_STRUCT_V1": FakeFVGScanner(),
+            "OTHER_SCANNER": object(),
+        }
+
+        def scan_all_with_stats(self, ctx, **kwargs):
+            return [], {
+                "FVG_REACTION_LONG_LOCAL_STRUCT_V1": {
+                    "candidates_found": 0, "setups_saved": 0,
+                    "errors_count": 0, "duration_ms": 1,
+                },
+                "OTHER_SCANNER": {
+                    "candidates_found": 0, "setups_saved": 0,
+                    "errors_count": 0, "duration_ms": 1,
+                },
+            }
+
+    class Repository:
+        def save_run_stat(self, *args, **kwargs):
+            pass
+
+    symbols = [f"SYM{i}" for i in range(50)]
+
+    def build_context(client, symbol, settings):
+        return symbol
+
+    monkeypatch.setattr(scanner_runner, "build_market_context", build_context)
+    total, scanned, failed = scanner_runner.run_scan_cycle(
+        object(), Orchestrator(), Repository(), symbols, None,
+        Settings(scanner_workers=4),
+    )
+
+    assert scanned == 50
+    assert failed == 0
+    assert len(log_calls) == 1, (
+        f"log_lifecycle_summary() called {len(log_calls)} times, expected exactly 1"
+    )
+
+
+def test_fvg_lifecycle_summary_does_not_break_on_error(monkeypatch):
+    """If log_lifecycle_summary raises, scanner cycle still completes."""
+
+    class BrokenFVGScanner:
+        name = "FVG_REACTION_LONG_LOCAL_STRUCT_V1"
+
+        def scan(self, ctx):
+            return []
+
+        def log_lifecycle_summary(self):
+            raise RuntimeError("diagnostic failure")
+
+    class Orchestrator:
+        scanners = {"FVG_REACTION_LONG_LOCAL_STRUCT_V1": BrokenFVGScanner()}
+
+        def scan_all_with_stats(self, ctx, **kwargs):
+            return [], {"FVG_REACTION_LONG_LOCAL_STRUCT_V1": {
+                "candidates_found": 0, "setups_saved": 0,
+                "errors_count": 0, "duration_ms": 1,
+            }}
+
+    class Repository:
+        def save_run_stat(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(scanner_runner, "build_market_context",
+                        lambda client, symbol, settings: symbol)
+
+    total, scanned, failed = scanner_runner.run_scan_cycle(
+        object(), Orchestrator(), Repository(), ["SYM1"], None,
+        Settings(scanner_workers=1),
+    )
+    assert scanned == 1
+    assert failed == 0
