@@ -4,6 +4,12 @@ Implements a stateful scanner that detects bullish Fair Value Gaps,
 waits for price retracement (first touch), then requires LOCAL_STRUCT
 confirmation before emitting a LONG signal.
 
+STATE INDEX FIX (2026-09-22):
+  All state is tracked by timestamp, NOT by candle array index.
+  Each scan() call receives a fresh 200-candle rolling window where
+  absolute indices shift between cycles.  We resolve timestamps to
+  current indices on every cycle to avoid the "frozen index" bug.
+
 Frozen configuration from V2 validation (OOS ROBUST CANDIDATE):
   Direction:      LONG
   Entry:          FIRST_TOUCH
@@ -15,9 +21,8 @@ Frozen configuration from V2 validation (OOS ROBUST CANDIDATE):
   MAX_BARS_TO_TOUCH: 48
 
 LOCAL_STRUCT formula (from research backtest_engine.py):
-  On candle AFTER touch:
-    swing_high = max(c.high for c in candles[touch_idx-20 : touch_idx])
-    confirmation = candle.close > swing_high
+  swing_high = max(c.high for c in candles[touch_idx-20:touch_idx])
+  confirmed = next_candle.close > swing_high
 
 References:
   FVG_REACTION_LONG_LOCAL_STRUCT_V2_VALIDATION
@@ -26,14 +31,13 @@ References:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
 from app.scanners.models import (
     MarketContext,
-    ScannerDirection,
     SetupCandidate,
     SetupState,
 )
@@ -41,7 +45,7 @@ from app.scanners.models import (
 logger = logging.getLogger(__name__)
 
 SCANNER_NAME = "FVG_REACTION_LONG_LOCAL_STRUCT_V1"
-SCANNER_VERSION = "1.0.0"
+SCANNER_VERSION = "1.0.1"  # bump for rolling-window fix
 
 # --- Frozen eligibility from V2 validation ---
 MIN_FVG_ATR = 0.05
@@ -49,16 +53,39 @@ MIN_C2_BODY_RATIO = 0.50
 MAX_BARS_TO_TOUCH = 48
 
 # --- SL/TP ---
-SL_BUFFER_ATR = 0.05  # SL = C2.low - atr * SL_BUFFER_ATR
+SL_BUFFER_ATR = 0.05
 TARGET_R = 3.0
 
 # --- LOCAL_STRUCT lookback ---
 LOCAL_STRUCT_LOOKBACK = 20
 
+# Interval lookup for timestamp-based bar counting
+_INTERVAL_MS: dict[str, int] = {
+    "5m": 300_000,
+    "15m": 900_000,
+    "1h": 3_600_000,
+    "4h": 14_400_000,
+}
+
 
 # ---------------------------------------------------------------------------
-# FVG detection (3-candle model)
+# Helpers
 # ---------------------------------------------------------------------------
+
+def _find_idx_by_ts(candles: list, ts: int) -> int | None:
+    """Find index of candle with matching timestamp. O(n) but n<=200."""
+    for i, c in enumerate(candles):
+        if c.timestamp == ts:
+            return i
+    return None
+
+
+def _bars_between(ts1: int, ts2: int, interval_ms: int) -> int:
+    """Number of bars between two timestamps."""
+    if interval_ms <= 0:
+        return 0
+    return max(0, (ts2 - ts1) // interval_ms)
+
 
 def _atr(candles: list, period: int = 14) -> float:
     """Wilder ATR from a list of Candle objects."""
@@ -76,19 +103,14 @@ def _atr(candles: list, period: int = 14) -> float:
     return atr_val
 
 
-def _volume_sma(candles: list, period: int = 20) -> float:
-    """Simple moving average of volume."""
-    if not candles:
-        return 1.0
-    n = min(period, len(candles))
-    return sum(c.volume for c in candles[-n:]) / n
-
+# ---------------------------------------------------------------------------
+# FVG detection
+# ---------------------------------------------------------------------------
 
 def detect_bullish_fvg(candles: list, index: int) -> dict[str, Any] | None:
-    """Detect a bullish FVG at position `index` (which is C3).
+    """Detect a bullish FVG at position `index` (C3).
 
-    Returns FVG dict if detected, None otherwise.
-    FVG is formed only after C3 closes — no look-ahead.
+    FVG formed only after C3 closes — no look-ahead.
     """
     if index < 2:
         return None
@@ -97,24 +119,19 @@ def detect_bullish_fvg(candles: list, index: int) -> dict[str, Any] | None:
     c2 = candles[index - 1]
     c3 = candles[index]
 
-    # Bullish FVG: C3.low > C1.high
     if c3.low <= c1.high:
         return None
 
     fvg_low = c1.high
     fvg_high = c3.low
     fvg_size = fvg_high - fvg_low
-
-    # Compute ATR at C3
     atr_val = _atr(candles[: index + 1])
 
-    # Compute C2 metrics
     c2_body = abs(c2.close - c2.open)
     c2_range = c2.high - c2.low
     c2_body_ratio = c2_body / c2_range if c2_range > 0 else 0.0
     c2_body_atr = c2_body / atr_val if atr_val > 0 else 0.0
 
-    # Eligibility
     if atr_val <= 0 or fvg_size / atr_val < MIN_FVG_ATR:
         return None
     if c2_body_ratio < MIN_C2_BODY_RATIO:
@@ -134,7 +151,6 @@ def detect_bullish_fvg(candles: list, index: int) -> dict[str, Any] | None:
         "c2_body_ratio": c2_body_ratio,
         "c2_body_atr": c2_body_atr,
         "atr": atr_val,
-        "c3_index": index,
     }
 
 
@@ -155,44 +171,40 @@ class FVGState(str, Enum):
 
 @dataclass
 class FVGSetup:
-    """Tracks a single FVG through its lifecycle."""
+    """Tracks a single FVG through its lifecycle.
+
+    All temporal state is stored as timestamps, never as candle array indices.
+    """
     symbol: str
     timeframe: str
     state: FVGState = FVGState.DETECTED
 
-    # FVG formation data
+    # FVG formation data (immutable after creation)
     fvg_created_at: int = 0
     fvg_low: float = 0.0
     fvg_high: float = 0.0
     fvg_size: float = 0.0
     fvg_atr: float = 0.0
 
-    # C2 data
+    # C2 data (immutable)
     c2_timestamp: int = 0
     c2_high: float = 0.0
     c2_low: float = 0.0
     c2_body_ratio: float = 0.0
     c2_body_atr: float = 0.0
-    c2_index: int = 0
 
-    # ATR
+    # ATR (immutable)
     atr: float = 0.0
 
-    # Index tracking
-    fvg_c3_index: int = 0  # index of C3 in candle array
-    bars_since_creation: int = 0
-
-    # Touch data
+    # Touch data (timestamps, not indices)
     first_touch_at: int | None = None
     bars_to_touch: int | None = None
     touch_price: float | None = None
-    touch_candle_index: int | None = None
 
     # Confirmation data
     confirmation_at: int | None = None
-    confirmation_candle_index: int | None = None
 
-    # Signal data (when confirmed)
+    # Signal data
     entry_price: float | None = None
     sl_price: float | None = None
     tp_price: float | None = None
@@ -206,31 +218,23 @@ class FVGSetup:
 # LOCAL_STRUCT confirmation
 # ---------------------------------------------------------------------------
 
-def check_local_struct_long(candles: list, touch_candle_idx: int) -> tuple[bool, float]:
+def check_local_struct_long(candles: list, touch_idx: int) -> tuple[bool, float]:
     """Check LOCAL_STRUCT confirmation for LONG.
 
-    Formula (from research backtest_engine.py):
-      swing_high = max(c.high for c in candles[touch_idx-20 : touch_idx])
-      On next candle: confirmed if candle.close > swing_high
-
-    Args:
-        candles: Full candle array.
-        touch_candle_idx: Index of the candle that touched the FVG.
-
-    Returns:
-        (is_confirmed, swing_high_value)
+    Formula:
+      swing_high = max(c.high for c in candles[touch_idx-20:touch_idx])
+      confirmed = candles[touch_idx+1].close > swing_high
     """
-    check_idx = touch_candle_idx + 1
+    check_idx = touch_idx + 1
     if check_idx >= len(candles):
         return False, 0.0
 
-    start = max(0, touch_candle_idx - LOCAL_STRUCT_LOOKBACK)
-    if touch_candle_idx <= start:
+    start = max(0, touch_idx - LOCAL_STRUCT_LOOKBACK)
+    if touch_idx <= start:
         return False, 0.0
 
-    swing_high = max(c.high for c in candles[start:touch_candle_idx])
+    swing_high = max(c.high for c in candles[start:touch_idx])
     confirmed = candles[check_idx].close > swing_high
-
     return confirmed, swing_high
 
 
@@ -239,19 +243,21 @@ def check_local_struct_long(candles: list, touch_candle_idx: int) -> tuple[bool,
 # ---------------------------------------------------------------------------
 
 class FVGReactionLongLocalStructV1Scanner:
-    """Stateful scanner: detects bullish FVGs, waits for touch + LOCAL_STRUCT."""
+    """Stateful scanner: detects bullish FVGs, waits for touch + LOCAL_STRUCT.
+
+    State is tracked by timestamps.  On each scan() cycle, we resolve
+    timestamps to current candle indices to handle the rolling 200-candle
+    window correctly.
+    """
 
     name = SCANNER_NAME
     version = SCANNER_VERSION
 
     def __init__(self) -> None:
-        # Active FVG setups keyed by (symbol, timeframe, fvg_created_at)
         self._setups: dict[tuple[str, str, int], FVGSetup] = {}
-        # Emitted signal fingerprints to prevent duplicates
         self._emitted: set[str] = set()
 
     def scan(self, ctx: MarketContext) -> list[SetupCandidate]:
-        """Scan for FVG setups. Called each cycle per symbol."""
         candidates: list[SetupCandidate] = []
 
         for tf_label, candles in [
@@ -261,22 +267,27 @@ class FVGReactionLongLocalStructV1Scanner:
             if len(candles) < 3:
                 continue
 
-            # Process existing setups first (may emit signals)
-            setup_candidates = self._update_setups(ctx.symbol, tf_label, candles, ctx)
+            interval_ms = _INTERVAL_MS.get(tf_label, 300_000)
+            last_candle = candles[-1]
+
+            # 1) Update existing setups using current candle window
+            setup_candidates = self._update_setups(
+                ctx.symbol, tf_label, candles, ctx, interval_ms,
+            )
             candidates.extend(setup_candidates)
 
-            # Detect new FVGs on the latest candle
-            new_candidates = self._detect_and_track(ctx.symbol, tf_label, candles, ctx)
-            candidates.extend(new_candidates)
+            # 2) Detect new FVGs on the latest candle
+            self._detect_and_track(ctx.symbol, tf_label, candles, ctx)
 
-            # If new FVGs were just created, immediately check touch/confirmation
-            # on the current candle data (handles both incremental and batch modes)
-            if new_candidates or any(
-                s.state == FVGState.WAITING_TOUCH
+            # 3) Re-process if new FVGs or WAITING_TOUCH setups exist
+            if any(
+                s.state in (FVGState.WAITING_TOUCH, FVGState.WAITING_LOCAL_STRUCT)
                 for s in self._setups.values()
                 if s.symbol == ctx.symbol and s.timeframe == tf_label
             ):
-                more = self._update_setups(ctx.symbol, tf_label, candles, ctx)
+                more = self._update_setups(
+                    ctx.symbol, tf_label, candles, ctx, interval_ms,
+                )
                 candidates.extend(more)
 
         return candidates
@@ -287,22 +298,17 @@ class FVGReactionLongLocalStructV1Scanner:
         timeframe: str,
         candles: list,
         ctx: MarketContext,
-    ) -> list[SetupCandidate]:
-        """Detect new FVGs and start tracking them."""
-        candidates: list[SetupCandidate] = []
+    ) -> None:
+        """Detect new FVG on the latest candle and add to tracking."""
         last_idx = len(candles) - 1
-
-        # Detect FVG on the most recent candle (C3 = last candle)
         fvg = detect_bullish_fvg(candles, last_idx)
         if fvg is None:
-            return candidates
+            return
 
-        # Duplicate check: don't create if same FVG already tracked
         key = (symbol, timeframe, fvg["fvg_created_at"])
         if key in self._setups:
-            return candidates
+            return
 
-        # Create new FVG setup
         setup = FVGSetup(
             symbol=symbol,
             timeframe=timeframe,
@@ -317,20 +323,10 @@ class FVGReactionLongLocalStructV1Scanner:
             c2_low=fvg["c2_low"],
             c2_body_ratio=fvg["c2_body_ratio"],
             c2_body_atr=fvg["c2_body_atr"],
-            c2_index=fvg["c3_index"] - 1,
             atr=fvg["atr"],
-            fvg_c3_index=fvg["c3_index"],
             market_regime=ctx.market_regime,
         )
-
         self._setups[key] = setup
-        logger.debug(
-            "%s %s: FVG detected fvg_low=%.4f fvg_high=%.4f fvg_atr=%.4f c2_body_ratio=%.2f",
-            symbol, timeframe, setup.fvg_low, setup.fvg_high,
-            setup.fvg_atr, setup.c2_body_ratio,
-        )
-
-        return candidates
 
     def _update_setups(
         self,
@@ -338,14 +334,12 @@ class FVGReactionLongLocalStructV1Scanner:
         timeframe: str,
         candles: list,
         ctx: MarketContext,
+        interval_ms: int,
     ) -> list[SetupCandidate]:
-        """Update all active setups for this symbol/timeframe."""
+        """Update all active setups using timestamp-based state resolution."""
         candidates: list[SetupCandidate] = []
-        last_idx = len(candles) - 1
-        last_candle = candles[last_idx]
-
-        to_expire: list[tuple[str, str, int]] = []
-        to_confirm: list[tuple[str, str, int]] = []
+        last_candle = candles[-1]
+        last_ts = last_candle.timestamp
 
         for key, setup in self._setups.items():
             if setup.symbol != symbol or setup.timeframe != timeframe:
@@ -353,85 +347,125 @@ class FVGReactionLongLocalStructV1Scanner:
             if setup.state in (FVGState.EXPIRED, FVGState.INVALIDATED, FVGState.SIGNAL_EMITTED):
                 continue
 
-            setup.bars_since_creation = last_idx - setup.fvg_c3_index
+            # --- bars_since_creation via timestamps ---
+            bars_since = _bars_between(setup.fvg_created_at, last_ts, interval_ms)
 
-            # --- State: WAITING_TOUCH ---
+            # --- WAITING_TOUCH ---
             if setup.state == FVGState.WAITING_TOUCH:
-                # Check expiration
-                if setup.bars_since_creation > MAX_BARS_TO_TOUCH:
+                if bars_since > MAX_BARS_TO_TOUCH:
                     setup.state = FVGState.EXPIRED
-                    logger.debug("%s %s: FVG expired (bars=%d)", symbol, timeframe, setup.bars_since_creation)
                     continue
 
-                # Check touch: price enters FVG zone (high >= fvg_low for bullish)
-                # Only check candles AFTER the FVG was formed (fvg_c3_index + 1)
-                if last_idx > setup.fvg_c3_index and last_candle.low <= setup.fvg_high:
-                    setup.state = FVGState.TOUCHED
-                    setup.first_touch_at = last_candle.timestamp
-                    setup.bars_to_touch = setup.bars_since_creation
-                    setup.touch_price = min(last_candle.low, setup.fvg_high)
-                    setup.touch_candle_index = last_idx
-
-                    # Immediately check LOCAL_STRUCT on next candle
+                # Scan ALL candles after FVG creation for touch
+                if self._check_touch(setup, candles, interval_ms, bars_since):
                     setup.state = FVGState.WAITING_LOCAL_STRUCT
 
-            # --- State: WAITING_LOCAL_STRUCT ---
+            # --- WAITING_LOCAL_STRUCT ---
             elif setup.state == FVGState.WAITING_LOCAL_STRUCT:
-                # Check expiration
-                if setup.bars_since_creation > MAX_BARS_TO_TOUCH:
+                if bars_since > MAX_BARS_TO_TOUCH:
                     setup.state = FVGState.EXPIRED
                     continue
 
-                # LOCAL_STRUCT check: on the candle AFTER touch
-                if setup.touch_candle_index is not None:
-                    confirmed, swing_high = check_local_struct_long(
-                        candles, setup.touch_candle_index,
-                    )
-                    if confirmed:
-                        setup.state = FVGState.CONFIRMED
-                        setup.confirmation_at = last_candle.timestamp
-                        setup.confirmation_candle_index = last_idx
-
-                        # Compute entry, SL, TP
-                        # Entry: at the close of confirmation candle (next candle after touch)
-                        entry_price = last_candle.close
-                        sl_price = setup.c2_low - setup.atr * SL_BUFFER_ATR
-                        risk = entry_price - sl_price
-
-                        if risk <= 0 or entry_price <= sl_price:
-                            setup.state = FVGState.INVALIDATED
-                            logger.debug(
-                                "%s %s: FVG invalidated (bad geometry entry=%.4f sl=%.4f)",
-                                symbol, timeframe, entry_price, sl_price,
-                            )
-                            continue
-
-                        tp_price = entry_price + TARGET_R * risk
-
-                        setup.entry_price = entry_price
-                        setup.sl_price = sl_price
-                        setup.tp_price = tp_price
-                        setup.risk = risk
-
-                        # Create candidate
-                        candidate = self._make_candidate(setup, ctx)
-                        if candidate is not None:
-                            candidates.append(candidate)
-                            setup.state = FVGState.SIGNAL_EMITTED
-
-        # Cleanup expired/invalidated
-        for key in to_expire:
-            if key in self._setups:
-                del self._setups[key]
+                candidate = self._check_local_struct_and_emit(
+                    setup, candles, ctx, interval_ms, bars_since,
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
 
         return candidates
 
+    def _check_touch(
+        self,
+        setup: FVGSetup,
+        candles: list,
+        interval_ms: int,
+        bars_since: int,
+    ) -> bool:
+        """Check all candles after FVG creation for first touch.
+
+        Returns True if touch was found (setup state updated).
+        """
+        # Find the candle index of FVG creation in the current window
+        fvg_idx = _find_idx_by_ts(candles, setup.fvg_created_at)
+        if fvg_idx is None:
+            # FVG created candle not in current window — too old
+            if bars_since > MAX_BARS_TO_TOUCH:
+                setup.state = FVGState.EXPIRED
+            return False
+
+        # Scan candles AFTER FVG creation
+        for idx in range(fvg_idx + 1, len(candles)):
+            candle = candles[idx]
+            if candle.low <= setup.fvg_high:
+                bars_to_touch = _bars_between(setup.fvg_created_at, candle.timestamp, interval_ms)
+                setup.first_touch_at = candle.timestamp
+                setup.bars_to_touch = bars_to_touch
+                setup.touch_price = min(candle.low, setup.fvg_high)
+                return True
+
+        return False
+
+    def _check_local_struct_and_emit(
+        self,
+        setup: FVGSetup,
+        candles: list,
+        ctx: MarketContext,
+        interval_ms: int,
+        bars_since: int,
+    ) -> SetupCandidate | None:
+        """Check LOCAL_STRUCT confirmation and emit signal if confirmed.
+
+        Looks at ALL candles after first_touch_at for the confirmation pattern.
+        """
+        if setup.first_touch_at is None:
+            return None
+
+        touch_idx = _find_idx_by_ts(candles, setup.first_touch_at)
+        if touch_idx is None:
+            # Touch candle not in current window — check if we can still confirm
+            # using the latest available candles
+            return None
+
+        # Check LOCAL_STRUCT on candles AFTER touch
+        for check_idx in range(touch_idx + 1, len(candles)):
+            check_candle = candles[check_idx]
+
+            # Compute swing_high from the 20 candles before touch
+            swing_start = max(0, touch_idx - LOCAL_STRUCT_LOOKBACK)
+            if touch_idx <= swing_start:
+                continue
+            swing_high = max(c.high for c in candles[swing_start:touch_idx])
+
+            if check_candle.close > swing_high:
+                # CONFIRMED!
+                setup.state = FVGState.CONFIRMED
+                setup.confirmation_at = check_candle.timestamp
+
+                entry_price = check_candle.close
+                sl_price = setup.c2_low - setup.atr * SL_BUFFER_ATR
+                risk = entry_price - sl_price
+
+                if risk <= 0 or entry_price <= sl_price:
+                    setup.state = FVGState.INVALIDATED
+                    return None
+
+                tp_price = entry_price + TARGET_R * risk
+                setup.entry_price = entry_price
+                setup.sl_price = sl_price
+                setup.tp_price = tp_price
+                setup.risk = risk
+
+                candidate = self._make_candidate(setup, ctx)
+                if candidate is not None:
+                    setup.state = FVGState.SIGNAL_EMITTED
+                return candidate
+
+        return None
+
     def _make_candidate(self, setup: FVGSetup, ctx: MarketContext) -> SetupCandidate | None:
-        """Convert a confirmed FVGSetup into a SetupCandidate."""
         if setup.entry_price is None or setup.sl_price is None or setup.tp_price is None:
             return None
 
-        # Duplicate fingerprint check
         fp = f"{SCANNER_NAME}|{setup.symbol}|LONG|{setup.timeframe}|{setup.fvg_created_at}"
         if fp in self._emitted:
             return None
@@ -451,12 +485,12 @@ class FVGReactionLongLocalStructV1Scanner:
             setup_started_at=now,
             signal_candle_open_time=setup.fvg_created_at,
             reference_price=setup.entry_price,
-            entry_zone_low=setup.entry_price,  # single price entry
+            entry_zone_low=setup.entry_price,
             entry_zone_high=setup.entry_price,
             invalidation_price=setup.sl_price,
             target_1=setup.tp_price,
             target_2=None,
-            score=80.0,  # base score
+            score=80.0,
             market_regime=setup.market_regime,
             reasons=(
                 "FVG_REACTION",
@@ -486,10 +520,9 @@ class FVGReactionLongLocalStructV1Scanner:
         )
 
     def cleanup_expired(self) -> int:
-        """Remove old expired/invalidated setups. Returns count removed."""
         to_remove = [
-            key for key, setup in self._setups.items()
-            if setup.state in (FVGState.EXPIRED, FVGState.INVALIDATED, FVGState.SIGNAL_EMITTED)
+            key for key, s in self._setups.items()
+            if s.state in (FVGState.EXPIRED, FVGState.INVALIDATED, FVGState.SIGNAL_EMITTED)
         ]
         for key in to_remove:
             del self._setups[key]
@@ -497,7 +530,6 @@ class FVGReactionLongLocalStructV1Scanner:
 
     @property
     def active_setups(self) -> int:
-        """Number of currently active (non-terminal) setups."""
         return sum(
             1 for s in self._setups.values()
             if s.state not in (FVGState.EXPIRED, FVGState.INVALIDATED, FVGState.SIGNAL_EMITTED)
