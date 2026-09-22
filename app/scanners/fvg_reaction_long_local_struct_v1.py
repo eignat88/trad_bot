@@ -165,8 +165,16 @@ class FVGState(str, Enum):
     WAITING_LOCAL_STRUCT = "WAITING_LOCAL_STRUCT"
     CONFIRMED = "CONFIRMED"
     SIGNAL_EMITTED = "SIGNAL_EMITTED"
+    LOCAL_STRUCT_REJECTED = "LOCAL_STRUCT_REJECTED"
     EXPIRED = "EXPIRED"
     INVALIDATED = "INVALIDATED"
+
+
+# States that should not be processed further
+TERMINAL_STATES = frozenset({
+    FVGState.EXPIRED, FVGState.INVALIDATED,
+    FVGState.SIGNAL_EMITTED, FVGState.LOCAL_STRUCT_REJECTED,
+})
 
 
 @dataclass
@@ -259,7 +267,7 @@ class FVGReactionLongLocalStructV1Scanner:
         # --- Observability counters (cumulative) ---
         self._counters: dict[str, int] = {
             "detected": 0, "touched": 0, "confirmed": 0,
-            "expired": 0, "invalidated": 0, "emitted": 0,
+            "rejected": 0, "expired": 0, "invalidated": 0, "emitted": 0,
         }
         self._tf_counters: dict[str, dict[str, int]] = {
             "5m": {k: 0 for k in self._counters},
@@ -366,7 +374,7 @@ class FVGReactionLongLocalStructV1Scanner:
         for key, setup in self._setups.items():
             if setup.symbol != symbol or setup.timeframe != timeframe:
                 continue
-            if setup.state in (FVGState.EXPIRED, FVGState.INVALIDATED, FVGState.SIGNAL_EMITTED):
+            if setup.state in TERMINAL_STATES:
                 continue
 
             # --- bars_since_creation via timestamps ---
@@ -532,11 +540,13 @@ class FVGReactionLongLocalStructV1Scanner:
                 )
             return candidate
 
-        # Not confirmed — close <= swing_high on the single allowed candle.
-        # Per research semantics: this FVG did NOT produce a signal.
-        # Leave state as WAITING_LOCAL_STRUCT; it will expire by MAX_BARS_TO_TOUCH.
+        # Not confirmed — close <= swing_high on touch+1.
+        # Per research semantics: the SINGLE allowed confirmation candle failed.
+        # This FVG can never produce a signal.  Mark as terminal.
+        setup.state = FVGState.LOCAL_STRUCT_REJECTED
+        self._bump(timeframe, "rejected")
         logger.debug(
-            "scanner=%s symbol=%s tf=%s event=LOCAL_STRUCT_NOT_CONFIRMED "
+            "scanner=%s symbol=%s tf=%s event=LOCAL_STRUCT_REJECTED "
             "fvg_created_at=%d confirmation_at=%d swing_high=%.4f "
             "confirmation_close=%.4f distance=%.4f%%",
             SCANNER_NAME, setup.symbol, timeframe,
@@ -607,7 +617,7 @@ class FVGReactionLongLocalStructV1Scanner:
     def cleanup_expired(self) -> int:
         to_remove = [
             key for key, s in self._setups.items()
-            if s.state in (FVGState.EXPIRED, FVGState.INVALIDATED, FVGState.SIGNAL_EMITTED)
+            if s.state in TERMINAL_STATES
         ]
         for key in to_remove:
             del self._setups[key]
@@ -617,7 +627,7 @@ class FVGReactionLongLocalStructV1Scanner:
     def active_setups(self) -> int:
         return sum(
             1 for s in self._setups.values()
-            if s.state not in (FVGState.EXPIRED, FVGState.INVALIDATED, FVGState.SIGNAL_EMITTED)
+            if s.state not in TERMINAL_STATES
         )
 
     # ------------------------------------------------------------------
@@ -680,6 +690,7 @@ class FVGReactionLongLocalStructV1Scanner:
                 f"touched={tf_data.get('touched', 0)} "
                 f"waiting_struct={tf_data.get('waiting_local_struct_current', 0)} "
                 f"confirmed={tf_data.get('confirmed', 0)} "
+                f"rejected={tf_data.get('rejected', 0)} "
                 f"expired={tf_data.get('expired', 0)} "
                 f"invalidated={tf_data.get('invalidated', 0)} "
                 f"emitted={tf_data.get('emitted', 0)}"
@@ -687,12 +698,13 @@ class FVGReactionLongLocalStructV1Scanner:
 
         logger.info(
             "FVG lifecycle: %s | total detected=%d active=%d touched=%d "
-            "confirmed=%d expired=%d invalidated=%d emitted=%d",
+            "confirmed=%d rejected=%d expired=%d invalidated=%d emitted=%d",
             " | ".join(parts),
             total.get("detected", 0),
             total.get("active_total", 0),
             total.get("touched", 0),
             total.get("confirmed", 0),
+            total.get("rejected", 0),
             total.get("expired", 0),
             total.get("invalidated", 0),
             total.get("emitted", 0),
