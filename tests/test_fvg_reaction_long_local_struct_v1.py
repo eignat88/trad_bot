@@ -379,3 +379,142 @@ class TestHelpers:
 
     def test_version_bumped(self):
         assert SCANNER_VERSION == "1.0.1"
+
+
+# ---------------------------------------------------------------------------
+# LOCAL_STRUCT_REJECTED terminal state
+# ---------------------------------------------------------------------------
+
+class TestLocalStructRejected:
+    def test_rejected_when_close_below_swing(self):
+        """When touch+1 close <= swing_high, setup transitions to REJECTED."""
+        ms = 300_000
+        scanner = FVGReactionLongLocalStructV1Scanner()
+
+        # Detect
+        w1 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w1[197] = _c(197 * ms, 100, 102, 98, 101)
+        w1[198] = _c(198 * ms, 101, 112, 100, 110)
+        w1[199] = _c(199 * ms, 110, 115, 103, 114)
+        scanner.scan(_ctx(candles_5m=tuple(w1)))
+
+        # Touch
+        w2 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w2[198] = _c(199 * ms, 110, 115, 103, 114)
+        w2[199] = _c(200 * ms, 114, 116, 102, 103)
+        scanner.scan(_ctx(candles_5m=tuple(w2)))
+
+        # touch+1: close=110 < swing=115 → REJECTED
+        w3 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w3[197] = _c(199 * ms, 110, 115, 103, 114)
+        w3[198] = _c(200 * ms, 114, 116, 102, 103)
+        w3[199] = _c(201 * ms, 103, 110, 102, 110)  # close=110 < swing=115
+        scanner.scan(_ctx(candles_5m=tuple(w3)))
+
+        setup = list(scanner._setups.values())[0]
+        assert setup.state == FVGState.LOCAL_STRUCT_REJECTED
+
+    def test_rejected_is_terminal(self):
+        """REJECTED setup is not processed in subsequent cycles."""
+        ms = 300_000
+        scanner = FVGReactionLongLocalStructV1Scanner()
+
+        # Full cycle: detect → touch → reject
+        w1 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w1[197] = _c(197 * ms, 100, 102, 98, 101)
+        w1[198] = _c(198 * ms, 101, 112, 100, 110)
+        w1[199] = _c(199 * ms, 110, 115, 103, 114)
+        scanner.scan(_ctx(candles_5m=tuple(w1)))
+
+        w2 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w2[198] = _c(199 * ms, 110, 115, 103, 114)
+        w2[199] = _c(200 * ms, 114, 116, 102, 103)
+        scanner.scan(_ctx(candles_5m=tuple(w2)))
+
+        w3 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w3[197] = _c(199 * ms, 110, 115, 103, 114)
+        w3[198] = _c(200 * ms, 114, 116, 102, 103)
+        w3[199] = _c(201 * ms, 103, 110, 102, 110)
+        scanner.scan(_ctx(candles_5m=tuple(w3)))
+        assert scanner.active_setups == 0  # rejected = terminal
+
+    def test_rejected_counter(self):
+        """Rejected counter increments exactly once."""
+        ms = 300_000
+        scanner = FVGReactionLongLocalStructV1Scanner()
+
+        w1 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w1[197] = _c(197 * ms, 100, 102, 98, 101)
+        w1[198] = _c(198 * ms, 101, 112, 100, 110)
+        w1[199] = _c(199 * ms, 110, 115, 103, 114)
+        scanner.scan(_ctx(candles_5m=tuple(w1)))
+
+        w2 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w2[198] = _c(199 * ms, 110, 115, 103, 114)
+        w2[199] = _c(200 * ms, 114, 116, 102, 103)
+        scanner.scan(_ctx(candles_5m=tuple(w2)))
+
+        w3 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w3[197] = _c(199 * ms, 110, 115, 103, 114)
+        w3[198] = _c(200 * ms, 114, 116, 102, 103)
+        w3[199] = _c(201 * ms, 103, 110, 102, 110)
+        scanner.scan(_ctx(candles_5m=tuple(w3)))
+
+        snap = scanner.get_observability_snapshot()
+        assert snap["total"]["rejected"] == 1
+        assert snap["total"]["waiting_local_struct_current"] == 0
+        assert snap["total"]["active_total"] == 0
+
+    def test_not_rejected_when_confirmed(self):
+        """If touch+1 close > swing, setup is CONFIRMED, not REJECTED."""
+        ms = 300_000
+        scanner = FVGReactionLongLocalStructV1Scanner()
+
+        w1 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w1[197] = _c(197 * ms, 100, 102, 98, 101)
+        w1[198] = _c(198 * ms, 101, 112, 100, 110)
+        w1[199] = _c(199 * ms, 110, 115, 103, 114)
+        scanner.scan(_ctx(candles_5m=tuple(w1)))
+
+        w2 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w2[198] = _c(199 * ms, 110, 115, 103, 114)
+        w2[199] = _c(200 * ms, 114, 116, 102, 103)
+        scanner.scan(_ctx(candles_5m=tuple(w2)))
+
+        w3 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w3[197] = _c(199 * ms, 110, 115, 103, 114)
+        w3[198] = _c(200 * ms, 114, 116, 102, 103)
+        w3[199] = _c(201 * ms, 103, 120, 102, 118)  # close=118 > swing=115
+        scanner.scan(_ctx(candles_5m=tuple(w3)))
+
+        snap = scanner.get_observability_snapshot()
+        assert snap["total"]["rejected"] == 0
+        assert snap["total"]["confirmed"] == 1
+        assert snap["total"]["emitted"] == 1
+
+    def test_lifecycle_log_includes_rejected(self):
+        """log_lifecycle_summary should include rejected count."""
+        ms = 300_000
+        scanner = FVGReactionLongLocalStructV1Scanner()
+
+        w1 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w1[197] = _c(197 * ms, 100, 102, 98, 101)
+        w1[198] = _c(198 * ms, 101, 112, 100, 110)
+        w1[199] = _c(199 * ms, 110, 115, 103, 114)
+        scanner.scan(_ctx(candles_5m=tuple(w1)))
+
+        w2 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w2[198] = _c(199 * ms, 110, 115, 103, 114)
+        w2[199] = _c(200 * ms, 114, 116, 102, 103)
+        scanner.scan(_ctx(candles_5m=tuple(w2)))
+
+        w3 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w3[197] = _c(199 * ms, 110, 115, 103, 114)
+        w3[198] = _c(200 * ms, 114, 116, 102, 103)
+        w3[199] = _c(201 * ms, 103, 110, 102, 110)
+        scanner.scan(_ctx(candles_5m=tuple(w3)))
+
+        # Should not raise
+        scanner.log_lifecycle_summary()
+        snap = scanner.get_observability_snapshot()
+        assert snap["total"]["rejected"] == 1

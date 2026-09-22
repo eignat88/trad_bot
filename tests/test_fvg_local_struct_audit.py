@@ -144,7 +144,7 @@ class TestStrictTouchPlusOneParity:
         assert len(r) == 0  # NOT confirmed — strict touch+1
 
         setup = list(scanner._setups.values())[0]
-        assert setup.state == FVGState.WAITING_LOCAL_STRUCT  # still waiting, not emitted
+        assert setup.state == FVGState.LOCAL_STRUCT_REJECTED  # rejected on touch+1
 
     def test_confirms_on_exact_next_candle(self):
         """Confirms only when touch+1 close > swing_high."""

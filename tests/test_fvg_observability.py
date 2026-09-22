@@ -202,5 +202,11 @@ class TestAggregateLog:
         s.scan(_ctx(candles_5m=tuple(w1)))
         s.scan(_ctx(candles_5m=tuple(w2)))
         s.scan(_ctx(candles_5m=tuple(w3)))
-        # Should not raise
         s.log_lifecycle_summary()
+
+    def test_snapshot_includes_rejected(self):
+        """Snapshot should have 'rejected' key."""
+        s = FVGReactionLongLocalStructV1Scanner()
+        snap = s.get_observability_snapshot()
+        assert "rejected" in snap["total"]
+        assert snap["total"]["rejected"] == 0
