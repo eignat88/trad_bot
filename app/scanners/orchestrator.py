@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from app.scanners.breakout_retest import BreakoutRetestScanner
 from app.scanners.deduplication import DeduplicationEngine
 from app.scanners.direction_gate import ScannerDirectionGatePolicy
+from app.scanners.fvg_reaction_long_local_struct_v1 import FVGReactionLongLocalStructV1Scanner
 from app.scanners.liquidity_reversal import LiquidityReversalScanner
 from app.scanners.liquidity_sweep_choch import LiquiditySweepCHOCHScanner
 from app.scanners.models import MarketContext, SetupCandidate
@@ -60,6 +61,7 @@ class ScannerOrchestrator:
             "MOMENTUM_EXHAUSTION_R": MomentumExhaustionRScanner(),
             "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1": MomentumExhaustionReverseLongV1Scanner(),
             "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2": MomentumExhaustionReverseLongV2Scanner(),
+            "FVG_REACTION_LONG_LOCAL_STRUCT_V1": FVGReactionLongLocalStructV1Scanner(),
         }
 
         if enabled_scanners is not None:
