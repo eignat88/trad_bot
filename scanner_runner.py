@@ -167,6 +167,7 @@ def run_scan_cycle(
                         regime_filter=settings.regime_filter_enabled,
                         scanner_regime_whitelist=settings.scanner_regime_whitelist,
                         trading_mode=settings.trading_mode,
+                        run_id=run_id,
                     )
                 else:
                     candidates, symbol_stats = orchestrator.scan_all_with_stats(
@@ -174,6 +175,7 @@ def run_scan_cycle(
                         gate_policy=gate_policy,
                         regime_filter=settings.regime_filter_enabled,
                         scanner_regime_whitelist=settings.scanner_regime_whitelist,
+                        run_id=run_id,
                     )
                 for name, values in symbol_stats.items():
                     stat = run_stats[name]
@@ -213,6 +215,17 @@ def run_scan_cycle(
 
     for scanner_name, values in run_stats.items():
         repository.save_run_stat(run_id, scanner_name, **values)
+
+    # FVG lifecycle observability: one INFO line per scanner cycle
+    fvg_scanner = orchestrator.scanners.get("FVG_REACTION_LONG_LOCAL_STRUCT_V1")
+    if fvg_scanner is not None:
+        log_summary = getattr(fvg_scanner, "log_lifecycle_summary", None)
+        if callable(log_summary):
+            try:
+                log_summary()
+            except Exception:
+                logger.debug("FVG lifecycle summary logging failed", exc_info=True)
+
     return total_found, scanned, failed
 
 
