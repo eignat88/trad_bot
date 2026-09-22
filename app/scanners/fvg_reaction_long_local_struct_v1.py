@@ -256,6 +256,21 @@ class FVGReactionLongLocalStructV1Scanner:
     def __init__(self) -> None:
         self._setups: dict[tuple[str, str, int], FVGSetup] = {}
         self._emitted: set[str] = set()
+        # --- Observability counters (cumulative) ---
+        self._counters: dict[str, int] = {
+            "detected": 0, "touched": 0, "confirmed": 0,
+            "expired": 0, "invalidated": 0, "emitted": 0,
+        }
+        self._tf_counters: dict[str, dict[str, int]] = {
+            "5m": {k: 0 for k in self._counters},
+            "15m": {k: 0 for k in self._counters},
+        }
+
+    def _bump(self, tf: str, counter: str) -> None:
+        """Increment a lifecycle counter (total + per-timeframe)."""
+        self._counters[counter] = self._counters.get(counter, 0) + 1
+        if tf in self._tf_counters:
+            self._tf_counters[tf][counter] = self._tf_counters[tf].get(counter, 0) + 1
 
     def scan(self, ctx: MarketContext) -> list[SetupCandidate]:
         candidates: list[SetupCandidate] = []
@@ -327,6 +342,13 @@ class FVGReactionLongLocalStructV1Scanner:
             market_regime=ctx.market_regime,
         )
         self._setups[key] = setup
+        self._bump(timeframe, "detected")
+        logger.debug(
+            "scanner=%s symbol=%s tf=%s event=FVG_DETECTED fvg_created_at=%d "
+            "fvg_low=%.4f fvg_high=%.4f fvg_atr=%.4f c2_body_ratio=%.2f",
+            SCANNER_NAME, symbol, timeframe, setup.fvg_created_at,
+            setup.fvg_low, setup.fvg_high, setup.fvg_atr, setup.c2_body_ratio,
+        )
 
     def _update_setups(
         self,
@@ -354,20 +376,42 @@ class FVGReactionLongLocalStructV1Scanner:
             if setup.state == FVGState.WAITING_TOUCH:
                 if bars_since > MAX_BARS_TO_TOUCH:
                     setup.state = FVGState.EXPIRED
+                    self._bump(timeframe, "expired")
+                    logger.debug(
+                        "scanner=%s symbol=%s tf=%s event=FVG_EXPIRED "
+                        "fvg_created_at=%d bars_since=%d",
+                        SCANNER_NAME, symbol, timeframe,
+                        setup.fvg_created_at, bars_since,
+                    )
                     continue
 
                 # Scan ALL candles after FVG creation for touch
                 if self._check_touch(setup, candles, interval_ms, bars_since):
                     setup.state = FVGState.WAITING_LOCAL_STRUCT
+                    self._bump(timeframe, "touched")
+                    logger.debug(
+                        "scanner=%s symbol=%s tf=%s event=FVG_TOUCHED "
+                        "fvg_created_at=%d touch_at=%d bars_to_touch=%d",
+                        SCANNER_NAME, symbol, timeframe,
+                        setup.fvg_created_at, setup.first_touch_at or 0,
+                        setup.bars_to_touch or 0,
+                    )
 
             # --- WAITING_LOCAL_STRUCT ---
             elif setup.state == FVGState.WAITING_LOCAL_STRUCT:
                 if bars_since > MAX_BARS_TO_TOUCH:
                     setup.state = FVGState.EXPIRED
+                    self._bump(timeframe, "expired")
+                    logger.debug(
+                        "scanner=%s symbol=%s tf=%s event=FVG_EXPIRED "
+                        "fvg_created_at=%d bars_since=%d",
+                        SCANNER_NAME, symbol, timeframe,
+                        setup.fvg_created_at, bars_since,
+                    )
                     continue
 
                 candidate = self._check_local_struct_and_emit(
-                    setup, candles, ctx, interval_ms, bars_since,
+                    setup, candles, ctx, interval_ms, bars_since, timeframe,
                 )
                 if candidate is not None:
                     candidates.append(candidate)
@@ -412,6 +456,7 @@ class FVGReactionLongLocalStructV1Scanner:
         ctx: MarketContext,
         interval_ms: int,
         bars_since: int,
+        timeframe: str,
     ) -> SetupCandidate | None:
         """Check LOCAL_STRUCT confirmation and emit signal if confirmed.
 
@@ -440,6 +485,13 @@ class FVGReactionLongLocalStructV1Scanner:
                 # CONFIRMED!
                 setup.state = FVGState.CONFIRMED
                 setup.confirmation_at = check_candle.timestamp
+                self._bump(timeframe, "confirmed")
+                logger.debug(
+                    "scanner=%s symbol=%s tf=%s event=LOCAL_STRUCT_CONFIRMED "
+                    "fvg_created_at=%d confirmation_at=%d swing_high=%.4f",
+                    SCANNER_NAME, setup.symbol, timeframe,
+                    setup.fvg_created_at, check_candle.timestamp, swing_high,
+                )
 
                 entry_price = check_candle.close
                 sl_price = setup.c2_low - setup.atr * SL_BUFFER_ATR
@@ -447,6 +499,12 @@ class FVGReactionLongLocalStructV1Scanner:
 
                 if risk <= 0 or entry_price <= sl_price:
                     setup.state = FVGState.INVALIDATED
+                    self._bump(timeframe, "invalidated")
+                    logger.debug(
+                        "scanner=%s symbol=%s tf=%s event=INVALIDATED "
+                        "fvg_created_at=%d reason=bad_risk_geometry",
+                        SCANNER_NAME, setup.symbol, timeframe, setup.fvg_created_at,
+                    )
                     return None
 
                 tp_price = entry_price + TARGET_R * risk
@@ -458,6 +516,14 @@ class FVGReactionLongLocalStructV1Scanner:
                 candidate = self._make_candidate(setup, ctx)
                 if candidate is not None:
                     setup.state = FVGState.SIGNAL_EMITTED
+                    self._bump(timeframe, "emitted")
+                    logger.debug(
+                        "scanner=%s symbol=%s tf=%s event=SIGNAL_EMITTED "
+                        "fvg_created_at=%d entry=%.4f sl=%.4f tp=%.4f",
+                        SCANNER_NAME, setup.symbol, timeframe,
+                        setup.fvg_created_at, setup.entry_price or 0,
+                        setup.sl_price or 0, setup.tp_price or 0,
+                    )
                 return candidate
 
         return None
@@ -533,4 +599,82 @@ class FVGReactionLongLocalStructV1Scanner:
         return sum(
             1 for s in self._setups.values()
             if s.state not in (FVGState.EXPIRED, FVGState.INVALIDATED, FVGState.SIGNAL_EMITTED)
+        )
+
+    # ------------------------------------------------------------------
+    # Observability
+    # ------------------------------------------------------------------
+
+    def get_observability_snapshot(self) -> dict[str, dict[str, int]]:
+        """Return lifecycle counters without modifying state.
+
+        Returns dict with keys: 'total', '5m', '15m', 'active'.
+        Each contains: detected, touched, confirmed, expired, invalidated,
+        emitted (cumulative) plus waiting_touch, waiting_local_struct (current).
+        """
+        # Current state gauges
+        wt = sum(1 for s in self._setups.values()
+                 if s.state == FVGState.WAITING_TOUCH)
+        wl = sum(1 for s in self._setups.values()
+                 if s.state == FVGState.WAITING_LOCAL_STRUCT)
+
+        snapshot: dict[str, dict[str, int]] = {}
+
+        # Total cumulative + active
+        snapshot["total"] = {
+            **self._counters,
+            "waiting_touch_current": wt,
+            "waiting_local_struct_current": wl,
+            "active_total": wt + wl,
+        }
+
+        # Per-timeframe
+        for tf in ("5m", "15m"):
+            tf_wt = sum(1 for s in self._setups.values()
+                        if s.timeframe == tf and s.state == FVGState.WAITING_TOUCH)
+            tf_wl = sum(1 for s in self._setups.values()
+                        if s.timeframe == tf and s.state == FVGState.WAITING_LOCAL_STRUCT)
+            snapshot[tf] = {
+                **self._tf_counters.get(tf, {}),
+                "waiting_touch_current": tf_wt,
+                "waiting_local_struct_current": tf_wl,
+                "active_total": tf_wt + tf_wl,
+            }
+
+        return snapshot
+
+    def log_lifecycle_summary(self) -> None:
+        """Emit one INFO log line with aggregate lifecycle counters.
+
+        Call once per scanner cycle (after all symbols processed),
+        not per-symbol.
+        """
+        snap = self.get_observability_snapshot()
+        total = snap.get("total", {})
+
+        parts = []
+        for tf in ("5m", "15m"):
+            tf_data = snap.get(tf, {})
+            parts.append(
+                f"{tf} detected={tf_data.get('detected', 0)} "
+                f"waiting_touch={tf_data.get('waiting_touch_current', 0)} "
+                f"touched={tf_data.get('touched', 0)} "
+                f"waiting_struct={tf_data.get('waiting_local_struct_current', 0)} "
+                f"confirmed={tf_data.get('confirmed', 0)} "
+                f"expired={tf_data.get('expired', 0)} "
+                f"invalidated={tf_data.get('invalidated', 0)} "
+                f"emitted={tf_data.get('emitted', 0)}"
+            )
+
+        logger.info(
+            "FVG lifecycle: %s | total detected=%d active=%d touched=%d "
+            "confirmed=%d expired=%d invalidated=%d emitted=%d",
+            " | ".join(parts),
+            total.get("detected", 0),
+            total.get("active_total", 0),
+            total.get("touched", 0),
+            total.get("confirmed", 0),
+            total.get("expired", 0),
+            total.get("invalidated", 0),
+            total.get("emitted", 0),
         )
