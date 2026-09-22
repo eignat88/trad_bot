@@ -460,71 +460,90 @@ class FVGReactionLongLocalStructV1Scanner:
     ) -> SetupCandidate | None:
         """Check LOCAL_STRUCT confirmation and emit signal if confirmed.
 
-        Looks at ALL candles after first_touch_at for the confirmation pattern.
+        STRICT parity with research backtest_engine.py:
+          swing_high = max(c.high for c in candles[touch_idx-20:touch_idx])
+          confirmed = candles[touch_idx+1].close > swing_high
+        Only the NEXT candle after touch is checked.  No multi-candle scan.
         """
         if setup.first_touch_at is None:
             return None
 
         touch_idx = _find_idx_by_ts(candles, setup.first_touch_at)
         if touch_idx is None:
-            # Touch candle not in current window — check if we can still confirm
-            # using the latest available candles
             return None
 
-        # Check LOCAL_STRUCT on candles AFTER touch
-        for check_idx in range(touch_idx + 1, len(candles)):
-            check_candle = candles[check_idx]
+        # Strict parity: only check touch_idx + 1
+        check_idx = touch_idx + 1
+        if check_idx >= len(candles):
+            return None
 
-            # Compute swing_high from the 20 candles before touch
-            swing_start = max(0, touch_idx - LOCAL_STRUCT_LOOKBACK)
-            if touch_idx <= swing_start:
-                continue
-            swing_high = max(c.high for c in candles[swing_start:touch_idx])
+        # Compute swing_high from the 20 candles BEFORE touch
+        swing_start = max(0, touch_idx - LOCAL_STRUCT_LOOKBACK)
+        if touch_idx <= swing_start:
+            return None
 
-            if check_candle.close > swing_high:
-                # CONFIRMED!
-                setup.state = FVGState.CONFIRMED
-                setup.confirmation_at = check_candle.timestamp
-                self._bump(timeframe, "confirmed")
+        swing_high = max(c.high for c in candles[swing_start:touch_idx])
+        check_candle = candles[check_idx]
+
+        if check_candle.close > swing_high:
+            # CONFIRMED
+            setup.state = FVGState.CONFIRMED
+            setup.confirmation_at = check_candle.timestamp
+            self._bump(timeframe, "confirmed")
+            logger.debug(
+                "scanner=%s symbol=%s tf=%s event=LOCAL_STRUCT_CONFIRMED "
+                "fvg_created_at=%d confirmation_at=%d swing_high=%.4f "
+                "confirmation_close=%.4f",
+                SCANNER_NAME, setup.symbol, timeframe,
+                setup.fvg_created_at, check_candle.timestamp, swing_high,
+                check_candle.close,
+            )
+
+            entry_price = check_candle.close
+            sl_price = setup.c2_low - setup.atr * SL_BUFFER_ATR
+            risk = entry_price - sl_price
+
+            if risk <= 0 or entry_price <= sl_price:
+                setup.state = FVGState.INVALIDATED
+                self._bump(timeframe, "invalidated")
                 logger.debug(
-                    "scanner=%s symbol=%s tf=%s event=LOCAL_STRUCT_CONFIRMED "
-                    "fvg_created_at=%d confirmation_at=%d swing_high=%.4f",
-                    SCANNER_NAME, setup.symbol, timeframe,
-                    setup.fvg_created_at, check_candle.timestamp, swing_high,
+                    "scanner=%s symbol=%s tf=%s event=INVALIDATED "
+                    "fvg_created_at=%d reason=bad_risk_geometry",
+                    SCANNER_NAME, setup.symbol, timeframe, setup.fvg_created_at,
                 )
+                return None
 
-                entry_price = check_candle.close
-                sl_price = setup.c2_low - setup.atr * SL_BUFFER_ATR
-                risk = entry_price - sl_price
+            tp_price = entry_price + TARGET_R * risk
+            setup.entry_price = entry_price
+            setup.sl_price = sl_price
+            setup.tp_price = tp_price
+            setup.risk = risk
 
-                if risk <= 0 or entry_price <= sl_price:
-                    setup.state = FVGState.INVALIDATED
-                    self._bump(timeframe, "invalidated")
-                    logger.debug(
-                        "scanner=%s symbol=%s tf=%s event=INVALIDATED "
-                        "fvg_created_at=%d reason=bad_risk_geometry",
-                        SCANNER_NAME, setup.symbol, timeframe, setup.fvg_created_at,
-                    )
-                    return None
+            candidate = self._make_candidate(setup, ctx)
+            if candidate is not None:
+                setup.state = FVGState.SIGNAL_EMITTED
+                self._bump(timeframe, "emitted")
+                logger.debug(
+                    "scanner=%s symbol=%s tf=%s event=SIGNAL_EMITTED "
+                    "fvg_created_at=%d entry=%.4f sl=%.4f tp=%.4f",
+                    SCANNER_NAME, setup.symbol, timeframe,
+                    setup.fvg_created_at, setup.entry_price or 0,
+                    setup.sl_price or 0, setup.tp_price or 0,
+                )
+            return candidate
 
-                tp_price = entry_price + TARGET_R * risk
-                setup.entry_price = entry_price
-                setup.sl_price = sl_price
-                setup.tp_price = tp_price
-                setup.risk = risk
-
-                candidate = self._make_candidate(setup, ctx)
-                if candidate is not None:
-                    setup.state = FVGState.SIGNAL_EMITTED
-                    self._bump(timeframe, "emitted")
-                    logger.debug(
-                        "scanner=%s symbol=%s tf=%s event=SIGNAL_EMITTED "
-                        "fvg_created_at=%d entry=%.4f sl=%.4f tp=%.4f",
-                        SCANNER_NAME, setup.symbol, timeframe,
-                        setup.fvg_created_at, setup.entry_price or 0,
-                        setup.sl_price or 0, setup.tp_price or 0,
-                    )
-                return candidate
+        # Not confirmed — close <= swing_high on the single allowed candle.
+        # Per research semantics: this FVG did NOT produce a signal.
+        # Leave state as WAITING_LOCAL_STRUCT; it will expire by MAX_BARS_TO_TOUCH.
+        logger.debug(
+            "scanner=%s symbol=%s tf=%s event=LOCAL_STRUCT_NOT_CONFIRMED "
+            "fvg_created_at=%d confirmation_at=%d swing_high=%.4f "
+            "confirmation_close=%.4f distance=%.4f%%",
+            SCANNER_NAME, setup.symbol, timeframe,
+            setup.fvg_created_at, check_candle.timestamp, swing_high,
+            check_candle.close,
+            (check_candle.close / swing_high - 1) * 100 if swing_high > 0 else 0,
+        )
 
         return None
 
