@@ -2,19 +2,18 @@
 from __future__ import annotations
 
 import pytest
+from datetime import datetime, timezone
 from app.models import Candle
 from app.scanners.fvg_reaction_long_local_struct_v1 import (
     FVGReactionLongLocalStructV1Scanner, FVGState,
     detect_bullish_fvg, check_local_struct_long,
+    _atr, _bars_between, _find_idx_by_ts,
     MIN_FVG_ATR, MIN_C2_BODY_RATIO, MAX_BARS_TO_TOUCH,
-    TARGET_R, SL_BUFFER_ATR,
+    TARGET_R, SL_BUFFER_ATR, SCANNER_VERSION,
 )
 from app.scanners.models import (
-    IndicatorSnapshot, MarketContext, MarketLevels,
-    SetupCandidate, SetupState,
+    IndicatorSnapshot, MarketContext, MarketLevels, SetupCandidate, SetupState,
 )
-from app.scanners.models import ScannerDirection
-from datetime import datetime, timezone
 
 
 def _c(ts, o, h, l, c, v=100):
@@ -29,204 +28,295 @@ def _ctx(symbol="BTC", candles_5m=(), candles_15m=(), regime="RANGE"):
     )
 
 
-def _fvg_candles():
-    """FVG at 20-22, touch at 23, confirm at 24.
+# ---------------------------------------------------------------------------
+# Rolling Window Regression
+# ---------------------------------------------------------------------------
 
-    C2 high=112, C3 high=115 → swing_high (within 20 lookback of touch at 23) = 115.
-    Confirmation candle must close > 115.
-    """
-    ms = 300_000
-    c = [_c(i * ms, 100, 102, 98, 100) for i in range(50)]
-    c[20] = _c(20*ms, 100, 102, 98, 101)    # C1: high=102
-    c[21] = _c(21*ms, 101, 112, 100, 110)   # C2: high=112
-    c[22] = _c(22*ms, 110, 115, 103, 114)   # C3: high=115, FVG [102, 103]
-    c[23] = _c(23*ms, 114, 116, 102, 103)   # touch (low=102 <= fvg_high=103)
-    c[24] = _c(24*ms, 103, 120, 102, 118)   # confirm: close=118 > swing_high=115
-    return c
+class TestRollingWindowRegression:
+    def test_3_cycle_lifecycle(self):
+        """Cycle 1: detect, Cycle 2: touch, Cycle 3: confirm + signal."""
+        ms = 300_000
+        scanner = FVGReactionLongLocalStructV1Scanner()
+
+        # Cycle 1: FVG at 197-199
+        w1 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w1[197] = _c(197 * ms, 100, 102, 98, 101)
+        w1[198] = _c(198 * ms, 101, 112, 100, 110)
+        w1[199] = _c(199 * ms, 110, 115, 103, 114)
+        r1 = scanner.scan(_ctx(candles_5m=tuple(w1)))
+        assert len(r1) == 0
+        assert scanner.active_setups == 1
+        setup = list(scanner._setups.values())[0]
+        assert setup.fvg_created_at == 199 * ms
+        assert setup.state == FVGState.WAITING_TOUCH
+
+        # Cycle 2: window shifts, FVG C3 now at 198, new candle 199 touches
+        w2 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w2[198] = _c(199 * ms, 110, 115, 103, 114)
+        w2[199] = _c(200 * ms, 114, 116, 102, 103)  # touch
+        r2 = scanner.scan(_ctx(candles_5m=tuple(w2)))
+        assert len(r2) == 0
+        setup = list(scanner._setups.values())[0]
+        assert setup.state == FVGState.WAITING_LOCAL_STRUCT
+        assert setup.first_touch_at == 200 * ms
+        assert setup.bars_to_touch == 1
+
+        # Cycle 3: confirm
+        w3 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w3[197] = _c(199 * ms, 110, 115, 103, 114)
+        w3[198] = _c(200 * ms, 114, 116, 102, 103)
+        w3[199] = _c(201 * ms, 103, 120, 102, 118)
+        r3 = scanner.scan(_ctx(candles_5m=tuple(w3)))
+        assert len(r3) >= 1
+        c = r3[0]
+        assert c.direction == "LONG"
+        assert c.scanner_name == "FVG_REACTION_LONG_LOCAL_STRUCT_V1"
+        assert c.state == SetupState.READY_TO_TRADE
+        assert c.features["bars_to_touch"] == 1
+
+    def test_bars_since_creation_progresses(self):
+        """bars_since should increase across cycles, not stay at 0."""
+        ms = 300_000
+        scanner = FVGReactionLongLocalStructV1Scanner()
+
+        w1 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w1[197] = _c(197 * ms, 100, 102, 98, 101)
+        w1[198] = _c(198 * ms, 101, 112, 100, 110)
+        w1[199] = _c(199 * ms, 110, 115, 103, 114)
+        scanner.scan(_ctx(candles_5m=tuple(w1)))
+
+        w2 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w2[198] = _c(199 * ms, 110, 115, 103, 114)
+        w2[199] = _c(200 * ms, 115, 116, 110, 112)
+        scanner.scan(_ctx(candles_5m=tuple(w2)))
+
+        w3 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w3[197] = _c(199 * ms, 110, 115, 103, 114)
+        w3[198] = _c(200 * ms, 115, 116, 110, 112)
+        w3[199] = _c(201 * ms, 115, 116, 110, 112)
+        scanner.scan(_ctx(candles_5m=tuple(w3)))
+
+        assert _bars_between(199 * ms, 201 * ms, ms) == 2
 
 
-def _run(candles):
-    """3-step incremental: detect -> touch -> confirm."""
-    s = FVGReactionLongLocalStructV1Scanner()
-    s.scan(_ctx(candles_5m=tuple(candles[:23])))  # detect
-    s.scan(_ctx(candles_5m=tuple(candles[:24])))  # touch
-    return s.scan(_ctx(candles_5m=tuple(candles[:25])))  # confirm
-
-
-# --- FVG Detection ---
+# ---------------------------------------------------------------------------
+# FVG Detection
+# ---------------------------------------------------------------------------
 
 class TestFVGDetection:
     def test_bullish_fvg(self):
         ms = 300_000
-        c = [_c(i*ms, 100, 102, 98, 100) for i in range(20)]
-        c[17] = _c(17*ms, 100, 102, 98, 101)
-        c[18] = _c(18*ms, 101, 110, 100, 108)
-        c[19] = _c(19*ms, 108, 112, 103, 111)
+        c = [_c(i * ms, 100, 102, 98, 100) for i in range(20)]
+        c[17] = _c(17 * ms, 100, 102, 98, 101)
+        c[18] = _c(18 * ms, 101, 110, 100, 108)
+        c[19] = _c(19 * ms, 108, 112, 103, 111)
         fvg = detect_bullish_fvg(c, 19)
         assert fvg is not None
-        assert fvg["fvg_low"] == 102.0
-        assert fvg["fvg_high"] == 103.0
+        assert fvg["fvg_low"] == 102.0 and fvg["fvg_high"] == 103.0
         assert fvg["c2_body_ratio"] > MIN_C2_BODY_RATIO
 
     def test_no_fvg_gap_overlaps(self):
-        c = [_c(i*300_000, 100, 105, 95, 101) for i in range(20)]
-        c[17] = _c(17*300_000, 100, 105, 95, 101)
-        c[18] = _c(18*300_000, 101, 110, 100, 108)
-        c[19] = _c(19*300_000, 108, 112, 104, 111)  # low=104 < C1.high=105
+        c = [_c(i * 300_000, 100, 105, 95, 101) for i in range(20)]
+        c[17] = _c(17 * 300_000, 100, 105, 95, 101)
+        c[18] = _c(18 * 300_000, 101, 110, 100, 108)
+        c[19] = _c(19 * 300_000, 108, 112, 104, 111)
         assert detect_bullish_fvg(c, 19) is None
 
     def test_no_fvg_weak_c2(self):
         ms = 300_000
-        c = [_c(i*ms, 100, 102, 98, 100) for i in range(20)]
-        c[17] = _c(17*ms, 100, 102, 98, 101)
-        c[18] = _c(18*ms, 100.5, 110, 90, 100.6)  # tiny body
-        c[19] = _c(19*ms, 100.6, 112, 103, 111)
+        c = [_c(i * ms, 100, 102, 98, 100) for i in range(20)]
+        c[17] = _c(17 * ms, 100, 102, 98, 101)
+        c[18] = _c(18 * ms, 100.5, 110, 90, 100.6)
+        c[19] = _c(19 * ms, 100.6, 112, 103, 111)
         assert detect_bullish_fvg(c, 19) is None
 
     def test_no_fvg_before_c3(self):
-        c = [_c(i*300_000, 100, 102, 98, 100) for i in range(20)]
+        c = [_c(i * 300_000, 100, 102, 98, 100) for i in range(20)]
         assert detect_bullish_fvg(c, 1) is None
 
     def test_no_fvg_small_atr(self):
-        c = [_c(i*300_000, 100, 100.01, 99.99, 100) for i in range(20)]
-        c[17] = _c(17*300_000, 100, 100.01, 99.99, 100)
-        c[18] = _c(18*300_000, 100, 100.02, 99.98, 100.01)
-        c[19] = _c(19*300_000, 100.01, 100.03, 100.005, 100.02)
+        c = [_c(i * 300_000, 100, 100.01, 99.99, 100) for i in range(20)]
+        c[17] = _c(17 * 300_000, 100, 100.01, 99.99, 100)
+        c[18] = _c(18 * 300_000, 100, 100.02, 99.98, 100.01)
+        c[19] = _c(19 * 300_000, 100.01, 100.03, 100.005, 100.02)
         assert detect_bullish_fvg(c, 19) is None
 
 
-# --- LOCAL_STRUCT ---
+# ---------------------------------------------------------------------------
+# LOCAL_STRUCT
+# ---------------------------------------------------------------------------
 
 class TestLocalStruct:
     def test_confirmed(self):
         ms = 300_000
-        c = [_c(i*ms, 100, 105, 99, 103) for i in range(25)]
-        c[23] = _c(23*ms, 103, 104, 101, 102)
-        c[24] = _c(24*ms, 102, 110, 101, 108)
+        c = [_c(i * ms, 100, 105, 99, 103) for i in range(25)]
+        c[23] = _c(23 * ms, 103, 104, 101, 102)
+        c[24] = _c(24 * ms, 102, 110, 101, 108)
         ok, sh = check_local_struct_long(c, 23)
         assert ok and sh == 105.0
 
     def test_not_confirmed(self):
         ms = 300_000
-        c = [_c(i*ms, 100, 105, 99, 103) for i in range(25)]
-        c[23] = _c(23*ms, 103, 104, 101, 102)
-        c[24] = _c(24*ms, 102, 104, 101, 103)
+        c = [_c(i * ms, 100, 105, 99, 103) for i in range(25)]
+        c[23] = _c(23 * ms, 103, 104, 101, 102)
+        c[24] = _c(24 * ms, 102, 104, 101, 103)
         ok, _ = check_local_struct_long(c, 23)
         assert not ok
 
     def test_lookback_boundary(self):
         ms = 300_000
-        c = [_c(i*ms, 100, 105, 99, 103) for i in range(25)]
-        c[3] = _c(3*ms, 100, 200, 99, 150)  # far back, within lookback
-        c[23] = _c(23*ms, 103, 104, 101, 102)
-        c[24] = _c(24*ms, 102, 110, 101, 109)
+        c = [_c(i * ms, 100, 105, 99, 103) for i in range(25)]
+        c[3] = _c(3 * ms, 100, 200, 99, 150)
+        c[23] = _c(23 * ms, 103, 104, 101, 102)
+        c[24] = _c(24 * ms, 102, 110, 101, 109)
         ok, sh = check_local_struct_long(c, 23)
-        assert sh == 200.0
-        assert not ok  # 109 < 200
+        assert sh == 200.0 and not ok
 
 
-# --- State Machine ---
+# ---------------------------------------------------------------------------
+# No look-ahead
+# ---------------------------------------------------------------------------
 
-class TestStateMachine:
-    def test_full_lifecycle(self):
-        c = _fvg_candles()
-        s = FVGReactionLongLocalStructV1Scanner()
-        # detect
-        r1 = s.scan(_ctx(candles_5m=tuple(c[:23])))
-        assert len(r1) == 0 and s.active_setups >= 1
-        # touch
-        r2 = s.scan(_ctx(candles_5m=tuple(c[:24])))
-        assert len(r2) == 0
-        # confirm
-        r3 = s.scan(_ctx(candles_5m=tuple(c[:25])))
-        assert len(r3) >= 1
-        assert r3[0].direction == "LONG"
-        assert r3[0].scanner_name == "FVG_REACTION_LONG_LOCAL_STRUCT_V1"
-        assert r3[0].state == SetupState.READY_TO_TRADE
-
-    def test_expired(self):
+class TestNoLookAhead:
+    def test_no_signal_without_confirmation_candle(self):
         ms = 300_000
-        c = [_c(i*ms, 100, 102, 98, 100) for i in range(100)]
-        c[20] = _c(20*ms, 100, 102, 98, 101)
-        c[21] = _c(21*ms, 101, 112, 100, 110)
-        c[22] = _c(22*ms, 110, 115, 103, 114)
-        s = FVGReactionLongLocalStructV1Scanner()
-        s.scan(_ctx(candles_5m=tuple(c[:23])))
-        assert s.active_setups >= 1
-        s.scan(_ctx(candles_5m=tuple(c[:80])))
-        active = [x for x in s._setups.values()
-                  if x.state not in (FVGState.EXPIRED, FVGState.INVALIDATED)]
-        assert len(active) == 0
+        scanner = FVGReactionLongLocalStructV1Scanner()
+        w1 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w1[197] = _c(197 * ms, 100, 102, 98, 101)
+        w1[198] = _c(198 * ms, 101, 112, 100, 110)
+        w1[199] = _c(199 * ms, 110, 115, 103, 114)
+        scanner.scan(_ctx(candles_5m=tuple(w1)))
 
-    def test_no_look_ahead(self):
+        w2 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w2[198] = _c(199 * ms, 110, 115, 103, 114)
+        w2[199] = _c(200 * ms, 114, 116, 102, 103)
+        r = scanner.scan(_ctx(candles_5m=tuple(w2)))
+        assert len(r) == 0
+
+
+# ---------------------------------------------------------------------------
+# Duplicate
+# ---------------------------------------------------------------------------
+
+class TestDuplicate:
+    def test_same_fvg_no_duplicate(self):
         ms = 300_000
-        c = [_c(i*ms, 100, 102, 98, 100) for i in range(50)]
-        c[20] = _c(20*ms, 100, 102, 98, 101)
-        c[21] = _c(21*ms, 101, 112, 100, 110)
-        c[22] = _c(22*ms, 110, 115, 103, 114)
-        c[23] = _c(23*ms, 114, 116, 102, 103)  # touch
-        s = FVGReactionLongLocalStructV1Scanner()
-        s.scan(_ctx(candles_5m=tuple(c[:23])))
-        r = s.scan(_ctx(candles_5m=tuple(c[:24])))
-        assert len(r) == 0  # no confirm candle yet
+        scanner = FVGReactionLongLocalStructV1Scanner()
+        w1 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w1[197] = _c(197 * ms, 100, 102, 98, 101)
+        w1[198] = _c(198 * ms, 101, 112, 100, 110)
+        w1[199] = _c(199 * ms, 110, 115, 103, 114)
+        scanner.scan(_ctx(candles_5m=tuple(w1)))
 
-    def test_duplicate(self):
-        c = _fvg_candles()
-        s = FVGReactionLongLocalStructV1Scanner()
-        s.scan(_ctx(candles_5m=tuple(c[:23])))  # detect
-        s.scan(_ctx(candles_5m=tuple(c[:24])))  # touch
-        r1 = s.scan(_ctx(candles_5m=tuple(c[:25])))  # confirm
+        w2 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w2[198] = _c(199 * ms, 110, 115, 103, 114)
+        w2[199] = _c(200 * ms, 114, 116, 102, 103)
+        scanner.scan(_ctx(candles_5m=tuple(w2)))
+
+        w3 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w3[197] = _c(199 * ms, 110, 115, 103, 114)
+        w3[198] = _c(200 * ms, 114, 116, 102, 103)
+        w3[199] = _c(201 * ms, 103, 120, 102, 118)
+        r1 = scanner.scan(_ctx(candles_5m=tuple(w3)))
         assert len(r1) >= 1
-        r2 = s.scan(_ctx(candles_5m=tuple(c[:25])))  # same data
+        r2 = scanner.scan(_ctx(candles_5m=tuple(w3)))
         assert len(r2) == 0
 
+
+# ---------------------------------------------------------------------------
+# 15m
+# ---------------------------------------------------------------------------
+
+class TestTimeframe:
     def test_15m(self):
         ms = 900_000
-        c = [_c(i*ms, 100, 102, 98, 100) for i in range(50)]
-        c[20] = _c(20*ms, 100, 102, 98, 101)
-        c[21] = _c(21*ms, 101, 112, 100, 110)
-        c[22] = _c(22*ms, 110, 115, 103, 114)
-        c[23] = _c(23*ms, 114, 116, 102, 103)  # touch
-        c[24] = _c(24*ms, 103, 120, 102, 118)  # confirm: close > swing
-        s = FVGReactionLongLocalStructV1Scanner()
-        s.scan(_ctx(candles_15m=tuple(c[:23])))
-        s.scan(_ctx(candles_15m=tuple(c[:24])))
-        r = s.scan(_ctx(candles_15m=tuple(c[:25])))
+        scanner = FVGReactionLongLocalStructV1Scanner()
+        w1 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w1[197] = _c(197 * ms, 100, 102, 98, 101)
+        w1[198] = _c(198 * ms, 101, 112, 100, 110)
+        w1[199] = _c(199 * ms, 110, 115, 103, 114)
+        scanner.scan(_ctx(candles_15m=tuple(w1)))
+
+        w2 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w2[198] = _c(199 * ms, 110, 115, 103, 114)
+        w2[199] = _c(200 * ms, 114, 116, 102, 103)
+        scanner.scan(_ctx(candles_15m=tuple(w2)))
+
+        w3 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w3[197] = _c(199 * ms, 110, 115, 103, 114)
+        w3[198] = _c(200 * ms, 114, 116, 102, 103)
+        w3[199] = _c(201 * ms, 103, 120, 102, 118)
+        r = scanner.scan(_ctx(candles_15m=tuple(w3)))
         assert len(r) >= 1
         assert r[0].setup_timeframe == "15m"
 
 
-# --- Risk Geometry ---
+# ---------------------------------------------------------------------------
+# Risk geometry
+# ---------------------------------------------------------------------------
 
 class TestRiskGeometry:
+    def _build_and_confirm(self, ms, c2_low_override=None):
+        scanner = FVGReactionLongLocalStructV1Scanner()
+        w1 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w1[197] = _c(197 * ms, 100, 102, 98, 101)
+        c2_low = c2_low_override if c2_low_override is not None else 100.0
+        w1[198] = _c(198 * ms, 101, 112, c2_low, 110)
+        w1[199] = _c(199 * ms, 110, 115, 103, 114)
+        scanner.scan(_ctx(candles_5m=tuple(w1)))
+
+        w2 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w2[198] = _c(199 * ms, 110, 115, 103, 114)
+        w2[199] = _c(200 * ms, 114, 116, 102, 103)
+        scanner.scan(_ctx(candles_5m=tuple(w2)))
+
+        w3 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w3[197] = _c(199 * ms, 110, 115, 103, 114)
+        w3[198] = _c(200 * ms, 114, 116, 102, 103)
+        w3[199] = _c(201 * ms, 103, 120, 102, 118)
+        return scanner.scan(_ctx(candles_5m=tuple(w3)))
+
     def test_c2_extremum_stop(self):
         ms = 300_000
-        c = [_c(i*ms, 100, 102, 98, 100) for i in range(50)]
-        c[20] = _c(20*ms, 100, 102, 98, 101)
-        c[21] = _c(21*ms, 101, 112, 99.5, 110)  # C2.low = 99.5
-        c[22] = _c(22*ms, 110, 115, 103, 114)
-        c[23] = _c(23*ms, 114, 116, 102, 103)
-        c[24] = _c(24*ms, 103, 120, 102, 118)  # confirm: close > swing
-        r = _run(c)
+        r = self._build_and_confirm(ms, c2_low_override=99.5)
         assert len(r) >= 1
         assert r[0].invalidation_price < 99.5
 
     def test_tp_3r(self):
         ms = 300_000
-        c = [_c(i*ms, 100, 102, 98, 100) for i in range(50)]
-        c[20] = _c(20*ms, 100, 102, 98, 101)
-        c[21] = _c(21*ms, 101, 112, 100, 110)
-        c[22] = _c(22*ms, 110, 115, 103, 114)
-        c[23] = _c(23*ms, 114, 116, 102, 103)
-        c[24] = _c(24*ms, 103, 120, 102, 118)  # confirm
-        r = _run(c)
+        r = self._build_and_confirm(ms)
         assert len(r) >= 1
         risk = r[0].entry_zone_high - r[0].invalidation_price
         expected = r[0].entry_zone_high + TARGET_R * risk
         assert abs(r[0].target_1 - expected) < 0.001
 
 
-# --- Frozen Values ---
+# ---------------------------------------------------------------------------
+# Expired
+# ---------------------------------------------------------------------------
+
+class TestExpired:
+    def test_expires_after_max_bars(self):
+        ms = 300_000
+        scanner = FVGReactionLongLocalStructV1Scanner()
+        w1 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w1[197] = _c(197 * ms, 100, 102, 98, 101)
+        w1[198] = _c(198 * ms, 101, 112, 100, 110)
+        w1[199] = _c(199 * ms, 110, 115, 103, 114)
+        scanner.scan(_ctx(candles_5m=tuple(w1)))
+        assert scanner.active_setups == 1
+
+        # 50 cycles later (50 bars)
+        w50 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w50[199] = _c((199 + 49) * ms, 115, 116, 110, 112)
+        scanner.scan(_ctx(candles_5m=tuple(w50)))
+        setup = list(scanner._setups.values())[0]
+        assert setup.state == FVGState.EXPIRED
+
+
+# ---------------------------------------------------------------------------
+# Frozen values
+# ---------------------------------------------------------------------------
 
 class TestFrozenValues:
     def test_constants(self):
@@ -237,12 +327,31 @@ class TestFrozenValues:
         assert SL_BUFFER_ATR == 0.05
 
 
-# --- Features ---
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
 
 class TestFeatures:
     def test_diagnostic_data(self):
-        c = _fvg_candles()
-        r = _run(c)
+        ms = 300_000
+        scanner = FVGReactionLongLocalStructV1Scanner()
+        w1 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w1[197] = _c(197 * ms, 100, 102, 98, 101)
+        w1[198] = _c(198 * ms, 101, 112, 100, 110)
+        w1[199] = _c(199 * ms, 110, 115, 103, 114)
+        scanner.scan(_ctx(candles_5m=tuple(w1)))
+
+        w2 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w2[198] = _c(199 * ms, 110, 115, 103, 114)
+        w2[199] = _c(200 * ms, 114, 116, 102, 103)
+        scanner.scan(_ctx(candles_5m=tuple(w2)))
+
+        w3 = [_c(i * ms, 100, 102, 98, 100) for i in range(200)]
+        w3[197] = _c(199 * ms, 110, 115, 103, 114)
+        w3[198] = _c(200 * ms, 114, 116, 102, 103)
+        w3[199] = _c(201 * ms, 103, 120, 102, 118)
+        r = scanner.scan(_ctx(candles_5m=tuple(w3)))
+
         assert len(r) >= 1
         f = r[0].features
         for key in ["fvg_created_at", "fvg_low", "fvg_high", "fvg_atr",
@@ -250,3 +359,23 @@ class TestFeatures:
                      "sl_price", "tp_price"]:
             assert key in f
         assert f["rr"] == 3.0
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+class TestHelpers:
+    def test_bars_between(self):
+        assert _bars_between(0, 300_000, 300_000) == 1
+        assert _bars_between(0, 600_000, 300_000) == 2
+        assert _bars_between(300_000, 0, 300_000) == 0
+
+    def test_find_idx_by_ts(self):
+        ms = 300_000
+        c = [_c(i * ms, 100, 102, 98, 100) for i in range(5)]
+        assert _find_idx_by_ts(c, 2 * ms) == 2
+        assert _find_idx_by_ts(c, 999 * ms) is None
+
+    def test_version_bumped(self):
+        assert SCANNER_VERSION == "1.0.1"
