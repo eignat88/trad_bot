@@ -157,15 +157,14 @@ class TestShadowBackfillWarmup:
 
         stats = BackfillStats()
         assert stats.evaluated == 0
-        assert stats.wick_atr_fail == 0
-        assert stats.close_location_fail == 0
-        assert stats.rsi_fail == 0
-        assert stats.bb_fail == 0
-        assert stats.ema_slope_fail == 0
-        assert stats.volume_fail == 0
-        assert stats.signal_pass == 0
+        assert stats.raw_candidates == 0
+        assert stats.strict_pass == 0
         assert stats.signals_inserted == 0
         assert stats.duplicates_skipped == 0
+        assert stats.wick_atr_values == []
+        assert stats.close_location_values == []
+        assert stats.rsi_values == []
+        assert stats.top_candles == []
 
     def test_indicator_warmup_constant(self):
         """Test that INDICATOR_WARMUP is sufficient for all indicators."""
@@ -181,17 +180,15 @@ class TestShadowBackfillWarmup:
         # Total: 200 + 50 = 250 candles minimum
         assert INDICATOR_WARMUP >= 250
 
-    def test_detect_with_diagnostics_returns_valid(self):
-        """Test _detect_with_diagnostics returns a valid rejection reason."""
+    def test_detect_raw_candidate_returns_valid(self):
+        """Test detect_raw_candidate returns a valid signal or None."""
         from app.shadow.backfill import ShadowBackfillRunner
+        from app.scanners.atr_wick_rejection_short import AtrWickRejectionShortScanner
         from app.models import Candle
         from app.scanners.models import MarketContext, IndicatorSnapshot, MarketLevels
 
-        # Create a mock runner
-        mock_settings = MagicMock()
-        mock_client = MagicMock()
-        mock_repo = MagicMock()
-        runner = ShadowBackfillRunner(mock_settings, mock_client, mock_repo)
+        # Create scanner
+        scanner = AtrWickRejectionShortScanner()
 
         # Create candles
         candles = []
@@ -235,15 +232,16 @@ class TestShadowBackfillWarmup:
             evaluated_at=datetime.now(timezone.utc),
         )
 
-        # Test diagnostic detection
-        result = runner._detect_with_diagnostics(ctx)
+        # Test raw candidate detection
+        result = scanner.detect_raw_candidate(ctx)
 
-        # Should return a valid rejection reason or PASS
-        valid_results = [
-            "PASS", "WICK_ATR", "CLOSE_LOCATION", "RSI",
-            "BB", "EMA_SLOPE", "VOLUME", "INSUFFICIENT_DATA"
-        ]
-        assert result in valid_results
+        # Should return WickRejectionSignal or None
+        if result is not None:
+            from app.scanners.atr_wick_rejection_short import WickRejectionSignal
+            assert isinstance(result, WickRejectionSignal)
+            # Raw candidate should have all features
+            assert result.wick_atr >= scanner.wick_atr_threshold
+            assert result.close_location <= scanner.close_location_threshold
 
     def test_no_lookahead_in_context_creation(self):
         """Test that context creation doesn't use future candles."""

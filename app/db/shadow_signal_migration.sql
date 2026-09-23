@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS dds.shadow_signal (
     CONSTRAINT shadow_signal_direction_chk CHECK (experiment_id = 'ATR_WICK_REJECTION_SHORT_V1')
 );
 
+-- Add strict_pass column (idempotent - safe to run multiple times)
+ALTER TABLE dds.shadow_signal
+ADD COLUMN IF NOT EXISTS strict_pass BOOLEAN NOT NULL DEFAULT FALSE;
+
 -- Indexes for analysis and backfill
 CREATE INDEX IF NOT EXISTS idx_shadow_signal_experiment ON dds.shadow_signal (experiment_id);
 CREATE INDEX IF NOT EXISTS idx_shadow_signal_symbol ON dds.shadow_signal (symbol, signal_time DESC);

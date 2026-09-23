@@ -11,13 +11,10 @@ This scanner detects SHORT signals based on:
 IMPORTANT: This is a SHADOW scanner — it does NOT open paper/live positions.
 It only collects signals for experimental analysis.
 
-Signal Logic:
-- A large upper wick (≥1.5x ATR) indicates rejection of higher prices
-- Close in lower 30% of candle range confirms bearish pressure
-- RSI ≥60 suggests overbought condition
-- Price near upper BB suggests mean reversion potential
-- Negative EMA slope confirms downtrend
-- Volume spike confirms conviction
+Architecture:
+- detect_raw_candidate(): Core detection (wick only) — no filtering
+- detect_signal(): Full detection with ALL filters (strict mode)
+- All feature values stored regardless of filtering
 
 Author: MiMo-v2.5
 Date: 2026-09-23
@@ -45,20 +42,14 @@ from app.scanners.models import MarketContext, ScannerDirection, SetupCandidate,
 SCANNER_NAME = "ATR_WICK_REJECTION_SHORT_V1"
 SCANNER_VERSION = "1.0.0"
 
-# Wick rejection thresholds
+# Wick rejection thresholds (CORE DETECTION — only wick size matters)
 WICK_ATR_THRESHOLD = 1.5  # Upper wick must be ≥1.5x ATR
+
+# Feature filter thresholds (OPTIONAL — for strict mode only)
 CLOSE_LOCATION_THRESHOLD = 0.30  # Close must be in lower 30% of range
-
-# RSI thresholds
 RSI_OVERBOUGHT = 60.0  # RSI ≥60 for SHORT signal
-
-# Bollinger Band thresholds
 BB_UPPER_PROXIMITY = 0.02  # Price within 2% of upper BB
-
-# EMA slope threshold (negative = downtrend)
 EMA_SLOPE_THRESHOLD = -0.0001  # Slope must be negative
-
-# Volume ratio threshold
 VOLUME_RATIO_THRESHOLD = 1.2  # Volume must be ≥1.2x average
 
 # ATR period
@@ -109,6 +100,8 @@ class WickRejectionSignal:
     ema_slope: float
     # Volume
     volume_ratio: float
+    # Filter results (for diagnostic)
+    strict_pass: bool = False
     # Metadata
     signal_version: str = SCANNER_VERSION
 
@@ -118,6 +111,11 @@ class AtrWickRejectionShortScanner:
 
     This scanner is designed for shadow/counterfactual analysis only.
     It does NOT integrate with paper trading or live trading systems.
+
+    Architecture:
+    - detect_raw_candidate(): Core detection (wick only) — no filtering
+    - detect_signal(): Full detection with ALL filters (strict mode)
+    - All feature values stored regardless of filtering
     """
 
     def __init__(
@@ -187,10 +185,16 @@ class AtrWickRejectionShortScanner:
         current_rsi = rsi_values[-1]
         return (current_rsi - min_rsi) / (max_rsi - min_rsi)
 
-    def detect_signal(self, ctx: MarketContext) -> WickRejectionSignal | None:
-        """Detect ATR wick rejection SHORT signal.
+    def detect_raw_candidate(self, ctx: MarketContext) -> WickRejectionSignal | None:
+        """Detect raw SHORT candidate based on wick rejection ONLY.
 
-        Returns WickRejectionSignal if all conditions are met, None otherwise.
+        This is the CORE detection — only checks:
+        - Upper wick ≥ threshold x ATR
+        - Close in lower portion of candle
+
+        All feature values are captured regardless of other filters.
+
+        Returns WickRejectionSignal if wick rejection detected, None otherwise.
         """
         candles_5m = list(ctx.candles_5m)
         if len(candles_5m) < 50:  # Need enough data for indicators
@@ -232,7 +236,7 @@ class AtrWickRejectionShortScanner:
         upper_wick_pct = upper_wick / last_candle.close if last_candle.close > 0 else 0
         close_location = self._calculate_close_location(last_candle)
 
-        # --- Signal conditions ---
+        # --- CORE DETECTION: Only check wick rejection ---
         # 1. Upper wick ≥ threshold x ATR
         if wick_atr_ratio < self.wick_atr_threshold:
             return None
@@ -241,23 +245,7 @@ class AtrWickRejectionShortScanner:
         if close_location > self.close_location_threshold:
             return None
 
-        # 3. RSI suggests overbought
-        if rsi < self.rsi_overbought:
-            return None
-
-        # 4. Price near upper Bollinger Band
-        if distance_to_upper_bb > self.bb_upper_proximity:
-            return None
-
-        # 5. EMA slope negative (downtrend)
-        if ema_slope_val > self.ema_slope_threshold:
-            return None
-
-        # 6. Volume confirmation
-        if vol_ratio < self.volume_ratio_threshold:
-            return None
-
-        # --- Create signal ---
+        # --- Return raw candidate with ALL features ---
         return WickRejectionSignal(
             symbol=ctx.symbol,
             signal_time=ctx.evaluated_at,
@@ -285,7 +273,74 @@ class AtrWickRejectionShortScanner:
             ema_slow=ema_slow,
             ema_slope=ema_slope_val,
             volume_ratio=vol_ratio,
+            strict_pass=False,  # Will be set by detect_signal if all filters pass
             signal_version=SCANNER_VERSION,
+        )
+
+    def detect_signal(self, ctx: MarketContext) -> WickRejectionSignal | None:
+        """Detect ATR wick rejection SHORT signal with ALL filters.
+
+        This is the STRICT mode — checks ALL conditions:
+        - Wick rejection (core)
+        - RSI overbought
+        - BB proximity
+        - EMA slope
+        - Volume confirmation
+
+        Returns WickRejectionSignal if all conditions are met, None otherwise.
+        """
+        # First, get raw candidate
+        raw = self.detect_raw_candidate(ctx)
+        if raw is None:
+            return None
+
+        # --- Apply ALL feature filters ---
+        # 3. RSI suggests overbought
+        if raw.rsi < self.rsi_overbought:
+            return None
+
+        # 4. Price near upper Bollinger Band
+        if raw.distance_to_upper_bb > self.bb_upper_proximity:
+            return None
+
+        # 5. EMA slope negative (downtrend)
+        if raw.ema_slope > self.ema_slope_threshold:
+            return None
+
+        # 6. Volume confirmation
+        if raw.volume_ratio < self.volume_ratio_threshold:
+            return None
+
+        # All filters passed — return with strict_pass=True
+        return WickRejectionSignal(
+            symbol=raw.symbol,
+            signal_time=raw.signal_time,
+            signal_price=raw.signal_price,
+            open=raw.open,
+            high=raw.high,
+            low=raw.low,
+            close=raw.close,
+            volume=raw.volume,
+            atr=raw.atr,
+            atr_pct=raw.atr_pct,
+            wick_size=raw.wick_size,
+            wick_atr=raw.wick_atr,
+            upper_wick_pct=raw.upper_wick_pct,
+            close_location=raw.close_location,
+            rsi=raw.rsi,
+            stoch_rsi=raw.stoch_rsi,
+            bb_upper=raw.bb_upper,
+            bb_mid=raw.bb_mid,
+            bb_lower=raw.bb_lower,
+            bb_width=raw.bb_width,
+            distance_to_upper_bb=raw.distance_to_upper_bb,
+            ema_fast=raw.ema_fast,
+            ema_medium=raw.ema_medium,
+            ema_slow=raw.ema_slow,
+            ema_slope=raw.ema_slope,
+            volume_ratio=raw.volume_ratio,
+            strict_pass=True,  # All filters passed
+            signal_version=raw.signal_version,
         )
 
     def scan(self, ctx: MarketContext) -> list[SetupCandidate]:
@@ -375,5 +430,6 @@ class AtrWickRejectionShortScanner:
             "ema_slow": signal.ema_slow,
             "ema_slope": signal.ema_slope,
             "volume_ratio": signal.volume_ratio,
+            "strict_pass": signal.strict_pass,
             "signal_version": signal.signal_version,
         }
