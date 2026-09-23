@@ -130,6 +130,10 @@ def _process_for_timeframe(
 
     evaluated = 0
     failed = 0
+
+    # Lazy-init shadow FVG filter observer for outcome recording
+    fvg_shadow_observer = None
+
     for setup in setups:
         try:
             candles = fetch_outcome_candles(client, setup, max_bars=max_bars)
@@ -143,6 +147,29 @@ def _process_for_timeframe(
                 logger.info("dry-run outcome: %s", asdict(outcome))
             else:
                 repository.save_signal_outcome(outcome)
+
+                # Shadow/FVG Filter OOS experiment: record outcome
+                if setup.scanner_name == "FVG_REACTION_LONG_LOCAL_STRUCT_V1":
+                    try:
+                        if fvg_shadow_observer is None:
+                            from app.shadow.fvg_filter_shadow import (
+                                FVGFilterShadowObserver,
+                            )
+                            fvg_shadow_observer = FVGFilterShadowObserver(repository)
+                        fvg_shadow_observer.record_outcome(
+                            setup_id=str(setup.setup_id),
+                            first_event=outcome.first_event,
+                            result_r=outcome.result_r,
+                            fee_slippage_adjusted_result_r=outcome.fee_slippage_adjusted_result_r,
+                            mfe_r=outcome.mfe_r,
+                            mae_r=outcome.mae_r,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "FVG shadow outcome recording failed for setup=%s",
+                            setup.setup_id, exc_info=True,
+                        )
+
             evaluated += 1
         except Exception:
             failed += 1
