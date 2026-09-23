@@ -2233,6 +2233,40 @@ class ScannerRepository:
 
         return self._with_retry(_do, label="get_open_shadow_trades")
 
+    # ------------------------------------------------------------------
+    # GENERIC HELPERS for shadow experiment modules
+    # ------------------------------------------------------------------
+
+    def _execute(self, sql: str, params: dict | None = None) -> Any:
+        """Execute a single SQL statement and return the cursor result.
+
+        Used by shadow experiment modules that need raw SQL execution.
+        Caller must commit separately when needed.
+        """
+        if not self._use_pg:
+            return None
+        cursor = self._conn.cursor()
+        if params:
+            cursor.execute(sql, params)
+        else:
+            cursor.execute(sql)
+        return cursor
+
+    def _fetchone(self, sql: str, params: tuple | None = None) -> Any:
+        """Execute a SQL statement and return a single row.
+
+        Used by shadow experiment modules that need to read a single value
+        (e.g. lastval() after INSERT).
+        """
+        if not self._use_pg:
+            return None
+        cursor = self._conn.cursor()
+        if params:
+            cursor.execute(sql, params)
+        else:
+            cursor.execute(sql)
+        return cursor.fetchone()
+
     def close(self) -> None:
         if self._conn:
             self._conn.close()

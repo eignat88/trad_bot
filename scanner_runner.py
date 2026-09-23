@@ -20,6 +20,7 @@ from app.exchange.bybit_client import BybitClient
 from app.scanners.context_builder import build_market_context
 from app.scanners.direction_gate import ScannerDirectionGatePolicy
 from app.scanners.expectancy_filter import ExpectancyFilter, load_expectancy
+from app.scanners.models import SetupCandidate
 from app.scanners.orchestrator import ScannerOrchestrator
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -99,6 +100,47 @@ def get_scanner_universe(
 def seconds_until_next_cycle(started_at: float, interval: int, now: float) -> float:
     """Return the remaining delay, keeping cycles anchored to their start."""
     return max(0, interval - (now - started_at))
+
+
+# --- Shadow/FVG Filter OOS experiment ----------------------------------
+
+_fvg_shadow_observer = None
+
+
+def _get_fvg_shadow_observer(repository: ScannerRepository):
+    """Lazy-init the FVG filter shadow observer (singleton per process)."""
+    global _fvg_shadow_observer
+    if _fvg_shadow_observer is None:
+        from app.shadow.fvg_filter_shadow import FVGFilterShadowObserver
+        _fvg_shadow_observer = FVGFilterShadowObserver(repository)
+    return _fvg_shadow_observer
+
+
+def _observe_fvg_shadow(repository: ScannerRepository, candidate: SetupCandidate) -> None:
+    """Record an FVG LONG signal for the shadow filter experiment.
+
+    Called from the scanner runner after a FVG LONG setup is saved.
+    This is a fire-and-forget observation — never blocks the signal.
+    """
+    observer = _get_fvg_shadow_observer(repository)
+    features = dict(candidate.features) if candidate.features else {}
+    # Ensure score and market_regime are in features for snapshot
+    features.setdefault("score", candidate.score)
+    features.setdefault("market_regime", candidate.market_regime)
+
+    # Get instrument_id from the repository
+    instrument_id = None
+    if repository._use_pg:
+        instrument_id = repository.ensure_instrument(candidate.symbol)
+
+    observer.observe_signal(
+        setup_id=str(candidate.setup_id),
+        symbol=candidate.symbol,
+        instrument_id=instrument_id,
+        direction=candidate.direction,
+        detected_at=candidate.detected_at,
+        features=features,
+    )
 
 
 def run_scan_cycle(
@@ -192,6 +234,14 @@ def run_scan_cycle(
                         detected_at=c.detected_at,
                         payload={"entry_zone": [c.entry_zone_low, c.entry_zone_high]},
                     )
+
+                    # Shadow/FVG Filter OOS experiment: classify every FVG LONG signal
+                    if (c.scanner_name == "FVG_REACTION_LONG_LOCAL_STRUCT_V1"
+                            and c.direction == "LONG"):
+                        try:
+                            _observe_fvg_shadow(repository, c)
+                        except Exception:
+                            logger.debug("FVG shadow observation failed", exc_info=True)
 
                 total_found += len(candidates)
                 if candidates:
