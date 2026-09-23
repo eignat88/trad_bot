@@ -161,9 +161,8 @@ class TestShadowBackfillWarmup:
         assert stats.strict_pass == 0
         assert stats.signals_inserted == 0
         assert stats.duplicates_skipped == 0
-        assert stats.wick_atr_values == []
-        assert stats.close_location_values == []
-        assert stats.rsi_values == []
+        assert stats.all_wick_atr_values == []
+        assert stats.wick_atr_bucket_counts == {}
         assert stats.top_candles == []
 
     def test_indicator_warmup_constant(self):
@@ -239,9 +238,11 @@ class TestShadowBackfillWarmup:
         if result is not None:
             from app.scanners.atr_wick_rejection_short import WickRejectionSignal
             assert isinstance(result, WickRejectionSignal)
-            # Raw candidate should have all features
-            assert result.wick_atr >= scanner.wick_atr_threshold
-            assert result.close_location <= scanner.close_location_threshold
+            # Raw candidate should have upper_wick > 0 (the only condition)
+            assert result.wick_size > 0
+            # Raw candidate should have all features computed
+            assert result.wick_atr >= 0  # wick_atr is computed but not filtered
+            assert result.close_location >= 0  # close_location is computed but not filtered
 
     def test_no_lookahead_in_context_creation(self):
         """Test that context creation doesn't use future candles."""

@@ -186,15 +186,19 @@ class AtrWickRejectionShortScanner:
         return (current_rsi - min_rsi) / (max_rsi - min_rsi)
 
     def detect_raw_candidate(self, ctx: MarketContext) -> WickRejectionSignal | None:
-        """Detect raw SHORT candidate based on wick rejection ONLY.
+        """Detect raw SHORT candidate — NO filters applied.
 
-        This is the CORE detection — only checks:
-        - Upper wick ≥ threshold x ATR
-        - Close in lower portion of candle
+        This is the RAWEST detection — the ONLY condition is:
+        - upper_wick > 0 (any candle with some upper wick)
 
-        All feature values are captured regardless of other filters.
+        All feature values (wick_atr, close_location, RSI, BB, EMA, volume)
+        are computed and stored, but NONE of them are used as filters.
 
-        Returns WickRejectionSignal if wick rejection detected, None otherwise.
+        Returns WickRejectionSignal for any candle with upper_wick > 0,
+        None only when:
+        - insufficient data (< 50 candles)
+        - ATR calculation fails
+        - upper_wick <= 0 (pure bullish candle)
         """
         candles_5m = list(ctx.candles_5m)
         if len(candles_5m) < 50:  # Need enough data for indicators
@@ -236,16 +240,11 @@ class AtrWickRejectionShortScanner:
         upper_wick_pct = upper_wick / last_candle.close if last_candle.close > 0 else 0
         close_location = self._calculate_close_location(last_candle)
 
-        # --- CORE DETECTION: Only check wick rejection ---
-        # 1. Upper wick ≥ threshold x ATR
-        if wick_atr_ratio < self.wick_atr_threshold:
+        # --- RAW DETECTION: Only check upper_wick > 0 ---
+        if upper_wick <= 0:
             return None
 
-        # 2. Close in lower portion of candle (bearish confirmation)
-        if close_location > self.close_location_threshold:
-            return None
-
-        # --- Return raw candidate with ALL features ---
+        # --- Return raw candidate with ALL features (no filtering) ---
         return WickRejectionSignal(
             symbol=ctx.symbol,
             signal_time=ctx.evaluated_at,

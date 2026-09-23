@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 # Minimum: 200 + 50 = 250 candles; use 260 for safety
 INDICATOR_WARMUP = 260
 
+# Threshold buckets for wick_atr distribution analysis
+WICK_ATR_BUCKETS = [0.20, 0.30, 0.40, 0.50, 0.75, 1.00, 1.25, 1.50]
+
 
 @dataclass
 class BackfillStats:
@@ -39,13 +42,10 @@ class BackfillStats:
     signals_inserted: int = 0
     duplicates_skipped: int = 0
     candles_processed: int = 0
-    # Diagnostic statistics
-    wick_atr_values: list[float] = field(default_factory=list)
-    close_location_values: list[float] = field(default_factory=list)
-    rsi_values: list[float] = field(default_factory=list)
-    bb_distance_values: list[float] = field(default_factory=list)
-    ema_slope_values: list[float] = field(default_factory=list)
-    volume_ratio_values: list[float] = field(default_factory=list)
+    # All wick_atr values from ALL evaluated candles
+    all_wick_atr_values: list[float] = field(default_factory=list)
+    # Threshold bucket counts
+    wick_atr_bucket_counts: dict[float, int] = field(default_factory=dict)
     # TOP candles by wick_atr
     top_candles: list[dict] = field(default_factory=list)
 
@@ -56,6 +56,8 @@ class DiagnosticStats:
     min_val: float = 0.0
     max_val: float = 0.0
     median: float = 0.0
+    p25: float = 0.0
+    p75: float = 0.0
     p90: float = 0.0
     p95: float = 0.0
     p99: float = 0.0
@@ -135,6 +137,9 @@ class ShadowBackfillRunner:
             # Process candles: need INDICATOR_WARMUP candles before the current one
             min_warmup = INDICATOR_WARMUP
 
+            # Initialize bucket counters
+            stats.wick_atr_bucket_counts = {b: 0 for b in WICK_ATR_BUCKETS}
+
             for i in range(min_warmup, len(all_candles)):
                 # Create window with historical context (no lookahead)
                 window = all_candles[max(0, i - min_warmup):i + 1]
@@ -149,20 +154,22 @@ class ShadowBackfillRunner:
                 stats.evaluated += 1
                 ctx = self._create_context(symbol, window, all_candles[i].timestamp)
 
-                # Detect raw candidate (wick rejection only)
+                # Detect raw candidate (upper_wick > 0 only — NO filters)
                 raw = self.scanner.detect_raw_candidate(ctx)
                 if raw is None:
+                    # Still track this candle in TOP-20 even if no upper wick
+                    # (upper_wick = 0 means it's not interesting)
                     continue
 
                 stats.raw_candidates += 1
 
-                # Collect diagnostic statistics
-                stats.wick_atr_values.append(raw.wick_atr)
-                stats.close_location_values.append(raw.close_location)
-                stats.rsi_values.append(raw.rsi)
-                stats.bb_distance_values.append(raw.distance_to_upper_bb)
-                stats.ema_slope_values.append(raw.ema_slope)
-                stats.volume_ratio_values.append(raw.volume_ratio)
+                # Collect wick_atr from ALL raw candidates
+                stats.all_wick_atr_values.append(raw.wick_atr)
+
+                # Count threshold buckets
+                for bucket in WICK_ATR_BUCKETS:
+                    if raw.wick_atr >= bucket:
+                        stats.wick_atr_bucket_counts[bucket] += 1
 
                 # Check if strict filters pass
                 strict = self.scanner.detect_signal(ctx)
@@ -178,7 +185,7 @@ class ShadowBackfillRunner:
                 if self.repo.save_signal(raw):
                     stats.signals_inserted += 1
 
-                # Track TOP candles by wick_atr
+                # Track TOP candles by wick_atr (keep all, sort later)
                 stats.top_candles.append({
                     "timestamp": candle_time.isoformat(),
                     "open": raw.open,
@@ -329,6 +336,8 @@ def _calculate_diagnostic_stats(values: list[float]) -> DiagnosticStats:
         min_val=sorted_vals[0],
         max_val=sorted_vals[-1],
         median=sorted_vals[n // 2],
+        p25=sorted_vals[int(n * 0.25)] if n >= 4 else sorted_vals[0],
+        p75=sorted_vals[int(n * 0.75)] if n >= 4 else sorted_vals[-1],
         p90=sorted_vals[int(n * 0.9)] if n >= 10 else sorted_vals[-1],
         p95=sorted_vals[int(n * 0.95)] if n >= 20 else sorted_vals[-1],
         p99=sorted_vals[int(n * 0.99)] if n >= 100 else sorted_vals[-1],
@@ -470,46 +479,40 @@ def main() -> None:
     for symbol, stats in sorted(results.items()):
         print(f"\n{symbol}:")
         print(f"  evaluated: {stats.evaluated}")
-        print(f"  raw_candidates: {stats.raw_candidates}")
+        print(f"  raw_candidates (upper_wick > 0): {stats.raw_candidates}")
         print(f"  strict_pass: {stats.strict_pass}")
         print(f"  signals_inserted: {stats.signals_inserted}")
         print(f"  duplicates_skipped: {stats.duplicates_skipped}")
 
-        # Print diagnostic statistics
-        if stats.wick_atr_values:
-            wick_stats = _calculate_diagnostic_stats(stats.wick_atr_values)
-            print(f"\n  Wick ATR Statistics:")
-            print(f"    min: {wick_stats.min_val:.4f}")
-            print(f"    max: {wick_stats.max_val:.4f}")
+        # Print wick_atr distribution statistics (from ALL evaluated candles with upper_wick > 0)
+        if stats.all_wick_atr_values:
+            wick_stats = _calculate_diagnostic_stats(stats.all_wick_atr_values)
+            print(f"\n  Wick ATR Distribution (n={wick_stats.count}):")
+            print(f"    min:  {wick_stats.min_val:.4f}")
+            print(f"    p25:  {wick_stats.p25:.4f}")
             print(f"    median: {wick_stats.median:.4f}")
-            print(f"    p90: {wick_stats.p90:.4f}")
-            print(f"    p95: {wick_stats.p95:.4f}")
-            print(f"    p99: {wick_stats.p99:.4f}")
+            print(f"    p75:  {wick_stats.p75:.4f}")
+            print(f"    p90:  {wick_stats.p90:.4f}")
+            print(f"    p95:  {wick_stats.p95:.4f}")
+            print(f"    p99:  {wick_stats.p99:.4f}")
+            print(f"    max:  {wick_stats.max_val:.4f}")
 
-        if stats.rsi_values:
-            rsi_stats = _calculate_diagnostic_stats(stats.rsi_values)
-            print(f"\n  RSI Statistics:")
-            print(f"    min: {rsi_stats.min_val:.2f}")
-            print(f"    max: {rsi_stats.max_val:.2f}")
-            print(f"    median: {rsi_stats.median:.2f}")
-            print(f"    p90: {rsi_stats.p90:.2f}")
-
-        if stats.close_location_values:
-            cl_stats = _calculate_diagnostic_stats(stats.close_location_values)
-            print(f"\n  Close Location Statistics:")
-            print(f"    min: {cl_stats.min_val:.4f}")
-            print(f"    max: {cl_stats.max_val:.4f}")
-            print(f"    median: {cl_stats.median:.4f}")
+        # Print threshold bucket counts
+        if stats.wick_atr_bucket_counts:
+            print(f"\n  Threshold Buckets:")
+            for bucket, count in sorted(stats.wick_atr_bucket_counts.items()):
+                pct = (count / stats.raw_candidates * 100) if stats.raw_candidates > 0 else 0
+                print(f"    wick_atr >= {bucket:.2f}: {count} ({pct:.1f}%)")
 
         # Print TOP candles
         if stats.top_candles:
             print(f"\n  TOP-20 Candles by Wick ATR:")
-            for i, candle in enumerate(stats.top_candles[:10], 1):
+            for i, candle in enumerate(stats.top_candles[:20], 1):
                 print(f"    {i}. {candle['timestamp']}")
-                print(f"       OHLC: {candle['open']:.4f} / {candle['high']:.4f} / {candle['low']:.4f} / {candle['close']:.4f}")
-                print(f"       ATR: {candle['atr']:.4f}, Wick: {candle['upper_wick']:.4f}, Wick/ATR: {candle['wick_atr']:.4f}")
+                print(f"       OHLC: {candle['open']:.6f} / {candle['high']:.6f} / {candle['low']:.6f} / {candle['close']:.6f}")
+                print(f"       ATR: {candle['atr']:.6f}, Wick: {candle['upper_wick']:.6f}, Wick/ATR: {candle['wick_atr']:.4f}")
                 print(f"       Close Loc: {candle['close_location']:.4f}, RSI: {candle['rsi']:.2f}")
-                print(f"       BB Dist: {candle['bb_distance']:.4f}, EMA Slope: {candle['ema_slope']:.6f}")
+                print(f"       BB Dist: {candle['bb_distance']:.6f}, EMA Slope: {candle['ema_slope']:.8f}")
                 print(f"       Vol Ratio: {candle['volume_ratio']:.4f}, Strict: {candle['strict_pass']}")
 
 
