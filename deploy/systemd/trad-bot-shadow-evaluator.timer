@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Trad Bot Shadow Evaluator every 5 minutes
+After=network-online.target postgresql.service
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

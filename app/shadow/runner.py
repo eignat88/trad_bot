@@ -1,12 +1,17 @@
 """Shadow scanner runner for real-time signal collection."""
 from __future__ import annotations
 
+import argparse
 import logging
+import signal
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
 
-from app.config import Settings
+from app.config import Settings, load_settings
+from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
 from app.scanners.atr_wick_rejection_short import AtrWickRejectionShortScanner, SCANNER_NAME
 from app.scanners.context_builder import build_market_context
@@ -32,6 +37,7 @@ class ShadowScannerRunner:
         self.client = client
         self.repo = repo
         self.scanner = AtrWickRejectionShortScanner()
+        self._running = False
 
     def scan_symbol(self, symbol: str) -> int:
         """Scan a single symbol for shadow signals.
@@ -170,3 +176,126 @@ class ShadowScannerRunner:
         except Exception:
             logger.exception("Failed to get universe symbols")
             return ["BTCUSDT", "ETHUSDT"]
+
+    def start(self, interval_seconds: int = 300) -> None:
+        """Start continuous shadow signal collection.
+
+        Args:
+            interval_seconds: Interval between scan cycles (default: 300 = 5 minutes)
+        """
+        self._running = True
+
+        def signal_handler(signum, frame):
+            logger.info("Received signal %d, stopping shadow runner...", signum)
+            self._running = False
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+        logger.info(
+            "Starting shadow scanner runner (interval=%ds)",
+            interval_seconds,
+        )
+
+        while self._running:
+            try:
+                summary = self.run_cycle()
+                logger.info(
+                    "Cycle complete: %d signals found",
+                    summary["total_signals"],
+                )
+            except Exception:
+                logger.exception("Shadow scan cycle failed")
+
+            if self._running:
+                time.sleep(interval_seconds)
+
+        logger.info("Shadow scanner runner stopped")
+
+
+def main() -> None:
+    """CLI entrypoint for shadow runner."""
+    parser = argparse.ArgumentParser(
+        description="Shadow runner: real-time ATR Wick Rejection Short signal collection",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single scan cycle and exit",
+    )
+    parser.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=300,
+        help="Interval between scan cycles in seconds (default: 300)",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config.yaml",
+        help="Path to config file (default: config.yaml)",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Log level (default: INFO)",
+    )
+
+    args = parser.parse_args()
+
+    # Setup logging
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    # Load settings
+    settings = load_settings(args.config)
+
+    # Create database connection
+    db_repo = ScannerRepository(
+        host=settings.db_host,
+        port=settings.db_port,
+        database=settings.db_name,
+        user=settings.db_user,
+        password=settings.db_password,
+        backend="postgres",
+    )
+
+    if not db_repo._use_pg:
+        logger.error("PostgreSQL connection required for shadow runner")
+        sys.exit(1)
+
+    # Create shadow repository
+    shadow_repo = ShadowSignalRepository(db_repo._conn)
+
+    # Create Bybit client
+    client = BybitClient(
+        api_key=settings.bybit_api_key,
+        api_secret=settings.bybit_api_secret,
+        timeout=settings.bybit_timeout,
+    )
+
+    # Create runner
+    runner = ShadowScannerRunner(settings, client, shadow_repo)
+
+    if args.once:
+        # Single cycle
+        logger.info("Running single shadow scan cycle...")
+        summary = runner.run_cycle()
+        print("\n" + "=" * 80)
+        print("SHADOW SCAN CYCLE COMPLETE")
+        print("=" * 80)
+        print(f"Symbols scanned: {summary['symbols_scanned']}")
+        print(f"Symbols with signals: {summary['symbols_with_signals']}")
+        print(f"Total signals: {summary['total_signals']}")
+        print("=" * 80)
+    else:
+        # Continuous mode
+        runner.start(interval_seconds=args.interval_seconds)
+
+
+if __name__ == "__main__":
+    main()

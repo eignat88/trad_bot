@@ -1,10 +1,16 @@
 """MFE/MAE evaluation module for shadow signals."""
 from __future__ import annotations
 
+import argparse
 import logging
+import signal
+import sys
+import time
 from datetime import datetime, timezone
 from typing import Any
 
+from app.config import load_settings
+from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
 from app.models import Candle
 from app.shadow.repository import ShadowSignalRepository
@@ -27,6 +33,7 @@ class ShadowSignalEvaluator:
     ) -> None:
         self.client = client
         self.repo = repo
+        self._running = False
 
     def evaluate_signal(self, signal_data: dict) -> dict | None:
         """Evaluate MFE/MAE for a single shadow signal.
@@ -255,3 +262,130 @@ class ShadowSignalEvaluator:
         )
 
         return summary
+
+    def start(self, interval_seconds: int = 300) -> None:
+        """Start continuous shadow signal evaluation.
+
+        Args:
+            interval_seconds: Interval between evaluation cycles (default: 300 = 5 minutes)
+        """
+        self._running = True
+
+        def signal_handler(signum, frame):
+            logger.info("Received signal %d, stopping shadow evaluator...", signum)
+            self._running = False
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+        logger.info(
+            "Starting shadow evaluator (interval=%ds)",
+            interval_seconds,
+        )
+
+        while self._running:
+            try:
+                summary = self.run_evaluation_cycle()
+                logger.info(
+                    "Evaluation cycle complete: %d signals evaluated",
+                    summary["signals_evaluated"],
+                )
+            except Exception:
+                logger.exception("Shadow evaluation cycle failed")
+
+            if self._running:
+                time.sleep(interval_seconds)
+
+        logger.info("Shadow evaluator stopped")
+
+
+def main() -> None:
+    """CLI entrypoint for shadow evaluator."""
+    parser = argparse.ArgumentParser(
+        description="Shadow evaluator: calculate MFE/MAE for ATR Wick Rejection Short signals",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single evaluation cycle and exit",
+    )
+    parser.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=300,
+        help="Interval between evaluation cycles in seconds (default: 300)",
+    )
+    parser.add_argument(
+        "--min-age-minutes",
+        type=int,
+        default=60,
+        help="Minimum age of signals to evaluate in minutes (default: 60)",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config.yaml",
+        help="Path to config file (default: config.yaml)",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Log level (default: INFO)",
+    )
+
+    args = parser.parse_args()
+
+    # Setup logging
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    # Load settings
+    settings = load_settings(args.config)
+
+    # Create database connection
+    db_repo = ScannerRepository(
+        host=settings.db_host,
+        port=settings.db_port,
+        database=settings.db_name,
+        user=settings.db_user,
+        password=settings.db_password,
+        backend="postgres",
+    )
+
+    if not db_repo._use_pg:
+        logger.error("PostgreSQL connection required for shadow evaluator")
+        sys.exit(1)
+
+    # Create shadow repository
+    shadow_repo = ShadowSignalRepository(db_repo._conn)
+
+    # Create Bybit client
+    client = BybitClient(
+        api_key=settings.bybit_api_key,
+        api_secret=settings.bybit_api_secret,
+        timeout=settings.bybit_timeout,
+    )
+
+    # Create evaluator
+    evaluator = ShadowSignalEvaluator(client, shadow_repo)
+
+    if args.once:
+        # Single cycle
+        logger.info("Running single shadow evaluation cycle...")
+        summary = evaluator.run_evaluation_cycle()
+        print("\n" + "=" * 80)
+        print("SHADOW EVALUATION CYCLE COMPLETE")
+        print("=" * 80)
+        print(f"Signals evaluated: {summary['signals_evaluated']}")
+        print("=" * 80)
+    else:
+        # Continuous mode
+        evaluator.start(interval_seconds=args.interval_seconds)
+
+
+if __name__ == "__main__":
+    main()
