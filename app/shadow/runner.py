@@ -15,7 +15,7 @@ from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
 from app.scanners.atr_wick_rejection_short import AtrWickRejectionShortScanner, WickRejectionSignal
 from app.scanners.context_builder import build_market_context
-from app.shadow.repository import ShadowSignalRepository
+from app.shadow.repository import SaveSignalStatus, ShadowSignalRepository
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +23,11 @@ logger = logging.getLogger(__name__)
 class ShadowScannerRunner:
     """Runner for real-time shadow signal collection.
 
-    This runner operates independently of the main scanner and paper trading.
-    It collects signals for experimental analysis without affecting trading.
+    Architecture:
+    - Worker threads: market fetch + detection (parallel, no DB)
+    - Main thread: sequential DB persistence via single connection
+
+    This avoids pg8000 thread-safety issues with shared connections.
     """
 
     def __init__(
@@ -39,102 +42,103 @@ class ShadowScannerRunner:
         self.scanner = AtrWickRejectionShortScanner()
         self._running = False
 
-    def scan_symbol(self, symbol: str) -> dict[str, int]:
-        """Scan a single symbol for RAW shadow candidates.
+    def _scan_symbol(self, symbol: str) -> WickRejectionSignal | None:
+        """Scan one symbol: fetch market data, detect RAW candidate.
 
-        Returns {"raw": N, "strict": M, "inserted": X, "duplicates": D, "errors": E}.
+        NO DB operations — pure computation + API call.
+        Returns WickRejectionSignal if a raw candidate exists, None otherwise.
         """
-        result = {"raw": 0, "strict": 0, "inserted": 0, "duplicates": 0, "errors": 0}
+        ctx = build_market_context(self.client, symbol, self.settings)
 
-        try:
-            ctx = build_market_context(self.client, symbol, self.settings)
+        raw = self.scanner.detect_raw_candidate(ctx)
+        if raw is None:
+            return None
 
-            # RAW candidate: upper_wick > 0 only, no strict filters
-            raw = self.scanner.detect_raw_candidate(ctx)
-            if raw is None:
-                return result
+        # Set strict_pass via centralised predicate
+        strict = self.scanner.passes_strict_filters(raw)
+        return WickRejectionSignal(
+            symbol=raw.symbol,
+            signal_time=raw.signal_time,
+            signal_price=raw.signal_price,
+            open=raw.open, high=raw.high, low=raw.low,
+            close=raw.close, volume=raw.volume,
+            atr=raw.atr, atr_pct=raw.atr_pct,
+            wick_size=raw.wick_size, wick_atr=raw.wick_atr,
+            upper_wick_pct=raw.upper_wick_pct,
+            close_location=raw.close_location,
+            rsi=raw.rsi, stoch_rsi=raw.stoch_rsi,
+            bb_upper=raw.bb_upper, bb_mid=raw.bb_mid,
+            bb_lower=raw.bb_lower, bb_width=raw.bb_width,
+            distance_to_upper_bb=raw.distance_to_upper_bb,
+            ema_fast=raw.ema_fast, ema_medium=raw.ema_medium,
+            ema_slow=raw.ema_slow, ema_slope=raw.ema_slope,
+            volume_ratio=raw.volume_ratio,
+            strict_pass=strict,
+            signal_version=raw.signal_version,
+        )
 
-            result["raw"] = 1
+    def _persist_candidate(self, signal: WickRejectionSignal) -> str:
+        """Persist a single candidate via repo. Main thread only.
 
-            # Determine strict_pass for this candidate
-            strict = self.scanner.passes_strict_filters(raw)
-            signal_to_save = WickRejectionSignal(
-                symbol=raw.symbol,
-                signal_time=raw.signal_time,
-                signal_price=raw.signal_price,
-                open=raw.open, high=raw.high, low=raw.low,
-                close=raw.close, volume=raw.volume,
-                atr=raw.atr, atr_pct=raw.atr_pct,
-                wick_size=raw.wick_size, wick_atr=raw.wick_atr,
-                upper_wick_pct=raw.upper_wick_pct,
-                close_location=raw.close_location,
-                rsi=raw.rsi, stoch_rsi=raw.stoch_rsi,
-                bb_upper=raw.bb_upper, bb_mid=raw.bb_mid,
-                bb_lower=raw.bb_lower, bb_width=raw.bb_width,
-                distance_to_upper_bb=raw.distance_to_upper_bb,
-                ema_fast=raw.ema_fast, ema_medium=raw.ema_medium,
-                ema_slow=raw.ema_slow, ema_slope=raw.ema_slope,
-                volume_ratio=raw.volume_ratio,
-                strict_pass=strict,
-                signal_version=raw.signal_version,
-            )
-
-            if strict:
-                result["strict"] = 1
-
-            saved_id = self.repo.save_signal(signal_to_save)
-            if saved_id is not None:
-                result["inserted"] = 1
-            else:
-                # Could be duplicate (ON CONFLICT DO NOTHING) or DB error
-                # Check if signal exists to distinguish
-                if self.repo.signal_exists(symbol, raw.signal_time):
-                    result["duplicates"] = 1
-                else:
-                    result["errors"] = 1
-
-        except Exception:
-            logger.exception("Shadow scan failed for %s", symbol)
-            result["errors"] = 1
-
-        return result
-
-    def scan_universe(self, symbols: list[str]) -> dict[str, int]:
-        """Scan all symbols in the universe.
-
-        Returns aggregated counts: raw, strict, inserted, duplicates, errors.
+        Returns: "inserted" | "duplicate" | "db_error"
         """
-        totals = {"raw": 0, "strict": 0, "inserted": 0, "duplicates": 0, "errors": 0}
+        result = self.repo.save_signal(signal)
+        if result.status == SaveSignalStatus.INSERTED:
+            return "inserted"
+        elif result.status == SaveSignalStatus.DUPLICATE:
+            return "duplicate"
+        else:
+            return "db_error"
+
+    def run_cycle(self) -> dict[str, Any]:
+        """Run one complete scan+persist cycle.
+
+        Phase 1 (parallel): fetch market data + detect candidates
+        Phase 2 (sequential): persist candidates to DB
+
+        Returns summary with separate scan_error / db_error counts.
+        """
+        start_time = datetime.now(timezone.utc)
+
+        symbols = self._get_universe_symbols()
+
+        # ── Phase 1: parallel market fetch + detection ────────
+        candidates: list[WickRejectionSignal] = []
+        raw_count = 0
+        strict_count = 0
+        scan_errors = 0
 
         with ThreadPoolExecutor(max_workers=self.settings.scanner_workers) as executor:
             future_to_symbol = {
-                executor.submit(self.scan_symbol, symbol): symbol
+                executor.submit(self._scan_symbol, symbol): symbol
                 for symbol in symbols
             }
             for future in as_completed(future_to_symbol):
                 symbol = future_to_symbol[future]
                 try:
-                    result = future.result()
-                    for key in totals:
-                        totals[key] += result[key]
+                    candidate = future.result()
+                    if candidate is not None:
+                        raw_count += 1
+                        if candidate.strict_pass:
+                            strict_count += 1
+                        candidates.append(candidate)
                 except Exception:
                     logger.exception("Shadow scan failed for %s", symbol)
-                    totals["errors"] += 1
+                    scan_errors += 1
 
-        return totals
+        # ── Phase 2: sequential DB persistence ────────────────
+        inserted = 0
+        duplicates = 0
+        db_errors = 0
 
-    def run_cycle(self) -> dict[str, Any]:
-        """Run one complete scan cycle.
-
-        Returns summary with raw/strict/inserted/duplicates/errors.
-        """
-        start_time = datetime.now(timezone.utc)
-
-        # Get universe of symbols
-        symbols = self._get_universe_symbols()
-
-        # Scan all symbols — returns aggregated counts
-        counts = self.scan_universe(symbols)
+        for signal in candidates:
+            status = self._persist_candidate(signal)
+            if status == "inserted":
+                inserted += 1
+            elif status == "duplicate":
+                duplicates += 1
+            else:
+                db_errors += 1
 
         end_time = datetime.now(timezone.utc)
 
@@ -142,18 +146,19 @@ class ShadowScannerRunner:
             "start_time": start_time.isoformat(),
             "end_time": end_time.isoformat(),
             "symbols_scanned": len(symbols),
-            "raw_candidates": counts["raw"],
-            "strict_pass": counts["strict"],
-            "inserted": counts["inserted"],
-            "duplicates": counts["duplicates"],
-            "errors": counts["errors"],
+            "raw_candidates": raw_count,
+            "strict_pass": strict_count,
+            "inserted": inserted,
+            "duplicates": duplicates,
+            "scan_errors": scan_errors,
+            "db_errors": db_errors,
         }
 
         logger.info(
-            "Shadow scan cycle: symbols=%d raw=%d strict=%d inserted=%d "
-            "duplicates=%d errors=%d",
-            len(symbols), counts["raw"], counts["strict"],
-            counts["inserted"], counts["duplicates"], counts["errors"],
+            "Shadow scan cycle: symbols=%d raw=%d strict=%d "
+            "inserted=%d duplicates=%d scan_errors=%d db_errors=%d",
+            len(symbols), raw_count, strict_count,
+            inserted, duplicates, scan_errors, db_errors,
         )
 
         return summary
@@ -308,7 +313,8 @@ def main() -> None:
         print(f"Strict pass:       {summary['strict_pass']}")
         print(f"Inserted:          {summary['inserted']}")
         print(f"Duplicates:        {summary['duplicates']}")
-        print(f"Errors:            {summary['errors']}")
+        print(f"Scan errors:       {summary['scan_errors']}")
+        print(f"DB errors:         {summary['db_errors']}")
         print("=" * 80)
     else:
         # Continuous mode

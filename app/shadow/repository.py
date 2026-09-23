@@ -4,11 +4,31 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any
 
 from app.scanners.atr_wick_rejection_short import WickRejectionSignal
 
 logger = logging.getLogger(__name__)
+
+
+class SaveSignalStatus(str, Enum):
+    """Result status for save_signal()."""
+    INSERTED = "INSERTED"
+    DUPLICATE = "DUPLICATE"
+    ERROR = "ERROR"
+
+
+class SaveSignalResult:
+    """Structured result from save_signal()."""
+    __slots__ = ("status", "signal_id")
+
+    def __init__(self, status: SaveSignalStatus, signal_id: int | None = None) -> None:
+        self.status = status
+        self.signal_id = signal_id
+
+    def __repr__(self) -> str:
+        return f"SaveSignalResult(status={self.status.value!r}, signal_id={self.signal_id})"
 
 
 class ShadowSignalRepository:
@@ -17,13 +37,21 @@ class ShadowSignalRepository:
     def __init__(self, conn: Any) -> None:
         self._conn = conn
 
-    def save_signal(self, signal: WickRejectionSignal) -> int | None:
+    def save_signal(self, signal: WickRejectionSignal) -> SaveSignalResult:
         """Save a shadow signal to the database.
 
-        Returns the signal_id if saved, None if duplicate or error.
+        Returns SaveSignalResult with status:
+        - INSERTED: new row created, signal_id set
+        - DUPLICATE: ON CONFLICT DO NOTHING, no row inserted
+        - ERROR: exception during execute/fetchone, rolled back
+
+        Transaction order (pg8000 safe):
+          cursor.execute(...)
+          row = cursor.fetchone()
+          conn.commit()
         """
         if not self._conn:
-            return None
+            return SaveSignalResult(SaveSignalStatus.ERROR)
 
         cursor = self._conn.cursor()
         try:
@@ -82,17 +110,19 @@ class ShadowSignalRepository:
                     signal.signal_version,
                 ),
             )
-            # Fetch RETURNING result BEFORE commit — pg8000 requires this
+            # fetchone BEFORE commit — pg8000 requires this
             row = cursor.fetchone()
             self._conn.commit()
+
             if row:
-                return row[0]
+                return SaveSignalResult(SaveSignalStatus.INSERTED, signal_id=row[0])
             # ON CONFLICT DO NOTHING returned no row → duplicate
-            return None
+            return SaveSignalResult(SaveSignalStatus.DUPLICATE)
+
         except Exception:
             self._conn.rollback()
             logger.exception("Failed to save shadow signal for %s", signal.symbol)
-            return None
+            return SaveSignalResult(SaveSignalStatus.ERROR)
 
     def signal_exists(self, symbol: str, signal_time: datetime) -> bool:
         """Check if a signal already exists for this symbol and time."""
