@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=/opt/trad_bot
 EnvironmentFile=/opt/trad_bot/.env
-ExecStart=/opt/trad_bot/.venv/bin/python /opt/trad_bot/app/scanners/outcome_cli.py --limit 200 --scanner FVG_REACTION_LONG_LOCAL_STRUCT_V1
+ExecStart=/opt/trad_bot/.venv/bin/python -m app.scanners.outcome_cli --limit 200 --scanner FVG_REACTION_LONG_LOCAL_STRUCT_V1
 
 User=tradbot
 Group=tradbot
