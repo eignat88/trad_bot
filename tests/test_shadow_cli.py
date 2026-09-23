@@ -70,7 +70,8 @@ class TestShadowRunnerCLI:
                                 "strict_pass": 0,
                                 "inserted": 1,
                                 "duplicates": 0,
-                                "errors": 0,
+                                "scan_errors": 0,
+                                "db_errors": 0,
                             }
                             mock_runner.return_value = mock_runner_instance
 
@@ -455,11 +456,11 @@ class TestShadowRunnerRawCapture:
         assert "passes_strict_filters" in source
 
     def test_runner_uses_detect_raw_candidate(self):
-        """Runner.scan_symbol calls detect_raw_candidate, not scan()."""
+        """Runner._scan_symbol calls detect_raw_candidate, not scan()."""
         import inspect
         from app.shadow.runner import ShadowScannerRunner
 
-        source = inspect.getsource(ShadowScannerRunner.scan_symbol)
+        source = inspect.getsource(ShadowScannerRunner._scan_symbol)
         assert "detect_raw_candidate" in source
         assert "scanner.scan(" not in source
 
@@ -468,12 +469,29 @@ class TestShadowRunnerRawCapture:
         import inspect
         from app.shadow.runner import ShadowScannerRunner
 
-        source = inspect.getsource(ShadowScannerRunner.scan_symbol)
-        # scan() is the strict method — should not appear
+        source = inspect.getsource(ShadowScannerRunner._scan_symbol)
         assert ".scan(ctx)" not in source
 
+    def test_runner_no_repo_in_scan_phase(self):
+        """Worker _scan_symbol has NO repo calls — DB-free."""
+        import inspect
+        from app.shadow.runner import ShadowScannerRunner
+
+        source = inspect.getsource(ShadowScannerRunner._scan_symbol)
+        assert "repo" not in source
+        assert "save_signal" not in source
+        assert "signal_exists" not in source
+
+    def test_runner_persist_in_main_thread(self):
+        """Persistence happens in _persist_candidate, not in workers."""
+        import inspect
+        from app.shadow.runner import ShadowScannerRunner
+
+        source = inspect.getsource(ShadowScannerRunner.run_cycle)
+        assert "_persist_candidate" in source
+
     def test_run_cycle_returns_raw_strict_inserted(self):
-        """run_cycle summary has raw/strict/inserted keys."""
+        """run_cycle summary has raw/strict/inserted/scan_errors/db_errors."""
         import inspect
         from app.shadow.runner import ShadowScannerRunner
 
@@ -482,4 +500,5 @@ class TestShadowRunnerRawCapture:
         assert "strict_pass" in source
         assert "inserted" in source
         assert "duplicates" in source
-        assert "errors" in source
+        assert "scan_errors" in source
+        assert "db_errors" in source

@@ -66,10 +66,12 @@ class TestShadowSignalRepository:
         mock_cursor.fetchone.return_value = (1,)
 
         # Save signal
-        signal_id = repo.save_signal(signal)
+        result = repo.save_signal(signal)
 
-        # Should return signal_id
-        assert signal_id == 1
+        # Should return INSERTED with signal_id
+        from app.shadow.repository import SaveSignalStatus
+        assert result.status == SaveSignalStatus.INSERTED
+        assert result.signal_id == 1
         mock_conn.commit.assert_called_once()
 
     def test_signal_exists_true(self, repo, mock_conn):
@@ -271,7 +273,9 @@ class TestSaveSignalReturnOrder:
     """Regression: fetchone must happen BEFORE commit for pg8000."""
 
     def test_successful_insert_fetches_before_commit(self, repo, mock_conn):
-        """INSERT RETURNING → fetchone → commit → return signal_id."""
+        """INSERT RETURNING → fetchone → commit → SaveSignalResult(INSERTED)."""
+        from app.shadow.repository import SaveSignalStatus
+
         mock_cursor = mock_conn.cursor.return_value
         mock_cursor.fetchone.return_value = (42,)
 
@@ -292,19 +296,19 @@ class TestSaveSignalReturnOrder:
             signal_version="1.0.0",
         )
 
-        signal_id = repo.save_signal(signal)
+        result = repo.save_signal(signal)
 
-        # Must return the signal_id
-        assert signal_id == 42
-        # fetchone must have been called (it was — we set return_value)
+        assert result.status == SaveSignalStatus.INSERTED
+        assert result.signal_id == 42
         mock_cursor.fetchone.assert_called_once()
-        # commit must happen
         mock_conn.commit.assert_called_once()
 
     def test_duplicate_returns_none(self, repo, mock_conn):
-        """ON CONFLICT DO NOTHING → fetchone returns None → commit → None."""
+        """ON CONFLICT DO NOTHING → fetchone returns None → DUPLICATE."""
+        from app.shadow.repository import SaveSignalStatus
+
         mock_cursor = mock_conn.cursor.return_value
-        mock_cursor.fetchone.return_value = None  # conflict, no row
+        mock_cursor.fetchone.return_value = None
 
         signal = WickRejectionSignal(
             symbol="TESTUSDT",
@@ -323,12 +327,15 @@ class TestSaveSignalReturnOrder:
             signal_version="1.0.0",
         )
 
-        signal_id = repo.save_signal(signal)
-        assert signal_id is None
+        result = repo.save_signal(signal)
+        assert result.status == SaveSignalStatus.DUPLICATE
+        assert result.signal_id is None
         mock_conn.commit.assert_called_once()
 
     def test_db_execute_error_rollback(self, repo, mock_conn):
-        """DB error on execute → rollback → None, commit NOT called."""
+        """DB error on execute → rollback → ERROR, commit NOT called."""
+        from app.shadow.repository import SaveSignalStatus
+
         mock_cursor = mock_conn.cursor.return_value
         mock_cursor.execute.side_effect = Exception("DB error")
 
@@ -349,13 +356,15 @@ class TestSaveSignalReturnOrder:
             signal_version="1.0.0",
         )
 
-        signal_id = repo.save_signal(signal)
-        assert signal_id is None
+        result = repo.save_signal(signal)
+        assert result.status == SaveSignalStatus.ERROR
         mock_conn.rollback.assert_called()
         mock_conn.commit.assert_not_called()
 
     def test_db_fetch_error_rollback(self, repo, mock_conn):
-        """DB error on fetchone → rollback → None, commit NOT called."""
+        """DB error on fetchone → rollback → ERROR, commit NOT called."""
+        from app.shadow.repository import SaveSignalStatus
+
         mock_cursor = mock_conn.cursor.return_value
         mock_cursor.fetchone.side_effect = Exception("fetch error")
 
@@ -376,13 +385,15 @@ class TestSaveSignalReturnOrder:
             signal_version="1.0.0",
         )
 
-        signal_id = repo.save_signal(signal)
-        assert signal_id is None
+        result = repo.save_signal(signal)
+        assert result.status == SaveSignalStatus.ERROR
         mock_conn.rollback.assert_called()
         mock_conn.commit.assert_not_called()
 
-    def test_no_connection_returns_none(self):
-        """Without connection, save_signal returns None."""
+    def test_no_connection_returns_error(self):
+        """Without connection, save_signal returns ERROR."""
+        from app.shadow.repository import SaveSignalStatus
+
         repo_no_conn = ShadowSignalRepository(conn=None)
         signal = WickRejectionSignal(
             symbol="TESTUSDT",
@@ -400,4 +411,5 @@ class TestSaveSignalReturnOrder:
             ema_slope=-0.0002, volume_ratio=1.5,
             signal_version="1.0.0",
         )
-        assert repo_no_conn.save_signal(signal) is None
+        result = repo_no_conn.save_signal(signal)
+        assert result.status == SaveSignalStatus.ERROR
