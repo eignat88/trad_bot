@@ -61,6 +61,103 @@ def evaluate_setup_outcome(
     if max_bars <= 0:
         raise ValueError("max_bars must be positive")
 
+    # --- FVG parity: entry at confirmation close, no touch search ---
+    is_fvg = candidate.scanner_name == "FVG_REACTION_LONG_LOCAL_STRUCT_V1"
+    confirmation_at = (candidate.features or {}).get("confirmation_at")
+
+    if is_fvg and confirmation_at is not None:
+        # FVG semantics: position is opened at confirmation close.
+        # Outcome evaluation starts from the NEXT candle after confirmation.
+        # No touch search — entry is deterministic at confirmation_at.
+        entry_price = candidate.features.get("entry_price") or candidate.entry_zone_high
+        future = [c for c in candles if c.timestamp > confirmation_at]
+        future = future[:max_bars]
+        entry = entry_price
+        risk = abs(entry - candidate.invalidation_price)
+        if risk <= 0:
+            raise ValueError("risk must be positive")
+
+        # Entry is pre-determined — first candle is for SL/TP evaluation only
+        entry_index = 0
+        event: OutcomeEvent = "OPEN"
+        mfe_r = 0.0
+        mae_r = 0.0
+        exit_index: int | None = None
+        exit_price: float | None = None
+
+        for index, candle in enumerate(future, start=1):
+            if candidate.direction == "LONG":
+                mfe_r = max(mfe_r, (candle.high - entry) / risk)
+                mae_r = min(mae_r, (candle.low - entry) / risk)
+                if candle.low <= candidate.invalidation_price:
+                    event = "SL"
+                    exit_price = candidate.invalidation_price
+                    exit_index = index
+                    break
+                if candidate.target_2 is not None and candle.high >= candidate.target_2:
+                    event = "TP2"
+                    exit_price = candidate.target_2
+                    exit_index = index
+                    break
+                if candle.high >= candidate.target_1:
+                    event = "TP1"
+                    exit_price = candidate.target_1
+                    exit_index = index
+                    break
+            else:
+                mfe_r = max(mfe_r, (entry - candle.low) / risk)
+                mae_r = min(mae_r, (entry - candle.high) / risk)
+                if candle.high >= candidate.invalidation_price:
+                    event = "SL"
+                    exit_price = candidate.invalidation_price
+                    exit_index = index
+                    break
+                if candidate.target_2 is not None and candle.low <= candidate.target_2:
+                    event = "TP2"
+                    exit_price = candidate.target_2
+                    exit_index = index
+                    break
+                if candle.low <= candidate.target_1:
+                    event = "TP1"
+                    exit_price = candidate.target_1
+                    exit_index = index
+                    break
+
+        if exit_price is None:
+            expire_at_breakeven = (candidate.features or {}).get("recommended_expiry_policy") == "BREAKEVEN"
+            if expire_at_breakeven:
+                result_r = 0.0
+                event = "EXPIRED_BE"
+                exit_price = entry
+            else:
+                last_close = future[-1].close if future else entry
+                result_r = _price_to_r(candidate, last_close, entry, risk)
+                event = "EXPIRED"
+                exit_price = last_close
+            exit_index = len(future) if future else 0
+        else:
+            result_r = _price_to_r(candidate, exit_price, entry, risk)
+
+        adjusted = result_r - fee_slippage_r
+        return SignalOutcome(
+            setup_id=str(candidate.setup_id),
+            symbol=candidate.symbol,
+            scanner_name=candidate.scanner_name,
+            direction=candidate.direction,
+            entry_touched=True,
+            first_event=event,
+            result_r=round(result_r, 6),
+            mfe_r=round(mfe_r, 6),
+            mae_r=round(mae_r, 6),
+            bars_to_entry=0,
+            bars_to_exit=exit_index,
+            entry_price=entry,
+            exit_price=exit_price,
+            fee_slippage_adjusted_result_r=round(adjusted, 6),
+        )
+
+    # --- Generic (non-FVG) path: touch-based entry ---
+    # Non-FVG scanners: start from signal candle.
     future = [c for c in candles if c.timestamp > candidate.signal_candle_open_time]
     future = future[:max_bars]
     entry = _entry_price(candidate)
