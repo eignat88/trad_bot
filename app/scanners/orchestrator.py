@@ -222,16 +222,23 @@ class ScannerOrchestrator:
 
         # Expectancy filter: drop scanner/direction combos with negative historical R.
         # Static manual blocks are handled by the gate policy above.
+        #
+        # IMPORTANT: shadow/control candidates must bypass the expectancy filter.
+        # They are analytical observations, not tradeable signals.  Dropping them
+        # here would destroy the control cohort needed for OOS comparison.
         expectancy_rejected = 0
         if expectancy_filter is not None:
-            valid, expectancy_rejected = filter_candidates(
-                valid,
+            tradeable = [c for c in valid if not c.features.get("_shadow_control")]
+            shadow = [c for c in valid if c.features.get("_shadow_control")]
+            tradeable, expectancy_rejected = filter_candidates(
+                tradeable,
                 expectancy_filter,
                 min_avg_r=min_avg_r,
                 min_samples=min_samples,
                 blocked_combinations=blocked_combinations,
                 trading_mode=trading_mode,
             )
+            valid = tradeable + shadow
 
         if valid:
             logger.info(

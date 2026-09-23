@@ -147,12 +147,12 @@ class MERLongCloseLocationOOSValidationV1Scanner:
             1. Delegate to frozen V1 base scanner
             2. If no base setup → return empty
             3. Compute close_location from signal candle
-            4. If close_location >= threshold → emit treatment signal
-            5. If close_location < threshold → log rejection, return empty
+            4. If close_location >= threshold → emit PASS treatment signal
+            5. If close_location < threshold → emit REJECT with _oos_rejected marker
 
-        Control/shadow cohort logging is handled by the orchestrator
-        or analytics layer — every base setup produces a control record
-        regardless of filter outcome.
+        Rejected candidates are returned with ``_oos_rejected=true`` in features
+        and state=EXPIRED.  They are persisted to ``dds.scanner_setup`` for
+        analytical tracking but never executed by the paper engine.
         """
         # Step 1: Run frozen base detection
         base_candidates = self._base_scanner.scan(ctx)
@@ -163,22 +163,14 @@ class MERLongCloseLocationOOSValidationV1Scanner:
 
         for candidate in base_candidates:
             # Step 2: Compute close_location from signal candle
-            # Signal candle is the same candle_5m[-1] used by the base scanner
             close_location, signal_ts = self._compute_close_location_from_signal_candle(
                 list(ctx.candles_5m)
             )
-
-            # Leakage audit guarantee:
-            # signal_ts = candles_5m[-1].timestamp  (closed candle)
-            # decision_ts = candidate.detected_at = ctx.evaluated_at
-            # Since ctx.candles_5m[-1] is fully closed before ctx.evaluated_at:
-            #   signal_ts <= decision_ts  ✓
 
             # Step 3: Evaluate close_location filter
             if close_location is not None:
                 filter_passed = close_location >= self.threshold
             else:
-                # Zero-range candle: cannot evaluate → reject
                 filter_passed = False
 
             # Step 4: Attach OOS features for tracking
@@ -187,7 +179,7 @@ class MERLongCloseLocationOOSValidationV1Scanner:
             )
 
             if filter_passed:
-                # TREATMENT: emit signal for paper/live entry
+                # TREATMENT PASS: emit signal for paper/live entry
                 logger.info(
                     "ME_R_LONG OOS candidate %s close_location=%.4f threshold=%.2f PASS",
                     ctx.symbol,
@@ -196,7 +188,17 @@ class MERLongCloseLocationOOSValidationV1Scanner:
                 )
                 results.append(enriched)
             else:
-                # REJECTED: log but do not emit
+                # TREATMENT REJECT: persist as non-executable analytical record
+                from dataclasses import replace
+                rejected_features = dict(enriched.features)
+                rejected_features["_oos_rejected"] = True
+                rejected_features["_oos_rejection_reason"] = REJECTION_REASON
+                rejected = replace(
+                    enriched,
+                    features=rejected_features,
+                    state=SetupState.EXPIRED,
+                    reasons=("OOS_FILTER_REJECTED",),
+                )
                 logger.info(
                     "ME_R_LONG OOS candidate %s close_location=%s threshold=%.2f REJECT reason=%s",
                     ctx.symbol,
@@ -204,5 +206,6 @@ class MERLongCloseLocationOOSValidationV1Scanner:
                     self.threshold,
                     REJECTION_REASON,
                 )
+                results.append(rejected)
 
         return results
