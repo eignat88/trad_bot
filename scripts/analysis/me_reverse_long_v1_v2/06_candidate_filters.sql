@@ -1,29 +1,25 @@
 -- 06_candidate_filters.sql
 -- Candidate filter analysis: test various thresholds on features
--- This script tests multiple filters and shows their impact
+-- Features come from dds.scanner_setup.features (NOT dds.paper_trade.features)
 -- NOTE: All ROUND() calls use ::numeric cast to avoid
 --       PostgreSQL "function round(double precision, integer) does not exist"
 
--- Filter 1: rsi_delta_3 threshold (V2 only feature, but V1 trades have it too if we compute it)
--- For V1 trades, we need to check if features contain rsi_delta_3
 -- V2 already filters on rsi_delta_3 > 0, so we test tighter thresholds
 
 WITH base AS (
     SELECT
         pt.trade_id,
-        pt.scanner_name,
         pt.pnl_r,
-        pt.mfe,
-        pt.mae,
-        (pt.features->>'exhaustion_magnitude')::numeric AS exhaustion_magnitude,
-        (pt.features->>'body_ratio')::numeric AS body_ratio,
-        (pt.features->>'rsi_confirmation')::numeric AS rsi_confirmation,
-        (pt.features->>'volume_ratio')::numeric AS volume_ratio,
-        (pt.features->>'rr_ratio')::numeric AS rr_ratio,
-        (pt.features->>'stop_distance_atr')::numeric AS stop_distance_atr,
-        (pt.features->>'rsi_14')::numeric AS rsi_14,
-        (pt.features->>'rsi_delta_3')::numeric AS rsi_delta_3
+        NULLIF(ss.features->>'exhaustion_magnitude', '')::numeric AS exhaustion_magnitude,
+        NULLIF(ss.features->>'body_ratio', '')::numeric AS body_ratio,
+        NULLIF(ss.features->>'rsi_confirmation', '')::numeric AS rsi_confirmation,
+        NULLIF(ss.features->>'volume_ratio', '')::numeric AS volume_ratio,
+        NULLIF(ss.features->>'rr_ratio', '')::numeric AS rr_ratio,
+        NULLIF(ss.features->>'stop_distance_atr', '')::numeric AS stop_distance_atr,
+        NULLIF(ss.features->>'rsi_14', '')::numeric AS rsi_14,
+        NULLIF(ss.features->>'rsi_delta_3', '')::numeric AS rsi_delta_3
     FROM dds.paper_trade pt
+    JOIN dds.scanner_setup ss ON ss.setup_id = pt.setup_id
     WHERE pt.scanner_name = 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V1'
       AND pt.direction = 'LONG'
       AND pt.status = 'CLOSED'

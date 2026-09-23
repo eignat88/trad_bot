@@ -1,6 +1,6 @@
 -- 04_winner_loser_features.sql
 -- Feature comparison: winners vs losers for V1 and V2
--- Uses features stored in dds.paper_trade.features JSONB
+-- Features come from dds.scanner_setup.features (NOT dds.paper_trade.features)
 -- NOTE: All ROUND() calls use ::numeric cast to avoid
 --       PostgreSQL "function round(double precision, integer) does not exist"
 
@@ -21,15 +21,15 @@ WITH trades AS (
         pt.entry_price,
         pt.exit_price,
         pt.stop_price,
-        -- JSONB features extraction
-        (pt.features->>'exhaustion_magnitude')::numeric AS exhaustion_magnitude,
-        (pt.features->>'body_ratio')::numeric AS body_ratio,
-        (pt.features->>'rsi_confirmation')::numeric AS rsi_confirmation,
-        (pt.features->>'volume_ratio')::numeric AS volume_ratio,
-        (pt.features->>'rr_ratio')::numeric AS rr_ratio,
-        (pt.features->>'stop_distance_atr')::numeric AS stop_distance_atr,
-        (pt.features->>'rsi_14')::numeric AS rsi_14,
-        (pt.features->>'rsi_delta_3')::numeric AS rsi_delta_3,
+        -- JSONB features extraction from scanner_setup
+        NULLIF(ss.features->>'exhaustion_magnitude', '')::numeric AS exhaustion_magnitude,
+        NULLIF(ss.features->>'body_ratio', '')::numeric AS body_ratio,
+        NULLIF(ss.features->>'rsi_confirmation', '')::numeric AS rsi_confirmation,
+        NULLIF(ss.features->>'volume_ratio', '')::numeric AS volume_ratio,
+        NULLIF(ss.features->>'rr_ratio', '')::numeric AS rr_ratio,
+        NULLIF(ss.features->>'stop_distance_atr', '')::numeric AS stop_distance_atr,
+        NULLIF(ss.features->>'rsi_14', '')::numeric AS rsi_14,
+        NULLIF(ss.features->>'rsi_delta_3', '')::numeric AS rsi_delta_3,
         -- Compute derived features
         CASE
             WHEN pt.pnl_r > 0 THEN 'WIN'
@@ -41,6 +41,7 @@ WITH trades AS (
             ELSE 'OTHER'
         END AS win_quality
     FROM dds.paper_trade pt
+    JOIN dds.scanner_setup ss ON ss.setup_id = pt.setup_id
     WHERE pt.scanner_name IN (
         'MOMENTUM_EXHAUSTION_REVERSE_LONG_V1',
         'MOMENTUM_EXHAUSTION_REVERSE_LONG_V2'

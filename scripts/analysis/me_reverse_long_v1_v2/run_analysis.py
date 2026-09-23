@@ -190,20 +190,21 @@ def get_winner_loser_features(conn) -> dict[str, list]:
             pt.mfe,
             pt.mae,
             pt.duration_sec,
-            (pt.features->>'exhaustion_magnitude')::numeric AS exhaustion_magnitude,
-            (pt.features->>'body_ratio')::numeric AS body_ratio,
-            (pt.features->>'rsi_confirmation')::numeric AS rsi_confirmation,
-            (pt.features->>'volume_ratio')::numeric AS volume_ratio,
-            (pt.features->>'rr_ratio')::numeric AS rr_ratio,
-            (pt.features->>'stop_distance_atr')::numeric AS stop_distance_atr,
-            (pt.features->>'rsi_14')::numeric AS rsi_14,
-            (pt.features->>'rsi_delta_3')::numeric AS rsi_delta_3,
+            NULLIF(ss.features->>'exhaustion_magnitude', '')::numeric AS exhaustion_magnitude,
+            NULLIF(ss.features->>'body_ratio', '')::numeric AS body_ratio,
+            NULLIF(ss.features->>'rsi_confirmation', '')::numeric AS rsi_confirmation,
+            NULLIF(ss.features->>'volume_ratio', '')::numeric AS volume_ratio,
+            NULLIF(ss.features->>'rr_ratio', '')::numeric AS rr_ratio,
+            NULLIF(ss.features->>'stop_distance_atr', '')::numeric AS stop_distance_atr,
+            NULLIF(ss.features->>'rsi_14', '')::numeric AS rsi_14,
+            NULLIF(ss.features->>'rsi_delta_3', '')::numeric AS rsi_delta_3,
             CASE
                 WHEN pt.pnl_r > 0 THEN 'WIN'
                 WHEN pt.pnl_r <= 0 AND pt.pnl_r > -0.9 THEN 'LOSS'
                 ELSE 'HARD_LOSS'
             END AS outcome_group
         FROM dds.paper_trade pt
+        JOIN dds.scanner_setup ss ON ss.setup_id = pt.setup_id
         WHERE pt.scanner_name IN (
             'MOMENTUM_EXHAUSTION_REVERSE_LONG_V1',
             'MOMENTUM_EXHAUSTION_REVERSE_LONG_V2'
@@ -340,20 +341,21 @@ def get_candidate_filters(conn) -> list[dict]:
         sql = f"""
         WITH base AS (
             SELECT
-                trade_id,
-                pnl_r,
-                (features->>'exhaustion_magnitude')::numeric AS exhaustion_magnitude,
-                (features->>'body_ratio')::numeric AS body_ratio,
-                (features->>'rsi_confirmation')::numeric AS rsi_confirmation,
-                (features->>'volume_ratio')::numeric AS volume_ratio,
-                (features->>'rr_ratio')::numeric AS rr_ratio,
-                (features->>'stop_distance_atr')::numeric AS stop_distance_atr,
-                (features->>'rsi_14')::numeric AS rsi_14,
-                (features->>'rsi_delta_3')::numeric AS rsi_delta_3
-            FROM dds.paper_trade
-            WHERE scanner_name = 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V1'
-              AND direction = 'LONG'
-              AND status = 'CLOSED'
+                pt.trade_id,
+                pt.pnl_r,
+                NULLIF(ss.features->>'exhaustion_magnitude', '')::numeric AS exhaustion_magnitude,
+                NULLIF(ss.features->>'body_ratio', '')::numeric AS body_ratio,
+                NULLIF(ss.features->>'rsi_confirmation', '')::numeric AS rsi_confirmation,
+                NULLIF(ss.features->>'volume_ratio', '')::numeric AS volume_ratio,
+                NULLIF(ss.features->>'rr_ratio', '')::numeric AS rr_ratio,
+                NULLIF(ss.features->>'stop_distance_atr', '')::numeric AS stop_distance_atr,
+                NULLIF(ss.features->>'rsi_14', '')::numeric AS rsi_14,
+                NULLIF(ss.features->>'rsi_delta_3', '')::numeric AS rsi_delta_3
+            FROM dds.paper_trade pt
+            JOIN dds.scanner_setup ss ON ss.setup_id = pt.setup_id
+            WHERE pt.scanner_name = 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V1'
+              AND pt.direction = 'LONG'
+              AND pt.status = 'CLOSED'
         ),
         baseline AS (
             SELECT
@@ -452,35 +454,36 @@ def get_symbol_analysis(conn) -> list[dict]:
     """Analyze specific symbols mentioned in the spec."""
     sql = """
     SELECT
-        scanner_name,
-        symbol,
-        trade_id,
-        pnl_r,
-        pnl_usdt,
-        entered_at,
-        closed_at,
-        exit_reason,
-        (features->>'rsi_delta_3')::numeric AS rsi_delta_3,
-        (features->>'rsi_14')::numeric AS rsi_14,
-        (features->>'exhaustion_magnitude')::numeric AS exhaustion_magnitude,
-        (features->>'body_ratio')::numeric AS body_ratio,
-        LAG(entered_at) OVER (
-            PARTITION BY symbol, scanner_name
-            ORDER BY entered_at
+        pt.scanner_name,
+        pt.symbol,
+        pt.trade_id,
+        pt.pnl_r,
+        pt.pnl_usdt,
+        pt.entered_at,
+        pt.closed_at,
+        pt.exit_reason,
+        NULLIF(ss.features->>'rsi_delta_3', '')::numeric AS rsi_delta_3,
+        NULLIF(ss.features->>'rsi_14', '')::numeric AS rsi_14,
+        NULLIF(ss.features->>'exhaustion_magnitude', '')::numeric AS exhaustion_magnitude,
+        NULLIF(ss.features->>'body_ratio', '')::numeric AS body_ratio,
+        LAG(pt.entered_at) OVER (
+            PARTITION BY pt.symbol, pt.scanner_name
+            ORDER BY pt.entered_at
         ) AS prev_entered_at,
-        LAG(pnl_r) OVER (
-            PARTITION BY symbol, scanner_name
-            ORDER BY entered_at
+        LAG(pt.pnl_r) OVER (
+            PARTITION BY pt.symbol, pt.scanner_name
+            ORDER BY pt.entered_at
         ) AS prev_pnl_r
-    FROM dds.paper_trade
-    WHERE scanner_name IN (
+    FROM dds.paper_trade pt
+    JOIN dds.scanner_setup ss ON ss.setup_id = pt.setup_id
+    WHERE pt.scanner_name IN (
         'MOMENTUM_EXHAUSTION_REVERSE_LONG_V1',
         'MOMENTUM_EXHAUSTION_REVERSE_LONG_V2'
     )
-    AND direction = 'LONG'
-    AND status = 'CLOSED'
-    AND symbol IN ('USELESSUSDT', 'WIFUSDT', 'TAOUSDT', 'BCHUSDT')
-    ORDER BY symbol, entered_at;
+    AND pt.direction = 'LONG'
+    AND pt.status = 'CLOSED'
+    AND pt.symbol IN ('USELESSUSDT', 'WIFUSDT', 'TAOUSDT', 'BCHUSDT')
+    ORDER BY pt.symbol, pt.entered_at;
     """
     return run_query(conn, sql)
 
