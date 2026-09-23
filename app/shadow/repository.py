@@ -37,7 +37,7 @@ class ShadowSignalRepository:
                     rsi, stoch_rsi,
                     bb_upper, bb_mid, bb_lower, bb_width, distance_to_upper_bb,
                     ema_fast, ema_medium, ema_slow, ema_slope,
-                    volume_ratio, signal_version
+                    volume_ratio, strict_pass, signal_version
                 ) VALUES (
                     'ATR_WICK_REJECTION_SHORT_V1', %s, '5m', %s, %s,
                     %s, %s, %s, %s, %s,
@@ -46,7 +46,7 @@ class ShadowSignalRepository:
                     %s, %s,
                     %s, %s, %s, %s, %s,
                     %s, %s, %s, %s,
-                    %s, %s
+                    %s, %s, %s
                 )
                 ON CONFLICT (experiment_id, symbol, signal_time) DO NOTHING
                 RETURNING signal_id
@@ -78,6 +78,7 @@ class ShadowSignalRepository:
                     signal.ema_slow,
                     signal.ema_slope,
                     signal.volume_ratio,
+                    signal.strict_pass,
                     signal.signal_version,
                 ),
             )

@@ -34,16 +34,32 @@ INDICATOR_WARMUP = 260
 class BackfillStats:
     """Statistics for backfill operation."""
     evaluated: int = 0
-    wick_atr_fail: int = 0
-    close_location_fail: int = 0
-    rsi_fail: int = 0
-    bb_fail: int = 0
-    ema_slope_fail: int = 0
-    volume_fail: int = 0
-    signal_pass: int = 0
+    raw_candidates: int = 0
+    strict_pass: int = 0
     signals_inserted: int = 0
     duplicates_skipped: int = 0
     candles_processed: int = 0
+    # Diagnostic statistics
+    wick_atr_values: list[float] = field(default_factory=list)
+    close_location_values: list[float] = field(default_factory=list)
+    rsi_values: list[float] = field(default_factory=list)
+    bb_distance_values: list[float] = field(default_factory=list)
+    ema_slope_values: list[float] = field(default_factory=list)
+    volume_ratio_values: list[float] = field(default_factory=list)
+    # TOP candles by wick_atr
+    top_candles: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class DiagnosticStats:
+    """Diagnostic statistics for a metric."""
+    min_val: float = 0.0
+    max_val: float = 0.0
+    median: float = 0.0
+    p90: float = 0.0
+    p95: float = 0.0
+    p99: float = 0.0
+    count: int = 0
 
 
 class ShadowBackfillRunner:
@@ -56,6 +72,8 @@ class ShadowBackfillRunner:
     - Fetch candles BEFORE start_time for indicator warmup
     - Only detect/record signals within [start_time, end_time]
     - Never use future candles (no lookahead)
+    - Save RAW candidates (wick rejection only) for diagnostic analysis
+    - strict_pass flag indicates if all filters passed
     """
 
     def __init__(
@@ -115,7 +133,6 @@ class ShadowBackfillRunner:
             )
 
             # Process candles: need INDICATOR_WARMUP candles before the current one
-            # For each candle at index i, we need candles[i-INDICATOR_WARMUP:i+1]
             min_warmup = INDICATOR_WARMUP
 
             for i in range(min_warmup, len(all_candles)):
@@ -132,112 +149,67 @@ class ShadowBackfillRunner:
                 stats.evaluated += 1
                 ctx = self._create_context(symbol, window, all_candles[i].timestamp)
 
-                # Detect signal with diagnostic counters
-                rejection = self._detect_with_diagnostics(ctx)
+                # Detect raw candidate (wick rejection only)
+                raw = self.scanner.detect_raw_candidate(ctx)
+                if raw is None:
+                    continue
 
-                if rejection == "PASS":
-                    stats.signal_pass += 1
+                stats.raw_candidates += 1
 
-                    # Check if signal already exists
-                    signal_time = datetime.fromtimestamp(all_candles[i].timestamp / 1000, tz=timezone.utc)
-                    if self.repo.signal_exists(symbol, signal_time):
-                        stats.duplicates_skipped += 1
-                        continue
+                # Collect diagnostic statistics
+                stats.wick_atr_values.append(raw.wick_atr)
+                stats.close_location_values.append(raw.close_location)
+                stats.rsi_values.append(raw.rsi)
+                stats.bb_distance_values.append(raw.distance_to_upper_bb)
+                stats.ema_slope_values.append(raw.ema_slope)
+                stats.volume_ratio_values.append(raw.volume_ratio)
 
-                    # Detect signal again for storage
-                    signal_data = self.scanner.detect_signal(ctx)
-                    if signal_data and self.repo.save_signal(signal_data):
-                        stats.signals_inserted += 1
-                else:
-                    # Count rejection reason
-                    if rejection == "WICK_ATR":
-                        stats.wick_atr_fail += 1
-                    elif rejection == "CLOSE_LOCATION":
-                        stats.close_location_fail += 1
-                    elif rejection == "RSI":
-                        stats.rsi_fail += 1
-                    elif rejection == "BB":
-                        stats.bb_fail += 1
-                    elif rejection == "EMA_SLOPE":
-                        stats.ema_slope_fail += 1
-                    elif rejection == "VOLUME":
-                        stats.volume_fail += 1
+                # Check if strict filters pass
+                strict = self.scanner.detect_signal(ctx)
+                if strict:
+                    stats.strict_pass += 1
+
+                # Save to database (raw candidate)
+                signal_time = candle_time
+                if self.repo.signal_exists(symbol, signal_time):
+                    stats.duplicates_skipped += 1
+                    continue
+
+                if self.repo.save_signal(raw):
+                    stats.signals_inserted += 1
+
+                # Track TOP candles by wick_atr
+                stats.top_candles.append({
+                    "timestamp": candle_time.isoformat(),
+                    "open": raw.open,
+                    "high": raw.high,
+                    "low": raw.low,
+                    "close": raw.close,
+                    "volume": raw.volume,
+                    "atr": raw.atr,
+                    "upper_wick": raw.wick_size,
+                    "wick_atr": raw.wick_atr,
+                    "close_location": raw.close_location,
+                    "rsi": raw.rsi,
+                    "bb_distance": raw.distance_to_upper_bb,
+                    "ema_slope": raw.ema_slope,
+                    "volume_ratio": raw.volume_ratio,
+                    "strict_pass": strict is not None,
+                })
+
+            # Sort top candles by wick_atr descending and keep top 20
+            stats.top_candles.sort(key=lambda x: x["wick_atr"], reverse=True)
+            stats.top_candles = stats.top_candles[:20]
 
             logger.info(
-                "Backfill complete for %s: %d evaluated, %d inserted, %d duplicates",
-                symbol, stats.evaluated, stats.signals_inserted, stats.duplicates_skipped,
+                "Backfill complete for %s: %d evaluated, %d raw, %d strict, %d inserted",
+                symbol, stats.evaluated, stats.raw_candidates, stats.strict_pass, stats.signals_inserted,
             )
             return stats
 
         except Exception:
             logger.exception("Backfill failed for %s", symbol)
             return stats
-
-    def _detect_with_diagnostics(self, ctx: Any) -> str:
-        """Detect signal and return rejection reason or 'PASS'.
-
-        This method checks each condition sequentially and returns
-        the first failed condition for diagnostic purposes.
-        """
-        from app.indicators import (
-            atr_wilder, bollinger_bands, ema, ema_slope,
-            rsi_wilder, volume_ratio as calc_volume_ratio,
-        )
-        from app.scanners.atr_wick_rejection_short import (
-            ATR_PERIOD, RSI_PERIOD, EMA_MEDIUM,
-            WICK_ATR_THRESHOLD, CLOSE_LOCATION_THRESHOLD,
-            RSI_OVERBOUGHT, BB_UPPER_PROXIMITY,
-            EMA_SLOPE_THRESHOLD, VOLUME_RATIO_THRESHOLD,
-        )
-
-        candles_5m = list(ctx.candles_5m)
-        if len(candles_5m) < 50:
-            return "INSUFFICIENT_DATA"
-
-        last_candle = candles_5m[-1]
-        closes = [c.close for c in candles_5m]
-
-        # Calculate indicators
-        try:
-            atr = atr_wilder(candles_5m, ATR_PERIOD)
-        except ValueError:
-            return "INSUFFICIENT_DATA"
-
-        # 1. Wick check
-        upper_wick = last_candle.high - max(last_candle.open, last_candle.close)
-        wick_atr_ratio = upper_wick / atr if atr > 0 else 0
-        if wick_atr_ratio < WICK_ATR_THRESHOLD:
-            return "WICK_ATR"
-
-        # 2. Close location check
-        candle_range = last_candle.high - last_candle.low
-        close_location = (last_candle.close - last_candle.low) / candle_range if candle_range > 0 else 0.5
-        if close_location > CLOSE_LOCATION_THRESHOLD:
-            return "CLOSE_LOCATION"
-
-        # 3. RSI check
-        rsi = rsi_wilder(closes, RSI_PERIOD)
-        if rsi < RSI_OVERBOUGHT:
-            return "RSI"
-
-        # 4. BB check
-        bb_upper, bb_mid, bb_lower = bollinger_bands(closes, 20)
-        distance_to_upper_bb = (bb_upper - last_candle.close) / last_candle.close if last_candle.close > 0 else 0
-        if distance_to_upper_bb > BB_UPPER_PROXIMITY:
-            return "BB"
-
-        # 5. EMA slope check
-        ema_slope_val = ema_slope(closes, EMA_MEDIUM, lookback=5) if len(closes) >= EMA_MEDIUM + 5 else 0
-        if ema_slope_val > EMA_SLOPE_THRESHOLD:
-            return "EMA_SLOPE"
-
-        # 6. Volume check
-        volumes = [c.volume for c in candles_5m]
-        vol_ratio = calc_volume_ratio(volumes, 20) if len(volumes) > 20 else 1.0
-        if vol_ratio < VOLUME_RATIO_THRESHOLD:
-            return "VOLUME"
-
-        return "PASS"
 
     def backfill_universe(
         self,
@@ -263,12 +235,14 @@ class ShadowBackfillRunner:
             results[symbol] = self.backfill_symbol(symbol, start_time, end_time)
 
         total_evaluated = sum(r.evaluated for r in results.values())
+        total_raw = sum(r.raw_candidates for r in results.values())
+        total_strict = sum(r.strict_pass for r in results.values())
         total_inserted = sum(r.signals_inserted for r in results.values())
         total_duplicates = sum(r.duplicates_skipped for r in results.values())
 
         logger.info(
-            "Universe backfill complete: %d symbols, %d evaluated, %d inserted, %d duplicates",
-            len(symbols), total_evaluated, total_inserted, total_duplicates,
+            "Universe backfill complete: %d symbols, %d evaluated, %d raw, %d strict, %d inserted, %d duplicates",
+            len(symbols), total_evaluated, total_raw, total_strict, total_inserted, total_duplicates,
         )
         return results
 
@@ -341,6 +315,25 @@ class ShadowBackfillRunner:
             "UNIUSDT", "ATOMUSDT", "NEARUSDT", "FTMUSDT", "ALGOUSDT",
             "HBARUSDT", "VETUSDT", "ICPUSDT", "FILUSDT", "AAVEUSDT",
         ]
+
+
+def _calculate_diagnostic_stats(values: list[float]) -> DiagnosticStats:
+    """Calculate diagnostic statistics for a list of values."""
+    if not values:
+        return DiagnosticStats()
+
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+
+    return DiagnosticStats(
+        min_val=sorted_vals[0],
+        max_val=sorted_vals[-1],
+        median=sorted_vals[n // 2],
+        p90=sorted_vals[int(n * 0.9)] if n >= 10 else sorted_vals[-1],
+        p95=sorted_vals[int(n * 0.95)] if n >= 20 else sorted_vals[-1],
+        p99=sorted_vals[int(n * 0.99)] if n >= 100 else sorted_vals[-1],
+        count=n,
+    )
 
 
 def main() -> None:
@@ -456,6 +449,8 @@ def main() -> None:
 
     # Print summary
     total_evaluated = sum(r.evaluated for r in results.values())
+    total_raw = sum(r.raw_candidates for r in results.values())
+    total_strict = sum(r.strict_pass for r in results.values())
     total_inserted = sum(r.signals_inserted for r in results.values())
     total_duplicates = sum(r.duplicates_skipped for r in results.values())
 
@@ -464,24 +459,58 @@ def main() -> None:
     print("=" * 80)
     print(f"Symbols processed: {len(results)}")
     print(f"Total evaluated: {total_evaluated}")
+    print(f"Total raw candidates: {total_raw}")
+    print(f"Total strict pass: {total_strict}")
     print(f"Total inserted: {total_inserted}")
     print(f"Total duplicates skipped: {total_duplicates}")
     print("=" * 80)
 
-    # Print per-symbol breakdown with rejection counters
+    # Print per-symbol breakdown with diagnostics
     print("\nPER-SYMBOL BREAKDOWN:")
     for symbol, stats in sorted(results.items()):
         print(f"\n{symbol}:")
         print(f"  evaluated: {stats.evaluated}")
-        print(f"  wick_atr_fail: {stats.wick_atr_fail}")
-        print(f"  close_location_fail: {stats.close_location_fail}")
-        print(f"  rsi_fail: {stats.rsi_fail}")
-        print(f"  bb_fail: {stats.bb_fail}")
-        print(f"  ema_slope_fail: {stats.ema_slope_fail}")
-        print(f"  volume_fail: {stats.volume_fail}")
-        print(f"  signal_pass: {stats.signal_pass}")
+        print(f"  raw_candidates: {stats.raw_candidates}")
+        print(f"  strict_pass: {stats.strict_pass}")
         print(f"  signals_inserted: {stats.signals_inserted}")
         print(f"  duplicates_skipped: {stats.duplicates_skipped}")
+
+        # Print diagnostic statistics
+        if stats.wick_atr_values:
+            wick_stats = _calculate_diagnostic_stats(stats.wick_atr_values)
+            print(f"\n  Wick ATR Statistics:")
+            print(f"    min: {wick_stats.min_val:.4f}")
+            print(f"    max: {wick_stats.max_val:.4f}")
+            print(f"    median: {wick_stats.median:.4f}")
+            print(f"    p90: {wick_stats.p90:.4f}")
+            print(f"    p95: {wick_stats.p95:.4f}")
+            print(f"    p99: {wick_stats.p99:.4f}")
+
+        if stats.rsi_values:
+            rsi_stats = _calculate_diagnostic_stats(stats.rsi_values)
+            print(f"\n  RSI Statistics:")
+            print(f"    min: {rsi_stats.min_val:.2f}")
+            print(f"    max: {rsi_stats.max_val:.2f}")
+            print(f"    median: {rsi_stats.median:.2f}")
+            print(f"    p90: {rsi_stats.p90:.2f}")
+
+        if stats.close_location_values:
+            cl_stats = _calculate_diagnostic_stats(stats.close_location_values)
+            print(f"\n  Close Location Statistics:")
+            print(f"    min: {cl_stats.min_val:.4f}")
+            print(f"    max: {cl_stats.max_val:.4f}")
+            print(f"    median: {cl_stats.median:.4f}")
+
+        # Print TOP candles
+        if stats.top_candles:
+            print(f"\n  TOP-20 Candles by Wick ATR:")
+            for i, candle in enumerate(stats.top_candles[:10], 1):
+                print(f"    {i}. {candle['timestamp']}")
+                print(f"       OHLC: {candle['open']:.4f} / {candle['high']:.4f} / {candle['low']:.4f} / {candle['close']:.4f}")
+                print(f"       ATR: {candle['atr']:.4f}, Wick: {candle['upper_wick']:.4f}, Wick/ATR: {candle['wick_atr']:.4f}")
+                print(f"       Close Loc: {candle['close_location']:.4f}, RSI: {candle['rsi']:.2f}")
+                print(f"       BB Dist: {candle['bb_distance']:.4f}, EMA Slope: {candle['ema_slope']:.6f}")
+                print(f"       Vol Ratio: {candle['volume_ratio']:.4f}, Strict: {candle['strict_pass']}")
 
 
 if __name__ == "__main__":

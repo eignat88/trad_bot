@@ -258,6 +258,7 @@ class TestAtrWickRejectionShortScanner:
             ema_slow=98.0,
             ema_slope=-0.0002,
             volume_ratio=1.5,
+            strict_pass=False,
             signal_version="1.0.0",
         )
 
@@ -302,6 +303,7 @@ class TestAtrWickRejectionShortScanner:
             ema_slow=98.0,
             ema_slope=-0.0002,
             volume_ratio=1.5,
+            strict_pass=False,
             signal_version="1.0.0",
         )
 
@@ -312,7 +314,8 @@ class TestAtrWickRejectionShortScanner:
             "atr", "atr_pct", "wick_size", "wick_atr", "upper_wick_pct",
             "close_location", "rsi", "stoch_rsi", "bb_upper", "bb_mid",
             "bb_lower", "bb_width", "distance_to_upper_bb", "ema_fast",
-            "ema_medium", "ema_slow", "ema_slope", "volume_ratio", "signal_version",
+            "ema_medium", "ema_slow", "ema_slope", "volume_ratio", "strict_pass",
+            "signal_version",
         ]
 
         for feature in required_features:

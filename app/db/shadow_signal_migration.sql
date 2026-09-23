@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS dds.shadow_signal (
     ema_slope           NUMERIC NOT NULL,
     -- Volume
     volume_ratio        NUMERIC NOT NULL,
+    -- Filter results (for diagnostic)
+    strict_pass         BOOLEAN NOT NULL DEFAULT FALSE,
     -- Metadata
     signal_version      TEXT NOT NULL DEFAULT '1.0.0',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
