@@ -1,11 +1,14 @@
 -- 08_rsi_recovery_from_candles.sql
 -- Recover RSI(14) and RSI delta from market.candle for all V1 trades
 -- Uses Wilder's RSI computed from 5m candles at signal candle open time
--- No look-ahead: only candles fully closed BEFORE signal candle.
+-- No look-ahead: only candles fully closed AT OR BEFORE signal candle.
 --
 -- Schema:
---   market.candle: instrument_id, timeframe, open_time, close, is_closed, quality_status
---   dds.scanner_setup: signal_candle_open_time (bigint, epoch seconds or milliseconds)
+--   market.candle: instrument_id, timeframe('5'/'15'), open_time, close, is_closed
+--   dds.scanner_setup: signal_candle_open_time (bigint, EPOCH MILLISECONDS)
+--
+-- Canonical conversion:
+--   signal_time_ts = to_timestamp(ss.signal_candle_open_time / 1000.0)
 --
 -- RSI(14) formula (Wilder's smoothing):
 --   1. First avg_gain = avg_loss = simple average of first 14 bars' gains/losses
@@ -14,18 +17,18 @@
 --   4. RSI = 100 - 100 / (1 + RS)
 --
 -- rsi_delta_3 = RSI(current) - RSI(3 bars ago)
+-- Minimum candles needed: 14 (RSI warmup) + 3 (delta lookback) = 17
 
 -- ============================================================
--- STEP 0: Diagnose signal_candle_open_time units
--- Run this first to determine if values are seconds or milliseconds
+-- DIAGNOSTIC: verify timestamp conversion
+-- Uncomment to verify: to_timestamp(X / 1000.0) produces correct dates
 -- ============================================================
 /*
 SELECT
     setup_id,
     signal_candle_open_time,
     detected_at,
-    to_timestamp(signal_candle_open_time) AS as_seconds,
-    to_timestamp(signal_candle_open_time / 1000) AS as_milliseconds
+    to_timestamp(signal_candle_open_time / 1000.0) AS correct_ts
 FROM dds.scanner_setup
 WHERE scanner_name IN (
     'MOMENTUM_EXHAUSTION_REVERSE_LONG_V1',
@@ -54,40 +57,33 @@ WITH v1_trades AS (
         ss.detected_at AS signal_time,
         ss.signal_candle_open_time,
         ss.instrument_id,
-        ss.features
+        ss.features,
+        -- CANONICAL: signal_candle_open_time is epoch milliseconds
+        to_timestamp(ss.signal_candle_open_time / 1000.0) AS signal_candle_ts
     FROM dds.paper_trade pt
     JOIN dds.scanner_setup ss ON ss.setup_id = pt.setup_id
     WHERE pt.scanner_name = 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V1'
       AND pt.direction = 'LONG'
       AND pt.status = 'CLOSED'
 ),
--- Convert signal_candle_open_time to timestamptz
--- Try seconds first (will be validated by diagnostic query above)
-signal_candles AS (
-    SELECT
-        vt.*,
-        to_timestamp(vt.signal_candle_open_time) AS signal_candle_ts
-    FROM v1_trades vt
-),
--- Get 5m candles up to and including signal candle for each trade
--- Use market.candle with is_closed = true and timeframe = '5'
+-- Get up to 200 closed 5m candles before signal candle (sufficient for RSI(14) + delta 3)
 candle_data AS (
     SELECT
-        sc.trade_id,
+        vt.trade_id,
         mc.open_time,
         mc.close,
-        mc.is_closed,
         ROW_NUMBER() OVER (
-            PARTITION BY sc.trade_id
+            PARTITION BY vt.trade_id
             ORDER BY mc.open_time DESC
         ) AS candle_idx  -- 1 = signal candle, 2 = 1 bar before, etc.
-    FROM signal_candles sc
+    FROM v1_trades vt
     JOIN market.candle mc
-        ON mc.instrument_id = sc.instrument_id
+        ON mc.instrument_id = vt.instrument_id
         AND mc.timeframe = '5'
         AND mc.is_closed = true
-        AND mc.open_time >= sc.signal_candle_ts - INTERVAL '180 minutes'
-        AND mc.open_time <= sc.signal_candle_ts
+        AND mc.open_time <= vt.signal_candle_ts
+    WHERE mc.open_time >= vt.signal_candle_ts - INTERVAL '1000 minutes'
+    -- 200 bars × 5min = 1000 minutes lookback (generous for Wilder RSI)
 ),
 -- Compute gains and losses for RSI
 candle_gains AS (
@@ -167,13 +163,13 @@ SELECT
         THEN 'PASS'
         ELSE 'REJECT'
     END AS v2_filter_result,
-    -- Coverage status
+    -- Recovery status with reason
     CASE
         WHEN ra.rsi_signal IS NOT NULL AND ra.rsi_3_bars_ago IS NOT NULL
-        THEN 'RECOVERED'
+        THEN 'RSI_RECOVERED'
         WHEN ra.rsi_signal IS NOT NULL
-        THEN 'RSI_ONLY_NO_DELTA'
-        ELSE 'MISSING'
+        THEN 'INSUFFICIENT_CANDLES'
+        ELSE 'NO_CANDLES'
     END AS recovery_status,
     -- Features from scanner_setup
     NULLIF(vt.features->>'exhaustion_magnitude', '')::numeric AS exhaustion_magnitude,

@@ -386,3 +386,99 @@ class TestCandleFilters:
             for v in violations:
                 all_violations.append(f"{f.name}: {v}")
         assert not all_violations, "Look-ahead violations:\n" + "\n".join(all_violations)
+
+
+# ============================================================
+# Timestamp conversion tests: signal_candle_open_time is epoch milliseconds
+# ============================================================
+
+def _find_raw_to_timestamp(sql: str) -> list[str]:
+    """Find to_timestamp(signal_candle_open_time) WITHOUT /1000.0 division.
+
+    Safe:   to_timestamp(ss.signal_candle_open_time / 1000.0)
+    Unsafe: to_timestamp(ss.signal_candle_open_time)
+    """
+    violations = []
+    for i, line in enumerate(sql.split("\n"), 1):
+        stripped = line.strip()
+        if stripped.startswith("--"):
+            continue
+        # Match to_timestamp(...signal_candle_open_time...) without /1000
+        if re.search(r"to_timestamp\s*\(\s*(?:ss|vt|sc)\.signal_candle_open_time\s*\)", line, re.IGNORECASE):
+            if "/ 1000" not in line and "/1000" not in line:
+                violations.append(f"Line {i}: {stripped[:80]}")
+    return violations
+
+
+def _find_division_1000(sql: str) -> bool:
+    """Check that /1000.0 is present for signal_candle_open_time conversion."""
+    return bool(re.search(r"signal_candle_open_time\s*/\s*1000", sql, re.IGNORECASE))
+
+
+class TestTimestampConversion:
+    """signal_candle_open_time is epoch milliseconds; must use /1000.0."""
+
+    def test_sql_no_raw_to_timestamp(self):
+        """to_timestamp(signal_candle_open_time) without /1000 is WRONG."""
+        all_violations = []
+        for sql_file in SQL_FILES:
+            content = sql_file.read_text(encoding="utf-8")
+            violations = _find_raw_to_timestamp(content)
+            for v in violations:
+                all_violations.append(f"{sql_file.name}: {v}")
+        assert not all_violations, (
+            "Raw to_timestamp(signal_candle_open_time) without /1000.0:\n"
+            + "\n".join(all_violations)
+        )
+
+    def test_python_no_raw_to_timestamp(self):
+        """Python SQL must not have raw to_timestamp without /1000."""
+        all_violations = []
+        for py_file in PY_FILES:
+            sql_strings = _extract_sql_strings(py_file)
+            for idx, sql in enumerate(sql_strings):
+                violations = _find_raw_to_timestamp(sql)
+                for v in violations:
+                    all_violations.append(f"{py_file.name} block #{idx + 1}: {v}")
+        assert not all_violations, (
+            "Raw to_timestamp(signal_candle_open_time) without /1000.0:\n"
+            + "\n".join(all_violations)
+        )
+
+    def test_sql_files_have_division_1000(self):
+        """SQL files using signal_candle_open_time must have /1000."""
+        for sql_file in SQL_FILES:
+            content = sql_file.read_text(encoding="utf-8")
+            uses_sct = bool(re.search(r'signal_candle_open_time', content, re.IGNORECASE))
+            uses_timestamp = bool(re.search(r'to_timestamp.*signal_candle_open_time', content, re.IGNORECASE))
+            if uses_sct and uses_timestamp:
+                assert _find_division_1000(content), (
+                    f"{sql_file.name} uses to_timestamp(signal_candle_open_time) but missing /1000"
+                )
+
+    def test_python_files_have_division_1000(self):
+        """Python SQL using signal_candle_open_time must have /1000."""
+        for py_file in PY_FILES:
+            sql_strings = _extract_sql_strings(py_file)
+            for idx, sql in enumerate(sql_strings):
+                uses_sct = bool(re.search(r'signal_candle_open_time', sql, re.IGNORECASE))
+                uses_timestamp = bool(re.search(r'to_timestamp.*signal_candle_open_time', sql, re.IGNORECASE))
+                if uses_sct and uses_timestamp:
+                    assert _find_division_1000(sql), (
+                        f"{py_file.name} block #{idx + 1} uses to_timestamp(signal_candle_open_time) but missing /1000"
+                    )
+
+
+class TestCounterfactualCoverage:
+    """Counterfactual must exclude trades without RSI recovery."""
+
+    def test_counterfactual_excludes_missing(self):
+        """run_analysis_v2.py get_counterfactual must filter on RSI_RECOVERED."""
+        py_file = ANALYSIS_DIR / "run_analysis_v2.py"
+        if not py_file.exists():
+            pytest.skip("run_analysis_v2.py not found")
+        content = py_file.read_text(encoding="utf-8")
+        # Check that the counterfactual function filters on RSI_RECOVERED
+        assert 'RSI_RECOVERED' in content, (
+            "Counterfactual should filter on recovery_status == 'RSI_RECOVERED'"
+        )
