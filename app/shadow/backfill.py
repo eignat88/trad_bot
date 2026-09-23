@@ -311,7 +311,32 @@ class ShadowBackfillRunner:
         )
 
     def _get_universe_symbols(self) -> list[str]:
-        """Get list of symbols from universe configuration."""
+        """Get list of symbols from universe configuration.
+
+        Uses the same logic as the main scanner:
+        - dynamic mode: fetches top N liquid symbols from Bybit
+        - static mode: uses configured symbols list
+        """
+        universe = self.settings.scanner_universe
+        if universe.mode == "dynamic":
+            try:
+                symbols = self.client.get_liquid_symbols(
+                    top_n=universe.top_n,
+                    min_turnover_24h=universe.min_turnover_24h,
+                    min_volume_24h=universe.min_volume_24h,
+                    quote_coin=universe.quote_coin,
+                )
+                if symbols:
+                    logger.info(
+                        "Dynamic universe: %d symbols (top_n=%d, min_turnover=%.0f)",
+                        len(symbols), universe.top_n, universe.min_turnover_24h,
+                    )
+                    return symbols
+                logger.warning("Dynamic universe empty, falling back to static")
+            except Exception:
+                logger.exception("Failed to fetch dynamic universe, falling back to static")
+
+        # Static mode or fallback
         if self.settings.symbols:
             return list(self.settings.symbols)
 

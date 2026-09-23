@@ -158,24 +158,42 @@ class ShadowScannerRunner:
         return summary
 
     def _get_universe_symbols(self) -> list[str]:
-        """Get list of symbols to scan from universe configuration."""
-        # Use configured symbols if available
+        """Get list of symbols to scan from universe configuration.
+
+        Uses the same logic as the main scanner:
+        - dynamic mode: fetches top N liquid symbols from Bybit
+        - static mode: uses configured symbols list
+        """
+        universe = self.settings.scanner_universe
+        if universe.mode == "dynamic":
+            try:
+                symbols = self.client.get_liquid_symbols(
+                    top_n=universe.top_n,
+                    min_turnover_24h=universe.min_turnover_24h,
+                    min_volume_24h=universe.min_volume_24h,
+                    quote_coin=universe.quote_coin,
+                )
+                if symbols:
+                    logger.info(
+                        "Dynamic universe: %d symbols (top_n=%d, min_turnover=%.0f)",
+                        len(symbols), universe.top_n, universe.min_turnover_24h,
+                    )
+                    return symbols
+                logger.warning("Dynamic universe empty, falling back to static")
+            except Exception:
+                logger.exception("Failed to fetch dynamic universe, falling back to static")
+
+        # Static mode or fallback
         if self.settings.symbols:
             return list(self.settings.symbols)
 
-        # Otherwise, get top symbols from exchange
-        try:
-            # For now, use a default list of popular symbols
-            default_symbols = [
-                "BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT",
-                "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT", "MATICUSDT",
-                "UNIUSDT", "ATOMUSDT", "NEARUSDT", "FTMUSDT", "ALGOUSDT",
-                "HBARUSDT", "VETUSDT", "ICPUSDT", "FILUSDT", "AAVEUSDT",
-            ]
-            return default_symbols[:self.settings.scanner_universe.top_n]
-        except Exception:
-            logger.exception("Failed to get universe symbols")
-            return ["BTCUSDT", "ETHUSDT"]
+        # Default universe
+        return [
+            "BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT",
+            "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT", "MATICUSDT",
+            "UNIUSDT", "ATOMUSDT", "NEARUSDT", "FTMUSDT", "ALGOUSDT",
+            "HBARUSDT", "VETUSDT", "ICPUSDT", "FILUSDT", "AAVEUSDT",
+        ]
 
     def start(self, interval_seconds: int = 300) -> None:
         """Start continuous shadow signal collection.
