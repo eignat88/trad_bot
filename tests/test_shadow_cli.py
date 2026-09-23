@@ -46,7 +46,6 @@ class TestShadowRunnerCLI:
                 with patch("app.shadow.runner.ScannerRepository") as mock_repo:
                     with patch("app.shadow.runner.BybitClient") as mock_client:
                         with patch("app.shadow.runner.ShadowScannerRunner") as mock_runner:
-                            # Setup mocks
                             mock_settings_obj = MagicMock(
                                 db_host="localhost",
                                 db_port=5432,
@@ -67,18 +66,18 @@ class TestShadowRunnerCLI:
                             mock_runner_instance = MagicMock()
                             mock_runner_instance.run_cycle.return_value = {
                                 "symbols_scanned": 1,
-                                "symbols_with_signals": 0,
-                                "total_signals": 0,
+                                "raw_candidates": 1,
+                                "strict_pass": 0,
+                                "inserted": 1,
+                                "duplicates": 0,
+                                "errors": 0,
                             }
                             mock_runner.return_value = mock_runner_instance
 
                             from app.shadow.runner import main
                             main()
 
-                            # Verify BybitClient was called with settings
                             mock_client.assert_called_once_with(mock_settings_obj)
-
-                            # Verify runner was called
                             mock_runner_instance.run_cycle.assert_called_once()
 
 
@@ -435,3 +434,52 @@ class TestShadowEvaluatorMultiHorizon:
         # The source should not contain --min-age-minutes
         source = inspect.getsource(eval_main)
         assert "--min-age-minutes" not in source
+
+
+class TestShadowRunnerRawCapture:
+    """Regression tests for raw capture mode in shadow runner."""
+
+    def test_passes_strict_filters_exists(self):
+        """passes_strict_filters is defined on the scanner."""
+        from app.scanners.atr_wick_rejection_short import AtrWickRejectionShortScanner
+        scanner = AtrWickRejectionShortScanner()
+        assert hasattr(scanner, "passes_strict_filters")
+
+    def test_detect_signal_uses_passes_strict_filters(self):
+        """detect_signal delegates to passes_strict_filters."""
+        from app.scanners.atr_wick_rejection_short import AtrWickRejectionShortScanner
+        import inspect
+
+        scanner = AtrWickRejectionShortScanner()
+        source = inspect.getsource(scanner.detect_signal)
+        assert "passes_strict_filters" in source
+
+    def test_runner_uses_detect_raw_candidate(self):
+        """Runner.scan_symbol calls detect_raw_candidate, not scan()."""
+        import inspect
+        from app.shadow.runner import ShadowScannerRunner
+
+        source = inspect.getsource(ShadowScannerRunner.scan_symbol)
+        assert "detect_raw_candidate" in source
+        assert "scanner.scan(" not in source
+
+    def test_runner_scanner_scan_not_called(self):
+        """Runner does NOT call scanner.scan() for raw collection."""
+        import inspect
+        from app.shadow.runner import ShadowScannerRunner
+
+        source = inspect.getsource(ShadowScannerRunner.scan_symbol)
+        # scan() is the strict method — should not appear
+        assert ".scan(ctx)" not in source
+
+    def test_run_cycle_returns_raw_strict_inserted(self):
+        """run_cycle summary has raw/strict/inserted keys."""
+        import inspect
+        from app.shadow.runner import ShadowScannerRunner
+
+        source = inspect.getsource(ShadowScannerRunner.run_cycle)
+        assert "raw_candidates" in source
+        assert "strict_pass" in source
+        assert "inserted" in source
+        assert "duplicates" in source
+        assert "errors" in source
