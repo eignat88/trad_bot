@@ -61,7 +61,19 @@ def evaluate_setup_outcome(
     if max_bars <= 0:
         raise ValueError("max_bars must be positive")
 
-    future = [c for c in candles if c.timestamp > candidate.signal_candle_open_time]
+    # FVG parity: confirmation_at marks the candle AFTER which outcome
+    # evaluation may begin.  All candles before confirmation are
+    # pre-confirmation and must NOT count as entry or SL/TP triggers.
+    confirmation_at = (candidate.features or {}).get("confirmation_at")
+    if confirmation_at is not None:
+        # confirmation_at is the close timestamp of the confirmation candle.
+        # Outcome starts from the NEXT candle after confirmation.
+        effective_start = confirmation_at
+    else:
+        # Non-FVG scanners: start from signal candle.
+        effective_start = candidate.signal_candle_open_time
+
+    future = [c for c in candles if c.timestamp > effective_start]
     future = future[:max_bars]
     entry = _entry_price(candidate)
     risk = abs(entry - candidate.invalidation_price)
