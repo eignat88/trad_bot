@@ -308,6 +308,10 @@ def main() -> None:
 
     cycle = 0
     while not SHUTDOWN:
+        # ------------------------------------------------------------------
+        # Phase 1: Refresh universe (may involve Bybit API calls)
+        # ------------------------------------------------------------------
+        t_phase_start = time.monotonic()
         try:
             universe = get_scanner_universe(client, settings)
             symbols = [str(item["symbol"]) for item in universe]
@@ -319,8 +323,15 @@ def main() -> None:
 
         cycle += 1
         start = time.monotonic()
+        t_universe_done = start
+        logger.info(
+            "cycle #%d phase: universe_refresh=%.2fs",
+            cycle, t_universe_done - t_phase_start,
+        )
 
-        # Start a new run (reconnect if DB connection dropped)
+        # ------------------------------------------------------------------
+        # Phase 2: Create scanner_run — started_at is set here
+        # ------------------------------------------------------------------
         try:
             run_id = repository.start_run(
                 symbols_total=len(symbols),
@@ -343,6 +354,15 @@ def main() -> None:
                 logger.error("reconnect failed, skipping cycle")
                 run_id = None
 
+        t_run_started = time.monotonic()
+        logger.info(
+            "cycle #%d phase: run_create=%.2fs (started_at set by PostgreSQL now())",
+            cycle, t_run_started - start,
+        )
+
+        # ------------------------------------------------------------------
+        # Phase 3: Scan cycle — the actual instrument processing
+        # ------------------------------------------------------------------
         try:
             total, scanned, failed = run_scan_cycle(
                 client, orchestrator, repository, symbols, run_id, settings,
@@ -370,9 +390,12 @@ def main() -> None:
                 status="COMPLETED" if failed == 0 else "PARTIAL",
             )
 
+            t_run_finished = time.monotonic()
             logger.info(
-                "cycle #%d done: %d/%d symbols | %d setups | %d active signals | %.1fs",
-                cycle, scanned, len(symbols), total, active_signals, elapsed,
+                "cycle #%d done: %d/%d symbols | %d setups | %d active signals | "
+                "scan=%.2fs total=%.2fs",
+                cycle, scanned, len(symbols), total, active_signals,
+                t_run_finished - t_run_started, elapsed,
             )
 
             # Refresh expectancy filter every 10 cycles
@@ -394,6 +417,7 @@ def main() -> None:
         delay = seconds_until_next_cycle(
             start, settings.scan_interval, time.monotonic(),
         )
+        logger.info("cycle #%d sleeping %.0fs before next cycle", cycle, delay)
         for _ in range(int(delay)):
             if SHUTDOWN:
                 break
