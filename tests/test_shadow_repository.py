@@ -90,27 +90,26 @@ class TestShadowSignalRepository:
 
         assert exists is False
 
-    def test_get_signals_without_outcomes(self, repo, mock_conn):
-        """Test getting signals without outcomes."""
+    def test_get_eligible_signals(self, repo, mock_conn):
+        """Test getting eligible signals for evaluation."""
         mock_cursor = mock_conn.cursor.return_value
+        now = datetime.now(timezone.utc)
         mock_cursor.fetchall.return_value = [
             (
-                1, "TESTUSDT", datetime.now(timezone.utc), 100.0,
-                100.0, 101.5, 99.8, 100.1, 1500.0,
-                0.5, 0.005,
-                1.4, 2.8, 0.014, 0.06,
-                65.0, 0.7,
-                102.0, 100.0, 98.0, 0.04, 0.019,
-                100.0, 99.0, 98.0, -0.0002,
-                1.5, "1.0.0",
+                1, "TESTUSDT", now, 100.0,
+                None,  # outcome_id (new signal)
+                None, None, None, None, None, None,  # evaluated_*_at
+                False,  # is_final
             )
         ]
 
-        signals = repo.get_signals_without_outcomes()
+        signals = repo.get_eligible_signals()
 
         assert len(signals) == 1
         assert signals[0]["symbol"] == "TESTUSDT"
         assert signals[0]["signal_price"] == 100.0
+        assert signals[0]["outcome_id"] is None
+        assert signals[0]["is_final"] is False
 
     def test_save_outcome_success(self, repo, mock_conn):
         """Test successful outcome saving."""
