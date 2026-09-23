@@ -545,5 +545,12 @@ class TestShadowRunnerRawCapture:
     def test_runner_shadow_max_workers_constant(self):
         """SHADOW_MAX_WORKERS is defined and reasonable."""
         from app.shadow.runner import SHADOW_MAX_WORKERS
-
         assert 1 <= SHADOW_MAX_WORKERS <= 10
+
+    def test_runner_start_no_total_signals_key(self):
+        """start() does not reference 'total_signals' — no KeyError."""
+        import inspect
+        from app.shadow.runner import ShadowScannerRunner
+
+        source = inspect.getsource(ShadowScannerRunner.start)
+        assert "total_signals" not in source

@@ -369,10 +369,7 @@ class ShadowScannerRunner:
         while self._running:
             try:
                 summary = self.run_cycle()
-                logger.info(
-                    "Cycle complete: %d signals found",
-                    summary["total_signals"],
-                )
+                # run_cycle() already logs the full summary; no duplicate needed.
             except Exception:
                 logger.exception("Shadow scan cycle failed")
 
