@@ -364,11 +364,7 @@ def main() -> None:
     shadow_repo = ShadowSignalRepository(db_repo._conn)
 
     # Create Bybit client
-    client = BybitClient(
-        api_key=settings.bybit_api_key,
-        api_secret=settings.bybit_api_secret,
-        timeout=settings.bybit_timeout,
-    )
+    client = BybitClient(settings)
 
     # Create evaluator
     evaluator = ShadowSignalEvaluator(client, shadow_repo)

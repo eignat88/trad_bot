@@ -46,7 +46,7 @@ class TestShadowRunnerCLI:
                     with patch("app.shadow.runner.BybitClient") as mock_client:
                         with patch("app.shadow.runner.ShadowScannerRunner") as mock_runner:
                             # Setup mocks
-                            mock_settings.return_value = MagicMock(
+                            mock_settings_obj = MagicMock(
                                 db_host="localhost",
                                 db_port=5432,
                                 db_name="trad_bot",
@@ -59,6 +59,7 @@ class TestShadowRunnerCLI:
                                 scanner_universe=MagicMock(top_n=50),
                                 scanner_workers=5,
                             )
+                            mock_settings.return_value = mock_settings_obj
                             mock_repo_instance = MagicMock()
                             mock_repo_instance._use_pg = True
                             mock_repo.return_value = mock_repo_instance
@@ -72,6 +73,9 @@ class TestShadowRunnerCLI:
 
                             from app.shadow.runner import main
                             main()
+
+                            # Verify BybitClient was called with settings
+                            mock_client.assert_called_once_with(mock_settings_obj)
 
                             # Verify runner was called
                             mock_runner_instance.run_cycle.assert_called_once()
@@ -96,7 +100,7 @@ class TestShadowEvaluatorCLI:
                     with patch("app.shadow.evaluator.BybitClient") as mock_client:
                         with patch("app.shadow.evaluator.ShadowSignalEvaluator") as mock_eval:
                             # Setup mocks
-                            mock_settings.return_value = MagicMock(
+                            mock_settings_obj = MagicMock(
                                 db_host="localhost",
                                 db_port=5432,
                                 db_name="trad_bot",
@@ -106,6 +110,7 @@ class TestShadowEvaluatorCLI:
                                 bybit_api_secret="",
                                 bybit_timeout=15,
                             )
+                            mock_settings.return_value = mock_settings_obj
                             mock_repo_instance = MagicMock()
                             mock_repo_instance._use_pg = True
                             mock_repo.return_value = mock_repo_instance
@@ -117,6 +122,9 @@ class TestShadowEvaluatorCLI:
 
                             from app.shadow.evaluator import main
                             main()
+
+                            # Verify BybitClient was called with settings
+                            mock_client.assert_called_once_with(mock_settings_obj)
 
                             # Verify evaluator was called
                             mock_eval_instance.run_evaluation_cycle.assert_called_once()
