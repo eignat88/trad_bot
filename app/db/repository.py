@@ -284,6 +284,47 @@ class ScannerRepository:
             self._conn.rollback()
             raise
 
+    def ensure_instruments_bulk(
+        self, symbols: list[str], quote_asset: str = "USDT",
+    ) -> dict[str, int]:
+        """Resolve or create instrument IDs for *symbols* in a single transaction.
+
+        Returns a mapping ``symbol → instrument_id``.
+        """
+        if not self._use_pg:
+            return {s: None for s in symbols}
+        cursor = self._conn.cursor()
+        result: dict[str, int] = {}
+        try:
+            # Fetch existing instruments in one query.
+            cursor.execute(
+                "SELECT symbol, instrument_id FROM dds.instrument "
+                "WHERE symbol = ANY(%s)",
+                (symbols,),
+            )
+            for row in cursor.fetchall():
+                result[row[0]] = row[1]
+
+            # Insert any missing instruments (idempotent — concurrent runner
+            # may have inserted the same symbol between our SELECT and INSERT).
+            missing = [s for s in symbols if s not in result]
+            for symbol in missing:
+                base = symbol.replace(quote_asset, "")
+                cursor.execute(
+                    "INSERT INTO dds.instrument (symbol, base_asset, quote_asset) "
+                    "VALUES (%s, %s, %s) "
+                    "ON CONFLICT (symbol) DO UPDATE SET symbol = EXCLUDED.symbol "
+                    "RETURNING instrument_id",
+                    (symbol, base, quote_asset),
+                )
+                result[symbol] = cursor.fetchone()[0]
+
+            self._conn.commit()
+            return result
+        except Exception:
+            self._conn.rollback()
+            raise
+
     # ----------------------------------------------------------------
     # SCANNER RUN
     # ----------------------------------------------------------------
@@ -308,23 +349,36 @@ class ScannerRepository:
         run_id: int | None,
         instruments: list[str | Mapping[str, Any]],
     ) -> None:
-        """Persist the ranked symbol snapshot used by a scanner run."""
+        """Persist the ranked symbol snapshot used by a scanner run.
+
+        Resolves all instrument IDs in a single transaction to avoid
+        N individual commits when the universe is large.
+        """
         if not self._use_pg or run_id is None:
             return
+
+        # Build a list of (symbol, rank, turnover, volume) tuples.
+        rows: list[tuple[str, int, float | None, float | None]] = []
+        for position, item in enumerate(instruments, start=1):
+            if isinstance(item, str):
+                rows.append((item, position, None, None))
+            else:
+                rows.append((
+                    str(item["symbol"]),
+                    int(item.get("rank", position)),
+                    item.get("turnover_24h"),
+                    item.get("volume_24h"),
+                ))
+
+        symbols = [r[0] for r in rows]
+        id_map = self.ensure_instruments_bulk(symbols)
+
         cursor = self._conn.cursor()
         try:
-            for position, item in enumerate(instruments, start=1):
-                if isinstance(item, str):
-                    symbol = item
-                    rank = position
-                    turnover_24h = None
-                    volume_24h = None
-                else:
-                    symbol = str(item["symbol"])
-                    rank = int(item.get("rank", position))
-                    turnover_24h = item.get("turnover_24h")
-                    volume_24h = item.get("volume_24h")
-                instrument_id = self.ensure_instrument(symbol)
+            for symbol, rank, turnover_24h, volume_24h in rows:
+                instrument_id = id_map.get(symbol)
+                if instrument_id is None:
+                    continue
                 cursor.execute(
                     """
                     INSERT INTO dds.scanner_run_instrument (
