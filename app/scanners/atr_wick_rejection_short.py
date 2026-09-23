@@ -276,69 +276,52 @@ class AtrWickRejectionShortScanner:
             signal_version=SCANNER_VERSION,
         )
 
+    def passes_strict_filters(self, raw: WickRejectionSignal) -> bool:
+        """Check whether a raw candidate passes all strict filters.
+
+        Same conditions as detect_signal(), but takes an existing
+        WickRejectionSignal and returns only the boolean result.
+        Centralises the strict predicate so it's defined in one place.
+        """
+        return (
+            raw.rsi >= self.rsi_overbought
+            and raw.distance_to_upper_bb <= self.bb_upper_proximity
+            and raw.ema_slope <= self.ema_slope_threshold
+            and raw.volume_ratio >= self.volume_ratio_threshold
+        )
+
     def detect_signal(self, ctx: MarketContext) -> WickRejectionSignal | None:
         """Detect ATR wick rejection SHORT signal with ALL filters.
 
-        This is the STRICT mode — checks ALL conditions:
-        - Wick rejection (core)
-        - RSI overbought
-        - BB proximity
-        - EMA slope
-        - Volume confirmation
-
-        Returns WickRejectionSignal if all conditions are met, None otherwise.
+        STRICT mode: delegates to passes_strict_filters().
+        Returns WickRejectionSignal with strict_pass=True if all
+        conditions are met, None otherwise.
         """
-        # First, get raw candidate
         raw = self.detect_raw_candidate(ctx)
         if raw is None:
             return None
 
-        # --- Apply ALL feature filters ---
-        # 3. RSI suggests overbought
-        if raw.rsi < self.rsi_overbought:
+        if not self.passes_strict_filters(raw):
             return None
 
-        # 4. Price near upper Bollinger Band
-        if raw.distance_to_upper_bb > self.bb_upper_proximity:
-            return None
-
-        # 5. EMA slope negative (downtrend)
-        if raw.ema_slope > self.ema_slope_threshold:
-            return None
-
-        # 6. Volume confirmation
-        if raw.volume_ratio < self.volume_ratio_threshold:
-            return None
-
-        # All filters passed — return with strict_pass=True
         return WickRejectionSignal(
             symbol=raw.symbol,
             signal_time=raw.signal_time,
             signal_price=raw.signal_price,
-            open=raw.open,
-            high=raw.high,
-            low=raw.low,
-            close=raw.close,
-            volume=raw.volume,
-            atr=raw.atr,
-            atr_pct=raw.atr_pct,
-            wick_size=raw.wick_size,
-            wick_atr=raw.wick_atr,
+            open=raw.open, high=raw.high, low=raw.low,
+            close=raw.close, volume=raw.volume,
+            atr=raw.atr, atr_pct=raw.atr_pct,
+            wick_size=raw.wick_size, wick_atr=raw.wick_atr,
             upper_wick_pct=raw.upper_wick_pct,
             close_location=raw.close_location,
-            rsi=raw.rsi,
-            stoch_rsi=raw.stoch_rsi,
-            bb_upper=raw.bb_upper,
-            bb_mid=raw.bb_mid,
-            bb_lower=raw.bb_lower,
-            bb_width=raw.bb_width,
+            rsi=raw.rsi, stoch_rsi=raw.stoch_rsi,
+            bb_upper=raw.bb_upper, bb_mid=raw.bb_mid,
+            bb_lower=raw.bb_lower, bb_width=raw.bb_width,
             distance_to_upper_bb=raw.distance_to_upper_bb,
-            ema_fast=raw.ema_fast,
-            ema_medium=raw.ema_medium,
-            ema_slow=raw.ema_slow,
-            ema_slope=raw.ema_slope,
+            ema_fast=raw.ema_fast, ema_medium=raw.ema_medium,
+            ema_slow=raw.ema_slow, ema_slope=raw.ema_slope,
             volume_ratio=raw.volume_ratio,
-            strict_pass=True,  # All filters passed
+            strict_pass=True,
             signal_version=raw.signal_version,
         )
 

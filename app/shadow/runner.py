@@ -13,7 +13,7 @@ from typing import Any
 from app.config import Settings, load_settings
 from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
-from app.scanners.atr_wick_rejection_short import AtrWickRejectionShortScanner, SCANNER_NAME
+from app.scanners.atr_wick_rejection_short import AtrWickRejectionShortScanner, WickRejectionSignal
 from app.scanners.context_builder import build_market_context
 from app.shadow.repository import ShadowSignalRepository
 
@@ -39,71 +39,73 @@ class ShadowScannerRunner:
         self.scanner = AtrWickRejectionShortScanner()
         self._running = False
 
-    def scan_symbol(self, symbol: str) -> int:
-        """Scan a single symbol for shadow signals.
+    def scan_symbol(self, symbol: str) -> dict[str, int]:
+        """Scan a single symbol for RAW shadow candidates.
 
-        Returns number of signals saved.
+        Returns {"raw": N, "strict": M, "inserted": X, "duplicates": D, "errors": E}.
         """
+        result = {"raw": 0, "strict": 0, "inserted": 0, "duplicates": 0, "errors": 0}
+
         try:
             ctx = build_market_context(self.client, symbol, self.settings)
-            signals = self.scanner.scan(ctx)
 
-            saved = 0
-            for candidate in signals:
-                # Convert SetupCandidate back to WickRejectionSignal for storage
-                # Extract signal data from candidate features
-                features = candidate.features
-                signal = self._candidate_to_signal(candidate, features)
-                if signal and self.repo.save_signal(signal):
-                    saved += 1
+            # RAW candidate: upper_wick > 0 only, no strict filters
+            raw = self.scanner.detect_raw_candidate(ctx)
+            if raw is None:
+                return result
 
-            return saved
+            result["raw"] = 1
+
+            # Determine strict_pass for this candidate
+            strict = self.scanner.passes_strict_filters(raw)
+            signal_to_save = WickRejectionSignal(
+                symbol=raw.symbol,
+                signal_time=raw.signal_time,
+                signal_price=raw.signal_price,
+                open=raw.open, high=raw.high, low=raw.low,
+                close=raw.close, volume=raw.volume,
+                atr=raw.atr, atr_pct=raw.atr_pct,
+                wick_size=raw.wick_size, wick_atr=raw.wick_atr,
+                upper_wick_pct=raw.upper_wick_pct,
+                close_location=raw.close_location,
+                rsi=raw.rsi, stoch_rsi=raw.stoch_rsi,
+                bb_upper=raw.bb_upper, bb_mid=raw.bb_mid,
+                bb_lower=raw.bb_lower, bb_width=raw.bb_width,
+                distance_to_upper_bb=raw.distance_to_upper_bb,
+                ema_fast=raw.ema_fast, ema_medium=raw.ema_medium,
+                ema_slow=raw.ema_slow, ema_slope=raw.ema_slope,
+                volume_ratio=raw.volume_ratio,
+                strict_pass=strict,
+                signal_version=raw.signal_version,
+            )
+
+            if strict:
+                result["strict"] = 1
+
+            saved_id = self.repo.save_signal(signal_to_save)
+            if saved_id is not None:
+                result["inserted"] = 1
+            else:
+                # Could be duplicate (ON CONFLICT DO NOTHING) or DB error
+                # Check if signal exists to distinguish
+                if self.repo.signal_exists(symbol, raw.signal_time):
+                    result["duplicates"] = 1
+                else:
+                    result["errors"] = 1
+
         except Exception:
             logger.exception("Shadow scan failed for %s", symbol)
-            return 0
+            result["errors"] = 1
 
-    def _candidate_to_signal(
-        self, candidate: Any, features: dict
-    ) -> Any:
-        """Convert a SetupCandidate back to WickRejectionSignal for storage."""
-        from app.scanners.atr_wick_rejection_short import WickRejectionSignal
-
-        return WickRejectionSignal(
-            symbol=candidate.symbol,
-            signal_time=candidate.detected_at,
-            signal_price=candidate.reference_price,
-            open=features.get("open", 0),
-            high=features.get("high", 0),
-            low=features.get("low", 0),
-            close=features.get("close", 0),
-            volume=features.get("volume", 0),
-            atr=features.get("atr", 0),
-            atr_pct=features.get("atr_pct", 0),
-            wick_size=features.get("wick_size", 0),
-            wick_atr=features.get("wick_atr", 0),
-            upper_wick_pct=features.get("upper_wick_pct", 0),
-            close_location=features.get("close_location", 0),
-            rsi=features.get("rsi", 0),
-            stoch_rsi=features.get("stoch_rsi"),
-            bb_upper=features.get("bb_upper", 0),
-            bb_mid=features.get("bb_mid", 0),
-            bb_lower=features.get("bb_lower", 0),
-            bb_width=features.get("bb_width", 0),
-            distance_to_upper_bb=features.get("distance_to_upper_bb", 0),
-            ema_fast=features.get("ema_fast", 0),
-            ema_medium=features.get("ema_medium", 0),
-            ema_slow=features.get("ema_slow", 0),
-            ema_slope=features.get("ema_slope", 0),
-            volume_ratio=features.get("volume_ratio", 0),
-            signal_version=features.get("signal_version", "1.0.0"),
-        )
+        return result
 
     def scan_universe(self, symbols: list[str]) -> dict[str, int]:
         """Scan all symbols in the universe.
 
-        Returns dict of {symbol: signals_saved}.
+        Returns aggregated counts: raw, strict, inserted, duplicates, errors.
         """
-        results: dict[str, int] = {}
+        totals = {"raw": 0, "strict": 0, "inserted": 0, "duplicates": 0, "errors": 0}
+
         with ThreadPoolExecutor(max_workers=self.settings.scanner_workers) as executor:
             future_to_symbol = {
                 executor.submit(self.scan_symbol, symbol): symbol
@@ -112,47 +114,46 @@ class ShadowScannerRunner:
             for future in as_completed(future_to_symbol):
                 symbol = future_to_symbol[future]
                 try:
-                    results[symbol] = future.result()
+                    result = future.result()
+                    for key in totals:
+                        totals[key] += result[key]
                 except Exception:
                     logger.exception("Shadow scan failed for %s", symbol)
-                    results[symbol] = 0
+                    totals["errors"] += 1
 
-        total = sum(results.values())
-        logger.info(
-            "Shadow scan complete: %d signals across %d symbols",
-            total, len(symbols),
-        )
-        return results
+        return totals
 
     def run_cycle(self) -> dict[str, Any]:
         """Run one complete scan cycle.
 
-        Returns summary of the scan.
+        Returns summary with raw/strict/inserted/duplicates/errors.
         """
         start_time = datetime.now(timezone.utc)
 
         # Get universe of symbols
         symbols = self._get_universe_symbols()
 
-        # Scan all symbols
-        results = self.scan_universe(symbols)
+        # Scan all symbols — returns aggregated counts
+        counts = self.scan_universe(symbols)
 
-        # Calculate summary
-        total_signals = sum(results.values())
-        symbols_with_signals = sum(1 for v in results.values() if v > 0)
+        end_time = datetime.now(timezone.utc)
 
         summary = {
             "start_time": start_time.isoformat(),
-            "end_time": datetime.now(timezone.utc).isoformat(),
+            "end_time": end_time.isoformat(),
             "symbols_scanned": len(symbols),
-            "symbols_with_signals": symbols_with_signals,
-            "total_signals": total_signals,
-            "results": results,
+            "raw_candidates": counts["raw"],
+            "strict_pass": counts["strict"],
+            "inserted": counts["inserted"],
+            "duplicates": counts["duplicates"],
+            "errors": counts["errors"],
         }
 
         logger.info(
-            "Shadow scan cycle complete: %d symbols scanned, %d signals found",
-            len(symbols), total_signals,
+            "Shadow scan cycle: symbols=%d raw=%d strict=%d inserted=%d "
+            "duplicates=%d errors=%d",
+            len(symbols), counts["raw"], counts["strict"],
+            counts["inserted"], counts["duplicates"], counts["errors"],
         )
 
         return summary
@@ -302,9 +303,12 @@ def main() -> None:
         print("\n" + "=" * 80)
         print("SHADOW SCAN CYCLE COMPLETE")
         print("=" * 80)
-        print(f"Symbols scanned: {summary['symbols_scanned']}")
-        print(f"Symbols with signals: {summary['symbols_with_signals']}")
-        print(f"Total signals: {summary['total_signals']}")
+        print(f"Symbols scanned:   {summary['symbols_scanned']}")
+        print(f"Raw candidates:    {summary['raw_candidates']}")
+        print(f"Strict pass:       {summary['strict_pass']}")
+        print(f"Inserted:          {summary['inserted']}")
+        print(f"Duplicates:        {summary['duplicates']}")
+        print(f"Errors:            {summary['errors']}")
         print("=" * 80)
     else:
         # Continuous mode
