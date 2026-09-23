@@ -396,7 +396,7 @@ def test_orchestrator_has_v3():
     from app.scanners.orchestrator import ScannerOrchestrator
     orchestrator = ScannerOrchestrator()
     assert "TREND_PULLBACK_V3" in orchestrator.scanners
-    assert len(orchestrator.scanners) == 11  # 9 existing + V3 + REVERSE_LONG_V1 + REVERSE_LONG_V2
+    assert len(orchestrator.scanners) == 13  # 9 existing + V3 + REVERSE_LONG_V1 + REVERSE_LONG_V2 + OOS_VALIDATION + FVG
 
 
 def test_orchestrator_can_enable_only_v3():

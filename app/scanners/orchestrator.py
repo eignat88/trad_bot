@@ -17,6 +17,7 @@ from app.scanners.momentum_exhaustion import MomentumExhaustionScanner
 from app.scanners.momentum_exhaustion_r import MomentumExhaustionRScanner
 from app.scanners.momentum_exhaustion_reverse_long_v1 import MomentumExhaustionReverseLongV1Scanner
 from app.scanners.momentum_exhaustion_reverse_long_v2 import MomentumExhaustionReverseLongV2Scanner
+from app.scanners.me_r_long_close_location_oos_validation import MERLongCloseLocationOOSValidationV1Scanner
 from app.scanners.expectancy_filter import ExpectancyFilter, filter_candidates
 from app.scanners.risk_geometry import validate_risk_geometry
 from app.scanners.scoring import score_candidate
@@ -61,6 +62,7 @@ class ScannerOrchestrator:
             "MOMENTUM_EXHAUSTION_R": MomentumExhaustionRScanner(),
             "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1": MomentumExhaustionReverseLongV1Scanner(),
             "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2": MomentumExhaustionReverseLongV2Scanner(),
+            "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1": MERLongCloseLocationOOSValidationV1Scanner(),
             "FVG_REACTION_LONG_LOCAL_STRUCT_V1": FVGReactionLongLocalStructV1Scanner(),
         }
 
@@ -97,6 +99,13 @@ class ScannerOrchestrator:
         )
         return candidates
 
+    # Scanners whose blocked candidates should still be saved as shadow/control.
+    # Used for OOS experiments where a baseline scanner is blocked but its
+    # signals must be collected for contemporaneous comparison.
+    SHADOW_CONTROL_SCANNERS: frozenset[str] = frozenset({
+        "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1",
+    })
+
     def scan_all_with_stats(
         self,
         ctx: MarketContext,
@@ -109,7 +118,17 @@ class ScannerOrchestrator:
         scanner_regime_whitelist: dict[str, dict[str, tuple[str, ...]]] | None = None,
         trading_mode: str = "paper",
     ) -> tuple[list[SetupCandidate], dict[str, dict[str, int | float]]]:
-        """Run every configured scanner and return per-scanner observability data."""
+        """Run every configured scanner and return per-scanner observability data.
+
+        Returns
+        -------
+        tuple[list[SetupCandidate], dict]
+            (valid_candidates, per_scanner_stats)
+
+        Shadow/control candidates are included in the stats but returned
+        as valid candidates with a ``_shadow_control`` marker in features
+        so the caller can save them for OOS cohort tracking.
+        """
         self.scan_count += 1
         self.last_scan_time = datetime.now(timezone.utc)
         all_candidates: list[SetupCandidate] = []
@@ -165,6 +184,10 @@ class ScannerOrchestrator:
 
         # Direction gates are independent of expectancy.  Candidates were still
         # generated/scored above, so blocked strategies remain observable.
+        # Shadow/control scanners: their blocked candidates are saved with a
+        # _shadow_control marker for OOS cohort tracking, even though they
+        # won't be traded.
+        shadow_candidates: list[SetupCandidate] = []
         if gate_policy is not None:
             gate_accepted: list[SetupCandidate] = []
             for candidate in valid:
@@ -173,6 +196,20 @@ class ScannerOrchestrator:
                 )
                 if decision.allowed:
                     gate_accepted.append(candidate)
+                elif candidate.scanner_name in self.SHADOW_CONTROL_SCANNERS:
+                    # Save as shadow/control for OOS cohort comparison
+                    from dataclasses import replace
+                    shadow_features = dict(candidate.features)
+                    shadow_features["_shadow_control"] = True
+                    shadow_features["_shadow_control_reason"] = "oos_experiment_baseline"
+                    shadow_candidates.append(replace(candidate, features=shadow_features))
+                    logger.info(
+                        "shadow/control candidate saved: symbol=%s scanner=%s direction=%s "
+                        "gate_status=%s close_location=%s",
+                        candidate.symbol, candidate.scanner_name, candidate.direction,
+                        decision.status,
+                        candidate.features.get("close_location"),
+                    )
                 else:
                     logger.info(
                         "direction gate rejected: symbol=%s scanner=%s direction=%s "
@@ -181,7 +218,7 @@ class ScannerOrchestrator:
                         decision.reason_code, decision.status, decision.reason,
                         decision.allowed_regimes, candidate.market_regime or ctx.market_regime,
                     )
-            valid = gate_accepted
+            valid = gate_accepted + shadow_candidates
 
         # Expectancy filter: drop scanner/direction combos with negative historical R.
         # Static manual blocks are handled by the gate policy above.

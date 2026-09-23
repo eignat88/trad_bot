@@ -226,7 +226,8 @@ class TestMomentumExhaustionReverseLongV1:
         long_policy = settings.execution_policy_configs["MOMENTUM_EXHAUSTION_REVERSE_LONG_V1"]["LONG"]
         
         assert long_policy.policy == "FIXED_TP_SL_HORIZON_V1"
-        assert long_policy.enabled is True
+        # V1 is BLOCKED for OOS validation — enabled=False
+        assert long_policy.enabled is False
         assert long_policy.hold_minutes == 240
         assert long_policy.dca_enabled is False
         assert long_policy.trailing_enabled is False
@@ -448,7 +449,8 @@ class TestV1ExecutionPolicy:
         ).get("LONG")
         assert policy is not None, "V1 LONG policy not found in config"
         assert policy.policy == "FIXED_TP_SL_HORIZON_V1"
-        assert policy.enabled is True
+        # V1 is BLOCKED for OOS validation — enabled=False
+        assert policy.enabled is False
 
     def test_v1_not_in_default_fallback(self):
         """V1 LONG must NOT fall through to DEFAULT."""
