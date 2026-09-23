@@ -36,6 +36,12 @@ from app.scanners.direction_gate import ScannerDirectionGatePolicy
 from app.scanners.expectancy_filter import ExpectancyFilter, filter_candidates, load_expectancy
 from app.scanners.orchestrator import ScannerOrchestrator
 
+# ME_R_LONG Early MAE Exit shadow experiment (observe-only)
+from app.shadow.me_long_early_exit_shadow import (
+    MELongEarlyExitShadowObserver,
+    SCANNER_NAME as ME_EARLY_EXIT_SCANNER,
+)
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 ENV_PATH = PROJECT_ROOT / ".env"
@@ -57,6 +63,170 @@ def setup_logging() -> None:
     )
 
 SHUTDOWN = False
+
+# --- ME_R_LONG Early MAE Exit shadow experiment (singleton) ---
+_me_early_exit_observer: MELongEarlyExitShadowObserver | None = None
+
+
+def _get_me_early_exit_observer(repo: ScannerRepository) -> MELongEarlyExitShadowObserver:
+    """Lazy-init the ME_R_LONG early exit shadow observer."""
+    global _me_early_exit_observer
+    if _me_early_exit_observer is None:
+        _me_early_exit_observer = MELongEarlyExitShadowObserver(repo)
+    return _me_early_exit_observer
+
+
+def _observe_me_early_exit_on_open(
+    repo: ScannerRepository,
+    engine: PaperTradingEngine,
+    opened_trades: list,
+) -> None:
+    """Create shadow observations for newly opened ME_R_LONG trades.
+
+    Called after engine.check_entries() to observe each matching trade.
+    NEVER blocks the trade — fire-and-forget observation.
+    """
+    observer = _get_me_early_exit_observer(repo)
+    for trade in opened_trades:
+        if (trade.scanner_name == ME_EARLY_EXIT_SCANNER
+                and trade.direction == "LONG"):
+            try:
+                observer.on_trade_open(
+                    trade_id=trade.trade_id,
+                    symbol=trade.symbol,
+                    entered_at=trade.entered_at,
+                    entry_price=trade.entry_price,
+                    stop_price=trade.stop_price,
+                )
+            except Exception:
+                logger.debug(
+                    "ME_R_LONG early exit shadow: on_trade_open failed "
+                    "for trade_id=%s",
+                    trade.trade_id,
+                    exc_info=True,
+                )
+
+
+def _evaluate_me_early_exit_variants(
+    repo: ScannerRepository,
+    engine: PaperTradingEngine,
+) -> None:
+    """Periodically evaluate ME_R_LONG early exit variants for open trades.
+
+    Queries market.candle data to compute MAE at each variant's evaluation
+    horizon and checks if the early-exit rule triggers.
+    """
+    observer = _get_me_early_exit_observer(repo)
+    now = datetime.now(timezone.utc)
+
+    for symbol, trade in engine.open_trades.items():
+        if (trade.scanner_name != ME_EARLY_EXIT_SCANNER
+                or trade.direction != "LONG"
+                or trade.trade_id is None):
+            continue
+
+        # Resolve instrument_id
+        instrument_id = None
+        if repo._use_pg:
+            instrument_id = repo.ensure_instrument(trade.symbol)
+
+        if instrument_id is None:
+            continue
+
+        try:
+            observer.evaluate_variants(
+                trade_id=trade.trade_id,
+                symbol=trade.symbol,
+                instrument_id=instrument_id,
+                entered_at=trade.entered_at,
+                entry_price=trade.entry_price,
+                stop_price=trade.stop_price,
+                current_time=now,
+            )
+        except Exception:
+            logger.debug(
+                "ME_R_LONG early exit shadow: evaluate_variants failed "
+                "for trade_id=%s",
+                trade.trade_id,
+                exc_info=True,
+            )
+
+
+def _notify_me_early_exit_on_close(
+    repo: ScannerRepository,
+    closed_trades: list,
+) -> None:
+    """Notify the ME_R_LONG early exit shadow observer when paper trades close.
+
+    Called from the position monitor after trades are closed.
+    """
+    observer = _get_me_early_exit_observer(repo)
+    for trade in closed_trades:
+        if (trade.scanner_name == ME_EARLY_EXIT_SCANNER
+                and trade.direction == "LONG"
+                and trade.trade_id is not None):
+            try:
+                observer.on_trade_close(
+                    trade_id=trade.trade_id,
+                    actual_pnl_r=trade.net_pnl / (
+                        abs(trade.entry_price - trade.stop_price) * trade.position_size
+                        if abs(trade.entry_price - trade.stop_price) > 0
+                        and trade.position_size > 0
+                        else 1.0
+                    ),
+                    actual_exit_reason=trade.exit_reason
+                        if hasattr(trade, 'exit_reason') else None,
+                )
+            except Exception:
+                logger.debug(
+                    "ME_R_LONG early exit shadow: on_trade_close failed "
+                    "for trade_id=%s",
+                    trade.trade_id,
+                    exc_info=True,
+                )
+
+
+def _finalize_me_early_exit_closes(repo: ScannerRepository) -> None:
+    """Poll for recently closed ME_R_LONG paper trades missing shadow close.
+
+    This is a resilient fallback that queries the DB for closed paper trades
+    whose shadow observations are still in EVALUATED status (not yet CLOSED).
+    Called every slow cycle (~300s).
+    """
+    if not repo._use_pg:
+        return
+
+    observer = _get_me_early_exit_observer(repo)
+
+    sql = """
+    SELECT DISTINCT pt.trade_id, pt.pnl_r, pt.exit_reason
+    FROM dds.paper_trade pt
+    JOIN dds.me_r_long_early_exit_observation obs
+        ON obs.trade_id = pt.trade_id
+        AND obs.experiment_id = %(experiment_id)s
+    WHERE pt.scanner_name = %(scanner_name)s
+      AND pt.direction = 'LONG'
+      AND pt.status = 'CLOSED'
+      AND obs.status = 'EVALUATED'
+      AND pt.closed_at > now() - interval '1 hour'
+    """
+    try:
+        cursor = repo._execute(sql, {
+            "experiment_id": "ME_R_LONG_EARLY_MAE_EXIT_OOS_V1",
+            "scanner_name": ME_EARLY_EXIT_SCANNER,
+        })
+        rows = cursor.fetchall() if cursor else []
+        for row in rows:
+            trade_id = row[0]
+            pnl_r = float(row[1]) if row[1] is not None else 0.0
+            exit_reason = row[2]
+            observer.on_trade_close(
+                trade_id=trade_id,
+                actual_pnl_r=pnl_r,
+                actual_exit_reason=exit_reason,
+            )
+    except Exception:
+        logger.debug("ME_R_LONG early exit shadow finalize query failed", exc_info=True)
 
 
 def _handle_signal(signum, frame):
@@ -240,6 +410,13 @@ def run_entry_cycle(
             opened = engine.check_entries(candidates, all_prices)
         stats["entries"] = len(opened)
 
+        # --- ME_R_LONG Early Exit shadow: observe new entries ---
+        if opened:
+            try:
+                _observe_me_early_exit_on_open(repo, engine, opened)
+            except Exception:
+                logger.debug("ME_R_LONG early exit shadow open hook failed", exc_info=True)
+
         # --- SHADOW ENGINE: create reverse LONG shadow for ME SHORT entries ---
         if shadow_engine is not None and shadow_engine.is_enabled and opened:
             shadow_entries = 0
@@ -256,6 +433,18 @@ def run_entry_cycle(
                     "shadow engine: %d reverse LONG shadow trades created this cycle",
                     shadow_entries,
                 )
+
+    # --- 1b. ME_R_LONG Early Exit shadow: evaluate open trades ---
+    try:
+        _evaluate_me_early_exit_variants(repo, engine)
+    except Exception:
+        logger.debug("ME_R_LONG early exit shadow evaluation hook failed", exc_info=True)
+
+    # --- 1c. ME_R_LONG Early Exit shadow: close observations for recently closed trades ---
+    try:
+        _finalize_me_early_exit_closes(repo)
+    except Exception:
+        logger.debug("ME_R_LONG early exit shadow close hook failed", exc_info=True)
 
     # --- 2. EXPIRE OLD SETUPS (independently protected) ---
     try:
@@ -426,6 +615,15 @@ def main() -> None:
                 hb["stop_gap_24h"],
                 hb["last_check_age_sec"] or 0,
             )
+            # ME_R_LONG early exit shadow stats
+            if _me_early_exit_observer is not None:
+                me_stats = _me_early_exit_observer.stats
+                logger.info(
+                    "ME_R_LONG early exit shadow: observations=%d "
+                    "evaluated=%d closed=%d errors=%d",
+                    me_stats["observations"], me_stats["evaluated"],
+                    me_stats["closed"], me_stats["errors"],
+                )
             last_heartbeat_log = now_mono
 
         # Sleep in small intervals to respond to shutdown
