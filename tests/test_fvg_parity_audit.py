@@ -100,6 +100,55 @@ class TestParityAudit:
         result = run_parity_audit(R(), limit=10)
         assert result["summary"]["duplicates"] >= 1
 
+    def test_different_fvg_created_at_no_duplicate(self):
+        """Same symbol/tf but different fvg_created_at → NOT a duplicate."""
+        f1 = json.dumps({"fvg_created_at": 1000, "confirmation_at": 2000,
+            "entry_price": 100.0, "sl_price": 98.0, "tp_price": 106.0,
+            "bars_to_touch": 2, "fvg_atr": 0.25, "c2_body_ratio": 0.75, "rr": 3.0})
+        f2 = json.dumps({"fvg_created_at": 5000, "confirmation_at": 2000,
+            "entry_price": 100.0, "sl_price": 98.0, "tp_price": 106.0,
+            "bars_to_touch": 2, "fvg_atr": 0.25, "c2_body_ratio": 0.75, "rr": 3.0})
+
+        class FC:
+            def __init__(self):
+                self._rows = [
+                    ("id-a", "FVG_REACTION_LONG_LOCAL_STRUCT_V1", "BTCUSDT",
+                     "LONG", "5m", "5m", None, 1500, 100.0, 100.0, 100.0,
+                     98.0, 106.0, None, 80.0, "RANGE", None, f1),
+                    ("id-b", "FVG_REACTION_LONG_LOCAL_STRUCT_V1", "BTCUSDT",
+                     "LONG", "5m", "5m", None, 2000, 100.0, 100.0, 100.0,
+                     98.0, 106.0, None, 80.0, "RANGE", None, f2),
+                ]
+            def execute(self, sql, params): pass
+            def fetchall(self): return self._rows
+        class R:
+            def __init__(self): self._conn = type("C", (), {"cursor": lambda s: FC()})()
+        result = run_parity_audit(R(), limit=10)
+        assert result["summary"]["duplicates"] == 0
+
+    def test_same_fvg_created_at_is_duplicate(self):
+        """Same (symbol, tf, fvg_created_at) → IS a duplicate."""
+        f = json.dumps({"fvg_created_at": 1000, "confirmation_at": 2000,
+            "entry_price": 100.0, "sl_price": 98.0, "tp_price": 106.0,
+            "bars_to_touch": 2, "fvg_atr": 0.25, "c2_body_ratio": 0.75, "rr": 3.0})
+
+        class FC:
+            def __init__(self):
+                self._rows = [
+                    ("id-a", "FVG_REACTION_LONG_LOCAL_STRUCT_V1", "BTCUSDT",
+                     "LONG", "5m", "5m", None, 1500, 100.0, 100.0, 100.0,
+                     98.0, 106.0, None, 80.0, "RANGE", None, f),
+                    ("id-b", "FVG_REACTION_LONG_LOCAL_STRUCT_V1", "BTCUSDT",
+                     "LONG", "5m", "5m", None, 1500, 100.0, 100.0, 100.0,
+                     98.0, 106.0, None, 80.0, "RANGE", None, f),
+                ]
+            def execute(self, sql, params): pass
+            def fetchall(self): return self._rows
+        class R:
+            def __init__(self): self._conn = type("C", (), {"cursor": lambda s: FC()})()
+        result = run_parity_audit(R(), limit=10)
+        assert result["summary"]["duplicates"] == 1
+
 
 # --- CLI ---
 
