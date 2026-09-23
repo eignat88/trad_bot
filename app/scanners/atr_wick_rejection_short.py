@@ -242,7 +242,7 @@ class AtrWickRejectionShortScanner:
             return None
 
         # 3. RSI suggests overbought
-        if rsi < self.rsi_overboought:
+        if rsi < self.rsi_overbought:
             return None
 
         # 4. Price near upper Bollinger Band

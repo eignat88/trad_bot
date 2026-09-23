@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -145,3 +146,136 @@ class TestShadowInit:
         assert "ShadowScannerRunner" in app.shadow.__all__
         assert "ShadowBackfillRunner" in app.shadow.__all__
         assert "ShadowSignalEvaluator" in app.shadow.__all__
+
+
+class TestShadowBackfillWarmup:
+    """Regression tests for backfill warmup and indicator requirements."""
+
+    def test_backfill_stats_dataclass(self):
+        """Test BackfillStats dataclass initialization."""
+        from app.shadow.backfill import BackfillStats
+
+        stats = BackfillStats()
+        assert stats.evaluated == 0
+        assert stats.wick_atr_fail == 0
+        assert stats.close_location_fail == 0
+        assert stats.rsi_fail == 0
+        assert stats.bb_fail == 0
+        assert stats.ema_slope_fail == 0
+        assert stats.volume_fail == 0
+        assert stats.signal_pass == 0
+        assert stats.signals_inserted == 0
+        assert stats.duplicates_skipped == 0
+
+    def test_indicator_warmup_constant(self):
+        """Test that INDICATOR_WARMUP is sufficient for all indicators."""
+        from app.shadow.backfill import INDICATOR_WARMUP
+
+        # Need at least:
+        # - EMA(200) needs 200 candles
+        # - ema_slope(50, lookback=5) needs 55 candles
+        # - BB(20) needs 20 candles
+        # - ATR(14) needs 15 candles
+        # - RSI(14) needs 15 candles
+        # - volume_ratio(20) needs 21 candles
+        # Total: 200 + 50 = 250 candles minimum
+        assert INDICATOR_WARMUP >= 250
+
+    def test_detect_with_diagnostics_returns_valid(self):
+        """Test _detect_with_diagnostics returns a valid rejection reason."""
+        from app.shadow.backfill import ShadowBackfillRunner
+        from app.models import Candle
+        from app.scanners.models import MarketContext, IndicatorSnapshot, MarketLevels
+
+        # Create a mock runner
+        mock_settings = MagicMock()
+        mock_client = MagicMock()
+        mock_repo = MagicMock()
+        runner = ShadowBackfillRunner(mock_settings, mock_client, mock_repo)
+
+        # Create candles
+        candles = []
+        base_time = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+        for i in range(260):
+            base_price = 100.0 - (i * 0.01)
+            candles.append(Candle(
+                timestamp=base_time + (i * 300000),
+                open=base_price,
+                high=base_price + 0.5,
+                low=base_price - 0.3,
+                close=base_price - 0.2,
+                volume=1000.0 + (i * 10),
+            ))
+
+        # Create context
+        indicators = IndicatorSnapshot(
+            atr=0.5,
+            rsi=65.0,
+            ema20=99.0,
+            ema50=99.5,
+            ema200=100.0,
+            bb_upper=100.5,
+            bb_lower=98.5,
+            bb_width=0.04,
+            volume_sma=1000.0,
+            adx=25.0,
+            ema50_slope=-0.0002,
+        )
+
+        ctx = MarketContext(
+            symbol="TESTUSDT",
+            candles_5m=tuple(candles),
+            candles_15m=tuple(candles),
+            candles_1h=tuple(candles),
+            candles_4h=tuple(candles),
+            indicators=indicators,
+            market_regime="RANGE",
+            levels=MarketLevels(),
+            evaluated_at=datetime.now(timezone.utc),
+        )
+
+        # Test diagnostic detection
+        result = runner._detect_with_diagnostics(ctx)
+
+        # Should return a valid rejection reason or PASS
+        valid_results = [
+            "PASS", "WICK_ATR", "CLOSE_LOCATION", "RSI",
+            "BB", "EMA_SLOPE", "VOLUME", "INSUFFICIENT_DATA"
+        ]
+        assert result in valid_results
+
+    def test_no_lookahead_in_context_creation(self):
+        """Test that context creation doesn't use future candles."""
+        from app.shadow.backfill import ShadowBackfillRunner
+        from app.models import Candle
+
+        # Create a mock runner
+        mock_settings = MagicMock()
+        mock_client = MagicMock()
+        mock_repo = MagicMock()
+        runner = ShadowBackfillRunner(mock_settings, mock_client, mock_repo)
+
+        # Create candles
+        base_time = int(datetime.now(timezone.utc).timestamp() * 1000)
+        candles = []
+
+        for i in range(300):
+            base_price = 100.0 + (i * 0.01)
+            candles.append(Candle(
+                timestamp=base_time + (i * 300000),
+                open=base_price,
+                high=base_price + 0.5,
+                low=base_price - 0.3,
+                close=base_price + 0.1,
+                volume=1000.0,
+            ))
+
+        # Create context with only first 260 candles
+        ctx = runner._create_context("TESTUSDT", candles[:260], candles[259].timestamp)
+
+        # Verify that the context only has 260 candles
+        assert len(ctx.candles_5m) == 260
+
+        # Verify that the last candle is at index 259
+        assert ctx.candles_5m[-1].timestamp == candles[259].timestamp
