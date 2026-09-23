@@ -109,35 +109,47 @@ class ShadowSignalRepository:
         )
         return cursor.fetchone() is not None
 
-    def get_signals_without_outcomes(
-        self,
-        min_age_minutes: int = 60,
-        limit: int = 1000,
-    ) -> list[dict]:
-        """Get signals that haven't been evaluated yet."""
+    def get_eligible_signals(self, limit: int = 1000) -> list[dict]:
+        """Get signals that need evaluation of at least one horizon.
+
+        A signal is eligible when:
+        - It has no outcome row (brand new), OR
+        - It has an outcome row with at least one un-evaluated mature horizon
+        """
         if not self._conn:
             return []
 
         cursor = self._conn.cursor()
         cursor.execute(
             """
-            SELECT s.signal_id, s.symbol, s.signal_time, s.signal_price,
-                   s.open, s.high, s.low, s.close, s.volume,
-                   s.atr, s.atr_pct,
-                   s.wick_size, s.wick_atr, s.upper_wick_pct, s.close_location,
-                   s.rsi, s.stoch_rsi,
-                   s.bb_upper, s.bb_mid, s.bb_lower, s.bb_width, s.distance_to_upper_bb,
-                   s.ema_fast, s.ema_medium, s.ema_slow, s.ema_slope,
-                   s.volume_ratio, s.signal_version
+            SELECT
+                s.signal_id, s.symbol, s.signal_time, s.signal_price,
+                o.signal_id AS outcome_id,
+                o.evaluated_15m_at, o.evaluated_30m_at, o.evaluated_60m_at,
+                o.evaluated_120m_at, o.evaluated_240m_at, o.evaluated_eod_at,
+                o.is_final
             FROM dds.shadow_signal s
             LEFT JOIN dds.shadow_signal_outcome o ON o.signal_id = s.signal_id
             WHERE s.experiment_id = 'ATR_WICK_REJECTION_SHORT_V1'
-              AND o.signal_id IS NULL
-              AND s.signal_time < now() - (%s * interval '1 minute')
+              AND (
+                -- New signals: at least 15m old
+                (o.signal_id IS NULL AND s.signal_time <= now() - interval '15 minutes')
+                OR
+                -- Existing outcomes with incomplete mature horizons
+                (o.signal_id IS NOT NULL AND o.is_final = FALSE
+                 AND (
+                    (o.evaluated_15m_at IS NULL AND s.signal_time <= now() - interval '15 minutes')
+                    OR (o.evaluated_30m_at IS NULL AND s.signal_time <= now() - interval '30 minutes')
+                    OR (o.evaluated_60m_at IS NULL AND s.signal_time <= now() - interval '60 minutes')
+                    OR (o.evaluated_120m_at IS NULL AND s.signal_time <= now() - interval '120 minutes')
+                    OR (o.evaluated_240m_at IS NULL AND s.signal_time <= now() - interval '240 minutes')
+                    OR (o.evaluated_eod_at IS NULL AND s.signal_time < date_trunc('day', now() + interval '1 day'))
+                 ))
+              )
             ORDER BY s.signal_time ASC
             LIMIT %s
             """,
-            (min_age_minutes, limit),
+            (limit,),
         )
 
         rows = cursor.fetchall()
@@ -147,34 +159,105 @@ class ShadowSignalRepository:
                 "symbol": r[1],
                 "signal_time": r[2],
                 "signal_price": float(r[3]),
-                "open": float(r[4]),
-                "high": float(r[5]),
-                "low": float(r[6]),
-                "close": float(r[7]),
-                "volume": float(r[8]),
-                "atr": float(r[9]),
-                "atr_pct": float(r[10]),
-                "wick_size": float(r[11]),
-                "wick_atr": float(r[12]),
-                "upper_wick_pct": float(r[13]),
-                "close_location": float(r[14]),
-                "rsi": float(r[15]),
-                "stoch_rsi": float(r[16]) if r[16] is not None else None,
-                "bb_upper": float(r[17]),
-                "bb_mid": float(r[18]),
-                "bb_lower": float(r[19]),
-                "bb_width": float(r[20]),
-                "distance_to_upper_bb": float(r[21]),
-                "ema_fast": float(r[22]),
-                "ema_medium": float(r[23]),
-                "ema_slow": float(r[24]),
-                "ema_slope": float(r[25]),
-                "volume_ratio": float(r[26]),
-                "signal_version": r[27],
+                "outcome_id": r[4],
+                "evaluated_15m_at": r[5],
+                "evaluated_30m_at": r[6],
+                "evaluated_60m_at": r[7],
+                "evaluated_120m_at": r[8],
+                "evaluated_240m_at": r[9],
+                "evaluated_eod_at": r[10],
+                "is_final": r[11],
             }
             for r in rows
         ]
 
+    def save_outcome_partial(
+        self,
+        signal_id: int,
+        symbol: str,
+        # Horizon values (only non-None will be written)
+        mfe_15m: float | None = None,
+        mae_15m: float | None = None,
+        evaluated_15m_at: datetime | None = None,
+        mfe_30m: float | None = None,
+        mae_30m: float | None = None,
+        evaluated_30m_at: datetime | None = None,
+        mfe_60m: float | None = None,
+        mae_60m: float | None = None,
+        evaluated_60m_at: datetime | None = None,
+        mfe_120m: float | None = None,
+        mae_120m: float | None = None,
+        evaluated_120m_at: datetime | None = None,
+        mfe_240m: float | None = None,
+        mae_240m: float | None = None,
+        evaluated_240m_at: datetime | None = None,
+        mfe_eod: float | None = None,
+        mae_eod: float | None = None,
+        evaluated_eod_at: datetime | None = None,
+        # Target flags (only final horizon updates these)
+        reached_minus_0_5: bool | None = None,
+        reached_minus_1_0: bool | None = None,
+        reached_minus_1_5: bool | None = None,
+        reached_minus_2_0: bool | None = None,
+        hit_plus_0_5_before_target: bool | None = None,
+        hit_plus_1_0_before_target: bool | None = None,
+        hit_plus_1_5_before_target: bool | None = None,
+        is_final: bool = False,
+    ) -> bool:
+        """Upsert outcome, only updating non-NULL fields."""
+        if not self._conn:
+            return False
+
+        # Build dynamic SET clause
+        updates = []
+        params = []
+
+        pairs = [
+            ("mfe_15m", mfe_15m), ("mae_15m", mae_15m), ("evaluated_15m_at", evaluated_15m_at),
+            ("mfe_30m", mfe_30m), ("mae_30m", mae_30m), ("evaluated_30m_at", evaluated_30m_at),
+            ("mfe_60m", mfe_60m), ("mae_60m", mae_60m), ("evaluated_60m_at", evaluated_60m_at),
+            ("mfe_120m", mfe_120m), ("mae_120m", mae_120m), ("evaluated_120m_at", evaluated_120m_at),
+            ("mfe_240m", mfe_240m), ("mae_240m", mae_240m), ("evaluated_240m_at", evaluated_240m_at),
+            ("mfe_eod", mfe_eod), ("mae_eod", mae_eod), ("evaluated_eod_at", evaluated_eod_at),
+            ("reached_minus_0_5", reached_minus_0_5), ("reached_minus_1_0", reached_minus_1_0),
+            ("reached_minus_1_5", reached_minus_1_5), ("reached_minus_2_0", reached_minus_2_0),
+            ("hit_plus_0_5_before_target", hit_plus_0_5_before_target),
+            ("hit_plus_1_0_before_target", hit_plus_1_0_before_target),
+            ("hit_plus_1_5_before_target", hit_plus_1_5_before_target),
+            ("is_final", is_final),
+        ]
+
+        for col, val in pairs:
+            if val is not None:
+                updates.append(f"{col} = %s")
+                params.append(val)
+
+        if not updates:
+            return True
+
+        updates.append("updated_at = now()")
+        params.append(signal_id)
+
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(
+                f"""
+                INSERT INTO dds.shadow_signal_outcome (
+                    signal_id, experiment_id, symbol, is_final
+                ) VALUES (%s, 'ATR_WICK_REJECTION_SHORT_V1', %s, %s)
+                ON CONFLICT (signal_id) DO UPDATE SET
+                    {', '.join(updates)}
+                """,
+                [signal_id, symbol, is_final] + params,
+            )
+            self._conn.commit()
+            return True
+        except Exception:
+            self._conn.rollback()
+            logger.exception("Failed to save outcome for signal %d", signal_id)
+            return False
+
+    # Legacy method kept for backward compatibility
     def save_outcome(
         self,
         signal_id: int,
@@ -199,60 +282,21 @@ class ShadowSignalRepository:
         hit_plus_1_5_before_target: bool = False,
     ) -> bool:
         """Save signal outcome (MFE/MAE evaluation results)."""
-        if not self._conn:
-            return False
-
-        cursor = self._conn.cursor()
-        try:
-            cursor.execute(
-                """
-                INSERT INTO dds.shadow_signal_outcome (
-                    signal_id, experiment_id, symbol,
-                    mfe_15m, mae_15m, mfe_30m, mae_30m,
-                    mfe_60m, mae_60m, mfe_120m, mae_120m,
-                    mfe_240m, mae_240m, mfe_eod, mae_eod,
-                    reached_minus_0_5, reached_minus_1_0,
-                    reached_minus_1_5, reached_minus_2_0,
-                    hit_plus_0_5_before_target, hit_plus_1_0_before_target,
-                    hit_plus_1_5_before_target
-                )
-                SELECT
-                    %s, 'ATR_WICK_REJECTION_SHORT_V1', s.symbol,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s
-                FROM dds.shadow_signal s
-                WHERE s.signal_id = %s
-                ON CONFLICT (signal_id) DO UPDATE SET
-                    mfe_15m = EXCLUDED.mfe_15m, mae_15m = EXCLUDED.mae_15m,
-                    mfe_30m = EXCLUDED.mfe_30m, mae_30m = EXCLUDED.mae_30m,
-                    mfe_60m = EXCLUDED.mfe_60m, mae_60m = EXCLUDED.mae_60m,
-                    mfe_120m = EXCLUDED.mfe_120m, mae_120m = EXCLUDED.mae_120m,
-                    mfe_240m = EXCLUDED.mfe_240m, mae_240m = EXCLUDED.mae_240m,
-                    mfe_eod = EXCLUDED.mfe_eod, mae_eod = EXCLUDED.mae_eod,
-                    reached_minus_0_5 = EXCLUDED.reached_minus_0_5,
-                    reached_minus_1_0 = EXCLUDED.reached_minus_1_0,
-                    reached_minus_1_5 = EXCLUDED.reached_minus_1_5,
-                    reached_minus_2_0 = EXCLUDED.reached_minus_2_0,
-                    hit_plus_0_5_before_target = EXCLUDED.hit_plus_0_5_before_target,
-                    hit_plus_1_0_before_target = EXCLUDED.hit_plus_1_0_before_target,
-                    hit_plus_1_5_before_target = EXCLUDED.hit_plus_1_5_before_target,
-                    updated_at = now()
-                """,
-                (
-                    signal_id,
-                    mfe_15m, mae_15m, mfe_30m, mae_30m,
-                    mfe_60m, mae_60m, mfe_120m, mae_120m,
-                    mfe_240m, mae_240m, mfe_eod, mae_eod,
-                    reached_minus_0_5, reached_minus_1_0,
-                    reached_minus_1_5, reached_minus_2_0,
-                    hit_plus_0_5_before_target, hit_plus_1_0_before_target,
-                    hit_plus_1_5_before_target,
-                    signal_id,
-                ),
-            )
-            self._conn.commit()
-            return True
-        except Exception:
-            self._conn.rollback()
-            logger.exception("Failed to save outcome for signal %d", signal_id)
-            return False
+        return self.save_outcome_partial(
+            signal_id=signal_id,
+            symbol="",
+            mfe_15m=mfe_15m, mae_15m=mae_15m,
+            mfe_30m=mfe_30m, mae_30m=mae_30m,
+            mfe_60m=mfe_60m, mae_60m=mae_60m,
+            mfe_120m=mfe_120m, mae_120m=mae_120m,
+            mfe_240m=mfe_240m, mae_240m=mae_240m,
+            mfe_eod=mfe_eod, mae_eod=mae_eod,
+            reached_minus_0_5=reached_minus_0_5,
+            reached_minus_1_0=reached_minus_1_0,
+            reached_minus_1_5=reached_minus_1_5,
+            reached_minus_2_0=reached_minus_2_0,
+            hit_plus_0_5_before_target=hit_plus_0_5_before_target,
+            hit_plus_1_0_before_target=hit_plus_1_0_before_target,
+            hit_plus_1_5_before_target=hit_plus_1_5_before_target,
+            is_final=True,
+        )

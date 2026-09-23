@@ -1,13 +1,19 @@
 """Tests for Shadow Signal Evaluator."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from app.models import Candle
-from app.shadow.evaluator import ShadowSignalEvaluator
+from app.shadow.evaluator import (
+    ShadowSignalEvaluator,
+    _calculate_mfe_mae_for_window,
+    _check_target_achievement,
+    _is_horizon_mature,
+    _is_eod_mature,
+)
 
 
 @pytest.fixture
@@ -22,8 +28,8 @@ def mock_client():
 def mock_repo():
     """Create a mock ShadowSignalRepository."""
     repo = MagicMock()
-    repo.get_signals_without_outcomes.return_value = []
-    repo.save_outcome.return_value = True
+    repo.get_eligible_signals.return_value = []
+    repo.save_outcome_partial.return_value = True
     return repo
 
 
@@ -36,12 +42,14 @@ def evaluator(mock_client, mock_repo):
 class TestShadowSignalEvaluator:
     """Test cases for Shadow Signal Evaluator."""
 
-    def test_calculate_mfe_mae_short_signal(self, evaluator):
+    def test_calculate_mfe_mae_short_signal(self):
         """Test MFE/MAE calculation for SHORT signal."""
+        signal_time = datetime(2026, 9, 23, 8, 0, tzinfo=timezone.utc)
+
         # Create candles after signal
         candles = [
             Candle(
-                timestamp=1000 + i * 300000,  # 5m intervals
+                timestamp=int((signal_time + timedelta(minutes=5 * (i + 1))).timestamp() * 1000),
                 open=100.0,
                 high=100.5 + (i * 0.1),  # Price rising slightly
                 low=99.5 - (i * 0.2),    # Price dropping more
@@ -54,7 +62,7 @@ class TestShadowSignalEvaluator:
         entry_price = 100.0
 
         # Calculate MFE/MAE for 60m horizon
-        mfe, mae = evaluator._calculate_mfe_mae(candles, entry_price, 60)
+        mfe, mae = _calculate_mfe_mae_for_window(candles, entry_price, 60, signal_time)
 
         # MFE should be positive (price dropped)
         assert mfe is not None
@@ -64,7 +72,7 @@ class TestShadowSignalEvaluator:
         assert mae is not None
         assert mae > 0  # Price rose, bad for SHORT
 
-    def test_check_target_achievement(self, evaluator):
+    def test_check_target_achievement(self):
         """Test target achievement checking."""
         # Create candles that hit specific targets
         candles = [
@@ -88,7 +96,7 @@ class TestShadowSignalEvaluator:
 
         signal_price = 100.0
 
-        results = evaluator._check_target_achievement(candles, signal_price)
+        results = _check_target_achievement(candles, signal_price)
 
         # Should have reached -0.5% target
         assert results["reached_minus_0_5"] is True
@@ -99,18 +107,34 @@ class TestShadowSignalEvaluator:
         # Should not have reached -1.5% target
         assert results["reached_minus_1_5"] is False
 
-    def test_evaluate_signal_success(self, evaluator, mock_client):
-        """Test successful signal evaluation."""
-        # Create signal time in the past
-        signal_time = datetime.now(timezone.utc).replace(
-            minute=datetime.now(timezone.utc).minute - 10
-        )
+    def test_evaluate_signal_incremental(self, evaluator, mock_client):
+        """Test incremental signal evaluation via run_evaluation_cycle."""
+        signal_time = datetime.now(timezone.utc) - timedelta(minutes=20)
+
+        # Mock repo to return eligible signal
+        mock_repo = evaluator.repo
+        mock_repo.get_eligible_signals.return_value = [
+            {
+                "signal_id": 1,
+                "symbol": "TESTUSDT",
+                "signal_time": signal_time,
+                "signal_price": 100.0,
+                "outcome_id": None,
+                "evaluated_15m_at": None,
+                "evaluated_30m_at": None,
+                "evaluated_60m_at": None,
+                "evaluated_120m_at": None,
+                "evaluated_240m_at": None,
+                "evaluated_eod_at": None,
+                "is_final": False,
+            }
+        ]
 
         # Mock client to return candles AFTER signal time
         signal_ts = int(signal_time.timestamp() * 1000)
         mock_client.get_klines.return_value = [
             Candle(
-                timestamp=signal_ts + (i + 1) * 300000,  # After signal time
+                timestamp=signal_ts + (i + 1) * 300000,
                 open=100.0 - (i * 0.1),
                 high=100.5 - (i * 0.1),
                 low=99.5 - (i * 0.1),
@@ -120,38 +144,25 @@ class TestShadowSignalEvaluator:
             for i in range(20)
         ]
 
-        signal_data = {
-            "signal_id": 1,
-            "symbol": "TESTUSDT",
-            "signal_time": signal_time,
-            "signal_price": 100.0,
-        }
+        summary = evaluator.run_evaluation_cycle()
 
-        outcome = evaluator.evaluate_signal(signal_data)
+        # Should have created an outcome with 15m horizon
+        assert summary["signals_checked"] == 1
+        assert summary["outcomes_created"] == 1
+        assert summary["horizons_updated"]["15m"] >= 1
 
-        # Should return outcome
-        assert outcome is not None
-        assert "mfe_15m" in outcome
-        assert "mae_15m" in outcome
-        assert "reached_minus_0_5" in outcome
+    def test_run_evaluation_cycle_returns_correct_keys(self, evaluator, mock_repo):
+        """Test that run_evaluation_cycle returns correct stat keys."""
+        mock_repo.get_eligible_signals.return_value = []
+        summary = evaluator.run_evaluation_cycle()
 
-    def test_evaluate_pending_signals(self, evaluator, mock_repo):
-        """Test evaluation of pending signals."""
-        # Mock repo to return pending signals
-        mock_repo.get_signals_without_outcomes.return_value = [
-            {
-                "signal_id": 1,
-                "symbol": "TESTUSDT",
-                "signal_time": datetime.now(timezone.utc),
-                "signal_price": 100.0,
-            }
-        ]
-
-        # Mock evaluate_signal to return outcome
-        evaluator.evaluate_signal = MagicMock(return_value={"mfe_60m": 1.0})
-
-        evaluated = evaluator.evaluate_pending_signals()
-
-        # Should evaluate 1 signal
-        assert evaluated == 1
-        mock_repo.save_outcome.assert_called_once()
+        assert "start_time" in summary
+        assert "end_time" in summary
+        assert "signals_checked" in summary
+        assert "symbols_processed" in summary
+        assert "outcomes_created" in summary
+        assert "outcomes_updated" in summary
+        assert "finalized" in summary
+        assert "errors" in summary
+        assert "horizons_updated" in summary
+        assert summary["signals_checked"] == 0

@@ -110,6 +110,30 @@ CREATE INDEX IF NOT EXISTS idx_shadow_outcome_experiment ON dds.shadow_signal_ou
 CREATE INDEX IF NOT EXISTS idx_shadow_outcome_symbol ON dds.shadow_signal_outcome (symbol);
 CREATE INDEX IF NOT EXISTS idx_shadow_outcome_mfe ON dds.shadow_signal_outcome (mfe_60m DESC NULLS LAST);
 
+-- Add per-horizon evaluation timestamps and finalization flag (idempotent)
+ALTER TABLE dds.shadow_signal_outcome ADD COLUMN IF NOT EXISTS evaluated_15m_at TIMESTAMPTZ NULL;
+ALTER TABLE dds.shadow_signal_outcome ADD COLUMN IF NOT EXISTS evaluated_30m_at TIMESTAMPTZ NULL;
+ALTER TABLE dds.shadow_signal_outcome ADD COLUMN IF NOT EXISTS evaluated_60m_at TIMESTAMPTZ NULL;
+ALTER TABLE dds.shadow_signal_outcome ADD COLUMN IF NOT EXISTS evaluated_120m_at TIMESTAMPTZ NULL;
+ALTER TABLE dds.shadow_signal_outcome ADD COLUMN IF NOT EXISTS evaluated_240m_at TIMESTAMPTZ NULL;
+ALTER TABLE dds.shadow_signal_outcome ADD COLUMN IF NOT EXISTS evaluated_eod_at TIMESTAMPTZ NULL;
+ALTER TABLE dds.shadow_signal_outcome ADD COLUMN IF NOT EXISTS is_final BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Reset stale data for existing outcomes so evaluator can re-evaluate mature horizons
+UPDATE dds.shadow_signal_outcome SET
+    evaluated_120m_at = NULL,
+    evaluated_240m_at = NULL,
+    evaluated_eod_at = NULL,
+    mfe_120m = NULL, mae_120m = NULL,
+    mfe_240m = NULL, mae_240m = NULL,
+    mfe_eod = NULL, mae_eod = NULL,
+    is_final = FALSE
+WHERE mfe_120m IS NOT NULL OR mfe_240m IS NOT NULL OR mfe_eod IS NOT NULL;
+
+-- Index for eligible signal query
+CREATE INDEX IF NOT EXISTS idx_shadow_outcome_is_final
+ON dds.shadow_signal_outcome (is_final) WHERE is_final = FALSE;
+
 -- ============================================================
 -- Reporting Views
 -- ============================================================
