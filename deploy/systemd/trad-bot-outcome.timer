@@ -1,0 +1,12 @@
+[Unit]
+Description=Trad Bot Outcome Evaluator Timer
+Requires=trad-bot-outcome.service
+
+[Timer]
+OnCalendar=*-*-* *:00/15:00
+Persistent=true
+RandomizedDelaySec=30
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
