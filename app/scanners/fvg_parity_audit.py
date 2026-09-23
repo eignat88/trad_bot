@@ -159,6 +159,7 @@ def run_parity_audit(
             "prod_sl": prod_sl,
             "prod_tp": prod_tp,
             "prod_confirmation_at": prod_confirmation_at,
+            "prod_fvg_created_at": prod_features.get("fvg_created_at") if prod_features else None,
             "prod_features_keys": list(prod_features.keys()) if prod_features else [],
             "research_entry": research_entry,
             "research_tp": research_tp,
@@ -195,10 +196,11 @@ def run_parity_audit(
 
     # Duplicate check: same (symbol, timeframe, fvg_created_at)
     if records:
-        fvg_keys = []
-        for r in records:
-            fvg_at = r.get("prod_confirmation_at") or r.get("prod_signal_ts")
-            fvg_keys.append((r["symbol"], r["timeframe"], fvg_at))
+        fvg_keys = [
+            (r["symbol"], r["timeframe"], r["prod_fvg_created_at"])
+            for r in records
+            if r.get("prod_fvg_created_at") is not None
+        ]
         from collections import Counter
         dupes = {k: v for k, v in Counter(fvg_keys).items() if v > 1}
         summary["duplicates"] = len(dupes)
