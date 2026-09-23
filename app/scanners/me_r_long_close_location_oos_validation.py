@@ -50,6 +50,7 @@ from datetime import datetime, timezone
 from app.scanners.close_location import (
     CLOSE_LOCATION_THRESHOLD,
     close_location_passes,
+    normalize_candle_timestamp,
 )
 from app.scanners.models import MarketContext, ScannerDirection, SetupCandidate, SetupState
 from app.scanners.momentum_exhaustion_reverse_long_v1 import MomentumExhaustionReverseLongV1Scanner
@@ -84,7 +85,7 @@ class MERLongCloseLocationOOSValidationV1Scanner:
 
     def _compute_close_location_from_signal_candle(
         self, candles_5m: list,
-    ) -> tuple[float | None, datetime | None]:
+    ) -> tuple[float | None, object]:
         """Extract close_location from the signal candle.
 
         The signal candle is candles_5m[-1] — the last fully closed 5m candle
@@ -93,10 +94,11 @@ class MERLongCloseLocationOOSValidationV1Scanner:
 
         Returns
         -------
-        tuple[float | None, datetime | None]
+        tuple[float | None, object]
             (close_location_value, signal_candle_timestamp)
             close_location is None for zero-range candles.
-            signal_candle_timestamp is used for leakage audit.
+            signal_candle_timestamp may be int (ms), datetime, or other —
+            use ``normalize_candle_timestamp()`` before serialising.
         """
         if not candles_5m:
             return None, None
@@ -118,7 +120,7 @@ class MERLongCloseLocationOOSValidationV1Scanner:
         candidate: SetupCandidate,
         close_location: float | None,
         filter_passed: bool,
-        signal_candle_timestamp: datetime | None,
+        signal_candle_timestamp: object,
     ) -> SetupCandidate:
         """Attach OOS experiment features to a SetupCandidate.
 
@@ -130,10 +132,8 @@ class MERLongCloseLocationOOSValidationV1Scanner:
         features["close_location"] = round(close_location, 6) if close_location is not None else None
         features["close_location_threshold"] = self.threshold
         features["close_location_passed"] = filter_passed
-        features["close_location_source_timestamp"] = (
-            signal_candle_timestamp.isoformat() if signal_candle_timestamp else None
-        )
-        features["close_location_decision_timestamp"] = candidate.detected_at.isoformat()
+        features["close_location_source_timestamp"] = normalize_candle_timestamp(signal_candle_timestamp)
+        features["close_location_decision_timestamp"] = normalize_candle_timestamp(candidate.detected_at)
         # Research features (observation only, NOT used as gate)
         # body_ratio is already in features from the base scanner
 
