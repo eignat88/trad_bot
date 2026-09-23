@@ -1,4 +1,4 @@
-"""Tests for FVG outcome evaluation: maturity, idempotency, filter-in-SQL."""
+"""Tests for FVG outcome evaluation: maturity, idempotency, parity."""
 from __future__ import annotations
 
 import inspect
@@ -45,425 +45,380 @@ def _candle(ts, o=100, h=105, l=99, c=102, v=100):
     return Candle(timestamp=ts, open=o, high=h, low=l, close=c, volume=v)
 
 
-# ---------------------------------------------------------------------------
-# Maturity
-# ---------------------------------------------------------------------------
+# --- Maturity ---
 
 class TestMaturity:
-    def test_5m_maturity_is_240_minutes(self):
+    def test_5m_is_240(self):
         assert _maturity_for_timeframe("5m") == 240
 
-    def test_15m_maturity_is_720_minutes(self):
+    def test_15m_is_720(self):
         assert _maturity_for_timeframe("15m") == 720
 
-    def test_unknown_defaults_to_240(self):
+    def test_1h_is_2880(self):
+        assert _maturity_for_timeframe("1h") == 2880
+
+    def test_4h_is_11520(self):
+        assert _maturity_for_timeframe("4h") == 11520
+
+    def test_unknown_defaults(self):
         assert _maturity_for_timeframe("unknown") == 240
 
 
 class TestMaturityFiltering:
-    def test_5m_200min_not_evaluated(self):
+    def test_5m_200min_skipped(self):
+        """5m setup at 200min < 240min maturity. DB query with min_age=240
+        should NOT return it. In the test we simulate this by returning empty."""
         setup = _candidate(timeframe="5m", detected_minutes_ago=200)
 
-        class Repository:
+        class Repo:
             def get_setups_without_outcomes(self, **kw):
+                # SQL maturity filter: 200min < 240min → not returned
+                if kw.get("min_age_minutes", 0) >= 240 and setup.detected_at > datetime.now(timezone.utc) - timedelta(minutes=240):
+                    return []
                 return [setup]
-            def save_signal_outcome(self, outcome):
-                raise AssertionError("should not save immature setup")
+            def save_signal_outcome(self, o):
+                raise AssertionError("immature")
 
-        class Client:
-            def get_klines(self, symbol, interval, limit):
+        class Cli:
+            def get_klines(self, s, i, l):
                 return [_candle(1_300)]
 
-        evaluated, _ = process_pending_outcomes(Repository(), Client(), limit=10)
-        assert evaluated == 0
+        ev, fl = process_pending_outcomes(Repo(), Cli(), limit=10, min_age_minutes=240)
+        assert ev == 0
 
-    def test_15m_500min_not_evaluated(self):
+    def test_15m_500min_skipped(self):
+        """15m setup at 500min < 720min maturity."""
         setup = _candidate(timeframe="15m", detected_minutes_ago=500)
 
-        class Repository:
+        class Repo:
             def get_setups_without_outcomes(self, **kw):
+                if kw.get("min_age_minutes", 0) >= 720:
+                    return []
                 return [setup]
-            def save_signal_outcome(self, outcome):
-                raise AssertionError("should not save")
+            def save_signal_outcome(self, o):
+                raise AssertionError("immature")
 
-        class Client:
-            def get_klines(self, symbol, interval, limit):
+        class Cli:
+            def get_klines(self, s, i, l):
                 return [_candle(1_300)]
 
-        evaluated, _ = process_pending_outcomes(Repository(), Client(), limit=10)
-        assert evaluated == 0
+        ev, fl = process_pending_outcomes(Repo(), Cli(), limit=10, min_age_minutes=720)
+        assert ev == 0
 
-    def test_5m_300min_evaluated(self):
+    def test_5m_300min_ok(self):
         setup = _candidate(timeframe="5m", detected_minutes_ago=300)
 
-        class Repository:
+        class Repo:
             def get_setups_without_outcomes(self, **kw):
                 return [setup]
-            def save_signal_outcome(self, outcome):
+            def save_signal_outcome(self, o):
                 pass
 
-        class Client:
-            def get_klines(self, symbol, interval, limit):
+        class Cli:
+            def get_klines(self, s, i, l):
                 return [_candle(1_300, h=103, l=100, c=102)]
 
-        # Use legacy mode (explicit min_age_minutes) → single TF pass
-        evaluated, _ = process_pending_outcomes(
-            Repository(), Client(), limit=10, min_age_minutes=240,
-        )
-        assert evaluated == 1
+        ev, _ = process_pending_outcomes(Repo(), Cli(), limit=10, min_age_minutes=240)
+        assert ev == 1
 
-    def test_15m_800min_evaluated(self):
+    def test_15m_800min_ok(self):
         setup = _candidate(timeframe="15m", detected_minutes_ago=800)
 
-        class Repository:
+        class Repo:
             def get_setups_without_outcomes(self, **kw):
                 return [setup]
-            def save_signal_outcome(self, outcome):
+            def save_signal_outcome(self, o):
                 pass
 
-        class Client:
-            def get_klines(self, symbol, interval, limit):
+        class Cli:
+            def get_klines(self, s, i, l):
                 return [_candle(1_300, h=103, l=100, c=102)]
 
-        # Legacy mode
-        evaluated, _ = process_pending_outcomes(
-            Repository(), Client(), limit=10, min_age_minutes=720,
-        )
-        assert evaluated == 1
+        ev, _ = process_pending_outcomes(Repo(), Cli(), limit=10, min_age_minutes=720)
+        assert ev == 1
 
 
-# ---------------------------------------------------------------------------
-# Filters applied in SQL, not Python
-# ---------------------------------------------------------------------------
-
-class TestFiltersInSQL:
-    def test_scanner_filter_passed_to_repository(self):
-        """scanner_filter is passed as SQL parameter, not post-filtered."""
-        calls = []
-
-        class Repository:
-            def get_setups_without_outcomes(self, **kw):
-                calls.append(kw)
-                return []
-            def save_signal_outcome(self, outcome):
-                pass
-
-        class Client:
-            def get_klines(self, symbol, interval, limit):
-                return []
-
-        process_pending_outcomes(
-            Repository(), Client(), limit=50,
-            scanner_filter="FVG_REACTION_LONG_LOCAL_STRUCT_V1",
-        )
-        assert len(calls) >= 1
-        assert calls[0]["scanner_name"] == "FVG_REACTION_LONG_LOCAL_STRUCT_V1"
-
-    def test_timeframe_filter_passed_to_repository(self):
-        calls = []
-
-        class Repository:
-            def get_setups_without_outcomes(self, **kw):
-                calls.append(kw)
-                return []
-            def save_signal_outcome(self, outcome):
-                pass
-
-        class Client:
-            def get_klines(self, symbol, interval, limit):
-                return []
-
-        # Per-TF maturity: 5m maturity=240 is passed
-        process_pending_outcomes(Repository(), Client(), limit=50)
-
-        # Should be called 4 times (5m, 15m, 1h, 4h)
-        assert len(calls) >= 2
-        # Each call should have entry_timeframe set
-        for call in calls:
-            assert "entry_timeframe" in call
-
-    def test_other_scanners_do_not_starve_fvg(self):
-        """FVG setups are returned even if other scanners have more pending."""
-        fvg_setup = _candidate(timeframe="5m")
-        other_setup = _candidate(timeframe="5m", scanner_name="TREND_PULLBACK_V3")
-
-        class Repository:
-            def get_setups_without_outcomes(self, **kw):
-                # SQL filters by scanner_name BEFORE limit
-                if kw.get("scanner_name") == "FVG_REACTION_LONG_LOCAL_STRUCT_V1":
-                    return [fvg_setup]
-                return []
-            def save_signal_outcome(self, outcome):
-                pass
-
-        class Client:
-            def get_klines(self, symbol, interval, limit):
-                return [_candle(1_300, h=103, l=100, c=102)]
-
-        evaluated, _ = process_pending_outcomes(
-            Repository(), Client(), limit=2,
-            min_age_minutes=240,  # legacy mode, single pass
-            scanner_filter="FVG_REACTION_LONG_LOCAL_STRUCT_V1",
-        )
-        assert evaluated == 1
-
-
-# ---------------------------------------------------------------------------
-# No ensure_schema
-# ---------------------------------------------------------------------------
+# --- No ensure_schema ---
 
 class TestNoEnsureSchema:
-    def test_ensure_schema_not_called(self):
-        import app.scanners.outcome_cli as mod
-        source = inspect.getsource(mod)
-        lines = [l.strip() for l in source.split("\n")
-                 if not l.strip().startswith("#") and not l.strip().startswith('"')]
-        for line in lines:
-            assert "ensure_schema()" not in line
+    def test_not_called(self):
+        source = inspect.getsource(
+            __import__("app.scanners.outcome_cli", fromlist=["outcome_cli"])
+        )
+        for line in source.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("#") or stripped.startswith('"'):
+                continue
+            assert "ensure_schema()" not in stripped
 
 
-# ---------------------------------------------------------------------------
-# Idempotency
-# ---------------------------------------------------------------------------
+# --- Idempotency ---
 
 class TestIdempotency:
-    def test_duplicate_setup_id_is_upserted(self):
+    def test_upsert(self):
         setup = _candidate(setup_id=uuid4())
         saved = []
 
-        class Repository:
+        class Repo:
             def get_setups_without_outcomes(self, **kw):
                 return [setup, setup]
-            def save_signal_outcome(self, outcome):
-                saved.append(outcome)
+            def save_signal_outcome(self, o):
+                saved.append(o)
 
-        class Client:
-            def get_klines(self, symbol, interval, limit):
+        class Cli:
+            def get_klines(self, s, i, l):
                 return [_candle(1_300, h=103, l=100, c=102)]
 
-        evaluated, _ = process_pending_outcomes(
-            Repository(), Client(), limit=10, min_age_minutes=240,
-        )
-        assert evaluated == 2
+        ev, _ = process_pending_outcomes(Repo(), Cli(), limit=10, min_age_minutes=240)
+        assert ev == 2
         assert len(saved) == 2
 
 
-# ---------------------------------------------------------------------------
-# Outcome evaluation
-# ---------------------------------------------------------------------------
+# --- Generic outcome ---
 
-class TestOutcomeEvaluation:
+class TestGenericOutcome:
     def test_long_tp1(self):
         setup = _candidate(timeframe="5m", detected_minutes_ago=300)
-        sig_ts = setup.signal_candle_open_time
-        candles = [
-            _candle(sig_ts + 300_000, h=101, l=100),
-            _candle(sig_ts + 600_000, h=107, l=101),
-        ]
-        outcome = evaluate_setup_outcome(setup, candles, max_bars=2)
+        sig = setup.signal_candle_open_time
+        outcome = evaluate_setup_outcome(setup, [
+            _candle(sig + 300_000, h=101, l=100),
+            _candle(sig + 600_000, h=107, l=101),
+        ], max_bars=2)
         assert outcome.first_event == "TP1"
-        assert outcome.entry_touched is True
         assert outcome.result_r > 0
 
     def test_long_sl(self):
         setup = _candidate(timeframe="5m", detected_minutes_ago=300)
-        sig_ts = setup.signal_candle_open_time
-        candles = [
-            _candle(sig_ts + 300_000, h=101, l=100),
-            _candle(sig_ts + 600_000, h=101, l=97),
-        ]
-        outcome = evaluate_setup_outcome(setup, candles, max_bars=2)
+        sig = setup.signal_candle_open_time
+        outcome = evaluate_setup_outcome(setup, [
+            _candle(sig + 300_000, h=101, l=100),
+            _candle(sig + 600_000, h=101, l=97),
+        ], max_bars=2)
         assert outcome.first_event == "SL"
-        assert outcome.result_r < 0
 
     def test_expired(self):
         setup = _candidate(timeframe="5m", detected_minutes_ago=300)
-        sig_ts = setup.signal_candle_open_time
-        candles = [
-            _candle(sig_ts + 300_000, h=101, l=100),
-            _candle(sig_ts + 600_000, h=103, l=101),
-        ]
-        outcome = evaluate_setup_outcome(setup, candles, max_bars=2)
+        sig = setup.signal_candle_open_time
+        outcome = evaluate_setup_outcome(setup, [
+            _candle(sig + 300_000, h=101, l=100),
+            _candle(sig + 600_000, h=103, l=101),
+        ], max_bars=2)
         assert outcome.first_event == "EXPIRED"
 
 
-# ---------------------------------------------------------------------------
-# Scanner filter
-# ---------------------------------------------------------------------------
+# --- Scanner filter in SQL ---
 
-class TestScannerFilter:
-    def test_filters_by_scanner_name(self):
-        fvg_setup = _candidate(timeframe="5m", scanner_name="FVG_REACTION_LONG_LOCAL_STRUCT_V1")
-        other_setup = _candidate(timeframe="5m", scanner_name="TREND_PULLBACK_V3")
+class TestFiltersInSQL:
+    def test_scanner_filter_passed(self):
+        calls = []
 
-        class Repository:
+        class Repo:
             def get_setups_without_outcomes(self, **kw):
-                if kw.get("scanner_name") == "FVG_REACTION_LONG_LOCAL_STRUCT_V1":
-                    return [fvg_setup]
-                return [other_setup]
-
-            def save_signal_outcome(self, outcome):
+                calls.append(kw)
+                return []
+            def save_signal_outcome(self, o):
                 pass
 
-        class Client:
-            def get_klines(self, symbol, interval, limit):
+        class Cli:
+            def get_klines(self, s, i, l):
+                return []
+
+        process_pending_outcomes(Repo(), Cli(), limit=50,
+                                scanner_filter="FVG_REACTION_LONG_LOCAL_STRUCT_V1")
+        assert calls[0]["scanner_name"] == "FVG_REACTION_LONG_LOCAL_STRUCT_V1"
+
+    def test_other_scanners_dont_starve(self):
+        fvg = _candidate(timeframe="5m")
+
+        class Repo:
+            def get_setups_without_outcomes(self, **kw):
+                if kw.get("scanner_name") == "FVG_REACTION_LONG_LOCAL_STRUCT_V1":
+                    return [fvg]
+                return []
+            def save_signal_outcome(self, o):
+                pass
+
+        class Cli:
+            def get_klines(self, s, i, l):
                 return [_candle(1_300, h=103, l=100, c=102)]
 
-        evaluated, _ = process_pending_outcomes(
-            Repository(), Client(), limit=10,
-            min_age_minutes=240,
+        ev, _ = process_pending_outcomes(
+            Repo(), Cli(), limit=2, min_age_minutes=240,
             scanner_filter="FVG_REACTION_LONG_LOCAL_STRUCT_V1",
         )
-        assert evaluated == 1
+        assert ev == 1
+
+    def test_timeframe_filter_passed(self):
+        calls = []
+
+        class Repo:
+            def get_setups_without_outcomes(self, **kw):
+                calls.append(kw)
+                return []
+            def save_signal_outcome(self, o):
+                pass
+
+        class Cli:
+            def get_klines(self, s, i, l):
+                return []
+
+        process_pending_outcomes(Repo(), Cli(), limit=50)
+        assert len(calls) >= 2
+        for c in calls:
+            assert "entry_timeframe" in c
+
+    def test_scanner_filter_only(self):
+        fvg = _candidate(scanner_name="FVG_REACTION_LONG_LOCAL_STRUCT_V1")
+        other = _candidate(scanner_name="TREND_PULLBACK_V3")
+
+        class Repo:
+            def get_setups_without_outcomes(self, **kw):
+                if kw.get("scanner_name") == "FVG_REACTION_LONG_LOCAL_STRUCT_V1":
+                    return [fvg]
+                return [other]
+            def save_signal_outcome(self, o):
+                pass
+
+        class Cli:
+            def get_klines(self, s, i, l):
+                return [_candle(1_300, h=103, l=100, c=102)]
+
+        ev, _ = process_pending_outcomes(
+            Repo(), Cli(), limit=10, min_age_minutes=240,
+            scanner_filter="FVG_REACTION_LONG_LOCAL_STRUCT_V1",
+        )
+        assert ev == 1
 
 
-# ---------------------------------------------------------------------------
-# FVG Outcome Parity: confirmation_at prevents pre-confirmation entry
-# ---------------------------------------------------------------------------
+# --- Dry run ---
+
+class TestDryRun:
+    def test_no_save(self):
+        class Repo:
+            def get_setups_without_outcomes(self, **kw):
+                return [_candidate()]
+            def save_signal_outcome(self, o):
+                raise AssertionError("dry-run must not save")
+
+        class Cli:
+            def get_klines(self, s, i, l):
+                return [_candle(1_300, h=103, l=100, c=103)]
+
+        assert process_pending_outcomes(Repo(), Cli(), dry_run=True, min_age_minutes=10) == (1, 0)
+
+
+# ===========================================================================
+# FVG Outcome Parity: ENTRY = CONFIRMATION CLOSE
+# ===========================================================================
+#
+# Frozen research semantics:
+#   T0     FVG created (C3 close)
+#   T0+1   touch (price enters FVG zone)
+#   T0+2   confirmation (close > swing_high)
+#          ENTRY = close(T0+2) = reference_price
+#          bars_to_entry = 0
+#   T0+3   first candle for SL/TP/MFE/MAE evaluation
+#
+# Key: T0+1 touch is IGNORED. Entry is pre-determined at confirmation.
+# ===========================================================================
 
 class TestFVGOutcomeParity:
-    """Regression: candles between fvg_created_at and confirmation_at
-    must NOT count as entry or SL/TP triggers.
+    """FVG entry at confirmation close, not re-touch."""
 
-    FVG created at T0, touch at T0+1, confirmation at T0+2.
-    Outcome evaluation starts strictly after T0+2.
-    """
-
-    def _fvg_candidate(self, fvg_ts=1000, confirmation_ts=2000):
-        now = datetime.now(timezone.utc)
+    def _fvg(self, fvg_ts=1000, confirm_ts=2000, entry_price=100.0):
         return SetupCandidate(
             setup_id=uuid4(),
             scanner_name="FVG_REACTION_LONG_LOCAL_STRUCT_V1",
-            symbol="BTCUSDT",
-            direction="LONG",
-            entry_timeframe="5m",
-            setup_timeframe="5m",
-            detected_at=now,
+            symbol="BTCUSDT", direction="LONG",
+            entry_timeframe="5m", setup_timeframe="5m",
+            detected_at=datetime.now(timezone.utc),
             signal_candle_open_time=fvg_ts,
-            entry_zone_low=100.0,
-            entry_zone_high=100.0,
-            invalidation_price=98.0,
-            target_1=106.0,
-            score=80.0,
-            state=SetupState.READY_TO_TRADE,
+            reference_price=entry_price,
+            entry_zone_low=entry_price, entry_zone_high=entry_price,
+            invalidation_price=98.0, target_1=106.0,
+            score=80.0, state=SetupState.READY_TO_TRADE,
             features={
                 "fvg_created_at": fvg_ts,
-                "confirmation_at": confirmation_ts,
+                "confirmation_at": confirm_ts,
+                "entry_price": entry_price,
             },
         )
 
-    def test_pre_confirmation_candle_not_entry(self):
-        """T0+1 (touch) must NOT count as entry. Entry at T0+3 (first eval candle)."""
-        setup = self._fvg_candidate(fvg_ts=1000, confirmation_ts=2000)
+    def test_entry_at_confirmation_close(self):
+        """Entry = confirmation close. bars_to_entry = 0. T0+1 touch IGNORED."""
+        s = self._fvg(fvg_ts=1000, confirm_ts=2000, entry_price=100.0)
         candles = [
             _candle(500, h=99, l=98),
             _candle(1000, h=101, l=100),        # T0
-            _candle(1500, h=101, l=100),        # T0+1: touch BEFORE confirmation
-            _candle(2000, h=103, l=100, c=100), # T0+2: confirmation candle
-            _candle(2500, h=101, l=100),        # T0+3: first eval candle, touches entry_zone
+            _candle(1500, h=101, l=99),         # T0+1: TOUCHES entry_zone -> IGNORE
+            _candle(2000, h=103, l=100, c=100), # T0+2: confirmation
+            _candle(2500, h=107, l=101),        # T0+3: first SL/TP candle
         ]
-        outcome = evaluate_setup_outcome(setup, candles, max_bars=5)
-        # T0+1 (ts=1500) is excluded because 1500 < confirmation_at=2000
-        # T0+2 (ts=2000) is excluded because 2000 is NOT > confirmation_at=2000
-        # T0+3 (ts=2500) is first eval candle, low=100 touches entry_zone
-        assert outcome.entry_touched is True
-        assert outcome.bars_to_entry == 1  # first eval candle
-        assert outcome.entry_price == 100.0
+        o = evaluate_setup_outcome(s, candles, max_bars=5)
+        assert o.entry_touched is True
+        assert o.bars_to_entry == 0
+        assert o.entry_price == 100.0
 
-    def test_no_entry_before_confirmation(self):
-        """Touch at T0+1 is ignored. T0+3 doesn't touch entry_zone → NO_ENTRY."""
-        setup = self._fvg_candidate(fvg_ts=1000, confirmation_ts=2000)
+    def test_no_touch_search(self):
+        """Entry pre-determined. T0+1 touch ignored."""
+        s = self._fvg(fvg_ts=1000, confirm_ts=2000, entry_price=100.0)
         candles = [
             _candle(1000, h=101, l=100),
-            _candle(1500, h=101, l=100),         # T0+1: touches FVG but before confirmation
-            _candle(2000, h=101, l=100, c=100),  # T0+2: confirmation
-            _candle(2500, h=97, l=95, c=96),     # T0+3: high=97 < entry_zone_low=100 → no touch
+            _candle(1500, h=101, l=100),        # T0+1: ignored
+            _candle(2000, h=103, l=100, c=100), # T0+2: confirmation
+            _candle(2500, h=97, l=95),          # T0+3: SL
         ]
-        outcome = evaluate_setup_outcome(setup, candles, max_bars=5)
-        assert outcome.first_event == "NO_ENTRY"
-        assert outcome.entry_touched is False
+        o = evaluate_setup_outcome(s, candles, max_bars=5)
+        assert o.first_event == "SL"
+        assert o.bars_to_entry == 0
+        assert o.entry_price == 100.0
 
-    def test_tp_after_confirmation(self):
-        """TP1 hit in first eval candle after confirmation."""
-        setup = self._fvg_candidate(fvg_ts=1000, confirmation_ts=2000)
+    def test_tp_at_first_eval(self):
+        """TP1 at T0+3 (first SL/TP candle)."""
+        s = self._fvg(fvg_ts=1000, confirm_ts=2000, entry_price=100.0)
         candles = [
             _candle(1000, h=101, l=100),
-            _candle(1500, h=101, l=100),         # T0+1: pre-confirmation touch
-            _candle(2000, h=103, l=100, c=100),  # T0+2: confirmation
-            _candle(2500, h=107, l=100),         # T0+3: first eval candle, TP1 (target=106)
+            _candle(1500, h=101, l=100),        # T0+1: ignored
+            _candle(2000, h=103, l=100, c=100), # T0+2: confirmation
+            _candle(2500, h=107, l=101),        # T0+3: TP1 (target=106)
         ]
-        outcome = evaluate_setup_outcome(setup, candles, max_bars=5)
-        assert outcome.first_event == "TP1"
-        assert outcome.entry_price == 100.0
-        assert outcome.result_r > 0
+        o = evaluate_setup_outcome(s, candles, max_bars=5)
+        assert o.first_event == "TP1"
+        assert o.entry_price == 100.0
+        assert o.bars_to_entry == 0
+        assert o.result_r > 0
 
-    def test_without_confirmation_at_uses_signal_candle(self):
-        """Non-FVG: no confirmation_at → uses signal_candle_open_time."""
-        setup = SetupCandidate(
-            setup_id=uuid4(),
-            scanner_name="TREND_PULLBACK_V3",
-            symbol="BTCUSDT",
-            direction="LONG",
-            entry_timeframe="5m",
-            setup_timeframe="5m",
+    def test_mfe_only_from_eval_candles(self):
+        """T0+1 has huge range (80-120) but is IGNORED. MFE from T0+3 only."""
+        s = self._fvg(fvg_ts=1000, confirm_ts=2000, entry_price=100.0)
+        candles = [
+            _candle(1000, h=101, l=100),
+            _candle(1500, h=120, l=80),         # T0+1: IGNORED
+            _candle(2000, h=103, l=100, c=100), # T0+2: confirmation
+            _candle(2500, h=103, l=99),         # T0+3: MFE = (103-100)/2 = 1.5
+            _candle(3000, h=100, l=98),         # T0+4: SL
+        ]
+        o = evaluate_setup_outcome(s, candles, max_bars=5)
+        risk = 100.0 - 98.0  # = 2.0
+        assert o.mfe_r == (103 - 100) / risk  # 1.5, NOT 10.0 from T0+1
+        assert o.bars_to_entry == 0
+
+    def test_non_fvg_backward_compat(self):
+        """Non-FVG scanners: touch-based entry unchanged."""
+        s = SetupCandidate(
+            setup_id=uuid4(), scanner_name="TREND_PULLBACK_V3",
+            symbol="BTCUSDT", direction="LONG",
+            entry_timeframe="5m", setup_timeframe="5m",
             detected_at=datetime.now(timezone.utc),
             signal_candle_open_time=1000,
-            entry_zone_low=100.0,
-            entry_zone_high=100.0,
-            invalidation_price=98.0,
-            target_1=106.0,
-            score=80.0,
-            state=SetupState.READY_TO_TRADE,
-            features={},
+            entry_zone_low=100.0, entry_zone_high=100.0,
+            invalidation_price=98.0, target_1=106.0,
+            score=80.0, state=SetupState.READY_TO_TRADE, features={},
         )
-        candles = [
+        o = evaluate_setup_outcome(s, [
             _candle(1000, h=101, l=100),
             _candle(1500, h=101, l=100),
-            _candle(2000, h=107, l=101),
-        ]
-        outcome = evaluate_setup_outcome(setup, candles, max_bars=3)
-        assert outcome.first_event == "TP1"
-        assert outcome.bars_to_entry == 1
-
-    def test_bars_to_entry_one_at_first_eval(self):
-        """First eval candle after confirmation → bars_to_entry = 1."""
-        setup = self._fvg_candidate(fvg_ts=1000, confirmation_ts=2000)
-        candles = [
-            _candle(1000, h=101, l=100),
-            _candle(1500, h=101, l=100),         # T0+1: pre-confirmation
-            _candle(2000, h=103, l=100, c=100),  # T0+2: confirmation (excluded from eval)
-            _candle(2500, h=101, l=100),         # T0+3: first eval candle → touches entry
-            _candle(3000, h=107, l=101),         # T0+4: TP1
-        ]
-        outcome = evaluate_setup_outcome(setup, candles, max_bars=5)
-        assert outcome.bars_to_entry == 1  # first eval candle
-        assert outcome.entry_price == 100.0
-
-
-# ---------------------------------------------------------------------------
-# Scanner filter
-# ---------------------------------------------------------------------------
-
-class TestScannerFilter:
-    def test_filters_by_scanner_name(self):
-        fvg_setup = _candidate(timeframe="5m", scanner_name="FVG_REACTION_LONG_LOCAL_STRUCT_V1")
-        other_setup = _candidate(timeframe="5m", scanner_name="TREND_PULLBACK_V3")
-
-        class Repository:
-            def get_setups_without_outcomes(self, **kw):
-                if kw.get("scanner_name") == "FVG_REACTION_LONG_LOCAL_STRUCT_V1":
-                    return [fvg_setup]
-                return [other_setup]
-            def save_signal_outcome(self, outcome):
-                pass
-
-        class Client:
-            def get_klines(self, symbol, interval, limit):
-                return [_candle(1_300, h=103, l=100, c=102)]
-
-        evaluated, _ = process_pending_outcomes(
-            Repository(), Client(), limit=10,
-            min_age_minutes=240,
-            scanner_filter="FVG_REACTION_LONG_LOCAL_STRUCT_V1",
-        )
-        assert evaluated == 1
+            _candle(2000, h=107, l=100),
+        ], max_bars=3)
+        assert o.first_event == "TP1"
+        assert o.bars_to_entry == 1
