@@ -43,8 +43,6 @@ CREATE TABLE IF NOT EXISTS dds.shadow_signal (
     ema_slope           NUMERIC NOT NULL,
     -- Volume
     volume_ratio        NUMERIC NOT NULL,
-    -- Filter results (for diagnostic)
-    strict_pass         BOOLEAN NOT NULL DEFAULT FALSE,
     -- Metadata
     signal_version      TEXT NOT NULL DEFAULT '1.0.0',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -53,6 +51,10 @@ CREATE TABLE IF NOT EXISTS dds.shadow_signal (
     CONSTRAINT shadow_signal_timeframe_chk CHECK (timeframe = '5m'),
     CONSTRAINT shadow_signal_direction_chk CHECK (experiment_id = 'ATR_WICK_REJECTION_SHORT_V1')
 );
+
+-- Add strict_pass column (idempotent - safe to run multiple times)
+ALTER TABLE dds.shadow_signal
+ADD COLUMN IF NOT EXISTS strict_pass BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- Indexes for analysis and backfill
 CREATE INDEX IF NOT EXISTS idx_shadow_signal_experiment ON dds.shadow_signal (experiment_id);
