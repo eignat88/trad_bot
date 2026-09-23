@@ -1,6 +1,8 @@
 -- 06_candidate_filters.sql
 -- Candidate filter analysis: test various thresholds on features
 -- This script tests multiple filters and shows their impact
+-- NOTE: All ROUND() calls use ::numeric cast to avoid
+--       PostgreSQL "function round(double precision, integer) does not exist"
 
 -- Filter 1: rsi_delta_3 threshold (V2 only feature, but V1 trades have it too if we compute it)
 -- For V1 trades, we need to check if features contain rsi_delta_3

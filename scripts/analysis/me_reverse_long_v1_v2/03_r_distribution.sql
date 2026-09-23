@@ -1,5 +1,7 @@
 -- 03_r_distribution.sql
 -- R-distribution buckets for V1 and V2
+-- NOTE: All ROUND() calls use ::numeric cast to avoid
+--       PostgreSQL "function round(double precision, integer) does not exist"
 
 -- V1 R distribution
 SELECT
@@ -12,7 +14,7 @@ SELECT
         WHEN pnl_r >= 1.0 THEN '>= +1R'
     END AS r_bucket,
     COUNT(*) AS count,
-    ROUND(COUNT(*)::numeric / (SELECT COUNT(*) FROM dds.paper_trade WHERE scanner_name = 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V1' AND status = 'CLOSED') * 100, 1) AS pct
+    ROUND((COUNT(*)::numeric / (SELECT COUNT(*) FROM dds.paper_trade WHERE scanner_name = 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V1' AND status = 'CLOSED') * 100)::numeric, 1) AS pct
 FROM dds.paper_trade pt
 WHERE pt.scanner_name = 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V1'
   AND pt.direction = 'LONG'
@@ -33,7 +35,7 @@ SELECT
         WHEN pnl_r >= 1.0 THEN '>= +1R'
     END AS r_bucket,
     COUNT(*) AS count,
-    ROUND(COUNT(*)::numeric / (SELECT COUNT(*) FROM dds.paper_trade WHERE scanner_name = 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V2' AND status = 'CLOSED') * 100, 1) AS pct
+    ROUND((COUNT(*)::numeric / (SELECT COUNT(*) FROM dds.paper_trade WHERE scanner_name = 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V2' AND status = 'CLOSED') * 100)::numeric, 1) AS pct
 FROM dds.paper_trade pt
 WHERE pt.scanner_name = 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V2'
   AND pt.direction = 'LONG'

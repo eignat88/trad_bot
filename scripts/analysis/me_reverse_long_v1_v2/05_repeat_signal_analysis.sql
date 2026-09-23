@@ -1,5 +1,7 @@
 -- 05_repeat_signal_analysis.sql
 -- Repeat signal analysis: same symbol, multiple signals
+-- NOTE: All ROUND() calls use ::numeric cast to avoid
+--       PostgreSQL "function round(double precision, integer) does not exist"
 
 WITH symbol_trades AS (
     SELECT
@@ -35,9 +37,9 @@ SELECT
     scanner_name,
     COUNT(*) AS total_trades,
     SUM(CASE WHEN prev_entered_at IS NOT NULL THEN 1 ELSE 0 END) AS repeat_trades,
-    ROUND(
+    ROUND((
         SUM(CASE WHEN prev_entered_at IS NOT NULL THEN 1 ELSE 0 END)::numeric
-        / COUNT(*) * 100, 1
+        / COUNT(*) * 100)::numeric, 1
     ) AS repeat_pct,
     SUM(CASE WHEN prev_entered_at IS NOT NULL
              AND EXTRACT(EPOCH FROM (entered_at - prev_entered_at)) / 60 <= 60
@@ -50,15 +52,15 @@ SELECT
     -- Repeat after win
     SUM(CASE WHEN prev_pnl_r IS NOT NULL AND prev_pnl_r > 0 THEN 1 ELSE 0 END) AS repeats_after_win,
     -- Win rate on repeats
-    ROUND(
+    ROUND((
         SUM(CASE WHEN prev_entered_at IS NOT NULL AND pnl_r > 0 THEN 1 ELSE 0 END)::numeric
-        / NULLIF(SUM(CASE WHEN prev_entered_at IS NOT NULL THEN 1 ELSE 0 END), 0),
+        / NULLIF(SUM(CASE WHEN prev_entered_at IS NOT NULL THEN 1 ELSE 0 END), 0))::numeric,
         4
     ) AS repeat_win_rate,
     -- Win rate on first trades
-    ROUND(
+    ROUND((
         SUM(CASE WHEN prev_entered_at IS NULL AND pnl_r > 0 THEN 1 ELSE 0 END)::numeric
-        / NULLIF(SUM(CASE WHEN prev_entered_at IS NULL THEN 1 ELSE 0 END), 0),
+        / NULLIF(SUM(CASE WHEN prev_entered_at IS NULL THEN 1 ELSE 0 END), 0))::numeric,
         4
     ) AS first_trade_win_rate
 FROM symbol_trades

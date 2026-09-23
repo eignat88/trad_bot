@@ -1,6 +1,8 @@
 -- 04_winner_loser_features.sql
 -- Feature comparison: winners vs losers for V1 and V2
 -- Uses features stored in dds.paper_trade.features JSONB
+-- NOTE: All ROUND() calls use ::numeric cast to avoid
+--       PostgreSQL "function round(double precision, integer) does not exist"
 
 WITH trades AS (
     SELECT
@@ -50,16 +52,16 @@ SELECT
     scanner_name,
     outcome_group,
     COUNT(*) AS count,
-    ROUND(AVG(exhaustion_magnitude), 4) AS avg_exhaustion_mag,
-    ROUND(AVG(body_ratio), 4) AS avg_body_ratio,
-    ROUND(AVG(rsi_confirmation), 4) AS avg_rsi_confirm,
-    ROUND(AVG(volume_ratio), 4) AS avg_volume_ratio,
-    ROUND(AVG(rr_ratio), 4) AS avg_rr_ratio,
-    ROUND(AVG(stop_distance_atr), 4) AS avg_stop_dist_atr,
-    ROUND(AVG(rsi_14), 2) AS avg_rsi_14,
-    ROUND(AVG(rsi_delta_3), 4) AS avg_rsi_delta_3,
-    ROUND(AVG(pnl_r), 4) AS avg_pnl_r,
-    ROUND(AVG(duration_sec)/60, 1) AS avg_hold_minutes
+    ROUND(AVG(exhaustion_magnitude)::numeric, 4) AS avg_exhaustion_mag,
+    ROUND(AVG(body_ratio)::numeric, 4) AS avg_body_ratio,
+    ROUND(AVG(rsi_confirmation)::numeric, 4) AS avg_rsi_confirm,
+    ROUND(AVG(volume_ratio)::numeric, 4) AS avg_volume_ratio,
+    ROUND(AVG(rr_ratio)::numeric, 4) AS avg_rr_ratio,
+    ROUND(AVG(stop_distance_atr)::numeric, 4) AS avg_stop_dist_atr,
+    ROUND(AVG(rsi_14)::numeric, 2) AS avg_rsi_14,
+    ROUND(AVG(rsi_delta_3)::numeric, 4) AS avg_rsi_delta_3,
+    ROUND(AVG(pnl_r)::numeric, 4) AS avg_pnl_r,
+    ROUND((AVG(duration_sec) / 60)::numeric, 1) AS avg_hold_minutes
 FROM trades
 GROUP BY scanner_name, outcome_group
 ORDER BY scanner_name, outcome_group;

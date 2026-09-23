@@ -98,27 +98,27 @@ def get_baseline_metrics(conn) -> dict[str, Any]:
         COUNT(*) AS trades,
         SUM(CASE WHEN pnl_r > 0 THEN 1 ELSE 0 END) AS wins,
         SUM(CASE WHEN pnl_r <= 0 THEN 1 ELSE 0 END) AS losses,
-        ROUND(SUM(CASE WHEN pnl_r > 0 THEN 1.0 ELSE 0 END) / COUNT(*), 4) AS win_rate,
-        ROUND(SUM(pnl_usdt), 2) AS net_pnl_usdt,
-        ROUND(AVG(pnl_usdt), 2) AS avg_pnl_usdt,
-        ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pnl_usdt), 2) AS median_pnl_usdt,
-        ROUND(SUM(pnl_r), 4) AS total_r,
-        ROUND(AVG(pnl_r), 4) AS expectancy_r,
-        ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pnl_r), 4) AS median_r,
+        ROUND((SUM(CASE WHEN pnl_r > 0 THEN 1.0 ELSE 0 END) / COUNT(*))::numeric, 4) AS win_rate,
+        ROUND(SUM(pnl_usdt)::numeric, 2) AS net_pnl_usdt,
+        ROUND(AVG(pnl_usdt)::numeric, 2) AS avg_pnl_usdt,
+        ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pnl_usdt))::numeric, 2) AS median_pnl_usdt,
+        ROUND(SUM(pnl_r)::numeric, 4) AS total_r,
+        ROUND(AVG(pnl_r)::numeric, 4) AS expectancy_r,
+        ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pnl_r))::numeric, 4) AS median_r,
         CASE
             WHEN SUM(CASE WHEN pnl_r < 0 THEN ABS(pnl_r) ELSE 0 END) > 0
-            THEN ROUND(
+            THEN ROUND((
                 SUM(CASE WHEN pnl_r > 0 THEN pnl_r ELSE 0 END)
-                / SUM(CASE WHEN pnl_r < 0 THEN ABS(pnl_r) ELSE 0 END), 4)
+                / SUM(CASE WHEN pnl_r < 0 THEN ABS(pnl_r) ELSE 0 END))::numeric, 4)
             ELSE NULL
         END AS profit_factor,
-        ROUND(AVG(CASE WHEN pnl_r > 0 THEN pnl_r END), 4) AS avg_win_r,
-        ROUND(AVG(CASE WHEN pnl_r <= 0 THEN pnl_r END), 4) AS avg_loss_r,
+        ROUND(AVG(CASE WHEN pnl_r > 0 THEN pnl_r END)::numeric, 4) AS avg_win_r,
+        ROUND(AVG(CASE WHEN pnl_r <= 0 THEN pnl_r END)::numeric, 4) AS avg_loss_r,
         MAX(pnl_r) AS max_win_r,
         MIN(pnl_r) AS max_loss_r,
-        ROUND(AVG(mfe), 4) AS avg_mfe,
-        ROUND(AVG(mae), 4) AS avg_mae,
-        ROUND(AVG(duration_sec)/60, 1) AS avg_hold_minutes
+        ROUND(AVG(mfe)::numeric, 4) AS avg_mfe,
+        ROUND(AVG(mae)::numeric, 4) AS avg_mae,
+        ROUND((AVG(duration_sec) / 60)::numeric, 1) AS avg_hold_minutes
     FROM dds.paper_trade
     WHERE scanner_name IN (
         'MOMENTUM_EXHAUSTION_REVERSE_LONG_V1',
@@ -160,7 +160,7 @@ def get_r_distribution(conn) -> dict[str, list]:
         scanner_name,
         r_bucket,
         COUNT(*) AS count,
-        ROUND(COUNT(*)::numeric / SUM(COUNT(*)) OVER (PARTITION BY scanner_name) * 100, 1) AS pct
+        ROUND((COUNT(*)::numeric / SUM(COUNT(*)) OVER (PARTITION BY scanner_name) * 100)::numeric, 1) AS pct
     FROM base
     GROUP BY scanner_name, r_bucket
     ORDER BY scanner_name, r_bucket;
@@ -215,18 +215,18 @@ def get_winner_loser_features(conn) -> dict[str, list]:
         scanner_name,
         outcome_group,
         COUNT(*) AS count,
-        ROUND(AVG(exhaustion_magnitude), 4) AS avg_exhaustion_mag,
-        ROUND(AVG(body_ratio), 4) AS avg_body_ratio,
-        ROUND(AVG(rsi_confirmation), 4) AS avg_rsi_confirm,
-        ROUND(AVG(volume_ratio), 4) AS avg_volume_ratio,
-        ROUND(AVG(rr_ratio), 4) AS avg_rr_ratio,
-        ROUND(AVG(stop_distance_atr), 4) AS avg_stop_dist_atr,
-        ROUND(AVG(rsi_14), 2) AS avg_rsi_14,
-        ROUND(AVG(rsi_delta_3), 4) AS avg_rsi_delta_3,
-        ROUND(AVG(pnl_r), 4) AS avg_pnl_r,
-        ROUND(AVG(duration_sec)/60, 1) AS avg_hold_minutes,
-        ROUND(AVG(mfe), 4) AS avg_mfe,
-        ROUND(AVG(mae), 4) AS avg_mae
+        ROUND(AVG(exhaustion_magnitude)::numeric, 4) AS avg_exhaustion_mag,
+        ROUND(AVG(body_ratio)::numeric, 4) AS avg_body_ratio,
+        ROUND(AVG(rsi_confirmation)::numeric, 4) AS avg_rsi_confirm,
+        ROUND(AVG(volume_ratio)::numeric, 4) AS avg_volume_ratio,
+        ROUND(AVG(rr_ratio)::numeric, 4) AS avg_rr_ratio,
+        ROUND(AVG(stop_distance_atr)::numeric, 4) AS avg_stop_dist_atr,
+        ROUND(AVG(rsi_14)::numeric, 2) AS avg_rsi_14,
+        ROUND(AVG(rsi_delta_3)::numeric, 4) AS avg_rsi_delta_3,
+        ROUND(AVG(pnl_r)::numeric, 4) AS avg_pnl_r,
+        ROUND((AVG(duration_sec) / 60)::numeric, 1) AS avg_hold_minutes,
+        ROUND(AVG(mfe)::numeric, 4) AS avg_mfe,
+        ROUND(AVG(mae)::numeric, 4) AS avg_mae
     FROM trades
     GROUP BY scanner_name, outcome_group
     ORDER BY scanner_name, outcome_group;
@@ -274,9 +274,9 @@ def get_repeat_signal_analysis(conn) -> dict[str, list]:
         scanner_name,
         COUNT(*) AS total_trades,
         SUM(CASE WHEN prev_entered_at IS NOT NULL THEN 1 ELSE 0 END) AS repeat_trades,
-        ROUND(
+        ROUND((
             SUM(CASE WHEN prev_entered_at IS NOT NULL THEN 1 ELSE 0 END)::numeric
-            / COUNT(*) * 100, 1
+            / COUNT(*) * 100)::numeric, 1
         ) AS repeat_pct,
         SUM(CASE WHEN prev_entered_at IS NOT NULL
                  AND EXTRACT(EPOCH FROM (entered_at - prev_entered_at)) / 60 <= 60
@@ -286,14 +286,14 @@ def get_repeat_signal_analysis(conn) -> dict[str, list]:
             THEN 1 ELSE 0 END) AS repeats_within_3h,
         SUM(CASE WHEN prev_pnl_r IS NOT NULL AND prev_pnl_r <= 0 THEN 1 ELSE 0 END) AS repeats_after_loss,
         SUM(CASE WHEN prev_pnl_r IS NOT NULL AND prev_pnl_r > 0 THEN 1 ELSE 0 END) AS repeats_after_win,
-        ROUND(
+        ROUND((
             SUM(CASE WHEN prev_entered_at IS NOT NULL AND pnl_r > 0 THEN 1 ELSE 0 END)::numeric
-            / NULLIF(SUM(CASE WHEN prev_entered_at IS NOT NULL THEN 1 ELSE 0 END), 0),
+            / NULLIF(SUM(CASE WHEN prev_entered_at IS NOT NULL THEN 1 ELSE 0 END), 0))::numeric,
             4
         ) AS repeat_win_rate,
-        ROUND(
+        ROUND((
             SUM(CASE WHEN prev_entered_at IS NULL AND pnl_r > 0 THEN 1 ELSE 0 END)::numeric
-            / NULLIF(SUM(CASE WHEN prev_entered_at IS NULL THEN 1 ELSE 0 END), 0),
+            / NULLIF(SUM(CASE WHEN prev_entered_at IS NULL THEN 1 ELSE 0 END), 0))::numeric,
             4
         ) AS first_trade_win_rate
     FROM symbol_trades
@@ -361,10 +361,10 @@ def get_candidate_filters(conn) -> list[dict]:
                 SUM(CASE WHEN pnl_r <= 0 THEN 1 ELSE 0 END) AS losses_before,
                 SUM(CASE WHEN pnl_r > 0 THEN 1 ELSE 0 END) AS wins_before,
                 SUM(CASE WHEN pnl_r <= -0.9 THEN 1 ELSE 0 END) AS hard_losses_before,
-                ROUND(AVG(pnl_r), 4) AS expectancy_before,
-                ROUND(
+                ROUND(AVG(pnl_r)::numeric, 4) AS expectancy_before,
+                ROUND((
                     SUM(CASE WHEN pnl_r > 0 THEN pnl_r ELSE 0 END)
-                    / NULLIF(SUM(CASE WHEN pnl_r < 0 THEN ABS(pnl_r) ELSE 0 END), 0), 4
+                    / NULLIF(SUM(CASE WHEN pnl_r < 0 THEN ABS(pnl_r) ELSE 0 END), 0))::numeric, 4
                 ) AS pf_before
             FROM base
         ),
@@ -374,10 +374,10 @@ def get_candidate_filters(conn) -> list[dict]:
                 SUM(CASE WHEN pnl_r <= 0 THEN 1 ELSE 0 END) AS losses_after,
                 SUM(CASE WHEN pnl_r > 0 THEN 1 ELSE 0 END) AS wins_after,
                 SUM(CASE WHEN pnl_r <= -0.9 THEN 1 ELSE 0 END) AS hard_losses_after,
-                ROUND(AVG(pnl_r), 4) AS expectancy_after,
-                ROUND(
+                ROUND(AVG(pnl_r)::numeric, 4) AS expectancy_after,
+                ROUND((
                     SUM(CASE WHEN pnl_r > 0 THEN pnl_r ELSE 0 END)
-                    / NULLIF(SUM(CASE WHEN pnl_r < 0 THEN ABS(pnl_r) ELSE 0 END), 0), 4
+                    / NULLIF(SUM(CASE WHEN pnl_r < 0 THEN ABS(pnl_r) ELSE 0 END), 0))::numeric, 4
                 ) AS pf_after
             FROM base
             WHERE {filter_condition}
@@ -396,12 +396,12 @@ def get_candidate_filters(conn) -> list[dict]:
             f.hard_losses_after,
             f.expectancy_after,
             f.pf_after,
-            ROUND((b.total_before - f.total_after)::numeric / b.total_before * 100, 1) AS pct_trades_removed,
-            ROUND((b.losses_before - f.losses_after)::numeric / NULLIF(b.losses_before, 0) * 100, 1) AS pct_losses_removed,
-            ROUND(f.wins_after::numeric / NULLIF(b.wins_before, 0) * 100, 1) AS pct_wins_retained,
+            ROUND(((b.total_before - f.total_after)::numeric / b.total_before * 100)::numeric, 1) AS pct_trades_removed,
+            ROUND(((b.losses_before - f.losses_after)::numeric / NULLIF(b.losses_before, 0) * 100)::numeric, 1) AS pct_losses_removed,
+            ROUND((f.wins_after::numeric / NULLIF(b.wins_before, 0) * 100)::numeric, 1) AS pct_wins_retained,
             CASE
                 WHEN f.hard_losses_after > 0 AND f.wins_after > 0
-                THEN ROUND((b.hard_losses_before - f.hard_losses_after)::numeric / NULLIF(b.wins_before - f.wins_after, 0), 2)
+                THEN ROUND(((b.hard_losses_before - f.hard_losses_after)::numeric / NULLIF((b.wins_before - f.wins_after)::numeric, 0))::numeric, 2)
                 ELSE NULL
             END AS hard_losses_per_winner_lost
         FROM baseline b, filtered f;
@@ -423,8 +423,8 @@ def get_exit_reason_analysis(conn) -> dict[str, list]:
         scanner_name,
         exit_reason,
         COUNT(*) AS count,
-        ROUND(AVG(pnl_r), 4) AS avg_pnl_r,
-        ROUND(SUM(pnl_usdt), 2) AS total_pnl_usdt
+        ROUND(AVG(pnl_r)::numeric, 4) AS avg_pnl_r,
+        ROUND(SUM(pnl_usdt)::numeric, 2) AS total_pnl_usdt
     FROM dds.paper_trade
     WHERE scanner_name IN (
         'MOMENTUM_EXHAUSTION_REVERSE_LONG_V1',
