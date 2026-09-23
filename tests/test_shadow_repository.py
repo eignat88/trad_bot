@@ -265,3 +265,139 @@ class TestShadowSignalRepository:
 
         assert success is False
         mock_conn.rollback.assert_called()
+
+
+class TestSaveSignalReturnOrder:
+    """Regression: fetchone must happen BEFORE commit for pg8000."""
+
+    def test_successful_insert_fetches_before_commit(self, repo, mock_conn):
+        """INSERT RETURNING → fetchone → commit → return signal_id."""
+        mock_cursor = mock_conn.cursor.return_value
+        mock_cursor.fetchone.return_value = (42,)
+
+        signal = WickRejectionSignal(
+            symbol="TESTUSDT",
+            signal_time=datetime.now(timezone.utc),
+            signal_price=100.0,
+            open=100.0, high=101.5, low=99.8, close=100.1,
+            volume=1500.0,
+            atr=0.5, atr_pct=0.005,
+            wick_size=1.4, wick_atr=2.8, upper_wick_pct=0.014,
+            close_location=0.06,
+            rsi=65.0, stoch_rsi=0.7,
+            bb_upper=102.0, bb_mid=100.0, bb_lower=98.0, bb_width=0.04,
+            distance_to_upper_bb=0.019,
+            ema_fast=100.0, ema_medium=99.0, ema_slow=98.0,
+            ema_slope=-0.0002, volume_ratio=1.5,
+            signal_version="1.0.0",
+        )
+
+        signal_id = repo.save_signal(signal)
+
+        # Must return the signal_id
+        assert signal_id == 42
+        # fetchone must have been called (it was — we set return_value)
+        mock_cursor.fetchone.assert_called_once()
+        # commit must happen
+        mock_conn.commit.assert_called_once()
+
+    def test_duplicate_returns_none(self, repo, mock_conn):
+        """ON CONFLICT DO NOTHING → fetchone returns None → commit → None."""
+        mock_cursor = mock_conn.cursor.return_value
+        mock_cursor.fetchone.return_value = None  # conflict, no row
+
+        signal = WickRejectionSignal(
+            symbol="TESTUSDT",
+            signal_time=datetime.now(timezone.utc),
+            signal_price=100.0,
+            open=100.0, high=101.5, low=99.8, close=100.1,
+            volume=1500.0,
+            atr=0.5, atr_pct=0.005,
+            wick_size=1.4, wick_atr=2.8, upper_wick_pct=0.014,
+            close_location=0.06,
+            rsi=65.0, stoch_rsi=0.7,
+            bb_upper=102.0, bb_mid=100.0, bb_lower=98.0, bb_width=0.04,
+            distance_to_upper_bb=0.019,
+            ema_fast=100.0, ema_medium=99.0, ema_slow=98.0,
+            ema_slope=-0.0002, volume_ratio=1.5,
+            signal_version="1.0.0",
+        )
+
+        signal_id = repo.save_signal(signal)
+        assert signal_id is None
+        mock_conn.commit.assert_called_once()
+
+    def test_db_execute_error_rollback(self, repo, mock_conn):
+        """DB error on execute → rollback → None, commit NOT called."""
+        mock_cursor = mock_conn.cursor.return_value
+        mock_cursor.execute.side_effect = Exception("DB error")
+
+        signal = WickRejectionSignal(
+            symbol="TESTUSDT",
+            signal_time=datetime.now(timezone.utc),
+            signal_price=100.0,
+            open=100.0, high=101.5, low=99.8, close=100.1,
+            volume=1500.0,
+            atr=0.5, atr_pct=0.005,
+            wick_size=1.4, wick_atr=2.8, upper_wick_pct=0.014,
+            close_location=0.06,
+            rsi=65.0, stoch_rsi=0.7,
+            bb_upper=102.0, bb_mid=100.0, bb_lower=98.0, bb_width=0.04,
+            distance_to_upper_bb=0.019,
+            ema_fast=100.0, ema_medium=99.0, ema_slow=98.0,
+            ema_slope=-0.0002, volume_ratio=1.5,
+            signal_version="1.0.0",
+        )
+
+        signal_id = repo.save_signal(signal)
+        assert signal_id is None
+        mock_conn.rollback.assert_called()
+        mock_conn.commit.assert_not_called()
+
+    def test_db_fetch_error_rollback(self, repo, mock_conn):
+        """DB error on fetchone → rollback → None, commit NOT called."""
+        mock_cursor = mock_conn.cursor.return_value
+        mock_cursor.fetchone.side_effect = Exception("fetch error")
+
+        signal = WickRejectionSignal(
+            symbol="TESTUSDT",
+            signal_time=datetime.now(timezone.utc),
+            signal_price=100.0,
+            open=100.0, high=101.5, low=99.8, close=100.1,
+            volume=1500.0,
+            atr=0.5, atr_pct=0.005,
+            wick_size=1.4, wick_atr=2.8, upper_wick_pct=0.014,
+            close_location=0.06,
+            rsi=65.0, stoch_rsi=0.7,
+            bb_upper=102.0, bb_mid=100.0, bb_lower=98.0, bb_width=0.04,
+            distance_to_upper_bb=0.019,
+            ema_fast=100.0, ema_medium=99.0, ema_slow=98.0,
+            ema_slope=-0.0002, volume_ratio=1.5,
+            signal_version="1.0.0",
+        )
+
+        signal_id = repo.save_signal(signal)
+        assert signal_id is None
+        mock_conn.rollback.assert_called()
+        mock_conn.commit.assert_not_called()
+
+    def test_no_connection_returns_none(self):
+        """Without connection, save_signal returns None."""
+        repo_no_conn = ShadowSignalRepository(conn=None)
+        signal = WickRejectionSignal(
+            symbol="TESTUSDT",
+            signal_time=datetime.now(timezone.utc),
+            signal_price=100.0,
+            open=100.0, high=101.5, low=99.8, close=100.1,
+            volume=1500.0,
+            atr=0.5, atr_pct=0.005,
+            wick_size=1.4, wick_atr=2.8, upper_wick_pct=0.014,
+            close_location=0.06,
+            rsi=65.0, stoch_rsi=0.7,
+            bb_upper=102.0, bb_mid=100.0, bb_lower=98.0, bb_width=0.04,
+            distance_to_upper_bb=0.019,
+            ema_fast=100.0, ema_medium=99.0, ema_slow=98.0,
+            ema_slope=-0.0002, volume_ratio=1.5,
+            signal_version="1.0.0",
+        )
+        assert repo_no_conn.save_signal(signal) is None

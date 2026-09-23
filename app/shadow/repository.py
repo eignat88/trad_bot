@@ -82,10 +82,12 @@ class ShadowSignalRepository:
                     signal.signal_version,
                 ),
             )
-            self._conn.commit()
+            # Fetch RETURNING result BEFORE commit — pg8000 requires this
             row = cursor.fetchone()
+            self._conn.commit()
             if row:
                 return row[0]
+            # ON CONFLICT DO NOTHING returned no row → duplicate
             return None
         except Exception:
             self._conn.rollback()
