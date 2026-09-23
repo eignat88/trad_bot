@@ -140,7 +140,7 @@ def test_process_pending_outcomes_saves_evaluated_rows():
         def __init__(self):
             self.saved: list[SignalOutcome] = []
 
-        def get_setups_without_outcomes(self, *, limit, min_age_minutes):
+        def get_setups_without_outcomes(self, *, limit, min_age_minutes, scanner_name=None, entry_timeframe=None):
             assert limit == 5
             assert min_age_minutes == 10
             return [setup]
@@ -168,7 +168,7 @@ def test_process_pending_outcomes_saves_evaluated_rows():
 
 def test_process_pending_outcomes_dry_run_does_not_save():
     class Repository:
-        def get_setups_without_outcomes(self, *, limit, min_age_minutes):
+        def get_setups_without_outcomes(self, *, limit, min_age_minutes, scanner_name=None, entry_timeframe=None):
             return [candidate()]
 
         def save_signal_outcome(self, outcome):
@@ -178,4 +178,4 @@ def test_process_pending_outcomes_dry_run_does_not_save():
         def get_klines(self, symbol, interval, limit):
             return [candle(1_300, high=103.5, low=100.5, close=103)]
 
-    assert process_pending_outcomes(Repository(), Client(), dry_run=True) == (1, 0)
+    assert process_pending_outcomes(Repository(), Client(), dry_run=True, min_age_minutes=10) == (1, 0)
