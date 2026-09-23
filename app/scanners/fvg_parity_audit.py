@@ -1,17 +1,17 @@
-"""FVG Production ↔ Research Parity Audit.
+"""FVG Production Structural Parity Audit.
 
-Reads production scanner_setup records and replays them through the
-research detection/lifecycle/backtest engine to verify exact parity.
+Reads production scanner_setup records and verifies that frozen
+production parameters are internally consistent with the research
+configuration (entry, SL, TP, frozen features, eligibility thresholds).
 
-For each setup, compares:
-  - confirmation_at / entry / SL / TP
-  - Whether research would have generated the same signal
-  - Duplicate/overlap detection
+This tool does NOT replay candles through the research detector.
+It performs structural/parameter-level consistency checks only.
 
 This is a READ-ONLY diagnostic tool.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 from datetime import datetime, timezone
@@ -260,3 +260,40 @@ def print_parity_report(result: dict[str, Any]) -> None:
         if btts:
             logger.info("  bars_to_touch: min=%d median=%d max=%d",
                        min(btts), sorted(btts)[len(btts)//2], max(btts))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="FVG production structural parity audit")
+    parser.add_argument("--scanner", type=str,
+                        default="FVG_REACTION_LONG_LOCAL_STRUCT_V1",
+                        help="Scanner name to audit")
+    parser.add_argument("--limit", type=int, default=100,
+                        help="Max setups to audit")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    from app.config import load_settings
+    from app.db.repository import ScannerRepository
+
+    settings = load_settings()
+    repository = ScannerRepository(
+        host=settings.db_host,
+        port=settings.db_port,
+        database=settings.db_name,
+        user=settings.db_user,
+        password=settings.db_password,
+        backend="postgres",
+    )
+    try:
+        result = run_parity_audit(repository, args.scanner, args.limit)
+        print_parity_report(result)
+    finally:
+        repository.close()
+
+
+if __name__ == "__main__":
+    main()
