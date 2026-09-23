@@ -120,18 +120,13 @@ def _process_for_timeframe(
     scanner_filter: str | None,
 ) -> tuple[int, int]:
     """Process pending outcomes for a specific timeframe maturity."""
+    # Filters applied in SQL — before LIMIT — so other scanners don't starve FVG
     setups = repository.get_setups_without_outcomes(
         limit=limit,
         min_age_minutes=min_age_minutes,
+        scanner_name=scanner_filter,
+        entry_timeframe=timeframe,
     )
-
-    # Optionally filter by scanner name
-    if scanner_filter:
-        setups = [s for s in setups if s.scanner_name == scanner_filter]
-
-    # Optionally filter by timeframe
-    if timeframe:
-        setups = [s for s in setups if s.entry_timeframe == timeframe]
 
     evaluated = 0
     failed = 0

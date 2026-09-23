@@ -1060,12 +1060,45 @@ class ScannerRepository:
         *,
         limit: int = 100,
         min_age_minutes: int = 240,
+        scanner_name: str | None = None,
+        entry_timeframe: str | None = None,
     ) -> list[SetupCandidate]:
         if not self._use_pg:
             return []
+        conditions = [
+            "o.setup_id IS NULL",
+            "s.signal_candle_open_time > 0",
+            "s.detected_at < now() - (%s * interval '1 minute')",
+            "s.entry_zone_low IS NOT NULL",
+            "s.entry_zone_high IS NOT NULL",
+            "s.invalidation_price IS NOT NULL",
+            "s.target_1 IS NOT NULL",
+            """(
+                (s.direction = 'LONG'
+                 AND s.invalidation_price < s.entry_zone_low
+                 AND s.target_1 > s.entry_zone_high)
+                OR
+                (s.direction = 'SHORT'
+                 AND s.invalidation_price > s.entry_zone_high
+                 AND s.target_1 < s.entry_zone_low)
+            )""",
+        ]
+        params: list[Any] = [min_age_minutes]
+
+        if scanner_name is not None:
+            conditions.append("s.scanner_name = %s")
+            params.append(scanner_name)
+
+        if entry_timeframe is not None:
+            conditions.append("s.entry_timeframe = %s")
+            params.append(entry_timeframe)
+
+        params.append(limit)
+
+        where_clause = "\n              AND ".join(conditions)
         cursor = self._conn.cursor()
         cursor.execute(
-            """
+            f"""
             SELECT s.setup_id, s.scanner_name, i.symbol, s.direction,
                    s.htf_timeframe, s.setup_timeframe, s.entry_timeframe,
                    s.setup_started_at, s.signal_candle_open_time,
@@ -1076,26 +1109,11 @@ class ScannerRepository:
             FROM dds.scanner_setup s
             JOIN dds.instrument i ON i.instrument_id = s.instrument_id
             LEFT JOIN dds.signal_outcome o ON o.setup_id = s.setup_id
-            WHERE o.setup_id IS NULL
-              AND s.signal_candle_open_time > 0
-              AND s.detected_at < now() - (%s * interval '1 minute')
-              AND s.entry_zone_low IS NOT NULL
-              AND s.entry_zone_high IS NOT NULL
-              AND s.invalidation_price IS NOT NULL
-              AND s.target_1 IS NOT NULL
-              AND (
-                (s.direction = 'LONG'
-                 AND s.invalidation_price < s.entry_zone_low
-                 AND s.target_1 > s.entry_zone_high)
-                OR
-                (s.direction = 'SHORT'
-                 AND s.invalidation_price > s.entry_zone_high
-                 AND s.target_1 < s.entry_zone_low)
-              )
+            WHERE {where_clause}
             ORDER BY s.detected_at ASC
             LIMIT %s
             """,
-            (min_age_minutes, limit),
+            params,
         )
         return [self._row_to_setup_candidate(row) for row in cursor.fetchall()]
 
