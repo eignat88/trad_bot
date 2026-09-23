@@ -1,8 +1,17 @@
-"""Shadow scanner runner for real-time signal collection."""
+"""Shadow scanner runner for real-time signal collection.
+
+Architecture:
+- Worker threads: lightweight 5m market fetch + detection (parallel, NO DB)
+- Main thread: sequential DB persistence via single connection
+
+Only fetches 5m candles (1 API call per symbol instead of 5).
+signal_time = timestamp of the last CLOSED 5m candle, not wall-clock.
+"""
 from __future__ import annotations
 
 import argparse
 import logging
+import random
 import signal
 import sys
 import time
@@ -12,22 +21,128 @@ from typing import Any
 
 from app.config import Settings, load_settings
 from app.db.repository import ScannerRepository
-from app.exchange.bybit_client import BybitClient
+from app.exchange.bybit_client import BybitClient, BybitError
+from app.models import Candle
 from app.scanners.atr_wick_rejection_short import AtrWickRejectionShortScanner, WickRejectionSignal
-from app.scanners.context_builder import build_market_context
+from app.scanners.models import IndicatorSnapshot, MarketContext, MarketLevels
 from app.shadow.repository import SaveSignalStatus, ShadowSignalRepository
 
 logger = logging.getLogger(__name__)
+
+# Shadow scanner only needs 5m candles
+SHADOW_KLINE_LIMIT = 200
+
+# Rate limit retry settings
+MAX_RETRIES = 3
+BACKOFF_BASE = 0.5  # seconds
+
+# Shadow runner uses fewer workers to stay under rate limits
+SHADOW_MAX_WORKERS = 6
+
+# Bybit rate limit error phrases
+_RATE_LIMIT_PHRASES = ("Too many visits", "Exceeded the API Rate Limit")
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Check if an exception is a Bybit rate limit error."""
+    msg = str(exc)
+    return any(phrase in msg for phrase in _RATE_LIMIT_PHRASES)
+
+
+def _build_shadow_context(
+    client: BybitClient,
+    symbol: str,
+) -> MarketContext | None:
+    """Build a lightweight MarketContext using only 5m candles.
+
+    Unlike build_market_context() which fetches 5 timeframes (5 calls),
+    this fetches only 5m candles (1 call per symbol).
+
+    signal_time = timestamp of the last CLOSED 5m candle.
+
+    Returns None if fetch fails or insufficient data.
+    """
+    candles_5m = client.get_klines(symbol, "5", SHADOW_KLINE_LIMIT)
+    if not candles_5m or len(candles_5m) < 50:
+        return None
+
+    # Filter out the forming (unclosed) candle if present.
+    # Bybit may return the current candle which is still open.
+    # A closed candle has its timestamp < now().
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    five_min_ms = 300_000
+    # The last candle is "closed" if its timestamp is at least one
+    # full 5m interval behind current time.
+    # More precisely: a candle is closed if (now - candle.timestamp) >= 5m
+    closed_candles = [
+        c for c in candles_5m
+        if (now_ms - c.timestamp) >= five_min_ms
+    ]
+
+    if len(closed_candles) < 50:
+        return None
+
+    # signal_time = timestamp of the last closed candle
+    last_closed = closed_candles[-1]
+    signal_time = datetime.fromtimestamp(last_closed.timestamp / 1000, tz=timezone.utc)
+
+    # Build minimal indicator snapshot (computed from 5m data)
+    closes = [c.close for c in closed_candles]
+    volumes = [c.volume for c in closed_candles]
+
+    # Basic indicators from 5m data
+    from app.indicators import (
+        atr_wilder, bollinger_bands, ema, ema_slope, rsi_wilder,
+    )
+    from app.scanners.context_builder import _classify_market_regime
+
+    try:
+        atr_val = atr_wilder(closed_candles, 14) if len(closed_candles) > 14 else 0
+    except ValueError:
+        atr_val = 0
+    try:
+        rsi_val = rsi_wilder(closes, 14) if len(closes) > 14 else 50.0
+    except ValueError:
+        rsi_val = 50.0
+    ema20_val = ema(closes, 20) if len(closes) >= 20 else closes[-1]
+    ema50_val = ema(closes, 50) if len(closes) >= 50 else closes[-1]
+    ema200_val = ema(closes, 200) if len(closes) >= 200 else closes[-1]
+    vol_sma = sum(volumes[-20:]) / min(20, len(volumes)) if volumes else 0
+    bb_upper, bb_mid, bb_lower = (0.0, 0.0, 0.0)
+    if len(closes) >= 20:
+        bb_upper, bb_mid, bb_lower = bollinger_bands(closes, 20)
+    bb_width = (bb_upper - bb_lower) / bb_mid if bb_mid > 0 else 0
+    adx_val = 0.0
+    ema50_slope_val = ema_slope(closes, 50, lookback=5) if len(closes) >= 55 else 0.0
+
+    indicators = IndicatorSnapshot(
+        atr=atr_val, rsi=rsi_val, ema20=ema20_val, ema50=ema50_val,
+        ema200=ema200_val, bb_upper=bb_upper, bb_lower=bb_lower,
+        bb_width=bb_width, volume_sma=vol_sma,
+        adx=adx_val, ema50_slope=ema50_slope_val,
+    )
+
+    return MarketContext(
+        symbol=symbol,
+        candles_5m=tuple(closed_candles),
+        candles_15m=(),
+        candles_1h=(),
+        candles_4h=(),
+        indicators=indicators,
+        market_regime=_classify_market_regime(indicators, closed_candles[-1].close),
+        levels=MarketLevels(),
+        evaluated_at=signal_time,  # <-- candle timestamp, NOT datetime.now()
+    )
 
 
 class ShadowScannerRunner:
     """Runner for real-time shadow signal collection.
 
     Architecture:
-    - Worker threads: market fetch + detection (parallel, no DB)
+    - Worker threads: lightweight 5m market fetch + detection (parallel, NO DB)
     - Main thread: sequential DB persistence via single connection
 
-    This avoids pg8000 thread-safety issues with shared connections.
+    Only 1 API call per symbol (5m klines) instead of 5.
     """
 
     def __init__(
@@ -42,21 +157,26 @@ class ShadowScannerRunner:
         self.scanner = AtrWickRejectionShortScanner()
         self._running = False
 
-    def _scan_symbol(self, symbol: str) -> WickRejectionSignal | None:
-        """Scan one symbol: fetch market data, detect RAW candidate.
+    def _scan_symbol(self, symbol: str) -> tuple[WickRejectionSignal | None, bool]:
+        """Scan one symbol: fetch 5m data, detect RAW candidate.
 
         NO DB operations — pure computation + API call.
-        Returns WickRejectionSignal if a raw candidate exists, None otherwise.
+
+        Returns:
+            (candidate, rate_limited) tuple.
+            candidate is None if no raw candidate found.
+            rate_limited is True if the attempt hit a rate limit.
         """
-        ctx = build_market_context(self.client, symbol, self.settings)
+        ctx = _build_shadow_context(self.client, symbol)
+        if ctx is None:
+            return None, False
 
         raw = self.scanner.detect_raw_candidate(ctx)
         if raw is None:
-            return None
+            return None, False
 
-        # Set strict_pass via centralised predicate
         strict = self.scanner.passes_strict_filters(raw)
-        return WickRejectionSignal(
+        candidate = WickRejectionSignal(
             symbol=raw.symbol,
             signal_time=raw.signal_time,
             signal_price=raw.signal_price,
@@ -76,12 +196,36 @@ class ShadowScannerRunner:
             strict_pass=strict,
             signal_version=raw.signal_version,
         )
+        return candidate, False
+
+    def _scan_symbol_with_retry(self, symbol: str) -> tuple[WickRejectionSignal | None, bool, bool]:
+        """Scan with bounded retry for rate limit errors.
+
+        Returns:
+            (candidate, rate_limited, retry_used)
+        """
+        last_exc: Exception | None = None
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                candidate, _ = self._scan_symbol(symbol)
+                return candidate, False, attempt > 0
+            except Exception as exc:
+                last_exc = exc
+                if _is_rate_limit_error(exc) and attempt < MAX_RETRIES - 1:
+                    backoff = BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 0.3)
+                    logger.warning(
+                        "Rate limit for %s (attempt %d/%d), retrying in %.1fs",
+                        symbol, attempt + 1, MAX_RETRIES, backoff,
+                    )
+                    time.sleep(backoff)
+                else:
+                    break
+
+        raise last_exc  # type: ignore[misc]
 
     def _persist_candidate(self, signal: WickRejectionSignal) -> str:
-        """Persist a single candidate via repo. Main thread only.
-
-        Returns: "inserted" | "duplicate" | "db_error"
-        """
+        """Persist a single candidate via repo. Main thread only."""
         result = self.repo.save_signal(signal)
         if result.status == SaveSignalStatus.INSERTED:
             return "inserted"
@@ -93,13 +237,10 @@ class ShadowScannerRunner:
     def run_cycle(self) -> dict[str, Any]:
         """Run one complete scan+persist cycle.
 
-        Phase 1 (parallel): fetch market data + detect candidates
-        Phase 2 (sequential): persist candidates to DB
-
-        Returns summary with separate scan_error / db_error counts.
+        Phase 1 (parallel workers): 5m market fetch + detection, NO DB
+        Phase 2 (main thread): sequential DB persistence
         """
         start_time = datetime.now(timezone.utc)
-
         symbols = self._get_universe_symbols()
 
         # ── Phase 1: parallel market fetch + detection ────────
@@ -107,16 +248,19 @@ class ShadowScannerRunner:
         raw_count = 0
         strict_count = 0
         scan_errors = 0
+        rate_limit_retries = 0
 
-        with ThreadPoolExecutor(max_workers=self.settings.scanner_workers) as executor:
+        with ThreadPoolExecutor(max_workers=SHADOW_MAX_WORKERS) as executor:
             future_to_symbol = {
-                executor.submit(self._scan_symbol, symbol): symbol
+                executor.submit(self._scan_symbol_with_retry, symbol): symbol
                 for symbol in symbols
             }
             for future in as_completed(future_to_symbol):
                 symbol = future_to_symbol[future]
                 try:
-                    candidate = future.result()
+                    candidate, rate_limited, retry_used = future.result()
+                    if retry_used:
+                        rate_limit_retries += 1
                     if candidate is not None:
                         raw_count += 1
                         if candidate.strict_pass:
@@ -152,13 +296,14 @@ class ShadowScannerRunner:
             "duplicates": duplicates,
             "scan_errors": scan_errors,
             "db_errors": db_errors,
+            "rate_limit_retries": rate_limit_retries,
         }
 
         logger.info(
-            "Shadow scan cycle: symbols=%d raw=%d strict=%d "
-            "inserted=%d duplicates=%d scan_errors=%d db_errors=%d",
+            "Shadow scan: symbols=%d raw=%d strict=%d "
+            "inserted=%d dupes=%d scan_err=%d db_err=%d rate_limit_retries=%d",
             len(symbols), raw_count, strict_count,
-            inserted, duplicates, scan_errors, db_errors,
+            inserted, duplicates, scan_errors, db_errors, rate_limit_retries,
         )
 
         return summary
@@ -315,6 +460,7 @@ def main() -> None:
         print(f"Duplicates:        {summary['duplicates']}")
         print(f"Scan errors:       {summary['scan_errors']}")
         print(f"DB errors:         {summary['db_errors']}")
+        print(f"Rate limit retries:{summary['rate_limit_retries']}")
         print("=" * 80)
     else:
         # Continuous mode

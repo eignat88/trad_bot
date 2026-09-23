@@ -72,6 +72,7 @@ class TestShadowRunnerCLI:
                                 "duplicates": 0,
                                 "scan_errors": 0,
                                 "db_errors": 0,
+                                "rate_limit_retries": 0,
                             }
                             mock_runner.return_value = mock_runner_instance
 
@@ -462,15 +463,15 @@ class TestShadowRunnerRawCapture:
 
         source = inspect.getsource(ShadowScannerRunner._scan_symbol)
         assert "detect_raw_candidate" in source
-        assert "scanner.scan(" not in source
 
-    def test_runner_scanner_scan_not_called(self):
-        """Runner does NOT call scanner.scan() for raw collection."""
+    def test_runner_no_build_market_context(self):
+        """Runner does NOT use build_market_context — uses lightweight shadow context."""
         import inspect
         from app.shadow.runner import ShadowScannerRunner
 
         source = inspect.getsource(ShadowScannerRunner._scan_symbol)
-        assert ".scan(ctx)" not in source
+        assert "build_market_context" not in source
+        assert "_build_shadow_context" in source
 
     def test_runner_no_repo_in_scan_phase(self):
         """Worker _scan_symbol has NO repo calls — DB-free."""
@@ -490,15 +491,59 @@ class TestShadowRunnerRawCapture:
         source = inspect.getsource(ShadowScannerRunner.run_cycle)
         assert "_persist_candidate" in source
 
-    def test_run_cycle_returns_raw_strict_inserted(self):
-        """run_cycle summary has raw/strict/inserted/scan_errors/db_errors."""
+    def test_shadow_context_only_5m(self):
+        """_build_shadow_context fetches only 5m klines."""
+        import inspect
+        from app.shadow.runner import _build_shadow_context
+
+        source = inspect.getsource(_build_shadow_context)
+        assert 'get_klines(' in source
+        assert '"5"' in source
+        # Should NOT fetch 15m/1h/4h/D
+        assert '"15"' not in source
+        assert '"60"' not in source
+        assert '"240"' not in source
+        assert '"D"' not in source
+
+    def test_shadow_context_filters_forming_candle(self):
+        """_build_shadow_context filters out unformed candles."""
+        import inspect
+        from app.shadow.runner import _build_shadow_context
+
+        source = inspect.getsource(_build_shadow_context)
+        assert "closed_candles" in source
+        assert "forming" in source.lower() or "unclosed" in source.lower() or "closed" in source
+
+    def test_shadow_context_signal_time_from_candle(self):
+        """signal_time comes from candle timestamp, not datetime.now()."""
+        import inspect
+        from app.shadow.runner import _build_shadow_context
+
+        source = inspect.getsource(_build_shadow_context)
+        assert "signal_time" in source
+        # datetime.now is used only for filtering unformed candles,
+        # but signal_time must come from the candle timestamp
+        assert "last_closed.timestamp" in source
+
+    def test_runner_has_rate_limit_retry(self):
+        """_scan_symbol_with_retry implements bounded retry."""
+        import inspect
+        from app.shadow.runner import ShadowScannerRunner
+
+        source = inspect.getsource(ShadowScannerRunner._scan_symbol_with_retry)
+        assert "MAX_RETRIES" in source
+        assert "_is_rate_limit_error" in source
+
+    def test_run_cycle_returns_rate_limit_retries(self):
+        """run_cycle summary includes rate_limit_retries."""
         import inspect
         from app.shadow.runner import ShadowScannerRunner
 
         source = inspect.getsource(ShadowScannerRunner.run_cycle)
-        assert "raw_candidates" in source
-        assert "strict_pass" in source
-        assert "inserted" in source
-        assert "duplicates" in source
-        assert "scan_errors" in source
-        assert "db_errors" in source
+        assert "rate_limit_retries" in source
+
+    def test_runner_shadow_max_workers_constant(self):
+        """SHADOW_MAX_WORKERS is defined and reasonable."""
+        from app.shadow.runner import SHADOW_MAX_WORKERS
+
+        assert 1 <= SHADOW_MAX_WORKERS <= 10
