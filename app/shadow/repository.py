@@ -176,8 +176,7 @@ class ShadowSignalRepository:
                     OR (o.evaluated_120m_at IS NULL AND s.signal_time <= now() - interval '120 minutes')
                     OR (o.evaluated_240m_at IS NULL AND s.signal_time <= now() - interval '240 minutes')
                     OR (o.evaluated_eod_at IS NULL
-                        AND s.signal_time < date_trunc('day', now())
-                        AND s.signal_time >= date_trunc('day', now()) - interval '1 day')
+                        AND s.signal_time < date_trunc('day', now()))
                  ))
               )
             ORDER BY s.signal_time ASC

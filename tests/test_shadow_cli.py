@@ -119,6 +119,7 @@ class TestShadowEvaluatorCLI:
                             mock_eval_instance = MagicMock()
                             mock_eval_instance.run_evaluation_cycle.return_value = {
                                 "signals_checked": 0,
+                                "symbols_processed": 0,
                                 "outcomes_created": 0,
                                 "outcomes_updated": 0,
                                 "finalized": 0,
@@ -554,3 +555,162 @@ class TestShadowRunnerRawCapture:
 
         source = inspect.getsource(ShadowScannerRunner.start)
         assert "total_signals" not in source
+
+
+class TestShadowEvaluatorEODBoundary:
+    """Regression tests for EOD half-open interval boundary."""
+
+    def test_get_eod_exclusive(self):
+        """EOD exclusive = next UTC midnight."""
+        from app.shadow.evaluator import _get_eod_exclusive
+
+        st = datetime(2026, 9, 23, 10, 30, tzinfo=timezone.utc)
+        eod = _get_eod_exclusive(st)
+        assert eod == datetime(2026, 9, 24, 0, 0, 0, tzinfo=timezone.utc)
+
+    def test_get_eod_exclusive_late_night(self):
+        """EOD for 23:30 signal is still next midnight."""
+        from app.shadow.evaluator import _get_eod_exclusive
+
+        st = datetime(2026, 9, 23, 23, 30, tzinfo=timezone.utc)
+        eod = _get_eod_exclusive(st)
+        assert eod == datetime(2026, 9, 24, 0, 0, 0, tzinfo=timezone.utc)
+
+    def test_is_eod_mature_midnight_boundary(self):
+        """EOD NOT mature at 23:59:59, mature at 00:00:00."""
+        from app.shadow.evaluator import _is_eod_mature
+
+        st = datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc)
+        assert _is_eod_mature(st, datetime(2026, 9, 23, 23, 59, 59, tzinfo=timezone.utc)) is False
+        assert _is_eod_mature(st, datetime(2026, 9, 24, 0, 0, 0, tzinfo=timezone.utc)) is True
+        assert _is_eod_mature(st, datetime(2026, 9, 24, 0, 5, 0, tzinfo=timezone.utc)) is True
+
+    def test_eod_no_next_day_candles(self):
+        """TEST 1: 23:30 signal — 00:00 next-day candle excluded."""
+        from app.shadow.evaluator import _calculate_mfe_mae_for_window, _get_eod_exclusive
+        from app.models import Candle
+
+        signal_time = datetime(2026, 9, 23, 23, 30, tzinfo=timezone.utc)
+        eod_excl = _get_eod_exclusive(signal_time)  # 2026-09-24 00:00:00
+
+        # Candles: 23:30..23:55 (in day) + 00:00, 00:05 (next day)
+        candles = []
+        base = int(signal_time.timestamp() * 1000)
+        for mins in [0, 5, 10, 15, 20, 25]:  # 23:30..23:55
+            candles.append(Candle(
+                timestamp=base + mins * 60_000,
+                open=100.0, high=100.3, low=99.8, close=100.0, volume=1000.0,
+            ))
+        # Next-day candles
+        midnight = int(datetime(2026, 9, 24, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        candles.append(Candle(timestamp=midnight, open=100.0, high=100.5, low=90.0, close=95.0, volume=5000.0))
+        candles.append(Candle(timestamp=midnight + 300_000, open=95.0, high=95.5, low=94.0, close=94.5, volume=3000.0))
+
+        mfe, mae = _calculate_mfe_mae_for_window(candles, 100.0, None, signal_time, eod_exclusive=eod_excl)
+
+        # MFE: max drop in day-only candles = 0.2% (100→99.8)
+        assert mfe is not None
+        assert mfe < 1.0  # NOT 10% (which would include next-day low=90)
+        # MAE: max rise in day-only candles = 0.3%
+        assert mae is not None
+        assert mae < 1.0
+
+    def test_eod_next_day_does_not_alter_mfe(self):
+        """TEST 2: next-day low=90 must NOT affect EOD MFE for SHORT."""
+        from app.shadow.evaluator import _calculate_mfe_mae_for_window, _get_eod_exclusive
+        from app.models import Candle
+
+        signal_time = datetime(2026, 9, 23, 14, 0, tzinfo=timezone.utc)
+        eod_excl = _get_eod_exclusive(signal_time)
+
+        candles = [
+            # Last candle of day: low=99
+            Candle(timestamp=int(datetime(2026, 9, 23, 23, 55, tzinfo=timezone.utc).timestamp() * 1000),
+                   open=100.0, high=100.5, low=99.0, close=99.5, volume=1000.0),
+            # Next-day candle: low=90
+            Candle(timestamp=int(datetime(2026, 9, 24, 0, 0, tzinfo=timezone.utc).timestamp() * 1000),
+                   open=99.5, high=100.0, low=90.0, close=91.0, volume=5000.0),
+        ]
+
+        mfe, _ = _calculate_mfe_mae_for_window(candles, 100.0, None, signal_time, eod_exclusive=eod_excl)
+
+        # MFE = 1% (from 100→99), NOT 10% (100→90)
+        assert mfe is not None
+        assert abs(mfe - 1.0) < 0.01
+
+    def test_eod_next_day_does_not_alter_mae(self):
+        """TEST 3: next-day high=110 must NOT affect EOD MAE."""
+        from app.shadow.evaluator import _calculate_mfe_mae_for_window, _get_eod_exclusive
+        from app.models import Candle
+
+        signal_time = datetime(2026, 9, 23, 14, 0, tzinfo=timezone.utc)
+        eod_excl = _get_eod_exclusive(signal_time)
+
+        candles = [
+            # Last candle of day: high=101
+            Candle(timestamp=int(datetime(2026, 9, 23, 23, 55, tzinfo=timezone.utc).timestamp() * 1000),
+                   open=100.0, high=101.0, low=99.5, close=100.0, volume=1000.0),
+            # Next-day candle: high=110
+            Candle(timestamp=int(datetime(2026, 9, 24, 0, 0, tzinfo=timezone.utc).timestamp() * 1000),
+                   open=100.0, high=110.0, low=99.0, close=100.0, volume=5000.0),
+        ]
+
+        _, mae = _calculate_mfe_mae_for_window(candles, 100.0, None, signal_time, eod_exclusive=eod_excl)
+
+        # MAE = 1% (from 100→101), NOT 10% (100→110)
+        assert mae is not None
+        assert abs(mae - 1.0) < 0.01
+
+    def test_target_flags_capped_to_eod(self):
+        """TEST 7: next-day candle reaching -2% must NOT set target flags."""
+        from app.shadow.evaluator import _check_target_achievement, _get_eod_exclusive
+        from app.models import Candle
+        from datetime import timezone
+
+        signal_time = datetime(2026, 9, 23, 14, 0, tzinfo=timezone.utc)
+        eod_excl = _get_eod_exclusive(signal_time)
+
+        candles = [
+            # Day candle: low=99.6 (-0.4%, below -0.5% threshold)
+            Candle(timestamp=int(datetime(2026, 9, 23, 23, 55, tzinfo=timezone.utc).timestamp() * 1000),
+                   open=100.0, high=100.5, low=99.6, close=99.8, volume=1000.0),
+            # Next-day candle: low=97.5 (-2.5%, would trigger -2% target)
+            Candle(timestamp=int(datetime(2026, 9, 24, 0, 5, tzinfo=timezone.utc).timestamp() * 1000),
+                   open=99.8, high=100.0, low=97.5, close=98.0, volume=5000.0),
+        ]
+
+        flags = _check_target_achievement(candles, 100.0, eod_exclusive=eod_excl)
+
+        # Day candle doesn't reach -0.5%
+        assert flags["reached_minus_0_5"] is False
+        assert flags["reached_minus_2_0"] is False  # NOT from next-day candle
+
+    def test_target_flags_with_eod_reaching(self):
+        """Day candle reaching -1% should set reached_minus_1_0."""
+        from app.shadow.evaluator import _check_target_achievement, _get_eod_exclusive
+        from app.models import Candle
+
+        signal_time = datetime(2026, 9, 23, 14, 0, tzinfo=timezone.utc)
+        eod_excl = _get_eod_exclusive(signal_time)
+
+        candles = [
+            # Day candle: low=98.5 (-1.5%)
+            Candle(timestamp=int(datetime(2026, 9, 23, 20, 0, tzinfo=timezone.utc).timestamp() * 1000),
+                   open=100.0, high=100.5, low=98.5, close=99.0, volume=1000.0),
+        ]
+
+        flags = _check_target_achievement(candles, 100.0, eod_exclusive=eod_excl)
+        assert flags["reached_minus_0_5"] is True
+        assert flags["reached_minus_1_0"] is True
+        assert flags["reached_minus_1_5"] is True
+
+    def test_eod_timezone_aware(self):
+        """TEST 8: all boundaries are timezone-aware UTC."""
+        from app.shadow.evaluator import _get_eod_exclusive, _is_eod_mature
+
+        st = datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc)
+        eod = _get_eod_exclusive(st)
+        assert eod.tzinfo is not None
+        assert eod.tzinfo == timezone.utc
+        assert eod.hour == 0
+        assert eod.minute == 0
