@@ -215,12 +215,15 @@ def get_rsi_recovery(conn) -> list[dict]:
           AND pt.direction = 'LONG'
           AND pt.status = 'CLOSED'
     ),
+    -- Convert signal_candle_open_time (bigint epoch seconds) to timestamptz
     signal_candles AS (
         SELECT
             vt.*,
             to_timestamp(vt.signal_candle_open_time) AS signal_candle_ts
         FROM v1_trades vt
     ),
+    -- Get 5m candles from market.candle up to and including signal candle
+    -- No look-ahead: open_time <= signal_time, is_closed = true
     candle_data AS (
         SELECT
             sc.trade_id,
@@ -229,14 +232,16 @@ def get_rsi_recovery(conn) -> list[dict]:
             ROW_NUMBER() OVER (
                 PARTITION BY sc.trade_id
                 ORDER BY mc.open_time DESC
-            ) AS candle_idx
+            ) AS candle_idx  -- 1 = signal candle, 2 = 1 bar before, etc.
         FROM signal_candles sc
-        JOIN dds.market_candle mc
+        JOIN market.candle mc
             ON mc.instrument_id = sc.instrument_id
-            AND mc.timeframe = '5m'
+            AND mc.timeframe = '5'
+            AND mc.is_closed = true
             AND mc.open_time >= sc.signal_candle_ts - INTERVAL '180 minutes'
             AND mc.open_time <= sc.signal_candle_ts
     ),
+    -- Compute gains and losses for RSI
     candle_gains AS (
         SELECT
             trade_id,
@@ -251,6 +256,7 @@ def get_rsi_recovery(conn) -> list[dict]:
             ) - close, 0) AS loss
         FROM candle_data
     ),
+    -- Wilder's RSI using 14-bar rolling window
     rsi_raw AS (
         SELECT
             trade_id,
@@ -279,6 +285,7 @@ def get_rsi_recovery(conn) -> list[dict]:
         FROM rsi_raw
         WHERE window_count >= 14
     ),
+    -- Get RSI for signal candle (candle_idx = 1) and 3 bars before (candle_idx = 4)
     rsi_at_signal AS (
         SELECT
             trade_id,
@@ -310,6 +317,14 @@ def get_rsi_recovery(conn) -> list[dict]:
             THEN 'PASS'
             ELSE 'REJECT'
         END AS v2_filter_result,
+        -- Coverage status
+        CASE
+            WHEN ra.rsi_signal IS NOT NULL AND ra.rsi_3_bars_ago IS NOT NULL
+            THEN 'RECOVERED'
+            WHEN ra.rsi_signal IS NOT NULL
+            THEN 'RSI_ONLY_NO_DELTA'
+            ELSE 'MISSING'
+        END AS recovery_status,
         NULLIF(vt.features->>'exhaustion_magnitude', '')::numeric AS exhaustion_magnitude,
         NULLIF(vt.features->>'body_ratio', '')::numeric AS body_ratio,
         NULLIF(vt.features->>'rsi_confirmation', '')::numeric AS rsi_confirmation,
@@ -324,7 +339,54 @@ def get_rsi_recovery(conn) -> list[dict]:
 
 
 # ============================================================
-# 5. COUNTERFACTUAL: V2-on-V1 (rsi_delta_3 > 0 filter on V1)
+# 5. RSI COVERAGE DIAGNOSTICS
+# ============================================================
+def get_rsi_coverage(conn) -> dict[str, Any]:
+    """Check RSI recovery coverage for V1 trades."""
+    sql = """
+    WITH v1_trades AS (
+        SELECT
+            pt.trade_id,
+            ss.signal_candle_open_time,
+            ss.instrument_id
+        FROM dds.paper_trade pt
+        JOIN dds.scanner_setup ss ON ss.setup_id = pt.setup_id
+        WHERE pt.scanner_name = 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V1'
+          AND pt.direction = 'LONG'
+          AND pt.status = 'CLOSED'
+    ),
+    signal_candles AS (
+        SELECT
+            vt.*,
+            to_timestamp(vt.signal_candle_open_time) AS signal_candle_ts
+        FROM v1_trades vt
+    ),
+    candle_counts AS (
+        SELECT
+            sc.trade_id,
+            COUNT(mc.open_time) AS candles_found
+        FROM signal_candles sc
+        JOIN market.candle mc
+            ON mc.instrument_id = sc.instrument_id
+            AND mc.timeframe = '5'
+            AND mc.is_closed = true
+            AND mc.open_time >= sc.signal_candle_ts - INTERVAL '180 minutes'
+            AND mc.open_time <= sc.signal_candle_ts
+        GROUP BY sc.trade_id
+    )
+    SELECT
+        (SELECT COUNT(*) FROM v1_trades) AS total_trades,
+        COUNT(cc.trade_id) AS trades_with_candles,
+        COUNT(cc.trade_id) FILTER (WHERE cc.candles_found >= 17) AS trades_enough_candles,
+        ROUND((COUNT(cc.trade_id)::numeric / NULLIF((SELECT COUNT(*) FROM v1_trades), 0) * 100)::numeric, 1) AS coverage_pct
+    FROM v1_trades vt
+    LEFT JOIN candle_counts cc ON cc.trade_id = vt.trade_id;
+    """
+    return run_query_single(conn, sql)
+
+
+# ============================================================
+# 6. COUNTERFACTUAL: V2-on-V1 (rsi_delta_3 > 0 filter on V1)
 # ============================================================
 def get_counterfactual_v2_on_v1(rsi_data: list[dict]) -> dict[str, Any]:
     """Apply rsi_delta_3 > 0 filter to V1 trades (counterfactual V2)."""
@@ -770,10 +832,14 @@ def generate_report(data: dict[str, Any]) -> str:
     lines.append(f"- **V2 period**: {v2s.get('period_start', 'N/A')} → {v2s.get('period_end', 'N/A')}")
     lines.append("")
 
-    # RSI Recovery Stats
+    # RSI Coverage Stats
     rsi_data = data.get('rsi_recovery', [])
     rsi_available = sum(1 for t in rsi_data if t.get('rsi_delta_3') is not None)
+    coverage = data.get('rsi_coverage', {})
     lines.append(f"- **V1 trades with recovered RSI**: {rsi_available} / {len(rsi_data)}")
+    if coverage:
+        lines.append(f"- **RSI coverage**: {coverage.get('trades_with_candles', 0)} / {coverage.get('total_trades', 0)} ({coverage.get('coverage_pct', 0)}%)")
+        lines.append(f"- **Trades with enough candles (≥17)**: {coverage.get('trades_enough_candles', 0)}")
     lines.append("")
 
     # 2. Baseline
@@ -901,6 +967,16 @@ def generate_report(data: dict[str, Any]) -> str:
     lines.append("## 11. Conclusions")
     lines.append("")
 
+    # Coverage warning
+    coverage = data.get('rsi_coverage', {})
+    coverage_pct = coverage.get('coverage_pct', 0) or 0
+    if coverage_pct < 90:
+        lines.append(f"⚠️ **RSI Recovery Coverage Warning**: {coverage_pct}% — conclusions may be weak due to insufficient data.")
+        lines.append(f"   - Total V1 trades: {coverage.get('total_trades', 'N/A')}")
+        lines.append(f"   - Trades with candles: {coverage.get('trades_with_candles', 'N/A')}")
+        lines.append(f"   - Trades with enough candles (≥17): {coverage.get('trades_enough_candles', 'N/A')}")
+        lines.append("")
+
     # Auto-generate from counterfactual
     cf = data.get('counterfactual', {})
     v1_all = cf.get('V1_ALL', {})
@@ -1004,6 +1080,10 @@ def main():
         rsi_recovery = get_rsi_recovery(conn)
         print(f"   Recovered RSI for {len(rsi_recovery)} V1 trades")
 
+        print("4b. RSI coverage diagnostics...")
+        rsi_coverage = get_rsi_coverage(conn)
+        print(f"   Coverage: {rsi_coverage.get('coverage_pct', 0)}%")
+
         print("5. Counterfactual V2-on-V1...")
         counterfactual = get_counterfactual_v2_on_v1(rsi_recovery)
 
@@ -1030,6 +1110,7 @@ def main():
             'baseline': baseline,
             'r_dist': r_dist,
             'rsi_recovery': rsi_recovery,
+            'rsi_coverage': rsi_coverage,
             'counterfactual': counterfactual,
             'winner_loser': winner_loser_raw,
             'bidirectional_thresholds': bidirectional_thresholds,

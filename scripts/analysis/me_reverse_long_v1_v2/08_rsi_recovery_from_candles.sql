@@ -1,7 +1,11 @@
 -- 08_rsi_recovery_from_candles.sql
--- Recover RSI(14) and RSI delta from dds.market_candle for all V1 trades
+-- Recover RSI(14) and RSI delta from market.candle for all V1 trades
 -- Uses Wilder's RSI computed from 5m candles at signal candle open time
 -- No look-ahead: only candles fully closed BEFORE signal candle.
+--
+-- Schema:
+--   market.candle: instrument_id, timeframe, open_time, close, is_closed, quality_status
+--   dds.scanner_setup: signal_candle_open_time (bigint, epoch seconds or milliseconds)
 --
 -- RSI(14) formula (Wilder's smoothing):
 --   1. First avg_gain = avg_loss = simple average of first 14 bars' gains/losses
@@ -11,6 +15,29 @@
 --
 -- rsi_delta_3 = RSI(current) - RSI(3 bars ago)
 
+-- ============================================================
+-- STEP 0: Diagnose signal_candle_open_time units
+-- Run this first to determine if values are seconds or milliseconds
+-- ============================================================
+/*
+SELECT
+    setup_id,
+    signal_candle_open_time,
+    detected_at,
+    to_timestamp(signal_candle_open_time) AS as_seconds,
+    to_timestamp(signal_candle_open_time / 1000) AS as_milliseconds
+FROM dds.scanner_setup
+WHERE scanner_name IN (
+    'MOMENTUM_EXHAUSTION_REVERSE_LONG_V1',
+    'MOMENTUM_EXHAUSTION_REVERSE_LONG_V2'
+)
+ORDER BY detected_at DESC
+LIMIT 10;
+*/
+
+-- ============================================================
+-- MAIN QUERY: RSI recovery for all V1 trades
+-- ============================================================
 WITH v1_trades AS (
     SELECT
         pt.trade_id,
@@ -20,8 +47,6 @@ WITH v1_trades AS (
         pt.entered_at,
         pt.pnl_r,
         pt.pnl_usdt,
-        pt.mfe,
-        pt.mae,
         pt.mfe_r,
         pt.mae_r,
         pt.exit_reason,
@@ -36,44 +61,38 @@ WITH v1_trades AS (
       AND pt.direction = 'LONG'
       AND pt.status = 'CLOSED'
 ),
--- Get the signal candle open time (epoch) for each trade
+-- Convert signal_candle_open_time to timestamptz
+-- Try seconds first (will be validated by diagnostic query above)
 signal_candles AS (
     SELECT
         vt.*,
-        -- signal_candle_open_time is stored as bigint (epoch seconds)
         to_timestamp(vt.signal_candle_open_time) AS signal_candle_ts
     FROM v1_trades vt
 ),
 -- Get 5m candles up to and including signal candle for each trade
--- We need at least RSI_PERIOD + rsi_delta_lookback + 1 candles before signal
+-- Use market.candle with is_closed = true and timeframe = '5'
 candle_data AS (
     SELECT
         sc.trade_id,
-        sc.symbol,
         mc.open_time,
-        mc.open,
-        mc.high,
-        mc.low,
         mc.close,
-        mc.volume,
+        mc.is_closed,
         ROW_NUMBER() OVER (
             PARTITION BY sc.trade_id
             ORDER BY mc.open_time DESC
         ) AS candle_idx  -- 1 = signal candle, 2 = 1 bar before, etc.
     FROM signal_candles sc
-    JOIN dds.market_candle mc
+    JOIN market.candle mc
         ON mc.instrument_id = sc.instrument_id
-        AND mc.timeframe = '5m'
-        -- Include signal candle and up to 30 bars before for RSI(14) + delta
+        AND mc.timeframe = '5'
+        AND mc.is_closed = true
         AND mc.open_time >= sc.signal_candle_ts - INTERVAL '180 minutes'
         AND mc.open_time <= sc.signal_candle_ts
 ),
--- Compute RSI for each trade using window functions
--- First, compute gains and losses
+-- Compute gains and losses for RSI
 candle_gains AS (
     SELECT
         trade_id,
-        symbol,
         open_time,
         close,
         candle_idx,
@@ -85,51 +104,32 @@ candle_gains AS (
         ) - close, 0) AS loss
     FROM candle_data
 ),
--- Now compute Wilder's RSI using cumulative sums
--- This is a simplified approach: compute simple average for first 14,
--- then use the recursive formula
+-- Wilder's RSI using 14-bar rolling window
 rsi_raw AS (
     SELECT
         trade_id,
-        symbol,
         open_time,
-        close,
         candle_idx,
-        gain,
-        loss,
-        -- For Wilder's RSI, we need running averages
-        -- Simple approach: use the last 14-bar window
-        AVG(gain) OVER (
-            PARTITION BY trade_id
-            ORDER BY open_time
-            ROWS BETWEEN 14 PRECEDING AND CURRENT ROW
-        ) AS avg_gain_14,
-        AVG(loss) OVER (
-            PARTITION BY trade_id
-            ORDER BY open_time
-            ROWS BETWEEN 14 PRECEDING AND CURRENT ROW
-        ) AS avg_loss_14,
-        COUNT(*) OVER (
-            PARTITION BY trade_id
-            ORDER BY open_time
-            ROWS BETWEEN 14 PRECEDING AND CURRENT ROW
-        ) AS window_count
+        AVG(gain) OVER w AS avg_gain,
+        AVG(loss) OVER w AS avg_loss,
+        COUNT(*) OVER w AS window_count
     FROM candle_gains
     WHERE gain IS NOT NULL  -- skip first row (no previous close)
+    WINDOW w AS (
+        PARTITION BY trade_id
+        ORDER BY open_time
+        ROWS BETWEEN 14 PRECEDING AND CURRENT ROW
+    )
 ),
 rsi_computed AS (
     SELECT
         trade_id,
-        symbol,
-        open_time,
-        close,
         candle_idx,
         CASE
-            WHEN avg_loss_14 = 0 THEN 100.0
-            WHEN avg_gain_14 = 0 THEN 0.0
-            ELSE ROUND((100.0 - 100.0 / (1.0 + avg_gain_14 / avg_loss_14))::numeric, 4)
-        END AS rsi_14,
-        window_count
+            WHEN avg_loss = 0 THEN 100.0
+            WHEN avg_gain = 0 THEN 0.0
+            ELSE ROUND((100.0 - 100.0 / (1.0 + avg_gain / avg_loss))::numeric, 4)
+        END AS rsi_14
     FROM rsi_raw
     WHERE window_count >= 14  -- need at least 14 bars for RSI
 ),
@@ -148,14 +148,12 @@ SELECT
     vt.scanner_name,
     vt.pnl_r,
     vt.pnl_usdt,
-    vt.mfe,
-    vt.mae,
     vt.mfe_r,
     vt.mae_r,
     vt.exit_reason,
     vt.duration_sec,
     vt.entered_at,
-    vt.signal_time,
+    vt.signal_candle_open_time,
     ra.rsi_signal AS rsi_14_at_signal,
     ra.rsi_3_bars_ago,
     CASE
@@ -166,16 +164,17 @@ SELECT
     CASE
         WHEN ra.rsi_signal IS NOT NULL AND ra.rsi_3_bars_ago IS NOT NULL
              AND (ra.rsi_signal - ra.rsi_3_bars_ago) > 0
-        THEN TRUE
-        ELSE FALSE
-    END AS rsi_delta_3_positive,
-    -- V2-style filter: would this trade pass rsi_delta_3 > 0?
-    CASE
-        WHEN ra.rsi_signal IS NOT NULL AND ra.rsi_3_bars_ago IS NOT NULL
-             AND (ra.rsi_signal - ra.rsi_3_bars_ago) > 0
         THEN 'PASS'
         ELSE 'REJECT'
     END AS v2_filter_result,
+    -- Coverage status
+    CASE
+        WHEN ra.rsi_signal IS NOT NULL AND ra.rsi_3_bars_ago IS NOT NULL
+        THEN 'RECOVERED'
+        WHEN ra.rsi_signal IS NOT NULL
+        THEN 'RSI_ONLY_NO_DELTA'
+        ELSE 'MISSING'
+    END AS recovery_status,
     -- Features from scanner_setup
     NULLIF(vt.features->>'exhaustion_magnitude', '')::numeric AS exhaustion_magnitude,
     NULLIF(vt.features->>'body_ratio', '')::numeric AS body_ratio,

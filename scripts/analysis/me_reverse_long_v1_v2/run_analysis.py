@@ -542,7 +542,7 @@ def generate_report(data: dict[str, Any]) -> str:
     lines.append("| `dds.scanner_setup` | Signal records with features JSONB |")
     lines.append("| `dds.paper_trade` | Paper trading outcomes with PnL |")
     lines.append("| `dds.paper_shadow_trade` | Shadow/counterfactual experiments |")
-    lines.append("| `dds.market_candle` | Historical OHLCV for feature recovery |")
+    lines.append("| `market.candle` | Historical OHLCV for feature recovery |")
     lines.append("| `analytics.trade_fact` | Canonical trade fact |")
     lines.append("")
 
