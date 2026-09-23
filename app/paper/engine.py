@@ -507,6 +507,41 @@ class PaperTradingEngine:
             self._mark_prices[c.symbol] = price
             opened.append(trade)
 
+            # Shadow experiment: link V2 paper trade to exhaustion observation
+            if c.scanner_name == "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2":
+                try:
+                    from app.shadow.exhaustion_shadow import (
+                        ExhaustionShadowObserver, EXPERIMENT_ID,
+                    )
+                    _link_sql = """
+                        UPDATE dds.shadow_exhaustion_observation
+                        SET has_trade = TRUE,
+                            source_trade_id = %(trade_id)s,
+                            entry_price = %(entry_price)s,
+                            stop_price = %(stop_price)s,
+                            target_1 = %(target_1)s,
+                            entered_at = %(entered_at)s,
+                            status = 'OPEN',
+                            updated_at = now()
+                        WHERE experiment_id = %(experiment_id)s
+                          AND setup_id = %(setup_id)s
+                    """
+                    self.repo._execute(_link_sql, {
+                        "experiment_id": EXPERIMENT_ID,
+                        "setup_id": str(c.setup_id),
+                        "trade_id": trade_id,
+                        "entry_price": entry,
+                        "stop_price": stop,
+                        "target_1": c.target_1,
+                        "entered_at": now,
+                    })
+                    self.repo._conn.commit()
+                except Exception:
+                    logger.debug(
+                        "shadow exhaustion trade link failed (fail-open): setup=%s trade=%s",
+                        c.setup_id, trade_id, exc_info=True,
+                    )
+
             logger.info(
                 "paper ENTRY: %s %s %s entry=%.4f stop=%.4f "
                 "stop_dist=%.3f%% tp=%.4f size=%.4f risk=$%.2f "
@@ -1177,6 +1212,45 @@ class PaperTradingEngine:
             distance_to_tp=round(distance_to_tp, 6) if distance_to_tp is not None else None,
             distance_to_sl=round(distance_to_sl, 6) if distance_to_sl is not None else None,
         )
+
+        # Shadow experiment: close V2 exhaustion observation
+        if trade.scanner_name == "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2":
+            try:
+                from app.shadow.exhaustion_shadow import EXPERIMENT_ID
+                _close_obs_sql = """
+                    UPDATE dds.shadow_exhaustion_observation
+                    SET exit_price = %(exit_price)s,
+                        exit_reason = %(exit_reason)s,
+                        closed_at = %(closed_at)s,
+                        pnl_usdt = %(pnl_usdt)s,
+                        pnl_r = %(pnl_r)s,
+                        mfe_r = %(mfe_r)s,
+                        mae_r = %(mae_r)s,
+                        holding_minutes = %(holding_minutes)s,
+                        status = 'CLOSED',
+                        outcome_source = 'LIVE_TRADE',
+                        updated_at = now()
+                    WHERE experiment_id = %(experiment_id)s
+                      AND setup_id = %(setup_id)s
+                """
+                self.repo._execute(_close_obs_sql, {
+                    "experiment_id": EXPERIMENT_ID,
+                    "setup_id": str(trade.setup_id),
+                    "exit_price": round(adjusted_exit, 6),
+                    "exit_reason": reason.value if hasattr(reason, "value") else str(reason),
+                    "closed_at": self._clock(),
+                    "pnl_usdt": round(net_pnl, 2),
+                    "pnl_r": round(r_multiple, 4),
+                    "mfe_r": round(mfe_r, 6),
+                    "mae_r": round(mae_r, 6),
+                    "holding_minutes": round(duration / 60, 1),
+                })
+                self.repo._conn.commit()
+            except Exception:
+                logger.debug(
+                    "shadow exhaustion close failed (fail-open): setup=%s trade=%s",
+                    trade.setup_id, trade.trade_id, exc_info=True,
+                )
 
         logger.info(
             "paper EXIT: %s %s %s reason=%s entry=%.4f exit=%.4f pnl=$%.2f R=%.2f balance=$%.2f",

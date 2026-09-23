@@ -21,6 +21,10 @@ from app.scanners.context_builder import build_market_context
 from app.scanners.direction_gate import ScannerDirectionGatePolicy
 from app.scanners.expectancy_filter import ExpectancyFilter, load_expectancy
 from app.scanners.orchestrator import ScannerOrchestrator
+from app.shadow.exhaustion_shadow import (
+    ExhaustionShadowObserver,
+    EXPERIMENT_ID as SHADOW_EXPERIMENT_ID,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_ROOT / "config.yaml"
@@ -109,6 +113,7 @@ def run_scan_cycle(
     run_id: int | None,
     settings: Settings | None = None,
     expectancy_filter: ExpectancyFilter | None = None,
+    exhaustion_observer: ExhaustionShadowObserver | None = None,
 ) -> tuple[int, int, int]:
     """Returns (total_found, scanned, failed)."""
     settings = settings or _load_runner_settings()
@@ -192,6 +197,26 @@ def run_scan_cycle(
                         detected_at=c.detected_at,
                         payload={"entry_zone": [c.entry_zone_low, c.entry_zone_high]},
                     )
+                    # Shadow experiment: observe V2 exhaustion_magnitude
+                    if (exhaustion_observer is not None
+                            and c.scanner_name == "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2"):
+                        try:
+                            exhaustion_observer.observe_signal(
+                                setup_id=str(c.setup_id),
+                                scanner_name=c.scanner_name,
+                                scanner_version=c.scanner_version,
+                                symbol=c.symbol,
+                                instrument_id=getattr(c, "instrument_id", None),
+                                direction=c.direction,
+                                detected_at=c.detected_at,
+                                signal_candle_open_time=getattr(c, "signal_candle_open_time", None),
+                                features=c.features,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "shadow exhaustion observer failed for setup=%s (fail-open)",
+                                c.setup_id, exc_info=True,
+                            )
 
                 total_found += len(candidates)
                 if candidates:
@@ -251,6 +276,13 @@ def main() -> None:
         logger.error("database health check failed")
         repository.close()
         raise SystemExit("database health check failed")
+
+    # Shadow experiment: exhaustion_magnitude <= 0.4 for V2
+    exhaustion_observer = ExhaustionShadowObserver(repository)
+    logger.info(
+        "shadow exhaustion observer initialized: experiment=%s threshold=0.4",
+        SHADOW_EXPERIMENT_ID,
+    )
 
     if not repository.acquire_runner_lock():
         # Try to clear stale idle backends holding the advisory lock
@@ -367,6 +399,7 @@ def main() -> None:
             total, scanned, failed = run_scan_cycle(
                 client, orchestrator, repository, symbols, run_id, settings,
                 expectancy_filter=expectancy_filter,
+                exhaustion_observer=exhaustion_observer,
             )
 
             repository.expire_setups()
