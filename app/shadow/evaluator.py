@@ -252,7 +252,12 @@ class ShadowSignalEvaluator:
         now: datetime,
         stats: dict,
     ) -> None:
-        """Evaluate a single signal, updating only mature horizons."""
+        """Evaluate a single signal, updating only mature horizons.
+
+        RC2: save failures are counted as errors.
+        RC3: horizons_updated only incremented AFTER successful DB write.
+        RC4: finalization considers horizons written in this cycle.
+        """
         signal_time = sig["signal_time"]
         signal_price = sig["signal_price"]
         signal_id = sig["signal_id"]
@@ -283,7 +288,6 @@ class ShadowSignalEvaluator:
             updates[f"mfe_{horizon_name}"] = mfe
             updates[f"mae_{horizon_name}"] = mae
             updates[evaluated_field] = now
-            stats["horizons_updated"][horizon_name] += 1
 
         # Check EOD
         if sig.get("evaluated_eod_at") is None and _is_eod_mature(signal_time, now):
@@ -293,31 +297,52 @@ class ShadowSignalEvaluator:
             updates["mfe_eod"] = mfe_eod
             updates["mae_eod"] = mae_eod
             updates["evaluated_eod_at"] = now
-            stats["horizons_updated"]["eod"] += 1
 
-        # Check if all horizons are done → finalize
-        all_done = all(sig.get(f"evaluated_{h}_at") is not None for h, _ in HORIZONS)
-        all_done = all_done and sig.get("evaluated_eod_at") is not None
+        # RC4: finalization considers horizons written in this cycle
+        # effective state = sig state OR updates state
+        all_done = all(
+            sig.get(f"evaluated_{h}_at") is not None or f"evaluated_{h}_at" in updates
+            for h, _ in HORIZONS
+        )
+        all_done = all_done and (
+            sig.get("evaluated_eod_at") is not None or "evaluated_eod_at" in updates
+        )
 
         if all_done and not sig.get("is_final"):
             # Calculate target flags using the FULL observation window
             target_flags = _check_target_achievement(post_candles, signal_price)
             updates.update(target_flags)
             updates["is_final"] = True
-            stats["finalized"] += 1
 
         if not updates:
             return
 
-        # Save
-        created_or_updated = self.repo.save_outcome_partial(
+        # RC2+RC3: save first, THEN update stats
+        saved = self.repo.save_outcome_partial(
             signal_id=signal_id, symbol=symbol, **updates,
         )
-        if created_or_updated:
-            if is_new:
-                stats["outcomes_created"] += 1
-            else:
-                stats["outcomes_updated"] += 1
+
+        if not saved:
+            # RC2: save failure counts as error
+            stats["errors"] += 1
+            return
+
+        # RC3: only count successful saves
+        # Count horizons that were just written
+        for horizon_name, _ in HORIZONS:
+            evaluated_field = f"evaluated_{horizon_name}_at"
+            if evaluated_field in updates and sig.get(evaluated_field) is None:
+                stats["horizons_updated"][horizon_name] += 1
+        if "evaluated_eod_at" in updates and sig.get("evaluated_eod_at") is None:
+            stats["horizons_updated"]["eod"] += 1
+
+        if is_new:
+            stats["outcomes_created"] += 1
+        else:
+            stats["outcomes_updated"] += 1
+
+        if updates.get("is_final"):
+            stats["finalized"] += 1
 
     def _get_candles_for_symbol(
         self,

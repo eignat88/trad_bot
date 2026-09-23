@@ -143,7 +143,9 @@ class ShadowSignalRepository:
                     OR (o.evaluated_60m_at IS NULL AND s.signal_time <= now() - interval '60 minutes')
                     OR (o.evaluated_120m_at IS NULL AND s.signal_time <= now() - interval '120 minutes')
                     OR (o.evaluated_240m_at IS NULL AND s.signal_time <= now() - interval '240 minutes')
-                    OR (o.evaluated_eod_at IS NULL AND s.signal_time < date_trunc('day', now() + interval '1 day'))
+                    OR (o.evaluated_eod_at IS NULL
+                        AND s.signal_time < date_trunc('day', now())
+                        AND s.signal_time >= date_trunc('day', now()) - interval '1 day')
                  ))
               )
             ORDER BY s.signal_time ASC
@@ -208,9 +210,9 @@ class ShadowSignalRepository:
         if not self._conn:
             return False
 
-        # Build dynamic SET clause
-        updates = []
-        params = []
+        # Build dynamic SET clause: every column = %s gets exactly one param
+        updates: list[str] = []
+        params: list[Any] = []
 
         pairs = [
             ("mfe_15m", mfe_15m), ("mae_15m", mae_15m), ("evaluated_15m_at", evaluated_15m_at),
@@ -235,9 +237,11 @@ class ShadowSignalRepository:
         if not updates:
             return True
 
+        # updated_at = now() is a SQL expression, no %s placeholder needed
         updates.append("updated_at = now()")
-        params.append(signal_id)
 
+        # Final parameter list: INSERT uses [signal_id, symbol, is_final],
+        # ON CONFLICT UPDATE uses only the dynamic params from pairs above.
         cursor = self._conn.cursor()
         try:
             cursor.execute(
