@@ -206,15 +206,24 @@ class ShadowSignalRepository:
         hit_plus_1_5_before_target: bool | None = None,
         is_final: bool = False,
     ) -> bool:
-        """Upsert outcome, only updating non-NULL fields."""
+        """Upsert outcome with dynamic columns for both INSERT and UPDATE.
+
+        Non-None values are included in the INSERT column list so new rows
+        get their horizon values immediately.  On conflict the same columns
+        are updated via EXCLUDED, so existing rows are also handled.
+
+        None means "don't touch this column now" — existing values are
+        preserved.  0.0 and False are valid values and will be written.
+
+        is_final semantics: passing is_final=False will NOT overwrite a row
+        that already has is_final=TRUE (the UPDATE only writes is_final
+        when the new value is explicitly True in the current call).
+        """
         if not self._conn:
             return False
 
-        # Build dynamic SET clause: every column = %s gets exactly one param
-        updates: list[str] = []
-        params: list[Any] = []
-
-        pairs = [
+        # --- collect non-None columns ---
+        all_pairs = [
             ("mfe_15m", mfe_15m), ("mae_15m", mae_15m), ("evaluated_15m_at", evaluated_15m_at),
             ("mfe_30m", mfe_30m), ("mae_30m", mae_30m), ("evaluated_30m_at", evaluated_30m_at),
             ("mfe_60m", mfe_60m), ("mae_60m", mae_60m), ("evaluated_60m_at", evaluated_60m_at),
@@ -226,34 +235,51 @@ class ShadowSignalRepository:
             ("hit_plus_0_5_before_target", hit_plus_0_5_before_target),
             ("hit_plus_1_0_before_target", hit_plus_1_0_before_target),
             ("hit_plus_1_5_before_target", hit_plus_1_5_before_target),
-            ("is_final", is_final),
         ]
 
-        for col, val in pairs:
+        # Separate: is_final is only written when explicitly True (never
+        # overwrites an existing TRUE with FALSE).
+        columns: list[str] = []
+        values: list[Any] = []
+        for col, val in all_pairs:
             if val is not None:
-                updates.append(f"{col} = %s")
-                params.append(val)
+                columns.append(col)
+                values.append(val)
 
-        if not updates:
+        if not columns:
             return True
 
-        # updated_at = now() is a SQL expression, no %s placeholder needed
-        updates.append("updated_at = now()")
+        # Build INSERT column list and placeholders
+        insert_cols = ["signal_id", "experiment_id", "symbol"] + columns
+        insert_placeholders = ["%s"] * (3 + len(columns))
+        insert_values: list[Any] = [
+            signal_id, "ATR_WICK_REJECTION_SHORT_V1", symbol,
+        ] + values
 
-        # Final parameter list: INSERT uses [signal_id, symbol, is_final],
-        # ON CONFLICT UPDATE uses only the dynamic params from pairs above.
+        # Build ON CONFLICT UPDATE clause using EXCLUDED.* for each column
+        update_clauses = [f"{col} = EXCLUDED.{col}" for col in columns]
+
+        # is_final: only write when caller passes True (prevent reset)
+        if is_final:
+            insert_cols.append("is_final")
+            insert_placeholders.append("%s")
+            insert_values.append(True)
+            update_clauses.append("is_final = EXCLUDED.is_final")
+
+        # Always update updated_at
+        update_clauses.append("updated_at = now()")
+
+        sql = f"""
+            INSERT INTO dds.shadow_signal_outcome (
+                {', '.join(insert_cols)}
+            ) VALUES ({', '.join(insert_placeholders)})
+            ON CONFLICT (signal_id) DO UPDATE SET
+                {', '.join(update_clauses)}
+        """
+
         cursor = self._conn.cursor()
         try:
-            cursor.execute(
-                f"""
-                INSERT INTO dds.shadow_signal_outcome (
-                    signal_id, experiment_id, symbol, is_final
-                ) VALUES (%s, 'ATR_WICK_REJECTION_SHORT_V1', %s, %s)
-                ON CONFLICT (signal_id) DO UPDATE SET
-                    {', '.join(updates)}
-                """,
-                [signal_id, symbol, is_final] + params,
-            )
+            cursor.execute(sql, insert_values)
             self._conn.commit()
             return True
         except Exception:
