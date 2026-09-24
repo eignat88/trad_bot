@@ -93,12 +93,71 @@ CREATE INDEX IF NOT EXISTS idx_shadow_outcome_is_final ON dds.shadow_signal_outc
 -- ── General reporting views ─────────────────────────────────
 
 CREATE OR REPLACE VIEW dds.v_shadow_signal_summary AS
-SELECT s.symbol, COUNT(*) AS signals, COUNT(o.signal_id) AS evaluated,
-    ROUND(AVG(s.atr_pct), 4) AS avg_atr_pct, ROUND(AVG(s.rsi), 2) AS avg_rsi,
-    ROUND(AVG(s.wick_atr), 4) AS avg_wick_atr, ROUND(AVG(s.volume_ratio), 4) AS avg_volume_ratio
-FROM dds.shadow_signal s LEFT JOIN dds.shadow_signal_outcome o ON o.signal_id = s.signal_id
+SELECT
+    s.symbol,
+    COUNT(*) AS signals,
+    COUNT(o.signal_id) AS evaluated,
+    ROUND(AVG(s.atr_pct), 4) AS avg_atr_pct,
+    ROUND(AVG(s.rsi), 2) AS avg_rsi,
+    ROUND(AVG(s.wick_atr), 4) AS avg_wick_atr,
+    ROUND(AVG(s.close_location), 4) AS avg_close_location,
+    ROUND(AVG(s.bb_width), 4) AS avg_bb_width,
+    ROUND(AVG(s.volume_ratio), 4) AS avg_volume_ratio
+FROM dds.shadow_signal s
+LEFT JOIN dds.shadow_signal_outcome o ON o.signal_id = s.signal_id
 WHERE s.experiment_id = 'ATR_WICK_REJECTION_SHORT_V1'
-GROUP BY s.symbol ORDER BY signals DESC;
+GROUP BY s.symbol
+ORDER BY signals DESC;
+
+CREATE OR REPLACE VIEW dds.v_shadow_mfe_mae_distribution AS
+SELECT
+    o.symbol,
+    COUNT(*) AS samples,
+    ROUND(AVG(o.mfe_60m), 4) AS avg_mfe_60m,
+    ROUND(AVG(o.mae_60m), 4) AS avg_mae_60m,
+    ROUND(AVG(o.mfe_120m), 4) AS avg_mfe_120m,
+    ROUND(AVG(o.mae_120m), 4) AS avg_mae_120m,
+    ROUND(
+        COUNT(*) FILTER (WHERE o.reached_minus_0_5)::numeric / COUNT(*), 4
+    ) AS pct_reached_0_5,
+    ROUND(
+        COUNT(*) FILTER (WHERE o.reached_minus_1_0)::numeric / COUNT(*), 4
+    ) AS pct_reached_1_0,
+    ROUND(
+        COUNT(*) FILTER (WHERE o.reached_minus_1_5)::numeric / COUNT(*), 4
+    ) AS pct_reached_1_5,
+    ROUND(
+        COUNT(*) FILTER (WHERE o.reached_minus_2_0)::numeric / COUNT(*), 4
+    ) AS pct_reached_2_0,
+    ROUND(
+        COUNT(*) FILTER (WHERE o.hit_plus_0_5_before_target)::numeric / COUNT(*), 4
+    ) AS pct_hit_0_5_adverse
+FROM dds.shadow_signal_outcome o
+WHERE o.experiment_id = 'ATR_WICK_REJECTION_SHORT_V1'
+GROUP BY o.symbol
+HAVING COUNT(*) >= 3
+ORDER BY avg_mfe_60m DESC NULLS LAST;
+
+CREATE OR REPLACE VIEW dds.v_shadow_feature_comparison AS
+SELECT
+    o.symbol,
+    CASE WHEN o.mfe_60m > 0 THEN 'profitable' ELSE 'losing' END AS outcome,
+    COUNT(*) AS samples,
+    ROUND(AVG(s.atr_pct), 4) AS avg_atr_pct,
+    ROUND(AVG(s.rsi), 2) AS avg_rsi,
+    ROUND(AVG(s.wick_atr), 4) AS avg_wick_atr,
+    ROUND(AVG(s.close_location), 4) AS avg_close_location,
+    ROUND(AVG(s.bb_width), 4) AS avg_bb_width,
+    ROUND(AVG(s.distance_to_upper_bb), 4) AS avg_distance_to_upper_bb,
+    ROUND(AVG(s.volume_ratio), 4) AS avg_volume_ratio,
+    ROUND(AVG(s.ema_slope), 6) AS avg_ema_slope
+FROM dds.shadow_signal s
+JOIN dds.shadow_signal_outcome o ON o.signal_id = s.signal_id
+WHERE o.experiment_id = 'ATR_WICK_REJECTION_SHORT_V1'
+  AND o.mfe_60m IS NOT NULL
+GROUP BY o.symbol, CASE WHEN o.mfe_60m > 0 THEN 'profitable' ELSE 'losing' END
+HAVING COUNT(*) >= 2
+ORDER BY o.symbol, outcome;
 
 -- ============================================================
 -- OOS Analysis Views
