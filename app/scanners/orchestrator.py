@@ -106,6 +106,12 @@ class ScannerOrchestrator:
         "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1",
     })
 
+    # Scanners whose blocked LONG candidates should be captured for research
+    # outcome tracking, even though they are not traded.
+    RESEARCH_CAPTURE_SCANNERS: frozenset[str] = frozenset({
+        "SUPPORT_RESISTANCE_REACTION",
+    })
+
     def scan_all_with_stats(
         self,
         ctx: MarketContext,
@@ -201,7 +207,10 @@ class ScannerOrchestrator:
         # Shadow/control scanners: their blocked candidates are saved with a
         # _shadow_control marker for OOS cohort tracking, even though they
         # won't be traded.
+        # Research capture scanners: blocked LONG candidates are collected
+        # for research outcome tracking (e.g. SRR LONG parameter analysis).
         shadow_candidates: list[SetupCandidate] = []
+        research_candidates: list[SetupCandidate] = []
         if gate_policy is not None:
             gate_accepted: list[SetupCandidate] = []
             for candidate in valid:
@@ -229,6 +238,22 @@ class ScannerOrchestrator:
                         decision.status,
                         candidate.features.get("close_location"),
                     )
+                elif (candidate.scanner_name in self.RESEARCH_CAPTURE_SCANNERS
+                      and candidate.direction == "LONG"):
+                    # Capture blocked SRR LONG for research outcome tracking.
+                    # These candidates are NOT tradeable but their feature
+                    # snapshots + outcomes feed parameter analysis.
+                    from dataclasses import replace
+                    research_features = dict(candidate.features)
+                    research_features["_research_capture"] = True
+                    research_features["_research_capture_reason"] = "direction_gate_blocked"
+                    research_candidates.append(replace(candidate, features=research_features))
+                    logger.info(
+                        "research candidate captured: symbol=%s scanner=%s direction=%s "
+                        "gate_status=%s score=%.1f",
+                        candidate.symbol, candidate.scanner_name, candidate.direction,
+                        decision.status, candidate.score,
+                    )
                 else:
                     logger.info(
                         "direction gate rejected: symbol=%s scanner=%s direction=%s "
@@ -238,6 +263,12 @@ class ScannerOrchestrator:
                         decision.allowed_regimes, candidate.market_regime or ctx.market_regime,
                     )
             valid = gate_accepted + shadow_candidates
+
+        # Attach research candidates to stats for caller access.
+        # The caller (scanner_runner) checks stats for _research_candidates
+        # and persists them via the SRR research observer.
+        if research_candidates:
+            stats.setdefault("_research_candidates", []).extend(research_candidates)
 
         # Expectancy filter: drop scanner/direction combos with negative historical R.
         # Static manual blocks are handled by the gate policy above.

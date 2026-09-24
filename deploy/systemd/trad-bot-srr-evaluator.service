@@ -1,0 +1,18 @@
+[Unit]
+Description=SRR LONG Research Outcome Evaluator
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/trad_bot
+ExecStart=/opt/trad_bot/.venv/bin/python -m app.shadow.srr_research_evaluator --once --config /opt/trad_bot/config.yaml
+User=trad_bot
+Group=trad_bot
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+
+# Safety
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/trad_bot/logs
