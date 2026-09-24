@@ -162,7 +162,19 @@ class ScannerOrchestrator:
         scored = [self._attach_context(c, ctx) for c in scored]
         scored = self._calibrate_scores(scored)
         scored.sort(key=lambda c: c.score, reverse=True)
+
+        # Separate treatment REJECT candidates (from OOS experiments) before
+        # deduplication.  These must always be persisted for analytical tracking,
+        # even if a shadow/control candidate with the same signal candle exists.
+        oos_rejected = [c for c in scored if c.features.get("_oos_rejected")]
+
         unique = self.dedup.filter_new(scored)
+
+        # Re-attach ALL OOS REJECT candidates that dedup filtered.
+        # They share the same candle as the base V1 shadow control but must
+        # persist independently under their own scanner_name for OOS analysis.
+        for c in oos_rejected:
+            unique.append(c)
 
         valid: list[SetupCandidate] = []
         invalid_geometry_by_scanner: dict[str, int] = {}
@@ -179,7 +191,9 @@ class ScannerOrchestrator:
                     c.invalidation_price, c.target_1,
                 )
                 continue
-            if c.score >= 30:
+            # Shadow/control scanners and OOS treatment REJECT bypass score gate:
+            # they are analytical observations, not tradeable signals.
+            if c.score >= 30 or c.features.get("_oos_rejected") or c.scanner_name in self.SHADOW_CONTROL_SCANNERS:
                 valid.append(c)
 
         # Direction gates are independent of expectancy.  Candidates were still
@@ -195,6 +209,11 @@ class ScannerOrchestrator:
                     candidate.scanner_name, candidate.direction, candidate.market_regime or ctx.market_regime
                 )
                 if decision.allowed:
+                    gate_accepted.append(candidate)
+                elif candidate.features.get("_oos_rejected"):
+                    # Treatment REJECT: persist as analytical record, not shadow
+                    # control.  _oos_rejected candidates always pass gate for DB
+                    # persistence — they are observations, not tradeable signals.
                     gate_accepted.append(candidate)
                 elif candidate.scanner_name in self.SHADOW_CONTROL_SCANNERS:
                     # Save as shadow/control for OOS cohort comparison
