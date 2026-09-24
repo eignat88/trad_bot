@@ -95,6 +95,9 @@ class Settings:
     bybit_rate_limit_retry_backoff: float = 0.5
     scanner_workers: int = 5
     scan_interval: int = 300
+    # OOS evaluator interval in scanner cycles (default 12 = every 60 minutes
+    # with 5-minute scan interval). Set to 0 to disable in-scanner evaluation.
+    oos_evaluator_cycle_interval: int = 12
     signal_conflict_window: int = 600
     telegram_token: str = ""
     telegram_chat_id: str = ""

@@ -217,6 +217,28 @@ def _observe_me_r_long_cl_oos(repository: ScannerRepository, candidate: SetupCan
     observe_oos_candidate(repo, candidate)
 
 
+def _run_oos_evaluator(client: BybitClient, repository: ScannerRepository) -> None:
+    """Run OOS evaluator for ME_R_LONG_CLOSE_LOCATION_OOS experiment.
+
+    Evaluates pending signals and updates outcomes for mature horizons.
+    Called periodically from the scanner main loop.
+    """
+    from app.shadow.me_r_long_close_location_oos_evaluator import MERLongCLoOosEvaluator
+    from app.shadow.me_r_long_close_location_oos_repository import MERLongCLoOosRepository
+
+    repo = MERLongCLoOosRepository(repository._conn)
+    evaluator = MERLongCLoOosEvaluator(client, repo)
+
+    # Run evaluation cycle
+    stats = evaluator.evaluate_pending(limit=100)
+
+    # Log summary
+    logger.info(
+        "ME_R_LONG_CLOSE_LOCATION_OOS evaluator: checked=%d updated=%d errors=%d",
+        stats["checked"], stats["updated"], stats["errors"],
+    )
+
+
 def run_scan_cycle(
     client: BybitClient,
     orchestrator: ScannerOrchestrator,
@@ -553,6 +575,14 @@ def main() -> None:
             if expectancy_filter is not None and cycle % 10 == 0:
                 expectancy_filter = load_expectancy(repository)
                 logger.info("expectancy filter refreshed: %d records", len(expectancy_filter.records))
+
+            # OOS evaluator: run every oos_evaluator_cycle_interval cycles
+            if (settings.oos_evaluator_cycle_interval > 0
+                    and cycle % settings.oos_evaluator_cycle_interval == 0):
+                try:
+                    _run_oos_evaluator(client, repository)
+                except Exception:
+                    logger.exception("OOS evaluator cycle failed")
         except Exception:
             logger.exception("cycle #%d failed", cycle)
             if run_id:
