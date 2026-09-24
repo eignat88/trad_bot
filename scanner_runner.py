@@ -189,6 +189,34 @@ def _observe_srr_long_research(repository: ScannerRepository, candidate: SetupCa
     )
 
 
+# --- ME_R_LONG_CLOSE_LOCATION_OOS Experiment ------------------------------
+
+_me_r_long_cl_oos_observer = None
+
+
+def _get_me_r_long_cl_oos_observer(repository: ScannerRepository):
+    """Lazy-init the ME_R_LONG_CLOSE_LOCATION_OOS observer (singleton per process)."""
+    global _me_r_long_cl_oos_observer
+    if _me_r_long_cl_oos_observer is None:
+        from app.shadow.me_r_long_close_location_oos_repository import MERLongCLoOosRepository
+        _me_r_long_cl_oos_observer = MERLongCLoOosRepository(repository._conn)
+    return _me_r_long_cl_oos_observer
+
+
+def _observe_me_r_long_cl_oos(repository: ScannerRepository, candidate: SetupCandidate) -> None:
+    """Record an ME_R_LONG_CLOSE_LOCATION_OOS candidate for OOS analysis.
+
+    Called from the scanner runner for every candidate from the OOS scanner.
+    Both PASS and REJECT candidates are saved for OOS analysis.
+    This is a fire-and-forget observation — never blocks the signal.
+    """
+    from app.shadow.me_r_long_close_location_oos_repository import MERLongCLoOosRepository
+    from app.shadow.me_r_long_close_location_oos_runner import observe_oos_candidate
+
+    repo = MERLongCLoOosRepository(repository._conn)
+    observe_oos_candidate(repo, candidate)
+
+
 def run_scan_cycle(
     client: BybitClient,
     orchestrator: ScannerOrchestrator,
@@ -291,6 +319,14 @@ def run_scan_cycle(
                             _observe_fvg_shadow(repository, c)
                         except Exception:
                             logger.debug("FVG shadow observation failed", exc_info=True)
+
+                    # ME_R_LONG_CLOSE_LOCATION_OOS: capture every OOS scanner candidate
+                    # Both PASS and REJECT are saved for OOS analysis
+                    if c.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1":
+                        try:
+                            _observe_me_r_long_cl_oos(repository, c)
+                        except Exception:
+                            logger.debug("ME_R_LONG_CL_OOS observation failed", exc_info=True)
 
                 # SRR LONG Research: capture every SRR LONG candidate for
                 # research outcome tracking (independent of paper trading).

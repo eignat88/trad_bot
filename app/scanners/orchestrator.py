@@ -250,12 +250,14 @@ class ScannerOrchestrator:
                     shadow_features["_shadow_control"] = True
                     shadow_features["_shadow_control_reason"] = "oos_experiment_baseline"
                     shadow_candidates.append(replace(candidate, features=shadow_features))
+                    # Note: V1 shadow control doesn't have close_location
+                    # because it's the baseline scanner without the OOS filter.
+                    # close_location is only computed by the OOS scanner.
                     logger.info(
                         "shadow/control candidate saved: symbol=%s scanner=%s direction=%s "
-                        "gate_status=%s close_location=%s",
+                        "gate_status=%s",
                         candidate.symbol, candidate.scanner_name, candidate.direction,
                         decision.status,
-                        candidate.features.get("close_location"),
                     )
                 else:
                     logger.info(
