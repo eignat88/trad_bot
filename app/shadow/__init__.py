@@ -6,6 +6,9 @@ __all__ = [
     "ShadowSignalEvaluator",
     "SRRResearchObserver",
     "SRRResearchEvaluator",
+    "V2DRepository",
+    "V2DRunner",
+    "V2DEvaluator",
 ]
 
 
@@ -25,4 +28,13 @@ def __getattr__(name: str):
     if name == "SRRResearchEvaluator":
         from .srr_research_evaluator import SRRResearchEvaluator
         return SRRResearchEvaluator
+    if name == "V2DRepository":
+        from .v2d_repository import V2DRepository
+        return V2DRepository
+    if name == "V2DRunner":
+        from .v2d_runner import V2DRunner
+        return V2DRunner
+    if name == "V2DEvaluator":
+        from .v2d_evaluator import V2DEvaluator
+        return V2DEvaluator
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
