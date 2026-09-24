@@ -830,3 +830,184 @@ class TestOrchestratorResearchCapture:
 
         from app.scanners.orchestrator import ScannerOrchestrator
         assert "SUPPORT_RESISTANCE_REACTION" not in ScannerOrchestrator.SHADOW_CONTROL_SCANNERS
+
+
+# ── Tests: INSERT Parity & Persistence ────────────────────────
+
+class TestInsertParity:
+    """Verify INSERT column/placeholder/value parity statically.
+
+    Prevents the 43-cols-vs-42-expressions bug from recurring.
+    """
+
+    def test_insert_placeholder_parity(self):
+        """INSERT must have exactly one expression per target column."""
+        import re
+
+        with open("app/shadow/srr_research_observer.py", encoding="utf-8") as f:
+            source = f.read()
+
+        # Extract the INSERT ... VALUES block
+        insert_match = re.search(
+            r"INSERT INTO dds\.srr_research_signal\s*\((.*?)\)\s*VALUES\s*\((.*?)\)",
+            source, re.DOTALL,
+        )
+        assert insert_match, "Could not find INSERT INTO dds.srr_research_signal"
+
+        columns_block = insert_match.group(1)
+        values_block = insert_match.group(2)
+
+        # Count columns (strip SQL comments)
+        clean_cols = re.sub(r"--.*", "", columns_block)
+        cols = [c.strip() for c in clean_cols.split(",") if c.strip()]
+        num_cols = len(cols)
+
+        # Count %s placeholders
+        num_placeholders = values_block.count("%s")
+
+        # Count SQL string literals (e.g. 'LONG', '5m')
+        num_literals = len(re.findall(r"'[^']+'", values_block))
+
+        total_expressions = num_placeholders + num_literals
+
+        assert total_expressions == num_cols, (
+            f"INSERT parity mismatch: {num_cols} columns but "
+            f"{total_expressions} expressions "
+            f"({num_placeholders} placeholders + {num_literals} literals). "
+            f"Columns: {cols}"
+        )
+
+    def test_bound_values_match_placeholders(self):
+        """Bound Python values count must match %s placeholder count."""
+        import re
+
+        with open("app/shadow/srr_research_observer.py", encoding="utf-8") as f:
+            source = f.read()
+
+        # Find the VALUES block and extract %s count
+        values_match = re.search(
+            r"VALUES\s*\((.*?)\)\s*ON CONFLICT",
+            source, re.DOTALL,
+        )
+        assert values_match, "Could not find VALUES block"
+        num_placeholders = values_match.group(1).count("%s")
+
+        # Find the bound tuple
+        tuple_match = re.search(
+            r"RETURNING signal_id\s*\"\"\",\s*\((.*?)\),\s*\)",
+            source, re.DOTALL,
+        )
+        assert tuple_match, "Could not find bound values tuple"
+        tuple_block = tuple_match.group(1)
+
+        # Count actual values: split by comma at depth 0
+        depth = 0
+        values = 1
+        for ch in tuple_block:
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                values += 1
+
+        assert values == num_placeholders, (
+            f"Bound values mismatch: {values} values but "
+            f"{num_placeholders} %s placeholders"
+        )
+
+    def test_observe_insert_returns_inserted(self, sample_features):
+        """Full observe → INSERT path returns status=inserted."""
+        import json
+
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_cursor.fetchone.return_value = (42,)
+
+        observer = SRRResearchObserver(mock_conn)
+        result = observer.observe_blocked_candidate(
+            setup_id="test-setup-id",
+            scanner_name="SUPPORT_RESISTANCE_REACTION",
+            scanner_version="2.0.0",
+            symbol="ETHUSDT",
+            direction="LONG",
+            detected_at=datetime(2026, 9, 24, 13, 39, 1, tzinfo=timezone.utc),
+            signal_candle_open_time=1700000000000,
+            reference_price=3500.0,
+            entry_zone_low=3493.0,
+            entry_zone_high=3507.0,
+            invalidation_price=3482.5,
+            target_1=3530.0,
+            target_2=3545.0,
+            score=47.0,
+            market_regime="TREND_UP",
+            features=sample_features,
+            reasons=["test_reason"],
+        )
+
+        assert result["status"] == "inserted"
+        assert result["signal_id"] == 42
+
+        # Verify SQL contains INSERT
+        call_args = mock_cursor.execute.call_args
+        sql = call_args[0][0]
+        assert "INSERT INTO dds.srr_research_signal" in sql
+
+        # Verify reasons is valid jsonb
+        bound = call_args[0][1]
+        reasons_value = bound[-1]
+        parsed = json.loads(reasons_value)
+        assert parsed == ["test_reason"]
+
+        mock_conn.commit.assert_called_once()
+
+    def test_observe_idempotent_on_duplicate(self, sample_features):
+        """Duplicate (experiment, symbol, candle) returns status=duplicate."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_cursor.fetchone.return_value = None  # ON CONFLICT → no row
+
+        observer = SRRResearchObserver(mock_conn)
+
+        result1 = observer.observe_blocked_candidate(
+            setup_id="setup-1",
+            scanner_name="SUPPORT_RESISTANCE_REACTION",
+            scanner_version="2.0.0",
+            symbol="ETHUSDT",
+            direction="LONG",
+            detected_at=datetime(2026, 9, 24, 13, 39, 1, tzinfo=timezone.utc),
+            signal_candle_open_time=1700000000000,
+            reference_price=3500.0,
+            entry_zone_low=3493.0,
+            entry_zone_high=3507.0,
+            invalidation_price=3482.5,
+            target_1=3530.0,
+            target_2=3545.0,
+            score=47.0,
+            market_regime="TREND_UP",
+            features=sample_features,
+        )
+        assert result1["status"] == "duplicate"
+
+        result2 = observer.observe_blocked_candidate(
+            setup_id="setup-2",
+            scanner_name="SUPPORT_RESISTANCE_REACTION",
+            scanner_version="2.0.0",
+            symbol="ETHUSDT",
+            direction="LONG",
+            detected_at=datetime(2026, 9, 24, 13, 39, 1, tzinfo=timezone.utc),
+            signal_candle_open_time=1700000000000,
+            reference_price=3500.0,
+            entry_zone_low=3493.0,
+            entry_zone_high=3507.0,
+            invalidation_price=3482.5,
+            target_1=3530.0,
+            target_2=3545.0,
+            score=50.0,
+            market_regime="TREND_UP",
+            features=sample_features,
+        )
+        assert result2["status"] == "duplicate"
+        assert observer._duplicate_count == 2

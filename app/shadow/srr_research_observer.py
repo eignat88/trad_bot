@@ -183,7 +183,7 @@ class SRRResearchObserver:
                     %s, %s,
                     %s, %s,
                     %s, %s, %s,
-                    %s
+                    %s, %s
                 )
                 ON CONFLICT (experiment_id, symbol, signal_candle_open_time)
                 WHERE signal_candle_open_time > 0
