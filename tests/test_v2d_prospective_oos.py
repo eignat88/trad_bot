@@ -348,64 +348,116 @@ class TestV2DEvaluatorCompatibility:
 class TestV2DMigrationIntegrity:
     """Verify migration SQL is correct and idempotent."""
 
+    @staticmethod
+    def _read_migration():
+        from pathlib import Path
+        return Path("sql/migrations/047_atr_wick_v2d_prospective_oos.sql").read_text()
+
     def test_migration_tables_created(self):
         """Migration creates v2d_signal and v2d_outcome tables."""
-        from pathlib import Path
-        migration = Path("sql/migrations/047_atr_wick_v2d_prospective_oos.sql").read_text()
+        migration = self._read_migration()
         assert "CREATE TABLE IF NOT EXISTS dds.v2d_signal" in migration
         assert "CREATE TABLE IF NOT EXISTS dds.v2d_outcome" in migration
 
     def test_migration_experiment_id_constraint(self):
         """Migration has CHECK constraint for V2_D experiment_id."""
-        from pathlib import Path
-        migration = Path("sql/migrations/047_atr_wick_v2d_prospective_oos.sql").read_text()
+        migration = self._read_migration()
         assert "ATR_WICK_FILTER_OOS_V2_D" in migration
         assert "v2d_signal_experiment_chk" in migration
         assert "v2d_outcome_experiment_chk" in migration
 
     def test_migration_no_v1_data_modification(self):
         """Migration does not modify V1 data (no UPDATE/DELETE on shadow tables)."""
-        from pathlib import Path
-        migration = Path("sql/migrations/047_atr_wick_v2d_prospective_oos.sql").read_text()
+        migration = self._read_migration()
         assert "UPDATE dds.shadow_signal" not in migration
         assert "DELETE FROM dds.shadow_signal" not in migration
         assert "UPDATE dds.shadow_signal_outcome" not in migration
         assert "DELETE FROM dds.shadow_signal_outcome" not in migration
 
-    def test_migration_registry_created(self):
-        """Migration creates experiment registry."""
-        from pathlib import Path
-        migration = Path("sql/migrations/047_atr_wick_v2d_prospective_oos.sql").read_text()
-        assert "shadow_oos_experiment_registry" in migration
-        assert "INSERT INTO dds.shadow_oos_experiment_registry" in migration
+    def test_migration_does_not_create_registry(self):
+        """Migration does NOT create shadow_oos_experiment_registry."""
+        migration = self._read_migration()
+        assert "CREATE TABLE IF NOT EXISTS dds.shadow_oos_experiment_registry" not in migration
+
+    def test_migration_does_not_insert_registry_rows(self):
+        """Migration does NOT INSERT new rows into registry."""
+        migration = self._read_migration()
+        assert "INSERT INTO dds.shadow_oos_experiment_registry" not in migration
+
+    def test_migration_only_updates_prospective_started_at(self):
+        """Migration only sets prospective_started_at via UPDATE."""
+        migration = self._read_migration()
+        assert "UPDATE dds.shadow_oos_experiment_registry" in migration
+        assert "prospective_started_at" in migration
+        assert "COALESCE(prospective_started_at, now())" in migration
+
+    def test_migration_safety_check_for_missing_registry_row(self):
+        """Migration raises EXCEPTION if V2_D registry row is missing."""
+        migration = self._read_migration()
+        assert "RAISE EXCEPTION" in migration
+        assert "ATR_WICK_FILTER_OOS_V2_D is missing" in migration
+
+    def test_migration_does_not_touch_existing_discovery_metadata(self):
+        """Migration UPDATE does not write to discovery columns."""
+        migration = self._read_migration()
+        update_start = migration.find("UPDATE dds.shadow_oos_experiment_registry")
+        assert update_start >= 0, "UPDATE not found"
+        update_block = migration[update_start:update_start + 500]
+        assert "SET" in update_block
+        assert "prospective_started_at =" in update_block
+        for col in ["status", "sample_n", "good_count", "bad_count",
+                     "hypothesis", "filter_definition", "source_experiment_id",
+                     "good_bad_ratio", "good_pct", "bad_pct",
+                     "avg_mfe_60m", "avg_mae_60m", "notes",
+                     "discovery_started_at", "discovery_ended_at", "created_at"]:
+            assert f"{col} =" not in update_block, \
+                f"Migration UPDATE modifies discovery column: {col}"
+
+    def test_migration_preserves_existing_prospective_started_at(self):
+        """COALESCE ensures prospective_started_at is not overwritten on re-run."""
+        migration = self._read_migration()
+        assert "COALESCE(prospective_started_at, now())" in migration
 
     def test_migration_idempotent(self):
-        """Migration uses IF NOT EXISTS for idempotency."""
-        from pathlib import Path
-        migration = Path("sql/migrations/047_atr_wick_v2d_prospective_oos.sql").read_text()
+        """Migration uses IF NOT EXISTS and COALESCE for idempotency."""
+        migration = self._read_migration()
         assert "CREATE TABLE IF NOT EXISTS" in migration
         assert "CREATE INDEX IF NOT EXISTS" in migration
-        assert "ON CONFLICT" in migration
+        assert "COALESCE(prospective_started_at, now())" in migration
 
     def test_migration_direction_constraint(self):
         """V2_D signals are constrained to SHORT direction."""
-        from pathlib import Path
-        migration = Path("sql/migrations/047_atr_wick_v2d_prospective_oos.sql").read_text()
+        migration = self._read_migration()
         assert "v2d_signal_direction_chk" in migration
         assert "CHECK (direction = 'SHORT')" in migration
 
     def test_migration_unique_index(self):
         """Unique index prevents duplicate signals per experiment/symbol/time."""
-        from pathlib import Path
-        migration = Path("sql/migrations/047_atr_wick_v2d_prospective_oos.sql").read_text()
+        migration = self._read_migration()
         assert "uq_v2d_signal_experiment_symbol_time" in migration
 
     def test_migration_views_created(self):
         """Observability views are created."""
-        from pathlib import Path
-        migration = Path("sql/migrations/047_atr_wick_v2d_prospective_oos.sql").read_text()
+        migration = self._read_migration()
         assert "v_v2d_accumulation" in migration
         assert "v_v2d_filter_compliance" in migration
+
+    def test_migration_no_v1_experiment_insert(self):
+        """Migration does not insert or modify V1 registry row."""
+        migration = self._read_migration()
+        assert "INSERT" not in migration or "ATR_WICK_REJECTION_SHORT_V1" not in migration
+
+    def test_migration_compatible_with_production_registry_schema(self):
+        """Migration uses only columns that exist in production registry."""
+        migration = self._read_migration()
+        assert "prospective_started_at" in migration
+        # Registry section should not reference non-production columns
+        registry_section = migration[migration.find("shadow_oos_experiment_registry"):]
+        registry_section = registry_section.split("v_v2d_accumulation")[0]
+        for col in ["description", "registered_at", "scanner_source",
+                     "filter_description", "config_json"]:
+            assert col not in registry_section, \
+                f"Migration references non-production registry column: {col}"
 
 
 # ============================================================

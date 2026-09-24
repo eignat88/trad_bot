@@ -14,6 +14,12 @@
 -- Filter: direction = SHORT, 0.20 <= StochRSI < 0.60
 -- No volume filter applied (per experiment config)
 --
+-- Registry dependency:
+--   dds.shadow_oos_experiment_registry is a shared canonical table
+--   created by earlier migrations.  This migration does NOT create
+--   or redefine it.  The V2_D row must already exist with
+--   exploratory metadata before this migration is run.
+--
 -- Idempotent migration — safe to re-run.
 -- ============================================================
 
@@ -143,54 +149,36 @@ CREATE INDEX IF NOT EXISTS idx_v2d_outcome_is_final
     ON dds.v2d_outcome (is_final) WHERE is_final = FALSE;
 
 -- ── Experiment registry ─────────────────────────────────────
+--
+-- Registry is canonical and created by earlier migrations.
+-- The V2_D row MUST already exist from exploratory analysis
+-- with full discovery metadata (hypothesis, filter_definition,
+-- sample_n, good/bad counts, etc.).
+--
+-- This migration only flips prospective_started_at to signal
+-- the start of prospective OOS collection.
+-- COALESCE ensures the timestamp is set exactly once.
 
-CREATE TABLE IF NOT EXISTS dds.shadow_oos_experiment_registry (
-    experiment_id       TEXT PRIMARY KEY,
-    description         TEXT NOT NULL,
-    status              TEXT NOT NULL DEFAULT 'active',
-    registered_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    started_at          TIMESTAMPTZ,
-    scanner_source      TEXT NOT NULL,
-    filter_description  TEXT NOT NULL,
-    timeframe           TEXT NOT NULL DEFAULT '5m',
-    direction           TEXT NOT NULL DEFAULT 'SHORT',
-    config_json         JSONB DEFAULT '{}'::jsonb,
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM dds.shadow_oos_experiment_registry
+        WHERE experiment_id = 'ATR_WICK_FILTER_OOS_V2_D'
+    ) THEN
+        RAISE EXCEPTION
+            'ATR_WICK_FILTER_OOS_V2_D is missing from '
+            'shadow_oos_experiment_registry; '
+            'exploratory hypothesis must be registered '
+            'before prospective OOS starts';
+    END IF;
+END $$;
 
--- Register V1 (historical)
-INSERT INTO dds.shadow_oos_experiment_registry (
-    experiment_id, description, status, scanner_source,
-    filter_description, timeframe, direction
-) VALUES (
-    'ATR_WICK_REJECTION_SHORT_V1',
-    'ATR Wick Rejection Short V1 — base shadow experiment',
-    'active',
-    'ATR_WICK_REJECTION_SHORT_V1',
-    'All features stored, strict_pass flag',
-    '5m',
-    'SHORT'
-) ON CONFLICT (experiment_id) DO NOTHING;
-
--- Register V2_D (new prospective experiment)
-INSERT INTO dds.shadow_oos_experiment_registry (
-    experiment_id, description, status, started_at, scanner_source,
-    filter_description, timeframe, direction, config_json
-) VALUES (
-    'ATR_WICK_FILTER_OOS_V2_D',
-    'ATR Wick Filter OOS V2_D — prospective StochRSI filter experiment',
-    'active',
-    now(),
-    'ATR_WICK_REJECTION_SHORT_V1',
-    'direction=SHORT, 0.20 <= StochRSI < 0.60, no volume filter',
-    '5m',
-    'SHORT',
-    '{"stoch_rsi_min": 0.20, "stoch_rsi_max": 0.60, "volume_filter": false}'::jsonb
-) ON CONFLICT (experiment_id) DO UPDATE SET
-    status = 'active',
-    started_at = COALESCE(dds.shadow_oos_experiment_registry.started_at, now()),
-    updated_at = now();
+UPDATE dds.shadow_oos_experiment_registry
+SET
+    prospective_started_at =
+        COALESCE(prospective_started_at, now())
+WHERE experiment_id = 'ATR_WICK_FILTER_OOS_V2_D';
 
 -- ── Observability view ──────────────────────────────────────
 
@@ -230,4 +218,8 @@ WHERE experiment_id = 'ATR_WICK_FILTER_OOS_V2_D';
 -- V2_D is a SHADOW/RESEARCH experiment only.
 -- It does NOT create paper trades or live positions.
 -- V1 continues operating independently — its data is untouched.
+--
+-- Discovery metadata in shadow_oos_experiment_registry is
+-- preserved: status, hypothesis, filter_definition, sample_n,
+-- good_count, bad_count, and all metrics remain unchanged.
 -- ============================================================
