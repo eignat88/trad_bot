@@ -179,7 +179,24 @@
       "title": "Candidates → Setups Pipeline",
       "type": "table",
       "targets": [
-        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT scanner_name AS \"Scanner\", symbols AS \"Symbols\", candidates AS \"Candidates\", setups AS \"Setups\", conversion_pct AS \"Conversion %\" FROM mart.scanner_candidates_pipeline ORDER BY scanner_name;", "format": "table", "refId": "A" }
+        { "datasource": { "type": "postgres", "uid": "trad_bot_postgres" }, "rawSql": "SELECT
+    scanner_name AS "Scanner",
+    MAX(symbols) AS "Symbols",
+    SUM(candidates) AS "Candidates",
+    SUM(setups) AS "Setups",
+    CASE
+        WHEN SUM(candidates) > 0
+        THEN ROUND(
+            100.0 * SUM(setups)::numeric
+            / SUM(candidates)::numeric,
+            1
+        )
+        ELSE 0
+    END AS "Conversion %"
+FROM mart.scanner_candidates_pipeline
+WHERE $__timeFilter(finished_at)
+GROUP BY scanner_name
+ORDER BY scanner_name;", "format": "table", "refId": "A" }
       ]
     },
     {

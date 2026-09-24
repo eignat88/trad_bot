@@ -141,4 +141,5 @@ JOIN latest_run lr ON srs.run_id = lr.run_id
 WHERE config.is_scanner_visible(srs.scanner_name)
 ORDER BY srs.scanner_name;
 
-COMMENT ON VIEW mart.scanner_candidates_pipeline IS 'Candidates to Setups pipeline for latest run.';
+-- Updated by migration 045: see 045_scanner_candidates_pipeline_time_range.sql
+-- Original: COMMENT ON VIEW mart.scanner_candidates_pipeline IS 'Candidates to Setups pipeline for latest run.';

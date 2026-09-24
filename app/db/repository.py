@@ -2267,6 +2267,114 @@ class ScannerRepository:
             cursor.execute(sql)
         return cursor.fetchone()
 
+    def is_connected(self) -> bool:
+        """Check if PostgreSQL connection is active."""
+        return self._use_pg
+
+    def save_funnel_observation(
+        self,
+        scanner_name: str,
+        period_start: datetime,
+        counters: Any,
+    ) -> None:
+        """UPSERT funnel counters into dds.signal_funnel_observation.
+
+        Idempotent: (scanner_name, period_type, period_start) is the
+        unique key.  Repeated flushes within the same hourly bucket
+        accumulate via numeric addition, not overwrite.
+
+        Uses positional %s placeholders (pg8000 requirement).
+        """
+        if not self._use_pg:
+            return
+        cursor = self._conn.cursor()
+        d = counters.as_dict()
+        # Positional tuple: scanner, period_start, then all counter fields
+        # in the same order as the INSERT column list.
+        params = (
+            scanner_name, period_start,
+            d["total_scans"], d["pass_data_length"], d["pass_swing_highs"],
+            d["pass_break_prev_high"], d["pass_return_near_high"],
+            d["pass_bearish_candle"], d["pass_body_ratio"],
+            d["pass_rsi_65"], d["pass_rsi_delta_available"],
+            d["pass_rsi_delta_positive"], d["final_setup"],
+            d["no_data"], d["no_swings"], d["no_breakout"],
+            d["too_far_above_prev_high"], d["not_bearish"],
+            d["body_too_large"], d["rsi_below_65"],
+            d["rsi_delta_missing"], d["rsi_delta_not_positive"],
+        )
+        cursor.execute(
+            """
+            INSERT INTO dds.signal_funnel_observation (
+                scanner_name, period_start, period_type,
+                total_scans, pass_data_length, pass_swing_highs,
+                pass_break_prev_high, pass_return_near_high,
+                pass_bearish_candle, pass_body_ratio,
+                pass_rsi_65, pass_rsi_delta_available,
+                pass_rsi_delta_positive, final_setup,
+                no_data, no_swings, no_breakout,
+                too_far_above_prev_high, not_bearish,
+                body_too_large, rsi_below_65,
+                rsi_delta_missing, rsi_delta_not_positive
+            ) VALUES (
+                %s, %s, 'hourly',
+                %s, %s, %s,
+                %s, %s,
+                %s, %s,
+                %s, %s,
+                %s, %s,
+                %s, %s, %s,
+                %s, %s,
+                %s, %s,
+                %s, %s
+            )
+            ON CONFLICT (scanner_name, period_type, period_start)
+            DO UPDATE SET
+                total_scans = dds.signal_funnel_observation.total_scans
+                    + EXCLUDED.total_scans,
+                pass_data_length = dds.signal_funnel_observation.pass_data_length
+                    + EXCLUDED.pass_data_length,
+                pass_swing_highs = dds.signal_funnel_observation.pass_swing_highs
+                    + EXCLUDED.pass_swing_highs,
+                pass_break_prev_high = dds.signal_funnel_observation.pass_break_prev_high
+                    + EXCLUDED.pass_break_prev_high,
+                pass_return_near_high = dds.signal_funnel_observation.pass_return_near_high
+                    + EXCLUDED.pass_return_near_high,
+                pass_bearish_candle = dds.signal_funnel_observation.pass_bearish_candle
+                    + EXCLUDED.pass_bearish_candle,
+                pass_body_ratio = dds.signal_funnel_observation.pass_body_ratio
+                    + EXCLUDED.pass_body_ratio,
+                pass_rsi_65 = dds.signal_funnel_observation.pass_rsi_65
+                    + EXCLUDED.pass_rsi_65,
+                pass_rsi_delta_available = dds.signal_funnel_observation.pass_rsi_delta_available
+                    + EXCLUDED.pass_rsi_delta_available,
+                pass_rsi_delta_positive = dds.signal_funnel_observation.pass_rsi_delta_positive
+                    + EXCLUDED.pass_rsi_delta_positive,
+                final_setup = dds.signal_funnel_observation.final_setup
+                    + EXCLUDED.final_setup,
+                no_data = dds.signal_funnel_observation.no_data
+                    + EXCLUDED.no_data,
+                no_swings = dds.signal_funnel_observation.no_swings
+                    + EXCLUDED.no_swings,
+                no_breakout = dds.signal_funnel_observation.no_breakout
+                    + EXCLUDED.no_breakout,
+                too_far_above_prev_high = dds.signal_funnel_observation.too_far_above_prev_high
+                    + EXCLUDED.too_far_above_prev_high,
+                not_bearish = dds.signal_funnel_observation.not_bearish
+                    + EXCLUDED.not_bearish,
+                body_too_large = dds.signal_funnel_observation.body_too_large
+                    + EXCLUDED.body_too_large,
+                rsi_below_65 = dds.signal_funnel_observation.rsi_below_65
+                    + EXCLUDED.rsi_below_65,
+                rsi_delta_missing = dds.signal_funnel_observation.rsi_delta_missing
+                    + EXCLUDED.rsi_delta_missing,
+                rsi_delta_not_positive = dds.signal_funnel_observation.rsi_delta_not_positive
+                    + EXCLUDED.rsi_delta_not_positive
+            """,
+            params,
+        )
+        self._conn.commit()
+
     def close(self) -> None:
         if self._conn:
             self._conn.close()

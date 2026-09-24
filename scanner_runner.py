@@ -20,6 +20,7 @@ from app.exchange.bybit_client import BybitClient
 from app.scanners.context_builder import build_market_context
 from app.scanners.direction_gate import ScannerDirectionGatePolicy
 from app.scanners.expectancy_filter import ExpectancyFilter, load_expectancy
+from app.scanners.funnel_diagnostics import flush_and_persist_all
 from app.scanners.models import SetupCandidate
 from app.scanners.orchestrator import ScannerOrchestrator
 
@@ -418,6 +419,13 @@ def main() -> None:
                 client, orchestrator, repository, symbols, run_id, settings,
                 expectancy_filter=expectancy_filter,
             )
+
+            # -- SIGNAL_FUNNEL_DIAGNOSTICS_V1: flush counters to DB --
+            # Fail-open: DB errors are logged but do not interrupt the cycle.
+            try:
+                flush_and_persist_all(repository)
+            except Exception:
+                logger.debug("signal funnel flush failed", exc_info=True)
 
             repository.expire_setups()
 
