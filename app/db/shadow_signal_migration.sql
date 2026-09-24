@@ -56,6 +56,22 @@ CREATE TABLE IF NOT EXISTS dds.shadow_signal (
 ALTER TABLE dds.shadow_signal
 ADD COLUMN IF NOT EXISTS strict_pass BOOLEAN NOT NULL DEFAULT FALSE;
 
+-- Add OOS filter flags (idempotent)
+ALTER TABLE dds.shadow_signal
+ADD COLUMN IF NOT EXISTS oos_a_stoch_08 BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE dds.shadow_signal
+ADD COLUMN IF NOT EXISTS oos_b_stoch_08_vol_10 BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE dds.shadow_signal
+ADD COLUMN IF NOT EXISTS oos_c_stoch_06_vol_10 BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Indexes for OOS analysis
+CREATE INDEX IF NOT EXISTS idx_shadow_signal_oos_a
+ON dds.shadow_signal (oos_a_stoch_08) WHERE oos_a_stoch_08 = TRUE;
+CREATE INDEX IF NOT EXISTS idx_shadow_signal_oos_b
+ON dds.shadow_signal (oos_b_stoch_08_vol_10) WHERE oos_b_stoch_08_vol_10 = TRUE;
+CREATE INDEX IF NOT EXISTS idx_shadow_signal_oos_c
+ON dds.shadow_signal (oos_c_stoch_06_vol_10) WHERE oos_c_stoch_06_vol_10 = TRUE;
+
 -- Indexes for analysis and backfill
 CREATE INDEX IF NOT EXISTS idx_shadow_signal_experiment ON dds.shadow_signal (experiment_id);
 CREATE INDEX IF NOT EXISTS idx_shadow_signal_symbol ON dds.shadow_signal (symbol, signal_time DESC);
@@ -207,3 +223,100 @@ WHERE o.experiment_id = 'ATR_WICK_REJECTION_SHORT_V1'
 GROUP BY o.symbol, CASE WHEN o.mfe_60m > 0 THEN 'profitable' ELSE 'losing' END
 HAVING COUNT(*) >= 2
 ORDER BY o.symbol, outcome;
+
+-- ============================================================
+-- OOS Filter Analysis View
+-- ============================================================
+-- For each OOS filter variant, compute N, coverage, avg/median MFE/MAE,
+-- target hit rates, and per-symbol breakdown.
+-- ============================================================
+
+-- OOS filter summary by variant
+CREATE OR REPLACE VIEW dds.v_shadow_oos_filter_summary AS
+WITH oos_variants AS (
+    SELECT
+        s.signal_id, s.symbol, s.stoch_rsi, s.volume_ratio, s.signal_time,
+        o.mfe_60m, o.mae_60m, o.reached_minus_0_5, o.reached_minus_1_0,
+        o.reached_minus_1_5, o.reached_minus_2_0,
+        'A: stoch>=0.8' AS variant,
+        s.oos_a_stoch_08 AS passes
+    FROM dds.shadow_signal s
+    JOIN dds.shadow_signal_outcome o ON o.signal_id = s.signal_id
+    WHERE s.experiment_id = 'ATR_WICK_REJECTION_SHORT_V1'
+      AND o.mfe_60m IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        s.signal_id, s.symbol, s.stoch_rsi, s.volume_ratio, s.signal_time,
+        o.mfe_60m, o.mae_60m, o.reached_minus_0_5, o.reached_minus_1_0,
+        o.reached_minus_1_5, o.reached_minus_2_0,
+        'B: stoch>=0.8 & vol<=1.0' AS variant,
+        s.oos_b_stoch_08_vol_10 AS passes
+    FROM dds.shadow_signal s
+    JOIN dds.shadow_signal_outcome o ON o.signal_id = s.signal_id
+    WHERE s.experiment_id = 'ATR_WICK_REJECTION_SHORT_V1'
+      AND o.mfe_60m IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        s.signal_id, s.symbol, s.stoch_rsi, s.volume_ratio, s.signal_time,
+        o.mfe_60m, o.mae_60m, o.reached_minus_0_5, o.reached_minus_1_0,
+        o.reached_minus_1_5, o.reached_minus_2_0,
+        'C: stoch>=0.6 & vol<=1.0' AS variant,
+        s.oos_c_stoch_06_vol_10 AS passes
+    FROM dds.shadow_signal s
+    JOIN dds.shadow_signal_outcome o ON o.signal_id = s.signal_id
+    WHERE s.experiment_id = 'ATR_WICK_REJECTION_SHORT_V1'
+      AND o.mfe_60m IS NOT NULL
+)
+SELECT
+    variant,
+    COUNT(*) AS n,
+    COUNT(*) FILTER (WHERE passes) AS passing,
+    ROUND(COUNT(*) FILTER (WHERE passes)::numeric / COUNT(*), 4) AS coverage,
+    -- Among passing signals
+    ROUND(AVG(mfe_60m) FILTER (WHERE passes AND mfe_60m > 0), 4) AS avg_mfe_good,
+    ROUND(AVG(mae_60m) FILTER (WHERE passes AND mfe_60m > 0), 4) AS avg_mae_good,
+    ROUND(AVG(mfe_60m) FILTER (WHERE passes AND mfe_60m <= 0), 4) AS avg_mfe_bad,
+    ROUND(AVG(mae_60m) FILTER (WHERE passes AND mfe_60m <= 0), 4) AS avg_mae_bad,
+    ROUND(
+        COUNT(*) FILTER (WHERE passes AND mfe_60m > 0)::numeric /
+        NULLIF(COUNT(*) FILTER (WHERE passes AND mfe_60m <= 0), 0),
+        4
+    ) AS good_bad_ratio,
+    -- Target hit rates among passing signals
+    ROUND(COUNT(*) FILTER (WHERE passes AND reached_minus_0_5)::numeric /
+          NULLIF(COUNT(*) FILTER (WHERE passes), 0), 4) AS hit_0_5_pct,
+    ROUND(COUNT(*) FILTER (WHERE passes AND reached_minus_1_0)::numeric /
+          NULLIF(COUNT(*) FILTER (WHERE passes), 0), 4) AS hit_1_0_pct,
+    ROUND(COUNT(*) FILTER (WHERE passes AND reached_minus_1_5)::numeric /
+          NULLIF(COUNT(*) FILTER (WHERE passes), 0), 4) AS hit_1_5_pct,
+    ROUND(COUNT(*) FILTER (WHERE passes AND reached_minus_2_0)::numeric /
+          NULLIF(COUNT(*) FILTER (WHERE passes), 0), 4) AS hit_2_0_pct
+FROM oos_variants
+GROUP BY variant
+ORDER BY variant;
+
+-- OOS per-symbol breakdown for variant A (as example)
+CREATE OR REPLACE VIEW dds.v_shadow_oos_by_symbol AS
+SELECT
+    s.symbol,
+    COUNT(*) AS n,
+    COUNT(*) FILTER (WHERE s.oos_a_stoch_08) AS a_pass,
+    COUNT(*) FILTER (WHERE s.oos_b_stoch_08_vol_10) AS b_pass,
+    COUNT(*) FILTER (WHERE s.oos_c_stoch_06_vol_10) AS c_pass,
+    ROUND(AVG(o.mfe_60m) FILTER (WHERE s.oos_a_stoch_08), 4) AS avg_mfe_a,
+    ROUND(AVG(o.mfe_60m) FILTER (WHERE s.oos_b_stoch_08_vol_10), 4) AS avg_mfe_b,
+    ROUND(AVG(o.mfe_60m) FILTER (WHERE s.oos_c_stoch_06_vol_10), 4) AS avg_mfe_c,
+    ROUND(AVG(o.mae_60m) FILTER (WHERE s.oos_a_stoch_08), 4) AS avg_mae_a,
+    ROUND(AVG(o.mae_60m) FILTER (WHERE s.oos_b_stoch_08_vol_10), 4) AS avg_mae_b,
+    ROUND(AVG(o.mae_60m) FILTER (WHERE s.oos_c_stoch_06_vol_10), 4) AS avg_mae_c
+FROM dds.shadow_signal s
+JOIN dds.shadow_signal_outcome o ON o.signal_id = s.signal_id
+WHERE s.experiment_id = 'ATR_WICK_REJECTION_SHORT_V1'
+  AND o.mfe_60m IS NOT NULL
+GROUP BY s.symbol
+HAVING COUNT(*) >= 3
+ORDER BY COUNT(*) DESC;
