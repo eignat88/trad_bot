@@ -1,3 +1,3 @@
-from .bybit_client import BybitClient, BybitError
+from .bybit_client import BybitClient, BybitError, _RateLimiter
 
-__all__ = ["BybitClient", "BybitError"]
+__all__ = ["BybitClient", "BybitError", "_RateLimiter"]

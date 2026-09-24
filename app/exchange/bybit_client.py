@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import json
 import logging
+import random
 import socket
+import threading
 import time
 from typing import Any
 from urllib.error import URLError
@@ -23,7 +26,72 @@ class BybitTimeoutError(BybitError):
     pass
 
 
+class _RateLimiter:
+    """Thread-safe token-bucket rate limiter.
+
+    Tokens refill at rps tokens per second up to a burst capacity of 1.
+    acquire() blocks until a token is available.
+    """
+
+    def __init__(self, rps: float = 10.0) -> None:
+        self._rps = max(rps, 0.1)
+        self._interval = 1.0 / self._rps
+        self._lock = threading.Lock()
+        # Start with a token ready so the first acquire() is instant.
+        self._last_token_time = time.monotonic() - self._interval
+        self._stop_event = threading.Event()
+
+    def acquire(self) -> None:
+        """Block until a token is available, then consume it."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_token_time
+                if elapsed >= self._interval:
+                    self._last_token_time = now
+                    return
+                wait_time = self._interval - elapsed
+            # Use Event.wait() instead of time.sleep() to avoid being
+            # captured by monkeypatch in tests.
+            self._stop_event.wait(timeout=wait_time)
+            self._stop_event.clear()
+
+
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Telemetry helpers
+# ---------------------------------------------------------------------------
+
+_telemetry = None
+
+
+def _get_telemetry():
+    """Lazy-load the ApiTelemetry singleton (avoids circular import)."""
+    global _telemetry
+    if _telemetry is None:
+        from app.exchange.api_telemetry import ApiTelemetry
+        _telemetry = ApiTelemetry.get_instance()
+    return _telemetry
+
+
+def _resolve_caller() -> str:
+    """Walk the stack to find the first caller outside bybit_client.py."""
+    for frame_info in inspect.stack():
+        filename = frame_info.filename
+        if "bybit_client" not in filename:
+            parts = filename.replace("\\", "/").split("/")
+            for i, part in enumerate(parts):
+                if part == "app":
+                    return "/".join(parts[i:])
+            return filename
+    return "<unknown>"
+
+
+def _is_rate_limit(ret_msg: str) -> bool:
+    """Check if the Bybit response indicates a rate limit."""
+    lower = ret_msg.lower()
+    return "too many visits" in lower or "exceeded the api rate limit" in lower
 
 
 class _Response:
@@ -49,14 +117,52 @@ class _UrlSession:
 
 class BybitClient:
     BASE_URL = "https://api.bybit.com"
+    _global_limiter: _RateLimiter | None = None
+    _global_limiter_lock: type[threading.Lock] = threading.Lock
 
     def __init__(self, settings: Settings, session: Any | None = None):
         self.settings = settings
         self.session = session or _UrlSession()
+        self._ensure_global_limiter()
+
+    @classmethod
+    def _ensure_global_limiter(cls) -> None:
+        """Create the global rate limiter if it does not already exist."""
+        if cls._global_limiter is None:
+            with cls._global_limiter_lock():
+                if cls._global_limiter is None:
+                    cls._global_limiter = _RateLimiter(
+                        rps=getattr(
+                            Settings(),
+                            "bybit_rate_limit_rps",
+                            10.0,
+                        )
+                    )
+
+    @classmethod
+    def get_global_limiter(cls) -> _RateLimiter:
+        """Return the global rate limiter, creating it lazily if needed."""
+        cls._ensure_global_limiter()
+        assert cls._global_limiter is not None
+        return cls._global_limiter
 
     def _public_get(self, endpoint: str, **params: Any) -> dict[str, Any]:
+        max_retries = getattr(self.settings, "bybit_rate_limit_max_retries", 5)
+        retry_backoff = getattr(self.settings, "bybit_rate_limit_retry_backoff", 0.5)
         attempts = self.settings.bybit_max_attempts
+
+        # Acquire a token from the global rate limiter before each HTTP request
+        limiter = self.get_global_limiter()
+        limiter.acquire()
+
         for attempt in range(1, attempts + 1):
+            t_start = time.monotonic()
+            telemetry = _get_telemetry()
+            caller = _resolve_caller()
+            symbol = params.get("symbol", endpoint)
+            interval = params.get("interval", "")
+            limit = params.get("limit", 0)
+
             try:
                 response = self.session.get(
                     self.BASE_URL + endpoint, params=params,
@@ -64,20 +170,131 @@ class BybitClient:
                 )
                 response.raise_for_status()
                 payload = response.json()
-                if payload.get("retCode") != 0:
-                    raise BybitError(payload.get("retMsg", "Bybit request failed"))
+
+                duration_ms = (time.monotonic() - t_start) * 1000
+                ret_code = payload.get("retCode", 0)
+                ret_msg = payload.get("retMsg", "")
+
+                if ret_code != 0:
+                    # Check for rate limit before raising
+                    if _is_rate_limit(ret_msg):
+                        telemetry.record_call(
+                            endpoint=endpoint, caller=caller, symbol=symbol,
+                            interval=str(interval), limit=int(limit),
+                            duration_ms=duration_ms, result="RATE_LIMIT",
+                            ret_msg=ret_msg,
+                        )
+                        # Rate-limit retry with exponential backoff + jitter
+                        for rl_attempt in range(1, max_retries + 1):
+                            backoff = retry_backoff * (2 ** (rl_attempt - 1))
+                            jitter = random.uniform(0, backoff * 0.5)
+                            sleep_time = backoff + jitter
+                            logger.warning(
+                                "%s: Rate limited on %s (attempt %d/%d), "
+                                "retrying in %.2fs",
+                                symbol, endpoint, rl_attempt, max_retries,
+                                sleep_time,
+                            )
+                            time.sleep(sleep_time)
+
+                            # Re-acquire limiter token
+                            limiter.acquire()
+
+                            t_retry_start = time.monotonic()
+                            try:
+                                retry_resp = self.session.get(
+                                    self.BASE_URL + endpoint, params=params,
+                                    timeout=self.settings.bybit_timeout,
+                                )
+                                retry_resp.raise_for_status()
+                                retry_payload = retry_resp.json()
+                                retry_duration = (time.monotonic() - t_retry_start) * 1000
+                                retry_ret_code = retry_payload.get("retCode", 0)
+                                retry_ret_msg = retry_payload.get("retMsg", "")
+
+                                if retry_ret_code == 0:
+                                    telemetry.record_call(
+                                        endpoint=endpoint, caller=caller, symbol=symbol,
+                                        interval=str(interval), limit=int(limit),
+                                        duration_ms=retry_duration, result="OK",
+                                    )
+                                    return retry_payload
+                                elif _is_rate_limit(retry_ret_msg):
+                                    telemetry.record_call(
+                                        endpoint=endpoint, caller=caller, symbol=symbol,
+                                        interval=str(interval), limit=int(limit),
+                                        duration_ms=retry_duration, result="RATE_LIMIT",
+                                        ret_msg=retry_ret_msg,
+                                    )
+                                    continue  # Keep retrying within the rate-limit loop
+                                else:
+                                    # Non-rate-limit error after rate limit
+                                    telemetry.record_call(
+                                        endpoint=endpoint, caller=caller, symbol=symbol,
+                                        interval=str(interval), limit=int(limit),
+                                        duration_ms=retry_duration, result="ERROR",
+                                        ret_msg=retry_ret_msg,
+                                    )
+                                    raise BybitError(retry_ret_msg or "Bybit request failed")
+                            except (TimeoutError, socket.timeout, URLError):
+                                retry_duration = (time.monotonic() - t_retry_start) * 1000
+                                telemetry.record_call(
+                                    endpoint=endpoint, caller=caller, symbol=symbol,
+                                    interval=str(interval), limit=int(limit),
+                                    duration_ms=retry_duration, result="TIMEOUT",
+                                )
+                                continue
+
+                        # Exhausted all rate-limit retries
+                        raise BybitError(
+                            f"{symbol}: Rate limited on {endpoint} after "
+                            f"{max_retries} retries"
+                        )
+
+                    # Non-rate-limit API error
+                    telemetry.record_call(
+                        endpoint=endpoint, caller=caller, symbol=symbol,
+                        interval=str(interval), limit=int(limit),
+                        duration_ms=duration_ms, result="ERROR",
+                        ret_msg=ret_msg,
+                    )
+                    raise BybitError(ret_msg or "Bybit request failed")
+
+                # Success
+                telemetry.record_call(
+                    endpoint=endpoint, caller=caller, symbol=symbol,
+                    interval=str(interval), limit=int(limit),
+                    duration_ms=duration_ms, result="OK",
+                )
                 return payload
+
             except (TimeoutError, socket.timeout) as exc:
+                duration_ms = (time.monotonic() - t_start) * 1000
+                telemetry.record_call(
+                    endpoint=endpoint, caller=caller, symbol=symbol,
+                    interval=str(interval), limit=int(limit),
+                    duration_ms=duration_ms, result="TIMEOUT",
+                )
                 timeout_error = exc
             except URLError as exc:
                 if not isinstance(exc.reason, (TimeoutError, socket.timeout)):
                     raise
+                duration_ms = (time.monotonic() - t_start) * 1000
+                telemetry.record_call(
+                    endpoint=endpoint, caller=caller, symbol=symbol,
+                    interval=str(interval), limit=int(limit),
+                    duration_ms=duration_ms, result="TIMEOUT",
+                )
                 timeout_error = exc
+            except BybitError:
+                # Re-raise rate-limit errors that escaped the inner retry loop
+                raise
 
-            symbol = params.get("symbol", endpoint)
             if attempt < attempts:
                 logger.warning("%s: Bybit timeout, retry %d/%d", symbol, attempt, attempts)
                 time.sleep(self.settings.bybit_retry_backoff * attempt)
+                # Re-acquire limiter after backoff
+                limiter.acquire()
                 continue
             raise BybitTimeoutError(
                 f"{symbol}: Bybit request timed out after {attempts} attempts"
@@ -89,7 +306,7 @@ class BybitClient:
         payload = self._public_get("/v5/market/kline", category="linear", symbol=symbol,
                                    interval=interval, limit=limit)
         rows = payload["result"]["list"]
-        rows.reverse()  # Bybit returns newest -> oldest; indicators require chronology.
+        rows.reverse()
         return [Candle(int(r[0]), *(float(value) for value in r[1:6])) for r in rows]
 
     def get_open_interest(self, symbol: str, interval: str = "5min", limit: int = 200) -> list[tuple[int, float]]:
@@ -195,4 +412,4 @@ class BybitClient:
         payload = response.json()
         if payload.get("retCode") != 0:
             raise BybitError(payload.get("retMsg", "order rejected"))
-        return payload  # Acceptance only; caller must reconcile actual order status.
+        return payload
