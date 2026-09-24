@@ -11,6 +11,8 @@ Verifies:
 - Horizons fill only when enough future candles exist
 - No look-ahead in feature snapshot
 - Existing paper trading behaviour unchanged
+- Research capture works for BOTH gate-enabled and gate-blocked SRR LONG
+- Scanner runner handles _research_candidates without KeyError
 """
 from __future__ import annotations
 
@@ -579,3 +581,252 @@ class TestEvaluatorIdempotency:
         )
 
         assert result["status"] == "duplicate"
+
+
+# ── Tests: Orchestrator Research Capture (Gate Independent) ───
+
+def _make_srr_long_candidate(**overrides) -> SetupCandidate:
+    """Build a minimal SRR LONG SetupCandidate for orchestrator tests."""
+    defaults = dict(
+        scanner_name="SUPPORT_RESISTANCE_REACTION",
+        scanner_version="2.0.0",
+        symbol="ETHUSDT",
+        direction="LONG",
+        htf_timeframe="1h",
+        setup_timeframe="15m",
+        entry_timeframe="5m",
+        detected_at=datetime(2026, 9, 24, 13, 39, 1, tzinfo=timezone.utc),
+        setup_started_at=datetime(2026, 9, 24, 13, 39, 1, tzinfo=timezone.utc),
+        signal_candle_open_time=1700000000000,
+        reference_price=3500.0,
+        entry_zone_low=3493.0,
+        entry_zone_high=3507.0,
+        invalidation_price=3482.5,
+        target_1=3530.0,
+        target_2=3545.0,
+        score=47.0,
+        market_regime="TREND_UP",
+        state=SetupState.SETUP_READY,
+        features={
+            "level_touch_count": 0.6,
+            "rejection_strength": 0.7,
+            "rr_ratio": 0.5,
+            "stop_distance_atr": 0.8,
+            "volume_spike": True,
+            "regime_alignment": 1.0,
+            "_raw_touch_count": 3,
+            "_raw_level_distance_pct": 0.15,
+            "_raw_atr": 1.5,
+            "_raw_atr_pct": 1.5,
+            "_raw_candle_range": 2.0,
+            "_raw_candle_body": 0.8,
+            "_raw_upper_wick": 0.3,
+            "_raw_lower_wick": 0.9,
+            "_raw_wick_body_ratio": 1.5,
+            "_raw_volume": 1500.0,
+            "_raw_volume_ratio": 1.5,
+            "_raw_rr": 2.0,
+            "_raw_risk_distance": 0.5,
+            "_raw_risk_distance_pct": 0.5,
+            "_raw_stop_distance_atr": 0.33,
+            "_raw_level_type": "support",
+        },
+    )
+    defaults.update(overrides)
+    return SetupCandidate(**defaults)
+
+
+def _make_srr_short_candidate(**overrides) -> SetupCandidate:
+    """Build a minimal SRR SHORT SetupCandidate."""
+    defaults = dict(
+        scanner_name="SUPPORT_RESISTANCE_REACTION",
+        scanner_version="2.0.0",
+        symbol="ETHUSDT",
+        direction="SHORT",
+        htf_timeframe="1h",
+        setup_timeframe="15m",
+        entry_timeframe="5m",
+        detected_at=datetime(2026, 9, 24, 13, 39, 1, tzinfo=timezone.utc),
+        setup_started_at=datetime(2026, 9, 24, 13, 39, 1, tzinfo=timezone.utc),
+        signal_candle_open_time=1700000000000,
+        reference_price=3500.0,
+        entry_zone_low=3493.0,
+        entry_zone_high=3507.0,
+        invalidation_price=3517.5,
+        target_1=3470.0,
+        target_2=3455.0,
+        score=47.0,
+        market_regime="TREND_DOWN",
+        state=SetupState.SETUP_READY,
+        features={"level_touch_count": 0.6, "_raw_touch_count": 3},
+    )
+    defaults.update(overrides)
+    return SetupCandidate(**defaults)
+
+
+class TestOrchestratorResearchCapture:
+    """Regression tests: SRR LONG capture is independent of direction gate.
+
+    The capture must happen after scoring + dedup + risk geometry + score gate,
+    but BEFORE direction gate and expectancy filter.
+    """
+
+    @pytest.fixture()
+    def mock_srr_scanner_long(self):
+        """ScannerOrchestrator with only SRR returning one LONG candidate."""
+        from app.scanners.orchestrator import ScannerOrchestrator
+        orch = ScannerOrchestrator(enabled_scanners=["SUPPORT_RESISTANCE_REACTION"])
+        srr = orch.scanners["SUPPORT_RESISTANCE_REACTION"]
+        candidate = _make_srr_long_candidate()
+        srr.scan = MagicMock(return_value=[candidate])
+        return orch
+
+    @pytest.fixture()
+    def mock_srr_scanner_short(self):
+        """ScannerOrchestrator with only SRR returning one SHORT candidate."""
+        from app.scanners.orchestrator import ScannerOrchestrator
+        orch = ScannerOrchestrator(enabled_scanners=["SUPPORT_RESISTANCE_REACTION"])
+        srr = orch.scanners["SUPPORT_RESISTANCE_REACTION"]
+        candidate = _make_srr_short_candidate()
+        srr.scan = MagicMock(return_value=[candidate])
+        return orch
+
+    @pytest.fixture()
+    def minimal_ctx(self):
+        """Minimal MarketContext for scan_all_with_stats."""
+        now = datetime.now(timezone.utc)
+        return MarketContext(
+            symbol="ETHUSDT",
+            candles_5m=(),
+            candles_15m=(),
+            candles_1h=(),
+            candles_4h=(),
+            indicators=IndicatorSnapshot(atr=1.5),
+            market_regime="TREND_UP",
+            levels=MarketLevels(),
+            evaluated_at=now,
+        )
+
+    def _make_gate(self, scanner_name: str, direction: str, allowed: bool):
+        """Create a gate policy with configurable allow/block."""
+        from app.scanners.direction_gate import (
+            ScannerDirectionGate, ScannerDirectionGatePolicy,
+        )
+        gates = {}
+        status = "ENABLED" if allowed else "BLOCKED"
+        gates[(scanner_name, direction)] = ScannerDirectionGate(
+            scanner_name, direction, status, reason="test",
+        )
+        # Add the other direction as well
+        other_dir = "SHORT" if direction == "LONG" else "LONG"
+        gates[(scanner_name, other_dir)] = ScannerDirectionGate(
+            scanner_name, other_dir, "ENABLED", reason="test",
+        )
+        return ScannerDirectionGatePolicy(gates, {})
+
+    def test_gate_enabled_srr_long_in_research(self, mock_srr_scanner_long, minimal_ctx):
+        """Gate ENABLED: SRR LONG stays in normal output AND appears in research."""
+        gate = self._make_gate("SUPPORT_RESISTANCE_REACTION", "LONG", allowed=True)
+        candidates, stats = mock_srr_scanner_long.scan_all_with_stats(
+            minimal_ctx, gate_policy=gate,
+        )
+        # Candidate should be in normal output (gate allowed)
+        longs = [c for c in candidates if c.scanner_name == "SUPPORT_RESISTANCE_REACTION"
+                 and c.direction == "LONG"
+                 and not c.features.get("_research_capture")]
+        assert len(longs) == 1, (
+            f"SRR LONG gate-allowed candidate missing from normal output. "
+            f"candidates={len(candidates)}, all={[c.direction for c in candidates]}"
+        )
+        # Research candidates must exist
+        research = stats.get("_research_candidates", [])
+        assert len(research) == 1, (
+            f"Expected 1 research candidate, got {len(research)}"
+        )
+        assert research[0].features["_research_capture"] is True
+        assert research[0].features["_research_capture_reason"] == "independent_research_capture"
+
+    def test_gate_blocked_srr_long_in_research(self, mock_srr_scanner_long, minimal_ctx):
+        """Gate BLOCKED: SRR LONG absent from tradeable output, still in research."""
+        gate = self._make_gate("SUPPORT_RESISTANCE_REACTION", "LONG", allowed=False)
+        candidates, stats = mock_srr_scanner_long.scan_all_with_stats(
+            minimal_ctx, gate_policy=gate,
+        )
+        # SRR LONG should be absent from normal tradeable output
+        tradeable = [c for c in candidates
+                     if c.scanner_name == "SUPPORT_RESISTANCE_REACTION"
+                     and c.direction == "LONG"
+                     and not c.features.get("_research_capture")
+                     and not c.features.get("_shadow_control")]
+        assert len(tradeable) == 0, (
+            f"SRR LONG gate-blocked candidate leaked into tradeable output! "
+            f"tradeable={[c.direction for c in tradeable]}"
+        )
+        # Research candidates must still exist
+        research = stats.get("_research_candidates", [])
+        assert len(research) == 1, (
+            f"Expected 1 research candidate despite gate BLOCKED, got {len(research)}"
+        )
+        assert research[0].features["_research_capture"] is True
+        assert research[0].scanner_name == "SUPPORT_RESISTANCE_REACTION"
+        assert research[0].direction == "LONG"
+
+    def test_srr_short_never_in_research(self, mock_srr_scanner_short, minimal_ctx):
+        """SRR SHORT must never appear in research_candidates."""
+        gate = self._make_gate("SUPPORT_RESISTANCE_REACTION", "SHORT", allowed=False)
+        candidates, stats = mock_srr_scanner_short.scan_all_with_stats(
+            minimal_ctx, gate_policy=gate,
+        )
+        research = stats.get("_research_candidates", [])
+        assert len(research) == 0, (
+            f"SRR SHORT should NOT be in research_candidates, got {len(research)}"
+        )
+
+    def test_research_candidates_always_present_in_stats(self, mock_srr_scanner_long, minimal_ctx):
+        """stats must always contain _research_candidates key (even if empty)."""
+        _, stats = mock_srr_scanner_long.scan_all_with_stats(minimal_ctx)
+        assert "_research_candidates" in stats, (
+            "_research_candidates key missing from stats dict"
+        )
+
+    def test_runner_handles_research_candidates_no_keyerror(self):
+        """scanner_runner stats loop must not KeyError on _research_candidates."""
+        symbol_stats = {
+            "SUPPORT_RESISTANCE_REACTION": {
+                "candidates_found": 1,
+                "errors_count": 0,
+                "duration_ms": 10.0,
+            },
+            "_research_candidates": [
+                _make_srr_long_candidate(),
+            ],
+        }
+        run_stats = {
+            "SUPPORT_RESISTANCE_REACTION": {
+                "symbols_scanned": 0, "candidates_found": 0,
+                "setups_saved": 0, "errors_count": 0, "duration_ms": 0.0,
+            },
+        }
+        # This must NOT raise KeyError
+        for name, values in symbol_stats.items():
+            if name.startswith("_"):
+                continue
+            stat = run_stats[name]
+            stat["symbols_scanned"] += 1
+            for field in ("candidates_found", "setups_saved", "errors_count", "duration_ms"):
+                if field in values:
+                    stat[field] += values[field]
+
+        assert run_stats["SUPPORT_RESISTANCE_REACTION"]["candidates_found"] == 1
+        assert run_stats["SUPPORT_RESISTANCE_REACTION"]["symbols_scanned"] == 1
+
+    def test_paper_trading_unchanged(self):
+        """SRR LONG + SHORT remain blocked. No execution gates changed."""
+        from app.config import Settings
+        settings = Settings()
+        blocked = set(settings.blocked_scanner_directions)
+        assert ("SUPPORT_RESISTANCE_REACTION", "LONG") in blocked
+        assert ("SUPPORT_RESISTANCE_REACTION", "SHORT") in blocked
+
+        from app.scanners.orchestrator import ScannerOrchestrator
+        assert "SUPPORT_RESISTANCE_REACTION" not in ScannerOrchestrator.SHADOW_CONTROL_SCANNERS
