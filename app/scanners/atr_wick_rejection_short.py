@@ -102,6 +102,10 @@ class WickRejectionSignal:
     volume_ratio: float
     # Filter results (for diagnostic)
     strict_pass: bool = False
+    # OOS filter flags
+    oos_a_stoch_08: bool = False
+    oos_b_stoch_08_vol_10: bool = False
+    oos_c_stoch_06_vol_10: bool = False
     # Metadata
     signal_version: str = SCANNER_VERSION
 
@@ -272,7 +276,10 @@ class AtrWickRejectionShortScanner:
             ema_slow=ema_slow,
             ema_slope=ema_slope_val,
             volume_ratio=vol_ratio,
-            strict_pass=False,  # Will be set by detect_signal if all filters pass
+            strict_pass=False,
+            oos_a_stoch_08=stoch_rsi is not None and stoch_rsi >= 0.8,
+            oos_b_stoch_08_vol_10=(stoch_rsi is not None and stoch_rsi >= 0.8 and vol_ratio <= 1.0),
+            oos_c_stoch_06_vol_10=(stoch_rsi is not None and stoch_rsi >= 0.6 and vol_ratio <= 1.0),
             signal_version=SCANNER_VERSION,
         )
 

@@ -194,6 +194,9 @@ class ShadowScannerRunner:
             ema_slow=raw.ema_slow, ema_slope=raw.ema_slope,
             volume_ratio=raw.volume_ratio,
             strict_pass=strict,
+            oos_a_stoch_08=raw.oos_a_stoch_08,
+            oos_b_stoch_08_vol_10=raw.oos_b_stoch_08_vol_10,
+            oos_c_stoch_06_vol_10=raw.oos_c_stoch_06_vol_10,
             signal_version=raw.signal_version,
         )
         return candidate, False
