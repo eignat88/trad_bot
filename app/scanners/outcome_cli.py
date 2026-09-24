@@ -15,6 +15,7 @@ from dataclasses import asdict
 from app.config import load_settings
 from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
+from app.exchange.api_telemetry import ApiTelemetry
 from app.models import Candle
 from app.scanners.models import SetupCandidate
 from app.scanners.outcome import SignalOutcome, evaluate_setup_outcome
@@ -207,6 +208,11 @@ def main() -> None:
     )
     # Schema must already exist from deployment migrations — no ensure_schema().
     client = BybitClient(settings)
+
+    # Begin API telemetry cycle for outcome evaluator
+    telemetry = ApiTelemetry.get_instance()
+    telemetry.begin_cycle()
+
     try:
         evaluated, failed = process_pending_outcomes(
             repository,
@@ -219,6 +225,15 @@ def main() -> None:
             scanner_filter=args.scanner,
         )
     finally:
+        # End API telemetry cycle for outcome evaluator
+        outcome_summary = telemetry.end_cycle()
+        if outcome_summary.total_calls > 0:
+            logger.info(
+                "outcome_cycle api_telemetry: total_calls=%d success=%d "
+                "rate_limited=%d peak_rps=%.1f",
+                outcome_summary.total_calls, outcome_summary.success,
+                outcome_summary.rate_limited, outcome_summary.peak_rps,
+            )
         repository.close()
     print(f"outcomes evaluated={evaluated} failed={failed} dry_run={args.dry_run}")
 

@@ -29,6 +29,7 @@ from app.config import Settings, load_settings
 from app.config.settings import get_dca_source
 from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
+from app.exchange.api_telemetry import ApiTelemetry
 from app.paper.engine import PaperTradingEngine
 from app.paper.position_monitor import PositionMonitor
 from app.paper.shadow_engine import ShadowPaperEngine
@@ -571,9 +572,15 @@ def main() -> None:
     interval = settings.paper_scan_interval
     last_heartbeat_log = time.monotonic()
 
+    # Begin API telemetry for paper runner
+    telemetry = ApiTelemetry.get_instance()
+
     while not SHUTDOWN:
         cycle += 1
         start = time.monotonic()
+
+        # Begin API telemetry cycle for paper
+        telemetry.begin_cycle(symbols=list(engine.open_trades.keys()))
 
         # Keepalive ping
         if not repo.ping():
@@ -628,6 +635,17 @@ def main() -> None:
 
         # Sleep in small intervals to respond to shutdown
         delay = max(0, interval - (time.monotonic() - start))
+
+        # End API telemetry cycle for paper
+        paper_summary = telemetry.end_cycle()
+        if paper_summary.total_calls > 0:
+            logger.info(
+                "paper_cycle #%d api_telemetry: total_calls=%d success=%d "
+                "rate_limited=%d peak_rps=%.1f",
+                cycle, paper_summary.total_calls, paper_summary.success,
+                paper_summary.rate_limited, paper_summary.peak_rps,
+            )
+
         for _ in range(int(delay)):
             if SHUTDOWN:
                 break

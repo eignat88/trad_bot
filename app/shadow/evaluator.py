@@ -24,6 +24,7 @@ from typing import Any
 from app.config import load_settings
 from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
+from app.exchange.api_telemetry import ApiTelemetry
 from app.models import Candle
 from app.shadow.repository import ShadowSignalRepository
 
@@ -290,6 +291,9 @@ class ShadowSignalEvaluator:
         now = datetime.now(timezone.utc)
         start = now
 
+        # Begin API telemetry cycle for shadow evaluator
+        telemetry = ApiTelemetry.get_instance()
+
         eligible = self.repo.get_eligible_signals(limit=5000)
 
         by_symbol: dict[str, list[dict]] = {}
@@ -330,6 +334,17 @@ class ShadowSignalEvaluator:
             stats["finalized"], stats["errors"],
         )
         logger.info("Horizons: %s", stats["horizons_updated"])
+
+        # End API telemetry cycle for shadow evaluator
+        eval_summary = telemetry.end_cycle()
+        if eval_summary.total_calls > 0:
+            logger.info(
+                "evaluator_cycle api_telemetry: total_calls=%d success=%d "
+                "rate_limited=%d peak_rps=%.1f",
+                eval_summary.total_calls, eval_summary.success,
+                eval_summary.rate_limited, eval_summary.peak_rps,
+            )
+
         return stats
 
     # ── lifecycle ─────────────────────────────────────────────

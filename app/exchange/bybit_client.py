@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import socket
@@ -24,6 +25,30 @@ class BybitTimeoutError(BybitError):
 
 
 logger = logging.getLogger(__name__)
+
+# ── Lazy telemetry import (avoids circular imports) ──────────────
+_telemetry = None
+
+
+def _get_telemetry():
+    global _telemetry
+    if _telemetry is None:
+        from app.exchange.api_telemetry import ApiTelemetry
+        _telemetry = ApiTelemetry.get_instance()
+    return _telemetry
+
+
+def _resolve_caller() -> str:
+    """Walk the call stack to find the first caller outside bybit_client.py."""
+    for frame_info in inspect.stack():
+        filename = frame_info.filename
+        if "bybit_client" not in filename:
+            # Return module.func format
+            module = inspect.getmodule(frame_info.frame)
+            mod_name = module.__name__ if module else "unknown"
+            func_name = frame_info.function
+            return f"{mod_name}.{func_name}"
+    return "unknown"
 
 
 class _Response:
@@ -55,8 +80,15 @@ class BybitClient:
         self.session = session or _UrlSession()
 
     def _public_get(self, endpoint: str, **params: Any) -> dict[str, Any]:
+        telemetry = _get_telemetry()
+        caller = _resolve_caller()
+        symbol = params.get("symbol", "")
+        interval = params.get("interval", params.get("intervalTime", ""))
+        limit = params.get("limit", 0)
+
         attempts = self.settings.bybit_max_attempts
         for attempt in range(1, attempts + 1):
+            t_start = time.monotonic()
             try:
                 response = self.session.get(
                     self.BASE_URL + endpoint, params=params,
@@ -64,17 +96,59 @@ class BybitClient:
                 )
                 response.raise_for_status()
                 payload = response.json()
+                duration_ms = (time.monotonic() - t_start) * 1000
+
                 if payload.get("retCode") != 0:
-                    raise BybitError(payload.get("retMsg", "Bybit request failed"))
+                    ret_msg = payload.get("retMsg", "Bybit request failed")
+                    # Detect rate limit from retMsg
+                    if "Too many visits" in ret_msg or "Rate Limit" in ret_msg:
+                        telemetry.record_call(
+                            endpoint=endpoint, caller=caller, symbol=symbol,
+                            interval=str(interval), limit=limit,
+                            duration_ms=duration_ms, result="RATE_LIMIT",
+                            ret_msg=ret_msg,
+                        )
+                    else:
+                        telemetry.record_call(
+                            endpoint=endpoint, caller=caller, symbol=symbol,
+                            interval=str(interval), limit=limit,
+                            duration_ms=duration_ms, result="ERROR",
+                            ret_msg=ret_msg,
+                        )
+                    raise BybitError(ret_msg)
+
+                telemetry.record_call(
+                    endpoint=endpoint, caller=caller, symbol=symbol,
+                    interval=str(interval), limit=limit,
+                    duration_ms=duration_ms, result="OK",
+                )
                 return payload
+
             except (TimeoutError, socket.timeout) as exc:
                 timeout_error = exc
             except URLError as exc:
                 if not isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                    # Non-timeout URL error — record and re-raise
+                    duration_ms = (time.monotonic() - t_start) * 1000
+                    telemetry.record_call(
+                        endpoint=endpoint, caller=caller, symbol=symbol,
+                        interval=str(interval), limit=limit,
+                        duration_ms=duration_ms, result="ERROR",
+                        ret_msg=str(exc),
+                    )
                     raise
                 timeout_error = exc
 
-            symbol = params.get("symbol", endpoint)
+            # Timeout on this attempt
+            duration_ms = (time.monotonic() - t_start) * 1000
+            if attempt == attempts:
+                telemetry.record_call(
+                    endpoint=endpoint, caller=caller, symbol=symbol,
+                    interval=str(interval), limit=limit,
+                    duration_ms=duration_ms, result="TIMEOUT",
+                    ret_msg=f"timeout after {attempts} attempts",
+                )
+
             if attempt < attempts:
                 logger.warning("%s: Bybit timeout, retry %d/%d", symbol, attempt, attempts)
                 time.sleep(self.settings.bybit_retry_backoff * attempt)

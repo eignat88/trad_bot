@@ -8,6 +8,7 @@ from typing import Any, Optional
 from app.analytics.models import Candle, CandleRange, Gap, Watermark, QualityStatus
 from app.analytics.repository import AnalyticsRepository
 from app.exchange.bybit_client import BybitClient
+from app.exchange.api_telemetry import ApiTelemetry
 
 logger = logging.getLogger(__name__)
 

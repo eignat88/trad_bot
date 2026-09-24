@@ -22,6 +22,7 @@ from typing import Any
 from app.config import Settings, load_settings
 from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient, BybitError
+from app.exchange.api_telemetry import ApiTelemetry
 from app.models import Candle
 from app.scanners.atr_wick_rejection_short import AtrWickRejectionShortScanner, WickRejectionSignal
 from app.scanners.models import IndicatorSnapshot, MarketContext, MarketLevels
@@ -243,6 +244,10 @@ class ShadowScannerRunner:
         start_time = datetime.now(timezone.utc)
         symbols = self._get_universe_symbols()
 
+        # Begin API telemetry cycle for shadow runner
+        telemetry = ApiTelemetry.get_instance()
+        telemetry.begin_cycle(symbols=symbols)
+
         # ── Phase 1: parallel market fetch + detection ────────
         candidates: list[WickRejectionSignal] = []
         raw_count = 0
@@ -305,6 +310,16 @@ class ShadowScannerRunner:
             len(symbols), raw_count, strict_count,
             inserted, duplicates, scan_errors, db_errors, rate_limit_retries,
         )
+
+        # End API telemetry cycle for shadow runner
+        shadow_summary = telemetry.end_cycle()
+        if shadow_summary.total_calls > 0:
+            logger.info(
+                "shadow_cycle api_telemetry: total_calls=%d success=%d "
+                "rate_limited=%d peak_rps=%.1f",
+                shadow_summary.total_calls, shadow_summary.success,
+                shadow_summary.rate_limited, shadow_summary.peak_rps,
+            )
 
         return summary
 

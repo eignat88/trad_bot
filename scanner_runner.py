@@ -17,6 +17,7 @@ from typing import Any
 from app.config import Settings, load_settings
 from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
+from app.exchange.api_telemetry import ApiTelemetry
 from app.scanners.context_builder import build_market_context
 from app.scanners.direction_gate import ScannerDirectionGatePolicy
 from app.scanners.expectancy_filter import ExpectancyFilter, load_expectancy
@@ -374,6 +375,11 @@ def main() -> None:
         cycle += 1
         start = time.monotonic()
         t_universe_done = start
+
+        # Begin API telemetry cycle
+        telemetry = ApiTelemetry.get_instance()
+        telemetry.begin_cycle(symbols=symbols)
+
         logger.info(
             "cycle #%d phase: universe_refresh=%.2fs",
             cycle, t_universe_done - t_phase_start,
@@ -462,6 +468,17 @@ def main() -> None:
                 except Exception:
                     logger.warning("could not record failed run status")
                     repository.reconnect()
+
+        # End API telemetry cycle and log summary
+        cycle_summary = telemetry.end_cycle()
+        logger.info(
+            "cycle #%d api_telemetry: total_calls=%d success=%d rate_limited=%d "
+            "peak_rps=%.1f duration=%.1fs avg_calls_per_symbol=%.1f",
+            cycle, cycle_summary.total_calls, cycle_summary.success,
+            cycle_summary.rate_limited, cycle_summary.peak_rps,
+            cycle_summary.duration_sec,
+            cycle_summary.total_calls / max(1, len(symbols)),
+        )
 
         # Sleep in small intervals to respond to shutdown
         delay = seconds_until_next_cycle(
