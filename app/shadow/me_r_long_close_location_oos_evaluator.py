@@ -31,22 +31,30 @@ class MERLongCLoOosEvaluator:
         self.repo = repo
         self.client = client
 
-    def evaluate_pending(self, limit: int = 100) -> int:
-        """Evaluate pending signals and return count of evaluated signals."""
+    def evaluate_pending(self, limit: int = 100) -> dict[str, int]:
+        """Evaluate pending signals and return stats.
+
+        Returns dict with:
+        - checked: number of eligible signals checked
+        - updated: number of signals with at least one horizon updated
+        - errors: number of signals that failed evaluation
+        """
         eligible = self.repo.get_eligible_signals(limit=limit)
-        evaluated = 0
+        stats = {"checked": 0, "updated": 0, "errors": 0}
 
         for signal in eligible:
+            stats["checked"] += 1
             try:
                 self._evaluate_signal(signal)
-                evaluated += 1
+                stats["updated"] += 1
             except Exception:
+                stats["errors"] += 1
                 logger.exception(
                     "Failed to evaluate signal %d for %s",
                     signal["signal_id"], signal["symbol"],
                 )
 
-        return evaluated
+        return stats
 
     def _evaluate_signal(self, signal: dict) -> None:
         """Evaluate a single signal across all horizons."""
