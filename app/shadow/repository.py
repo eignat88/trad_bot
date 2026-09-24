@@ -67,7 +67,7 @@ class ShadowSignalRepository:
                     ema_fast, ema_medium, ema_slow, ema_slope,
                     volume_ratio, strict_pass,
                     oos_a_stoch_08, oos_b_stoch_08_vol_10, oos_c_stoch_06_vol_10,
-                    signal_version
+                    oos_filter_version, signal_version
                 ) VALUES (
                     'ATR_WICK_REJECTION_SHORT_V1', %s, '5m', %s, %s,
                     %s, %s, %s, %s, %s,
@@ -78,7 +78,7 @@ class ShadowSignalRepository:
                     %s, %s, %s, %s,
                     %s, %s,
                     %s, %s, %s,
-                    %s
+                    %s, %s
                 )
                 ON CONFLICT (experiment_id, symbol, signal_time) DO NOTHING
                 RETURNING signal_id
@@ -114,6 +114,7 @@ class ShadowSignalRepository:
                     signal.oos_a_stoch_08,
                     signal.oos_b_stoch_08_vol_10,
                     signal.oos_c_stoch_06_vol_10,
+                    signal.oos_filter_version,
                     signal.signal_version,
                 ),
             )

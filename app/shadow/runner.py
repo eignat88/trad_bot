@@ -197,6 +197,7 @@ class ShadowScannerRunner:
             oos_a_stoch_08=raw.oos_a_stoch_08,
             oos_b_stoch_08_vol_10=raw.oos_b_stoch_08_vol_10,
             oos_c_stoch_06_vol_10=raw.oos_c_stoch_06_vol_10,
+            oos_filter_version=raw.oos_filter_version,
             signal_version=raw.signal_version,
         )
         return candidate, False

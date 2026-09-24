@@ -41,6 +41,7 @@ from app.scanners.models import MarketContext, ScannerDirection, SetupCandidate,
 # --- Configuration Constants ---
 SCANNER_NAME = "ATR_WICK_REJECTION_SHORT_V1"
 SCANNER_VERSION = "1.0.0"
+OOS_FILTER_VERSION = "ATR_WICK_FILTER_OOS_V1"
 
 # Wick rejection thresholds (CORE DETECTION — only wick size matters)
 WICK_ATR_THRESHOLD = 1.5  # Upper wick must be ≥1.5x ATR
@@ -106,6 +107,7 @@ class WickRejectionSignal:
     oos_a_stoch_08: bool = False
     oos_b_stoch_08_vol_10: bool = False
     oos_c_stoch_06_vol_10: bool = False
+    oos_filter_version: str | None = None
     # Metadata
     signal_version: str = SCANNER_VERSION
 
@@ -280,6 +282,7 @@ class AtrWickRejectionShortScanner:
             oos_a_stoch_08=stoch_rsi is not None and stoch_rsi >= 0.8,
             oos_b_stoch_08_vol_10=(stoch_rsi is not None and stoch_rsi >= 0.8 and vol_ratio <= 1.0),
             oos_c_stoch_06_vol_10=(stoch_rsi is not None and stoch_rsi >= 0.6 and vol_ratio <= 1.0),
+            oos_filter_version=OOS_FILTER_VERSION,
             signal_version=SCANNER_VERSION,
         )
 
