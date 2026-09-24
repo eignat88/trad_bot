@@ -475,5 +475,57 @@ class TestOOSIntegrity:
         source = inspect.getsource(ShadowScannerRunner._scan_symbol)
         assert "oos_filter_version=raw.oos_filter_version" in source
 
+    def test_legacy_signal_summary_columns(self):
+        """v_shadow_signal_summary preserves legacy column list and order."""
+        migration = Path("app/db/shadow_signal_migration.sql").read_text()
+        # Extract the view definition
+        idx = migration.find("CREATE OR REPLACE VIEW dds.v_shadow_signal_summary AS")
+        assert idx >= 0, "v_shadow_signal_summary not found in migration"
+        view_def = migration[idx:idx+600]
+        # Verify legacy columns exist in correct order
+        assert "avg_atr_pct" in view_def
+        assert "avg_rsi" in view_def
+        assert "avg_wick_atr" in view_def
+        assert "avg_close_location" in view_def
+        assert "avg_bb_width" in view_def
+        assert "avg_volume_ratio" in view_def
+        # Check column order
+        pos_atr = view_def.find("avg_atr_pct")
+        pos_rsi = view_def.find("avg_rsi")
+        pos_wick = view_def.find("avg_wick_atr")
+        pos_close = view_def.find("avg_close_location")
+        pos_bb = view_def.find("avg_bb_width")
+        pos_vol = view_def.find("avg_volume_ratio")
+        assert pos_atr < pos_rsi < pos_wick < pos_close < pos_bb < pos_vol
+
+    def test_legacy_mfe_mae_distribution_exists(self):
+        """v_shadow_mfe_mae_distribution is defined in migration."""
+        migration = Path("app/db/shadow_signal_migration.sql").read_text()
+        assert "CREATE OR REPLACE VIEW dds.v_shadow_mfe_mae_distribution" in migration
+        assert "pct_reached_0_5" in migration
+        assert "pct_reached_1_0" in migration
+        assert "pct_hit_0_5_adverse" in migration
+
+    def test_legacy_feature_comparison_exists(self):
+        """v_shadow_feature_comparison is defined in migration."""
+        migration = Path("app/db/shadow_signal_migration.sql").read_text()
+        assert "CREATE OR REPLACE VIEW dds.v_shadow_feature_comparison" in migration
+        assert "avg_distance_to_upper_bb" in migration
+        assert "avg_ema_slope" in migration
+
+    def test_oos_views_present(self):
+        """OOS views are still in migration."""
+        migration = Path("app/db/shadow_signal_migration.sql").read_text()
+        assert "CREATE OR REPLACE VIEW dds.v_shadow_oos_filter_summary" in migration
+        assert "CREATE OR REPLACE VIEW dds.v_shadow_oos_by_symbol" in migration
+        assert "oos_filter_version = 'ATR_WICK_FILTER_OOS_V1'" in migration
+
+    def test_migration_idempotent_no_destructive(self):
+        """Migration is safe to re-run: no destructive operations."""
+        migration = Path("app/db/shadow_signal_migration.sql").read_text()
+        assert "UPDATE dds.shadow_signal_outcome SET" not in migration
+        assert "DROP VIEW" not in migration
+        assert "DROP TABLE" not in migration
+
 
 from pathlib import Path
