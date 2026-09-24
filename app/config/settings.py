@@ -90,6 +90,9 @@ class Settings:
     bybit_timeout: float = 15.0
     bybit_max_attempts: int = 3
     bybit_retry_backoff: float = 1.0
+    bybit_rate_limit_rps: float = 10.0
+    bybit_rate_limit_max_retries: int = 5
+    bybit_rate_limit_retry_backoff: float = 0.5
     scanner_workers: int = 5
     scan_interval: int = 300
     signal_conflict_window: int = 600
@@ -480,6 +483,12 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         raise ValueError("db_name must not be empty")
     if settings.bybit_retry_backoff < 0:
         raise ValueError("bybit_retry_backoff cannot be negative")
+    if settings.bybit_rate_limit_rps <= 0:
+        raise ValueError("bybit_rate_limit_rps must be positive")
+    if settings.bybit_rate_limit_max_retries < 0:
+        raise ValueError("bybit_rate_limit_max_retries cannot be negative")
+    if settings.bybit_rate_limit_retry_backoff < 0:
+        raise ValueError("bybit_rate_limit_retry_backoff cannot be negative")
     if settings.initial_balance <= 0:
         raise ValueError("initial_balance must be positive")
     if not 0 < settings.risk_per_trade <= 1:
