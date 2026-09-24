@@ -1,0 +1,22 @@
+[Unit]
+Description=Trad Bot V2D Scanner - ATR Wick Filter OOS V2_D Prospective
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trad_bot
+EnvironmentFile=/opt/trad_bot/.env
+ExecStart=/opt/trad_bot/.venv/bin/python -m app.shadow.v2d_runner --interval-seconds 300
+
+Restart=on-failure
+RestartSec=10
+
+User=tradbot
+Group=tradbot
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
