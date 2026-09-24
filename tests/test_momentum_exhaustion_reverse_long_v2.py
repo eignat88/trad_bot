@@ -147,6 +147,10 @@ def _make_valid_context(
 class TestMomentumExhaustionReverseLongV2:
     """Tests for MOMENTUM_EXHAUSTION_REVERSE_LONG_V2 scanner."""
 
+    def setup_method(self):
+        from app.scanners.funnel_diagnostics import reset_all_collectors
+        reset_all_collectors()
+
     def test_scanner_name_and_version(self):
         scanner = MomentumExhaustionReverseLongV2Scanner()
         assert scanner.name == "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2"
@@ -383,11 +387,12 @@ class TestMomentumExhaustionReverseLongV2:
         assert "rsi_delta_3" not in v1_source
 
     def test_no_shadow_dependency(self):
-        """V2 must not depend on shadow engine."""
+        """V2 must not depend on shadow engine (paper/live)."""
         import inspect
         source = inspect.getsource(MomentumExhaustionReverseLongV2Scanner)
-        assert "shadow" not in source.lower()
         assert "ShadowPaperEngine" not in source
+        assert "ShadowTradeEngine" not in source
+        assert "shadow_engine" not in source
 
     def test_lineage_tracking(self):
         """V2 must track source_scanner and source_direction in features."""

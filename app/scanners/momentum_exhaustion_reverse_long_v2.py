@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from app.scanners.models import MarketContext, ScannerDirection, SetupCandidate, SetupState
 from app.scanners.swing_engine import find_swing_highs
 from app.indicators.technical import rsi_wilder
+from app.scanners.funnel_diagnostics import get_funnel_collector
 
 
 class MomentumExhaustionReverseLongV2Scanner:
@@ -136,55 +137,78 @@ class MomentumExhaustionReverseLongV2Scanner:
         return min(overshoot / 0.02, 1.0)
 
     def _scan_long(self, ctx: MarketContext) -> SetupCandidate | None:
-        """Bearish exhaustion detected → reversed direction: LONG.
+        """Bearish exhaustion detected -> reversed direction: LONG.
 
         Identical to V1 _scan_long, with one addition:
         rsi_delta_3 > 0 check before creating the setup.
+
+        -- SIGNAL_FUNNEL_DIAGNOSTICS_V1 (shadow-only) --
+        Every gate incrementally counts PASS/REJECT for observability.
+        No production behavior is changed.
         """
+        funnel = get_funnel_collector(self.name)
+        funnel.increment("TOTAL_SCANS")
+
         candles_15m, candles_5m = list(ctx.candles_15m), list(ctx.candles_5m)
         if len(candles_15m) < 30 or len(candles_5m) < 15:
+            funnel.increment("NO_DATA")
             return None
+        funnel.increment("PASS_DATA_LENGTH")
 
         swing_highs = find_swing_highs(candles_15m, self.swing_lookback)
         if len(swing_highs) < 2:
+            funnel.increment("NO_SWINGS")
             return None
+        funnel.increment("PASS_SWING_HIGHS")
         prev_high = swing_highs[-2].price
 
         recent_high = max(c.high for c in candles_5m[-5:])
         # Price broke above previous swing high
         if recent_high <= prev_high:
+            funnel.increment("NO_BREAKOUT")
             return None
+        funnel.increment("PASS_BREAK_PREV_HIGH")
 
         current_price = candles_5m[-1].close
         # Price came back near the previous high (not too far above)
         if current_price > prev_high * (1 + self.exhaustion_threshold):
+            funnel.increment("TOO_FAR_ABOVE_PREV_HIGH")
             return None
+        funnel.increment("PASS_RETURN_NEAR_HIGH")
 
         last = candles_5m[-1]
         # Bearish candle (exhaustion signal)
         if last.close > last.open:
+            funnel.increment("NOT_BEARISH")
             return None
+        funnel.increment("PASS_BEARISH_CANDLE")
         candle_range = last.high - last.low
         body = abs(last.close - last.open)
         if candle_range > 0 and body / candle_range > 0.7:
+            funnel.increment("BODY_TOO_LARGE")
             return None
+        funnel.increment("PASS_BODY_RATIO")
 
         # RSI overbought confirmation
         if ctx.indicators.rsi < 65:
+            funnel.increment("RSI_BELOW_65")
             return None
+        funnel.increment("PASS_RSI_65")
 
-        # ── V2 ADDITION: RSI rising confirmation ──
-        # Compute rsi_delta_3 from closed 5m candles only.
-        # This uses candles that are fully known at detected_at — no look-ahead.
+        # -- V2 ADDITION: RSI rising confirmation --
         rsi_delta_3 = self._compute_rsi_delta_3(candles_5m)
         if rsi_delta_3 is None:
-            return None  # insufficient data to compute RSI delta
+            funnel.increment("RSI_DELTA_MISSING")
+            return None
+        funnel.increment("PASS_RSI_DELTA_AVAILABLE")
         if rsi_delta_3 <= 0:
-            return None  # RSI not rising — reject setup
+            funnel.increment("RSI_DELTA_NOT_POSITIVE")
+            return None
+        funnel.increment("PASS_RSI_DELTA_POSITIVE")
 
         atr = ctx.indicators.atr if ctx.indicators.atr > 0 else (current_price * 0.015)
 
-        # ── Reversed direction: LONG ──
+        # -- Reversed direction: LONG --
         sl_pct = 0.025  # 2.5%
         tp_pct = 0.03   # 3.0%
 
@@ -205,6 +229,8 @@ class MomentumExhaustionReverseLongV2Scanner:
         features["hold_minutes"] = 240
         features["source_scanner"] = source_scanner
         features["source_direction"] = source_direction
+
+        funnel.increment("FINAL_SETUP")
 
         return SetupCandidate(
             scanner_name=self.name, scanner_version=self.version, symbol=ctx.symbol,
