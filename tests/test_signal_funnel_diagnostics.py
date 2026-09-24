@@ -202,6 +202,39 @@ class TestFunnelCollector:
         assert "TOTAL_SCANS" in text
         assert "NO_DATA" in text
 
+    def test_restore_merges_counters(self):
+        """restore() merges flushed counters back into collector."""
+        col = FunnelCollector("RESTORE_UNIT")
+        col.increment("TOTAL_SCANS")
+        col.increment("NO_DATA")
+
+        flushed, period_start = col.flush()
+        assert col.get_counters().TOTAL_SCANS == 0
+
+        # Simulate some new scans between flush and restore
+        col.increment("TOTAL_SCANS")
+
+        # Restore the flushed data
+        col.restore(flushed, period_start)
+
+        c = col.get_counters()
+        assert c.TOTAL_SCANS == 2  # 1 restored + 1 new
+        assert c.NO_DATA == 1      # 1 restored
+
+    def test_restore_keeps_earlier_period_start(self):
+        """restore() keeps the earlier period_start when merging."""
+        col = FunnelCollector("PERIOD_TEST")
+        col.increment("TOTAL_SCANS")
+
+        flushed, period_start = col.flush()
+        col.increment("TOTAL_SCANS")
+
+        col.restore(flushed, period_start)
+
+        # The period_start should be the earlier one (from flushed)
+        c = col.get_counters()
+        assert c.TOTAL_SCANS == 2
+
 
 # ── Global registry tests ──────────────────────────────────────────────
 
@@ -282,9 +315,10 @@ class TestFlushAndPersist:
         assert c.NO_DATA == 0
 
     def test_fail_open_on_db_error(self):
-        """DB exception does not raise — fail-open."""
+        """DB exception does not raise — fail-open, counters restored."""
         col = get_funnel_collector("FAIL_OPEN")
         col.increment("TOTAL_SCANS")
+        col.increment("NO_DATA")
 
         mock_repo = MagicMock()
         mock_repo.is_connected.return_value = True
@@ -293,9 +327,33 @@ class TestFlushAndPersist:
         # Should NOT raise
         flush_and_persist_all(mock_repo)
 
-        # Counters still flushed (reset)
+        # Counters RESTORED — not lost
         c = col.get_counters()
-        assert c.TOTAL_SCANS == 0
+        assert c.TOTAL_SCANS == 1
+        assert c.NO_DATA == 1
+
+    def test_fail_open_restores_counters_for_next_cycle(self):
+        """After DB failure, next successful persist includes restored counters."""
+        col = get_funnel_collector("RESTORE_TEST")
+        col.increment("TOTAL_SCANS")  # cycle 1
+
+        mock_repo = MagicMock()
+        mock_repo.is_connected.return_value = True
+        mock_repo.save_funnel_observation.side_effect = RuntimeError("DB down")
+
+        # Cycle 1 fails
+        flush_and_persist_all(mock_repo)
+        assert col.get_counters().TOTAL_SCANS == 1  # restored
+
+        # Cycle 2: more scans + successful persist
+        col.increment("TOTAL_SCANS")  # cycle 2
+        mock_repo.save_funnel_observation.side_effect = None  # reset
+
+        flush_and_persist_all(mock_repo)
+
+        # Persisted counters include both cycles
+        call_args = mock_repo.save_funnel_observation.call_args
+        assert call_args.kwargs["counters"].TOTAL_SCANS == 2  # 1 restored + 1 new
 
     def test_fail_open_on_no_repo(self):
         """None repository does not raise — fail-open."""
@@ -440,3 +498,40 @@ class TestV2FunnelIntegration:
         assert "ShadowPaperEngine" not in source
         assert "ShadowTradeEngine" not in source
         assert "shadow_engine" not in source
+
+
+# ── SQL placeholder validation tests ───────────────────────────────────
+
+class TestSQLPlaceholderValidation:
+    """Verify that save_funnel_observation uses positional %s, not named %(...)s."""
+
+    def test_no_named_placeholders_in_sql(self):
+        """SQL must not contain %(name)s pyformat placeholders."""
+        import inspect
+        from app.db.repository import ScannerRepository
+        source = inspect.getsource(ScannerRepository.save_funnel_observation)
+        # Named placeholders look like %(word)s — must not appear
+        import re
+        named = re.findall(r'%\(\w+\)s', source)
+        assert named == [], f"Found named placeholders: {named}"
+
+    def test_positional_placeholders_present(self):
+        """SQL must use positional %s placeholders."""
+        import inspect
+        from app.db.repository import ScannerRepository
+        source = inspect.getsource(ScannerRepository.save_funnel_observation)
+        # Should have many %s in the INSERT ... VALUES clause
+        assert source.count("%s") >= 20, (
+            f"Expected >= 20 positional %s placeholders, found {source.count('%s')}"
+        )
+
+    def test_params_is_tuple(self):
+        """Parameters passed to cursor.execute must be a tuple, not a dict."""
+        import inspect
+        from app.db.repository import ScannerRepository
+        source = inspect.getsource(ScannerRepository.save_funnel_observation)
+        # The execute call should pass `params,` (tuple), not `{"scanner": ...}`
+        assert 'params,' in source or 'params )' in source, (
+            "Expected positional tuple params, not dict"
+        )
+        assert '"scanner"' not in source, "Found dict-style params"

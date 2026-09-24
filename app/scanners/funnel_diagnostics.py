@@ -164,6 +164,24 @@ class FunnelCollector:
             self._period_start = datetime.now(timezone.utc)
             return flushed, period_start
 
+    def restore(self, counters: FunnelCounters, period_start: datetime) -> None:
+        """Restore flushed counters after a failed persist attempt.
+
+        Merges the restored counters INTO the current (empty or partially
+        accumulated) counters so that no data is lost.  The period_start
+        is reset to the earlier of the two timestamps.
+        """
+        with self._lock:
+            # Merge: add restored values to whatever accumulated since flush
+            for field in counters.__dataclass_fields__:
+                restored_val = getattr(counters, field)
+                if restored_val:
+                    current_val = getattr(self._current, field)
+                    setattr(self._current, field, current_val + restored_val)
+            # Keep the earlier period_start
+            if period_start < self._period_start:
+                self._period_start = period_start
+
     def summary_text(self) -> str:
         """Human-readable funnel summary for logging."""
         c = self.get_counters()
@@ -222,7 +240,16 @@ def reset_all_collectors() -> None:
 
 
 def flush_and_persist_all(repository: ScannerRepository | None) -> None:
-    """Flush all collectors and persist to PostgreSQL. Fail-open."""
+    """Flush all collectors and persist to PostgreSQL.
+
+    Atomic: counters are reset ONLY on successful DB write.
+    On failure, flushed counters are restored into the collector so
+    the next cycle accumulates on top of the lost data instead of
+    starting from zero.
+
+    The scanner is never interrupted — persistence errors are logged
+    and swallowed (fail-open).
+    """
     collectors = get_all_collectors()
     for scanner_name, collector in collectors.items():
         counters, period_start = collector.flush()
@@ -249,7 +276,10 @@ def flush_and_persist_all(repository: ScannerRepository | None) -> None:
                     scanner_name, counters.TOTAL_SCANS,
                 )
         except Exception:
+            # Restore flushed counters so they are not lost.
+            # The next successful persist will include them.
+            collector.restore(counters, period_start)
             logger.warning(
-                "signal funnel persistence failed for %s: %s",
+                "signal funnel persistence failed for %s, counters restored: %s",
                 scanner_name, str(sys.exc_info()[1]),
             )
