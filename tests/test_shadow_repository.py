@@ -413,3 +413,67 @@ class TestSaveSignalReturnOrder:
         )
         result = repo_no_conn.save_signal(signal)
         assert result.status == SaveSignalStatus.ERROR
+
+
+class TestOOSIntegrity:
+    """Regression tests for OOS filter integrity."""
+
+    def test_oos_columns_nullable_in_migration(self):
+        """Migration adds OOS columns as nullable BOOLEAN."""
+        migration = Path("app/db/shadow_signal_migration.sql").read_text()
+        assert "oos_a_stoch_08 BOOLEAN NULL" in migration
+        assert "oos_b_stoch_08_vol_10 BOOLEAN NULL" in migration
+        assert "oos_c_stoch_06_vol_10 BOOLEAN NULL" in migration
+        assert "oos_filter_version TEXT NULL" in migration
+        # No DEFAULT FALSE for OOS columns
+        assert "oos_a_stoch_08 BOOLEAN NOT NULL DEFAULT FALSE" not in migration
+
+    def test_no_destructive_outcome_reset(self):
+        """Migration must not reset existing outcome data via UPDATE."""
+        migration = Path("app/db/shadow_signal_migration.sql").read_text()
+        # No mass UPDATE that resets evaluation timestamps or finalization
+        assert "UPDATE dds.shadow_signal_outcome SET" not in migration
+        # "is_final = FALSE" in CREATE INDEX WHERE is fine — it's a partial index, not data reset
+        assert "evaluated_120m_at = NULL" not in migration
+
+    def test_migration_normalises_old_schema(self):
+        """Migration handles old NOT NULL/DEFAULT columns."""
+        migration = Path("app/db/shadow_signal_migration.sql").read_text()
+        assert "DROP NOT NULL" in migration
+        assert "DROP DEFAULT" in migration
+
+    def test_oos_filter_version_in_signal(self):
+        """WickRejectionSignal has oos_filter_version field."""
+        from app.scanners.atr_wick_rejection_short import WickRejectionSignal
+        from dataclasses import fields
+        field_names = {f.name for f in fields(WickRejectionSignal)}
+        assert "oos_filter_version" in field_names
+        assert "oos_a_stoch_08" in field_names
+
+    def test_oos_filter_version_constant(self):
+        """OOS_FILTER_VERSION constant is defined."""
+        from app.scanners.atr_wick_rejection_short import OOS_FILTER_VERSION
+        assert OOS_FILTER_VERSION == "ATR_WICK_FILTER_OOS_V1"
+
+    def test_oos_version_in_detect_raw(self):
+        """detect_raw_candidate sets oos_filter_version."""
+        import inspect
+        from app.scanners.atr_wick_rejection_short import AtrWickRejectionShortScanner
+        source = inspect.getsource(AtrWickRejectionShortScanner.detect_raw_candidate)
+        assert "oos_filter_version=OOS_FILTER_VERSION" in source
+
+    def test_save_signal_includes_oos_columns(self):
+        """Repository INSERT includes oos_filter_version column."""
+        migration = Path("app/shadow/repository.py").read_text()
+        assert "oos_filter_version" in migration
+        assert "oos_a_stoch_08" in migration
+
+    def test_runner_preserves_oos_filter_version(self):
+        """Runner propagates oos_filter_version from raw."""
+        import inspect
+        from app.shadow.runner import ShadowScannerRunner
+        source = inspect.getsource(ShadowScannerRunner._scan_symbol)
+        assert "oos_filter_version=raw.oos_filter_version" in source
+
+
+from pathlib import Path
