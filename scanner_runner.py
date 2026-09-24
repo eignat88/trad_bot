@@ -158,12 +158,12 @@ def _get_srr_research_observer(repository: ScannerRepository):
     return _srr_research_observer
 
 
-def _observe_srr_long_blocked(repository: ScannerRepository, candidate: SetupCandidate) -> None:
-    """Record a blocked SRR LONG candidate for research outcome tracking.
+def _observe_srr_long_research(repository: ScannerRepository, candidate: SetupCandidate) -> None:
+    """Record an SRR LONG candidate for research outcome tracking.
 
-    Called from the scanner runner when a SRR LONG candidate is blocked
-    by the direction gate but should still be captured for research.
-    This is fire-and-forget — never enables paper trading.
+    Called from the scanner runner for every valid SRR LONG candidate,
+    regardless of whether it is later blocked or traded by the direction gate.
+    Research capture is independent of paper trading — never enables trading.
     """
     observer = _get_srr_research_observer(repository)
     features = dict(candidate.features) if candidate.features else {}
@@ -264,6 +264,9 @@ def run_scan_cycle(
                         scanner_regime_whitelist=settings.scanner_regime_whitelist,
                     )
                 for name, values in symbol_stats.items():
+                    # Skip metadata keys (e.g. _research_candidates)
+                    if name.startswith("_"):
+                        continue
                     stat = run_stats[name]
                     stat["symbols_scanned"] += 1
                     for field in ("candidates_found", "setups_saved", "errors_count", "duration_ms"):
@@ -289,12 +292,12 @@ def run_scan_cycle(
                         except Exception:
                             logger.debug("FVG shadow observation failed", exc_info=True)
 
-                # SRR LONG Research: capture blocked SRR LONG candidates
-                # for research outcome tracking (independent of paper trading).
+                # SRR LONG Research: capture every SRR LONG candidate for
+                # research outcome tracking (independent of paper trading).
                 research_candidates = symbol_stats.get("_research_candidates", [])
                 for rc in research_candidates:
                     try:
-                        _observe_srr_long_blocked(repository, rc)
+                        _observe_srr_long_research(repository, rc)
                     except Exception:
                         logger.debug("SRR research observation failed", exc_info=True)
 

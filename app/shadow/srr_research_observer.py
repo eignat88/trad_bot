@@ -1,15 +1,16 @@
-"""SRR LONG Research Observer — captures blocked SRR LONG signals for research.
+"""SRR LONG Research Observer — captures SRR LONG signals for research.
 
-This module intercepts SUPPORT_RESISTANCE_REACTION LONG candidates that are
-rejected by the direction gate and persists them with a full feature snapshot
-for downstream outcome evaluation and parameter analysis.
+This module intercepts SUPPORT_RESISTANCE_REACTION LONG candidates
+after they pass scanner validity/risk/score checks and persists them
+with a full feature snapshot for downstream outcome evaluation and
+parameter analysis.
 
-Key design decisions:
+Research capture is independent from the direction gate and paper trading:
 - SRR LONG remains BLOCKED for paper trading (unchanged).
-- Research signals are captured independently from scanner_setup.
+- Research signals are captured regardless of gate ENABLED/BLOCKED state.
+- Research capture never creates paper trades or changes tradeability.
 - Feature snapshot uses raw numeric values, not normalised booleans.
 - Duplicate signals are deduplicated by (experiment, symbol, signal_candle_open_time).
-- No paper trades are ever created from this observer.
 
 Tables:
   dds.srr_research_signal — immutable feature snapshot per signal
@@ -27,9 +28,10 @@ SCANNER_NAME = "SUPPORT_RESISTANCE_REACTION"
 
 
 class SRRResearchObserver:
-    """Observes blocked SRR LONG candidates and persists research signals.
+    """Observes SRR LONG candidates and persists research signals.
 
     This class is purely observational — it never enables paper trading.
+    Research capture happens independently of the direction gate state.
     """
 
     def __init__(self, conn: Any) -> None:
@@ -59,7 +61,11 @@ class SRRResearchObserver:
         features: dict[str, Any],
         reasons: tuple[str, ...] | list[str] = (),
     ) -> dict[str, Any]:
-        """Record a blocked SRR LONG candidate as a research signal.
+        """Record an SRR LONG candidate as a research signal.
+
+        Called for every valid SRR LONG candidate regardless of direction
+        gate state.  The name 'observe_blocked_candidate' is retained for
+        backward compatibility.
 
         Parameters
         ----------

@@ -106,8 +106,10 @@ class ScannerOrchestrator:
         "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1",
     })
 
-    # Scanners whose blocked LONG candidates should be captured for research
-    # outcome tracking, even though they are not traded.
+    # Scanners whose LONG candidates should be captured for research
+    # outcome tracking, independently of direction gate / paper trading.
+    # Every valid, deduplicated, score-passing candidate is captured
+    # regardless of whether it is later blocked or traded.
     RESEARCH_CAPTURE_SCANNERS: frozenset[str] = frozenset({
         "SUPPORT_RESISTANCE_REACTION",
     })
@@ -202,15 +204,32 @@ class ScannerOrchestrator:
             if c.score >= 30 or c.features.get("_oos_rejected") or c.scanner_name in self.SHADOW_CONTROL_SCANNERS:
                 valid.append(c)
 
+        # ── Research capture: BEFORE direction gate / expectancy filter ──
+        # Every valid SRR LONG candidate is captured for research, regardless
+        # of whether the direction gate later blocks it from paper trading.
+        # This ensures the research dataset is not biased by gate decisions.
+        research_candidates: list[SetupCandidate] = []
+        for candidate in valid:
+            if (candidate.scanner_name in self.RESEARCH_CAPTURE_SCANNERS
+                    and candidate.direction == "LONG"):
+                from dataclasses import replace as _replace
+                research_features = dict(candidate.features)
+                research_features["_research_capture"] = True
+                research_features["_research_capture_reason"] = "independent_research_capture"
+                research_candidates.append(_replace(candidate, features=research_features))
+                logger.info(
+                    "SRR research captured: symbol=%s scanner=%s direction=%s "
+                    "score=%.1f setup_id=%s",
+                    candidate.symbol, candidate.scanner_name, candidate.direction,
+                    candidate.score, candidate.setup_id,
+                )
+
         # Direction gates are independent of expectancy.  Candidates were still
         # generated/scored above, so blocked strategies remain observable.
         # Shadow/control scanners: their blocked candidates are saved with a
         # _shadow_control marker for OOS cohort tracking, even though they
         # won't be traded.
-        # Research capture scanners: blocked LONG candidates are collected
-        # for research outcome tracking (e.g. SRR LONG parameter analysis).
         shadow_candidates: list[SetupCandidate] = []
-        research_candidates: list[SetupCandidate] = []
         if gate_policy is not None:
             gate_accepted: list[SetupCandidate] = []
             for candidate in valid:
@@ -238,22 +257,6 @@ class ScannerOrchestrator:
                         decision.status,
                         candidate.features.get("close_location"),
                     )
-                elif (candidate.scanner_name in self.RESEARCH_CAPTURE_SCANNERS
-                      and candidate.direction == "LONG"):
-                    # Capture blocked SRR LONG for research outcome tracking.
-                    # These candidates are NOT tradeable but their feature
-                    # snapshots + outcomes feed parameter analysis.
-                    from dataclasses import replace
-                    research_features = dict(candidate.features)
-                    research_features["_research_capture"] = True
-                    research_features["_research_capture_reason"] = "direction_gate_blocked"
-                    research_candidates.append(replace(candidate, features=research_features))
-                    logger.info(
-                        "research candidate captured: symbol=%s scanner=%s direction=%s "
-                        "gate_status=%s score=%.1f",
-                        candidate.symbol, candidate.scanner_name, candidate.direction,
-                        decision.status, candidate.score,
-                    )
                 else:
                     logger.info(
                         "direction gate rejected: symbol=%s scanner=%s direction=%s "
@@ -265,10 +268,10 @@ class ScannerOrchestrator:
             valid = gate_accepted + shadow_candidates
 
         # Attach research candidates to stats for caller access.
-        # The caller (scanner_runner) checks stats for _research_candidates
+        # The caller (scanner_runner) reads stats["_research_candidates"]
         # and persists them via the SRR research observer.
-        if research_candidates:
-            stats.setdefault("_research_candidates", []).extend(research_candidates)
+        # Always set the key so the caller never gets KeyError.
+        stats["_research_candidates"] = research_candidates
 
         # Expectancy filter: drop scanner/direction combos with negative historical R.
         # Static manual blocks are handled by the gate policy above.
@@ -301,6 +304,8 @@ class ScannerOrchestrator:
                 saved_by_scanner.get(candidate.scanner_name, 0) + 1
             )
         for name in stats:
+            if name.startswith("_"):
+                continue
             stats[name]["setups_saved"] = saved_by_scanner.get(name, 0)
 
         # Market regime filter: apply scanner-specific allow-lists first, then
