@@ -1036,3 +1036,125 @@ class TestZECUSDTRegression:
         # The V1 shadow is independent — it doesn't have close_location because
         # V1 doesn't compute it.  That's OK: V1 shadow is the BASELINE.
         # The close_location filter is the TREATMENT's differentiator.
+
+
+# ── Treatment identity regression tests ──────────────────────────────
+
+class TestTreatmentIdentity:
+    """Verify that TREATMENT and CONTROL have distinct scanner_name identities.
+
+    CONTROL: scanner_name=MOMENTUM_EXHAUSTION_REVERSE_LONG_V1, _shadow_control=true
+    TREATMENT: scanner_name=ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1, _oos_rejected=true
+
+    They share the same signal candle but must produce independent DB rows
+    (different scanner_name → different unique key in dds.scanner_setup).
+    """
+
+    def test_oos_scanner_sets_own_scanner_name(self):
+        """All OOS scanner candidates must have OOS scanner name, not base name."""
+        scanner = MERLongCloseLocationOOSValidationV1Scanner()
+        base_candidate = SetupCandidate(
+            scanner_name="MOMENTUM_EXHAUSTION_REVERSE_LONG_V1",
+            symbol="BTCUSDT",
+            direction="LONG",
+            detected_at=datetime.now(timezone.utc),
+            features={},
+            state=SetupState.SETUP_READY,
+        )
+
+        # PASS
+        enriched_pass = scanner._attach_oos_features(
+            base_candidate, close_location=0.75, filter_passed=True,
+            signal_candle_timestamp=datetime.now(timezone.utc),
+        )
+        assert enriched_pass.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
+
+        # REJECT
+        enriched_reject = scanner._attach_oos_features(
+            base_candidate, close_location=0.438, filter_passed=False,
+            signal_candle_timestamp=datetime.now(timezone.utc),
+        )
+        assert enriched_reject.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
+
+    def test_treatment_and_control_different_scanner_names(self):
+        """CONTROL and TREATMENT must never share scanner_name."""
+        assert "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1" != "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
+
+    def test_dedup_keys_differ(self):
+        """CONTROL and TREATMENT dedup keys must differ (different scanner_name)."""
+        from app.scanners.deduplication import DeduplicationEngine
+        engine = DeduplicationEngine()
+
+        control = SetupCandidate(
+            scanner_name="MOMENTUM_EXHAUSTION_REVERSE_LONG_V1",
+            symbol="BTCUSDT", direction="LONG",
+            entry_timeframe="5m",
+            signal_candle_open_time=1790179200000,
+            detected_at=datetime.now(timezone.utc),
+            state=SetupState.SETUP_READY,
+        )
+        treatment = SetupCandidate(
+            scanner_name="ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1",
+            symbol="BTCUSDT", direction="LONG",
+            entry_timeframe="5m",
+            signal_candle_open_time=1790179200000,
+            detected_at=datetime.now(timezone.utc),
+            state=SetupState.EXPIRED,
+        )
+
+        assert engine._key(control) != engine._key(treatment)
+
+    def test_orchestrator_persists_both_control_and_treatment(self):
+        """For one base signal, orchestrator returns both CONTROL shadow and TREATMENT REJECT."""
+        from app.scanners.orchestrator import ScannerOrchestrator
+        from app.scanners.direction_gate import (
+            ScannerDirectionGatePolicy, ScannerDirectionGate,
+            GATE_BLOCKED, GATE_ENABLED,
+        )
+
+        orch = ScannerOrchestrator()
+        gates = {}
+        for name in orch.scanners:
+            for d in ("LONG", "SHORT"):
+                if name == "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1":
+                    gates[(name, d)] = ScannerDirectionGate(name, d, GATE_BLOCKED, reason="OOS")
+                else:
+                    gates[(name, d)] = ScannerDirectionGate(name, d, GATE_ENABLED)
+        gate_policy = ScannerDirectionGatePolicy(gates, {})
+
+        base = 50000.0
+        prices_15m = [base + i * 0.8 if i < 12 else base + 9.6 - (i - 12) * 0.3 if i < 16 else base + 8.4 + (i - 16) * 0.9 if i < 25 else base + 16.5 - (i - 25) * 0.2 for i in range(35)]
+        prices_5m = [base + 9 + i * 0.1 if i < 8 else base + 9.8 + (i - 8) * 0.5 if i < 12 else base + 11.8 - (i - 12) * 0.2 if i < 18 else base + 10.6 - (i - 18) * 0.15 for i in range(20)]
+
+        candles_5m = make_candles_5m(prices_5m)
+        last = candles_5m[-1]
+        mid = (last.high + last.low) / 2
+        last.open = mid + 0.02
+        last.close = mid - 0.02
+
+        ctx = MockMarketContext(
+            candles_15m=make_candles_15m(prices_15m),
+            candles_5m=candles_5m,
+            indicators=MockIndicators(rsi=70.0, atr=base * 0.01),
+        )
+
+        candidates, stats = orch.scan_all_with_stats(ctx, gate_policy=gate_policy)
+
+        # CONTROL: shadow control from base V1 scanner
+        shadow = [c for c in candidates if c.features.get("_shadow_control")]
+        assert len(shadow) > 0, "CONTROL shadow candidate missing"
+        assert shadow[0].scanner_name == "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1"
+        assert shadow[0].features["_shadow_control"] is True
+
+        # TREATMENT: REJECT from OOS scanner
+        treatment = [c for c in candidates if c.features.get("_oos_rejected")]
+        assert len(treatment) > 0, "TREATMENT REJECT candidate missing"
+        assert treatment[0].scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
+        assert treatment[0].features["_oos_rejected"] is True
+        assert treatment[0].state == SetupState.EXPIRED
+
+        # CONTROL and TREATMENT must have different scanner_names
+        assert shadow[0].scanner_name != treatment[0].scanner_name
+
+        # CONTROL and TREATMENT must have different setup_ids (different DB rows)
+        assert shadow[0].setup_id != treatment[0].setup_id

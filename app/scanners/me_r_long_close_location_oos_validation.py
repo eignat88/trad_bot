@@ -138,7 +138,7 @@ class MERLongCloseLocationOOSValidationV1Scanner:
         # body_ratio is already in features from the base scanner
 
         from dataclasses import replace
-        return replace(candidate, features=features)
+        return replace(candidate, features=features, scanner_name=self.name)
 
     def scan(self, ctx: MarketContext) -> list[SetupCandidate]:
         """Scan for ME_R_LONG base setup + close_location filter.
