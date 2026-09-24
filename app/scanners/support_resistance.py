@@ -7,6 +7,24 @@ Quality features emitted (all normalised to [0, 1]):
     stop_distance_atr     – stop distance in ATR (inverted: tighter = higher)
     volume_spike          – volume > 1.3× average
     regime_alignment      – regime direction matches trade direction
+
+Research features (raw numeric, for parameter analysis):
+    _raw_touch_count          – absolute touch count
+    _raw_level_distance_pct   – distance from price to level as fraction
+    _raw_atr                  – ATR value
+    _raw_atr_pct              – ATR as % of price
+    _raw_candle_range         – signal candle range
+    _raw_candle_body          – signal candle body
+    _raw_upper_wick           – signal candle upper wick
+    _raw_lower_wick           – signal candle lower wick
+    _raw_wick_body_ratio      – wick / body ratio (raw)
+    _raw_volume               – signal candle volume
+    _raw_volume_ratio         – volume / average volume
+    _raw_rr                   – raw reward-to-risk ratio
+    _raw_risk_distance        – abs(entry - invalidation)
+    _raw_risk_distance_pct    – risk as % of entry
+    _raw_stop_distance_atr    – stop distance in ATR units
+    _raw_level_type           – 'support' or 'resistance'
 """
 from __future__ import annotations
 from datetime import datetime, timezone
@@ -60,7 +78,14 @@ class SupportResistanceScanner:
         direction: str,
         market_regime: str | None,
     ) -> dict[str, object]:
-        level_touch_count = self._level_touch_count(candles_1h, level)
+        # ── raw touch count (absolute) ────────────────────────
+        raw_touch_count = sum(
+            1 for c in candles_1h
+            if abs(c.low - level) / level < 0.003 or abs(c.high - level) / level < 0.003
+        )
+
+        # ── normalised quality features ───────────────────────
+        level_touch_count = min(raw_touch_count / 5, 1.0)
         rejection_strength = self._rejection_strength(candles_5m[-1])
 
         risk = abs(entry - invalidation)
@@ -78,13 +103,42 @@ class SupportResistanceScanner:
             (direction == "SHORT" and market_regime == "TREND_DOWN")
         ) else 0.3
 
+        # ── raw numeric features for research ─────────────────
+        last = candles_5m[-1]
+        candle_range = last.high - last.low
+        candle_body = abs(last.close - last.open)
+        upper_wick = last.high - max(last.open, last.close)
+        lower_wick = min(last.open, last.close) - last.low
+        wick_total = candle_range - candle_body
+        wick_body_ratio = (wick_total / candle_body) if candle_body > 0 else 0.0
+        raw_volume_ratio = (last.volume / avg_vol) if avg_vol > 0 else 0.0
+        raw_atr_pct = (atr / entry * 100) if entry > 0 else 0.0
+
         return {
+            # ── normalised quality features ───────────────────
             "level_touch_count": level_touch_count,
             "rejection_strength": rejection_strength,
             "rr_ratio": rr_ratio,
             "stop_distance_atr": stop_distance_atr,
             "volume_spike": volume_spike,
             "regime_alignment": regime_alignment,
+            # ── raw numeric features for research analytics ──
+            "_raw_touch_count": raw_touch_count,
+            "_raw_level_distance_pct": round(abs(entry - level) / level * 100, 6) if level > 0 else 0.0,
+            "_raw_atr": round(atr, 8),
+            "_raw_atr_pct": round(raw_atr_pct, 4),
+            "_raw_candle_range": round(candle_range, 8),
+            "_raw_candle_body": round(candle_body, 8),
+            "_raw_upper_wick": round(upper_wick, 8),
+            "_raw_lower_wick": round(lower_wick, 8),
+            "_raw_wick_body_ratio": round(wick_body_ratio, 4),
+            "_raw_volume": round(last.volume, 2),
+            "_raw_volume_ratio": round(raw_volume_ratio, 4),
+            "_raw_rr": round(rr_raw, 4),
+            "_raw_risk_distance": round(risk, 8),
+            "_raw_risk_distance_pct": round(risk / entry * 100, 4) if entry > 0 else 0.0,
+            "_raw_stop_distance_atr": round(stop_atr, 4),
+            "_raw_level_type": "support" if direction == "LONG" else "resistance",
         }
 
     def _scan_long(self, ctx: MarketContext) -> SetupCandidate | None:

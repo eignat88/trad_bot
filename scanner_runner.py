@@ -144,6 +144,51 @@ def _observe_fvg_shadow(repository: ScannerRepository, candidate: SetupCandidate
     )
 
 
+# --- SRR LONG Research Experiment ------------------------------------------
+
+_srr_research_observer = None
+
+
+def _get_srr_research_observer(repository: ScannerRepository):
+    """Lazy-init the SRR research observer (singleton per process)."""
+    global _srr_research_observer
+    if _srr_research_observer is None:
+        from app.shadow.srr_research_observer import SRRResearchObserver
+        _srr_research_observer = SRRResearchObserver(repository._conn)
+    return _srr_research_observer
+
+
+def _observe_srr_long_blocked(repository: ScannerRepository, candidate: SetupCandidate) -> None:
+    """Record a blocked SRR LONG candidate for research outcome tracking.
+
+    Called from the scanner runner when a SRR LONG candidate is blocked
+    by the direction gate but should still be captured for research.
+    This is fire-and-forget — never enables paper trading.
+    """
+    observer = _get_srr_research_observer(repository)
+    features = dict(candidate.features) if candidate.features else {}
+
+    observer.observe_blocked_candidate(
+        setup_id=str(candidate.setup_id),
+        scanner_name=candidate.scanner_name,
+        scanner_version=candidate.scanner_version,
+        symbol=candidate.symbol,
+        direction=candidate.direction,
+        detected_at=candidate.detected_at,
+        signal_candle_open_time=candidate.signal_candle_open_time,
+        reference_price=candidate.reference_price,
+        entry_zone_low=candidate.entry_zone_low,
+        entry_zone_high=candidate.entry_zone_high,
+        invalidation_price=candidate.invalidation_price,
+        target_1=candidate.target_1,
+        target_2=candidate.target_2,
+        score=candidate.score,
+        market_regime=candidate.market_regime,
+        features=features,
+        reasons=candidate.reasons,
+    )
+
+
 def run_scan_cycle(
     client: BybitClient,
     orchestrator: ScannerOrchestrator,
@@ -243,6 +288,15 @@ def run_scan_cycle(
                             _observe_fvg_shadow(repository, c)
                         except Exception:
                             logger.debug("FVG shadow observation failed", exc_info=True)
+
+                # SRR LONG Research: capture blocked SRR LONG candidates
+                # for research outcome tracking (independent of paper trading).
+                research_candidates = symbol_stats.get("_research_candidates", [])
+                for rc in research_candidates:
+                    try:
+                        _observe_srr_long_blocked(repository, rc)
+                    except Exception:
+                        logger.debug("SRR research observation failed", exc_info=True)
 
                 total_found += len(candidates)
                 if candidates:

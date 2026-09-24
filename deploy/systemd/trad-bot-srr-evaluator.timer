@@ -1,0 +1,11 @@
+[Unit]
+Description=SRR LONG Research Outcome Evaluator Timer
+After=network.target
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=300
+AccuracySec=30
+
+[Install]
+WantedBy=timers.target
