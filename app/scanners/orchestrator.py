@@ -178,11 +178,14 @@ class ScannerOrchestrator:
 
         unique = self.dedup.filter_new(scored)
 
-        # Re-attach ALL OOS REJECT candidates that dedup filtered.
-        # They share the same candle as the base V1 shadow control but must
-        # persist independently under their own scanner_name for OOS analysis.
-        for c in oos_rejected:
-            unique.append(c)
+        # Re-attach OOS REJECT candidates that dedup actually filtered out.
+        # Dedup may keep an OOS REJECT (its key is unique due to different
+        # scanner_name), so we must not double-add it.  Only re-add when the
+        # dedup key is absent — meaning dedup genuinely removed it.
+        if oos_rejected:
+            for c in oos_rejected:
+                if not self.dedup.contains_key(c):
+                    unique.append(c)
 
         valid: list[SetupCandidate] = []
         invalid_geometry_by_scanner: dict[str, int] = {}
@@ -309,6 +312,23 @@ class ScannerOrchestrator:
             if name.startswith("_"):
                 continue
             stats[name]["setups_saved"] = saved_by_scanner.get(name, 0)
+
+        # ── Funnel invariant guard ───────────────────────────────────────
+        # setups_saved must never exceed candidates_found.  If it does,
+        # log an ERROR so the issue surfaces at runtime, not only via
+        # Grafana.  Guard is observational only — it never mutates counters.
+        for name in stats:
+            if name.startswith("_"):
+                continue
+            s = stats[name]
+            if s["setups_saved"] > s["candidates_found"]:
+                logger.error(
+                    "funnel invariant violated: scanner=%s "
+                    "candidates_found=%d setups_saved=%d",
+                    name,
+                    s["candidates_found"],
+                    s["setups_saved"],
+                )
 
         # Market regime filter: apply scanner-specific allow-lists first, then
         # the generic direction-conflict policy for scanners without a rule.
