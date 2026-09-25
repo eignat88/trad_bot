@@ -1,6 +1,8 @@
-"""Research Evaluator Runner — CLI entrypoint for the background evaluator.
+"""Research Evaluator Runner — standalone CLI entrypoint for the background evaluator.
 
-Can run as a standalone systemd service or integrated into scanner_runner.
+Runs as trad-bot-research-evaluator.service — completely independent from
+the scanner process.  Reads from research.research_signal, writes to
+research.research_outcome.  No production tables touched.
 
 Usage:
     python -m app.research.evaluator_runner --once
