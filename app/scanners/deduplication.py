@@ -8,11 +8,19 @@ class DeduplicationEngine:
         self._seen: dict[str, SetupCandidate] = {}
         self.price_tolerance = price_tolerance
 
-    def _key(self, candidate: SetupCandidate) -> str:
+    def key(self, candidate: SetupCandidate) -> str:
+        """Return the dedup identity key for a candidate.
+
+        Public API — used by orchestrator to check whether a candidate was
+        already kept by ``filter_new`` without touching private internals.
+        """
         return (
             f"{candidate.scanner_name}|{candidate.symbol}|{candidate.direction}|"
             f"{candidate.entry_timeframe}|{candidate.signal_candle_open_time}"
         )
+
+    # Internal alias kept so existing internal callers don't break.
+    _key = key
 
     def _is_duplicate(self, candidate: SetupCandidate) -> bool:
         key = self._key(candidate)
@@ -35,9 +43,16 @@ class DeduplicationEngine:
         result: list[SetupCandidate] = []
         for c in candidates:
             if not self._is_duplicate(c):
-                self._seen[self._key(c)] = c
+                self._seen[self.key(c)] = c
                 result.append(c)
         return result
+
+    def contains_key(self, candidate: SetupCandidate) -> bool:
+        """Return True if this candidate's key was already accepted by ``filter_new``.
+
+        Public API — avoids exposing the internal ``_seen`` dict.
+        """
+        return self.key(candidate) in self._seen
 
     def cleanup(self, max_age_seconds: int = 7200) -> None:
         from datetime import datetime, timezone
