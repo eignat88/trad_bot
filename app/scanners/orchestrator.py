@@ -191,17 +191,13 @@ class ScannerOrchestrator:
         # Re-attach OOS REJECT candidates that dedup actually filtered out.
         # Dedup may keep an OOS REJECT (its key is unique due to different
         # scanner_name), so we must not double-add it.  Only re-add if the
-        # dedup key is NOT already present in dedup._seen — meaning dedup
-        # removed it (e.g. same signal candle as a V1 shadow control).
+        # dedup key is NOT already present — meaning dedup removed it.
         # This preserves the invariant: one candidate → at most one entry in
         # valid → at most one scanner_setup row.
         if oos_rejected:
-            seen_keys = set(self.dedup._seen)
             for c in oos_rejected:
-                key = self.dedup._key(c)
-                if key not in seen_keys:
+                if not self.dedup.contains_key(c):
                     unique.append(c)
-                    seen_keys.add(key)
 
         valid: list[SetupCandidate] = []
         invalid_geometry_by_scanner: dict[str, int] = {}
@@ -328,6 +324,24 @@ class ScannerOrchestrator:
             if name.startswith("_"):
                 continue
             stats[name]["setups_saved"] = saved_by_scanner.get(name, 0)
+
+        # ── Funnel invariant guard ───────────────────────────────────────
+        # setups_saved must never exceed candidates_found.  If it does,
+        # something in the dedup / re-add / risk-geometry pipeline is
+        # creating extra records — log immediately so the issue is caught
+        # at runtime rather than surfacing only through Grafana.
+        for name in stats:
+            if name.startswith("_"):
+                continue
+            s = stats[name]
+            if s["setups_saved"] > s["candidates_found"]:
+                logger.error(
+                    "funnel invariant violated: scanner=%s "
+                    "candidates_found=%d setups_saved=%d",
+                    name,
+                    s["candidates_found"],
+                    s["setups_saved"],
+                )
 
         # Market regime filter: apply scanner-specific allow-lists first, then
         # the generic direction-conflict policy for scanners without a rule.

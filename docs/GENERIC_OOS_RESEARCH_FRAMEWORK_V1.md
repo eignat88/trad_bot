@@ -1436,6 +1436,20 @@ After confirming generic framework works for 2+ weeks:
 
 **Total estimated time: 15-25 hours (spread across 3-5 sessions)**
 
+### Runtime separation (IMPORTANT)
+
+The evaluator MUST NOT be integrated into scanner_runner.
+Scanner and evaluator are completely independent processes:
+
+```
+trad-bot-scanner.service          → scanner_runner.py (collection only)
+trad-bot-research-evaluator.service → evaluator_runner.py (evaluation only)
+```
+
+No runtime dependency between them. The evaluator reads from
+`research.research_signal` (written by scanner) and writes to
+`research.research_outcome`. This is the only coupling — via DB.
+
 ---
 
 ## 12. Required Tests

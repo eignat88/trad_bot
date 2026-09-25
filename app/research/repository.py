@@ -57,7 +57,7 @@ class ResearchRepository:
                     %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
-                ON CONFLICT (experiment_id, symbol, signal_candle_open_time)
+                ON CONFLICT (experiment_id, symbol, direction, signal_candle_open_time)
                 WHERE signal_candle_open_time > 0
                 DO NOTHING
                 RETURNING observation_id
@@ -156,7 +156,7 @@ class ResearchRepository:
                   AND o.reference_price > 0
                   AND o.invalidation_price > 0
                   AND o.target_1 > 0
-                ON CONFLICT (experiment_id, symbol, signal_candle_open_time)
+                ON CONFLICT (experiment_id, symbol, direction, signal_candle_open_time)
                 WHERE signal_candle_open_time > 0
                 DO NOTHING
                 RETURNING signal_id

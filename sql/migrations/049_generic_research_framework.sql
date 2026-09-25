@@ -114,9 +114,11 @@ CREATE TABLE IF NOT EXISTS research.research_observation (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Dedup: one observation per experiment + symbol + candle
-CREATE UNIQUE INDEX IF NOT EXISTS uq_research_observation_candle
-    ON research.research_observation (experiment_id, symbol, signal_candle_open_time)
+-- Dedup: one observation per experiment + symbol + direction + candle
+-- Includes direction because some scanners (e.g. VOLATILITY_COMPRESSION)
+-- can emit both LONG and SHORT candidates on the same candle.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_research_observation_identity
+    ON research.research_observation (experiment_id, symbol, direction, signal_candle_open_time)
     WHERE signal_candle_open_time > 0;
 
 -- Evaluator query performance
@@ -182,9 +184,9 @@ CREATE TABLE IF NOT EXISTS research.research_signal (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Dedup: one signal per experiment + symbol + candle
-CREATE UNIQUE INDEX IF NOT EXISTS uq_research_signal_candle
-    ON research.research_signal (experiment_id, symbol, signal_candle_open_time)
+-- Dedup: one signal per experiment + symbol + direction + candle
+CREATE UNIQUE INDEX IF NOT EXISTS uq_research_signal_identity
+    ON research.research_signal (experiment_id, symbol, direction, signal_candle_open_time)
     WHERE signal_candle_open_time > 0;
 
 CREATE INDEX IF NOT EXISTS idx_rs_experiment
