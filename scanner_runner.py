@@ -189,6 +189,30 @@ def _observe_srr_long_research(repository: ScannerRepository, candidate: SetupCa
     )
 
 
+# --- Generic Research Framework V1 ------------------------------------------
+
+_research_observer = None
+
+
+def _get_research_observer(repository: ScannerRepository):
+    """Lazy-init the generic research observer (singleton per process)."""
+    global _research_observer
+    if _research_observer is None:
+        try:
+            from app.research.observer import ResearchObserver
+            from app.research.repository import ResearchRepository
+            from app.research.adapters.momentum_exhaustion_r import EXPERIMENT_CONFIG as MER_CONFIG
+
+            research_repo = ResearchRepository(repository._conn)
+            experiments = {
+                MER_CONFIG["scanner_name"]: MER_CONFIG,
+            }
+            _research_observer = ResearchObserver(research_repo, experiments)
+        except Exception:
+            logger.debug("research observer init failed — research capture disabled", exc_info=True)
+    return _research_observer
+
+
 # --- ME_R_LONG_CLOSE_LOCATION_OOS Experiment ------------------------------
 
 _me_r_long_cl_oos_observer = None
@@ -435,7 +459,12 @@ def main() -> None:
             raise SystemExit("scanner runner already active")
     repository.abort_stale_runs()
 
-    orchestrator = ScannerOrchestrator(repository=repository)
+    # Generic research observer: fail-open, never blocks scanner
+    research_obs = _get_research_observer(repository)
+    if research_obs is not None:
+        logger.info("generic research observer enabled: experiments=%s", list(research_obs._experiments.keys()))
+
+    orchestrator = ScannerOrchestrator(repository=repository, research_observer=research_obs)
 
     # Sync scanner direction gates to config.scanner_direction_gate (canonical source)
     try:

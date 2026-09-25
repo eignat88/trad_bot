@@ -4,7 +4,7 @@ import logging
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from app.scanners.breakout_retest import BreakoutRetestScanner
 from app.scanners.deduplication import DeduplicationEngine
@@ -48,8 +48,10 @@ class ScannerOrchestrator:
         self,
         enabled_scanners: list[str] | None = None,
         repository: ScannerRepository | None = None,
+        research_observer: Any | None = None,
     ) -> None:
         self.repository = repository
+        self.research_observer = research_observer
         all_scanners = {
             "LIQUIDITY_SWEEP_CHOCH_OB": LiquiditySweepCHOCHScanner(),
             "BREAKOUT_RETEST": BreakoutRetestScanner(),
@@ -146,6 +148,14 @@ class ScannerOrchestrator:
             started = time.perf_counter()
             try:
                 candidates = scanner.scan(ctx)
+                # ── Generic research capture: BEFORE any filtering ──
+                # Fail-open: observer errors never affect production.
+                if self.research_observer is not None:
+                    for c in candidates:
+                        try:
+                            self.research_observer.observe(c)
+                        except Exception:
+                            logger.debug("research observation failed for %s", name, exc_info=True)
                 all_candidates.extend(candidates)
                 stats[name] = {
                     "candidates_found": len(candidates),
@@ -178,11 +188,20 @@ class ScannerOrchestrator:
 
         unique = self.dedup.filter_new(scored)
 
-        # Re-attach ALL OOS REJECT candidates that dedup filtered.
-        # They share the same candle as the base V1 shadow control but must
-        # persist independently under their own scanner_name for OOS analysis.
-        for c in oos_rejected:
-            unique.append(c)
+        # Re-attach OOS REJECT candidates that dedup actually filtered out.
+        # Dedup may keep an OOS REJECT (its key is unique due to different
+        # scanner_name), so we must not double-add it.  Only re-add if the
+        # dedup key is NOT already present in dedup._seen — meaning dedup
+        # removed it (e.g. same signal candle as a V1 shadow control).
+        # This preserves the invariant: one candidate → at most one entry in
+        # valid → at most one scanner_setup row.
+        if oos_rejected:
+            seen_keys = set(self.dedup._seen)
+            for c in oos_rejected:
+                key = self.dedup._key(c)
+                if key not in seen_keys:
+                    unique.append(c)
+                    seen_keys.add(key)
 
         valid: list[SetupCandidate] = []
         invalid_geometry_by_scanner: dict[str, int] = {}
