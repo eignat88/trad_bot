@@ -1,35 +1,24 @@
 [Unit]
 Description=trad_bot research evaluator — multi-horizon MFE/MAE/TP/SL
 Documentation=file:///opt/trad_bot/docs/GENERIC_OOS_RESEARCH_FRAMEWORK_V1.md
-After=network.target postgresql.service
-Wants=postgresql.service
+After=network-online.target postgresql.service trad-bot-scanner.service
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=trad_bot
-Group=trad_bot
 WorkingDirectory=/opt/trad_bot
+EnvironmentFile=/opt/trad_bot/.env
 ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.evaluator_runner --interval-seconds 300 --log-level INFO
 
-# Restart policy
 Restart=on-failure
 RestartSec=30
 
-# Resource limits
-MemoryMax=512M
-CPUQuota=50%
+User=tradbot
+Group=tradbot
 
-# Logging
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=trad-bot-research-evaluator
-
-# Security hardening
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/opt/trad_bot/logs
-PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
