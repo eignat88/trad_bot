@@ -398,6 +398,114 @@ INSERT INTO research.research_experiment (
 )
 ON CONFLICT (experiment_id) DO NOTHING;
 
+-- ── 9b. Seed: VOLATILITY_COMPRESSION ───────────────────────
+
+INSERT INTO research.research_experiment (
+    experiment_id, scanner_name, scanner_version, description,
+    status, parameter_set_id, parameters_snapshot
+) VALUES (
+    'VC_GENERIC_V1', 'VOLATILITY_COMPRESSION', '2.0.0',
+    'Generic research for VOLATILITY_COMPRESSION. LONG + SHORT.',
+    'ACTIVE', 'vc_2.0.0_20260928',
+    '{"atr_period": 14, "squeeze_lookback": 20, "bb_squeeze_threshold": 0.02}'::jsonb
+) ON CONFLICT (experiment_id) DO NOTHING;
+
+-- ── 9c. Seed: MOMENTUM_EXHAUSTION ──────────────────────────
+
+INSERT INTO research.research_experiment (
+    experiment_id, scanner_name, scanner_version, description,
+    status, parameter_set_id, parameters_snapshot
+) VALUES (
+    'ME_GENERIC_V1', 'MOMENTUM_EXHAUSTION', '1.0.0',
+    'Generic research for MOMENTUM_EXHAUSTION. LONG + SHORT.',
+    'ACTIVE', 'me_1.0.0_20260928',
+    '{"swing_lookback": 5, "exhaustion_threshold": 0.003}'::jsonb
+) ON CONFLICT (experiment_id) DO NOTHING;
+
+-- ── 9d. Seed: SUPPORT_RESISTANCE_REACTION ──────────────────
+
+INSERT INTO research.research_experiment (
+    experiment_id, scanner_name, scanner_version, description,
+    status, parameter_set_id, parameters_snapshot
+) VALUES (
+    'SRR_GENERIC_V1', 'SUPPORT_RESISTANCE_REACTION', '2.0.0',
+    'Generic research for SUPPORT_RESISTANCE_REACTION. LONG + SHORT. Parallel to SRR_LONG_OUTCOME_V1.',
+    'ACTIVE', 'srr_2.0.0_20260928',
+    '{"swing_lookback": 5, "level_proximity_pct": 0.003, "min_touches": 3, "min_rejection_body_ratio": 0.5}'::jsonb
+) ON CONFLICT (experiment_id) DO NOTHING;
+
+-- ── 9e. Seed: LIQUIDITY_REVERSAL ───────────────────────────
+
+INSERT INTO research.research_experiment (
+    experiment_id, scanner_name, scanner_version, description,
+    status, parameter_set_id, parameters_snapshot
+) VALUES (
+    'LR_GENERIC_V1', 'LIQUIDITY_REVERSAL', '2.0.0',
+    'Generic research for LIQUIDITY_REVERSAL. LONG + SHORT.',
+    'ACTIVE', 'lr_2.0.0_20260928',
+    '{"swing_lookback": 5, "sweep_margin": 0.001}'::jsonb
+) ON CONFLICT (experiment_id) DO NOTHING;
+
+-- ── 9f. Seed: LIQUIDITY_SWEEP_CHOCH_OB ─────────────────────
+
+INSERT INTO research.research_experiment (
+    experiment_id, scanner_name, scanner_version, description,
+    status, parameter_set_id, parameters_snapshot
+) VALUES (
+    'LSCO_GENERIC_V1', 'LIQUIDITY_SWEEP_CHOCH_OB', '2.0.0',
+    'Generic research for LIQUIDITY_SWEEP_CHOCH_OB. LONG + SHORT.',
+    'ACTIVE', 'lsco_2.0.0_20260928',
+    '{"ob_lookback": 5, "swing_lookback": 5, "sweep_margin": 0.001}'::jsonb
+) ON CONFLICT (experiment_id) DO NOTHING;
+
+-- ── 9g. Seed: TREND_PULLBACK_V3 ────────────────────────────
+
+INSERT INTO research.research_experiment (
+    experiment_id, scanner_name, scanner_version, description,
+    status, parameter_set_id, parameters_snapshot
+) VALUES (
+    'TPV3_GENERIC_V1', 'TREND_PULLBACK_V3', '1.0.0',
+    'Generic research for TREND_PULLBACK_V3. Edge-optimized, LONG only.',
+    'ACTIVE', 'tpv3_1.0.0_20260928',
+    '{"pullback_tolerance": 0.012, "rsi_threshold": 60.0, "adx_threshold": 35.0, "target_r": 0.50, "stop_buffer": 0.002}'::jsonb
+) ON CONFLICT (experiment_id) DO NOTHING;
+
+-- ── 9h. Seed: MOMENTUM_EXHAUSTION_REVERSE_LONG_V2 ──────────
+
+INSERT INTO research.research_experiment (
+    experiment_id, scanner_name, scanner_version, description,
+    status, parameter_set_id, parameters_snapshot
+) VALUES (
+    'ME_RL_V2_GENERIC_V1', 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V2', '1.0.0',
+    'Generic research for ME_R_LONG_V2. Reversal LONG with RSI delta.',
+    'ACTIVE', 'me_rlv2_1.0.0_20260928',
+    '{"swing_lookback": 5, "exhaustion_threshold": 0.003, "rsi_period": 14, "rsi_delta_lookback": 3}'::jsonb
+) ON CONFLICT (experiment_id) DO NOTHING;
+
+-- ── 9i. Seed: MOMENTUM_EXHAUSTION_REVERSE_LONG_V1 ──────────
+
+INSERT INTO research.research_experiment (
+    experiment_id, scanner_name, scanner_version, description,
+    status, parameter_set_id, parameters_snapshot
+) VALUES (
+    'ME_RL_V1_GENERIC_V1', 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V1', '1.0.0',
+    'Generic research for ME_R_LONG_V1. BLOCKED in production — captures blocked candidates.',
+    'ACTIVE', 'me_rlv1_1.0.0_20260928',
+    '{"swing_lookback": 5, "exhaustion_threshold": 0.003}'::jsonb
+) ON CONFLICT (experiment_id) DO NOTHING;
+
+-- ── 9j. Seed: FVG_REACTION_LONG_LOCAL_STRUCT_V1 ────────────
+
+INSERT INTO research.research_experiment (
+    experiment_id, scanner_name, scanner_version, description,
+    status, parameter_set_id, parameters_snapshot
+) VALUES (
+    'FVG_GENERIC_V1', 'FVG_REACTION_LONG_LOCAL_STRUCT_V1', '1.0.1',
+    'Generic research for FVG_REACTION_LONG. Stateful, LONG only. Parallel to FVG shadow.',
+    'ACTIVE', 'fvg_1.0.1_20260928',
+    '{"MIN_FVG_ATR": 0.05, "MIN_C2_BODY_RATIO": 0.50, "MAX_BARS_TO_TOUCH": 48, "SL_BUFFER_ATR": 0.05, "TARGET_R": 3.0, "LOCAL_STRUCT_LOOKBACK": 20}'::jsonb
+) ON CONFLICT (experiment_id) DO NOTHING;
+
 -- ── 10. GRANT permissions for trad_bot role ────────────────
 -- Required: trad_bot process connects as role 'trad_bot'.
 -- Idempotent: GRANT is safe to re-run.

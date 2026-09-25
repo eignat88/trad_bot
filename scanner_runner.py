@@ -211,6 +211,15 @@ def _get_research_observer(repository: ScannerRepository):
             from app.research.adapters.momentum_exhaustion_r import EXPERIMENT_CONFIG as MER_CONFIG
             from app.research.adapters.trend_pullback_v2 import EXPERIMENT_CONFIG as TPV2_CONFIG
             from app.research.adapters.breakout_retest import EXPERIMENT_CONFIG as BR_CONFIG
+            from app.research.adapters.volatility_compression import EXPERIMENT_CONFIG as VC_CONFIG
+            from app.research.adapters.momentum_exhaustion import EXPERIMENT_CONFIG as ME_CONFIG
+            from app.research.adapters.support_resistance import EXPERIMENT_CONFIG as SRR_CONFIG
+            from app.research.adapters.liquidity_reversal import EXPERIMENT_CONFIG as LR_CONFIG
+            from app.research.adapters.liquidity_sweep_choch import EXPERIMENT_CONFIG as LSCO_CONFIG
+            from app.research.adapters.trend_pullback_v3 import EXPERIMENT_CONFIG as TPV3_CONFIG
+            from app.research.adapters.momentum_exhaustion_reverse_long_v2 import EXPERIMENT_CONFIG as ME_RL_V2_CONFIG
+            from app.research.adapters.momentum_exhaustion_reverse_long_v1 import EXPERIMENT_CONFIG as ME_RL_V1_CONFIG
+            from app.research.adapters.fvg_reaction_long import EXPERIMENT_CONFIG as FVG_CONFIG
 
             # Dedicated connection — never shares with production
             _research_conn = pg8000.connect(
@@ -225,6 +234,15 @@ def _get_research_observer(repository: ScannerRepository):
                 MER_CONFIG["scanner_name"]: MER_CONFIG,
                 TPV2_CONFIG["scanner_name"]: TPV2_CONFIG,
                 BR_CONFIG["scanner_name"]: BR_CONFIG,
+                VC_CONFIG["scanner_name"]: VC_CONFIG,
+                ME_CONFIG["scanner_name"]: ME_CONFIG,
+                SRR_CONFIG["scanner_name"]: SRR_CONFIG,
+                LR_CONFIG["scanner_name"]: LR_CONFIG,
+                LSCO_CONFIG["scanner_name"]: LSCO_CONFIG,
+                TPV3_CONFIG["scanner_name"]: TPV3_CONFIG,
+                ME_RL_V2_CONFIG["scanner_name"]: ME_RL_V2_CONFIG,
+                ME_RL_V1_CONFIG["scanner_name"]: ME_RL_V1_CONFIG,
+                FVG_CONFIG["scanner_name"]: FVG_CONFIG,
             }
             _research_observer = ResearchObserver(research_repo, experiments)
             logger.info(
