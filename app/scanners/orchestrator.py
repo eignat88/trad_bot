@@ -4,7 +4,7 @@ import logging
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from app.scanners.breakout_retest import BreakoutRetestScanner
 from app.scanners.deduplication import DeduplicationEngine
@@ -48,8 +48,10 @@ class ScannerOrchestrator:
         self,
         enabled_scanners: list[str] | None = None,
         repository: ScannerRepository | None = None,
+        research_observer: Any | None = None,
     ) -> None:
         self.repository = repository
+        self.research_observer = research_observer
         all_scanners = {
             "LIQUIDITY_SWEEP_CHOCH_OB": LiquiditySweepCHOCHScanner(),
             "BREAKOUT_RETEST": BreakoutRetestScanner(),
@@ -146,6 +148,14 @@ class ScannerOrchestrator:
             started = time.perf_counter()
             try:
                 candidates = scanner.scan(ctx)
+                # ── Generic research capture: BEFORE any filtering ──
+                # Fail-open: observer errors never affect production.
+                if self.research_observer is not None:
+                    for c in candidates:
+                        try:
+                            self.research_observer.observe(c)
+                        except Exception:
+                            logger.debug("research observation failed for %s", name, exc_info=True)
                 all_candidates.extend(candidates)
                 stats[name] = {
                     "candidates_found": len(candidates),
@@ -182,6 +192,8 @@ class ScannerOrchestrator:
         # Dedup may keep an OOS REJECT (its key is unique due to different
         # scanner_name), so we must not double-add it.  Only re-add when the
         # dedup key is absent — meaning dedup genuinely removed it.
+        # Invariant: one candidate -> at most one entry in valid -> at most
+        # one scanner_setup row.
         if oos_rejected:
             for c in oos_rejected:
                 if not self.dedup.contains_key(c):
