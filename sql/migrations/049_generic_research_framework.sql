@@ -362,6 +362,42 @@ INSERT INTO research.research_experiment (
 )
 ON CONFLICT (experiment_id) DO NOTHING;
 
+-- ── 8. Seed: TREND_PULLBACK_V2 experiment ──────────────────
+
+INSERT INTO research.research_experiment (
+    experiment_id, scanner_name, scanner_version, description,
+    status, parameter_set_id, parameters_snapshot
+) VALUES (
+    'TPV2_GENERIC_V1',
+    'TREND_PULLBACK_V2',
+    '1.0.0',
+    'Generic research observation for TREND_PULLBACK_V2. '
+    'Captures all LONG candidates for outcome evaluation '
+    'and offline parameter optimization.',
+    'ACTIVE',
+    'tpv2_1.0.0_20260928',
+    '{"pullback_tolerance": 0.012, "rsi_cool_threshold": 55, "target_r": 0.50, "stop_buffer": 0.002}'::jsonb
+)
+ON CONFLICT (experiment_id) DO NOTHING;
+
+-- ── 9. Seed: BREAKOUT_RETEST experiment ────────────────────
+
+INSERT INTO research.research_experiment (
+    experiment_id, scanner_name, scanner_version, description,
+    status, parameter_set_id, parameters_snapshot
+) VALUES (
+    'BR_GENERIC_V1',
+    'BREAKOUT_RETEST',
+    '2.0.0',
+    'Generic research observation for BREAKOUT_RETEST. '
+    'Captures all LONG and SHORT candidates for outcome evaluation '
+    'and offline parameter optimization.',
+    'ACTIVE',
+    'br_2.0.0_20260928',
+    '{"swing_lookback": 5, "breakout_margin": 0.001, "retest_margin": 0.003}'::jsonb
+)
+ON CONFLICT (experiment_id) DO NOTHING;
+
 -- ============================================================
 -- NO production tables modified.
 -- NO paper trading tables modified.

@@ -209,6 +209,8 @@ def _get_research_observer(repository: ScannerRepository):
             from app.research.observer import ResearchObserver
             from app.research.repository import ResearchRepository
             from app.research.adapters.momentum_exhaustion_r import EXPERIMENT_CONFIG as MER_CONFIG
+            from app.research.adapters.trend_pullback_v2 import EXPERIMENT_CONFIG as TPV2_CONFIG
+            from app.research.adapters.breakout_retest import EXPERIMENT_CONFIG as BR_CONFIG
 
             # Dedicated connection — never shares with production
             _research_conn = pg8000.connect(
@@ -221,6 +223,8 @@ def _get_research_observer(repository: ScannerRepository):
             research_repo = ResearchRepository(_research_conn)
             experiments = {
                 MER_CONFIG["scanner_name"]: MER_CONFIG,
+                TPV2_CONFIG["scanner_name"]: TPV2_CONFIG,
+                BR_CONFIG["scanner_name"]: BR_CONFIG,
             }
             _research_observer = ResearchObserver(research_repo, experiments)
             logger.info(
