@@ -364,7 +364,7 @@ class ResearchEvaluator:
         # Upsert outcome
         saved = self._repo.upsert_outcome(
             signal_id=signal_id,
-            experiment_id="",  # denormalized from signal
+            experiment_id=sig.get("experiment_id", ""),
             symbol=symbol,
             updates=updates,
         )

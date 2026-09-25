@@ -308,7 +308,7 @@ class ResearchRepository:
             cursor.execute(
                 """
                 SELECT
-                    s.signal_id, s.symbol, s.signal_time, s.reference_price,
+                    s.signal_id, s.experiment_id, s.symbol, s.signal_time, s.reference_price,
                     s.invalidation_price, s.target_1,
                     o.signal_id AS outcome_id,
                     o.evaluated_15m_at, o.evaluated_30m_at, o.evaluated_60m_at,
@@ -337,14 +337,14 @@ class ResearchRepository:
             rows = cursor.fetchall()
             return [
                 {
-                    "signal_id": r[0], "symbol": r[1], "signal_time": r[2],
-                    "entry_price": float(r[3]),
-                    "invalidation_price": float(r[4]) if r[4] is not None else None,
-                    "target_1": float(r[5]) if r[5] is not None else None,
-                    "outcome_id": r[6],
-                    "evaluated_15m_at": r[7], "evaluated_30m_at": r[8],
-                    "evaluated_60m_at": r[9], "evaluated_120m_at": r[10],
-                    "evaluated_240m_at": r[11], "is_final": r[12],
+                    "signal_id": r[0], "experiment_id": r[1], "symbol": r[2], "signal_time": r[3],
+                    "entry_price": float(r[4]),
+                    "invalidation_price": float(r[5]) if r[5] is not None else None,
+                    "target_1": float(r[6]) if r[6] is not None else None,
+                    "outcome_id": r[7],
+                    "evaluated_15m_at": r[8], "evaluated_30m_at": r[9],
+                    "evaluated_60m_at": r[10], "evaluated_120m_at": r[11],
+                    "evaluated_240m_at": r[12], "is_final": r[13],
                 }
                 for r in rows
             ]

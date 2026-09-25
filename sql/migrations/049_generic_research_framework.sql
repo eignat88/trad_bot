@@ -420,6 +420,15 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA research
 ALTER DEFAULT PRIVILEGES IN SCHEMA research
     GRANT USAGE, SELECT ON SEQUENCES TO trad_bot;
 
+-- ── 11. Backfill experiment_id in existing outcomes ────────
+-- Idempotent: only touches rows where experiment_id is empty.
+
+UPDATE research.research_outcome o
+SET experiment_id = s.experiment_id
+FROM research.research_signal s
+WHERE s.signal_id = o.signal_id
+  AND (o.experiment_id IS NULL OR o.experiment_id = '');
+
 -- ============================================================
 -- NO production tables modified.
 -- NO paper trading tables modified.
