@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import signal as _signal
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -441,12 +442,20 @@ class ResearchEvaluator:
     # ── lifecycle ─────────────────────────────────────────────
 
     def start(self, experiment_ids: list[str], interval_seconds: int = 300) -> None:
-        """Start continuous evaluation loop for multiple experiments."""
+        """Start continuous evaluation loop for multiple experiments.
+
+        Shutdown is handled via threading.Event: SIGTERM/SIGINT set the event,
+        which unblocks the interruptible wait immediately.  This ensures the
+        process exits within seconds of receiving the signal, well before
+        systemd's TimeoutStopSec.
+        """
+        self._shutdown = threading.Event()
         self._running = True
 
         def _stop(signum: int, frame: Any) -> None:
             logger.info("research evaluator: received signal %d, stopping", signum)
             self._running = False
+            self._shutdown.set()
 
         _signal.signal(_signal.SIGINT, _stop)
         _signal.signal(_signal.SIGTERM, _stop)
@@ -457,10 +466,13 @@ class ResearchEvaluator:
 
         while self._running:
             for exp_id in experiment_ids:
+                if not self._running:
+                    break
                 try:
                     self.run_evaluation_cycle(exp_id)
                 except Exception:
                     logger.exception("research evaluation cycle failed for %s", exp_id)
             if self._running:
-                time.sleep(interval_seconds)
+                # Interruptible wait: returns immediately when _shutdown is set
+                self._shutdown.wait(timeout=interval_seconds)
         logger.info("research evaluator stopped")
