@@ -190,10 +190,10 @@ class ScannerOrchestrator:
 
         # Re-attach OOS REJECT candidates that dedup actually filtered out.
         # Dedup may keep an OOS REJECT (its key is unique due to different
-        # scanner_name), so we must not double-add it.  Only re-add if the
-        # dedup key is NOT already present — meaning dedup removed it.
-        # This preserves the invariant: one candidate → at most one entry in
-        # valid → at most one scanner_setup row.
+        # scanner_name), so we must not double-add it.  Only re-add when the
+        # dedup key is absent — meaning dedup genuinely removed it.
+        # Invariant: one candidate -> at most one entry in valid -> at most
+        # one scanner_setup row.
         if oos_rejected:
             for c in oos_rejected:
                 if not self.dedup.contains_key(c):
@@ -327,9 +327,8 @@ class ScannerOrchestrator:
 
         # ── Funnel invariant guard ───────────────────────────────────────
         # setups_saved must never exceed candidates_found.  If it does,
-        # something in the dedup / re-add / risk-geometry pipeline is
-        # creating extra records — log immediately so the issue is caught
-        # at runtime rather than surfacing only through Grafana.
+        # log an ERROR so the issue surfaces at runtime, not only via
+        # Grafana.  Guard is observational only — it never mutates counters.
         for name in stats:
             if name.startswith("_"):
                 continue
