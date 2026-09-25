@@ -408,6 +408,26 @@ def run_scan_cycle(
                     except Exception:
                         logger.debug("SRR research observation failed", exc_info=True)
 
+                # ── Generic research: resolve statuses + promote to signals ──
+                # Fail-open: never blocks scanner cycle.
+                if _research_observer is not None:
+                    try:
+                        rejections = symbol_stats.get("_research_rejections", [])
+                        setup_ready = symbol_stats.get("_research_setup_ready", [])
+                        if rejections or setup_ready:
+                            batch_stats = _research_observer._repo.resolve_and_promote_batch(
+                                rejections, setup_ready,
+                            )
+                            if batch_stats["resolved"] or batch_stats["promoted"]:
+                                logger.info(
+                                    "research resolve: resolved=%d promoted=%d errors=%d",
+                                    batch_stats["resolved"],
+                                    batch_stats["promoted"],
+                                    batch_stats["errors"],
+                                )
+                    except Exception:
+                        logger.debug("research resolve/promote failed", exc_info=True)
+
                 total_found += len(candidates)
                 if candidates:
                     best = max(candidates, key=lambda c: c.score)

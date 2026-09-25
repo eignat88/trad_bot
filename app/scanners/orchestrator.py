@@ -143,6 +143,9 @@ class ScannerOrchestrator:
         self.last_scan_time = datetime.now(timezone.utc)
         all_candidates: list[SetupCandidate] = []
         stats: dict[str, dict[str, int | float]] = {}
+        # Track research observation rejections for status resolution.
+        # Each entry: (setup_id, status, rejection_stage, rejection_reason)
+        research_rejections: list[tuple[str, str, str | None, str | None]] = []
 
         for name, scanner in self.scanners.items():
             started = time.perf_counter()
@@ -188,6 +191,16 @@ class ScannerOrchestrator:
 
         unique = self.dedup.filter_new(scored)
 
+        # Track dedup-rejected candidates for research status resolution
+        unique_ids = {c.setup_id for c in unique}
+        for c in scored:
+            if c.setup_id not in unique_ids:
+                sid = str(c.setup_id) if c.setup_id else None
+                if sid:
+                    research_rejections.append(
+                        (sid, "DEDUP_REJECTED", "deduplication", "duplicate fingerprint")
+                    )
+
         # Re-attach OOS REJECT candidates that dedup actually filtered out.
         # Dedup may keep an OOS REJECT (its key is unique due to different
         # scanner_name), so we must not double-add it.  Only re-add when the
@@ -213,11 +226,22 @@ class ScannerOrchestrator:
                     c.entry_zone_low, c.entry_zone_high,
                     c.invalidation_price, c.target_1,
                 )
+                sid = str(c.setup_id) if c.setup_id else None
+                if sid:
+                    research_rejections.append(
+                        (sid, "GEOMETRY_REJECTED", "risk_geometry", reason)
+                    )
                 continue
             # Shadow/control scanners and OOS treatment REJECT bypass score gate:
             # they are analytical observations, not tradeable signals.
             if c.score >= 30 or c.features.get("_oos_rejected") or c.scanner_name in self.SHADOW_CONTROL_SCANNERS:
                 valid.append(c)
+            else:
+                sid = str(c.setup_id) if c.setup_id else None
+                if sid:
+                    research_rejections.append(
+                        (sid, "SCORE_REJECTED", "score_gate", f"score={c.score:.1f} < 30")
+                    )
 
         # ── Research capture: BEFORE direction gate / expectancy filter ──
         # Every valid SRR LONG candidate is captured for research, regardless
@@ -282,6 +306,11 @@ class ScannerOrchestrator:
                         decision.reason_code, decision.status, decision.reason,
                         decision.allowed_regimes, candidate.market_regime or ctx.market_regime,
                     )
+                    sid = str(candidate.setup_id) if candidate.setup_id else None
+                    if sid:
+                        research_rejections.append(
+                            (sid, "GATE_REJECTED", decision.reason_code, decision.reason)
+                        )
             valid = gate_accepted + shadow_candidates
 
         # Attach research candidates to stats for caller access.
@@ -289,6 +318,18 @@ class ScannerOrchestrator:
         # and persists them via the SRR research observer.
         # Always set the key so the caller never gets KeyError.
         stats["_research_candidates"] = research_candidates
+
+        # Attach rejection info for research status resolution.
+        # Each entry: (setup_id_str, status, rejection_stage, rejection_reason)
+        stats["_research_rejections"] = research_rejections
+
+        # Attach SETUP_READY candidates for research promotion.
+        # These are candidates that passed all production gates.
+        stats["_research_setup_ready"] = [
+            (str(c.setup_id), c.scanner_name)
+            for c in (gate_accepted if gate_policy is not None else valid)
+            if c.setup_id and not c.features.get("_shadow_control")
+        ]
 
         # Expectancy filter: drop scanner/direction combos with negative historical R.
         # Static manual blocks are handled by the gate policy above.

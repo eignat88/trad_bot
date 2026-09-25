@@ -171,6 +171,126 @@ class ResearchRepository:
             logger.exception("research: promote_to_signal failed for observation %d", observation_id)
             return None
 
+    # ── batch resolve + promote ─────────────────────────────
+
+    def resolve_and_promote_batch(
+        self,
+        rejections: list[tuple[str, str, str | None, str | None]],
+        setup_ready: list[tuple[str, str]],
+    ) -> dict[str, int]:
+        """Batch resolve observation statuses and promote eligible to signals.
+
+        Three phases, each independently committed:
+          1. Mark rejected observations (DEDUP/GATE/SCORE/GEOMETRY/REGIME)
+          2. Mark SETUP_READY observations
+          3. Promote ALL non-DETECTED observations to research_signal
+
+        Both SETUP_READY and REJECTED get outcomes — the core goal
+        is researching rejected candidates.
+
+        Idempotent: re-running only touches DETECTED observations
+        and only inserts signals that don't exist yet.
+
+        Returns dict with counts: resolved, promoted, errors.
+        """
+        if not self._conn:
+            return {"resolved": 0, "promoted": 0, "errors": 0}
+
+        stats = {"resolved": 0, "promoted": 0, "errors": 0}
+
+        # Phase 1: resolve rejected observations
+        cursor = self._conn.cursor()
+        try:
+            for setup_id, status, stage, reason in rejections:
+                try:
+                    cursor.execute(
+                        """
+                        UPDATE research.research_observation
+                        SET status = %s,
+                            rejection_stage = COALESCE(%s, rejection_stage),
+                            rejection_reason = COALESCE(%s, rejection_reason)
+                        WHERE setup_id = %s
+                          AND status = 'DETECTED'
+                        """,
+                        (status, stage, reason, setup_id),
+                    )
+                    if cursor.rowcount > 0:
+                        stats["resolved"] += 1
+                except Exception:
+                    stats["errors"] += 1
+                    logger.exception("research: resolve rejection failed for %s", setup_id)
+
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            logger.exception("research: resolve_and_promote_batch phase 1 failed")
+            stats["errors"] += 1
+
+        # Phase 2: mark SETUP_READY observations
+        cursor = self._conn.cursor()
+        try:
+            for setup_id, _ in setup_ready:
+                try:
+                    cursor.execute(
+                        """
+                        UPDATE research.research_observation
+                        SET status = 'SETUP_READY'
+                        WHERE setup_id = %s
+                          AND status = 'DETECTED'
+                        """,
+                        (setup_id,),
+                    )
+                    if cursor.rowcount > 0:
+                        stats["resolved"] += 1
+                except Exception:
+                    stats["errors"] += 1
+                    logger.exception("research: resolve setup_ready failed for %s", setup_id)
+
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            logger.exception("research: resolve_and_promote_batch phase 2 failed")
+            stats["errors"] += 1
+
+        # Phase 3: promote ALL resolved observations to signals
+        # Both SETUP_READY and REJECTED — research needs outcomes for both
+        try:
+            cursor.execute(
+                """
+                INSERT INTO research.research_signal (
+                    observation_id, experiment_id, scanner_name, parameter_set_id,
+                    symbol, direction, signal_time, signal_candle_open_time,
+                    reference_price, invalidation_price, target_1, target_2,
+                    score, features, parameters, market_regime
+                )
+                SELECT
+                    o.observation_id, o.experiment_id, o.scanner_name, o.parameter_set_id,
+                    o.symbol, o.direction, o.signal_time, o.signal_candle_open_time,
+                    o.reference_price, o.invalidation_price, o.target_1, o.target_2,
+                    o.score, o.features, o.parameters, o.market_regime
+                FROM research.research_observation o
+                WHERE o.status != 'DETECTED'
+                  AND o.reference_price > 0
+                  AND o.invalidation_price > 0
+                  AND o.target_1 > 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM research.research_signal s
+                      WHERE s.observation_id = o.observation_id
+                  )
+                ON CONFLICT (experiment_id, symbol, direction, signal_candle_open_time)
+                WHERE signal_candle_open_time > 0
+                DO NOTHING
+                """
+            )
+            stats["promoted"] = cursor.rowcount
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            logger.exception("research: promote batch failed")
+            stats["errors"] += 1
+
+        return stats
+
     # ── eligible signals for evaluator ───────────────────────
 
     def get_eligible_signals(self, experiment_id: str, limit: int = 5000) -> list[dict]:

@@ -398,6 +398,28 @@ INSERT INTO research.research_experiment (
 )
 ON CONFLICT (experiment_id) DO NOTHING;
 
+-- ── 10. GRANT permissions for trad_bot role ────────────────
+-- Required: trad_bot process connects as role 'trad_bot'.
+-- Idempotent: GRANT is safe to re-run.
+
+GRANT USAGE ON SCHEMA research TO trad_bot;
+
+GRANT SELECT, INSERT, UPDATE
+    ON ALL TABLES IN SCHEMA research
+    TO trad_bot;
+
+GRANT USAGE, SELECT
+    ON ALL SEQUENCES IN SCHEMA research
+    TO trad_bot;
+
+-- Default privileges: future tables/sequences created in research schema
+-- automatically get granted to trad_bot.
+ALTER DEFAULT PRIVILEGES IN SCHEMA research
+    GRANT SELECT, INSERT, UPDATE ON TABLES TO trad_bot;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA research
+    GRANT USAGE, SELECT ON SEQUENCES TO trad_bot;
+
 -- ============================================================
 -- NO production tables modified.
 -- NO paper trading tables modified.
