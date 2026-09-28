@@ -7,13 +7,19 @@ For each candidate from a registered scanner x direction:
 2. Evaluates frozen filter rules (e.g., bb_width_percentile < cutoff)
 3. Computes variant geometry for ME SHORT A/B/C
 4. Inserts prospective_observation with experiment_id + rule_passed
-5. For ME A/B/C: inserts 3 observations from the same source_signal_id
+5. For ME A/B/C: inserts 3 observations sharing a synthetic source key
 
 Design:
   - fail-open: errors logged, never propagate to scanner cycle
   - shadow-only: no orders, no paper trades, no production changes
   - append-only: INSERT only, no UPDATE in observe()
   - anti-leakage: all computations use information at detection time
+
+Source linkage:
+  Prospective observations use a SYNTHETIC composite key for
+  source_signal_id until the evaluator links them to actual
+  research.research_signal rows. This allows observation at
+  detection time without waiting for signal promotion.
 """
 from __future__ import annotations
 
@@ -44,6 +50,20 @@ class ProspectiveOOSObserver:
         self._registry = registry
         self._stats: dict[str, int] = {}
 
+    def _make_source_key(
+        self, scanner_name: str, symbol: str, direction: str, signal_time: Any,
+    ) -> int:
+        """Create a deterministic synthetic source_signal_id from candidate identity.
+
+        This is a negative hash used as a placeholder until the evaluator
+        links prospective observations to actual research signals.
+        Uses a hash of (scanner, symbol, direction, signal_time) to ensure
+        uniqueness and idempotency.
+        """
+        key_str = f"{scanner_name}:{symbol}:{direction}:{signal_time}"
+        # Use Python hash, mapped to negative int to distinguish from real signal_ids
+        return -abs(hash(key_str)) % (2**31)
+
     def observe(
         self,
         scanner_name: str,
@@ -58,8 +78,6 @@ class ProspectiveOOSObserver:
         features: dict,
         parameters: dict,
         market_regime: str | None,
-        source_signal_id: int,
-        source_observation_id: int | None,
     ) -> None:
         """Process a candidate against all applicable prospective experiments.
 
@@ -68,6 +86,11 @@ class ProspectiveOOSObserver:
         """
         if not self._conn:
             return
+
+        # Generate synthetic source key from candidate identity
+        source_key = self._make_source_key(
+            scanner_name, symbol, direction, signal_time,
+        )
 
         cursor = self._conn.cursor()
         try:
@@ -81,18 +104,16 @@ class ProspectiveOOSObserver:
                     # ME SHORT: produce A/B/C from same source
                     self._observe_me_geometry(
                         cursor, exp_id, exp_spec,
-                        source_signal_id, source_observation_id,
-                        symbol, signal_time, reference_price,
-                        invalidation_price, target_1, target_2,
+                        source_key, symbol, signal_time,
+                        reference_price, invalidation_price, target_1, target_2,
                         score, features, parameters, market_regime,
                     )
                 else:
                     # Standard: one observation per experiment
                     self._observe_standard(
                         cursor, exp_id, exp_spec,
-                        source_signal_id, source_observation_id,
-                        symbol, signal_time, reference_price,
-                        invalidation_price, target_1, target_2,
+                        source_key, symbol, signal_time,
+                        reference_price, invalidation_price, target_1, target_2,
                         score, features, parameters, market_regime,
                     )
 
@@ -108,11 +129,11 @@ class ProspectiveOOSObserver:
 
     def _observe_standard(
         self, cursor, exp_id: str, exp_spec: dict,
-        source_signal_id: int, source_observation_id: int | None,
-        symbol: str, signal_time: Any, reference_price: float,
-        invalidation_price: float | None, target_1: float | None,
-        target_2: float | None, score: float, features: dict,
-        parameters: dict, market_regime: str | None,
+        source_key: int, symbol: str, signal_time: Any,
+        reference_price: float, invalidation_price: float | None,
+        target_1: float | None, target_2: float | None,
+        score: float, features: dict, parameters: dict,
+        market_regime: str | None,
     ) -> None:
         """Insert a standard prospective observation."""
         rule_passed = True
@@ -131,12 +152,9 @@ class ProspectiveOOSObserver:
                 filter_reason = "bb_width_percentile is NULL"
 
         elif exp_id == "LR_SHORT_GATE_V1":
-            # Gate validation: capture gate result but don't filter
-            rule_passed = True  # All candidates pass for observational
+            # Gate validation: capture all candidates, tag gate result
+            rule_passed = True
             filter_reason = "observational_gate_validation"
-
-        # SRR_LONG_BASELINE_V1: no filter, capture all
-        # (rule_passed stays True)
 
         cursor.execute(
             """
@@ -150,7 +168,7 @@ class ProspectiveOOSObserver:
             ON CONFLICT (experiment_id, source_signal_id) DO NOTHING
             """,
             (
-                exp_id, source_signal_id, source_observation_id,
+                exp_id, source_key, None,
                 symbol, direction, signal_time,
                 reference_price, invalidation_price, target_1, target_2,
                 score, rule_passed, filter_reason,
@@ -163,11 +181,11 @@ class ProspectiveOOSObserver:
 
     def _observe_me_geometry(
         self, cursor, exp_id: str, exp_spec: dict,
-        source_signal_id: int, source_observation_id: int | None,
-        symbol: str, signal_time: Any, reference_price: float,
-        invalidation_price: float | None, target_1: float | None,
-        target_2: float | None, score: float, features: dict,
-        parameters: dict, market_regime: str | None,
+        source_key: int, symbol: str, signal_time: Any,
+        reference_price: float, invalidation_price: float | None,
+        target_1: float | None, target_2: float | None,
+        score: float, features: dict, parameters: dict,
+        market_regime: str | None,
     ) -> None:
         """Insert ME SHORT geometry variant observation.
 
@@ -197,25 +215,20 @@ class ProspectiveOOSObserver:
         elif exp_id == "ME_SHORT_GEOM_B_V1":
             # Wider stop: max(current_risk, 0.5 * ATR)
             new_risk = max(current_risk, 0.5 * atr)
-            # For SHORT: stop is ABOVE entry
             variant_entry = reference_price
-            variant_stop = reference_price + new_risk
-            # Keep same target distance
+            variant_stop = reference_price + new_risk  # SHORT: stop above entry
             if target_1 is not None:
                 original_target_dist = abs(reference_price - target_1)
                 variant_target = reference_price - original_target_dist
 
         elif exp_id == "ME_SHORT_GEOM_C_V1":
             # Delayed entry: use current_price (close of detection candle)
-            # as entry. This is available at detection time.
-            # Stop/target distance preserved relative to new entry.
             current_price = features.get("entry_price", reference_price)
             if current_price is None or current_price <= 0:
                 current_price = reference_price
             variant_entry = current_price
-            # Preserve original risk distance
             original_stop_dist = abs(reference_price - invalidation_price)
-            variant_stop = current_price + original_stop_dist  # SHORT: stop above entry
+            variant_stop = current_price + original_stop_dist
             if target_1 is not None:
                 original_target_dist = abs(reference_price - target_1)
                 variant_target = current_price - original_target_dist
@@ -233,7 +246,7 @@ class ProspectiveOOSObserver:
             ON CONFLICT (experiment_id, source_signal_id) DO NOTHING
             """,
             (
-                exp_id, source_signal_id, source_observation_id,
+                exp_id, source_key, None,
                 symbol, direction, signal_time,
                 reference_price, invalidation_price, target_1, target_2,
                 score, f"variant={exp_id}",

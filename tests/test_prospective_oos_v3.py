@@ -263,3 +263,72 @@ class TestDBSchema:
     def test_evaluator_exists(self):
         evaluator = PROJECT_ROOT / "app" / "research" / "prospective_evaluator.py"
         assert evaluator.exists()
+
+
+# ============================================================
+# RUNTIME WIRING TESTS
+# ============================================================
+
+class TestRuntimeWiring:
+    """Verify that ProspectiveOOSObserver and ProspectiveOOSEvaluator
+    are actually wired into the production runtime call paths."""
+
+    def test_observer_imported_in_scanner_runner(self):
+        """ProspectiveOOSObserver must be importable from scanner_runner."""
+        runner_path = PROJECT_ROOT / "scanner_runner.py"
+        content = runner_path.read_text()
+        assert "ProspectiveOOSObserver" in content
+        assert "prospective_observer" in content
+
+    def test_observer_called_in_candidate_loop(self):
+        """prospective_obs.observe() must be called in the per-candidate loop."""
+        runner_path = PROJECT_ROOT / "scanner_runner.py"
+        content = runner_path.read_text()
+        # Must appear in the scanner loop, not just in init
+        assert "prospective_obs.observe(" in content
+
+    def test_evaluator_runner_loads_prospective(self):
+        """evaluator_runner must load and evaluate prospective experiments."""
+        runner_path = PROJECT_ROOT / "app" / "research" / "evaluator_runner.py"
+        content = runner_path.read_text()
+        assert "ProspectiveOOSEvaluator" in content
+        assert "_load_prospective_experiments" in content
+        assert "prospective_experiment" in content
+
+    def test_evaluator_runner_checks_started_at(self):
+        """Prospective experiments only evaluated when started_at IS NOT NULL."""
+        runner_path = PROJECT_ROOT / "app" / "research" / "evaluator_runner.py"
+        content = runner_path.read_text()
+        assert "started_at IS NOT NULL" in content or "started_at IS NOT NULL" in content
+
+    def test_prospective_observer_no_source_signal_at_observe_time(self):
+        """Observer should not require source_signal_id at detection time."""
+        import inspect
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        sig = inspect.signature(ProspectiveOOSObserver.observe)
+        # source_signal_id should NOT be in observe() parameters
+        assert "source_signal_id" not in sig.parameters
+        assert "source_observation_id" not in sig.parameters
+
+    def test_migration_is_idempotent(self):
+        """All CREATE TABLE/VIEW/INDEX should be IF NOT EXISTS."""
+        migration = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        content = migration.read_text()
+        import re
+        content_no_comments = re.sub(r'--.*$', '', content, flags=re.MULTILINE)
+        # Check CREATE TABLE
+        tables = re.findall(r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\S+)', content_no_comments)
+        tables_idempotent = re.findall(r'CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\S+)', content_no_comments)
+        non_idempotent_tables = [t for t in tables if t not in tables_idempotent]
+        assert len(non_idempotent_tables) == 0, f"Non-idempotent tables: {non_idempotent_tables}"
+
+        # Check CREATE VIEW
+        views = re.findall(r'CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+(\S+)', content_no_comments)
+        # OR REPLACE is fine for views
+        assert len(views) > 0, "No views found"
+
+        # Check CREATE INDEX
+        indexes = re.findall(r'CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(\S+)', content_no_comments)
+        indexes_idempotent = re.findall(r'CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(\S+)', content_no_comments)
+        non_idempotent_indexes = [i for i in indexes if i not in indexes_idempotent]
+        assert len(non_idempotent_indexes) == 0, f"Non-idempotent indexes: {non_idempotent_indexes}"

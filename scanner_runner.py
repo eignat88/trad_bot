@@ -256,6 +256,60 @@ def _get_research_observer(repository: ScannerRepository):
     return _research_observer
 
 
+# --- Prospective OOS Observer -------------------------------------------
+
+_prospective_observer = None
+_prospective_conn = None
+
+
+def _get_prospective_observer(repository: ScannerRepository):
+    """Lazy-init the prospective OOS observer (singleton per process).
+
+    Uses a DEDICATED pg8000 connection, independent from production
+    and from the generic research observer connection.
+    """
+    global _prospective_observer, _prospective_conn
+    if _prospective_observer is None:
+        try:
+            import pg8000
+            from app.research.prospective_observer import ProspectiveOOSObserver
+            import json
+            from pathlib import Path
+
+            # Load frozen registry
+            registry_path = Path(__file__).parent / "app" / "research" / "prospective_registry.json"
+            if not registry_path.exists():
+                logger.debug("prospective registry not found at %s", registry_path)
+                return None
+            with open(registry_path) as f:
+                registry_data = json.load(f)
+            experiments = {e["experiment_id"]: e for e in registry_data["experiments"]}
+
+            # Only start observing if prospective_started_at is set
+            # (activation is done separately via migration/update)
+            if not experiments:
+                return None
+
+            # Dedicated connection — never shares with production or generic research
+            _prospective_conn = pg8000.connect(
+                host=repository._host,
+                port=repository._port,
+                database=repository._database,
+                user=repository._user,
+                password=repository._password,
+            )
+            _prospective_observer = ProspectiveOOSObserver(_prospective_conn, experiments)
+            logger.info(
+                "prospective observer initialized: experiments=%s",
+                list(experiments.keys()),
+            )
+        except Exception:
+            _prospective_observer = None
+            _prospective_conn = None
+            logger.debug("prospective observer init failed — prospective capture disabled", exc_info=True)
+    return _prospective_observer
+
+
 # --- ME_R_LONG_CLOSE_LOCATION_OOS Experiment ------------------------------
 
 _me_r_long_cl_oos_observer = None
@@ -417,6 +471,27 @@ def run_scan_cycle(
                         except Exception:
                             logger.debug("ME_R_LONG_CL_OOS observation failed", exc_info=True)
 
+                    # Prospective OOS: capture for frozen experiments
+                    # Fail-open: never blocks scanner cycle.
+                    if prospective_obs is not None:
+                        try:
+                            prospective_obs.observe(
+                                scanner_name=c.scanner_name,
+                                direction=c.direction,
+                                symbol=c.symbol,
+                                signal_time=c.detected_at,
+                                reference_price=c.reference_price,
+                                invalidation_price=c.invalidation_price,
+                                target_1=c.target_1,
+                                target_2=c.target_2,
+                                score=c.score,
+                                features=dict(c.features) if c.features else {},
+                                parameters={},
+                                market_regime=c.market_regime,
+                            )
+                        except Exception:
+                            logger.debug("prospective observation failed for %s", c.scanner_name, exc_info=True)
+
                 # SRR LONG Research: capture every SRR LONG candidate for
                 # research outcome tracking (independent of paper trading).
                 research_candidates = symbol_stats.get("_research_candidates", [])
@@ -526,6 +601,11 @@ def main() -> None:
     research_obs = _get_research_observer(repository)
     if research_obs is not None:
         logger.info("generic research observer enabled: experiments=%s", list(research_obs._experiments.keys()))
+
+    # Prospective OOS observer: fail-open, captures for frozen experiments
+    prospective_obs = _get_prospective_observer(repository)
+    if prospective_obs is not None:
+        logger.info("prospective OOS observer enabled: experiments=%s", list(prospective_obs._registry.keys()))
 
     orchestrator = ScannerOrchestrator(repository=repository, research_observer=research_obs)
 

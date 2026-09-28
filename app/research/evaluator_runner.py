@@ -1,8 +1,9 @@
 """Research Evaluator Runner — standalone CLI entrypoint for the background evaluator.
 
 Runs as trad-bot-research-evaluator.service — completely independent from
-the scanner process.  Reads from research.research_signal, writes to
-research.research_outcome.  No production tables touched.
+the scanner process.  Evaluates BOTH:
+  1. Generic research experiments (research.research_signal → research.research_outcome)
+  2. Prospective OOS experiments (research.prospective_observation → research.prospective_outcome)
 
 Usage:
     python -m app.research.evaluator_runner --once
@@ -52,35 +53,66 @@ def main() -> None:
     client = BybitClient(settings)
     evaluator = ResearchEvaluator(conn=db_repo._conn, client=client)
 
-    # Active experiments — read from research.research_experiment
+    # ── Generic research experiments ────────────────────────────
     experiment_ids = _load_active_experiments(db_repo._conn)
-    if not experiment_ids:
-        logger.warning("No active research experiments found")
+    if experiment_ids:
+        logger.info("Active generic experiments: %s", experiment_ids)
+
         if args.once:
-            print("No active experiments.")
-        sys.exit(0)
-
-    logger.info("Active experiments: %s", experiment_ids)
-
-    if args.once:
-        for exp_id in experiment_ids:
-            summary = evaluator.run_evaluation_cycle(exp_id)
-            print(f"\n{'=' * 80}")
-            print(f"RESEARCH EVALUATION CYCLE — {exp_id}")
-            print(f"{'=' * 80}")
-            print(f"Signals checked:    {summary['signals_checked']}")
-            print(f"Symbols processed:  {summary['symbols_processed']}")
-            print(f"Horizons updated:   {summary['horizons_updated']}")
-            print(f"Outcomes created:   {summary['outcomes_created']}")
-            print(f"Outcomes updated:   {summary['outcomes_updated']}")
-            print(f"Finalized:          {summary['finalized']}")
-            print(f"Errors:             {summary['errors']}")
-            print(f"{'=' * 80}")
+            for exp_id in experiment_ids:
+                summary = evaluator.run_evaluation_cycle(exp_id)
+                print(f"\n{'=' * 80}")
+                print(f"RESEARCH EVALUATION CYCLE — {exp_id}")
+                print(f"{'=' * 80}")
+                print(f"Signals checked:    {summary['signals_checked']}")
+                print(f"Symbols processed:  {summary['symbols_processed']}")
+                print(f"Horizons updated:   {summary['horizons_updated']}")
+                print(f"Outcomes created:   {summary['outcomes_created']}")
+                print(f"Outcomes updated:   {summary['outcomes_updated']}")
+                print(f"Finalized:          {summary['finalized']}")
+                print(f"Errors:             {summary['errors']}")
+                print(f"{'=' * 80}")
+        else:
+            evaluator.start(
+                experiment_ids=experiment_ids,
+                interval_seconds=args.interval_seconds,
+            )
     else:
-        evaluator.start(
-            experiment_ids=experiment_ids,
-            interval_seconds=args.interval_seconds,
-        )
+        logger.warning("No active generic research experiments found")
+
+    # ── Prospective OOS experiments ─────────────────────────────
+    prospective_ids = _load_prospective_experiments(db_repo._conn)
+    if prospective_ids:
+        logger.info("Active prospective experiments: %s", prospective_ids)
+
+        from app.research.prospective_evaluator import ProspectiveOOSEvaluator
+        prospective_eval = ProspectiveOOSEvaluator(conn=db_repo._conn, client=client)
+
+        if args.once:
+            for exp_id in prospective_ids:
+                summary = prospective_eval.run_evaluation_cycle(exp_id)
+                print(f"\n{'=' * 80}")
+                print(f"PROSPECTIVE EVALUATION CYCLE — {exp_id}")
+                print(f"{'=' * 80}")
+                print(f"Signals checked:    {summary['signals_checked']}")
+                print(f"Horizons updated:   {summary['horizons_updated']}")
+                print(f"Finalized:          {summary['finalized']}")
+                print(f"Errors:             {summary['errors']}")
+                print(f"{'=' * 80}")
+        else:
+            # Run prospective evaluation in the same loop as generic
+            prospective_eval.start(
+                experiment_ids=prospective_ids,
+                interval_seconds=args.interval_seconds,
+            )
+    else:
+        logger.info("No active prospective experiments found")
+
+    if not experiment_ids and not prospective_ids:
+        logger.warning("No experiments (generic or prospective) found")
+        if args.once:
+            print("No experiments.")
+        sys.exit(0)
 
 
 def _load_active_experiments(conn) -> list[str]:
@@ -95,6 +127,27 @@ def _load_active_experiments(conn) -> list[str]:
         return [row[0] for row in cursor.fetchall()]
     except Exception:
         logger.exception("Failed to load active experiments")
+        return []
+
+
+def _load_prospective_experiments(conn) -> list[str]:
+    """Load active prospective experiment IDs.
+
+    Returns experiments with status='RUNNING' (started_at IS NOT NULL).
+    Experiments with started_at=NULL are NOT evaluated yet.
+    """
+    if not conn:
+        return []
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT experiment_id FROM research.prospective_experiment "
+            "WHERE status = 'RUNNING' AND started_at IS NOT NULL "
+            "ORDER BY experiment_id"
+        )
+        return [row[0] for row in cursor.fetchall()]
+    except Exception:
+        logger.debug("prospective_experiment table not found or empty")
         return []
 
 
