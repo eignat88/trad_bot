@@ -1,5 +1,5 @@
 # ============================================================
-# LOCAL RESTORE — Research Snapshot into trad_bot_research_snapshot
+# LOCAL RESTORE -- Research Snapshot into trad_bot_research_snapshot
 # ============================================================
 # Run from PowerShell on Windows:
 #   cd D:\py_pro\trad_bot\research_snapshot
@@ -10,46 +10,32 @@
 #
 # NEVER touches the existing local trad_bot database.
 #
-# RESTORE CONTRACT — considered SUCCESS only if ALL pass:
-#   A. psql restore exit checked (errors logged, not fatal-stop)
-#   B. schema 'research' exists
-#   C. required tables exist:
-#        research.research_experiment
-#        research.research_observation
-#        research.research_signal
-#        research.research_outcome
-#   D. exact row counts:
-#        research_experiment  = 12
-#        research_observation = 6912
-#        research_signal      = 6656
-#        research_outcome     = 6487
-#   E. internal research FK constraints present
-#   F. 03_parity_validation.sql runs without SQL error
+# PREPROCESSING:
+#   The VPS dump (PostgreSQL 17.11) contains:
+#   - \restrict / \unrestrict guard commands (unsupported by psql 17.2)
+#   - 4 FK constraints referencing analytics.analysis_run (not present locally)
+#   Preprocessing removes ALL of these before psql sees the file.
+#   After preprocessing, psql must complete with ZERO errors.
 #
-# EXTERNAL DEPENDENCIES:
-#   The VPS dump contains 4 FK constraints referencing
-#   analytics.analysis_run (schema not present locally).
-#   psql runs WITHOUT ON_ERROR_STOP so it skips these errors
-#   and continues to create all remaining objects.
-#   These 4 missing FK constraints are expected and documented.
-#
-# PREREQUISITES:
-#   1. research_full_*.sql.gz in D:\py_pro\trad_bot\research_snapshot\
-#   2. PostgreSQL running locally
-#   3. psql.exe available (auto-detected or fallback to standard path)
+# FAIL-CLOSED RULE:
+#   "RESTORE COMPLETE" is printed ONLY if ALL of these pass:
+#     - target DB != trad_bot
+#     - authoritative gzip exists and decompresses
+#     - preprocessing strips restrict/unrestrict (verified count=0)
+#     - preprocessing strips exactly 4 known external FK blocks
+#     - psql exit code = 0
+#     - stderr contains no ERROR/FATAL/PANIC/invalid command
+#     - research schema exists
+#     - 4 required tables exist with exact row counts
+#     - 3 required internal FK constraints exist
+#     - 03_parity_validation.sql passes
 # ============================================================
-
-# NOTE: We intentionally do NOT set ErrorActionPreference = "Stop".
-# PowerShell treats psql stderr (NOTICE/WARNING) as ErrorRecord objects
-# which Stop mode converts to terminating exceptions.
-# All psql exit codes are checked explicitly.
 
 $SNAPSHOT_DIR = "D:\py_pro\trad_bot\research_snapshot"
 $TARGET_DB    = "trad_bot_research_snapshot"
 $PG_USER      = "postgres"
-$PSQL_TIMEOUT = 300  # seconds
 
-# ── Expected row counts (from VPS export 2026-09-28) ──────────
+# -- Expected row counts (from VPS export 2026-09-28) -----------
 $EXPECTED = @{
     "research_experiment"  = 12
     "research_observation" = 6912
@@ -57,149 +43,260 @@ $EXPECTED = @{
     "research_outcome"     = 6487
 }
 
-# ── Required internal FK constraints ───────────────────────────
+# -- Required internal FK constraints ---------------------------
 $REQUIRED_FKS = @(
     "research_observation_experiment_id_fkey"
     "research_signal_observation_id_fkey"
     "research_outcome_signal_id_fkey"
 )
 
-# ── Locate psql.exe ────────────────────────────────────────────
+# -- Known external FK constraint names (analytics -> removed) ---
+$EXTERNAL_FK_NAMES = @(
+    "experiment_source_run_id_fkey"
+    "finding_occurrence_analysis_run_id_fkey"
+    "finding_source_run_id_fkey"
+    "hypothesis_source_run_id_fkey"
+)
+
+# -- Locate psql.exe --------------------------------------------
 $psqlPath = $null
 try { $psqlPath = (Get-Command psql -ErrorAction Stop).Source } catch {}
 if (-not $psqlPath) {
-    foreach ($candidate in @(
+    foreach ($c in @(
         "C:\Program Files\PostgreSQL\17\bin\psql.exe",
         "C:\Program Files\PostgreSQL\16\bin\psql.exe",
         "C:\Program Files\PostgreSQL\15\bin\psql.exe"
     )) {
-        if (Test-Path $candidate) { $psqlPath = $candidate; break }
+        if (Test-Path $c) { $psqlPath = $c; break }
     }
 }
 if (-not $psqlPath) {
     Write-Host "ERROR: psql.exe not found." -ForegroundColor Red
     exit 1
 }
-Write-Host "  psql: $psqlPath" -ForegroundColor DarkGray
 
-# ── Helper: run psql -c (single command) ───────────────────────
+# ============================================================
+# HELPER: run psql -c (single command), check exit code only
+# ============================================================
 function Invoke-Psql {
-    param(
-        [Parameter(Mandatory)][string[]]$Arguments
-    )
-
-    $stderrFile = "$env:TEMP\psql_stderr_$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
-
-    & $psqlPath @Arguments 2> $stderrFile
-    $exitCode = $LASTEXITCODE
-
-    # Print stderr — classify as info or error
-    if (Test-Path $stderrFile) {
-        $stderr = Get-Content $stderrFile -Raw -ErrorAction SilentlyContinue
-        if ($stderr) {
-            $stderr.Trim() -split "`n" | ForEach-Object {
+    param([string[]]$Arguments)
+    $sf = "$env:TEMP\psql_e_$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
+    & $psqlPath @Arguments 2> $sf
+    $ec = $global:LASTEXITCODE
+    if (Test-Path $sf) {
+        $s = Get-Content $sf -Raw -ErrorAction SilentlyContinue
+        if ($s) {
+            $s.Trim() -split "`n" | ForEach-Object {
                 if ($_ -match "NOTICE|WARNING|HINT") {
                     Write-Host "  [psql] $_" -ForegroundColor DarkGray
-                } elseif ($_ -match "ERROR|ОШИБКА") {
+                } elseif ($_ -match "ERROR|FATAL|PANIC") {
                     Write-Host "  [psql:ERROR] $_" -ForegroundColor Red
                 }
             }
         }
-        Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue
+        Remove-Item $sf -Force -ErrorAction SilentlyContinue
     }
-
-    if ($exitCode -ne 0) {
-        throw "psql exited with code $exitCode"
-    }
+    if ($ec -ne 0) { throw "psql exited with code $ec" }
 }
 
-# ── Helper: run psql -f (file restore) ─────────────────────────
-# Runs WITHOUT ON_ERROR_STOP so psql continues past external FK errors.
-# Returns stdout+stderr content for post-restore analysis.
-function Invoke-PsqlRestore {
-    param(
-        [Parameter(Mandatory)][string]$Database,
-        [Parameter(Mandatory)][string]$FilePath
-    )
+# ============================================================
+# HELPER: preprocess dump file
+#   - Strip \restrict / \unrestrict lines
+#   - Strip 4 known external FK ALTER TABLE blocks
+#   - Verify preprocessing results
+#   Returns: preprocessed file path
+# ============================================================
+function Invoke-DumpPreprocess {
+    param([string]$InputPath)
 
-    $stderrFile = "$env:TEMP\psql_restore_stderr_$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
-    $stdoutFile = "$env:TEMP\psql_restore_stdout_$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
+    $content = Get-Content $InputPath -Raw
+    $lines = $content -split "`n"
 
-    # NO ON_ERROR_STOP: psql skips failed statements and continues.
-    # This is essential — the dump has 4 FK constraints referencing
-    # analytics.analysis_run which doesn't exist locally.
-    & $psqlPath -U $PG_USER -d $Database -f $FilePath 1> $stdoutFile 2> $stderrFile
-    $exitCode = $LASTEXITCODE
+    # -- 1. Strip \restrict and \unrestrict --------------------
+    $restrictCount = 0
+    $unrestrictCount = 0
+    $filtered = @()
+    foreach ($line in $lines) {
+        if ($line -match '^\s*\\restrict\s+') {
+            $restrictCount++
+            continue
+        }
+        if ($line -match '^\s*\\unrestrict\s+') {
+            $unrestrictCount++
+            continue
+        }
+        $filtered += $line
+    }
 
-    # Classify and display stderr
-    $errorCount = 0
-    if (Test-Path $stderrFile) {
-        $stderr = Get-Content $stderrFile -Raw -ErrorAction SilentlyContinue
-        if ($stderr) {
-            $stderr.Trim() -split "`n" | ForEach-Object {
-                if ($_ -match "ОШИБКА|ERROR") { $script:errorCount++ }
-                if ($_ -match "NOTICE|WARNING|HINT") {
-                    Write-Host "  [psql] $_" -ForegroundColor DarkGray
-                } elseif ($_ -match "ОШИБКА|ERROR") {
-                    Write-Host "  [psql:ERROR] $_" -ForegroundColor Red
+    Write-Host "  Preprocess: stripped $restrictCount \restrict, $unrestrictCount \unrestrict" -ForegroundColor DarkGray
+    if ($restrictCount -ne $unrestrictCount) {
+        throw "FATAL: \restrict count ($restrictCount) != \unrestrict count ($unrestrictCount)"
+    }
+    if ($restrictCount -ne 1) {
+        throw "FATAL: expected exactly 1 \restrict pair, got $restrictCount"
+    }
+
+    # -- 2. Strip 4 known external FK blocks -------------------
+    # Each block in pg_dump format:
+    #   --
+    #   -- Name: <table> <constraint_name>; Type: FK CONSTRAINT; ...
+    #   --
+    #
+    #   ALTER TABLE ONLY <table>
+    #       ADD CONSTRAINT <name> ... REFERENCES analytics...
+    #
+    # Strategy: find lines matching ADD CONSTRAINT ... REFERENCES analytics,
+    # then walk backwards to remove the complete block (ALTER TABLE ONLY
+    # line + preceding comment block).
+    $fkRemoved = 0
+    $linesToRemove = @{}  # line index -> $true
+    for ($i = 0; $i -lt $filtered.Count; $i++) {
+        if ($filtered[$i] -match 'ADD CONSTRAINT\s+(\S+)\s+.*REFERENCES\s+analytics\.') {
+            $constraintName = $Matches[1]
+            if ($constraintName -notin $EXTERNAL_FK_NAMES) {
+                throw "FATAL: unknown external FK constraint: $constraintName"
+            }
+
+            # Mark this ADD CONSTRAINT line for removal
+            $linesToRemove[$i] = $true
+
+            # Walk backwards to find ALTER TABLE ONLY line
+            for ($j = $i - 1; $j -ge [Math]::Max(0, $i - 3); $j--) {
+                if ($filtered[$j] -match 'ALTER TABLE ONLY') {
+                    $linesToRemove[$j] = $true
+                    # Continue backwards through comment block and blank lines
+                    for ($k = $j - 1; $k -ge [Math]::Max(0, $j - 5); $k--) {
+                        if ($filtered[$k] -match '^\s*--' -or $filtered[$k].Trim() -eq '') {
+                            $linesToRemove[$k] = $true
+                        } else {
+                            break
+                        }
+                    }
+                    break
                 }
             }
+            $fkRemoved++
         }
     }
 
-    # Return structured result
-    return @{
-        ExitCode   = $exitCode
-        ErrorCount = $errorCount
-        StderrFile = $stderrFile
-        StdoutFile = $stdoutFile
+    $result = @()
+    for ($i = 0; $i -lt $filtered.Count; $i++) {
+        if (-not $linesToRemove.ContainsKey($i)) {
+            $result += $filtered[$i]
+        }
     }
+
+    Write-Host "  Preprocess: stripped $fkRemoved external FK constraints" -ForegroundColor DarkGray
+    if ($fkRemoved -ne $EXTERNAL_FK_NAMES.Count) {
+        throw "FATAL: expected exactly $($EXTERNAL_FK_NAMES.Count) external FK removals, got $fkRemoved"
+    }
+
+    # -- 3. Write preprocessed file ----------------------------
+    $outputPath = $InputPath -replace '\.sql$', '_preprocessed.sql'
+    [System.IO.File]::WriteAllText($outputPath, ($result -join "`n"), [System.Text.Encoding]::UTF8)
+
+    # -- 4. Verify no analytics references remain ---------------
+    $remaining = Get-Content $outputPath | Where-Object { $_ -match 'analytics' }
+    if ($remaining.Count -gt 0) {
+        throw "FATAL: analytics references still present after preprocessing: $($remaining.Count) lines"
+    }
+
+    # -- 5. Verify no restrict/unrestrict remain ----------------
+    $restrictLeft = Get-Content $outputPath | Where-Object { $_ -match '\\restrict|\\unrestrict' }
+    if ($restrictLeft.Count -gt 0) {
+        throw "FATAL: restrict/unrestrict still present after preprocessing: $($restrictLeft.Count) lines"
+    }
+
+    return $outputPath
 }
 
-# ── Helper: validate restore ───────────────────────────────────
+# ============================================================
+# HELPER: analyze psql stderr for errors
+#   Returns hashtable with error classification
+# ============================================================
+function Get-PsqlErrorAnalysis {
+    param([string]$StderrContent)
+
+    $result = @{
+        HasError       = $false
+        ErrorLines     = @()
+        HasFatal       = $false
+        HasPanic       = $false
+        HasInvalidCmd  = $false
+        HasNativeErr   = $false  # PowerShell NativeCommandError leakage
+        ErrorCount     = 0
+    }
+
+    if (-not $StderrContent) { return $result }
+
+    $lines = $StderrContent.Trim() -split "`n"
+    foreach ($line in $lines) {
+        $trimmed = $line.Trim()
+        if ($trimmed -match 'ERROR:') {
+            $result.HasError = $true
+            $result.ErrorLines += $trimmed
+            $result.ErrorCount++
+        }
+        if ($trimmed -match 'FATAL|PANIC') {
+            $result.HasFatal = $true
+            $result.HasError = $true
+            $result.ErrorLines += $trimmed
+            $result.ErrorCount++
+        }
+        if ($trimmed -match 'invalid command|Unknown command') {
+            $result.HasInvalidCmd = $true
+            $result.HasError = $true
+            $result.ErrorLines += $trimmed
+            $result.ErrorCount++
+        }
+        if ($trimmed -match 'NativeCommandError|FullyQualifiedErrorId') {
+            $result.HasNativeErr = $true
+            $result.HasError = $true
+            $result.ErrorLines += $trimmed
+            $result.ErrorCount++
+        }
+    }
+
+    return $result
+}
+
+# ============================================================
+# HELPER: validate restore integrity
+# ============================================================
 function Test-RestoreIntegrity {
     param(
         [string]$Database,
         [hashtable]$ExpectedCounts,
         [string[]]$RequiredFks
     )
-
     $errors = @()
 
-    # Check B: schema exists
-    $schemaCheck = & $psqlPath -U $PG_USER -d $Database -t -A -c `
+    # Schema exists
+    $r = & $psqlPath -U $PG_USER -d $Database -t -A -c `
         "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = 'research';" 2>$null
-    if ($schemaCheck.Trim() -ne "1") {
-        $errors += "FAIL: research schema not found"
+    if ($r.Trim() -ne "1") { $errors += "research schema not found" }
+
+    # Required tables
+    $r = & $psqlPath -U $PG_USER -d $Database -t -A -c `
+        "SELECT table_name FROM information_schema.tables WHERE table_schema='research' AND table_name IN ('research_experiment','research_observation','research_signal','research_outcome') ORDER BY table_name;" 2>$null
+    $t = ($r.Trim() -split "`n") | Where-Object { $_ }
+    if ($t.Count -ne 4) { $errors += "required tables: found $($t.Count)/4" }
+
+    # Exact row counts
+    foreach ($tbl in $ExpectedCounts.Keys) {
+        $r = & $psqlPath -U $PG_USER -d $Database -t -A -c `
+            "SELECT COUNT(*) FROM research.$tbl;" 2>$null
+        $actual = [int]$r.Trim()
+        $expected = $ExpectedCounts[$tbl]
+        if ($actual -ne $expected) { $errors += "$tbl count=$actual (expected $expected)" }
     }
 
-    # Check C: required tables exist
-    $tableCheck = & $psqlPath -U $PG_USER -d $Database -t -A -c `
-        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'research' AND table_name IN ('research_experiment','research_observation','research_signal','research_outcome') ORDER BY table_name;" 2>$null
-    $tables = $tableCheck.Trim() -split "`n" | Where-Object { $_ }
-    if ($tables.Count -ne 4) {
-        $errors += "FAIL: required tables missing (found $($tables.Count)/4)"
-    }
-
-    # Check D: exact row counts
-    foreach ($table in $ExpectedCounts.Keys) {
-        $countResult = & $psqlPath -U $PG_USER -d $Database -t -A -c `
-            "SELECT COUNT(*) FROM research.$table;" 2>$null
-        $actual = [int]$countResult.Trim()
-        $expected = $ExpectedCounts[$table]
-        if ($actual -ne $expected) {
-            $errors += "FAIL: $table count = $actual (expected $expected)"
-        }
-    }
-
-    # Check E: internal FK constraints present
-    $fkCheck = & $psqlPath -U $PG_USER -d $Database -t -A -c `
-        "SELECT constraint_name FROM information_schema.table_constraints WHERE constraint_type = 'FOREIGN KEY' AND table_schema = 'research' ORDER BY constraint_name;" 2>$null
-    $fks = $fkCheck.Trim() -split "`n" | Where-Object { $_ }
-    foreach ($requiredFk in $RequiredFks) {
-        if ($fks -notcontains $requiredFk) {
-            $errors += "FAIL: internal FK constraint missing: $requiredFk"
-        }
+    # Internal FK constraints
+    $r = & $psqlPath -U $PG_USER -d $Database -t -A -c `
+        "SELECT constraint_name FROM information_schema.table_constraints WHERE constraint_type='FOREIGN KEY' AND table_schema='research' ORDER BY constraint_name;" 2>$null
+    $fks = ($r.Trim() -split "`n") | Where-Object { $_ }
+    foreach ($fk in $RequiredFks) {
+        if ($fks -notcontains $fk) { $errors += "internal FK missing: $fk" }
     }
 
     return $errors
@@ -209,176 +306,155 @@ function Test-RestoreIntegrity {
 # MAIN
 # ============================================================
 
-Write-Host "=== LOCAL RESTORE: Research Snapshot ===" -ForegroundColor Cyan
-Write-Host "Target DB: $TARGET_DB" -ForegroundColor Cyan
-Write-Host "Source dir: $SNAPSHOT_DIR" -ForegroundColor Cyan
-Write-Host ""
+$ErrorActionPreference = "Stop"
+$restoreOk = $false
 
-# ── 0. Safety check — never touch trad_bot ─────────────────────
-Write-Host "--- Safety: confirming target is $TARGET_DB (NOT trad_bot) ---" -ForegroundColor Yellow
-if ($TARGET_DB -eq "trad_bot") {
-    Write-Host "ERROR: TARGET_DB must not be trad_bot. Aborting." -ForegroundColor Red
-    exit 1
-}
-Write-Host "  OK: target=$TARGET_DB" -ForegroundColor Green
-
-# ── 1. Find the authoritative full dump ────────────────────────
-Write-Host ""
-Write-Host "--- Step 1: Locate authoritative dump ---" -ForegroundColor Yellow
-
-$FullDump = Get-ChildItem -Path $SNAPSHOT_DIR -Filter "research_full_*.sql.gz" |
-    Sort-Object LastWriteTime -Descending | Select-Object -First 1
-
-if (-not $FullDump) {
-    Write-Host "ERROR: No research_full_*.sql.gz found in $SNAPSHOT_DIR" -ForegroundColor Red
-    exit 1
-}
-
-Write-Host "  Found: $($FullDump.Name)" -ForegroundColor Green
-Write-Host "  Size:  $([math]::Round($FullDump.Length / 1MB, 2)) MB" -ForegroundColor Green
-
-# ── 2. Decompress the full dump ────────────────────────────────
-Write-Host ""
-Write-Host "--- Step 2: Decompress dump ---" -ForegroundColor Yellow
-
-$DecompressedSql = $FullDump.FullName -replace '\.gz$', ''
-
-if (Test-Path $DecompressedSql) {
-    Write-Host "  Decompressed file already exists, reusing" -ForegroundColor DarkGray
-} else {
-    $bytes = [System.IO.File]::ReadAllBytes($FullDump.FullName)
-    $ms = [System.IO.MemoryStream]::new($bytes)
-    $gzStream = [System.IO.Compression.GZipStream]::new(
-        $ms,
-        [System.IO.Compression.CompressionMode]::Decompress
-    )
-    $reader = [System.IO.StreamReader]::new($gzStream)
-    $decompressed = $reader.ReadToEnd()
-    $reader.Close()
-    $gzStream.Close()
-    $ms.Close()
-
-    [System.IO.File]::WriteAllText($DecompressedSql, $decompressed, [System.Text.Encoding]::UTF8)
-    Write-Host "  Decompressed to: $(Split-Path $DecompressedSql -Leaf)" -ForegroundColor Green
-}
-
-$DecompressedSize = (Get-Item $DecompressedSql).Length
-Write-Host "  Decompressed size: $([math]::Round($DecompressedSize / 1MB, 2)) MB"
-
-# ── 2b. Strip \restrict line (PostgreSQL 17 VPS dump) ──────────
-$restrictCheck = Get-Content $DecompressedSql -Head 10 | Where-Object { $_ -match '\\restrict' }
-if ($restrictCheck) {
-    Write-Host "  Stripping \restrict (VPS pg_dump 17.11)..." -ForegroundColor DarkGray
-    $content = Get-Content $DecompressedSql -Raw
-    $content = $content -replace '(?m)^\\restrict\s+\S+\s*$', ''
-    [System.IO.File]::WriteAllText($DecompressedSql, $content, [System.Text.Encoding]::UTF8)
-    Write-Host "  \restrict removed" -ForegroundColor Green
-}
-
-# ── 3. Drop and recreate target database ───────────────────────
-Write-Host ""
-Write-Host "--- Step 3: Recreate $TARGET_DB ---" -ForegroundColor Yellow
-
-Write-Host "  Terminating connections..." -ForegroundColor DarkGray
 try {
-    Invoke-Psql -Arguments @("-U", $PG_USER, "-d", "postgres", "-c",
-        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$TARGET_DB' AND pid <> pg_backend_pid();")
-} catch {
-    Write-Host "  (no active connections)" -ForegroundColor DarkGray
-}
-
-Write-Host "  Dropping database..." -ForegroundColor DarkGray
-try {
-    Invoke-Psql -Arguments @("-U", $PG_USER, "-d", "postgres", "-c",
-        "DROP DATABASE IF EXISTS $TARGET_DB;")
-} catch {
-    Write-Host "  (drop issue, continuing)" -ForegroundColor DarkGray
-}
-
-Write-Host "  Creating database..." -ForegroundColor DarkGray
-Invoke-Psql -Arguments @("-U", $PG_USER, "-d", "postgres", "-c",
-    "CREATE DATABASE $TARGET_DB;")
-Write-Host "  Database $TARGET_DB created" -ForegroundColor Green
-
-# ── 4. Verify connection ───────────────────────────────────────
-Write-Host ""
-Write-Host "--- Step 4: Verify connection ---" -ForegroundColor Yellow
-
-$checkDb = & $psqlPath -U $PG_USER -d $TARGET_DB -t -A -c "SELECT current_database();" 2>$null
-$checkDb = $checkDb.Trim()
-
-if ($checkDb -ne $TARGET_DB) {
-    Write-Host "ERROR: Connected to '$checkDb' instead of '$TARGET_DB'" -ForegroundColor Red
-    exit 1
-}
-Write-Host "  Confirmed: connected to $TARGET_DB" -ForegroundColor Green
-
-# ── 5. Restore from dump ───────────────────────────────────────
-Write-Host ""
-Write-Host "--- Step 5: Restore from authoritative dump ---" -ForegroundColor Yellow
-Write-Host "  Running psql (without ON_ERROR_STOP, external FK errors expected)..." -ForegroundColor DarkGray
-
-$restoreResult = Invoke-PsqlRestore -Database $TARGET_DB -FilePath $DecompressedSql
-
-# Log errors to file for diagnostics
-$logDir = $SNAPSHOT_DIR
-$logFile = Join-Path $logDir "restore_last_error.log"
-if ($restoreResult.ErrorCount -gt 0) {
-    Write-Host "  psql encountered $($restoreResult.ErrorCount) SQL error(s), saving to $logFile" -ForegroundColor Yellow
-    $stderrContent = Get-Content $restoreResult.StderrFile -Raw -ErrorAction SilentlyContinue
-    if ($stderrContent) {
-        $header = "=== Restore error log ===`nDatabase: $TARGET_DB`nTimestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`n`n"
-        [System.IO.File]::WriteAllText($logFile, $header + $stderrContent, [System.Text.Encoding]::UTF8)
-    }
-} else {
-    Write-Host "  psql restore completed with 0 SQL errors" -ForegroundColor Green
-}
-
-# Cleanup temp stderr/stdout
-Remove-Item $restoreResult.StderrFile -Force -ErrorAction SilentlyContinue
-Remove-Item $restoreResult.StdoutFile -Force -ErrorAction SilentlyContinue
-
-# ── 6. Post-restore validation (HARD FAIL if any check fails) ─
-Write-Host ""
-Write-Host "--- Step 6: Post-restore validation ---" -ForegroundColor Yellow
-Write-Host "  Running integrity checks..." -ForegroundColor DarkGray
-
-$validationErrors = Test-RestoreIntegrity -Database $TARGET_DB -ExpectedCounts $EXPECTED -RequiredFks $REQUIRED_FKS
-
-if ($validationErrors.Count -gt 0) {
+    Write-Host "=== LOCAL RESTORE: Research Snapshot ===" -ForegroundColor Cyan
+    Write-Host "Target DB: $TARGET_DB" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "RESTORE FAILED - validation errors:" -ForegroundColor Red
-    foreach ($err in $validationErrors) {
-        Write-Host "  $err" -ForegroundColor Red
+
+    # -- 0. Safety -----------------------------------------------
+    if ($TARGET_DB -eq "trad_bot") {
+        throw "FATAL: TARGET_DB must not be trad_bot"
     }
+    Write-Host "  [OK] Safety: target=$TARGET_DB" -ForegroundColor Green
+
+    # -- 1. Find dump --------------------------------------------
+    $FullDump = Get-ChildItem -Path $SNAPSHOT_DIR -Filter "research_full_*.sql.gz" |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $FullDump) { throw "FATAL: No research_full_*.sql.gz found" }
+    Write-Host "  [OK] Dump: $($FullDump.Name) ($([math]::Round($FullDump.Length/1MB,2)) MB)" -ForegroundColor Green
+
+    # -- 2. Decompress -------------------------------------------
+    $DecompressedSql = $FullDump.FullName -replace '\.gz$', ''
+    if (-not (Test-Path $DecompressedSql)) {
+        $bytes = [System.IO.File]::ReadAllBytes($FullDump.FullName)
+        $ms = [System.IO.MemoryStream]::new($bytes)
+        $gz = [System.IO.Compression.GZipStream]::new($ms, [System.IO.Compression.CompressionMode]::Decompress)
+        $reader = [System.IO.StreamReader]::new($gz)
+        $decompressed = $reader.ReadToEnd()
+        $reader.Close(); $gz.Close(); $ms.Close()
+        [System.IO.File]::WriteAllText($DecompressedSql, $decompressed, [System.Text.Encoding]::UTF8)
+    }
+    Write-Host "  [OK] Decompressed: $([math]::Round((Get-Item $DecompressedSql).Length/1MB,2)) MB" -ForegroundColor Green
+
+    # -- 3. Preprocess -------------------------------------------
+    $PreprocessedSql = Invoke-DumpPreprocess -InputPath $DecompressedSql
+    Write-Host "  [OK] Preprocessed: $(Split-Path $PreprocessedSql -Leaf)" -ForegroundColor Green
+
+    # -- 4. Drop and recreate DB ---------------------------------
+    $stderrFile = "$env:TEMP\psql_db_stderr.txt"
+    & $psqlPath -U $PG_USER -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$TARGET_DB' AND pid<>pg_backend_pid();" 2> $stderrFile
+    & $psqlPath -U $PG_USER -d postgres -c "DROP DATABASE IF EXISTS $TARGET_DB;" 2> $stderrFile
+    & $psqlPath -U $PG_USER -d postgres -c "CREATE DATABASE $TARGET_DB;" 2> $stderrFile
+    if ($global:LASTEXITCODE -ne 0) { throw "FATAL: CREATE DATABASE failed" }
+    Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue
+    Write-Host "  [OK] Database $TARGET_DB created" -ForegroundColor Green
+
+    # -- 5. Verify connection ------------------------------------
+    $checkDb = & $psqlPath -U $PG_USER -d $TARGET_DB -t -A -c "SELECT current_database();" 2>$null
+    if ($checkDb.Trim() -ne $TARGET_DB) { throw "FATAL: connected to wrong DB: $($checkDb.Trim())" }
+    Write-Host "  [OK] Connected to $TARGET_DB" -ForegroundColor Green
+
+    # -- 6. Restore (NO ON_ERROR_STOP) --------------------------
     Write-Host ""
-    Write-Host "Error log: $logFile" -ForegroundColor Yellow
-    exit 1
+    Write-Host "  Restoring (psql -f without ON_ERROR_STOP)..." -ForegroundColor DarkGray
+
+    $restoreStderr = "$env:TEMP\restore_stderr_$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
+    $restoreStdout = "$env:TEMP\restore_stdout_$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
+
+    & $psqlPath -U $PG_USER -d $TARGET_DB -f $PreprocessedSql 1> $restoreStdout 2> $restoreStderr
+    $psqlExit = $global:LASTEXITCODE
+
+    # Analyze stderr
+    $stderrContent = ""
+    if (Test-Path $restoreStderr) {
+        $stderrContent = Get-Content $restoreStderr -Raw -ErrorAction SilentlyContinue
+    }
+    $analysis = Get-PsqlErrorAnalysis -StderrContent $stderrContent
+
+    # Save error log if any errors detected
+    $errorLogFile = Join-Path $SNAPSHOT_DIR "restore_last_error.log"
+    if ($analysis.ErrorCount -gt 0 -or $psqlExit -ne 0) {
+        $logHeader = "=== Restore error log ===`nDatabase: $TARGET_DB`nTimestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`npsql exit: $psqlExit`n`n"
+        [System.IO.File]::WriteAllText($errorLogFile, $logHeader + $stderrContent, [System.Text.Encoding]::UTF8)
+        Write-Host "  Error log saved: $errorLogFile" -ForegroundColor Yellow
+    }
+
+    # Cleanup temp files
+    Remove-Item $restoreStderr -Force -ErrorAction SilentlyContinue
+    Remove-Item $restoreStdout -Force -ErrorAction SilentlyContinue
+
+    # -- 7. Check psql exit code ---------------------------------
+    if ($psqlExit -ne 0) {
+        Write-Host "  [FAIL] psql exit code: $psqlExit" -ForegroundColor Red
+        throw "FATAL: psql restore exited with code $psqlExit"
+    }
+    Write-Host "  [OK] psql exit code: 0" -ForegroundColor Green
+
+    # -- 8. Check stderr for ANY errors -------------------------
+    if ($analysis.HasFatal) {
+        Write-Host "  [FAIL] FATAL/PANIC in stderr" -ForegroundColor Red
+        throw "FATAL: psql stderr contains FATAL/PANIC"
+    }
+    if ($analysis.HasInvalidCmd) {
+        Write-Host "  [FAIL] Invalid psql command in stderr" -ForegroundColor Red
+        throw "FATAL: psql stderr contains invalid command"
+    }
+    if ($analysis.HasNativeErr) {
+        Write-Host "  [FAIL] NativeCommandError in stderr" -ForegroundColor Red
+        throw "FATAL: PowerShell NativeCommandError detected in stderr"
+    }
+    if ($analysis.HasError) {
+        Write-Host "  [FAIL] SQL errors in stderr: $($analysis.ErrorCount)" -ForegroundColor Red
+        foreach ($e in $analysis.ErrorLines) { Write-Host "    $e" -ForegroundColor Red }
+        throw "FATAL: $($analysis.ErrorCount) unexpected SQL errors in psql stderr"
+    }
+    Write-Host "  [OK] stderr: 0 errors, 0 FATAL, 0 invalid commands" -ForegroundColor Green
+
+    # -- 9. Post-restore validation ------------------------------
+    Write-Host ""
+    Write-Host "  Running integrity validation..." -ForegroundColor DarkGray
+    $valErrors = Test-RestoreIntegrity -Database $TARGET_DB -ExpectedCounts $EXPECTED -RequiredFks $REQUIRED_FKS
+    if ($valErrors.Count -gt 0) {
+        foreach ($e in $valErrors) { Write-Host "  [FAIL] $e" -ForegroundColor Red }
+        throw "FATAL: $($valErrors.Count) validation error(s)"
+    }
+    Write-Host "  [OK] All integrity checks passed" -ForegroundColor Green
+
+    # -- 10. Row counts display ----------------------------------
+    Write-Host ""
+    Write-Host "  Row counts:" -ForegroundColor Yellow
+    $countSql = "SELECT 'research_experiment' AS tbl, COUNT(*) AS cnt FROM research.research_experiment UNION ALL SELECT 'research_observation', COUNT(*) FROM research.research_observation UNION ALL SELECT 'research_signal', COUNT(*) FROM research.research_signal UNION ALL SELECT 'research_outcome', COUNT(*) FROM research.research_outcome;"
+    $stderrF = "$env:TEMP\count_stderr.txt"
+    & $psqlPath -U $PG_USER -d $TARGET_DB -c $countSql 2> $stderrF
+    Remove-Item $stderrF -Force -ErrorAction SilentlyContinue
+
+    # -- 11. Cleanup decompressed SQL ----------------------------
+    Remove-Item $DecompressedSql -Force -ErrorAction SilentlyContinue
+    Remove-Item $PreprocessedSql -Force -ErrorAction SilentlyContinue
+
+    $restoreOk = $true
+
+} finally {
+    if (-not $restoreOk) {
+        Write-Host ""
+        Write-Host "=== RESTORE FAILED ===" -ForegroundColor Red
+        Write-Host "Check error log: $errorLogFile" -ForegroundColor Yellow
+    }
 }
 
-Write-Host "  All validation checks passed" -ForegroundColor Green
-
-# ── 7. Row counts (display) ────────────────────────────────────
-Write-Host ""
-Write-Host "--- Step 7: Row counts ---" -ForegroundColor Yellow
-
-$countSql = "SELECT 'research_experiment' AS tbl, COUNT(*) AS cnt FROM research.research_experiment UNION ALL SELECT 'research_observation', COUNT(*) FROM research.research_observation UNION ALL SELECT 'research_signal', COUNT(*) FROM research.research_signal UNION ALL SELECT 'research_outcome', COUNT(*) FROM research.research_outcome;"
-Invoke-Psql -Arguments @("-U", $PG_USER, "-d", $TARGET_DB, "-c", $countSql)
-
-# ── 8. Cleanup ─────────────────────────────────────────────────
-Write-Host ""
-Write-Host "--- Step 8: Cleanup ---" -ForegroundColor Yellow
-
-Remove-Item $DecompressedSql -Force
-Write-Host "  Removed decompressed SQL (keeping .gz original)" -ForegroundColor Green
-
-# ── 9. Summary ─────────────────────────────────────────────────
-Write-Host ""
-Write-Host "=== RESTORE COMPLETE ===" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "Database:   $TARGET_DB" -ForegroundColor White
-Write-Host "Trad_bot:   UNTOUCHED" -ForegroundColor Green
-Write-Host "FK skipped: 4 (analytics.analysis_run, expected, not needed for analysis)" -ForegroundColor DarkGray
-Write-Host ""
-Write-Host "Next: Run parity validation:" -ForegroundColor White
-Write-Host "  psql -U postgres -d $TARGET_DB -f 03_parity_validation.sql" -ForegroundColor White
+# -- Only reach here if everything passed -----------------------
+if ($restoreOk) {
+    Write-Host ""
+    Write-Host "=== RESTORE COMPLETE ===" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Database:      $TARGET_DB" -ForegroundColor White
+    Write-Host "Trad_bot:      UNTOUCHED" -ForegroundColor Green
+    Write-Host "FK removed:    4 (analytics.analysis_run)" -ForegroundColor DarkGray
+    Write-Host "Restrict:      stripped (\restrict + \unrestrict)" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "Parity validation:" -ForegroundColor White
+    Write-Host "  & `"$psqlPath`" -U $PG_USER -d $TARGET_DB -f .\03_parity_validation.sql" -ForegroundColor DarkGray
+}
