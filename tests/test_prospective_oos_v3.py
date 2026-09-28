@@ -805,3 +805,100 @@ class TestMigration050:
                 f"{exp['experiment_id']} has status '{exp['status']}', expected 'READY_TO_START'"
             assert exp["started_at"] is None, \
                 f"{exp['experiment_id']} has started_at != NULL"
+
+    def test_invariant_checks_all_frozen_fields(self):
+        """Invariant must compare ALL 21 frozen fields, not just scanner/direction."""
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        content = m.read_text()
+        required_fields = [
+            "version", "scanner_name", "direction", "experiment_type",
+            "hypothesis", "primary_metric", "secondary_metrics",
+            "filter_rule", "threshold", "entry_rule", "stop_rule", "target_rule",
+            "position_sizing", "fee_assumption", "horizons",
+            "minimum_n", "minimum_symbols", "discovery_source", "paired_with",
+        ]
+        for field in required_fields:
+            assert f"IS DISTINCT FROM _expected_{field}" in content or \
+                   f"IS DISTINCT FROM _expected_{field} " in content, \
+                f"Invariant missing IS DISTINCT FROM check for: {field}"
+
+    def test_invariant_uses_is_distinct_from(self):
+        """Invariant must use IS DISTINCT FROM for NULL-safe comparison."""
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        content = m.read_text()
+        assert "IS DISTINCT FROM" in content, "Invariant must use IS DISTINCT FROM"
+
+    def test_invariant_raises_on_drift(self):
+        """Invariant must RAISE EXCEPTION on configuration drift."""
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        content = m.read_text()
+        assert "RAISE EXCEPTION" in content
+        assert "FROZEN CONFIGURATION DRIFT" in content
+
+    def test_invariant_does_not_compare_runtime_fields(self):
+        """Invariant must NOT compare started_at, status, created_at, updated_at."""
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        content = m.read_text()
+        import re
+        # Find the invariant DO block
+        do_block = re.search(r'DO \$\$.*?END \$\$;', content, re.DOTALL)
+        assert do_block is not None, "Invariant DO block not found"
+        block = do_block.group(0)
+        # Runtime fields should NOT appear in IS DISTINCT FROM checks
+        for runtime_field in ["started_at", "created_at", "updated_at"]:
+            pattern = f"IS DISTINCT FROM _expected_{runtime_field}"
+            assert pattern not in block, \
+                f"Invariant must NOT compare runtime field: {runtime_field}"
+
+    def test_registry_json_equivalence(self):
+        """Registry JSON frozen definitions must match migration seed values exactly."""
+        import json
+        reg_path = PROJECT_ROOT / "app" / "research" / "prospective_registry.json"
+        registry = json.loads(reg_path.read_text())
+
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        migration = m.read_text()
+
+        # For each experiment, verify ALL frozen fields in migration match JSON
+        frozen_fields = [
+            "experiment_id", "version", "scanner_name", "direction",
+            "experiment_type", "hypothesis", "primary_metric",
+            "filter_rule", "threshold", "entry_rule", "stop_rule",
+            "target_rule", "position_sizing_rule", "fee_assumption",
+            "minimum_n", "minimum_symbols",
+        ]
+
+        for exp in registry["experiments"]:
+            eid = exp["experiment_id"]
+            # Verify experiment_id string in INSERT
+            assert f"'{eid}'" in migration, f"Missing experiment_id: {eid}"
+
+            # Verify text fields appear in migration
+            for field in ["scanner_name", "direction", "experiment_type",
+                          "primary_metric", "filter_rule", "entry_rule",
+                          "stop_rule", "target_rule"]:
+                val = exp[field]
+                assert f"'{val}'" in migration, \
+                    f"Migration missing {field}='{val}' for {eid}"
+
+            # Verify numeric fields
+            if exp.get("threshold") is not None:
+                assert str(exp["threshold"]) in migration, \
+                    f"Migration missing threshold={exp['threshold']} for {eid}"
+            # minimum_n appears as ", N, " or ", N," in INSERT VALUES
+            if exp.get("minimum_n"):
+                mn = str(exp["minimum_n"])
+                assert f", {mn}," in migration or f", {mn} " in migration or \
+                       f" {mn}," in migration, \
+                    f"Migration missing minimum_n={mn} for {eid}"
+
+    def test_invariant_covers_all_six_experiments(self):
+        """Invariant DO block must have CASE entries for all 6 experiments."""
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        content = m.read_text()
+        required = [
+            "SRR_LONG_BASELINE_V1", "ME_SHORT_GEOM_A_V1", "ME_SHORT_GEOM_B_V1",
+            "ME_SHORT_GEOM_C_V1", "VC_SHORT_BB_WIDTH_V1", "LR_SHORT_GATE_V1",
+        ]
+        for eid in required:
+            assert f"WHEN '{eid}'" in content, f"Invariant missing WHEN clause for {eid}"

@@ -275,56 +275,235 @@ INSERT INTO research.prospective_experiment (
 
 ON CONFLICT (experiment_id) DO NOTHING;
 
--- ── 5b. Invariant check: verify frozen fields match ──────────
+-- ── 5b. Invariant check: verify ALL frozen fields match ──────
 -- If a row already exists, its frozen configuration must match.
 -- Runtime fields (started_at, status, created_at, updated_at) are NOT checked.
+-- Uses IS DISTINCT FROM for NULL-safe comparison.
+-- Uses JSONB comparison via ->> for semantic JSON equality.
 
 DO $$
 DECLARE
     _rec RECORD;
-    _mismatch TEXT := '';
+    _ok BOOLEAN;
+    _errors TEXT := '';
+    _expected_experiment_id TEXT;
+    _expected_version INT;
+    _expected_scanner_name TEXT;
+    _expected_direction TEXT;
+    _expected_experiment_type TEXT;
+    _expected_hypothesis TEXT;
+    _expected_primary_metric TEXT;
+    _expected_secondary_metrics JSONB;
+    _expected_filter_rule TEXT;
+    _expected_threshold NUMERIC;
+    _expected_entry_rule TEXT;
+    _expected_stop_rule TEXT;
+    _expected_target_rule TEXT;
+    _expected_position_sizing TEXT;
+    _expected_fee_assumption TEXT;
+    _expected_horizons JSONB;
+    _expected_minimum_n INT;
+    _expected_minimum_symbols INT;
+    _expected_discovery_source TEXT;
+    _expected_paired_with TEXT;
 BEGIN
     FOR _rec IN
-        SELECT experiment_id, scanner_name, direction, version, primary_metric, threshold
-        FROM research.prospective_experiment
+        SELECT * FROM research.prospective_experiment
         WHERE experiment_id IN (
             'SRR_LONG_BASELINE_V1', 'ME_SHORT_GEOM_A_V1', 'ME_SHORT_GEOM_B_V1',
             'ME_SHORT_GEOM_C_V1', 'VC_SHORT_BB_WIDTH_V1', 'LR_SHORT_GATE_V1'
         )
     LOOP
-        -- Verify scanner_name matches frozen registry
+        -- Load expected values from frozen seed
         CASE _rec.experiment_id
             WHEN 'SRR_LONG_BASELINE_V1' THEN
-                IF _rec.scanner_name != 'SUPPORT_RESISTANCE_REACTION' OR _rec.direction != 'LONG' THEN
-                    _mismatch := _mismatch || _rec.experiment_id || ': scanner/direction mismatch; ';
-                END IF;
+                _expected_version := 1;
+                _expected_scanner_name := 'SUPPORT_RESISTANCE_REACTION';
+                _expected_direction := 'LONG';
+                _expected_experiment_type := 'BASELINE_VALIDATION';
+                _expected_hypothesis := 'SRR LONG has signal edge (80.1% Fav) and gate edge. Prospective collection to validate.';
+                _expected_primary_metric := 'MFE_pct_60m';
+                _expected_secondary_metrics := '["MAE_pct_60m","MFE_pct_15m","MFE_pct_30m","MFE_pct_120m","MFE_pct_240m","TP_before_SL","SL_before_TP","MFE_R_60m","MAE_R_60m"]'::jsonb;
+                _expected_filter_rule := 'NONE - capture all SRR LONG candidates before production gate';
+                _expected_threshold := NULL;
+                _expected_entry_rule := 'Existing production entry semantics';
+                _expected_stop_rule := 'Existing production invalidation_price';
+                _expected_target_rule := 'Existing production target_1';
+                _expected_position_sizing := 'shadow_only';
+                _expected_fee_assumption := 'none';
+                _expected_horizons := '["15m","30m","60m","120m","240m"]'::jsonb;
+                _expected_minimum_n := 50;
+                _expected_minimum_symbols := 10;
+                _expected_discovery_source := '49b3828';
+                _expected_paired_with := NULL;
             WHEN 'ME_SHORT_GEOM_A_V1' THEN
-                IF _rec.scanner_name != 'MOMENTUM_EXHAUSTION' OR _rec.direction != 'SHORT' THEN
-                    _mismatch := _mismatch || _rec.experiment_id || ': scanner/direction mismatch; ';
-                END IF;
+                _expected_version := 1;
+                _expected_scanner_name := 'MOMENTUM_EXHAUSTION';
+                _expected_direction := 'SHORT';
+                _expected_experiment_type := 'GEOMETRY_CONTROL';
+                _expected_hypothesis := 'ME SHORT has 85.8% Fav but current 0.2% stop destroys it. Control: current geometry.';
+                _expected_primary_metric := 'MFE_pct_60m';
+                _expected_secondary_metrics := '["MAE_pct_60m","MFE_pct_15m","MFE_pct_30m","MFE_pct_120m","MFE_pct_240m","TP_before_SL","SL_before_TP","MFE_R_60m","MAE_R_60m"]'::jsonb;
+                _expected_filter_rule := 'NONE';
+                _expected_threshold := NULL;
+                _expected_entry_rule := 'reference_price (recent_high from 5m candles)';
+                _expected_stop_rule := 'invalidation_price = reference_price * 1.002 (existing 0.2% stop)';
+                _expected_target_rule := 'target_1 = current_price - ATR * 2';
+                _expected_position_sizing := 'shadow_only';
+                _expected_fee_assumption := 'none';
+                _expected_horizons := '["15m","30m","60m","120m","240m"]'::jsonb;
+                _expected_minimum_n := 50;
+                _expected_minimum_symbols := 10;
+                _expected_discovery_source := '49b3828';
+                _expected_paired_with := NULL;
             WHEN 'ME_SHORT_GEOM_B_V1' THEN
-                IF _rec.scanner_name != 'MOMENTUM_EXHAUSTION' OR _rec.direction != 'SHORT' THEN
-                    _mismatch := _mismatch || _rec.experiment_id || ': scanner/direction mismatch; ';
-                END IF;
+                _expected_version := 1;
+                _expected_scanner_name := 'MOMENTUM_EXHAUSTION';
+                _expected_direction := 'SHORT';
+                _expected_experiment_type := 'GEOMETRY_INTERVENTION_WIDER_STOP';
+                _expected_hypothesis := 'Wider stop reduces premature SL hits. stop=max(risk, 0.5*ATR_14).';
+                _expected_primary_metric := 'MFE_pct_60m';
+                _expected_secondary_metrics := '["MAE_pct_60m","MFE_pct_15m","MFE_pct_30m","MFE_pct_120m","MFE_pct_240m","TP_before_SL","SL_before_TP","MFE_R_60m","MAE_R_60m"]'::jsonb;
+                _expected_filter_rule := 'NONE - same signals as GEOM_A';
+                _expected_threshold := NULL;
+                _expected_entry_rule := 'Same as GEOM_A';
+                _expected_stop_rule := 'FROZEN: stop_distance = max(abs(reference_price - invalidation_price), 0.5 * ATR_14_5m)';
+                _expected_target_rule := 'Same risk distance as GEOM_A, adjusted to new entry';
+                _expected_position_sizing := 'shadow_only';
+                _expected_fee_assumption := 'none';
+                _expected_horizons := '["15m","30m","60m","120m","240m"]'::jsonb;
+                _expected_minimum_n := 50;
+                _expected_minimum_symbols := 10;
+                _expected_discovery_source := '49b3828';
+                _expected_paired_with := 'ME_SHORT_GEOM_A_V1';
             WHEN 'ME_SHORT_GEOM_C_V1' THEN
-                IF _rec.scanner_name != 'MOMENTUM_EXHAUSTION' OR _rec.direction != 'SHORT' THEN
-                    _mismatch := _mismatch || _rec.experiment_id || ': scanner/direction mismatch; ';
-                END IF;
+                _expected_version := 1;
+                _expected_scanner_name := 'MOMENTUM_EXHAUSTION';
+                _expected_direction := 'SHORT';
+                _expected_experiment_type := 'GEOMETRY_INTERVENTION_DELAYED_ENTRY';
+                _expected_hypothesis := 'Delayed entry at candle close avoids initial noise. 25.6% have MAE in first 15m then recover.';
+                _expected_primary_metric := 'MFE_pct_60m';
+                _expected_secondary_metrics := '["MAE_pct_60m","MFE_pct_15m","MFE_pct_30m","MFE_pct_120m","MFE_pct_240m","TP_before_SL","SL_before_TP","MFE_R_60m","MAE_R_60m"]'::jsonb;
+                _expected_filter_rule := 'NONE - same signals as GEOM_A';
+                _expected_threshold := NULL;
+                _expected_entry_rule := 'FROZEN: entry at close of 5m candle that triggered detection. Stop/target distance preserved.';
+                _expected_stop_rule := 'adjusted: new_stop = delayed_entry + original_risk_distance';
+                _expected_target_rule := 'adjusted: new_target = delayed_entry - original_target_distance';
+                _expected_position_sizing := 'shadow_only';
+                _expected_fee_assumption := 'none';
+                _expected_horizons := '["15m","30m","60m","120m","240m"]'::jsonb;
+                _expected_minimum_n := 50;
+                _expected_minimum_symbols := 10;
+                _expected_discovery_source := '49b3828';
+                _expected_paired_with := 'ME_SHORT_GEOM_A_V1';
             WHEN 'VC_SHORT_BB_WIDTH_V1' THEN
-                IF _rec.scanner_name != 'VOLATILITY_COMPRESSION' OR _rec.direction != 'SHORT'
-                   OR _rec.threshold != 0.569723 THEN
-                    _mismatch := _mismatch || _rec.experiment_id || ': scanner/direction/threshold mismatch; ';
-                END IF;
+                _expected_version := 1;
+                _expected_scanner_name := 'VOLATILITY_COMPRESSION';
+                _expected_direction := 'SHORT';
+                _expected_experiment_type := 'FEATURE_FILTER';
+                _expected_hypothesis := 'VC SHORT baseline flat but bb_width < 0.569723 isolates compressed states with different MFE.';
+                _expected_primary_metric := 'MFE_pct_60m';
+                _expected_secondary_metrics := '["MAE_pct_60m","MFE_pct_15m","MFE_pct_30m","MFE_pct_120m","MFE_pct_240m","TP_before_SL","SL_before_TP"]'::jsonb;
+                _expected_filter_rule := 'PASS: bb_width_percentile < 0.569723. CONTROL: >= 0.569723.';
+                _expected_threshold := 0.569723;
+                _expected_entry_rule := 'Existing production entry semantics';
+                _expected_stop_rule := 'Existing production invalidation_price';
+                _expected_target_rule := 'Existing production target_1';
+                _expected_position_sizing := 'shadow_only';
+                _expected_fee_assumption := 'none';
+                _expected_horizons := '["15m","30m","60m","120m","240m"]'::jsonb;
+                _expected_minimum_n := 50;
+                _expected_minimum_symbols := 10;
+                _expected_discovery_source := '49b3828';
+                _expected_paired_with := NULL;
             WHEN 'LR_SHORT_GATE_V1' THEN
-                IF _rec.scanner_name != 'LIQUIDITY_REVERSAL' OR _rec.direction != 'SHORT' THEN
-                    _mismatch := _mismatch || _rec.experiment_id || ': scanner/direction mismatch; ';
-                END IF;
+                _expected_version := 1;
+                _expected_scanner_name := 'LIQUIDITY_REVERSAL';
+                _expected_direction := 'SHORT';
+                _expected_experiment_type := 'GATE_VALIDATION';
+                _expected_hypothesis := 'Existing gate improves forward MFE% (SETUP Fav=67.8% vs REJECTED Fav=16.7% in discovery).';
+                _expected_primary_metric := 'MFE_pct_60m';
+                _expected_secondary_metrics := '["MAE_pct_60m","MFE_pct_15m","MFE_pct_30m","MFE_pct_120m","MFE_pct_240m","TP_before_SL","SL_before_TP"]'::jsonb;
+                _expected_filter_rule := 'NONE - capture all, tag with gate result';
+                _expected_threshold := NULL;
+                _expected_entry_rule := 'Existing production entry semantics';
+                _expected_stop_rule := 'Existing production invalidation_price';
+                _expected_target_rule := 'Existing production target_1';
+                _expected_position_sizing := 'shadow_only';
+                _expected_fee_assumption := 'none';
+                _expected_horizons := '["15m","30m","60m","120m","240m"]'::jsonb;
+                _expected_minimum_n := 30;
+                _expected_minimum_symbols := 5;
+                _expected_discovery_source := '49b3828';
+                _expected_paired_with := NULL;
+            ELSE
+                _errors := _errors || _rec.experiment_id || ': unknown experiment; ';
+                CONTINUE;
         END CASE;
-    END LOOP;
 
-    IF _mismatch != '' THEN
-        RAISE EXCEPTION 'FROZEN CONFIGURATION DRIFT DETECTED: %', _mismatch;
-    END IF;
+        -- Compare ALL immutable frozen fields (NULL-safe with IS DISTINCT FROM)
+        _ok := TRUE;
+
+        IF _rec.version IS DISTINCT FROM _expected_version THEN
+            _errors := _errors || _rec.experiment_id || ': version drift; '; _ok := FALSE;
+        END IF;
+        IF _rec.scanner_name IS DISTINCT FROM _expected_scanner_name THEN
+            _errors := _errors || _rec.experiment_id || ': scanner_name drift; '; _ok := FALSE;
+        END IF;
+        IF _rec.direction IS DISTINCT FROM _expected_direction THEN
+            _errors := _errors || _rec.experiment_id || ': direction drift; '; _ok := FALSE;
+        END IF;
+        IF _rec.experiment_type IS DISTINCT FROM _expected_experiment_type THEN
+            _errors := _errors || _rec.experiment_id || ': experiment_type drift; '; _ok := FALSE;
+        END IF;
+        IF _rec.hypothesis IS DISTINCT FROM _expected_hypothesis THEN
+            _errors := _errors || _rec.experiment_id || ': hypothesis drift; '; _ok := FALSE;
+        END IF;
+        IF _rec.primary_metric IS DISTINCT FROM _expected_primary_metric THEN
+            _errors := _errors || _rec.experiment_id || ': primary_metric drift; '; _ok := FALSE;
+        END IF;
+        -- JSONB comparison: cast both sides to jsonb text for semantic equality
+        IF _rec.secondary_metrics IS DISTINCT FROM _expected_secondary_metrics THEN
+            _errors := _errors || _rec.experiment_id || ': secondary_metrics drift; '; _ok := FALSE;
+        END IF;
+        IF _rec.filter_rule IS DISTINCT FROM _expected_filter_rule THEN
+            _errors := _errors || _rec.experiment_id || ': filter_rule drift; '; _ok := FALSE;
+        END IF;
+        IF _rec.threshold IS DISTINCT FROM _expected_threshold THEN
+            _errors := _errors || _rec.experiment_id || ': threshold drift; '; _ok := FALSE;
+        END IF;
+        IF _rec.entry_rule IS DISTINCT FROM _expected_entry_rule THEN
+            _errors := _errors || _rec.experiment_id || ': entry_rule drift; '; _ok := FALSE;
+        END IF;
+        IF _rec.stop_rule IS DISTINCT FROM _expected_stop_rule THEN
+            _errors := _errors || _rec.experiment_id || ': stop_rule drift; '; _ok := FALSE;
+        END IF;
+        IF _rec.target_rule IS DISTINCT FROM _expected_target_rule THEN
+            _errors := _errors || _rec.experiment_id || ': target_rule drift; '; _ok := FALSE;
+        END IF;
+        IF _rec.position_sizing IS DISTINCT FROM _expected_position_sizing THEN
+            _errors := _errors || _rec.experiment_id || ': position_sizing drift; '; _ok := FALSE;
+        END IF;
+        IF _rec.fee_assumption IS DISTINCT FROM _expected_fee_assumption THEN
+            _errors := _errors || _rec.experiment_id || ': fee_assumption drift; '; _ok := FALSE;
+        END IF;
+        IF _rec.horizons IS DISTINCT FROM _expected_horizons THEN
+            _errors := _errors || _rec.experiment_id || ': horizons drift; '; _ok := FALSE;
+        END IF;
+        IF _rec.minimum_n IS DISTINCT FROM _expected_minimum_n THEN
+            _errors := _errors || _rec.experiment_id || ': minimum_n drift; '; _ok := FALSE;
+        END IF;
+        IF _rec.minimum_symbols IS DISTINCT FROM _expected_minimum_symbols THEN
+            _errors := _errors || _rec.experiment_id || ': minimum_symbols drift; '; _ok := FALSE;
+        END IF;
+        IF _rec.discovery_source IS DISTINCT FROM _expected_discovery_source THEN
+            _errors := _errors || _rec.experiment_id || ': discovery_source drift; '; _ok := FALSE;
+        END IF;
+        IF _rec.paired_with IS DISTINCT FROM _expected_paired_with THEN
+            _errors := _errors || _rec.experiment_id || ': paired_with drift; '; _ok := FALSE;
+        END IF;
+
+    END LOOP;
 
     -- Verify exactly 6 expected experiments exist
     IF (SELECT COUNT(*) FROM research.prospective_experiment
@@ -332,7 +511,11 @@ BEGIN
             'SRR_LONG_BASELINE_V1', 'ME_SHORT_GEOM_A_V1', 'ME_SHORT_GEOM_B_V1',
             'ME_SHORT_GEOM_C_V1', 'VC_SHORT_BB_WIDTH_V1', 'LR_SHORT_GATE_V1'
         )) != 6 THEN
-        RAISE EXCEPTION 'Expected exactly 6 prospective experiments, found different count';
+        _errors := _errors || 'Expected exactly 6 prospective experiments; ';
+    END IF;
+
+    IF _errors != '' THEN
+        RAISE EXCEPTION 'FROZEN CONFIGURATION DRIFT DETECTED: %', _errors;
     END IF;
 END $$;
 
