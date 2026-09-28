@@ -39,6 +39,7 @@ def main() -> None:
     from app.db.repository import ScannerRepository
     from app.exchange.bybit_client import BybitClient
     from app.research.evaluator import ResearchEvaluator
+    from app.research.repository import ResearchRepository
 
     settings = load_settings(args.config)
     db_repo = ScannerRepository(
@@ -86,7 +87,10 @@ def main() -> None:
         logger.info("Active prospective experiments: %s", prospective_ids)
 
         from app.research.prospective_evaluator import ProspectiveOOSEvaluator
-        prospective_eval = ProspectiveOOSEvaluator(conn=db_repo._conn, client=client)
+        # Prospective evaluator uses ResearchRepository for signal lookups,
+        # not BybitClient. The BybitClient is only used for candle fetching.
+        research_repo = ResearchRepository(db_repo._conn)
+        prospective_eval = ProspectiveOOSEvaluator(conn=db_repo._conn, client=client, repo=research_repo)
 
         if args.once:
             for exp_id in prospective_ids:

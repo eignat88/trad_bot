@@ -129,9 +129,10 @@ def _check_tp_sl(
 class ProspectiveOOSEvaluator:
     """Multi-horizon evaluator for prospective OOS experiments."""
 
-    def __init__(self, conn: Any, client: BybitClient) -> None:
+    def __init__(self, conn: Any, client: BybitClient, repo: Any = None) -> None:
         self._conn = conn
         self.client = client
+        self._repo = repo  # ResearchRepository for get_eligible_signals if needed
 
     def _get_candles(self, symbol: str, from_time: datetime, to_time: datetime) -> list[Candle]:
         try:

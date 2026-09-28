@@ -21,6 +21,7 @@ from app.scanners.context_builder import build_market_context
 from app.scanners.direction_gate import ScannerDirectionGatePolicy
 from app.scanners.expectancy_filter import ExpectancyFilter, load_expectancy
 from app.scanners.funnel_diagnostics import flush_and_persist_all
+from app.research.prospective_observer import ProspectiveOOSObserver
 from app.scanners.models import SetupCandidate
 from app.scanners.orchestrator import ScannerOrchestrator
 
@@ -368,6 +369,7 @@ def run_scan_cycle(
     run_id: int | None,
     settings: Settings | None = None,
     expectancy_filter: ExpectancyFilter | None = None,
+    prospective_obs: ProspectiveOOSObserver | None = None,
 ) -> tuple[int, int, int]:
     """Returns (total_found, scanned, failed)."""
     settings = settings or _load_runner_settings()
@@ -603,6 +605,9 @@ def main() -> None:
         logger.info("generic research observer enabled: experiments=%s", list(research_obs._experiments.keys()))
 
     # Prospective OOS observer: fail-open, captures for frozen experiments
+    # Fail-closed initialization: prospective_obs = None ensures NameError cannot occur
+    # even if the observer factory returns None due to missing registry or connection failure.
+    prospective_obs: ProspectiveOOSObserver | None = None
     prospective_obs = _get_prospective_observer(repository)
     if prospective_obs is not None:
         logger.info("prospective OOS observer enabled: experiments=%s", list(prospective_obs._registry.keys()))
@@ -705,6 +710,7 @@ def main() -> None:
             total, scanned, failed = run_scan_cycle(
                 client, orchestrator, repository, symbols, run_id, settings,
                 expectancy_filter=expectancy_filter,
+                prospective_obs=prospective_obs,
             )
 
             # -- SIGNAL_FUNNEL_DIAGNOSTICS_V1: flush counters to DB --
