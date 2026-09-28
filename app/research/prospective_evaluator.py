@@ -263,10 +263,26 @@ class ProspectiveOOSEvaluator:
             logger.exception("prospective evaluator: upsert outcome failed for obs %d", obs_id)
 
     def run_evaluation_cycle(self, experiment_id: str) -> dict[str, Any]:
-        """Run one evaluation cycle for a prospective experiment."""
+        """Run one evaluation cycle for a prospective experiment.
+
+        CRITICAL: Only evaluates observations with signal_time >= experiment.started_at.
+        Warm-up observations captured before activation are NEVER evaluated.
+        """
         now = datetime.now(timezone.utc)
 
+        # Get the experiment's started_at to enforce the prospective boundary
         cursor = self._conn.cursor()
+        cursor.execute(
+            "SELECT started_at FROM research.prospective_experiment WHERE experiment_id = %s",
+            (experiment_id,),
+        )
+        row = cursor.fetchone()
+        if row is None or row[0] is None:
+            return {"experiment_id": experiment_id, "signals_checked": 0,
+                    "horizons_updated": {}, "finalized": 0, "errors": 0}
+        started_at = row[0]
+
+        # ONLY observations with signal_time >= started_at are prospective
         cursor.execute(
             """
             SELECT o.observation_id, o.symbol, o.signal_time, o.experiment_id,
@@ -277,10 +293,11 @@ class ProspectiveOOSEvaluator:
             FROM research.prospective_observation o
             LEFT JOIN research.prospective_outcome r ON r.observation_id = o.observation_id
             WHERE o.experiment_id = %s
+              AND o.signal_time >= %s
               AND (r.observation_id IS NULL
                    OR r.is_final = FALSE)
             """,
-            (experiment_id,),
+            (experiment_id, started_at),
         )
         eligible = cursor.fetchall()
         self._conn.commit()

@@ -38,14 +38,6 @@ class ProspectiveOOSObserver:
     """
 
     def __init__(self, conn: Any, registry: dict[str, dict]) -> None:
-        """Parameters
-        ----------
-        conn : psycopg2 connection
-            Database connection (separate from production).
-        registry : dict
-            Prospective experiment registry loaded from JSON.
-            Keyed by experiment_id.
-        """
         self._conn = conn
         self._registry = registry
         self._stats: dict[str, int] = {}
@@ -53,15 +45,8 @@ class ProspectiveOOSObserver:
     def _make_source_key(
         self, scanner_name: str, symbol: str, direction: str, signal_time: Any,
     ) -> int:
-        """Create a deterministic synthetic source_signal_id from candidate identity.
-
-        This is a negative hash used as a placeholder until the evaluator
-        links prospective observations to actual research signals.
-        Uses a hash of (scanner, symbol, direction, signal_time) to ensure
-        uniqueness and idempotency.
-        """
+        """Deterministic synthetic source_signal_id from candidate identity."""
         key_str = f"{scanner_name}:{symbol}:{direction}:{signal_time}"
-        # Use Python hash, mapped to negative int to distinguish from real signal_ids
         return -abs(hash(key_str)) % (2**31)
 
     def observe(
@@ -87,7 +72,6 @@ class ProspectiveOOSObserver:
         if not self._conn:
             return
 
-        # Generate synthetic source key from candidate identity
         source_key = self._make_source_key(
             scanner_name, symbol, direction, signal_time,
         )
@@ -101,7 +85,6 @@ class ProspectiveOOSObserver:
                     continue
 
                 if exp_id.startswith("ME_SHORT_GEOM_"):
-                    # ME SHORT: produce A/B/C from same source
                     self._observe_me_geometry(
                         cursor, exp_id, exp_spec,
                         source_key, symbol, signal_time,
@@ -109,7 +92,6 @@ class ProspectiveOOSObserver:
                         score, features, parameters, market_regime,
                     )
                 else:
-                    # Standard: one observation per experiment
                     self._observe_standard(
                         cursor, exp_id, exp_spec,
                         source_key, symbol, signal_time,
@@ -123,8 +105,7 @@ class ProspectiveOOSObserver:
             self._conn.rollback()
             self._stats["errors"] = self._stats.get("errors", 0) + 1
             logger.exception(
-                "prospective observer error: %s %s",
-                scanner_name, symbol,
+                "prospective observer error: %s %s", scanner_name, symbol,
             )
 
     def _observe_standard(
@@ -139,7 +120,6 @@ class ProspectiveOOSObserver:
         rule_passed = True
         filter_reason = None
 
-        # Apply frozen filter rules
         if exp_id == "VC_SHORT_BB_WIDTH_V1":
             bb_pct = features.get("bb_width_percentile")
             if bb_pct is not None:
@@ -152,7 +132,6 @@ class ProspectiveOOSObserver:
                 filter_reason = "bb_width_percentile is NULL"
 
         elif exp_id == "LR_SHORT_GATE_V1":
-            # Gate validation: capture all candidates, tag gate result
             rule_passed = True
             filter_reason = "observational_gate_validation"
 
@@ -175,7 +154,6 @@ class ProspectiveOOSObserver:
                 json.dumps(features), json.dumps(parameters), market_regime,
             ),
         )
-
         if cursor.rowcount > 0:
             self._stats[exp_id] = self._stats.get(exp_id, 0) + 1
 
@@ -189,15 +167,50 @@ class ProspectiveOOSObserver:
     ) -> None:
         """Insert ME SHORT geometry variant observation.
 
-        For GEOM_A: use original geometry (current stop/target)
-        For GEOM_B: wider stop = max(current_risk, 0.5 * ATR)
-        For GEOM_C: delayed entry (at detection candle close)
-                     stop/target adjusted relative to delayed entry
+        EXACT FROZEN FORMULAS (all distances are from reference_price):
+
+        GEOM_A (CONTROL):
+          entry_time_A    = signal_time (detection time)
+          entry_price_A   = reference_price
+          stop_A          = invalidation_price (= reference_price * 1.002)
+          target_A        = target_1 (= current_price - ATR*2)
+          risk_dist_A     = abs(reference_price - invalidation_price)
+          target_dist_A   = abs(reference_price - target_1)
+
+        GEOM_B (WIDER STOP):
+          entry_time_B    = signal_time (same as A)
+          entry_price_B   = reference_price (same as A)
+          new_risk        = max(risk_dist_A, 0.5 * ATR_14_5m)
+          stop_B          = reference_price + new_risk
+          target_B        = reference_price - target_dist_A (SAME target distance as A)
+          risk_dist_B     = new_risk (wider than A)
+          target_dist_B   = target_dist_A (same as A)
+
+        NOTE: B widens the stop but keeps the same target distance.
+        This means B has worse RR than A (wider stop, same target).
+        This is intentional: the hypothesis is that wider stop captures
+        more favorable moves that A's tight stop misses.
+
+        GEOM_C (DELAYED ENTRY):
+          decision_time       = signal_time (when scanner detects)
+          detection_candle_close = features["entry_price"] (close of the 5m candle at detection)
+          entry_time_C        = detection_candle_close time
+          entry_price_C       = detection_candle_close (= features["entry_price"])
+          risk_dist_C         = risk_dist_A (same as original)
+          target_dist_C       = target_dist_A (same as original)
+          stop_C              = entry_price_C + risk_dist_C
+          target_C            = entry_price_C - target_dist_C
+
+        GEOM_C is a delayed-entry experiment: C enters at the CLOSE of the
+        detection candle, not at detection time. Since detection happens
+        during the candle, C's entry is 0-5 minutes later than A's.
         """
         if invalidation_price is None or reference_price <= 0:
             return
 
-        current_risk = abs(reference_price - invalidation_price)
+        risk_dist_A = abs(reference_price - invalidation_price)
+        target_dist_A = abs(reference_price - target_1) if target_1 is not None else 0
+
         atr = features.get("atr", reference_price * 0.015)
         if atr is None or atr <= 0:
             atr = reference_price * 0.015
@@ -207,31 +220,27 @@ class ProspectiveOOSObserver:
         variant_target = target_1
 
         if exp_id == "ME_SHORT_GEOM_A_V1":
-            # Control: current geometry as-is
             variant_entry = reference_price
             variant_stop = invalidation_price
             variant_target = target_1
 
         elif exp_id == "ME_SHORT_GEOM_B_V1":
-            # Wider stop: max(current_risk, 0.5 * ATR)
-            new_risk = max(current_risk, 0.5 * atr)
+            new_risk = max(risk_dist_A, 0.5 * atr)
             variant_entry = reference_price
-            variant_stop = reference_price + new_risk  # SHORT: stop above entry
+            variant_stop = reference_price + new_risk
+            # Target distance preserved from A (NOT adjusted for wider stop)
             if target_1 is not None:
-                original_target_dist = abs(reference_price - target_1)
-                variant_target = reference_price - original_target_dist
+                variant_target = reference_price - target_dist_A
 
         elif exp_id == "ME_SHORT_GEOM_C_V1":
-            # Delayed entry: use current_price (close of detection candle)
+            # Entry at detection candle close (available at detection time)
             current_price = features.get("entry_price", reference_price)
             if current_price is None or current_price <= 0:
                 current_price = reference_price
             variant_entry = current_price
-            original_stop_dist = abs(reference_price - invalidation_price)
-            variant_stop = current_price + original_stop_dist
+            variant_stop = current_price + risk_dist_A
             if target_1 is not None:
-                original_target_dist = abs(reference_price - target_1)
-                variant_target = current_price - original_target_dist
+                variant_target = current_price - target_dist_A
 
         cursor.execute(
             """
@@ -254,7 +263,6 @@ class ProspectiveOOSObserver:
                 json.dumps(features), json.dumps(parameters), market_regime,
             ),
         )
-
         if cursor.rowcount > 0:
             self._stats[exp_id] = self._stats.get(exp_id, 0) + 1
 
