@@ -667,3 +667,141 @@ class TestSmokeValidation:
             for mutation in ["INSERT ", "UPDATE ", "DELETE ", "TRUNCATE ", "ALTER TABLE", "DROP TABLE"]:
                 if mutation in upper:
                     assert False, f"Mutating SQL found: {mutation} -> {stripped[:100]}"
+
+
+# ============================================================
+# MIGRATION 050 TESTS
+# ============================================================
+
+class TestMigration050:
+    """Test the fixed migration 050 for seed, GRANT, idempotency, invariants."""
+
+    def test_migration_file_exists(self):
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        assert m.exists()
+
+    def test_migration_has_seed_insert(self):
+        """Migration must contain INSERT INTO research.prospective_experiment."""
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        content = m.read_text()
+        assert "INSERT INTO research.prospective_experiment" in content
+        assert "ON CONFLICT (experiment_id) DO NOTHING" in content
+
+    def test_migration_seeds_all_six_experiments(self):
+        """Migration INSERT must contain all 6 exact experiment IDs."""
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        content = m.read_text()
+        required = [
+            "SRR_LONG_BASELINE_V1",
+            "ME_SHORT_GEOM_A_V1",
+            "ME_SHORT_GEOM_B_V1",
+            "ME_SHORT_GEOM_C_V1",
+            "VC_SHORT_BB_WIDTH_V1",
+            "LR_SHORT_GATE_V1",
+        ]
+        for exp_id in required:
+            assert f"'{exp_id}'" in content, f"Seed INSERT missing: {exp_id}"
+
+    def test_migration_has_invariant_check(self):
+        """Migration must verify frozen fields match after seeding."""
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        content = m.read_text()
+        assert "RAISE EXCEPTION" in content
+        assert "FROZEN CONFIGURATION DRIFT" in content
+
+    def test_migration_has_transaction(self):
+        """Migration must be wrapped in BEGIN/COMMIT."""
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        content = m.read_text()
+        # Strip comments and find first/last SQL statement
+        import re
+        lines = [l.strip() for l in content.split("\n")
+                 if l.strip() and not l.strip().startswith("--")]
+        assert lines[0] in ("BEGIN", "BEGIN;"), f"Migration must start with BEGIN, got: {lines[0]}"
+        assert lines[-1] in ("COMMIT;", "COMMIT"), f"Migration must end with COMMIT, got: {lines[-1]}"
+
+    def test_migration_no_invalid_grant(self):
+        """Migration must not contain 'GRANT SELECT ON ALL VIEWS' in SQL statements."""
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        content = m.read_text()
+        # Strip comments before checking
+        import re
+        content_no_comments = re.sub(r'--.*$', '', content, flags=re.MULTILINE)
+        assert "GRANT SELECT ON ALL VIEWS" not in content_no_comments.upper(), \
+            "Invalid PostgreSQL GRANT syntax found in SQL statements"
+
+    def test_migration_has_explicit_view_grant(self):
+        """Migration must explicitly GRANT SELECT on the accumulation view."""
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        content = m.read_text()
+        assert "GRANT SELECT ON research.v_prospective_accumulation" in content
+
+    def test_migration_all_tables_idempotent(self):
+        """All CREATE TABLE must be IF NOT EXISTS."""
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        content = m.read_text()
+        import re
+        content_no_comments = re.sub(r'--.*$', '', content, flags=re.MULTILINE)
+        tables = re.findall(r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\S+)', content_no_comments)
+        tables_idempotent = re.findall(r'CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\S+)', content_no_comments)
+        non_idempotent = [t for t in tables if t not in tables_idempotent]
+        assert len(non_idempotent) == 0, f"Non-idempotent tables: {non_idempotent}"
+
+    def test_migration_indexes_idempotent(self):
+        """All CREATE INDEX must be IF NOT EXISTS."""
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        content = m.read_text()
+        import re
+        content_no_comments = re.sub(r'--.*$', '', content, flags=re.MULTILINE)
+        indexes = re.findall(r'CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(\S+)', content_no_comments)
+        indexes_idempotent = re.findall(r'CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(\S+)', content_no_comments)
+        non_idempotent = [i for i in indexes if i not in indexes_idempotent]
+        assert len(non_idempotent) == 0, f"Non-idempotent indexes: {non_idempotent}"
+
+    def test_seed_sets_started_at_null(self):
+        """All seeded experiments must have started_at = NULL."""
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        content = m.read_text()
+        import re
+        # Count 'READY_TO_START' in INSERT VALUES lines only
+        # The CHECK constraint also mentions it, so we count the pattern
+        # "'READY_TO_START', NULL)" which appears in each INSERT row
+        null_started = content.count("'READY_TO_START', NULL)")
+        assert null_started == 6, f"Expected 6 seeded rows with READY_TO_START + NULL, got {null_started}"
+
+    def test_vc_threshold_in_seed(self):
+        """VC SHORT seed must contain frozen threshold 0.569723."""
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        content = m.read_text()
+        assert "0.569723" in content
+
+    def test_registry_json_db_mapping(self):
+        """Verify JSON fields map to DB columns for all 6 experiments."""
+        import json
+        reg_path = PROJECT_ROOT / "app" / "research" / "prospective_registry.json"
+        registry = json.loads(reg_path.read_text())
+
+        m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
+        migration = m.read_text()
+
+        for exp in registry["experiments"]:
+            eid = exp["experiment_id"]
+            # experiment_id in INSERT
+            assert f"'{eid}'" in migration, f"Missing {eid}"
+            # scanner_name
+            assert f"'{exp['scanner_name']}'" in migration, f"Missing scanner for {eid}"
+            # direction
+            assert f"'{exp['direction']}'" in migration, f"Missing direction for {eid}"
+            # primary_metric
+            assert f"'{exp['primary_metric']}'" in migration, f"Missing metric for {eid}"
+
+    def test_registry_json_status_boundary(self):
+        """JSON status must be READY_TO_START, not READY or ACTIVE."""
+        import json
+        reg_path = PROJECT_ROOT / "app" / "research" / "prospective_registry.json"
+        registry = json.loads(reg_path.read_text())
+        for exp in registry["experiments"]:
+            assert exp["status"] == "READY_TO_START", \
+                f"{exp['experiment_id']} has status '{exp['status']}', expected 'READY_TO_START'"
+            assert exp["started_at"] is None, \
+                f"{exp['experiment_id']} has started_at != NULL"
