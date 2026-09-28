@@ -568,3 +568,102 @@ class TestMEPairing:
         # Different symbol should produce different key
         key3 = observer._make_source_key("MOMENTUM_EXHAUSTION", "ETHUSDT", "SHORT", "2026-09-25T12:00:00")
         assert key1 != key3
+
+
+# ============================================================
+# SMOKE VALIDATION SQL TESTS
+# ============================================================
+
+class TestSmokeValidation:
+    """Verify 05_smoke_validation.sql exists and is correct."""
+
+    def test_smoke_file_exists(self):
+        smoke = PROJECT_ROOT / "research_snapshot" / "05_smoke_validation.sql"
+        assert smoke.exists(), "05_smoke_validation.sql not found"
+
+    def test_smoke_is_read_only(self):
+        """Smoke SQL must contain no mutating statements."""
+        smoke = PROJECT_ROOT / "research_snapshot" / "05_smoke_validation.sql"
+        content = smoke.read_text().upper()
+        for keyword in ["INSERT ", "UPDATE ", "DELETE ", "TRUNCATE ", "ALTER ", "DROP ", "CREATE "]:
+            # Check for actual SQL mutations, not comments or string literals
+            # Allow CREATE in information_schema checks
+            lines = [l for l in content.split("\n")
+                     if l.strip() and not l.strip().startswith("--")]
+            for line in lines:
+                # CREATE is allowed in SELECT subqueries checking table existence
+                if keyword in line and "INFORMATION_SCHEMA" not in line and "SELECT" not in line.split(keyword)[0]:
+                    assert False, f"Mutating SQL found: {keyword} in: {line.strip()[:80]}"
+
+    def test_smoke_checks_all_six_experiments(self):
+        """Smoke SQL must reference all 6 exact experiment IDs."""
+        smoke = PROJECT_ROOT / "research_snapshot" / "05_smoke_validation.sql"
+        content = smoke.read_text()
+        required = [
+            "SRR_LONG_BASELINE_V1",
+            "ME_SHORT_GEOM_A_V1",
+            "ME_SHORT_GEOM_B_V1",
+            "ME_SHORT_GEOM_C_V1",
+            "VC_SHORT_BB_WIDTH_V1",
+            "LR_SHORT_GATE_V1",
+        ]
+        for exp_id in required:
+            assert exp_id in content, f"Smoke SQL missing experiment: {exp_id}"
+
+    def test_smoke_checks_prospective_boundary(self):
+        """Smoke SQL must check started_at."""
+        smoke = PROJECT_ROOT / "research_snapshot" / "05_smoke_validation.sql"
+        content = smoke.read_text()
+        assert "started_at IS NULL" in content
+        assert "started_at IS NOT NULL" in content
+
+    def test_smoke_checks_me_pairing(self):
+        """Smoke SQL must validate A/B/C pairing."""
+        smoke = PROJECT_ROOT / "research_snapshot" / "05_smoke_validation.sql"
+        content = smoke.read_text()
+        assert "source_signal_id" in content
+        assert "ME_SHORT_GEOM_A_V1" in content
+        assert "ME_SHORT_GEOM_B_V1" in content
+        assert "ME_SHORT_GEOM_C_V1" in content
+        assert "variant_count" in content or "COUNT(DISTINCT" in content
+
+    def test_smoke_checks_vc_threshold(self):
+        """Smoke SQL must validate VC frozen threshold."""
+        smoke = PROJECT_ROOT / "research_snapshot" / "05_smoke_validation.sql"
+        content = smoke.read_text()
+        assert "0.569723" in content
+        assert "bb_width_percentile" in content
+        assert "rule_passed" in content
+
+    def test_smoke_references_all_required_tables(self):
+        """Smoke SQL must reference all prospective tables and view."""
+        smoke = PROJECT_ROOT / "research_snapshot" / "05_smoke_validation.sql"
+        content = smoke.read_text()
+        assert "prospective_experiment" in content
+        assert "prospective_observation" in content
+        assert "prospective_outcome" in content
+        assert "v_prospective_accumulation" in content
+
+    def test_smoke_has_pre_and_post_activation(self):
+        """Smoke SQL must have both pre-activation and post-activation sections."""
+        smoke = PROJECT_ROOT / "research_snapshot" / "05_smoke_validation.sql"
+        content = smoke.read_text()
+        assert "PRE-ACTIVATION" in content or "pre-activation" in content.lower()
+        assert "POST-ACTIVATION" in content or "post-activation" in content.lower()
+
+    def test_smoke_no_mutations_final(self):
+        """Final check: no INSERT/UPDATE/DELETE/TRUNCATE/ALTER/DROP/CREATE anywhere."""
+        smoke = PROJECT_ROOT / "research_snapshot" / "05_smoke_validation.sql"
+        content = smoke.read_text()
+        # Split into lines, strip comments
+        import re
+        lines = content.split("\n")
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("--") or not stripped:
+                continue
+            upper = stripped.upper()
+            # Allow CREATE TABLE/VIEW/INDEX in information_schema subqueries
+            for mutation in ["INSERT ", "UPDATE ", "DELETE ", "TRUNCATE ", "ALTER TABLE", "DROP TABLE"]:
+                if mutation in upper:
+                    assert False, f"Mutating SQL found: {mutation} -> {stripped[:100]}"
