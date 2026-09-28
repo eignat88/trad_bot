@@ -710,15 +710,21 @@ class TestMigration050:
         assert "FROZEN CONFIGURATION DRIFT" in content
 
     def test_migration_has_transaction(self):
-        """Migration must be wrapped in BEGIN/COMMIT."""
+        """Migration must contain BEGIN/COMMIT wrapping the seed data."""
         m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
         content = m.read_text()
-        # Strip comments and find first/last SQL statement
         import re
         lines = [l.strip() for l in content.split("\n")
                  if l.strip() and not l.strip().startswith("--")]
-        assert lines[0] in ("BEGIN", "BEGIN;"), f"Migration must start with BEGIN, got: {lines[0]}"
-        assert lines[-1] in ("COMMIT;", "COMMIT"), f"Migration must end with COMMIT, got: {lines[-1]}"
+        # BEGIN should appear early
+        assert any(l in ("BEGIN", "BEGIN;") for l in lines[:20]), \
+            "Migration must contain BEGIN"
+        # COMMIT must exist
+        assert "COMMIT;" in lines, "Migration must contain COMMIT;"
+        # COMMIT must come before the GRANT DO block
+        commit_idx = lines.index("COMMIT;")
+        grant_found = any("GRANT" in l for l in lines[commit_idx+1:])
+        assert grant_found, "GRANT must come after COMMIT"
 
     def test_migration_no_invalid_grant(self):
         """Migration must not contain 'GRANT SELECT ON ALL VIEWS' in SQL statements."""

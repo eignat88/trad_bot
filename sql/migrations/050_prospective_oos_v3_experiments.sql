@@ -548,25 +548,28 @@ GROUP BY o.experiment_id, pe.scanner_name, pe.direction, pe.experiment_type,
 COMMENT ON VIEW research.v_prospective_accumulation
     IS 'Accumulation stats for prospective OOS experiments (migration 050)';
 
--- ── 7. GRANT permissions ──────────────────────────────────────
--- NOTE: PostgreSQL does not support "GRANT SELECT ON ALL VIEWS".
--- Views in the research schema get SELECT via the table GRANT
--- when trad_bot owns or has privileges on them.
--- We grant on ALL TABLES which covers views accessed through
--- the research schema, and also grant explicit SELECT on the view.
-
-GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA research TO trad_bot;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA research TO trad_bot;
-
--- Explicitly grant SELECT on the accumulation view
-GRANT SELECT ON research.v_prospective_accumulation TO trad_bot;
-
-ALTER DEFAULT PRIVILEGES IN SCHEMA research
-    GRANT SELECT, INSERT, UPDATE ON TABLES TO trad_bot;
-ALTER DEFAULT PRIVILEGES IN SCHEMA research
-    GRANT USAGE, SELECT ON SEQUENCES TO trad_bot;
-
 COMMIT;
+
+-- ============================================================
+-- POST-COMMIT: GRANT permissions
+-- ============================================================
+-- GRANT failures must NOT roll back the seed data.
+-- If trad_bot role does not exist (local test), GRANT is skipped.
+
+DO $$
+BEGIN
+    BEGIN
+        GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA research TO trad_bot;
+        GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA research TO trad_bot;
+        GRANT SELECT ON research.v_prospective_accumulation TO trad_bot;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA research
+            GRANT SELECT, INSERT, UPDATE ON TABLES TO trad_bot;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA research
+            GRANT USAGE, SELECT ON SEQUENCES TO trad_bot;
+    EXCEPTION WHEN undefined_object THEN
+        RAISE NOTICE 'trad_bot role not found - skipping GRANT (local test environment)';
+    END;
+END $$;
 
 -- ============================================================
 -- NO production tables modified.
