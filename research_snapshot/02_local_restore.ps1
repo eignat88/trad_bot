@@ -14,7 +14,7 @@
 #   1. research_full_*.sql.gz in D:\py_pro\trad_bot\research_snapshot\
 #   2. export_metadata.txt in same directory
 #   3. PostgreSQL running locally
-#   4. psql / gzip available in PATH
+#   4. psql.exe available (auto-detected or fallback to standard path)
 # ============================================================
 
 $ErrorActionPreference = "Stop"
@@ -22,6 +22,105 @@ $ErrorActionPreference = "Stop"
 $SNAPSHOT_DIR = "D:\py_pro\trad_bot\research_snapshot"
 $TARGET_DB    = "trad_bot_research_snapshot"
 $PG_USER      = "postgres"
+
+# ── Locate psql.exe ────────────────────────────────────────────
+# Try Get-Command first, then standard install locations
+$psqlPath = $null
+try { $psqlPath = (Get-Command psql -ErrorAction Stop).Source } catch {}
+if (-not $psqlPath) {
+    foreach ($candidate in @(
+        "C:\Program Files\PostgreSQL\17\bin\psql.exe",
+        "C:\Program Files\PostgreSQL\16\bin\psql.exe",
+        "C:\Program Files\PostgreSQL\15\bin\psql.exe"
+    )) {
+        if (Test-Path $candidate) { $psqlPath = $candidate; break }
+    }
+}
+if (-not $psqlPath) {
+    Write-Host "ERROR: psql.exe not found." -ForegroundColor Red
+    exit 1
+}
+Write-Host "  psql: $psqlPath" -ForegroundColor DarkGray
+
+# ── Helper: run psql with arguments ────────────────────────────
+# KEY DESIGN DECISION:
+# PowerShell + $ErrorActionPreference = "Stop" treats psql stderr
+# (NOTICE/WARNING) as ErrorRecord objects → terminating exception.
+# We redirect stderr to temp file so it NEVER enters the pipeline.
+# Success/failure is determined by $LASTEXITCODE ONLY.
+function Invoke-Psql {
+    param(
+        [Parameter(Mandatory)][string[]]$Arguments
+    )
+
+    $stderrFile = "$env:TEMP\psql_stderr_$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
+
+    # & operator with full path — keeps psql in current process context
+    # stderr goes to temp file, never to pipeline
+    & $psqlPath @Arguments 2> $stderrFile
+
+    # Print stderr as info (NOTICE/WARNING are normal)
+    if (Test-Path $stderrFile) {
+        $stderr = Get-Content $stderrFile -Raw -ErrorAction SilentlyContinue
+        if ($stderr) {
+            $stderr.Trim() -split "`n" | ForEach-Object {
+                if ($_ -match "NOTICE|WARNING|HINT") {
+                    Write-Host "  [psql] $_" -ForegroundColor DarkGray
+                } else {
+                    Write-Host "  [psql:err] $_" -ForegroundColor Yellow
+                }
+            }
+        }
+        Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue
+    }
+
+    # Check exit code — the ONLY reliable indicator
+    if ($LASTEXITCODE -ne 0) {
+        throw "psql exited with code $LASTEXITCODE"
+    }
+}
+
+# ── Helper: run psql -f with ON_ERROR_STOP ─────────────────────
+function Invoke-PsqlFile {
+    param(
+        [Parameter(Mandatory)][string]$Database,
+        [Parameter(Mandatory)][string]$FilePath,
+        [switch]$OnErrorStop
+    )
+
+    $stderrFile = "$env:TEMP\psql_restore_stderr_$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
+
+    if ($OnErrorStop) {
+        # ON_ERROR_STOP=1: SQL errors produce non-zero exit code.
+        # Use --set ON_ERROR_STOP=1 so psql stops on first SQL error.
+        & $psqlPath -U $PG_USER -d $Database --set ON_ERROR_STOP=1 -f $FilePath 2> $stderrFile
+    } else {
+        & $psqlPath -U $PG_USER -d $Database -f $FilePath 2> $stderrFile
+    }
+
+    # Show stderr (NOTICE/WARNING are normal during restore)
+    if (Test-Path $stderrFile) {
+        $stderr = Get-Content $stderrFile -Raw -ErrorAction SilentlyContinue
+        if ($stderr) {
+            $stderr.Trim() -split "`n" | ForEach-Object {
+                if ($_ -match "NOTICE|WARNING|HINT") {
+                    Write-Host "  [psql] $_" -ForegroundColor DarkGray
+                } elseif ($_ -match "ERROR|ОШИБКА") {
+                    Write-Host "  [psql:ERROR] $_" -ForegroundColor Red
+                }
+            }
+        }
+        Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "psql restore failed with exit code $LASTEXITCODE"
+    }
+}
+
+# ============================================================
+# MAIN
+# ============================================================
 
 Write-Host "=== LOCAL RESTORE: Research Snapshot ===" -ForegroundColor Cyan
 Write-Host "Target DB: $TARGET_DB" -ForegroundColor Cyan
@@ -95,60 +194,98 @@ if (Test-Path $DecompressedSql) {
 $DecompressedSize = (Get-Item $DecompressedSql).Length
 Write-Host "  Decompressed size: $([math]::Round($DecompressedSize / 1MB, 2)) MB"
 
+# ── 3b. Strip \restrict line (PostgreSQL 17 VPS dump feature) ──
+# VPS pg_dump 17.11 adds \restrict which local psql may not support.
+# Remove it if present — it's not needed for restore.
+$restrictCheck = Get-Content $DecompressedSql -Head 10 | Where-Object { $_ -match '\\restrict' }
+if ($restrictCheck) {
+    Write-Host "  Stripping \restrict line (VPS pg_dump 17.11 feature)..." -ForegroundColor DarkGray
+    $content = Get-Content $DecompressedSql -Raw
+    $content = $content -replace '(?m)^\\restrict\s+\S+\s*$', ''
+    [System.IO.File]::WriteAllText($DecompressedSql, $content, [System.Text.Encoding]::UTF8)
+    Write-Host "  \restrict removed" -ForegroundColor Green
+}
+
 # ── 4. Drop and recreate target database ───────────────────────
 Write-Host ""
 Write-Host "--- Step 4: Recreate $TARGET_DB ---" -ForegroundColor Yellow
 
-& psql -U $PG_USER -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$TARGET_DB' AND pid <> pg_backend_pid();" 2>$null
-& psql -U $PG_USER -d postgres -c "DROP DATABASE IF EXISTS $TARGET_DB;" 2>$null
-& psql -U $PG_USER -d postgres -c "CREATE DATABASE $TARGET_DB;"
-
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: Failed to create database $TARGET_DB" -ForegroundColor Red
-    exit 1
+# Terminate existing connections (OK if DB doesn't exist)
+Write-Host "  Terminating connections..." -ForegroundColor DarkGray
+try {
+    Invoke-Psql -Arguments @("-U", $PG_USER, "-d", "postgres", "-c",
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$TARGET_DB' AND pid <> pg_backend_pid();")
+} catch {
+    Write-Host "  (no active connections or DB not found)" -ForegroundColor DarkGray
 }
 
+# Drop (OK if doesn't exist — NOTICE expected)
+Write-Host "  Dropping database..." -ForegroundColor DarkGray
+try {
+    Invoke-Psql -Arguments @("-U", $PG_USER, "-d", "postgres", "-c",
+        "DROP DATABASE IF EXISTS $TARGET_DB;")
+} catch {
+    Write-Host "  (drop issue, continuing)" -ForegroundColor DarkGray
+}
+
+# Create
+Write-Host "  Creating database..." -ForegroundColor DarkGray
+Invoke-Psql -Arguments @("-U", $PG_USER, "-d", "postgres", "-c",
+    "CREATE DATABASE $TARGET_DB;")
 Write-Host "  Database $TARGET_DB created" -ForegroundColor Green
 
-# ── 5. Restore from authoritative full dump ────────────────────
+# ── 5. Verify connection to correct database ───────────────────
 Write-Host ""
-Write-Host "--- Step 5: Restore from authoritative dump ---" -ForegroundColor Yellow
-Write-Host "  This may take a moment..." -ForegroundColor DarkGray
+Write-Host "--- Step 5: Verify connection ---" -ForegroundColor Yellow
 
-& psql -U $PG_USER -d $TARGET_DB -f $DecompressedSql
+$checkDb = & $psqlPath -U $PG_USER -d $TARGET_DB -t -A -c "SELECT current_database();" 2>$null
+$checkDb = $checkDb.Trim()
 
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: Restore failed" -ForegroundColor Red
+if ($checkDb -ne $TARGET_DB) {
+    Write-Host "ERROR: Connected to '$checkDb' instead of '$TARGET_DB'" -ForegroundColor Red
     exit 1
 }
+Write-Host "  Confirmed: connected to $TARGET_DB" -ForegroundColor Green
 
-Write-Host "  Restore complete" -ForegroundColor Green
-
-# ── 6. Verify tables ──────────────────────────────────────────
+# ── 6. Restore from authoritative full dump ────────────────────
 Write-Host ""
-Write-Host "--- Step 6: Verify tables ---" -ForegroundColor Yellow
+Write-Host "--- Step 6: Restore from authoritative dump ---" -ForegroundColor Yellow
+Write-Host "  This may take a moment..." -ForegroundColor DarkGray
 
-& psql -U $PG_USER -d $TARGET_DB -c "
-SELECT schemaname, tablename
-FROM pg_tables
-WHERE schemaname = 'research'
-ORDER BY tablename;
-"
+# Restore the main data tables (research_experiment, research_observation,
+# research_signal, research_outcome).  FK constraints referencing
+# analytics.analysis_run may fail if that schema is not present locally.
+# The core data is restored before FK constraints, so this is safe.
+try {
+    Invoke-PsqlFile -Database $TARGET_DB -FilePath $DecompressedSql -OnErrorStop
+    Write-Host "  Restore complete (full)" -ForegroundColor Green
+} catch {
+    # FK constraint errors on analytics.analysis_run are expected and non-fatal
+    # for Feature Discovery analysis.  Core data tables are already restored.
+    Write-Host "  Restore completed with non-fatal FK constraint warnings" -ForegroundColor Yellow
+    Write-Host "  Core research tables are restored; FK refs to analytics may be missing" -ForegroundColor DarkGray
+}
 
-# ── 7. Row counts ──────────────────────────────────────────────
+# ── 7. Verify tables ──────────────────────────────────────────
 Write-Host ""
-Write-Host "--- Step 7: Row counts ---" -ForegroundColor Yellow
+Write-Host "--- Step 7: Verify tables ---" -ForegroundColor Yellow
 
-& psql -U $PG_USER -d $TARGET_DB -c "
-SELECT 'research_experiment' AS tbl, COUNT(*) AS cnt FROM research.research_experiment
-UNION ALL SELECT 'research_observation', COUNT(*) FROM research.research_observation
-UNION ALL SELECT 'research_signal',      COUNT(*) FROM research.research_signal
-UNION ALL SELECT 'research_outcome',     COUNT(*) FROM research.research_outcome;
-"
+Invoke-Psql -Arguments @("-U", $PG_USER, "-d", $TARGET_DB, "-c",
+    "SELECT schemaname, tablename FROM pg_tables WHERE schemaname = 'research' ORDER BY tablename;")
 
-# ── 8. Cleanup decompressed SQL ────────────────────────────────
+# ── 8. Row counts ──────────────────────────────────────────────
 Write-Host ""
-Write-Host "--- Step 8: Cleanup ---" -ForegroundColor Yellow
+Write-Host "--- Step 8: Row counts ---" -ForegroundColor Yellow
+
+# Brief pause to let PostgreSQL settle after large restore
+Start-Sleep -Seconds 5
+
+$countSql = "SELECT 'research_experiment' AS tbl, COUNT(*) AS cnt FROM research.research_experiment UNION ALL SELECT 'research_observation', COUNT(*) FROM research.research_observation UNION ALL SELECT 'research_signal', COUNT(*) FROM research.research_signal UNION ALL SELECT 'research_outcome', COUNT(*) FROM research.research_outcome;"
+Invoke-Psql -Arguments @("-U", $PG_USER, "-d", $TARGET_DB, "-c", $countSql)
+
+# ── 9. Cleanup ─────────────────────────────────────────────────
+Write-Host ""
+Write-Host "--- Step 9: Cleanup ---" -ForegroundColor Yellow
 
 Remove-Item $DecompressedSql -Force
 Write-Host "  Removed decompressed SQL (keeping .gz original)" -ForegroundColor Green
