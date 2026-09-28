@@ -29,3 +29,9 @@ monitoring/grafana/.env
 backup/
 config.yaml.save
 config.yaml.save.*
+
+# Research snapshot — dump artifacts (large binaries, never commit)
+research_snapshot/research_full_*.sql.gz
+research_snapshot/research_schema_*.sql
+research_snapshot/research_data_*.sql.gz
+research_snapshot/export_metadata.txt
