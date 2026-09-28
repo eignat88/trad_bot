@@ -1,9 +1,14 @@
 """Research Evaluator Runner — standalone CLI entrypoint for the background evaluator.
 
 Runs as trad-bot-research-evaluator.service — completely independent from
-the scanner process.  Evaluates BOTH:
+the scanner process.  Evaluates BOTH in a SINGLE unified scheduler loop:
   1. Generic research experiments (research.research_signal → research.research_outcome)
   2. Prospective OOS experiments (research.prospective_observation → research.prospective_outcome)
+
+Architecture:
+  One top-level scheduler loop loads experiment lists dynamically each cycle,
+  runs all generic evaluations, then all prospective evaluations, then sleeps.
+  No blocking .start() calls — both experiment types share the same cycle.
 
 Usage:
     python -m app.research.evaluator_runner --once
@@ -13,14 +18,19 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any
 
 logger = logging.getLogger("research_evaluator")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generic Research Evaluator — multi-horizon MFE/MAE/TP/SL",
+        description="Research Evaluator — unified generic + prospective scheduler",
     )
     parser.add_argument("--once", action="store_true", help="Single cycle then exit")
     parser.add_argument("--interval-seconds", type=int, default=300)
@@ -39,6 +49,7 @@ def main() -> None:
     from app.db.repository import ScannerRepository
     from app.exchange.bybit_client import BybitClient
     from app.research.evaluator import ResearchEvaluator
+    from app.research.prospective_evaluator import ProspectiveOOSEvaluator
     from app.research.repository import ResearchRepository
 
     settings = load_settings(args.config)
@@ -54,69 +65,152 @@ def main() -> None:
     client = BybitClient(settings)
     evaluator = ResearchEvaluator(conn=db_repo._conn, client=client)
 
-    # ── Generic research experiments ────────────────────────────
-    experiment_ids = _load_active_experiments(db_repo._conn)
+    # Prospective evaluator: injected with ResearchRepository (not BybitClient)
+    research_repo = ResearchRepository(db_repo._conn)
+    prospective_eval = ProspectiveOOSEvaluator(
+        conn=db_repo._conn, client=client, repo=research_repo,
+    )
+
+    if args.once:
+        _run_single_cycle(db_repo._conn, evaluator, prospective_eval)
+        return
+
+    # ── Daemon mode: unified scheduler loop ────────────────────
+    _run_scheduler_loop(
+        conn=db_repo._conn,
+        evaluator=evaluator,
+        prospective_eval=prospective_eval,
+        interval_seconds=args.interval_seconds,
+    )
+
+
+def _run_single_cycle(
+    conn: Any,
+    evaluator: ResearchEvaluator,
+    prospective_eval: ProspectiveOOSEvaluator,
+) -> None:
+    """Execute one evaluation cycle for BOTH generic + prospective, then exit."""
+    # ── Generic ──
+    experiment_ids = _load_active_experiments(conn)
     if experiment_ids:
         logger.info("Active generic experiments: %s", experiment_ids)
-
-        if args.once:
-            for exp_id in experiment_ids:
-                summary = evaluator.run_evaluation_cycle(exp_id)
-                print(f"\n{'=' * 80}")
-                print(f"RESEARCH EVALUATION CYCLE — {exp_id}")
-                print(f"{'=' * 80}")
-                print(f"Signals checked:    {summary['signals_checked']}")
-                print(f"Symbols processed:  {summary['symbols_processed']}")
-                print(f"Horizons updated:   {summary['horizons_updated']}")
-                print(f"Outcomes created:   {summary['outcomes_created']}")
-                print(f"Outcomes updated:   {summary['outcomes_updated']}")
-                print(f"Finalized:          {summary['finalized']}")
-                print(f"Errors:             {summary['errors']}")
-                print(f"{'=' * 80}")
-        else:
-            evaluator.start(
-                experiment_ids=experiment_ids,
-                interval_seconds=args.interval_seconds,
-            )
+        for exp_id in experiment_ids:
+            summary = evaluator.run_evaluation_cycle(exp_id)
+            print(f"\n{'=' * 80}")
+            print(f"RESEARCH EVALUATION CYCLE — {exp_id}")
+            print(f"{'=' * 80}")
+            print(f"Signals checked:    {summary['signals_checked']}")
+            print(f"Symbols processed:  {summary['symbols_processed']}")
+            print(f"Horizons updated:   {summary['horizons_updated']}")
+            print(f"Outcomes created:   {summary['outcomes_created']}")
+            print(f"Outcomes updated:   {summary['outcomes_updated']}")
+            print(f"Finalized:          {summary['finalized']}")
+            print(f"Errors:             {summary['errors']}")
+            print(f"{'=' * 80}")
     else:
         logger.warning("No active generic research experiments found")
 
-    # ── Prospective OOS experiments ─────────────────────────────
-    prospective_ids = _load_prospective_experiments(db_repo._conn)
+    # ── Prospective ──
+    prospective_ids = _load_prospective_experiments(conn)
     if prospective_ids:
         logger.info("Active prospective experiments: %s", prospective_ids)
-
-        from app.research.prospective_evaluator import ProspectiveOOSEvaluator
-        # Prospective evaluator uses ResearchRepository for signal lookups,
-        # not BybitClient. The BybitClient is only used for candle fetching.
-        research_repo = ResearchRepository(db_repo._conn)
-        prospective_eval = ProspectiveOOSEvaluator(conn=db_repo._conn, client=client, repo=research_repo)
-
-        if args.once:
-            for exp_id in prospective_ids:
-                summary = prospective_eval.run_evaluation_cycle(exp_id)
-                print(f"\n{'=' * 80}")
-                print(f"PROSPECTIVE EVALUATION CYCLE — {exp_id}")
-                print(f"{'=' * 80}")
-                print(f"Signals checked:    {summary['signals_checked']}")
-                print(f"Horizons updated:   {summary['horizons_updated']}")
-                print(f"Finalized:          {summary['finalized']}")
-                print(f"Errors:             {summary['errors']}")
-                print(f"{'=' * 80}")
-        else:
-            # Run prospective evaluation in the same loop as generic
-            prospective_eval.start(
-                experiment_ids=prospective_ids,
-                interval_seconds=args.interval_seconds,
-            )
+        for exp_id in prospective_ids:
+            summary = prospective_eval.run_evaluation_cycle(exp_id)
+            print(f"\n{'=' * 80}")
+            print(f"PROSPECTIVE EVALUATION CYCLE — {exp_id}")
+            print(f"{'=' * 80}")
+            print(f"Signals checked:    {summary['signals_checked']}")
+            print(f"Horizons updated:   {summary['horizons_updated']}")
+            print(f"Finalized:          {summary['finalized']}")
+            print(f"Errors:             {summary['errors']}")
+            print(f"{'=' * 80}")
     else:
         logger.info("No active prospective experiments found")
 
     if not experiment_ids and not prospective_ids:
         logger.warning("No experiments (generic or prospective) found")
-        if args.once:
-            print("No experiments.")
-        sys.exit(0)
+        print("No experiments.")
+
+
+def _run_scheduler_loop(
+    conn: Any,
+    evaluator: ResearchEvaluator,
+    prospective_eval: ProspectiveOOSEvaluator,
+    interval_seconds: int = 300,
+) -> None:
+    """Unified daemon scheduler: generic + prospective in one loop.
+
+    Each iteration:
+      1. Reload experiment lists from DB (dynamic status changes)
+      2. Run generic evaluations
+      3. Run prospective evaluations
+      4. Interruptible sleep
+    """
+    shutdown = threading.Event()
+    running = True
+
+    def _stop(signum: int, frame: Any) -> None:
+        nonlocal running
+        logger.info("research evaluator: received signal %d, stopping", signum)
+        running = False
+        shutdown.set()
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    logger.info(
+        "research evaluator started (unified loop): interval=%ds",
+        interval_seconds,
+    )
+
+    cycle = 0
+    while running:
+        cycle += 1
+
+        # ── Generic research experiments ──────────────────────
+        experiment_ids = _load_active_experiments(conn)
+        if experiment_ids:
+            logger.info("Active generic experiments: %s", experiment_ids)
+        for exp_id in experiment_ids:
+            if not running:
+                break
+            try:
+                evaluator.run_evaluation_cycle(exp_id)
+            except Exception:
+                logger.exception(
+                    "research evaluation cycle failed for %s", exp_id,
+                )
+
+        # ── Prospective OOS experiments ───────────────────────
+        prospective_ids = _load_prospective_experiments(conn)
+        if prospective_ids:
+            logger.info("Active prospective experiments: %s", prospective_ids)
+        for exp_id in prospective_ids:
+            if not running:
+                break
+            try:
+                stats = prospective_eval.run_evaluation_cycle(exp_id)
+                logger.info(
+                    "prospective evaluation [%s]: checked=%d finalized=%d errors=%d",
+                    exp_id, stats["signals_checked"],
+                    stats["finalized"], stats["errors"],
+                )
+            except Exception:
+                logger.exception(
+                    "prospective evaluation cycle failed for %s", exp_id,
+                )
+
+        if not experiment_ids and not prospective_ids:
+            logger.info(
+                "cycle #%d: no active experiments (generic or prospective)",
+                cycle,
+            )
+
+        # ── Interruptible wait ────────────────────────────────
+        if running:
+            shutdown.wait(timeout=interval_seconds)
+
+    logger.info("research evaluator stopped")
 
 
 def _load_active_experiments(conn) -> list[str]:
@@ -126,7 +220,8 @@ def _load_active_experiments(conn) -> list[str]:
     cursor = conn.cursor()
     try:
         cursor.execute(
-            "SELECT experiment_id FROM research.research_experiment WHERE status = 'ACTIVE' ORDER BY experiment_id"
+            "SELECT experiment_id FROM research.research_experiment "
+            "WHERE status = 'ACTIVE' ORDER BY experiment_id"
         )
         return [row[0] for row in cursor.fetchall()]
     except Exception:
@@ -135,10 +230,10 @@ def _load_active_experiments(conn) -> list[str]:
 
 
 def _load_prospective_experiments(conn) -> list[str]:
-    """Load active prospective experiment IDs.
+    """Load prospective experiment IDs with status='RUNNING'.
 
-    Returns experiments with status='RUNNING' (started_at IS NOT NULL).
-    Experiments with started_at=NULL are NOT evaluated yet.
+    Returns experiments with status='RUNNING' AND started_at IS NOT NULL.
+    Experiments with started_at=NULL or status != 'RUNNING' are NOT evaluated.
     """
     if not conn:
         return []

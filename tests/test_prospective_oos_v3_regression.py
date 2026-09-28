@@ -1,13 +1,15 @@
 """Regression tests for Prospective OOS V3 runtime wiring.
 
-Tests the two runtime failures discovered on VPS:
+Tests three runtime failures discovered on VPS:
 1. NameError: name 'prospective_obs' is not defined in scanner_runner.py
 2. AttributeError: 'BybitClient' object has no attribute 'get_eligible_signals'
+3. evaluator_runner.py blocking .start() prevents prospective path execution
 
 Also verifies:
 - ME A/B/C exact pairing by source_signal_id
 - Evaluator processes research.prospective_observation → research.prospective_outcome
 - Fail-closed initialization of prospective_obs
+- Unified scheduler loop for generic + prospective
 """
 from __future__ import annotations
 
@@ -15,7 +17,7 @@ import ast
 import inspect
 import textwrap
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
 
 import pytest
 
@@ -384,3 +386,214 @@ class TestScannerCoverage:
         source = (PROJECT_ROOT / "app" / "research" / "prospective_observer.py").read_text()
         assert "_observe_standard(" in source
         assert "_observe_me_geometry(" in source
+
+
+# ══════════════════════════════════════════════════════════════
+# Test 8: Unified scheduler loop (orchestration fix)
+# ══════════════════════════════════════════════════════════════
+
+class TestUnifiedSchedulerLoop:
+    """evaluator_runner.py must use ONE scheduler loop for both generic + prospective.
+    Blocking .start() calls must NOT be used in daemon mode.
+    """
+
+    def test_no_evaluator_start_call_in_runner(self):
+        """evaluator_runner.py must NOT call evaluator.start() in daemon mode."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        # The old pattern: evaluator.start( or evaluator.start (
+        assert "evaluator.start(" not in source and "evaluator.start (" not in source, (
+            "evaluator_runner.py still calls evaluator.start() — "
+            "this blocks the scheduler loop"
+        )
+
+    def test_no_prospective_eval_start_call_in_runner(self):
+        """evaluator_runner.py must NOT call prospective_eval.start() in daemon mode."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        assert "prospective_eval.start(" not in source, (
+            "evaluator_runner.py still calls prospective_eval.start() — "
+            "this blocks the scheduler loop"
+        )
+
+    def test_run_scheduler_loop_exists(self):
+        """A unified _run_scheduler_loop function must exist."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        assert "def _run_scheduler_loop(" in source, (
+            "_run_scheduler_loop function not found"
+        )
+
+    def test_run_single_cycle_exists(self):
+        """A _run_single_cycle function must exist for --once mode."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        assert "def _run_single_cycle(" in source, (
+            "_run_single_cycle function not found"
+        )
+
+    def test_scheduler_loop_calls_generic_then_prospective(self):
+        """_run_scheduler_loop must call generic experiments THEN prospective."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        # Find _run_scheduler_loop body
+        loop_start = source.find("def _run_scheduler_loop(")
+        assert loop_start > 0
+        loop_body = source[loop_start:source.find("\ndef ", loop_start + 1)]
+        generic_pos = loop_body.find("run_evaluation_cycle(exp_id)")
+        # Check both generic and prospective loaders are called
+        assert "_load_active_experiments(conn)" in loop_body
+        assert "_load_prospective_experiments(conn)" in loop_body
+
+    def test_scheduler_loop_reloads_experiments_each_cycle(self):
+        """Experiment lists must be reloaded each scheduler cycle (dynamic status)."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        loop_start = source.find("def _run_scheduler_loop(")
+        loop_body = source[loop_start:source.find("\ndef ", loop_start + 1)]
+        # Both loaders must be called inside the while loop (not outside)
+        assert loop_body.count("_load_active_experiments(conn)") >= 1
+        assert loop_body.count("_load_prospective_experiments(conn)") >= 1
+
+    def test_scheduler_loop_has_signal_handling(self):
+        """_run_scheduler_loop must install SIGTERM/SIGINT handlers."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        loop_start = source.find("def _run_scheduler_loop(")
+        loop_body = source[loop_start:source.find("\ndef ", loop_start + 1)]
+        assert "signal.signal(signal.SIGTERM" in loop_body
+        assert "signal.signal(signal.SIGINT" in loop_body
+
+    def test_scheduler_loop_has_interruptible_wait(self):
+        """Scheduler loop must use interruptible wait, not time.sleep()."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        loop_start = source.find("def _run_scheduler_loop(")
+        loop_body = source[loop_start:source.find("\ndef ", loop_start + 1)]
+        assert "shutdown.wait(" in loop_body or "shutdown.wait (" in loop_body
+        # Must NOT use time.sleep in the scheduler loop
+        assert "time.sleep" not in loop_body
+
+    def test_scheduler_loop_error_isolation_generic(self):
+        """Exception in generic experiment must not prevent prospective execution."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        loop_start = source.find("def _run_scheduler_loop(")
+        loop_body = source[loop_start:source.find("\ndef ", loop_start + 1)]
+        # Check that generic evaluation is wrapped in try/except
+        assert "except Exception:" in loop_body
+        # Check that prospective is called AFTER the generic try/except block
+        generic_except_pos = loop_body.find("except Exception:", loop_body.find("run_evaluation_cycle"))
+        prospective_call_pos = loop_body.find("_load_prospective_experiments")
+        assert prospective_call_pos > generic_except_pos, (
+            "Prospective experiments should be loaded after generic error handling"
+        )
+
+    def test_daemon_mode_uses_scheduler_loop(self):
+        """main() daemon path must call _run_scheduler_loop, not .start()."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        # Find the else branch in main() that handles daemon mode
+        assert "_run_scheduler_loop(" in source, (
+            "main() does not call _run_scheduler_loop()"
+        )
+
+    def test_once_mode_uses_single_cycle(self):
+        """main() --once path must call _run_single_cycle."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        assert "_run_single_cycle(" in source, (
+            "main() does not call _run_single_cycle()"
+        )
+
+    def test_no_start_methods_called_in_runner(self):
+        """No .start() call on evaluator objects must exist in runner code (not docstrings)."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        # Strip docstrings and comments to avoid false matches
+        lines = source.splitlines()
+        code_lines = []
+        in_docstring = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('"""') and stripped.endswith('"""') and len(stripped) > 6:
+                continue  # single-line docstring
+            if stripped.startswith('"""') and not in_docstring:
+                in_docstring = True
+                continue
+            if in_docstring:
+                if '"""' in stripped:
+                    in_docstring = False
+                continue
+            if stripped.startswith('#'):
+                continue
+            code_lines.append(line)
+        code_only = "\n".join(code_lines)
+        # evaluator.start( and prospective_eval.start( must not appear in executable code
+        assert "evaluator.start(" not in code_only, (
+            "evaluator.start() called in executable code"
+        )
+        assert "prospective_eval.start(" not in code_only, (
+            "prospective_eval.start() called in executable code"
+        )
+
+    def test_prospective_evaluator_instantiated_before_scheduler(self):
+        """Prospective evaluator must be created before the scheduler loop starts."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        main_start = source.find("def main()")
+        scheduler_call_pos = source.find("_run_scheduler_loop(")
+        eval_create_pos = source.find("ProspectiveOOSEvaluator(")
+        assert eval_create_pos < scheduler_call_pos, (
+            "ProspectiveEvaluator must be created before _run_scheduler_loop"
+        )
+
+    def test_research_repo_passed_to_prospective_evaluator(self):
+        """ResearchRepository must be passed to ProspectiveOOSEvaluator."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        assert "repo=research_repo" in source or "repo = research_repo" in source, (
+            "ResearchRepository not passed to ProspectiveOOSEvaluator"
+        )
+
+    def test_prospective_loader_requires_started_at(self):
+        """_load_prospective_experiments must require started_at IS NOT NULL."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        assert "started_at IS NOT NULL" in source, (
+            "prospective loader does not require started_at IS NOT NULL"
+        )
+
+    def test_prospective_loader_requires_running(self):
+        """_load_prospective_experiments must require status='RUNNING'."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        assert "status = 'RUNNING'" in source or "status='RUNNING'" in source, (
+            "prospective loader does not require status='RUNNING'"
+        )
+
+
+# ══════════════════════════════════════════════════════════════
+# Test 9: Error isolation behavior
+# ══════════════════════════════════════════════════════════════
+
+class TestErrorIsolation:
+    """Errors in one experiment must not block others."""
+
+    def test_generic_error_try_except_wraps_cycle(self):
+        """Each generic experiment evaluation must be wrapped in try/except."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        # Find the generic evaluation loop in scheduler
+        loop_start = source.find("def _run_scheduler_loop(")
+        loop_body = source[loop_start:source.find("\ndef ", loop_start + 1)]
+        # Check for try/except pattern around run_evaluation_cycle
+        assert "try:" in loop_body
+        assert "logger.exception(" in loop_body
+
+    def test_prospective_error_try_except_wraps_cycle(self):
+        """Each prospective experiment evaluation must be wrapped in try/except."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        loop_start = source.find("def _run_scheduler_loop(")
+        loop_body = source[loop_start:source.find("\ndef ", loop_start + 1)]
+        # Both "try" and "except" should appear before and after prospective call
+        pos = loop_body.find("prospective_eval.run_evaluation_cycle")
+        assert pos > 0, "prospective run_evaluation_cycle not found"
+        before = loop_body[:pos]
+        assert "try:" in before, "prospective evaluation not wrapped in try"
+
+    def test_both_experiment_types_independent(self):
+        """A single scheduler cycle must handle both types independently."""
+        source = (PROJECT_ROOT / "app" / "research" / "evaluator_runner.py").read_text()
+        loop_start = source.find("def _run_scheduler_loop(")
+        loop_body = source[loop_start:source.find("\ndef ", loop_start + 1)]
+        # Generic section
+        assert "experiment_ids = _load_active_experiments(conn)" in loop_body
+        # Prospective section
+        assert "prospective_ids = _load_prospective_experiments(conn)" in loop_body
+        # Both must be present — not one-or-the-other
+        assert "for exp_id in experiment_ids:" in loop_body
+        assert "for exp_id in prospective_ids:" in loop_body
