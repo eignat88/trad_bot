@@ -87,14 +87,14 @@ class ProspectiveOOSObserver:
                 if exp_id.startswith("ME_SHORT_GEOM_"):
                     self._observe_me_geometry(
                         cursor, exp_id, exp_spec,
-                        source_key, symbol, signal_time,
+                        source_key, symbol, direction, signal_time,
                         reference_price, invalidation_price, target_1, target_2,
                         score, features, parameters, market_regime,
                     )
                 else:
                     self._observe_standard(
                         cursor, exp_id, exp_spec,
-                        source_key, symbol, signal_time,
+                        source_key, symbol, direction, signal_time,
                         reference_price, invalidation_price, target_1, target_2,
                         score, features, parameters, market_regime,
                     )
@@ -110,7 +110,7 @@ class ProspectiveOOSObserver:
 
     def _observe_standard(
         self, cursor, exp_id: str, exp_spec: dict,
-        source_key: int, symbol: str, signal_time: Any,
+        source_key: int, symbol: str, direction: str, signal_time: Any,
         reference_price: float, invalidation_price: float | None,
         target_1: float | None, target_2: float | None,
         score: float, features: dict, parameters: dict,
@@ -134,6 +134,36 @@ class ProspectiveOOSObserver:
         elif exp_id == "LR_SHORT_GATE_V1":
             rule_passed = True
             filter_reason = "observational_gate_validation"
+
+        elif exp_id == "BREAKOUT_RETEST_LONG_EXPECTANCY_REJECT_OOS_V1":
+            # This experiment captures candidates rejected by expectancy filter
+            # The observation is made BEFORE the expectancy filter in the pipeline
+            rule_passed = True
+            filter_reason = "expectancy_rejection_oos_capture"
+            # Add expectancy data to features for analysis
+            features_with_expectancy = dict(features)
+            features_with_expectancy["_expectancy_rejection_oos"] = True
+            features_with_expectancy["_rejection_reason"] = "profit_factor_below_threshold"
+            features = features_with_expectancy
+
+        elif exp_id == "FVG_REACTION_LONG_EXPECTANCY_REJECT_OOS_V1":
+            # This experiment captures candidates rejected by expectancy filter
+            rule_passed = True
+            filter_reason = "expectancy_rejection_oos_capture"
+            features_with_expectancy = dict(features)
+            features_with_expectancy["_expectancy_rejection_oos"] = True
+            features_with_expectancy["_rejection_reason"] = "negative_historical_performance"
+            features = features_with_expectancy
+
+        elif exp_id == "TREND_PULLBACK_V3_HIGH_VOL_OOS_V1":
+            # This experiment captures candidates rejected by regime filter
+            rule_passed = True
+            filter_reason = "regime_counterfactual_oos_capture"
+            features_with_regime = dict(features)
+            features_with_regime["_regime_counterfactual_oos"] = True
+            features_with_regime["_actual_regime"] = market_regime
+            features_with_regime["_required_regime"] = "TREND_UP"
+            features = features_with_regime
 
         cursor.execute(
             """
@@ -159,7 +189,7 @@ class ProspectiveOOSObserver:
 
     def _observe_me_geometry(
         self, cursor, exp_id: str, exp_spec: dict,
-        source_key: int, symbol: str, signal_time: Any,
+        source_key: int, symbol: str, direction: str, signal_time: Any,
         reference_price: float, invalidation_price: float | None,
         target_1: float | None, target_2: float | None,
         score: float, features: dict, parameters: dict,

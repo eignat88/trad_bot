@@ -1,21 +1,25 @@
 """Regression tests for Prospective OOS V3 runtime wiring.
 
-Tests three runtime failures discovered on VPS:
+Tests four runtime failures discovered on VPS:
 1. NameError: name 'prospective_obs' is not defined in scanner_runner.py
 2. AttributeError: 'BybitClient' object has no attribute 'get_eligible_signals'
 3. evaluator_runner.py blocking .start() prevents prospective path execution
+4. NameError: name 'direction' is not defined in _observe_standard/_observe_me_geometry
 
 Also verifies:
 - ME A/B/C exact pairing by source_signal_id
 - Evaluator processes research.prospective_observation → research.prospective_outcome
 - Fail-closed initialization of prospective_obs
 - Unified scheduler loop for generic + prospective
+- Runtime observe() for SRR LONG, VC SHORT, LR SHORT, ME SHORT A/B/C
 """
 from __future__ import annotations
 
 import ast
 import inspect
+import json
 import textwrap
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
@@ -597,3 +601,661 @@ class TestErrorIsolation:
         # Both must be present — not one-or-the-other
         assert "for exp_id in experiment_ids:" in loop_body
         assert "for exp_id in prospective_ids:" in loop_body
+
+
+# ══════════════════════════════════════════════════════════════
+# Test 10: NameError: direction not defined in _observe_standard/_observe_me_geometry
+# ══════════════════════════════════════════════════════════════
+
+class TestDirectionParameterBug:
+    """Regression: NameError: name 'direction' is not defined.
+
+    Both _observe_standard() and _observe_me_geometry() use `direction` in their
+    SQL INSERT but it was not passed as a parameter from observe().
+    """
+
+    def test_observe_standard_accepts_direction(self):
+        """_observe_standard must have 'direction' in its parameter list."""
+        source = (PROJECT_ROOT / "app" / "research" / "prospective_observer.py").read_text()
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "ProspectiveOOSObserver":
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == "_observe_standard":
+                        arg_names = [arg.arg for arg in item.args.args]
+                        assert "direction" in arg_names, (
+                            f"_observe_standard missing 'direction' param; got: {arg_names}"
+                        )
+                        return
+        pytest.fail("_observe_standard not found")
+
+    def test_observe_me_geometry_accepts_direction(self):
+        """_observe_me_geometry must have 'direction' in its parameter list."""
+        source = (PROJECT_ROOT / "app" / "research" / "prospective_observer.py").read_text()
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "ProspectiveOOSObserver":
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == "_observe_me_geometry":
+                        arg_names = [arg.arg for arg in item.args.args]
+                        assert "direction" in arg_names, (
+                            f"_observe_me_geometry missing 'direction' param; got: {arg_names}"
+                        )
+                        return
+        pytest.fail("_observe_me_geometry not found")
+
+    def test_observe_passes_direction_to_standard(self):
+        """observe() must pass direction to _observe_standard()."""
+        source = (PROJECT_ROOT / "app" / "research" / "prospective_observer.py").read_text()
+        # Find the _observe_standard call inside observe()
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "ProspectiveOOSObserver":
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == "observe":
+                        body_src = ast.get_source_segment(source, item)
+                        assert "self._observe_standard(" in body_src
+                        # The call must include direction as an argument
+                        # Find the call and check args
+                        for subnode in ast.walk(item):
+                            if (isinstance(subnode, ast.Call)
+                                    and hasattr(subnode.func, 'attr')
+                                    and subnode.func.attr == "_observe_standard"):
+                                # Check that 'direction' appears as an argument
+                                arg_names_in_call = [
+                                    getattr(a, 'id', getattr(a, 'arg', ''))
+                                    for a in subnode.args
+                                ]
+                                # direction should be in positional args (after symbol, before signal_time)
+                                assert "direction" in arg_names_in_call, (
+                                    f"observe() does not pass direction to _observe_standard; "
+                                    f"args: {arg_names_in_call}"
+                                )
+                                return
+        pytest.fail("observe() -> _observe_standard call not found")
+
+    def test_observe_passes_direction_to_me_geometry(self):
+        """observe() must pass direction to _observe_me_geometry()."""
+        source = (PROJECT_ROOT / "app" / "research" / "prospective_observer.py").read_text()
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "ProspectiveOOSObserver":
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == "observe":
+                        for subnode in ast.walk(item):
+                            if (isinstance(subnode, ast.Call)
+                                    and hasattr(subnode.func, 'attr')
+                                    and subnode.func.attr == "_observe_me_geometry"):
+                                arg_names_in_call = [
+                                    getattr(a, 'id', getattr(a, 'arg', ''))
+                                    for a in subnode.args
+                                ]
+                                assert "direction" in arg_names_in_call, (
+                                    f"observe() does not pass direction to _observe_me_geometry; "
+                                    f"args: {arg_names_in_call}"
+                                )
+                                return
+        pytest.fail("observe() -> _observe_me_geometry call not found")
+
+    def test_observe_standard_uses_direction_in_insert(self):
+        """_observe_standard must reference 'direction' in its VALUES tuple."""
+        source = (PROJECT_ROOT / "app" / "research" / "prospective_observer.py").read_text()
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "ProspectiveOOSObserver":
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == "_observe_standard":
+                        body_src = ast.get_source_segment(source, item)
+                        assert "direction" in body_src
+                        return
+        pytest.fail("_observe_standard not found")
+
+
+# ══════════════════════════════════════════════════════════════
+# Test 11: Runtime observe() — actual call tests with mock cursor
+# ══════════════════════════════════════════════════════════════
+
+def _load_registry():
+    """Load the frozen prospective registry."""
+    return json.loads(
+        (PROJECT_ROOT / "app" / "research" / "prospective_registry.json").read_text()
+    )
+
+
+def _make_registry_dict(registry_data):
+    """Convert registry JSON to {experiment_id: exp_spec} dict."""
+    return {e["experiment_id"]: e for e in registry_data["experiments"]}
+
+
+def _make_observe_kwargs(*, symbol="PENGUUSDT", direction="LONG",
+                         scanner_name="SUPPORT_RESISTANCE_REACTION",
+                         overrides=None):
+    """Build common observe() kwargs with optional overrides."""
+    defaults = dict(
+        scanner_name=scanner_name,
+        direction=direction,
+        symbol=symbol,
+        signal_time=datetime(2026, 9, 28, 14, 0, 0, tzinfo=timezone.utc),
+        reference_price=0.01234,
+        invalidation_price=0.01234 * 1.002,
+        target_1=0.01234 - 0.0005,
+        target_2=None,
+        score=85.0,
+        features={"bb_width_percentile": 0.4, "atr": 0.0001, "entry_price": 0.01230},
+        parameters={},
+        market_regime="TRENDING",
+    )
+    if overrides:
+        defaults.update(overrides)
+    return defaults
+
+
+class TestObserveSRRLong:
+    """Runtime test: observe() for SUPPORT_RESISTANCE_REACTION LONG."""
+
+    def test_srr_long_creates_observation(self):
+        """SRR_LONG_BASELINE_V1 observation must be inserted for SRR LONG."""
+        registry = _make_registry_dict(_load_registry())
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_conn.cursor.return_value = mock_cursor
+
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        kwargs = _make_observe_kwargs(
+            scanner_name="SUPPORT_RESISTANCE_REACTION",
+            direction="LONG",
+        )
+        observer.observe(**kwargs)
+
+        # Must have committed
+        mock_conn.commit.assert_called_once()
+        # Must have executed an INSERT
+        assert mock_cursor.execute.call_count >= 1
+        insert_call = mock_cursor.execute.call_args_list[0]
+        sql = insert_call[0][0]
+        assert "INSERT INTO research.prospective_observation" in sql
+        # Verify experiment_id in VALUES
+        args = insert_call[0][1]
+        assert args[0] == "SRR_LONG_BASELINE_V1"
+
+    def test_srr_long_direction_in_values(self):
+        """SRR LONG must pass direction='LONG' in the INSERT VALUES."""
+        registry = _make_registry_dict(_load_registry())
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_conn.cursor.return_value = mock_cursor
+
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        kwargs = _make_observe_kwargs(
+            scanner_name="SUPPORT_RESISTANCE_REACTION",
+            direction="LONG",
+        )
+        observer.observe(**kwargs)
+
+        insert_call = mock_cursor.execute.call_args_list[0]
+        args = insert_call[0][1]
+        # direction is the 5th value (index 4) in the INSERT
+        assert args[4] == "LONG"
+
+    def test_srr_long_wrong_direction_no_observation(self):
+        """SRR SHORT must NOT create SRR_LONG_BASELINE_V1 observation."""
+        registry = _make_registry_dict(_load_registry())
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 0
+        mock_conn.cursor.return_value = mock_cursor
+
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        kwargs = _make_observe_kwargs(
+            scanner_name="SUPPORT_RESISTANCE_REACTION",
+            direction="SHORT",
+        )
+        observer.observe(**kwargs)
+
+        # SRR_LONG_BASELINE_V1 requires direction=LONG, so no INSERT should happen
+        # (the loop filters by direction match)
+        # Only commit should be called, no execute
+        if mock_cursor.execute.call_count > 0:
+            # If execute was called, it should be for a different experiment
+            for call_args in mock_cursor.execute.call_args_list:
+                args = call_args[0][1]
+                assert args[0] != "SRR_LONG_BASELINE_V1"
+
+
+class TestObserveVCShort:
+    """Runtime test: observe() for VOLATILITY_COMPRESSION SHORT."""
+
+    def test_vc_short_creates_observation(self):
+        """VC_SHORT_BB_WIDTH_V1 observation must be inserted for VC SHORT."""
+        registry = _make_registry_dict(_load_registry())
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_conn.cursor.return_value = mock_cursor
+
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        kwargs = _make_observe_kwargs(
+            scanner_name="VOLATILITY_COMPRESSION",
+            direction="SHORT",
+            overrides={"features": {"bb_width_percentile": 0.4, "atr": 0.001}},
+        )
+        observer.observe(**kwargs)
+
+        mock_conn.commit.assert_called_once()
+        assert mock_cursor.execute.call_count >= 1
+        insert_call = mock_cursor.execute.call_args_list[0]
+        args = insert_call[0][1]
+        assert args[0] == "VC_SHORT_BB_WIDTH_V1"
+
+    def test_vc_short_direction_in_values(self):
+        """VC SHORT must pass direction='SHORT' in the INSERT."""
+        registry = _make_registry_dict(_load_registry())
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_conn.cursor.return_value = mock_cursor
+
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        kwargs = _make_observe_kwargs(
+            scanner_name="VOLATILITY_COMPRESSION",
+            direction="SHORT",
+            overrides={"features": {"bb_width_percentile": 0.4, "atr": 0.001}},
+        )
+        observer.observe(**kwargs)
+
+        insert_call = mock_cursor.execute.call_args_list[0]
+        args = insert_call[0][1]
+        assert args[4] == "SHORT"
+
+    def test_vc_short_bb_width_above_threshold_rejects(self):
+        """VC SHORT with bb_width_percentile >= threshold: rule_passed=False."""
+        registry = _make_registry_dict(_load_registry())
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_conn.cursor.return_value = mock_cursor
+
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        kwargs = _make_observe_kwargs(
+            scanner_name="VOLATILITY_COMPRESSION",
+            direction="SHORT",
+            overrides={"features": {"bb_width_percentile": 0.9}},  # above threshold 0.569723
+        )
+        observer.observe(**kwargs)
+
+        insert_call = mock_cursor.execute.call_args_list[0]
+        args = insert_call[0][1]
+        # rule_passed is at index 11
+        assert args[11] is False, "bb_width 0.9 should be rule_passed=False"
+
+    def test_vc_short_bb_width_below_threshold_passes(self):
+        """VC SHORT with bb_width_percentile < threshold: rule_passed=True."""
+        registry = _make_registry_dict(_load_registry())
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_conn.cursor.return_value = mock_cursor
+
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        kwargs = _make_observe_kwargs(
+            scanner_name="VOLATILITY_COMPRESSION",
+            direction="SHORT",
+            overrides={"features": {"bb_width_percentile": 0.3}},  # below threshold 0.569723
+        )
+        observer.observe(**kwargs)
+
+        insert_call = mock_cursor.execute.call_args_list[0]
+        args = insert_call[0][1]
+        assert args[11] is True, "bb_width 0.3 should be rule_passed=True"
+
+
+class TestObserveLRShort:
+    """Runtime test: observe() for LIQUIDITY_REVERSAL SHORT."""
+
+    def test_lr_short_creates_observation(self):
+        """LR_SHORT_GATE_V1 observation must be inserted for LR SHORT."""
+        registry = _make_registry_dict(_load_registry())
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_conn.cursor.return_value = mock_cursor
+
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        kwargs = _make_observe_kwargs(
+            scanner_name="LIQUIDITY_REVERSAL",
+            direction="SHORT",
+        )
+        observer.observe(**kwargs)
+
+        mock_conn.commit.assert_called_once()
+        assert mock_cursor.execute.call_count >= 1
+        insert_call = mock_cursor.execute.call_args_list[0]
+        args = insert_call[0][1]
+        assert args[0] == "LR_SHORT_GATE_V1"
+
+    def test_lr_short_direction_in_values(self):
+        """LR SHORT must pass direction='SHORT' in the INSERT."""
+        registry = _make_registry_dict(_load_registry())
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_conn.cursor.return_value = mock_cursor
+
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        kwargs = _make_observe_kwargs(
+            scanner_name="LIQUIDITY_REVERSAL",
+            direction="SHORT",
+        )
+        observer.observe(**kwargs)
+
+        insert_call = mock_cursor.execute.call_args_list[0]
+        args = insert_call[0][1]
+        assert args[4] == "SHORT"
+
+
+class TestObserveMEShortABC:
+    """Runtime test: observe() for MOMENTUM_EXHAUSTION SHORT → 3 paired A/B/C."""
+
+    def test_me_short_creates_three_observations(self):
+        """MOMENTUM_EXHAUSTION SHORT must create 3 observations (A, B, C)."""
+        registry = _make_registry_dict(_load_registry())
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_conn.cursor.return_value = mock_cursor
+
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        kwargs = _make_observe_kwargs(
+            scanner_name="MOMENTUM_EXHAUSTION",
+            direction="SHORT",
+            overrides={
+                "invalidation_price": 0.01234 * 1.002,
+                "target_1": 0.01180,
+                "features": {"atr": 0.0001, "entry_price": 0.01230},
+            },
+        )
+        observer.observe(**kwargs)
+
+        # Must execute 3 INSERT statements (A, B, C)
+        assert mock_cursor.execute.call_count == 3, (
+            f"Expected 3 inserts for ME SHORT A/B/C, got {mock_cursor.execute.call_count}"
+        )
+
+        # Verify experiment IDs
+        exp_ids = []
+        for call_args in mock_cursor.execute.call_args_list:
+            args = call_args[0][1]
+            exp_ids.append(args[0])
+        assert "ME_SHORT_GEOM_A_V1" in exp_ids
+        assert "ME_SHORT_GEOM_B_V1" in exp_ids
+        assert "ME_SHORT_GEOM_C_V1" in exp_ids
+
+    def test_me_short_abc_share_source_key(self):
+        """All 3 ME geometry variants must share the same source_signal_id."""
+        registry = _make_registry_dict(_load_registry())
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_conn.cursor.return_value = mock_cursor
+
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        kwargs = _make_observe_kwargs(
+            scanner_name="MOMENTUM_EXHAUSTION",
+            direction="SHORT",
+            overrides={
+                "invalidation_price": 0.01234 * 1.002,
+                "target_1": 0.01180,
+                "features": {"atr": 0.0001, "entry_price": 0.01230},
+            },
+        )
+        observer.observe(**kwargs)
+
+        source_keys = []
+        for call_args in mock_cursor.execute.call_args_list:
+            args = call_args[0][1]
+            source_keys.append(args[1])  # source_signal_id is index 1
+        assert len(source_keys) == 3
+        assert source_keys[0] == source_keys[1] == source_keys[2], (
+            f"ME A/B/C must share same source_signal_id, got: {source_keys}"
+        )
+
+    def test_me_short_direction_in_all_three(self):
+        """All 3 ME geometry variants must have direction='SHORT'."""
+        registry = _make_registry_dict(_load_registry())
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_conn.cursor.return_value = mock_cursor
+
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        kwargs = _make_observe_kwargs(
+            scanner_name="MOMENTUM_EXHAUSTION",
+            direction="SHORT",
+            overrides={
+                "invalidation_price": 0.01234 * 1.002,
+                "target_1": 0.01180,
+                "features": {"atr": 0.0001, "entry_price": 0.01230},
+            },
+        )
+        observer.observe(**kwargs)
+
+        for call_args in mock_cursor.execute.call_args_list:
+            args = call_args[0][1]
+            assert args[4] == "SHORT", (
+                f"direction must be 'SHORT' in all ME inserts, got {args[4]} "
+                f"for {args[0]}"
+            )
+
+    def test_me_short_geom_a_uses_original_geometry(self):
+        """GEOM_A must use original reference_price, invalidation_price, target_1."""
+        registry = _make_registry_dict(_load_registry())
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_conn.cursor.return_value = mock_cursor
+
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        ref_price = 0.01234
+        inv_price = ref_price * 1.002
+        target = 0.01180
+
+        kwargs = _make_observe_kwargs(
+            scanner_name="MOMENTUM_EXHAUSTION",
+            direction="SHORT",
+            overrides={
+                "reference_price": ref_price,
+                "invalidation_price": inv_price,
+                "target_1": target,
+                "features": {"atr": 0.0001, "entry_price": 0.01230},
+            },
+        )
+        observer.observe(**kwargs)
+
+        for call_args in mock_cursor.execute.call_args_list:
+            args = call_args[0][1]
+            if args[0] == "ME_SHORT_GEOM_A_V1":
+                # variant_entry=ref_price, variant_stop=inv_price, variant_target=target
+                # ME insert order: [12] variant_entry, [13] variant_stop, [14] variant_target
+                assert args[12] == ref_price, "GEOM_A variant_entry must be reference_price"
+                assert args[13] == inv_price, "GEOM_A variant_stop must be invalidation_price"
+                assert args[14] == target, "GEOM_A variant_target must be target_1"
+                return
+        pytest.fail("ME_SHORT_GEOM_A_V1 not found in inserts")
+
+    def test_me_short_geom_b_wider_stop(self):
+        """GEOM_B must use wider stop than A."""
+        registry = _make_registry_dict(_load_registry())
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_conn.cursor.return_value = mock_cursor
+
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        ref_price = 100.0
+        inv_price = 100.2  # 0.2% stop
+        target = 95.0
+
+        kwargs = _make_observe_kwargs(
+            scanner_name="MOMENTUM_EXHAUSTION",
+            direction="SHORT",
+            overrides={
+                "reference_price": ref_price,
+                "invalidation_price": inv_price,
+                "target_1": target,
+                "features": {"atr": 1.5, "entry_price": 99.9},
+            },
+        )
+        observer.observe(**kwargs)
+
+        for call_args in mock_cursor.execute.call_args_list:
+            args = call_args[0][1]
+            if args[0] == "ME_SHORT_GEOM_B_V1":
+                # variant_stop must be wider than inv_price
+                # [13] variant_stop
+                assert args[13] > inv_price, (
+                    f"GEOM_B variant_stop ({args[13]}) must be wider than "
+                    f"invalidation_price ({inv_price})"
+                )
+                return
+        pytest.fail("ME_SHORT_GEOM_B_V1 not found in inserts")
+
+    def test_me_short_geom_c_delayed_entry(self):
+        """GEOM_C must use entry_price from features as entry."""
+        registry = _make_registry_dict(_load_registry())
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_conn.cursor.return_value = mock_cursor
+
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        ref_price = 100.0
+        inv_price = 100.2
+        target = 95.0
+        detection_close = 99.9
+
+        kwargs = _make_observe_kwargs(
+            scanner_name="MOMENTUM_EXHAUSTION",
+            direction="SHORT",
+            overrides={
+                "reference_price": ref_price,
+                "invalidation_price": inv_price,
+                "target_1": target,
+                "features": {"atr": 1.5, "entry_price": detection_close},
+            },
+        )
+        observer.observe(**kwargs)
+
+        for call_args in mock_cursor.execute.call_args_list:
+            args = call_args[0][1]
+            if args[0] == "ME_SHORT_GEOM_C_V1":
+                # variant_entry must be detection candle close
+                # [12] variant_entry
+                assert args[12] == detection_close, (
+                    f"GEOM_C variant_entry ({args[12]}) must be "
+                    f"detection candle close ({detection_close})"
+                )
+                return
+        pytest.fail("ME_SHORT_GEOM_C_V1 not found in inserts")
+
+
+class TestIdempotency:
+    """UNIQUE(experiment_id, source_signal_id) / DO NOTHING semantics."""
+
+    def test_duplicate_observe_is_idempotent(self):
+        """Calling observe() twice with same data must not create duplicates."""
+        registry = _make_registry_dict(_load_registry())
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        # First call: rowcount=1 (inserted), second call: rowcount=0 (conflict)
+        mock_cursor.rowcount = 1
+        mock_conn.cursor.return_value = mock_cursor
+
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        kwargs = _make_observe_kwargs()
+
+        observer.observe(**kwargs)
+        first_call_count = mock_cursor.execute.call_count
+
+        # Reset mock for second call
+        mock_cursor.reset_mock()
+        mock_cursor.rowcount = 0  # DO NOTHING on conflict
+        mock_conn.reset_mock()
+
+        observer.observe(**kwargs)
+
+        # Same number of INSERT attempts
+        assert mock_cursor.execute.call_count == first_call_count
+
+    def test_same_source_key_same_symbol_same_direction(self):
+        """Same (scanner, symbol, direction, signal_time) produces same source_key."""
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        mock_conn = MagicMock()
+        registry = _make_registry_dict(_load_registry())
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        key1 = observer._make_source_key("SUPPORT_RESISTANCE_REACTION", "PENGUUSDT", "LONG", "2026-09-28T14:00:00Z")
+        key2 = observer._make_source_key("SUPPORT_RESISTANCE_REACTION", "PENGUUSDT", "LONG", "2026-09-28T14:00:00Z")
+        assert key1 == key2
+
+    def test_different_symbol_produces_different_key(self):
+        """Different symbols must produce different source_keys."""
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        mock_conn = MagicMock()
+        registry = _make_registry_dict(_load_registry())
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        key1 = observer._make_source_key("SUPPORT_RESISTANCE_REACTION", "PENGUUSDT", "LONG", "2026-09-28T14:00:00Z")
+        key2 = observer._make_source_key("SUPPORT_RESISTANCE_REACTION", "BTCUSDT", "LONG", "2026-09-28T14:00:00Z")
+        assert key1 != key2
+
+
+class TestNoAutoActivation:
+    """Experiments must remain PAUSED/READY_TO_START after observe()."""
+
+    def test_observe_does_not_update_experiment_status(self):
+        """observe() must only INSERT into prospective_observation, never UPDATE prospective_experiment."""
+        source = (PROJECT_ROOT / "app" / "research" / "prospective_observer.py").read_text()
+        assert "UPDATE research.prospective_experiment" not in source
+        assert "UPDATE research.prospective_observation" not in source
+
+    def test_registry_experiments_still_ready_to_start(self):
+        """All registry experiments must have status=READY_TO_START."""
+        registry = _load_registry()
+        for exp in registry["experiments"]:
+            assert exp.get("status") == "READY_TO_START", (
+                f"{exp['experiment_id']} has status {exp.get('status')}, expected READY_TO_START"
+            )
