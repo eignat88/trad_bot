@@ -331,6 +331,10 @@ class ScannerOrchestrator:
             if c.setup_id and not c.features.get("_shadow_control")
         ]
 
+        # Attach expectancy-rejected candidates for OOS research.
+        # These are candidates that passed all gates but were rejected by expectancy filter.
+        stats["_expectancy_rejected_candidates"] = expectancy_rejected_candidates
+
         # Expectancy filter: drop scanner/direction combos with negative historical R.
         # Static manual blocks are handled by the gate policy above.
         #
@@ -338,9 +342,14 @@ class ScannerOrchestrator:
         # They are analytical observations, not tradeable signals.  Dropping them
         # here would destroy the control cohort needed for OOS comparison.
         expectancy_rejected = 0
+        expectancy_rejected_candidates = []
         if expectancy_filter is not None:
             tradeable = [c for c in valid if not c.features.get("_shadow_control")]
             shadow = [c for c in valid if c.features.get("_shadow_control")]
+            
+            # Capture candidates before filtering for OOS research
+            tradeable_before = list(tradeable)
+            
             tradeable, expectancy_rejected = filter_candidates(
                 tradeable,
                 expectancy_filter,
@@ -349,6 +358,14 @@ class ScannerOrchestrator:
                 blocked_combinations=blocked_combinations,
                 trading_mode=trading_mode,
             )
+            
+            # Identify candidates rejected by expectancy filter
+            tradeable_ids = {c.setup_id for c in tradeable}
+            expectancy_rejected_candidates = [
+                c for c in tradeable_before 
+                if c.setup_id not in tradeable_ids
+            ]
+            
             valid = tradeable + shadow
 
         if valid:
@@ -385,10 +402,22 @@ class ScannerOrchestrator:
 
         # Market regime filter: apply scanner-specific allow-lists first, then
         # the generic direction-conflict policy for scanners without a rule.
+        regime_rejected_candidates = []
         if regime_filter:
+            valid_before_regime = list(valid)
             valid = self._apply_regime_filter(
                 ctx, valid, scanner_regime_whitelist or {},
             )
+            
+            # Identify candidates rejected by regime filter
+            valid_ids = {c.setup_id for c in valid}
+            regime_rejected_candidates = [
+                c for c in valid_before_regime
+                if c.setup_id not in valid_ids
+            ]
+
+        # Attach regime-rejected candidates for OOS research
+        stats["_regime_rejected_candidates"] = regime_rejected_candidates
 
         return valid, stats
 

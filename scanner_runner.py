@@ -503,6 +503,76 @@ def run_scan_cycle(
                     except Exception:
                         logger.debug("SRR research observation failed", exc_info=True)
 
+                # Expectancy-rejected candidates for OOS research
+                # Capture candidates that passed all gates but were rejected by expectancy filter
+                expectancy_rejected_candidates = symbol_stats.get("_expectancy_rejected_candidates", [])
+                for erc in expectancy_rejected_candidates:
+                    if prospective_obs is not None:
+                        try:
+                            # Add expectancy metadata to features
+                            features = dict(erc.features) if erc.features else {}
+                            features["_expectancy_rejection_oos"] = True
+                            features["_rejection_stage"] = "expectancy_filter"
+                            
+                            # Determine rejection reason based on scanner
+                            if erc.scanner_name == "BREAKOUT_RETEST":
+                                features["_rejection_reason"] = "profit_factor_below_threshold"
+                                features["_threshold"] = 1.20
+                            elif erc.scanner_name == "FVG_REACTION_LONG_LOCAL_STRUCT_V1":
+                                features["_rejection_reason"] = "negative_historical_performance"
+                                features["_threshold"] = 0.0
+                            elif erc.scanner_name == "TREND_PULLBACK_V3":
+                                features["_rejection_reason"] = "regime_mismatch"
+                                features["_actual_regime"] = erc.market_regime
+                                features["_required_regime"] = "TREND_UP"
+                            
+                            prospective_obs.observe(
+                                scanner_name=erc.scanner_name,
+                                direction=erc.direction,
+                                symbol=erc.symbol,
+                                signal_time=erc.detected_at,
+                                reference_price=erc.reference_price,
+                                invalidation_price=erc.invalidation_price,
+                                target_1=erc.target_1,
+                                target_2=erc.target_2,
+                                score=erc.score,
+                                features=features,
+                                parameters={},
+                                market_regime=erc.market_regime,
+                            )
+                        except Exception:
+                            logger.debug("expectancy rejected OOS observation failed for %s", erc.scanner_name, exc_info=True)
+
+                # Regime-rejected candidates for OOS research
+                # Capture candidates that passed all filters except regime filter
+                regime_rejected_candidates = symbol_stats.get("_regime_rejected_candidates", [])
+                for rrc in regime_rejected_candidates:
+                    if prospective_obs is not None:
+                        try:
+                            # Add regime metadata to features
+                            features = dict(rrc.features) if rrc.features else {}
+                            features["_regime_counterfactual_oos"] = True
+                            features["_rejection_stage"] = "regime_filter"
+                            features["_actual_regime"] = rrc.market_regime
+                            features["_required_regime"] = "TREND_UP"
+                            
+                            prospective_obs.observe(
+                                scanner_name=rrc.scanner_name,
+                                direction=rrc.direction,
+                                symbol=rrc.symbol,
+                                signal_time=rrc.detected_at,
+                                reference_price=rrc.reference_price,
+                                invalidation_price=rrc.invalidation_price,
+                                target_1=rrc.target_1,
+                                target_2=rrc.target_2,
+                                score=rrc.score,
+                                features=features,
+                                parameters={},
+                                market_regime=rrc.market_regime,
+                            )
+                        except Exception:
+                            logger.debug("regime rejected OOS observation failed for %s", rrc.scanner_name, exc_info=True)
+
                 # ── Generic research: resolve statuses + promote to signals ──
                 # Fail-open: never blocks scanner cycle.
                 if _research_observer is not None:
