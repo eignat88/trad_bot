@@ -134,6 +134,39 @@ class ProspectiveOOSEvaluator:
         self.client = client
         self._repo = repo  # ResearchRepository for get_eligible_signals if needed
 
+    # Maximum fallback horizon for TP/SL checking when no frozen_max_hold is set.
+    _DEFAULT_MAX_HOLD_MINUTES = 240
+
+    @staticmethod
+    def _get_frozen_max_hold(obs: dict) -> int:
+        """Extract frozen max_hold from observation features.
+
+        The observer embeds ``_frozen_max_hold`` in the features JSON for
+        experiments that define a frozen exit window.  When present, TP/SL
+        first-hit is checked ONLY within this window.  Events after the
+        frozen max_hold do NOT change the frozen trade outcome.
+
+        When absent (standard prospective experiments), falls back to the
+        default 240-minute horizon so that existing behaviour is preserved.
+        """
+        features = obs.get("features")
+        if features is None:
+            return ProspectiveOOSEvaluator._DEFAULT_MAX_HOLD_MINUTES
+
+        # features may arrive as a JSON string or as a dict
+        if isinstance(features, str):
+            try:
+                import json as _json
+                features = _json.loads(features)
+            except (ValueError, TypeError):
+                return ProspectiveOOSEvaluator._DEFAULT_MAX_HOLD_MINUTES
+
+        hold = features.get("_frozen_max_hold")
+        if isinstance(hold, (int, float)) and hold > 0:
+            return int(hold)
+
+        return ProspectiveOOSEvaluator._DEFAULT_MAX_HOLD_MINUTES
+
     def _get_candles(self, symbol: str, from_time: datetime, to_time: datetime) -> list[Candle]:
         try:
             start_ms = int((from_time - timedelta(minutes=5)).timestamp() * 1000)
@@ -173,6 +206,12 @@ class ProspectiveOOSEvaluator:
         signal_ts = int(signal_time.timestamp() * 1000)
         post_candles = [c for c in all_candles if c.timestamp > signal_ts]
 
+        # Extract frozen_max_hold from observation features.
+        # When present, TP/SL first-hit is checked only within this window.
+        # Events AFTER frozen_max_hold do NOT change the frozen trade outcome.
+        # MFE/MAE at all horizons (including 240m) continue to be computed.
+        frozen_max_hold = self._get_frozen_max_hold(obs)
+
         updates = {}
         obs_id = obs["observation_id"]
 
@@ -210,7 +249,7 @@ class ProspectiveOOSEvaluator:
             updates[f"return_at_{label}"] = ret
             updates[eval_field] = now
 
-        # Finalize at 240m: check TP/SL
+        # Finalize: check TP/SL within the frozen_max_hold window (or 240m if none).
         all_done = all(
             obs.get(f"evaluated_{h}_at") is not None or f"evaluated_{h}_at" in updates
             for h, _ in HORIZONS
@@ -218,7 +257,7 @@ class ProspectiveOOSEvaluator:
         if all_done and not obs.get("is_final"):
             tp_sl = _check_tp_sl(
                 post_candles, entry_price, stop_price, target_price,
-                240, signal_time, is_short,
+                frozen_max_hold, signal_time, is_short,
             )
             updates.update(tp_sl)
             updates["is_final"] = True
@@ -290,6 +329,7 @@ class ProspectiveOOSEvaluator:
                    o.direction,
                    o.reference_price, o.invalidation_price, o.target_1, o.target_2,
                    o.variant_entry, o.variant_stop, o.variant_target,
+                   o.features,
                    r.evaluated_15m_at, r.evaluated_30m_at, r.evaluated_60m_at,
                    r.evaluated_120m_at, r.evaluated_240m_at, r.is_final
             FROM research.prospective_observation o
@@ -334,9 +374,10 @@ class ProspectiveOOSEvaluator:
                     "target_1": row[7], "target_2": row[8],
                     "variant_entry": row[9], "variant_stop": row[10],
                     "variant_target": row[11],
-                    "evaluated_15m_at": row[12], "evaluated_30m_at": row[13],
-                    "evaluated_60m_at": row[14], "evaluated_120m_at": row[15],
-                    "evaluated_240m_at": row[16], "is_final": row[17],
+                    "features": row[12],
+                    "evaluated_15m_at": row[13], "evaluated_30m_at": row[14],
+                    "evaluated_60m_at": row[15], "evaluated_120m_at": row[16],
+                    "evaluated_240m_at": row[17], "is_final": row[18],
                 }
                 try:
                     self.evaluate_observation(obs, candles, now, stats)
