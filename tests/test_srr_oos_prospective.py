@@ -649,3 +649,409 @@ class TestNoCollateralChanges:
             assert "SRR_OOS_SCANNER_V1_PROSPECTIVE" not in content, (
                 f"{py_file.name} unexpectedly references SRR_OOS_SCANNER_V1_PROSPECTIVE"
             )
+
+
+# ════════════════════════════════════════════════════════════════
+# 10. Frozen max-hold semantics regression tests
+# ════════════════════════════════════════════════════════════════
+
+class _FakeCandle:
+    """Minimal candle for evaluator unit tests."""
+    def __init__(self, ts: int, high: float, low: float, close: float = 100.0):
+        self.timestamp = ts
+        self.high = high
+        self.low = low
+        self.close = close
+
+
+def _make_candles_for_hold_test(
+    signal_time, *,
+    tp_price=101.5, sl_price=99.25,
+    is_short=False, max_minutes=120,
+    tp_hit_at_min=None, sl_hit_at_min=None,
+    both_same_candle_min=None,
+):
+    """Build candle list for frozen hold regression tests.
+
+    Creates candles at 5-minute intervals from signal_time up to 240 minutes.
+    Optionally injects TP/SL hits at specific minutes.
+
+    Parameters
+    ----------
+    tp_hit_at_min : int | None
+        Minute at which TP is first hit (if None, TP is never hit).
+    sl_hit_at_min : int | None
+        Minute at which SL is first hit (if None, SL is never hit).
+    both_same_candle_min : int | None
+        If set, both TP and SL fire in the same candle at this minute.
+    """
+    signal_ts = int(signal_time.timestamp() * 1000)
+    candles = []
+
+    for minute in range(5, 245, 5):
+        ts = signal_ts + minute * 60_000
+
+        # Default: neutral candle
+        high = 100.5
+        low = 99.5
+
+        if both_same_candle_min is not None and minute == both_same_candle_min:
+            # Both TP and SL in same candle
+            if is_short:
+                high = max(sl_price + 0.1, 101.0)
+                low = min(tp_price - 0.1, 98.0)
+            else:
+                high = max(tp_price + 0.1, 102.0)
+                low = min(sl_price - 0.1, 98.0)
+        else:
+            if tp_hit_at_min is not None and minute == tp_hit_at_min:
+                if is_short:
+                    low = tp_price - 0.1  # short TP: low <= target
+                else:
+                    high = tp_price + 0.1  # long TP: high >= target
+
+            if sl_hit_at_min is not None and minute == sl_hit_at_min:
+                if is_short:
+                    high = sl_price + 0.1  # short SL: high >= stop
+                else:
+                    low = sl_price - 0.1  # long SL: low <= stop
+
+        candles.append(_FakeCandle(ts, high, low))
+
+    return candles
+
+
+class TestFrozenMaxHoldTpSl:
+    """CASE 1-6: TP/SL first-hit is bounded by frozen_max_hold."""
+
+    def test_case1_tp_before_120m(self):
+        """CASE 1: LONG TP hit at 60m, SL never hit.
+
+        Expected: tp_hit=True, tp_before_sl=True, sl_hit=False.
+        """
+        from app.research.prospective_evaluator import _check_tp_sl
+
+        signal_time = datetime(2026, 9, 29, 10, 0, 0, tzinfo=timezone.utc)
+        candles = _make_candles_for_hold_test(
+            signal_time, tp_hit_at_min=60,
+        )
+
+        result = _check_tp_sl(
+            candles, entry_price=100.0, stop_price=99.25,
+            target_price=101.5, max_minutes=120,
+            signal_time=signal_time, is_short=False,
+        )
+        assert result["tp_hit"] is True
+        assert result["tp_before_sl"] is True
+        assert result["sl_hit"] is False
+        assert result["sl_before_tp"] is False
+        assert result["ambiguous_intrabar"] is False
+
+    def test_case2_sl_before_120m(self):
+        """CASE 2: LONG SL hit at 45m, TP never hit.
+
+        Expected: sl_hit=True, sl_before_tp=True, tp_hit=False.
+        """
+        from app.research.prospective_evaluator import _check_tp_sl
+
+        signal_time = datetime(2026, 9, 29, 10, 0, 0, tzinfo=timezone.utc)
+        candles = _make_candles_for_hold_test(
+            signal_time, sl_hit_at_min=45,
+        )
+
+        result = _check_tp_sl(
+            candles, entry_price=100.0, stop_price=99.25,
+            target_price=101.5, max_minutes=120,
+            signal_time=signal_time, is_short=False,
+        )
+        assert result["sl_hit"] is True
+        assert result["sl_before_tp"] is True
+        assert result["tp_hit"] is False
+        assert result["tp_before_sl"] is False
+
+    def test_case3_tp_after_max_hold(self):
+        """CASE 3: CRITICAL — TP hit at 180m (after frozen_max_hold=120).
+
+        No TP/SL events before 120m.
+        TP hit at 180m.
+
+        Expected frozen outcome: tp_hit=False, sl_hit=False.
+        The trade would have been TIME_EXIT at 120m.
+        """
+        from app.research.prospective_evaluator import _check_tp_sl
+
+        signal_time = datetime(2026, 9, 29, 10, 0, 0, tzinfo=timezone.utc)
+        candles = _make_candles_for_hold_test(
+            signal_time, tp_hit_at_min=180,
+        )
+
+        result = _check_tp_sl(
+            candles, entry_price=100.0, stop_price=99.25,
+            target_price=101.5, max_minutes=120,  # frozen_max_hold
+            signal_time=signal_time, is_short=False,
+        )
+        # TP at 180m must NOT count — frozen window is [0, 120)
+        assert result["tp_hit"] is False
+        assert result["sl_hit"] is False
+        assert result["tp_before_sl"] is False
+        assert result["sl_before_tp"] is False
+        assert result["ambiguous_intrabar"] is False
+
+    def test_case4_sl_after_max_hold(self):
+        """CASE 4: SL hit at 180m (after frozen_max_hold=120).
+
+        No TP/SL events before 120m.
+
+        Expected: tp_hit=False, sl_hit=False.
+        """
+        from app.research.prospective_evaluator import _check_tp_sl
+
+        signal_time = datetime(2026, 9, 29, 10, 0, 0, tzinfo=timezone.utc)
+        candles = _make_candles_for_hold_test(
+            signal_time, sl_hit_at_min=180,
+        )
+
+        result = _check_tp_sl(
+            candles, entry_price=100.0, stop_price=99.25,
+            target_price=101.5, max_minutes=120,
+            signal_time=signal_time, is_short=False,
+        )
+        assert result["tp_hit"] is False
+        assert result["sl_hit"] is False
+
+    def test_case5_tp_sl_same_candle_before_120m(self):
+        """CASE 5: TP and SL in same candle at 30m.
+
+        Expected: ambiguous_intrabar=True, tp_hit=True, sl_hit=True,
+                  tp_before_sl=False, sl_before_tp=False.
+        """
+        from app.research.prospective_evaluator import _check_tp_sl
+
+        signal_time = datetime(2026, 9, 29, 10, 0, 0, tzinfo=timezone.utc)
+        candles = _make_candles_for_hold_test(
+            signal_time, both_same_candle_min=30,
+        )
+
+        result = _check_tp_sl(
+            candles, entry_price=100.0, stop_price=99.25,
+            target_price=101.5, max_minutes=120,
+            signal_time=signal_time, is_short=False,
+        )
+        assert result["ambiguous_intrabar"] is True
+        assert result["tp_hit"] is True
+        assert result["sl_hit"] is True
+        assert result["tp_before_sl"] is False
+        assert result["sl_before_tp"] is False
+
+    def test_case6_event_exactly_at_120m_boundary(self):
+        """CASE 6: TP hit at minute 120 (on the boundary).
+
+        Boundary semantics: the window is [signal_time, signal_time + 120m).
+        A candle at exactly +120m has c.timestamp == cutoff_ts, so it is
+        EXCLUDED by the condition ``c.timestamp >= cutoff_ts``.
+
+        Expected: tp_hit=False (boundary excluded).
+        """
+        from app.research.prospective_evaluator import _check_tp_sl
+
+        signal_time = datetime(2026, 9, 29, 10, 0, 0, tzinfo=timezone.utc)
+        candles = _make_candles_for_hold_test(
+            signal_time, tp_hit_at_min=120,
+        )
+
+        result = _check_tp_sl(
+            candles, entry_price=100.0, stop_price=99.25,
+            target_price=101.5, max_minutes=120,
+            signal_time=signal_time, is_short=False,
+        )
+        # Candle at +120m is excluded by cutoff boundary
+        assert result["tp_hit"] is False
+        assert result["sl_hit"] is False
+
+
+class TestFrozenMaxHoldMfeIndependence:
+    """CASE 7: MFE/MAE at 240m continues to work even with frozen_max_hold=120."""
+
+    def test_case7_mfe_240m_independent(self):
+        """Show that MFE/MAE 240m is computed independently of frozen TP/SL max_hold.
+
+        With frozen_max_hold=120 for TP/SL outcome:
+        - evaluated_240m_at IS NOT NULL
+        - mfe_r_240m / mae_r_240m are computed from full 240m window
+        - tp_hit / sl_hit are bounded to 120m
+        """
+        from app.research.prospective_evaluator import _calculate_mfe_mae
+
+        signal_time = datetime(2026, 9, 29, 10, 0, 0, tzinfo=timezone.utc)
+        signal_ts = int(signal_time.timestamp() * 1000)
+
+        # Candle at 150m with favorable move (beyond frozen 120m)
+        candles = [
+            _FakeCandle(ts=signal_ts + 5 * 60_000, high=101.0, low=99.5),   # +5m
+            _FakeCandle(ts=signal_ts + 60 * 60_000, high=101.5, low=99.0),  # +60m
+            _FakeCandle(ts=signal_ts + 120 * 60_000, high=101.0, low=99.5), # +120m
+            _FakeCandle(ts=signal_ts + 150 * 60_000, high=103.0, low=99.0), # +150m (post-frozen)
+            _FakeCandle(ts=signal_ts + 200 * 60_000, high=104.0, low=98.0), # +200m (post-frozen)
+        ]
+
+        # 240m MFE should see the +200m candle (104.0 → 4% fav for LONG)
+        mfe_240, mae_240 = _calculate_mfe_mae(
+            candles, entry_price=100.0, max_minutes=240,
+            signal_time=signal_time, is_short=False,
+        )
+        assert mfe_240 is not None
+        assert mfe_240 >= 3.0, f"240m MFE should see post-120m move: got {mfe_240}"
+
+        # 120m MFE should NOT see the +150m candle
+        mfe_120, mae_120 = _calculate_mfe_mae(
+            candles, entry_price=100.0, max_minutes=120,
+            signal_time=signal_time, is_short=False,
+        )
+        assert mfe_120 is not None
+        assert mfe_120 < 2.0, f"120m MFE should not see post-120m move: got {mfe_120}"
+
+
+class TestFrozenMaxHoldEvaluatorIntegration:
+    """Integration tests for evaluator with frozen_max_hold in features."""
+
+    def test_get_frozen_max_hold_from_json_string(self):
+        """Evaluator extracts _frozen_max_hold from JSON string features."""
+        from app.research.prospective_evaluator import ProspectiveOOSEvaluator
+
+        obs = {
+            "features": '{"_frozen_max_hold": 120, "_frozen_sl_r": 0.75}',
+        }
+        assert ProspectiveOOSEvaluator._get_frozen_max_hold(obs) == 120
+
+    def test_get_frozen_max_hold_from_dict(self):
+        """Evaluator extracts _frozen_max_hold from dict features."""
+        from app.research.prospective_evaluator import ProspectiveOOSEvaluator
+
+        obs = {
+            "features": {"_frozen_max_hold": 90, "_frozen_sl_r": 0.75},
+        }
+        assert ProspectiveOOSEvaluator._get_frozen_max_hold(obs) == 90
+
+    def test_get_frozen_max_hold_missing(self):
+        """Evaluator falls back to 240 when _frozen_max_hold is absent."""
+        from app.research.prospective_evaluator import ProspectiveOOSEvaluator
+
+        obs = {"features": {"_frozen_sl_r": 0.75}}
+        assert ProspectiveOOSEvaluator._get_frozen_max_hold(obs) == 240
+
+    def test_get_frozen_max_hold_none_features(self):
+        """Evaluator falls back to 240 when features is None."""
+        from app.research.prospective_evaluator import ProspectiveOOSEvaluator
+
+        obs = {"features": None}
+        assert ProspectiveOOSEvaluator._get_frozen_max_hold(obs) == 240
+
+    def test_get_frozen_max_hold_no_features_key(self):
+        """Evaluator falls back to 240 when features key is missing."""
+        from app.research.prospective_evaluator import ProspectiveOOSEvaluator
+
+        obs = {}
+        assert ProspectiveOOSEvaluator._get_frozen_max_hold(obs) == 240
+
+    def test_get_frozen_max_hold_invalid_json(self):
+        """Evaluator falls back to 240 on invalid JSON string."""
+        from app.research.prospective_evaluator import ProspectiveOOSEvaluator
+
+        obs = {"features": "not valid json"}
+        assert ProspectiveOOSEvaluator._get_frozen_max_hold(obs) == 240
+
+    def test_get_frozen_max_hold_zero_ignored(self):
+        """Evaluator ignores _frozen_max_hold=0 (not positive)."""
+        from app.research.prospective_evaluator import ProspectiveOOSEvaluator
+
+        obs = {"features": {"_frozen_max_hold": 0}}
+        assert ProspectiveOOSEvaluator._get_frozen_max_hold(obs) == 240
+
+    def test_get_frozen_max_hold_negative_ignored(self):
+        """Evaluator ignores negative _frozen_max_hold."""
+        from app.research.prospective_evaluator import ProspectiveOOSEvaluator
+
+        obs = {"features": {"_frozen_max_hold": -10}}
+        assert ProspectiveOOSEvaluator._get_frozen_max_hold(obs) == 240
+
+
+class TestBoundarySemanticsDocumented:
+    """Document and verify the exact boundary semantics of the evaluation window.
+
+    The evaluation window for _check_tp_sl and _calculate_mfe_mae is:
+
+        [signal_time, signal_time + max_minutes)
+
+    Semantics:
+        - Candle with timestamp == signal_ts: EXCLUDED (c.timestamp <= signal_ts)
+        - Candle with timestamp == cutoff_ts: EXCLUDED (c.timestamp >= cutoff_ts)
+        - The LAST candle that counts has timestamp < cutoff_ts
+
+    For max_hold=120:
+        - Last included candle starts at +115m (5m candle, timestamp at +115m)
+        - Candle at +120m is EXCLUDED
+    """
+
+    def test_upper_bound_exclusive(self):
+        """Candle at exactly cutoff_ts is excluded."""
+        from app.research.prospective_evaluator import _check_tp_sl
+
+        signal_time = datetime(2026, 9, 29, 10, 0, 0, tzinfo=timezone.utc)
+        signal_ts = int(signal_time.timestamp() * 1000)
+
+        # Candle at exactly +120m = cutoff
+        boundary_candle = _FakeCandle(
+            ts=signal_ts + 120 * 60_000,
+            high=102.0,  # Would hit TP for LONG
+            low=99.0,
+        )
+
+        result = _check_tp_sl(
+            candles=[boundary_candle],
+            entry_price=100.0, stop_price=99.25,
+            target_price=101.5, max_minutes=120,
+            signal_time=signal_time, is_short=False,
+        )
+        assert result["tp_hit"] is False, "Candle at cutoff should be excluded"
+
+    def test_last_included_candle(self):
+        """Candle at +115m (last 5m candle before +120m) IS included."""
+        from app.research.prospective_evaluator import _check_tp_sl
+
+        signal_time = datetime(2026, 9, 29, 10, 0, 0, tzinfo=timezone.utc)
+        signal_ts = int(signal_time.timestamp() * 1000)
+
+        last_included = _FakeCandle(
+            ts=signal_ts + 115 * 60_000,
+            high=102.0,  # Would hit TP for LONG
+            low=99.5,
+        )
+
+        result = _check_tp_sl(
+            candles=[last_included],
+            entry_price=100.0, stop_price=99.25,
+            target_price=101.5, max_minutes=120,
+            signal_time=signal_time, is_short=False,
+        )
+        assert result["tp_hit"] is True, "Candle at +115m should be included"
+
+    def test_signal_candle_excluded_from_tp_sl(self):
+        """Candle at signal_time is excluded (entry candle)."""
+        from app.research.prospective_evaluator import _check_tp_sl
+
+        signal_time = datetime(2026, 9, 29, 10, 0, 0, tzinfo=timezone.utc)
+        signal_ts = int(signal_time.timestamp() * 1000)
+
+        signal_candle = _FakeCandle(
+            ts=signal_ts,
+            high=102.0,  # Would hit TP
+            low=98.0,
+        )
+
+        result = _check_tp_sl(
+            candles=[signal_candle],
+            entry_price=100.0, stop_price=99.25,
+            target_price=101.5, max_minutes=120,
+            signal_time=signal_time, is_short=False,
+        )
+        assert result["tp_hit"] is False, "Signal candle should be excluded"
