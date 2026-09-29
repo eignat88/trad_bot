@@ -287,6 +287,7 @@ class ProspectiveOOSEvaluator:
         cursor.execute(
             """
             SELECT o.observation_id, o.symbol, o.signal_time, o.experiment_id,
+                   o.direction,
                    o.reference_price, o.invalidation_price, o.target_1, o.target_2,
                    o.variant_entry, o.variant_stop, o.variant_target,
                    r.evaluated_15m_at, r.evaluated_30m_at, r.evaluated_60m_at,
@@ -328,13 +329,14 @@ class ProspectiveOOSEvaluator:
                 obs = {
                     "observation_id": row[0], "symbol": row[1],
                     "signal_time": row[2], "experiment_id": row[3],
-                    "reference_price": row[4], "invalidation_price": row[5],
-                    "target_1": row[6], "target_2": row[7],
-                    "variant_entry": row[8], "variant_stop": row[9],
-                    "variant_target": row[10],
-                    "evaluated_15m_at": row[11], "evaluated_30m_at": row[12],
-                    "evaluated_60m_at": row[13], "evaluated_120m_at": row[14],
-                    "evaluated_240m_at": row[15], "is_final": row[16],
+                    "direction": row[4],
+                    "reference_price": row[5], "invalidation_price": row[6],
+                    "target_1": row[7], "target_2": row[8],
+                    "variant_entry": row[9], "variant_stop": row[10],
+                    "variant_target": row[11],
+                    "evaluated_15m_at": row[12], "evaluated_30m_at": row[13],
+                    "evaluated_60m_at": row[14], "evaluated_120m_at": row[15],
+                    "evaluated_240m_at": row[16], "is_final": row[17],
                 }
                 try:
                     self.evaluate_observation(obs, candles, now, stats)
