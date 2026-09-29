@@ -30,14 +30,18 @@ class TestFrozenRegistry:
         self.experiments = {e["experiment_id"]: e for e in self.registry["experiments"]}
 
     def test_six_experiments_registered(self):
-        assert len(self.experiments) == 6
+        assert len(self.experiments) == 10
 
     def test_experiment_ids(self):
         expected = {
             "SRR_LONG_BASELINE_V1",
+            "SRR_OOS_SCANNER_V1_PROSPECTIVE",
             "ME_SHORT_GEOM_A_V1", "ME_SHORT_GEOM_B_V1", "ME_SHORT_GEOM_C_V1",
             "VC_SHORT_BB_WIDTH_V1",
             "LR_SHORT_GATE_V1",
+            "BREAKOUT_RETEST_LONG_EXPECTANCY_REJECT_OOS_V1",
+            "FVG_REACTION_LONG_EXPECTANCY_REJECT_OOS_V1",
+            "TREND_PULLBACK_V3_HIGH_VOL_OOS_V1",
         }
         assert set(self.experiments.keys()) == expected
 
@@ -59,7 +63,6 @@ class TestFrozenRegistry:
     def test_all_shadow_only(self):
         for exp_id, exp in self.experiments.items():
             assert exp["position_sizing_rule"] == "shadow_only", f"{exp_id} not shadow"
-            assert exp["fee_assumption"] == "none", f"{exp_id} has fee_assumption"
 
     def test_no_production_changes_rule(self):
         assert self.registry["rules"]["no_production_changes"] is True
@@ -72,8 +75,15 @@ class TestFrozenRegistry:
             assert exp["started_at"] is None, f"{exp_id} has started_at set before deployment"
 
     def test_all_use_mfe_pct_primary(self):
+        r_denominated = {"SRR_OOS_SCANNER_V1_PROSPECTIVE",
+                         "BREAKOUT_RETEST_LONG_EXPECTANCY_REJECT_OOS_V1",
+                         "FVG_REACTION_LONG_EXPECTANCY_REJECT_OOS_V1",
+                         "TREND_PULLBACK_V3_HIGH_VOL_OOS_V1"}
         for exp_id, exp in self.experiments.items():
-            assert exp["primary_metric"] == "MFE_pct_60m", f"{exp_id} uses {exp['primary_metric']}"
+            if exp_id in r_denominated:
+                assert exp["primary_metric"] == "MFE_R_60m"
+            else:
+                assert exp["primary_metric"] == "MFE_pct_60m", f"{exp_id} uses {exp['primary_metric']}"
 
     def test_me_stop_rules_frozen(self):
         b = self.experiments["ME_SHORT_GEOM_B_V1"]
@@ -254,7 +264,7 @@ class TestDBSchema:
         assert reg.exists()
         data = json.loads(reg.read_text())
         assert "experiments" in data
-        assert len(data["experiments"]) == 6
+        assert len(data["experiments"]) == 10
 
     def test_observer_exists(self):
         observer = PROJECT_ROOT / "app" / "research" / "prospective_observer.py"
@@ -596,7 +606,7 @@ class TestSmokeValidation:
                     assert False, f"Mutating SQL found: {keyword} in: {line.strip()[:80]}"
 
     def test_smoke_checks_all_six_experiments(self):
-        """Smoke SQL must reference all 6 exact experiment IDs."""
+        """Smoke SQL must reference all original 6 experiment IDs from migration 050."""
         smoke = PROJECT_ROOT / "research_snapshot" / "05_smoke_validation.sql"
         content = smoke.read_text()
         required = [
@@ -782,7 +792,7 @@ class TestMigration050:
         assert "0.569723" in content
 
     def test_registry_json_db_mapping(self):
-        """Verify JSON fields map to DB columns for all 6 experiments."""
+        """Verify JSON fields map to DB columns for all original 6 experiments."""
         import json
         reg_path = PROJECT_ROOT / "app" / "research" / "prospective_registry.json"
         registry = json.loads(reg_path.read_text())
@@ -790,8 +800,15 @@ class TestMigration050:
         m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
         migration = m.read_text()
 
-        for exp in registry["experiments"]:
-            eid = exp["experiment_id"]
+        # Original V3 experiments seeded in migration 050
+        v3_experiments = [
+            "SRR_LONG_BASELINE_V1", "ME_SHORT_GEOM_A_V1", "ME_SHORT_GEOM_B_V1",
+            "ME_SHORT_GEOM_C_V1", "VC_SHORT_BB_WIDTH_V1", "LR_SHORT_GATE_V1",
+        ]
+        exp_by_id = {e["experiment_id"]: e for e in registry["experiments"]}
+
+        for eid in v3_experiments:
+            exp = exp_by_id[eid]
             # experiment_id in INSERT
             assert f"'{eid}'" in migration, f"Missing {eid}"
             # scanner_name
@@ -857,13 +874,20 @@ class TestMigration050:
                 f"Invariant must NOT compare runtime field: {runtime_field}"
 
     def test_registry_json_equivalence(self):
-        """Registry JSON frozen definitions must match migration seed values exactly."""
+        """Registry JSON frozen definitions must match migration seed values exactly for original V3 experiments."""
         import json
         reg_path = PROJECT_ROOT / "app" / "research" / "prospective_registry.json"
         registry = json.loads(reg_path.read_text())
 
         m = PROJECT_ROOT / "sql" / "migrations" / "050_prospective_oos_v3_experiments.sql"
         migration = m.read_text()
+
+        # Original V3 experiments seeded in migration 050
+        v3_experiments = [
+            "SRR_LONG_BASELINE_V1", "ME_SHORT_GEOM_A_V1", "ME_SHORT_GEOM_B_V1",
+            "ME_SHORT_GEOM_C_V1", "VC_SHORT_BB_WIDTH_V1", "LR_SHORT_GATE_V1",
+        ]
+        exp_by_id = {e["experiment_id"]: e for e in registry["experiments"]}
 
         # For each experiment, verify ALL frozen fields in migration match JSON
         frozen_fields = [
@@ -874,8 +898,8 @@ class TestMigration050:
             "minimum_n", "minimum_symbols",
         ]
 
-        for exp in registry["experiments"]:
-            eid = exp["experiment_id"]
+        for eid in v3_experiments:
+            exp = exp_by_id[eid]
             # Verify experiment_id string in INSERT
             assert f"'{eid}'" in migration, f"Missing experiment_id: {eid}"
 

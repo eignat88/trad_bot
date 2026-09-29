@@ -100,11 +100,23 @@ class ProspectiveOOSObserver:
             for exp_id, exp_spec in self._registry.items():
                 if exp_spec["scanner_name"] != scanner_name:
                     continue
-                if exp_spec["direction"] != direction:
+                # Check direction match: support multi-direction experiments
+                allowed_directions = exp_spec.get("directions")
+                if allowed_directions:
+                    if direction not in allowed_directions:
+                        continue
+                elif exp_spec["direction"] != direction:
                     continue
 
                 if exp_id.startswith("ME_SHORT_GEOM_"):
                     obs_id = self._observe_me_geometry(
+                        cursor, exp_id, exp_spec,
+                        source_key, symbol, direction, signal_time,
+                        reference_price, invalidation_price, target_1, target_2,
+                        score, features, parameters, market_regime,
+                    )
+                elif exp_id == "SRR_OOS_SCANNER_V1_PROSPECTIVE":
+                    obs_id = self._observe_srr_oos_exit(
                         cursor, exp_id, exp_spec,
                         source_key, symbol, direction, signal_time,
                         reference_price, invalidation_price, target_1, target_2,
@@ -300,6 +312,74 @@ class ProspectiveOOSObserver:
                 score, f"variant={exp_id}",
                 variant_entry, variant_stop, variant_target,
                 json.dumps(features), json.dumps(parameters), market_regime,
+            ),
+        )
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+        return None
+
+    def _observe_srr_oos_exit(
+        self, cursor, exp_id: str, exp_spec: dict,
+        source_key: int, symbol: str, direction: str, signal_time: Any,
+        reference_price: float, invalidation_price: float | None,
+        target_1: float | None, target_2: float | None,
+        score: float, features: dict, parameters: dict,
+        market_regime: str | None,
+    ) -> int | None:
+        """Insert SRR OOS exit validation observation with frozen exit geometry.
+
+        Captures BOTH LONG and SHORT from SUPPORT_RESISTANCE_REACTION.
+        Computes variant_exit using frozen OOS geometry:
+          R = abs(reference_price - invalidation_price)
+          LONG:  stop = entry - 0.75R, target = entry + 1.50R
+          SHORT: stop = entry + 0.75R, target = entry - 1.50R
+
+        Returns observation_id or None.
+        """
+        if invalidation_price is None or reference_price <= 0:
+            return None
+
+        structural_r = abs(reference_price - invalidation_price)
+        if structural_r <= 0:
+            return None
+
+        variant_entry = reference_price
+        is_short = direction == "SHORT"
+
+        if is_short:
+            variant_stop = reference_price + 0.75 * structural_r
+            variant_target = reference_price - 1.50 * structural_r
+        else:
+            variant_stop = reference_price - 0.75 * structural_r
+            variant_target = reference_price + 1.50 * structural_r
+
+        frozen_exit_features = dict(features)
+        frozen_exit_features["_frozen_sl_r"] = 0.75
+        frozen_exit_features["_frozen_tp_r"] = 1.50
+        frozen_exit_features["_frozen_max_hold"] = 120
+        frozen_exit_features["_structural_r"] = structural_r
+
+        cursor.execute(
+            """
+            INSERT INTO research.prospective_observation (
+                experiment_id, source_signal_id, source_observation_id,
+                symbol, direction, signal_time,
+                reference_price, invalidation_price, target_1, target_2,
+                score, rule_passed, filter_reason,
+                variant_entry, variant_stop, variant_target,
+                features, parameters, market_regime
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (experiment_id, source_signal_id) DO NOTHING
+            RETURNING observation_id
+            """,
+            (
+                exp_id, source_key, None,
+                symbol, direction, signal_time,
+                reference_price, invalidation_price, target_1, target_2,
+                score, "oos_exit_validation_frozen_geometry",
+                variant_entry, variant_stop, variant_target,
+                json.dumps(frozen_exit_features), json.dumps(parameters), market_regime,
             ),
         )
         row = cursor.fetchone()
