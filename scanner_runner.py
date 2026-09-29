@@ -299,10 +299,30 @@ def _get_prospective_observer(repository: ScannerRepository):
                 user=repository._user,
                 password=repository._password,
             )
-            _prospective_observer = ProspectiveOOSObserver(_prospective_conn, experiments)
+            # Also init a research repository for immediate promotion to research_signal
+            research_repo_for_promote = None
+            try:
+                from app.research.repository import ResearchRepository as _PromoteRepo
+                import pg8000 as _pg8000
+                _promote_conn = _pg8000.connect(
+                    host=repository._host,
+                    port=repository._port,
+                    database=repository._database,
+                    user=repository._user,
+                    password=repository._password,
+                )
+                research_repo_for_promote = _PromoteRepo(_promote_conn)
+            except Exception:
+                logger.debug("prospective promote repo init failed — observations will not be promoted", exc_info=True)
+
+            _prospective_observer = ProspectiveOOSObserver(
+                _prospective_conn, experiments,
+                research_repo=research_repo_for_promote,
+            )
             logger.info(
-                "prospective observer initialized: experiments=%s",
+                "prospective observer initialized: experiments=%s promote=%s",
                 list(experiments.keys()),
+                "ON" if research_repo_for_promote else "OFF",
             )
         except Exception:
             _prospective_observer = None
@@ -592,6 +612,20 @@ def run_scan_cycle(
                                 )
                     except Exception:
                         logger.debug("research resolve/promote failed", exc_info=True)
+
+                # ── Prospective OOS: log observation stats ──
+                # Promotion happens immediately inside prospective_obs.observe()
+                # Fail-open: never blocks scanner cycle.
+                if prospective_obs is not None:
+                    try:
+                        stats = prospective_obs.stats
+                        if stats:
+                            logger.info(
+                                "prospective OOS: %s",
+                                ", ".join(f"{k}={v}" for k, v in stats.items()),
+                            )
+                    except Exception:
+                        logger.debug("prospective stats logging failed", exc_info=True)
 
                 total_found += len(candidates)
                 if candidates:

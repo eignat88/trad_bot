@@ -291,6 +291,91 @@ class ResearchRepository:
 
         return stats
 
+    def promote_prospective_to_signal(self, observation_id: int) -> bool:
+        """Promote a prospective observation to a research signal.
+
+        This method copies the observation data to research_signal table
+        and links it via the prospective_observation_id column.
+
+        Returns True if promotion was successful, False otherwise.
+        """
+        if not self._conn:
+            return False
+
+        cursor = self._conn.cursor()
+        try:
+            # Check if observation exists and hasn't been promoted yet
+            cursor.execute(
+                """
+                SELECT po.observation_id, po.experiment_id, po.symbol, po.direction,
+                       po.signal_time, po.reference_price, po.invalidation_price,
+                       po.target_1, po.target_2, po.score, po.features, po.parameters,
+                       po.market_regime
+                FROM research.prospective_observation po
+                WHERE po.observation_id = %s
+                  AND NOT EXISTS (
+                      SELECT 1 FROM research.research_signal rs
+                      WHERE rs.prospective_observation_id = po.observation_id
+                  )
+                """,
+                (observation_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return False
+
+            # Extract data
+            (obs_id, exp_id, symbol, direction, signal_time, reference_price,
+             invalidation_price, target_1, target_2, score, features, parameters,
+             market_regime) = row
+
+            # Insert into research_signal
+            cursor.execute(
+                """
+                INSERT INTO research.research_signal (
+                    observation_id, experiment_id, scanner_name, parameter_set_id,
+                    symbol, direction, signal_time, signal_candle_open_time,
+                    reference_price, invalidation_price, target_1, target_2,
+                    score, features, parameters, market_regime,
+                    prospective_observation_id
+                ) VALUES (
+                    %s, %s, 'PROSPECTIVE', 'prospective_oos',
+                    %s, %s, %s, 0,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s
+                )
+                ON CONFLICT (experiment_id, symbol, direction, signal_candle_open_time)
+                WHERE signal_candle_open_time > 0
+                DO NOTHING
+                """,
+                (
+                    obs_id, exp_id, symbol, direction, signal_time,
+                    reference_price, invalidation_price, target_1, target_2,
+                    score, features, parameters, market_regime,
+                    obs_id,
+                ),
+            )
+
+            if cursor.rowcount > 0:
+                self._conn.commit()
+                logger.debug(
+                    "promoted prospective observation %d to research signal",
+                    observation_id,
+                )
+                return True
+            else:
+                self._conn.rollback()
+                return False
+
+        except Exception:
+            self._conn.rollback()
+            logger.exception(
+                "research: promote_prospective_to_signal failed for %d",
+                observation_id,
+            )
+            return False
+
     # ── eligible signals for evaluator ───────────────────────
 
     def get_eligible_signals(self, experiment_id: str, limit: int = 5000) -> list[dict]:

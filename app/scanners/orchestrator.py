@@ -331,10 +331,6 @@ class ScannerOrchestrator:
             if c.setup_id and not c.features.get("_shadow_control")
         ]
 
-        # Attach expectancy-rejected candidates for OOS research.
-        # These are candidates that passed all gates but were rejected by expectancy filter.
-        stats["_expectancy_rejected_candidates"] = expectancy_rejected_candidates
-
         # Expectancy filter: drop scanner/direction combos with negative historical R.
         # Static manual blocks are handled by the gate policy above.
         #
@@ -367,6 +363,10 @@ class ScannerOrchestrator:
             ]
             
             valid = tradeable + shadow
+
+        # Attach expectancy-rejected candidates for OOS research.
+        # These are candidates that passed all gates but were rejected by expectancy filter.
+        stats["_expectancy_rejected_candidates"] = expectancy_rejected_candidates
 
         if valid:
             logger.info(

@@ -1,4 +1,4 @@
-"""Prospective OOS Observer — captures candidates for 6 prospective experiments.
+"""Prospective OOS Observer — captures candidates for prospective OOS experiments.
 
 Positioned AFTER the generic research observer but BEFORE any further filtering.
 For each candidate from a registered scanner x direction:
@@ -8,6 +8,7 @@ For each candidate from a registered scanner x direction:
 3. Computes variant geometry for ME SHORT A/B/C
 4. Inserts prospective_observation with experiment_id + rule_passed
 5. For ME A/B/C: inserts 3 observations sharing a synthetic source key
+6. Immediately promotes each new observation to research.research_signal
 
 Design:
   - fail-open: errors logged, never propagate to scanner cycle
@@ -16,10 +17,9 @@ Design:
   - anti-leakage: all computations use information at detection time
 
 Source linkage:
-  Prospective observations use a SYNTHETIC composite key for
-  source_signal_id until the evaluator links them to actual
-  research.research_signal rows. This allows observation at
-  detection time without waiting for signal promotion.
+  Each prospective observation is immediately promoted to research_signal
+  via the dedicated research repository.  The research_signal row carries
+  a prospective_observation_id column linking back to the source.
 """
 from __future__ import annotations
 
@@ -34,12 +34,25 @@ class ProspectiveOOSObserver:
     """Captures scanner candidates for prospective OOS experiments.
 
     Called for every candidate that matches a registered prospective experiment.
-    Produces prospective_observation rows with frozen rule evaluations.
+    Produces prospective_observation rows with frozen rule evaluations,
+    then immediately promotes each to research.research_signal.
     """
 
-    def __init__(self, conn: Any, registry: dict[str, dict]) -> None:
+    def __init__(self, conn: Any, registry: dict[str, dict],
+                 research_repo: Any | None = None) -> None:
+        """Parameters
+        ----------
+        conn : connection
+            Direct DB connection for prospective_observation INSERTs.
+        registry : dict
+            Registry of prospective experiments keyed by experiment_id.
+        research_repo : ResearchRepository, optional
+            If provided, new observations are immediately promoted to
+            research.research_signal after insertion.
+        """
         self._conn = conn
         self._registry = registry
+        self._research_repo = research_repo
         self._stats: dict[str, int] = {}
 
     def _make_source_key(
@@ -63,19 +76,25 @@ class ProspectiveOOSObserver:
         features: dict,
         parameters: dict,
         market_regime: str | None,
-    ) -> None:
+    ) -> list[int]:
         """Process a candidate against all applicable prospective experiments.
 
         For ME SHORT: produces 3 paired observations (A/B/C).
         For others: produces 1 observation per matching experiment.
+
+        Each new observation is immediately promoted to research_signal
+        if a research_repo was provided at construction.
+
+        Returns list of observation_ids created.
         """
         if not self._conn:
-            return
+            return []
 
         source_key = self._make_source_key(
             scanner_name, symbol, direction, signal_time,
         )
 
+        observation_ids: list[int] = []
         cursor = self._conn.cursor()
         try:
             for exp_id, exp_spec in self._registry.items():
@@ -85,19 +104,25 @@ class ProspectiveOOSObserver:
                     continue
 
                 if exp_id.startswith("ME_SHORT_GEOM_"):
-                    self._observe_me_geometry(
+                    obs_id = self._observe_me_geometry(
                         cursor, exp_id, exp_spec,
                         source_key, symbol, direction, signal_time,
                         reference_price, invalidation_price, target_1, target_2,
                         score, features, parameters, market_regime,
                     )
                 else:
-                    self._observe_standard(
+                    obs_id = self._observe_standard(
                         cursor, exp_id, exp_spec,
                         source_key, symbol, direction, signal_time,
                         reference_price, invalidation_price, target_1, target_2,
                         score, features, parameters, market_regime,
                     )
+
+                if obs_id is not None:
+                    observation_ids.append(obs_id)
+                    self._stats[exp_id] = self._stats.get(exp_id, 0) + 1
+                    # ── Immediately promote to research_signal ──
+                    self._promote_observation(obs_id)
 
             self._conn.commit()
 
@@ -108,6 +133,32 @@ class ProspectiveOOSObserver:
                 "prospective observer error: %s %s", scanner_name, symbol,
             )
 
+        return observation_ids
+
+    def _promote_observation(self, observation_id: int) -> None:
+        """Promote a newly created prospective observation to research_signal.
+
+        Uses the dedicated research repository's promote_prospective_to_signal
+        method.  Fail-open: errors logged, never propagated.
+        """
+        if self._research_repo is None:
+            return
+        try:
+            ok = self._research_repo.promote_prospective_to_signal(observation_id)
+            if ok:
+                self._stats["promoted"] = self._stats.get("promoted", 0) + 1
+                logger.debug(
+                    "prospective observation %d promoted to research_signal",
+                    observation_id,
+                )
+            else:
+                self._stats["promote_skipped"] = self._stats.get("promote_skipped", 0) + 1
+        except Exception:
+            self._stats["promote_errors"] = self._stats.get("promote_errors", 0) + 1
+            logger.exception(
+                "prospective promotion failed for obs_id=%d", observation_id,
+            )
+
     def _observe_standard(
         self, cursor, exp_id: str, exp_spec: dict,
         source_key: int, symbol: str, direction: str, signal_time: Any,
@@ -115,8 +166,8 @@ class ProspectiveOOSObserver:
         target_1: float | None, target_2: float | None,
         score: float, features: dict, parameters: dict,
         market_regime: str | None,
-    ) -> None:
-        """Insert a standard prospective observation."""
+    ) -> int | None:
+        """Insert a standard prospective observation. Returns observation_id or None."""
         rule_passed = True
         filter_reason = None
 
@@ -136,18 +187,14 @@ class ProspectiveOOSObserver:
             filter_reason = "observational_gate_validation"
 
         elif exp_id == "BREAKOUT_RETEST_LONG_EXPECTANCY_REJECT_OOS_V1":
-            # This experiment captures candidates rejected by expectancy filter
-            # The observation is made BEFORE the expectancy filter in the pipeline
             rule_passed = True
             filter_reason = "expectancy_rejection_oos_capture"
-            # Add expectancy data to features for analysis
             features_with_expectancy = dict(features)
             features_with_expectancy["_expectancy_rejection_oos"] = True
             features_with_expectancy["_rejection_reason"] = "profit_factor_below_threshold"
             features = features_with_expectancy
 
         elif exp_id == "FVG_REACTION_LONG_EXPECTANCY_REJECT_OOS_V1":
-            # This experiment captures candidates rejected by expectancy filter
             rule_passed = True
             filter_reason = "expectancy_rejection_oos_capture"
             features_with_expectancy = dict(features)
@@ -156,7 +203,6 @@ class ProspectiveOOSObserver:
             features = features_with_expectancy
 
         elif exp_id == "TREND_PULLBACK_V3_HIGH_VOL_OOS_V1":
-            # This experiment captures candidates rejected by regime filter
             rule_passed = True
             filter_reason = "regime_counterfactual_oos_capture"
             features_with_regime = dict(features)
@@ -175,6 +221,7 @@ class ProspectiveOOSObserver:
                 features, parameters, market_regime
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (experiment_id, source_signal_id) DO NOTHING
+            RETURNING observation_id
             """,
             (
                 exp_id, source_key, None,
@@ -184,8 +231,10 @@ class ProspectiveOOSObserver:
                 json.dumps(features), json.dumps(parameters), market_regime,
             ),
         )
-        if cursor.rowcount > 0:
-            self._stats[exp_id] = self._stats.get(exp_id, 0) + 1
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+        return None
 
     def _observe_me_geometry(
         self, cursor, exp_id: str, exp_spec: dict,
@@ -194,49 +243,10 @@ class ProspectiveOOSObserver:
         target_1: float | None, target_2: float | None,
         score: float, features: dict, parameters: dict,
         market_regime: str | None,
-    ) -> None:
-        """Insert ME SHORT geometry variant observation.
-
-        EXACT FROZEN FORMULAS (all distances are from reference_price):
-
-        GEOM_A (CONTROL):
-          entry_time_A    = signal_time (detection time)
-          entry_price_A   = reference_price
-          stop_A          = invalidation_price (= reference_price * 1.002)
-          target_A        = target_1 (= current_price - ATR*2)
-          risk_dist_A     = abs(reference_price - invalidation_price)
-          target_dist_A   = abs(reference_price - target_1)
-
-        GEOM_B (WIDER STOP):
-          entry_time_B    = signal_time (same as A)
-          entry_price_B   = reference_price (same as A)
-          new_risk        = max(risk_dist_A, 0.5 * ATR_14_5m)
-          stop_B          = reference_price + new_risk
-          target_B        = reference_price - target_dist_A (SAME target distance as A)
-          risk_dist_B     = new_risk (wider than A)
-          target_dist_B   = target_dist_A (same as A)
-
-        NOTE: B widens the stop but keeps the same target distance.
-        This means B has worse RR than A (wider stop, same target).
-        This is intentional: the hypothesis is that wider stop captures
-        more favorable moves that A's tight stop misses.
-
-        GEOM_C (DELAYED ENTRY):
-          decision_time       = signal_time (when scanner detects)
-          detection_candle_close = features["entry_price"] (close of the 5m candle at detection)
-          entry_time_C        = detection_candle_close time
-          entry_price_C       = detection_candle_close (= features["entry_price"])
-          risk_dist_C         = risk_dist_A (same as original)
-          target_dist_C       = target_dist_A (same as original)
-          stop_C              = entry_price_C + risk_dist_C
-          target_C            = entry_price_C - target_dist_C
-
-        GEOM_C is a delayed-entry experiment: C enters at the CLOSE of the
-        detection candle, not at detection time. Since detection happens
-        during the candle, C's entry is 0-5 minutes later than A's.
-        """
+    ) -> int | None:
+        """Insert ME SHORT geometry variant observation. Returns observation_id or None."""
         if invalidation_price is None or reference_price <= 0:
-            return
+            return None
 
         risk_dist_A = abs(reference_price - invalidation_price)
         target_dist_A = abs(reference_price - target_1) if target_1 is not None else 0
@@ -258,12 +268,10 @@ class ProspectiveOOSObserver:
             new_risk = max(risk_dist_A, 0.5 * atr)
             variant_entry = reference_price
             variant_stop = reference_price + new_risk
-            # Target distance preserved from A (NOT adjusted for wider stop)
             if target_1 is not None:
                 variant_target = reference_price - target_dist_A
 
         elif exp_id == "ME_SHORT_GEOM_C_V1":
-            # Entry at detection candle close (available at detection time)
             current_price = features.get("entry_price", reference_price)
             if current_price is None or current_price <= 0:
                 current_price = reference_price
@@ -283,6 +291,7 @@ class ProspectiveOOSObserver:
                 features, parameters, market_regime
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (experiment_id, source_signal_id) DO NOTHING
+            RETURNING observation_id
             """,
             (
                 exp_id, source_key, None,
@@ -293,8 +302,10 @@ class ProspectiveOOSObserver:
                 json.dumps(features), json.dumps(parameters), market_regime,
             ),
         )
-        if cursor.rowcount > 0:
-            self._stats[exp_id] = self._stats.get(exp_id, 0) + 1
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+        return None
 
     @property
     def stats(self) -> dict[str, int]:
