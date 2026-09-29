@@ -112,6 +112,16 @@ class ScannerOrchestrator:
         "VOLATILITY_COMPRESSION",        # VC_SHORT_BB_WIDTH prospective OOS
     })
 
+    # Tradeable scanners whose deterministic / fixed-geometry strategy
+    # should not be filtered by the generic cross-scanner score gate.
+    # These scanners still receive a computed score (for telemetry and
+    # research), but the score is not used as a hard rejection criterion.
+    # Intentionally separate from SHADOW_CONTROL_SCANNERS: bypass
+    # scanners remain on the normal tradeable production pipeline.
+    SCORE_BYPASS_SCANNERS: frozenset[str] = frozenset({
+        "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2",
+    })
+
     # Scanners whose LONG candidates should be captured for research
     # outcome tracking, independently of direction gate / paper trading.
     # Every valid, deduplicated, score-passing candidate is captured
@@ -241,7 +251,14 @@ class ScannerOrchestrator:
                 continue
             # Shadow/control scanners and OOS treatment REJECT bypass score gate:
             # they are analytical observations, not tradeable signals.
-            if c.score >= 30 or c.features.get("_oos_rejected") or c.scanner_name in self.SHADOW_CONTROL_SCANNERS:
+            # SCORE_BYPASS scanners use deterministic fixed-geometry rules where
+            # the generic cross-scanner score provides no additional quality signal.
+            if (
+                c.score >= 30
+                or c.features.get("_oos_rejected")
+                or c.scanner_name in self.SHADOW_CONTROL_SCANNERS
+                or c.scanner_name in self.SCORE_BYPASS_SCANNERS
+            ):
                 valid.append(c)
             else:
                 sid = str(c.setup_id) if c.setup_id else None
