@@ -93,7 +93,7 @@ class ScannerOrchestrator:
         trading_mode: str = "paper",
     ) -> list[SetupCandidate]:
         candidates, _ = self.scan_all_with_stats(
-            ctx, expectancy_filter, min_avg_r, min_samples, blocked_combinations,
+            ctx, expectancy_filter, min_avg_r, min_samples,
             gate_policy=gate_policy,
             regime_filter=regime_filter,
             scanner_regime_whitelist=scanner_regime_whitelist,
@@ -127,6 +127,9 @@ class ScannerOrchestrator:
         regime_filter: bool = False,
         scanner_regime_whitelist: dict[str, dict[str, tuple[str, ...]]] | None = None,
         trading_mode: str = "paper",
+        # NOTE: blocked_combinations is DEPRECATED and IGNORED.
+        # Direction gating is handled exclusively by gate_policy (DB-aware).
+        # The parameter is retained for API backward-compatibility only.
     ) -> tuple[list[SetupCandidate], dict[str, dict[str, int | float]]]:
         """Run every configured scanner and return per-scanner observability data.
 
@@ -268,7 +271,12 @@ class ScannerOrchestrator:
         # Shadow/control scanners: their blocked candidates are saved with a
         # _shadow_control marker for OOS cohort tracking, even though they
         # won't be traded.
+        # OBSERVE_ONLY scanners: blocked from paper execution but eligible for
+        # prospective/research OOS capture.  They go through the expectancy
+        # filter separately so that EXPECTANCY_REJECTION_OOS experiments
+        # (e.g. FVG) can capture their defined population.
         shadow_candidates: list[SetupCandidate] = []
+        observe_candidates: list[SetupCandidate] = []
         if gate_policy is not None:
             gate_accepted: list[SetupCandidate] = []
             for candidate in valid:
@@ -282,6 +290,23 @@ class ScannerOrchestrator:
                     # control.  _oos_rejected candidates always pass gate for DB
                     # persistence — they are observations, not tradeable signals.
                     gate_accepted.append(candidate)
+                elif decision.status == "OBSERVE_ONLY":
+                    # OBSERVE_ONLY: not tradeable, but eligible for research/OOS
+                    # capture.  These candidates will go through the expectancy
+                    # filter so that registered prospective experiments can capture
+                    # their defined population.  They are saved to DB with a
+                    # non-tradeable status for research tracking.
+                    from dataclasses import replace as _replace_obs
+                    obs_features = dict(candidate.features)
+                    obs_features["_observe_only"] = True
+                    obs_features["_observe_only_reason"] = decision.reason
+                    observe_candidates.append(_replace_obs(candidate, features=obs_features))
+                    logger.info(
+                        "observe-only candidate: symbol=%s scanner=%s direction=%s "
+                        "reason_code=%s gate_reason=%s",
+                        candidate.symbol, candidate.scanner_name, candidate.direction,
+                        decision.reason_code, decision.reason,
+                    )
                 elif candidate.scanner_name in self.SHADOW_CONTROL_SCANNERS:
                     # Save as shadow/control for OOS cohort comparison
                     from dataclasses import replace
@@ -337,8 +362,14 @@ class ScannerOrchestrator:
         # IMPORTANT: shadow/control candidates must bypass the expectancy filter.
         # They are analytical observations, not tradeable signals.  Dropping them
         # here would destroy the control cohort needed for OOS comparison.
+        #
+        # OBSERVE_ONLY candidates also go through the expectancy filter so that
+        # registered prospective experiments (e.g. EXPECTANCY_REJECTION_OOS)
+        # can capture their defined population.  Candidates rejected by
+        # expectancy are tracked separately for OOS capture.
         expectancy_rejected = 0
         expectancy_rejected_candidates = []
+        observe_expectancy_rejected: list[SetupCandidate] = []
         if expectancy_filter is not None:
             tradeable = [c for c in valid if not c.features.get("_shadow_control")]
             shadow = [c for c in valid if c.features.get("_shadow_control")]
@@ -346,12 +377,14 @@ class ScannerOrchestrator:
             # Capture candidates before filtering for OOS research
             tradeable_before = list(tradeable)
             
+            # Direction gating is handled by gate_policy above.
+            # Do NOT pass blocked_combinations here — that would create
+            # a second, stale veto that could override DB-ENABLED decisions.
             tradeable, expectancy_rejected = filter_candidates(
                 tradeable,
                 expectancy_filter,
                 min_avg_r=min_avg_r,
                 min_samples=min_samples,
-                blocked_combinations=blocked_combinations,
                 trading_mode=trading_mode,
             )
             
@@ -364,9 +397,35 @@ class ScannerOrchestrator:
             
             valid = tradeable + shadow
 
+        # OBSERVE_ONLY candidates: run through expectancy filter separately
+        # so that expectancy-rejected candidates are captured for OOS.
+        # This happens AFTER the main expectancy filter so that both
+        # tradeable and observe-only expectancy rejections are merged.
+        if observe_candidates and expectancy_filter is not None:
+            obs_before = list(observe_candidates)
+            obs_after, _ = filter_candidates(
+                observe_candidates,
+                expectancy_filter,
+                min_avg_r=min_avg_r,
+                min_samples=min_samples,
+                trading_mode=trading_mode,
+            )
+            obs_after_ids = {c.setup_id for c in obs_after}
+            observe_expectancy_rejected = [
+                c for c in obs_before
+                if c.setup_id not in obs_after_ids
+            ]
+            # Merge into the main expectancy_rejected list so scanner_runner
+            # can capture them via the same prospective_obs.observe() path.
+            expectancy_rejected_candidates.extend(observe_expectancy_rejected)
+
         # Attach expectancy-rejected candidates for OOS research.
         # These are candidates that passed all gates but were rejected by expectancy filter.
         stats["_expectancy_rejected_candidates"] = expectancy_rejected_candidates
+
+        # Attach OBSERVE_ONLY candidates for research tracking (saved to DB
+        # with non-tradeable status, not as READY_TO_TRADE).
+        stats["_observe_candidates"] = observe_candidates
 
         if valid:
             logger.info(

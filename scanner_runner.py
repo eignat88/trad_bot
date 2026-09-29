@@ -514,6 +514,42 @@ def run_scan_cycle(
                         except Exception:
                             logger.debug("prospective observation failed for %s", c.scanner_name, exc_info=True)
 
+                # OBSERVE_ONLY candidates: save to DB with non-tradeable status
+                # and capture for prospective OOS.  These candidates passed
+                # risk_geometry + score_gate but were blocked by OBSERVE_ONLY
+                # direction gate status.  They are research observations, not
+                # tradeable signals.
+                observe_candidates = symbol_stats.get("_observe_candidates", [])
+                for oc in observe_candidates:
+                    # Save with DETECTED status (not READY_TO_TRADE)
+                    # so paper_runner never picks them up.
+                    from app.scanners.models import SetupState as _ObsState
+                    from dataclasses import replace as _obs_replace
+                    obs_c = _obs_replace(oc, state=_ObsState.DETECTED)
+                    try:
+                        repository.save_setup(obs_c, run_id=run_id)
+                    except Exception:
+                        logger.debug("observe-only setup save failed for %s", oc.scanner_name, exc_info=True)
+                    # Capture for prospective OOS
+                    if prospective_obs is not None:
+                        try:
+                            prospective_obs.observe(
+                                scanner_name=oc.scanner_name,
+                                direction=oc.direction,
+                                symbol=oc.symbol,
+                                signal_time=oc.detected_at,
+                                reference_price=oc.reference_price,
+                                invalidation_price=oc.invalidation_price,
+                                target_1=oc.target_1,
+                                target_2=oc.target_2,
+                                score=oc.score,
+                                features=dict(oc.features) if oc.features else {},
+                                parameters={},
+                                market_regime=oc.market_regime,
+                            )
+                        except Exception:
+                            logger.debug("observe-only prospective observation failed for %s", oc.scanner_name, exc_info=True)
+
                 # SRR LONG Research: capture every SRR LONG candidate for
                 # research outcome tracking (independent of paper trading).
                 research_candidates = symbol_stats.get("_research_candidates", [])

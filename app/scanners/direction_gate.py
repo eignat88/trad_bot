@@ -3,6 +3,20 @@
 The database rows are loaded once at the start of each scan/entry cycle.  The
 static Settings values remain a fail-safe fallback and unknown combinations are
 never allowed implicitly.
+
+Status semantics:
+
+  ENABLED      — research capture YES, execution gate YES
+  BLOCKED      — research capture may still occur (experiment-registered),
+                 execution gate NO
+  REGIME       — research capture YES, execution allowed only in configured
+                 regime
+  OBSERVE_ONLY — research capture YES, execution gate NO
+
+OBSERVE_ONLY allows scanner signal generation and OOS research/prospective
+capture while explicitly preventing paper/live trade execution.  This solves
+the coupling where paper execution permission was a prerequisite for OOS
+observation eligibility.
 """
 from __future__ import annotations
 
@@ -15,7 +29,8 @@ logger = logging.getLogger(__name__)
 GATE_ENABLED = "ENABLED"
 GATE_BLOCKED = "BLOCKED"
 GATE_REGIME = "REGIME"
-_VALID_STATUSES = frozenset({GATE_ENABLED, GATE_BLOCKED, GATE_REGIME})
+GATE_OBSERVE_ONLY = "OBSERVE_ONLY"
+_VALID_STATUSES = frozenset({GATE_ENABLED, GATE_BLOCKED, GATE_REGIME, GATE_OBSERVE_ONLY})
 
 
 @dataclass(frozen=True)
@@ -100,6 +115,11 @@ class ScannerDirectionGatePolicy:
         )
 
     def evaluate(self, scanner_name: str, direction: str, market_regime: str | None) -> GateDecision:
+        """Evaluate whether a scanner/direction is allowed for PAPER/LIVE execution.
+
+        OBSERVE_ONLY returns allowed=False — the scanner can generate signals
+        and participate in research/OOS capture, but cannot open paper trades.
+        """
         key = (scanner_name.upper(), direction.upper())
         gate = self._gates.get(key) or self._fallback_gates.get(key)
         if gate is None:
@@ -110,6 +130,8 @@ class ScannerDirectionGatePolicy:
             return GateDecision(True, status, reason=gate.reason, allowed_regimes=gate.allowed_regimes)
         if status == GATE_BLOCKED:
             return GateDecision(False, status, "DIRECTION_GATE_BLOCKED", gate.reason, gate.allowed_regimes)
+        if status == GATE_OBSERVE_ONLY:
+            return GateDecision(False, status, "DIRECTION_GATE_OBSERVE_ONLY", gate.reason, gate.allowed_regimes)
         if status == GATE_REGIME:
             regime = (market_regime or "").upper()
             if regime in gate.allowed_regimes:

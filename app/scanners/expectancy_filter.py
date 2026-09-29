@@ -150,12 +150,17 @@ def filter_candidates(
     blocked_combinations: frozenset[tuple[str, str]] = frozenset(),
     trading_mode: str = "paper",
 ) -> tuple[list[SetupCandidate], int]:
-    """Filter candidates by manual blocks and historical expectancy.
+    """Filter candidates by historical expectancy.
 
-    ``blocked_combinations`` rejects a scanner/direction pair regardless of its
-    historical sample count.  In PAPER mode, combinations with fewer than
-    ``min_samples`` closed trades are allowed through for bootstrap data
-    collection.  Returns (accepted, rejected_count).
+    ``blocked_combinations`` is DEPRECATED and should NOT be used in
+    production code.  Direction gating is handled exclusively by
+    ``ScannerDirectionGatePolicy`` (DB-aware).  The parameter is
+    retained only for backward-compatible test infrastructure.
+
+    In PAPER mode, combinations with fewer than ``min_samples`` closed
+    trades are allowed through for bootstrap data collection.
+
+    Returns (accepted, rejected_count).
     """
     accepted: list[SetupCandidate] = []
     rejected = 0

@@ -682,10 +682,13 @@ class ScannerRepository:
         - Otherwise → status='ENABLED'
 
         Rows with source='MANUAL' are never overwritten (operator edits
-        survive service restarts).  Rows with source='CONFIG' are updated
-        when the corresponding config.yaml entry changes.  Rows for scanners
-        no longer in *registered_scanners* are left untouched (historical
-        auditing).
+        survive service restarts).  This includes OBSERVE_ONLY rows set
+        by operators — they are preserved across service restarts just
+        like any other MANUAL status.
+
+        Rows with source='CONFIG' are updated when the corresponding
+        config.yaml entry changes.  Rows for scanners no longer in
+        *registered_scanners* are left untouched (historical auditing).
 
         Returns a counts dict with scanners, combinations, blocked, regime,
         enabled, and preserved keys.

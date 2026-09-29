@@ -394,12 +394,15 @@ def run_entry_cycle(
         candidates = gated_candidates
 
         if expectancy_filter is not None:
+            # Direction gating is handled exclusively by
+            # ScannerDirectionGatePolicy above.  Do NOT pass
+            # blocked_combinations here — that would create a second,
+            # stale veto that could override a DB-ENABLED decision.
             candidates, rejected = filter_candidates(
                 candidates,
                 expectancy_filter,
                 min_avg_r=settings.expectancy_min_avg_r,
                 min_samples=settings.expectancy_min_samples,
-                blocked_combinations=frozenset(settings.blocked_scanner_directions),
                 trading_mode=settings.trading_mode,
             )
             stats["expectancy_rejected"] = rejected
