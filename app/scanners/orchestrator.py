@@ -93,7 +93,7 @@ class ScannerOrchestrator:
         trading_mode: str = "paper",
     ) -> list[SetupCandidate]:
         candidates, _ = self.scan_all_with_stats(
-            ctx, expectancy_filter, min_avg_r, min_samples, blocked_combinations,
+            ctx, expectancy_filter, min_avg_r, min_samples,
             gate_policy=gate_policy,
             regime_filter=regime_filter,
             scanner_regime_whitelist=scanner_regime_whitelist,
@@ -127,6 +127,9 @@ class ScannerOrchestrator:
         regime_filter: bool = False,
         scanner_regime_whitelist: dict[str, dict[str, tuple[str, ...]]] | None = None,
         trading_mode: str = "paper",
+        # NOTE: blocked_combinations is DEPRECATED and IGNORED.
+        # Direction gating is handled exclusively by gate_policy (DB-aware).
+        # The parameter is retained for API backward-compatibility only.
     ) -> tuple[list[SetupCandidate], dict[str, dict[str, int | float]]]:
         """Run every configured scanner and return per-scanner observability data.
 
@@ -346,12 +349,14 @@ class ScannerOrchestrator:
             # Capture candidates before filtering for OOS research
             tradeable_before = list(tradeable)
             
+            # Direction gating is handled by gate_policy above.
+            # Do NOT pass blocked_combinations here — that would create
+            # a second, stale veto that could override DB-ENABLED decisions.
             tradeable, expectancy_rejected = filter_candidates(
                 tradeable,
                 expectancy_filter,
                 min_avg_r=min_avg_r,
                 min_samples=min_samples,
-                blocked_combinations=blocked_combinations,
                 trading_mode=trading_mode,
             )
             

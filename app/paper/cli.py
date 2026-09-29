@@ -22,6 +22,7 @@ from app.paper.engine import PaperTradingEngine
 from app.paper.readiness import assess_readiness
 from app.scanners.context_builder import build_market_context
 from app.scanners.orchestrator import ScannerOrchestrator
+from app.scanners.direction_gate import ScannerDirectionGatePolicy
 from app.scanners.expectancy_filter import filter_candidates, load_expectancy
 
 logger = logging.getLogger("paper_cli")
@@ -297,8 +298,29 @@ def cmd_run_once(args: argparse.Namespace) -> None:
             )
             candidates.append(c)
 
-        # Manual scanner/direction blocks are safety controls and therefore
-        # apply independently of the statistical expectancy feature flag.
+        # --- Direction gate: single source of truth for scanner/direction ---
+        gate_policy = ScannerDirectionGatePolicy.load_for_cycle(
+            repo,
+            scanner_names=ScannerOrchestrator().scanners.keys(),
+            blocked_combinations=settings.blocked_scanner_directions,
+            regime_whitelist=settings.scanner_regime_whitelist,
+        )
+        gated_candidates = []
+        for candidate in candidates:
+            decision = gate_policy.evaluate(
+                candidate.scanner_name, candidate.direction, candidate.market_regime,
+            )
+            if decision.allowed:
+                gated_candidates.append(candidate)
+            else:
+                logger.info(
+                    "paper entry direction gate rejected: scanner=%s direction=%s reason_code=%s",
+                    candidate.scanner_name, candidate.direction, decision.reason_code,
+                )
+        candidates = gated_candidates
+
+        # Expectancy filter: statistical evidence gate.
+        # Direction gating is handled above; do NOT pass blocked_combinations.
         expectancy = load_expectancy(repo) if settings.expectancy_filter_enabled else None
         from app.scanners.expectancy_filter import ExpectancyFilter
         candidates, rejected = filter_candidates(
@@ -309,11 +331,10 @@ def cmd_run_once(args: argparse.Namespace) -> None:
             min_profit_factor=settings.expectancy_min_profit_factor,
             min_net_pnl=settings.expectancy_min_net_pnl,
             enforce_expectancy=settings.expectancy_filter_enabled,
-            blocked_combinations=frozenset(settings.blocked_scanner_directions),
             trading_mode=settings.trading_mode,
         )
         if rejected:
-            logger.info("paper: candidate filter rejected %d setups", rejected)
+            logger.info("paper: expectancy filter rejected %d setups", rejected)
 
         opened = engine.check_entries(candidates, prices)
         if opened:
