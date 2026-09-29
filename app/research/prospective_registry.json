@@ -26,6 +26,45 @@
       "status": "READY_TO_START"
     },
     {
+      "experiment_id": "SRR_OOS_SCANNER_V1_PROSPECTIVE",
+      "version": 1,
+      "scanner_name": "SUPPORT_RESISTANCE_REACTION",
+      "direction": "LONG",
+      "experiment_type": "OOS_EXIT_VALIDATION",
+      "hypothesis": "SRR_GENERIC_V1 showed positive expectancy with SL=0.75R/TP=1.5R/MAX_HOLD=120m. Prospective validation with frozen OOS exit geometry on BOTH LONG and SHORT.",
+      "primary_metric": "MFE_R_60m",
+      "secondary_metrics": ["MAE_R_60m", "MFE_R_15m", "MFE_R_30m", "MFE_R_120m", "MFE_R_240m", "TP_before_SL", "SL_before_TP", "MFE_pct_60m", "MAE_pct_60m"],
+      "filter_rule": "NONE - capture all SRR candidates, apply frozen OOS exit geometry",
+      "threshold": null,
+      "entry_rule": "FROZEN: entry at reference_price (rejection candle close)",
+      "stop_rule": "FROZEN: for LONG, stop = entry - 0.75R; for SHORT, stop = entry + 0.75R; where R = abs(reference_price - invalidation_price)",
+      "target_rule": "FROZEN: for LONG, target = entry + 1.50R; for SHORT, target = entry - 1.50R; where R = abs(reference_price - invalidation_price)",
+      "max_hold_minutes": 120,
+      "position_sizing_rule": "shadow_only",
+      "fee_assumption": "taker 0.055% per side + 0.05% slippage per side = 0.21% round-trip",
+      "horizons": ["15m", "30m", "60m", "120m", "240m"],
+      "minimum_n": 50,
+      "minimum_symbols": 10,
+      "source_signal_required": false,
+      "paired_with": null,
+      "directions": ["LONG", "SHORT"],
+      "frozen_exit": {
+        "sl_r": 0.75,
+        "tp_r": 1.50,
+        "max_hold_minutes": 120
+      },
+      "started_at": null,
+      "status": "READY_TO_START",
+      "historical_baseline": {
+        "experiment_id": "SRR_GENERIC_V1",
+        "samples": 543,
+        "long_avg_r_after_costs": 0.374,
+        "short_avg_r_after_costs": 0.483,
+        "long_n": 262,
+        "short_n": 316
+      }
+    },
+    {
       "experiment_id": "ME_SHORT_GEOM_A_V1",
       "version": 1,
       "scanner_name": "MOMENTUM_EXHAUSTION",
