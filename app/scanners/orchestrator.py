@@ -104,8 +104,12 @@ class ScannerOrchestrator:
     # Scanners whose blocked candidates should still be saved as shadow/control.
     # Used for OOS experiments where a baseline scanner is blocked but its
     # signals must be collected for contemporaneous comparison.
+    # Direction is implicit: only BLOCKED directions enter this path (ENABLED
+    # directions hit ``decision.allowed`` first in the elif chain).
     SHADOW_CONTROL_SCANNERS: frozenset[str] = frozenset({
         "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1",
+        "MOMENTUM_EXHAUSTION",          # ME_SHORT_GEOM_A/B/C prospective OOS
+        "VOLATILITY_COMPRESSION",        # VC_SHORT_BB_WIDTH prospective OOS
     })
 
     # Scanners whose LONG candidates should be captured for research

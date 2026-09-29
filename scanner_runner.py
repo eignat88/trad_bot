@@ -466,6 +466,14 @@ def run_scan_cycle(
                         stat[field] += values[field]
 
                 for c in candidates:
+                    # Shadow/control candidates must be persisted as DETECTED,
+                    # never READY_TO_TRADE.  Scanners set state=SETUP_READY by
+                    # default which save_setup maps to READY_TO_TRADE; override
+                    # that for shadow candidates so paper_runner never sees them.
+                    if c.features.get("_shadow_control"):
+                        from app.scanners.models import SetupState as _ShadowState
+                        from dataclasses import replace as _shadow_replace
+                        c = _shadow_replace(c, state=_ShadowState.DETECTED)
                     repository.save_setup(c, run_id=run_id)
                     repository.save_event(
                         "SETUP_DETECTED", c.scanner_name, symbol,
