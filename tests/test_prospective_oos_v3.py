@@ -38,7 +38,7 @@ class TestFrozenRegistry:
             "SRR_OOS_SCANNER_V1_PROSPECTIVE",
             "ME_SHORT_GEOM_A_V1", "ME_SHORT_GEOM_B_V1", "ME_SHORT_GEOM_C_V1",
             "VC_SHORT_BB_WIDTH_V1",
-            "LR_SHORT_GATE_V1",
+            "LR_LONG_GATE_V1",
             "BREAKOUT_RETEST_LONG_EXPECTANCY_REJECT_OOS_V1",
             "FVG_REACTION_LONG_EXPECTANCY_REJECT_OOS_V1",
             "TREND_PULLBACK_V3_HIGH_VOL_OOS_V1",
@@ -801,9 +801,10 @@ class TestMigration050:
         migration = m.read_text()
 
         # Original V3 experiments seeded in migration 050
+        # Note: LR_SHORT_GATE_V1 was removed from registry when closed (2026-09-30)
         v3_experiments = [
             "SRR_LONG_BASELINE_V1", "ME_SHORT_GEOM_A_V1", "ME_SHORT_GEOM_B_V1",
-            "ME_SHORT_GEOM_C_V1", "VC_SHORT_BB_WIDTH_V1", "LR_SHORT_GATE_V1",
+            "ME_SHORT_GEOM_C_V1", "VC_SHORT_BB_WIDTH_V1",
         ]
         exp_by_id = {e["experiment_id"]: e for e in registry["experiments"]}
 
@@ -883,9 +884,10 @@ class TestMigration050:
         migration = m.read_text()
 
         # Original V3 experiments seeded in migration 050
+        # Note: LR_SHORT_GATE_V1 was removed from registry when closed (2026-09-30)
         v3_experiments = [
             "SRR_LONG_BASELINE_V1", "ME_SHORT_GEOM_A_V1", "ME_SHORT_GEOM_B_V1",
-            "ME_SHORT_GEOM_C_V1", "VC_SHORT_BB_WIDTH_V1", "LR_SHORT_GATE_V1",
+            "ME_SHORT_GEOM_C_V1", "VC_SHORT_BB_WIDTH_V1",
         ]
         exp_by_id = {e["experiment_id"]: e for e in registry["experiments"]}
 

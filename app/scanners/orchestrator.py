@@ -357,6 +357,21 @@ class ScannerOrchestrator:
                         research_rejections.append(
                             (sid, "GATE_REJECTED", decision.reason_code, decision.reason)
                         )
+                    # BLOCKED candidates with registered prospective experiments:
+                    # route to prospective capture path for OOS data collection.
+                    # Paper safety preserved: these candidates are saved as DETECTED
+                    # (not READY_TO_TRADE) and never reach paper execution.
+                    blocked_features = dict(candidate.features)
+                    blocked_features["_blocked_for_prospective"] = True
+                    blocked_features["_blocked_reason"] = decision.reason
+                    from dataclasses import replace as _replace_blocked
+                    observe_candidates.append(_replace_blocked(candidate, features=blocked_features))
+                    logger.info(
+                        "blocked candidate routed to prospective: symbol=%s scanner=%s direction=%s "
+                        "gate_status=%s",
+                        candidate.symbol, candidate.scanner_name, candidate.direction,
+                        decision.status,
+                    )
             valid = gate_accepted + shadow_candidates
 
         # Attach research candidates to stats for caller access.

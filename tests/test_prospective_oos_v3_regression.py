@@ -376,14 +376,14 @@ class TestScannerCoverage:
         exp_ids = [e["experiment_id"] for e in registry["experiments"]]
         assert "VC_SHORT_BB_WIDTH_V1" in exp_ids
 
-    def test_registry_covers_lr_short(self):
-        """LR_SHORT_GATE_V1 must be in the registry."""
+    def test_registry_covers_lr_long(self):
+        """LR_LONG_GATE_V1 must be in the registry."""
         import json
         registry = json.loads(
             (PROJECT_ROOT / "app" / "research" / "prospective_registry.json").read_text()
         )
         exp_ids = [e["experiment_id"] for e in registry["experiments"]]
-        assert "LR_SHORT_GATE_V1" in exp_ids
+        assert "LR_LONG_GATE_V1" in exp_ids
 
     def test_prospective_observer_routes_all_scanners(self):
         """observe() must dispatch to _observe_standard or _observe_me_geometry."""
@@ -925,11 +925,11 @@ class TestObserveVCShort:
         assert args[11] is True, "bb_width 0.3 should be rule_passed=True"
 
 
-class TestObserveLRShort:
-    """Runtime test: observe() for LIQUIDITY_REVERSAL SHORT."""
+class TestObserveLRLong:
+    """Runtime test: observe() for LIQUIDITY_REVERSAL LONG."""
 
-    def test_lr_short_creates_observation(self):
-        """LR_SHORT_GATE_V1 observation must be inserted for LR SHORT."""
+    def test_lr_long_creates_observation(self):
+        """LR_LONG_GATE_V1 observation must be inserted for LR LONG."""
         registry = _make_registry_dict(_load_registry())
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
@@ -941,7 +941,7 @@ class TestObserveLRShort:
 
         kwargs = _make_observe_kwargs(
             scanner_name="LIQUIDITY_REVERSAL",
-            direction="SHORT",
+            direction="LONG",
         )
         observer.observe(**kwargs)
 
@@ -949,10 +949,10 @@ class TestObserveLRShort:
         assert mock_cursor.execute.call_count >= 1
         insert_call = mock_cursor.execute.call_args_list[0]
         args = insert_call[0][1]
-        assert args[0] == "LR_SHORT_GATE_V1"
+        assert args[0] == "LR_LONG_GATE_V1"
 
-    def test_lr_short_direction_in_values(self):
-        """LR SHORT must pass direction='SHORT' in the INSERT."""
+    def test_lr_long_direction_in_values(self):
+        """LR LONG must pass direction='LONG' in the INSERT."""
         registry = _make_registry_dict(_load_registry())
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
@@ -964,13 +964,13 @@ class TestObserveLRShort:
 
         kwargs = _make_observe_kwargs(
             scanner_name="LIQUIDITY_REVERSAL",
-            direction="SHORT",
+            direction="LONG",
         )
         observer.observe(**kwargs)
 
         insert_call = mock_cursor.execute.call_args_list[0]
         args = insert_call[0][1]
-        assert args[4] == "SHORT"
+        assert args[4] == "LONG"
 
 
 class TestObserveMEShortABC:
