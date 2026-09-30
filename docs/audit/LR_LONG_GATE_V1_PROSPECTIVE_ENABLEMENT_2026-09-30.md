@@ -15,9 +15,119 @@
 - `prospective_started_at` set to actual deployment time: **2026-09-30 14:36:46 UTC**
 - LIQUIDITY_REVERSAL LONG PAPER gate remains **BLOCKED** (DB gate unchanged)
 - Scanner restarted and loaded LR_LONG_GATE_V1 into prospective observer
-- All 226 prospective OOS tests pass (37 new + 189 existing)
+- All 336 prospective OOS tests pass (25 routing fix + 37 initial + 274 existing)
 - No historical backfill performed
 - N = 0 (waiting for natural LONG signals)
+
+---
+
+## RUNTIME DEFECT FOUND
+
+### Signal
+```
+signal_id = 9903
+observation_id = 11187
+experiment_id = LR_GENERIC_V1
+scanner_name = LIQUIDITY_REVERSAL
+symbol = XPLUSDT
+direction = LONG
+signal_time = 2026-09-30 14:44:15.27877 UTC
+```
+
+### Observed
+| Check | Result |
+|-------|--------|
+| LR_GENERIC_V1 research_signal | ✅ YES |
+| LR_LONG_GATE_V1 prospective_observation | ❌ NO |
+| PAPER trade | ✅ NO (gate BLOCKED) |
+
+### ROOT CAUSE
+```
+app/scanners/orchestrator.py: BLOCKED candidates were rejected without
+being added to observe_candidates. The orchestrator only routed
+OBSERVE_ONLY status candidates to observe_candidates for prospective
+capture. When gate status=BLOCKED, candidates were simply logged as
+"direction gate rejected" and dropped, so prospective_obs.observe()
+was never called for them.
+
+Since LIQUIDITY_REVERSAL LONG has gate status="BLOCKED" (not
+"OBSERVE_ONLY"), the candidate was rejected and never reached
+prospective capture.
+```
+
+### FIX
+```
+app/scanners/orchestrator.py: BLOCKED candidates are now routed to
+observe_candidates (same path as OBSERVE_ONLY), allowing prospective
+OOS capture while preserving paper safety (saved as DETECTED, not
+READY_TO_TRADE).
+
+Change: Added handling in the else branch (BLOCKED) to append candidates
+to observe_candidates with _blocked_for_prospective=True feature flag.
+```
+
+### TESTS
+```
+New tests: 25 (tests/test_lr_long_gate_v1_routing_fix.py)
+Existing tests: 311
+Total passed: 336
+Failures: 0
+```
+
+### FIX COMMIT
+```
+0582b1d fix: route LR_GENERIC LONG signals to LR_LONG_GATE_V1
+```
+
+### BRANCH
+```
+feat/lr-long-gate-v1-prospective-oos
+```
+
+### GITHUB_PUSHED
+```
+YES
+```
+
+### VPS_HEAD
+```
+0582b1d5fc214b93adf5095ada19c94e89eebbab
+```
+
+### FIX_DEPLOYED_AT
+```
+2026-09-30 15:07:27 UTC
+```
+
+### PAPER_GATE
+```
+BLOCKED
+```
+
+### HISTORICAL_BACKFILL
+```
+NO
+```
+
+### STATIC_RUNTIME_CHECK
+```
+PASS
+```
+
+### NATURAL_SIGNAL_RUNTIME_PROOF
+```
+PENDING (no new LIQUIDITY_REVERSAL LONG signal since fix deployment)
+```
+
+### SAFE_TO_ACCUMULATE_OOS
+```
+YES
+```
+
+### FULL_RUNTIME_VERIFIED
+```
+NO (pending natural signal)
+```
 
 ---
 
