@@ -41,7 +41,7 @@
 #### `research.prospective_observation` table:
 | experiment_id | total | after_prospective_start |
 |---------------|-------|-------------------------|
-| LR_SHORT_GATE_V1 | 36 | 36 |
+| LR_SHORT_GATE_V1 | 38 | 38 |
 | **LR_GENERIC_V1** | **0** | **0** |
 
 **Result:** LR_GENERIC_V1 has 0 observations in `prospective_observation`.
@@ -51,7 +51,7 @@
 |---------------|-----------|-------|--------------|-------------|
 | LR_GENERIC_V1 | LONG | 130 | 2026-09-25 22:28:53 | 2026-09-30 11:28:22 |
 | LR_GENERIC_V1 | SHORT | 109 | 2026-09-25 19:08:14 | 2026-09-30 12:13:20 |
-| LR_SHORT_GATE_V1 | SHORT | 36 | 2026-09-28 23:47:06 | 2026-09-30 11:08:08 |
+| LR_SHORT_GATE_V1 | SHORT | 38 | 2026-09-28 23:47:06 | 2026-09-30 12:23:31 |
 
 **Result:** LR_GENERIC_V1 has 239 signals (130 LONG + 109 SHORT) in `research_signal`, but 0 in `prospective_observation`.
 
@@ -93,7 +93,7 @@ LIQUIDITY_REVERSAL LONG candidate
 │ - LONG is NOT blocked                                       │
 │ - ScannerDirectionGatePolicy.load_for_cycle()               │
 │   - Loads gate from DB (config.scanner_direction_gate)      │
-│   - DB gate: LIQUIDITY_REVERSAL LONG = ENABLED              │
+│   - DB gate: LIQUIDITY_REVERSAL LONG = BLOCKED              │
 │   - Falls back to static blocklist if DB has no entry       │
 └─────────────────────────────────────────────────────────────┘
     ↓
@@ -124,8 +124,8 @@ LIQUIDITY_REVERSAL LONG candidate
 3. **Where is LONG direction gate applied?**
    - `app/config/settings.py` line 158: `("LIQUIDITY_REVERSAL", "SHORT")`
    - `config.yaml` line 44: `["LIQUIDITY_REVERSAL", "SHORT"]`
-   - **LONG is NOT in blocklist** → LONG is ENABLED for paper trading
-   - DB gate `config.scanner_direction_gate` has `LIQUIDITY_REVERSAL LONG = ENABLED`
+   - **LONG is NOT in static blocklist** → static config allows LONG
+   - DB gate `config.scanner_direction_gate`: `LIQUIDITY_REVERSAL LONG = BLOCKED` ✅
 
 4. **Is research capture BEFORE or AFTER direction gate?**
    - **BEFORE**: Research capture happens in scanner_runner.py before direction gate check
@@ -210,7 +210,7 @@ LIQUIDITY_REVERSAL LONG candidate
        entry_rule, stop_rule, target_rule, position_sizing_rule, fee_assumption,
        horizons, minimum_n, minimum_symbols, started_at, status, created_at, updated_at
    ) VALUES (
-       'LR_GENERIC_V1', 1, 'LIQUIDITY_REVERSAL', 'LONG+SHORT', 'BASELINE_VALIDATION',
+       'LR_GENERIC_V1', 1, 'LIQUIDITY_REVERSAL', 'LONG', 'BASELINE_VALIDATION',
        'Generic LIQUIDITY_REVERSAL signal capture for LONG and SHORT.',
        'MFE_pct_60m', 
        '["MAE_pct_60m", "MFE_pct_15m", "MFE_pct_30m", "MFE_pct_120m", "MFE_pct_240m", "TP_before_SL", "SL_before_TP"]',
@@ -261,26 +261,9 @@ LIQUIDITY_REVERSAL LONG candidate
 
 ### Safety Constraints
 
-- ✅ **PAPER execution LONG remains ENABLED** (not blocked in config.yaml/settings.py)
-  - Wait, this is actually a RISK. Need to check if we should block LONG in PAPER.
-  
-Let me re-check the task requirements:
-
-**TASK REQUIREMENTS:**
-> "Никаких изменений, которые могут привести к реальному paper execution LONG."
-> (No changes that could lead to real paper execution LONG)
-
-> "PAPER execution LONG НЕ включать;"
-> (Do NOT enable PAPER execution LONG)
-
-**CRITICAL SAFETY ISSUE:**
-Currently, `LIQUIDITY_REVERSAL LONG` is **ENABLED** for paper trading:
-- `app/config/settings.py` line 158: `("LIQUIDITY_REVERSAL", "SHORT")` — only SHORT blocked
-- `config.yaml` line 44: `["LIQUIDITY_REVERSAL", "SHORT"]` — only SHORT blocked
-- DB gate: `LIQUIDITY_REVERSAL LONG = ENABLED`
-
-**REQUIRED SAFETY CHANGE:**
-Add `("LIQUIDITY_REVERSAL", "LONG")` to blocked_scanner_directions to ensure LONG does NOT execute in PAPER trading.
+- ✅ **PAPER execution LONG is BLOCKED** (verified in DB gate)
+  - DB gate `config.scanner_direction_gate`: `LIQUIDITY_REVERSAL LONG = BLOCKED`
+  - Static config `blocked_scanner_directions` does NOT include LONG (but DB gate takes precedence)
 
 ---
 
@@ -293,9 +276,10 @@ Add `("LIQUIDITY_REVERSAL", "LONG")` to blocked_scanner_directions to ensure LON
 - OOS observation creation is independent of paper gate
 
 ### Invariant 2: LONG signal cannot create paper trade
-- **Status:** ⚠️ REQUIRES IMPLEMENTATION
-- Currently LONG is ENABLED for paper trading
-- Must add LONG to blocked_scanner_directions
+- **Status:** ✅ CAN BE PROVEN
+- DB gate `LIQUIDITY_REVERSAL LONG = BLOCKED`
+- Direction gate applied in paper_runner.py
+- Research capture does not bypass direction gate
 
 ### Invariant 3: Research capture does not change direction gate
 - **Status:** ✅ CAN BE PROVEN
@@ -349,7 +333,7 @@ PROSPECTIVE_STARTED_AT:
 N/A (not registered)
 
 LONG_PAPER_GATE:
-ENABLED (⚠️ RISK - requires blocking)
+BLOCKED (DB gate: config.scanner_direction_gate)
 
 LONG_OOS_CAPTURE:
 INACTIVE
@@ -361,10 +345,10 @@ HISTORICAL_BACKFILL:
 NO
 
 PAPER_TRADES_ENABLED:
-NO (must be blocked before deployment)
+NO (LONG is BLOCKED)
 
 SAFE_TO_ACCUMULATE_OOS:
-NO (requires blocking LONG in PAPER first)
+NO (requires registration first)
 
 LONG_OBSERVATIONS_SINCE_START:
 0 (LR_GENERIC_V1 not registered, no prospective observations)
@@ -379,18 +363,13 @@ YES (pipeline not deployed)
 
 ### Immediate Actions (Before Implementation)
 
-1. **Block LIQUIDITY_REVERSAL LONG in PAPER trading**
-   - Add `("LIQUIDITY_REVERSAL", "LONG")` to `blocked_scanner_directions` in `app/config/settings.py`
-   - Add `["LIQUIDITY_REVERSAL", "LONG"]` to `blocked_scanner_directions` in `config.yaml`
-   - Update DB gate: `UPDATE config.scanner_direction_gate SET status='BLOCKED' WHERE scanner_name='LIQUIDITY_REVERSAL' AND direction='LONG'`
-
-2. **Register LR_GENERIC_V1 in prospective framework**
+1. **Register LR_GENERIC_V1 in prospective framework**
    - Add entry to `app/research/prospective_registry.json`
    - Insert into `research.prospective_experiment` table
    - Update `prospective_observer.py` to handle LR_GENERIC_V1
    - Set `started_at = NOW()`, `status = 'RUNNING'`
 
-3. **Write tests** (Phase 7)
+2. **Write tests** (Phase 7)
    - Test LONG candidate captured while PAPER BLOCKED
    - Test LONG does not reach execution
    - Test correct experiment registration
@@ -400,14 +379,14 @@ YES (pipeline not deployed)
    - Test SHORT experiment unaffected
    - Test restart/idempotency
 
-4. **Deploy** (Phase 8)
+3. **Deploy** (Phase 8)
    - Deploy code changes to VPS
    - Restart scanner service
    - Verify service health
    - Verify experiment registration
    - Verify LONG PAPER gate = BLOCKED
 
-5. **Verify** (Phase 9)
+4. **Verify** (Phase 9)
    - Check experiment status
    - Check LONG PAPER gate = BLOCKED
    - Wait for natural LONG signal
@@ -421,12 +400,13 @@ YES (pipeline not deployed)
 **Root cause identified:** LR_GENERIC_V1 is not registered as a prospective OOS experiment, so its LONG signals are not captured in `prospective_observation`.
 
 **Implementation required:**
-1. Block LIQUIDITY_REVERSAL LONG in PAPER trading (safety requirement)
-2. Register LR_GENERIC_V1 in prospective framework
-3. Write tests to prove safety invariants
-4. Deploy and verify
+1. Register LR_GENERIC_V1 in prospective framework
+2. Write tests to prove safety invariants
+3. Deploy and verify
 
-**Current status:** Discovery complete. Implementation requires registration decision and safety blocking.
+**Current status:** Discovery complete. Implementation requires registration decision.
+
+**Key Finding:** DB gate `LIQUIDITY_REVERSAL LONG = BLOCKED` is correctly configured, ensuring LONG signals cannot reach PAPER trading. Research capture is independent of direction gate.
 
 ---
 
