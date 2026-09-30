@@ -194,7 +194,7 @@ class ProspectiveOOSObserver:
                 rule_passed = False
                 filter_reason = "bb_width_percentile is NULL"
 
-        elif exp_id == "LR_SHORT_GATE_V1":
+        elif exp_id in ("LR_SHORT_GATE_V1", "LR_LONG_GATE_V1"):
             rule_passed = True
             filter_reason = "observational_gate_validation"
 
