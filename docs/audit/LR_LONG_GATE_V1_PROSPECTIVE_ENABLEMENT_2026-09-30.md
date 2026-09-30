@@ -8,7 +8,7 @@
 
 ## EXECUTIVE SUMMARY
 
-**Status:** ✅ **SUCCESS** — LR_LONG_GATE_V1 is deployed and ready to accumulate prospective LONG OOS observations.
+**Status:** ✅ **FULLY VERIFIED** — LR_LONG_GATE_V1 is deployed, runtime-verified with natural signals, and safe to accumulate prospective OOS.
 
 **Key Results:**
 - Experiment registered in `research.prospective_experiment` with `status=RUNNING`
@@ -17,7 +17,76 @@
 - Scanner restarted and loaded LR_LONG_GATE_V1 into prospective observer
 - All 336 prospective OOS tests pass (25 routing fix + 37 initial + 274 existing)
 - No historical backfill performed
-- N = 0 (waiting for natural LONG signals)
+- **N = 3** (3 natural LONG signals captured after routing fix)
+- **NATURAL_SIGNAL_RUNTIME_PROOF = PASS**
+- **FULL_RUNTIME_VERIFIED = YES**
+
+---
+
+## NATURAL SIGNAL RUNTIME PROOF
+
+### FIX_DEPLOYED_AT
+```
+2026-09-30 15:07:27 UTC
+```
+
+### PROOF SIGNALS
+
+After FIX_DEPLOYED_AT, 3 natural LIQUIDITY_REVERSAL LONG signals were captured:
+
+#### 1. UNIUSDT
+| Field | Value |
+|-------|-------|
+| generic signal_id | 9979 |
+| generic observation_id | 11283 |
+| generic experiment_id | LR_GENERIC_V1 |
+| prospective observation_id | 1493 |
+| prospective experiment_id | LR_LONG_GATE_V1 |
+| symbol | UNIUSDT |
+| direction | LONG |
+| signal_time | 2026-09-30 15:37:49.517723 UTC |
+
+#### 2. ONDOUSDT
+| Field | Value |
+|-------|-------|
+| generic signal_id | 10002 |
+| generic observation_id | 11308 |
+| generic experiment_id | LR_GENERIC_V1 |
+| prospective observation_id | 1508 |
+| prospective experiment_id | LR_LONG_GATE_V1 |
+| symbol | ONDOUSDT |
+| direction | LONG |
+| signal_time | 2026-09-30 15:57:47.606925 UTC |
+
+#### 3. ADAUSDT
+| Field | Value |
+|-------|-------|
+| generic signal_id | 10004 |
+| generic observation_id | 11310 |
+| generic experiment_id | LR_GENERIC_V1 |
+| prospective observation_id | 1509 |
+| prospective experiment_id | LR_LONG_GATE_V1 |
+| symbol | ADAUSDT |
+| direction | LONG |
+| signal_time | 2026-09-30 15:57:49.910834 UTC |
+
+### PAPER CHECK
+```
+dds.paper_trade
+scanner_name = LIQUIDITY_REVERSAL
+direction = LONG
+entered_at >= 2026-09-30 15:07:27 UTC
+
+result: 0 rows
+```
+
+### RUNTIME INVARIANT PROVEN
+```
+NEW NATURAL LONG
+→ research.research_signal         YES  (3/3 signals captured)
+→ LR_LONG_GATE_V1 observation      YES  (3/3 observations created)
+→ PAPER trade                      NO   (0 trades, gate BLOCKED)
+```
 
 ---
 
@@ -126,7 +195,46 @@ YES
 
 ### FULL_RUNTIME_VERIFIED
 ```
-NO (pending natural signal)
+YES
+```
+
+---
+
+## FINAL STATUS
+
+```
+CODE_FIX:
+PASS
+
+TESTS:
+PASS (336 passed / 0 failed)
+
+DEPLOY:
+PASS
+
+STATIC_RUNTIME_CHECK:
+PASS
+
+NATURAL_SIGNAL_RUNTIME_PROOF:
+PASS
+
+SAFE_TO_ACCUMULATE_OOS:
+YES
+
+FULL_RUNTIME_VERIFIED:
+YES
+
+HISTORICAL_BACKFILL:
+NO
+
+PAPER_GATE:
+BLOCKED
+
+PAPER_TRADES_AFTER_FIX:
+0
+
+OBSERVATIONS_AFTER_FIX:
+3 (UNIUSDT, ONDOUSDT, ADAUSDT)
 ```
 
 ---
