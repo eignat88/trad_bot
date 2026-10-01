@@ -1,0 +1,132 @@
+{
+  "protocol_id": "LR_LONG_GEOMETRY_PROSPECTIVE_VALIDATION_V1",
+  "frozen_at": "2026-10-01 13:48:27 UTC",
+  "git_sha": "85cc87a21399c34424cc3ca5bbd513961c665f68",
+  "vps_host": "trad-bot-01",
+  "source_discovery_report": "docs/research/LR_LONG_ENTRY_GEOMETRY_DISCOVERY_V1_2026-10-01.md",
+  "source_discovery_verdict": "FRAGILE_DISCOVERY_EDGE",
+  "frozen_hypothesis": {
+    "experiment_id": "LR_LONG_GEOMETRY_PROSPECTIVE_VALIDATION_V1",
+    "direction": "LONG",
+    "scanner": "LIQUIDITY_REVERSAL",
+    "entry": "reference_price / swept_level (production semantics)",
+    "sl_r": 0.50,
+    "tp_r": 3.0,
+    "timeout_minutes": 120,
+    "risk_gate": "abs(entry - original_structural_stop) / entry >= 0.003",
+    "risk_gate_threshold": 0.003,
+    "fee_per_side": 0.00055,
+    "slippage_per_side_normal": 0.0005,
+    "slippage_per_side_elevated": 0.001,
+    "same_candle_rule": "STOP_FIRST",
+    "primary_metric": "Net E[R] after fees + normal slippage",
+    "secondary_metrics": [
+      "PF",
+      "WR",
+      "median R",
+      "day concentration",
+      "symbol concentration",
+      "drawdown / losing streak"
+    ]
+  },
+  "validation_population": {
+    "primary_rule": "POST_FREEZE_ONLY",
+    "inclusion": "signal_time >= 2026-10-01 13:48:27 UTC",
+    "source_dataset": "LR_LONG_GATE_V1",
+    "pre_freeze_observations": "PRE_FREEZE_BLIND_HOLDOUT — excluded from primary validation",
+    "pre_freeze_n_at_freeze": 32
+  },
+  "maturity_checkpoint": {
+    "eligible_n_min": 50,
+    "distinct_oos_days_min": 7,
+    "n_definition": "only observations passing frozen risk_gate (risk_dist / entry >= 0.3%)"
+  },
+  "metrics_policy": {
+    "allowed_before_checkpoint": [
+      "post_freeze_raw_signals",
+      "risk_gate_eligible_n",
+      "risk_gate_rejected_n",
+      "distinct_symbols",
+      "distinct_oos_days",
+      "outcomes_available",
+      "finalized",
+      "last_signal_time",
+      "pipeline_health"
+    ],
+    "forbidden_before_checkpoint": [
+      "Net E[R]",
+      "PF",
+      "WR",
+      "candidate_performance",
+      "day_performance",
+      "symbol_performance",
+      "TP/SL performance"
+    ]
+  },
+  "validation_execution": {
+    "trigger": "eligible_n >= 50 AND distinct_oos_days >= 7",
+    "grid_search": false,
+    "alternatives_allowed": false,
+    "frozen_params": {
+      "sl_r": 0.50,
+      "tp_r": 3.0,
+      "timeout_minutes": 120,
+      "ambiguity": "STOP_FIRST",
+      "fee_per_side": 0.00055,
+      "slippage_per_side": 0.0005
+    }
+  },
+  "predeclared_robustness": {
+    "costs": ["normal_slippage_0.0005", "elevated_slippage_0.001"],
+    "concentration": [
+      "exclude_best_day",
+      "exclude_top_symbol",
+      "exclude_top3_symbols",
+      "exclude_largest_winner",
+      "exclude_top3_winners"
+    ],
+    "bootstrap": ["trade_level_95ci", "day_block_95ci"]
+  },
+  "verdict_rules": {
+    "VALIDATION_FAILED": "frozen hypothesis does not show robust positive edge after costs",
+    "VALIDATION_INCONCLUSIVE": "Net E[R] ~ 0; CI spans zero; edge depends on one day/symbol; sample not robust",
+    "VALIDATION_PASSED": "Net E[R] > 0 AND PF > 1 AND survives normal costs AND survives excl best day AND survives excl top symbol AND bootstrap consistent with positive expectancy"
+  },
+  "no_retro_optimization": true,
+  "pipeline_verification_at_freeze": {
+    "lr_long_gate_v1_status": "RUNNING",
+    "lr_long_gate_v1_started_at": "2026-09-30 14:36:46 UTC",
+    "direction_gate_long": "BLOCKED",
+    "direction_gate_short": "BLOCKED",
+    "total_observations": 32,
+    "direction_long": 32,
+    "distinct_symbols": 24,
+    "distinct_days": 2,
+    "duplicate_signals": 0,
+    "outcomes_available": 28,
+    "finalized": 19,
+    "last_signal": "2026-10-01 13:44:03 UTC",
+    "paper_trades_lr_long_gate_v1": 0,
+    "paper_trades_lr_long_post_freeze": 0,
+    "paper_trades_lr_long_since_experiment_start": 0,
+    "post_freeze_raw_n": 0,
+    "post_freeze_eligible_n": 0,
+    "post_freeze_symbols": 0,
+    "post_freeze_days": 0,
+    "post_freeze_outcomes": 0,
+    "post_freeze_finalized": 0,
+    "pipeline_status": "RUNNING_healthy"
+  },
+  "safety_invariants": {
+    "long_paper_gate_blocked": true,
+    "no_new_paper_trades_post_freeze": true,
+    "no_new_paper_trades_since_experiment_start": true,
+    "research_capture_independent_of_paper_gate": true,
+    "no_duplicate_observations": true,
+    "lr_long_gate_v1_semantics_unchanged": true,
+    "no_production_config_changes": true,
+    "no_scanner_changes": true,
+    "no_service_restarts": true
+  },
+  "next_action": "Wait for natural LIQUIDITY_REVERSAL LONG signals. Monitor operational counters only. Execute frozen validation when eligible_n >= 50 AND days >= 7."
+}
