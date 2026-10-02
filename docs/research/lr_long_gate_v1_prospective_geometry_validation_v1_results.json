@@ -1,0 +1,194 @@
+{
+  "experiment_id": "LR_LONG_GATE_V1",
+  "audit_cutoff": "2026-10-02 14:53:31+00",
+  "git_head": "7bc1cd9e0a16ed6aab92cdd9fba094390401bc59",
+  "protocol_artifact": "docs/research/LR_LONG_GEOMETRY_PROSPECTIVE_VALIDATION_V1_PROTOCOL_2026-10-01.md",
+  "freeze_timestamp": "2026-10-01 13:48:27+00",
+  "integrity": {
+    "raw_n": 51,
+    "duplicate_observation_ids": 0,
+    "duplicate_symbol_signal_time": 0,
+    "non_long_rows": 1,
+    "null_reference_price": 1,
+    "null_invalidation_price": 1,
+    "zero_risk_distance": 0,
+    "negative_risk_distance": 0,
+    "observations_after_cutoff": 0,
+    "observations_without_outcome": 2,
+    "pre_freeze_inserted_after_freeze": 0,
+    "post_freeze_sourced_pre_freeze": 0
+  },
+  "dataset": {
+    "raw_n": 51,
+    "pre_freeze_n": 33,
+    "post_freeze_n": 18,
+    "post_freeze_first": "2026-10-01 15:23:56.496315+00",
+    "post_freeze_last": "2026-10-02 14:51:50.865758+00",
+    "gate_pass_n": 13,
+    "gate_fail_n": 5,
+    "eligible_n": 9,
+    "finalized_n": 9,
+    "gate_pass_not_final_n": 4,
+    "symbols": 7,
+    "oos_days": 2
+  },
+  "frozen_protocol": {
+    "sl_r": 0.5,
+    "tp_r": 3.0,
+    "timeout_min": 120,
+    "risk_gate": 0.003,
+    "fee_per_side": 0.00055,
+    "slippage_normal_per_side": 0.0005,
+    "slippage_elevated_per_side": 0.001,
+    "round_trip_normal": 0.0021000000000000003,
+    "round_trip_elevated": 0.0031000000000000003,
+    "ambiguity_policy": "STOP_FIRST",
+    "checkpoint_min_n": 50,
+    "checkpoint_min_days": 7
+  },
+  "checkpoint_met": false,
+  "execution_gross": {
+    "n": 9,
+    "n_tp": 3,
+    "n_sl": 6,
+    "n_timeout": 0,
+    "n_ambiguous": 0,
+    "win_rate": 0.3333333333333333,
+    "gross_er": 0.2842588468806489,
+    "net_er": 0.2842588468806489,
+    "net_pf": 1.4263882703209732,
+    "net_total_r": 2.5583296219258402,
+    "median_net_r": -1.0,
+    "max_losing_streak": 4
+  },
+  "execution_primary": {
+    "n": 9,
+    "n_tp": 3,
+    "n_sl": 6,
+    "n_timeout": 0,
+    "n_ambiguous": 0,
+    "win_rate": 0.3333333333333333,
+    "gross_er": 0.2842588468806489,
+    "net_er": -0.02552254932696132,
+    "net_pf": 0.9709712970582715,
+    "net_total_r": -0.2297029439426519,
+    "median_net_r": -1.2974865951742638,
+    "max_losing_streak": 4
+  },
+  "execution_elevated": {
+    "n": 9,
+    "n_tp": 3,
+    "n_sl": 6,
+    "n_timeout": 0,
+    "n_ambiguous": 0,
+    "win_rate": 0.3333333333333333,
+    "gross_er": 0.2842588468806489,
+    "net_er": -0.1730374999020138,
+    "net_pf": 0.8235090077201718,
+    "net_total_r": -1.5573374991181244,
+    "median_net_r": -1.43914687859058,
+    "max_losing_streak": 4
+  },
+  "bootstrap": {
+    "point_estimate": -0.02552254932696132,
+    "bootstrap_median": -0.027728784658829282,
+    "ci_95_low": -0.9349215951765087,
+    "ci_95_high": 1.2726066914686875,
+    "p_er_gt_0": 0.4083
+  },
+  "day_concentration": {
+    "largest_day_share_n": 0.6666666666666666,
+    "loo": [
+      {
+        "excluded_day": "2026-10-01",
+        "n": 3,
+        "net_er": 1.312050055596368,
+        "net_pf": 3.8682192222634493
+      },
+      {
+        "excluded_day": "2026-10-02",
+        "n": 6,
+        "net_er": -0.6943088517886259,
+        "net_pf": 0.3630804515916866
+      }
+    ],
+    "days": [
+      {
+        "day": "2026-10-01",
+        "n": 6,
+        "net_er": -0.6943088517886259,
+        "net_pf": 0.3630804515916866,
+        "net_total_r": -4.165853110731756
+      },
+      {
+        "day": "2026-10-02",
+        "n": 3,
+        "net_er": 1.312050055596368,
+        "net_pf": 3.8682192222634493,
+        "net_total_r": 3.9361501667891035
+      }
+    ]
+  },
+  "symbol_concentration": {
+    "exclude_top1": {
+      "n": 6,
+      "net_er": -0.7101247588003755,
+      "net_pf": 0.35788799222621254
+    },
+    "exclude_top3": {
+      "n": 4,
+      "net_er": -1.3335055773833513,
+      "net_pf": 0.0
+    },
+    "top_symbols": [
+      {
+        "symbol": "ENAUSDT",
+        "n": 3,
+        "net_er": 1.3436818696198671,
+        "net_total_r": 4.031045608859602
+      },
+      {
+        "symbol": "PUMPFUNUSDT",
+        "n": 1,
+        "net_er": -1.3014999999999988,
+        "net_total_r": -1.3014999999999988
+      },
+      {
+        "symbol": "SUIUSDT",
+        "n": 1,
+        "net_er": 2.3747737567311504,
+        "net_total_r": 2.3747737567311504
+      },
+      {
+        "symbol": "ARBUSDT",
+        "n": 1,
+        "net_er": -1.3157341550887538,
+        "net_total_r": -1.3157341550887538
+      },
+      {
+        "symbol": "ZECUSDT",
+        "n": 1,
+        "net_er": -1.2974865951742638,
+        "net_total_r": -1.2974865951742638
+      },
+      {
+        "symbol": "STXUSDT",
+        "n": 1,
+        "net_er": -1.3484691600464191,
+        "net_total_r": -1.3484691600464191
+      },
+      {
+        "symbol": "ARKUSDT",
+        "n": 1,
+        "net_er": -1.3723323992239682,
+        "net_total_r": -1.3723323992239682
+      }
+    ]
+  },
+  "costs": {
+    "round_trip_normal": 0.0021000000000000003,
+    "round_trip_elevated": 0.0031000000000000003
+  },
+  "random_seed": 42,
+  "bootstrap_n": 10000
+}
