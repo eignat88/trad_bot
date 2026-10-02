@@ -61,7 +61,7 @@ def _calculate_mfe_mae(
 def _check_tp_sl(
     candles: list[Candle], entry_price: float, stop_price: float,
     target_price: float | None, max_minutes: int, signal_time: datetime,
-    is_short: bool,
+    is_short: bool, intrabar_policy: str = "ORDER_FIRST",
 ) -> dict[str, Any]:
     """Check TP/SL hit sequence with ambiguous intrabar detection."""
     result = {
@@ -98,6 +98,10 @@ def _check_tp_sl(
             result["ambiguous_intrabar"] = True
             result["tp_hit"] = True
             result["sl_hit"] = True
+            if intrabar_policy == "STOP_FIRST":
+                result["sl_before_tp"] = True
+            elif intrabar_policy == "TP_FIRST":
+                result["tp_before_sl"] = True
             if result["time_to_tp"] is None:
                 result["time_to_tp"] = round(candle_minutes, 1)
             if result["time_to_sl"] is None:
@@ -201,6 +205,8 @@ class ProspectiveOOSEvaluator:
 
         risk_1r = abs(entry_price - stop_price) if stop_price else 0
         if risk_1r <= 0:
+            if obs.get("experiment_id") == "VC_SHORT_EXECUTION_V1":
+                return
             risk_1r = entry_price * 0.01
 
         signal_ts = int(signal_time.timestamp() * 1000)
@@ -258,6 +264,7 @@ class ProspectiveOOSEvaluator:
             tp_sl = _check_tp_sl(
                 post_candles, entry_price, stop_price, target_price,
                 frozen_max_hold, signal_time, is_short,
+                intrabar_policy="STOP_FIRST" if obs.get("experiment_id") == "VC_SHORT_EXECUTION_V1" else "ORDER_FIRST",
             )
             updates.update(tp_sl)
             updates["is_final"] = True

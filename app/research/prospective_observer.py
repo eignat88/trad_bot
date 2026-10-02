@@ -183,6 +183,34 @@ class ProspectiveOOSObserver:
         rule_passed = True
         filter_reason = None
 
+        if exp_id == "VC_SHORT_EXECUTION_V1":
+            bb_pct = features.get("bb_width_percentile")
+            if bb_pct is None or float(bb_pct) >= float(exp_spec["threshold"]):
+                return None
+            if direction != "SHORT" or invalidation_price is None or reference_price <= 0:
+                return None
+            if invalidation_price <= reference_price or target_1 is None or target_1 >= reference_price:
+                return None
+            structural_r = abs(reference_price - invalidation_price)
+            execution_features = dict(features)
+            execution_features.update({
+                "_frozen_entry": "reference_price",
+                "_frozen_structural_r": structural_r,
+                "_frozen_structural_r_pct": structural_r / reference_price,
+                "_frozen_sl_r": 1.0,
+                "_frozen_tp_r": abs(reference_price - target_1) / structural_r,
+                "_frozen_max_hold": int(exp_spec["max_hold_minutes"]),
+                "_frozen_intrabar_policy": "STOP_FIRST",
+                "_frozen_freeze_ts": exp_spec["freeze_ts"],
+            })
+            return self._insert_observation(
+                cursor, exp_id, source_key, symbol, direction, signal_time,
+                reference_price, invalidation_price, target_1, target_2, score,
+                True, "vc_bb_width_execution_geometry_frozen",
+                reference_price, invalidation_price, target_1,
+                execution_features, parameters, market_regime,
+            )
+
         if exp_id == "VC_SHORT_BB_WIDTH_V1":
             bb_pct = features.get("bb_width_percentile")
             if bb_pct is not None:
@@ -247,6 +275,41 @@ class ProspectiveOOSObserver:
         if row:
             return row[0]
         return None
+
+    @staticmethod
+    def _insert_observation(
+        cursor, exp_id: str, source_key: int, symbol: str, direction: str,
+        signal_time: Any, reference_price: float,
+        invalidation_price: float | None, target_1: float | None,
+        target_2: float | None, score: float, rule_passed: bool,
+        filter_reason: str, variant_entry: float, variant_stop: float,
+        variant_target: float, features: dict, parameters: dict,
+        market_regime: str | None,
+    ) -> int | None:
+        cursor.execute(
+            """
+            INSERT INTO research.prospective_observation (
+                experiment_id, source_signal_id, source_observation_id,
+                symbol, direction, signal_time,
+                reference_price, invalidation_price, target_1, target_2,
+                score, rule_passed, filter_reason,
+                variant_entry, variant_stop, variant_target,
+                features, parameters, market_regime
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (experiment_id, source_signal_id) DO NOTHING
+            RETURNING observation_id
+            """,
+            (
+                exp_id, source_key, None,
+                symbol, direction, signal_time,
+                reference_price, invalidation_price, target_1, target_2,
+                score, rule_passed, filter_reason,
+                variant_entry, variant_stop, variant_target,
+                json.dumps(features), json.dumps(parameters), market_regime,
+            ),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
 
     def _observe_me_geometry(
         self, cursor, exp_id: str, exp_spec: dict,
