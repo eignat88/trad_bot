@@ -20,6 +20,11 @@ Source linkage:
   Each prospective observation is immediately promoted to research_signal
   via the dedicated research repository.  The research_signal row carries
   a prospective_observation_id column linking back to the source.
+
+Persistence:
+  The observer also respects terminal DB lifecycle states. A registry entry
+  alone is not enough to reactivate an experiment whose DB row is CANCELLED
+  or COMPLETED.
 """
 from __future__ import annotations
 
@@ -55,6 +60,62 @@ class ProspectiveOOSObserver:
         self._registry = registry
         self._research_repo = research_repo
         self._stats: dict[str, int] = {}
+        self._active_cache: dict[str, bool] = {}
+
+    @staticmethod
+    def _active_status(db_status: str | None) -> bool:
+        """Return whether a DB lifecycle state permits prospective capture.
+
+        Terminal states must never be reactivated by registry reload,
+        scanner restart, evaluator restart, or migration/bootstrap logic.
+        """
+        return db_status not in {"CANCELLED", "COMPLETED"}
+
+    @staticmethod
+    def _load_active_registry(registry: dict[str, dict]) -> dict[str, dict]:
+        """Filter out experiment specs that explicitly mark themselves inactive."""
+        active: dict[str, dict] = {}
+        for exp_id, spec in registry.items():
+            if spec.get("status") in {"CANCELLED", "COMPLETED", "INACTIVE"}:
+                continue
+            active[exp_id] = spec
+        return active
+
+    def _is_db_active(self, exp_id: str) -> bool:
+        """Check the experiment's DB lifecycle state before capture."""
+        if self._conn is None:
+            return True
+        if exp_id in self._active_cache:
+            return self._active_cache[exp_id]
+
+        active = True
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT status FROM research.prospective_experiment "
+                "WHERE experiment_id = %s",
+                (exp_id,),
+            )
+            row = cursor.fetchone()
+            if row is not None and row[0] is not None:
+                active = self._active_status(str(row[0]))
+                self._active_cache[exp_id] = active
+                if not active:
+                    logger.info(
+                        "prospective observer: skipping terminal experiment %s (status=%s)",
+                        exp_id, row[0],
+                    )
+        except Exception:
+            # Fail-open on lifecycle lookup errors; terminal persistence remains
+            # protected by registry-level terminal flags and evaluator status checks.
+            logger.debug(
+                "prospective observer: lifecycle lookup failed for %s; registry routing retained",
+                exp_id, exc_info=True,
+            )
+        finally:
+            cursor.close()
+        return active
+
 
     def _make_source_key(
         self, scanner_name: str, symbol: str, direction: str, signal_time: Any,
@@ -94,13 +155,17 @@ class ProspectiveOOSObserver:
         source_key = self._make_source_key(
             scanner_name, symbol, direction, signal_time,
         )
+        active_registry = self._load_active_registry(self._registry)
 
         observation_ids: list[int] = []
         cursor = self._conn.cursor()
         try:
-            for exp_id, exp_spec in self._registry.items():
+            for exp_id, exp_spec in active_registry.items():
                 if exp_spec["scanner_name"] != scanner_name:
                     continue
+                if not self._is_db_active(exp_id):
+                    continue
+
                 # Check direction match: support multi-direction experiments
                 allowed_directions = exp_spec.get("directions")
                 if allowed_directions:
@@ -176,13 +241,18 @@ class ProspectiveOOSObserver:
         self, cursor, exp_id: str, exp_spec: dict,
         source_key: int, symbol: str, direction: str, signal_time: Any,
         reference_price: float, invalidation_price: float | None,
-        target_1: float | None, target_2: float | None,
-        score: float, features: dict, parameters: dict,
-        market_regime: str | None,
+        target_1: float | None, target_2: float | None, score: float,
+        features: dict, parameters: dict, market_regime: str | None,
     ) -> int | None:
         """Insert a standard prospective observation. Returns observation_id or None."""
         rule_passed = True
         filter_reason = None
+        insert_rows = (
+            exp_id, source_key, None, symbol, direction, signal_time,
+            reference_price, invalidation_price, target_1, target_2,
+            score, rule_passed, filter_reason,
+            json.dumps(features), json.dumps(parameters), market_regime,
+        )
 
         if exp_id == "VC_SHORT_EXECUTION_V1":
             freeze_ts = exp_spec["freeze_ts"]
@@ -212,15 +282,14 @@ class ProspectiveOOSObserver:
                 "_frozen_intrabar_policy": "STOP_FIRST",
                 "_frozen_freeze_ts": exp_spec["freeze_ts"],
             })
-            return self._insert_observation(
-                cursor, exp_id, source_key, symbol, direction, signal_time,
-                reference_price, invalidation_price, target_1, target_2, score,
-                True, "vc_bb_width_execution_geometry_frozen",
-                reference_price, invalidation_price, target_1,
-                execution_features, parameters, market_regime,
+            insert_rows = (
+                exp_id, source_key, None, symbol, direction, signal_time,
+                reference_price, invalidation_price, target_1, target_2,
+                score, True, "vc_bb_width_execution_geometry_frozen",
+                json.dumps(execution_features), json.dumps(parameters), market_regime,
             )
 
-        if exp_id == "VC_SHORT_BB_WIDTH_V1":
+        elif exp_id == "VC_SHORT_BB_WIDTH_V1":
             bb_pct = features.get("bb_width_percentile")
             if bb_pct is not None:
                 threshold = exp_spec.get("threshold")
@@ -234,6 +303,12 @@ class ProspectiveOOSObserver:
         elif exp_id in ("LR_SHORT_GATE_V1", "LR_LONG_GATE_V1"):
             rule_passed = True
             filter_reason = "observational_gate_validation"
+            insert_rows = (
+                exp_id, source_key, None, symbol, direction, signal_time,
+                reference_price, invalidation_price, target_1, target_2,
+                score, rule_passed, filter_reason,
+                json.dumps(features), json.dumps(parameters), market_regime,
+            )
 
         elif exp_id == "BREAKOUT_RETEST_LONG_EXPECTANCY_REJECT_OOS_V1":
             rule_passed = True
@@ -241,7 +316,12 @@ class ProspectiveOOSObserver:
             features_with_expectancy = dict(features)
             features_with_expectancy["_expectancy_rejection_oos"] = True
             features_with_expectancy["_rejection_reason"] = "profit_factor_below_threshold"
-            features = features_with_expectancy
+            insert_rows = (
+                exp_id, source_key, None, symbol, direction, signal_time,
+                reference_price, invalidation_price, target_1, target_2,
+                score, rule_passed, filter_reason,
+                json.dumps(features_with_expectancy), json.dumps(parameters), market_regime,
+            )
 
         elif exp_id == "FVG_REACTION_LONG_EXPECTANCY_REJECT_OOS_V1":
             rule_passed = True
@@ -249,7 +329,12 @@ class ProspectiveOOSObserver:
             features_with_expectancy = dict(features)
             features_with_expectancy["_expectancy_rejection_oos"] = True
             features_with_expectancy["_rejection_reason"] = "negative_historical_performance"
-            features = features_with_expectancy
+            insert_rows = (
+                exp_id, source_key, None, symbol, direction, signal_time,
+                reference_price, invalidation_price, target_1, target_2,
+                score, rule_passed, filter_reason,
+                json.dumps(features_with_expectancy), json.dumps(parameters), market_regime,
+            )
 
         elif exp_id == "TREND_PULLBACK_V3_HIGH_VOL_OOS_V1":
             rule_passed = True
@@ -258,7 +343,12 @@ class ProspectiveOOSObserver:
             features_with_regime["_regime_counterfactual_oos"] = True
             features_with_regime["_actual_regime"] = market_regime
             features_with_regime["_required_regime"] = "TREND_UP"
-            features = features_with_regime
+            insert_rows = (
+                exp_id, source_key, None, symbol, direction, signal_time,
+                reference_price, invalidation_price, target_1, target_2,
+                score, rule_passed, filter_reason,
+                json.dumps(features_with_regime), json.dumps(parameters), market_regime,
+            )
 
         cursor.execute(
             """
@@ -272,50 +362,7 @@ class ProspectiveOOSObserver:
             ON CONFLICT (experiment_id, source_signal_id) DO NOTHING
             RETURNING observation_id
             """,
-            (
-                exp_id, source_key, None,
-                symbol, direction, signal_time,
-                reference_price, invalidation_price, target_1, target_2,
-                score, rule_passed, filter_reason,
-                json.dumps(features), json.dumps(parameters), market_regime,
-            ),
-        )
-        row = cursor.fetchone()
-        if row:
-            return row[0]
-        return None
-
-    @staticmethod
-    def _insert_observation(
-        cursor, exp_id: str, source_key: int, symbol: str, direction: str,
-        signal_time: Any, reference_price: float,
-        invalidation_price: float | None, target_1: float | None,
-        target_2: float | None, score: float, rule_passed: bool,
-        filter_reason: str, variant_entry: float, variant_stop: float,
-        variant_target: float, features: dict, parameters: dict,
-        market_regime: str | None,
-    ) -> int | None:
-        cursor.execute(
-            """
-            INSERT INTO research.prospective_observation (
-                experiment_id, source_signal_id, source_observation_id,
-                symbol, direction, signal_time,
-                reference_price, invalidation_price, target_1, target_2,
-                score, rule_passed, filter_reason,
-                variant_entry, variant_stop, variant_target,
-                features, parameters, market_regime
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (experiment_id, source_signal_id) DO NOTHING
-            RETURNING observation_id
-            """,
-            (
-                exp_id, source_key, None,
-                symbol, direction, signal_time,
-                reference_price, invalidation_price, target_1, target_2,
-                score, rule_passed, filter_reason,
-                variant_entry, variant_stop, variant_target,
-                json.dumps(features), json.dumps(parameters), market_regime,
-            ),
+            insert_rows,
         )
         row = cursor.fetchone()
         return row[0] if row else None
@@ -324,9 +371,8 @@ class ProspectiveOOSObserver:
         self, cursor, exp_id: str, exp_spec: dict,
         source_key: int, symbol: str, direction: str, signal_time: Any,
         reference_price: float, invalidation_price: float | None,
-        target_1: float | None, target_2: float | None,
-        score: float, features: dict, parameters: dict,
-        market_regime: str | None,
+        target_1: float | None, target_2: float | None, score: float,
+        features: dict, parameters: dict, market_regime: str | None,
     ) -> int | None:
         """Insert ME SHORT geometry variant observation. Returns observation_id or None."""
         if invalidation_price is None or reference_price <= 0:
@@ -395,9 +441,8 @@ class ProspectiveOOSObserver:
         self, cursor, exp_id: str, exp_spec: dict,
         source_key: int, symbol: str, direction: str, signal_time: Any,
         reference_price: float, invalidation_price: float | None,
-        target_1: float | None, target_2: float | None,
-        score: float, features: dict, parameters: dict,
-        market_regime: str | None,
+        target_1: float | None, target_2: float | None, score: float,
+        features: dict, parameters: dict, market_regime: str | None,
     ) -> int | None:
         """Insert SRR OOS exit validation observation with frozen exit geometry.
 

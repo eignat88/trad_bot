@@ -49,9 +49,9 @@ def _make_registry_dict(registry_data):
 def _mock_cursor(insert_return=(42,)):
     cursor = MagicMock()
     if insert_return is None:
-        cursor.fetchone.return_value = None  # conflict → no row
+        cursor.fetchone.side_effect = [("RUNNING",), None]  # lifecycle row, then conflict → no row
     else:
-        cursor.fetchone.return_value = insert_return
+        cursor.fetchone.side_effect = [("RUNNING",), insert_return]  # lifecycle row, then INSERT RETURNING row
     return cursor
 
 
@@ -105,9 +105,11 @@ def _make_observe_kwargs(
 def _get_lr_long_insert_args(conn):
     """Extract the LR_LONG_GATE_V1 INSERT call args."""
     for call in conn.cursor.return_value.execute.call_args_list:
-        args = call[0][1]
-        if args[0] == "LR_LONG_GATE_V1":
-            return args
+        sql = call[0][0] if call[0] else ""
+        if "INSERT INTO research.prospective_observation" in sql:
+            args = call[0][1]
+            if args and args[0] == "LR_LONG_GATE_V1":
+                return args
     pytest.fail("LR_LONG_GATE_V1 INSERT not found")
 
 
@@ -211,10 +213,13 @@ class TestObserverRouting:
         observer.observe(**kwargs)
 
         # LR_LONG_GATE_V1 requires direction=LONG, so no INSERT should happen
-        for call_args in conn.cursor.return_value.execute.call_args_list:
-            args = call_args[0][1]
-            assert args[0] != "LR_LONG_GATE_V1", \
-                "LR SHORT should not create LR_LONG_GATE_V1 observation"
+        # (the loop filters by direction match)
+        for call in conn.cursor.return_value.execute.call_args_list:
+            sql = call[0][0] if call[0] else ""
+            if "INSERT INTO research.prospective_observation" in sql:
+                args = call[0][1]
+                assert args[0] != "LR_LONG_GATE_V1", \
+                    "LR SHORT should not create LR_LONG_GATE_V1 observation"
 
     def test_lr_long_does_not_create_lr_short_observation(self):
         """LR LONG must NOT create LR_SHORT_GATE_V1 observation."""
@@ -227,10 +232,12 @@ class TestObserverRouting:
         observer.observe(**kwargs)
 
         # LR_SHORT_GATE_V1 requires direction=SHORT, so no INSERT should happen
-        for call_args in conn.cursor.return_value.execute.call_args_list:
-            args = call_args[0][1]
-            assert args[0] != "LR_SHORT_GATE_V1", \
-                "LR LONG should not create LR_SHORT_GATE_V1 observation"
+        for call in conn.cursor.return_value.execute.call_args_list:
+            sql = call[0][0] if call[0] else ""
+            if "INSERT INTO research.prospective_observation" in sql:
+                args = call[0][1]
+                assert args[0] != "LR_SHORT_GATE_V1", \
+                    "LR LONG should not create LR_SHORT_GATE_V1 observation"
 
     def test_filter_reason_observational(self):
         """LR_LONG_GATE_V1 observations must be tagged as observational."""
@@ -256,8 +263,12 @@ class TestObserverRouting:
         kwargs = _make_observe_kwargs()
         observer.observe(**kwargs)
 
-        insert_call = conn.cursor.return_value.execute.call_args_list[0]
-        sql = insert_call[0][0]
+        insert_calls = [
+            c for c in conn.cursor.return_value.execute.call_args_list
+            if "INSERT INTO research.prospective_observation" in str(c)
+        ]
+        assert insert_calls, "No prospective observation INSERT found"
+        sql = insert_calls[0][0][0]
         assert "prospective_observation" in sql
         assert "scanner_setup" not in sql
 
@@ -272,10 +283,12 @@ class TestObserverRouting:
         observer.observe(**kwargs)
 
         # Should NOT be in the ME_SHORT_GEOM_ prefix branch
-        for call_args in conn.cursor.return_value.execute.call_args_list:
-            args = call_args[0][1]
-            assert not str(args[0]).startswith("ME_SHORT_GEOM_"), \
-                "LR_LONG_GATE_V1 must not use ME geometry path"
+        for call in conn.cursor.return_value.execute.call_args_list:
+            sql = call[0][0] if call[0] else ""
+            if "INSERT INTO research.prospective_observation" in sql:
+                args = call[0][1]
+                assert not str(args[0]).startswith("ME_SHORT_GEOM_"), \
+                    "LR_LONG_GATE_V1 must not use ME geometry path"
 
 
 # ════════════════════════════════════════════════════════════════
