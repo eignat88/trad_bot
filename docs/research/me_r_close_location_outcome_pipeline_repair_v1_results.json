@@ -1,0 +1,43 @@
+{
+  "experiment_id": "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1",
+  "legacy_signals": 422,
+  "legacy_outcomes_before": 0,
+  "symbols": 54,
+  "oos_days": 9,
+  "root_cause": "MERLongCLoOosEvaluator constructor argument order defect: scanner_runner.py calls MERLongCLoOosEvaluator(client, repo) but __init__ expects (repo, client)",
+  "secondary_causes": [
+    "Migration 054 not applied on VPS (experiment not registered in research.prospective_experiment)",
+    "No registry entry in app/research/prospective_registry.json",
+    "atr column NULL for all 422 signals (scanner never populated it)",
+    "Evaluator uses hardcoded 2.5% risk proxy instead of actual invalidation distance"
+  ],
+  "hypothesis_still_active": true,
+  "decision": "REPAIR_AND_CONTINUE",
+  "repair_performed": true,
+  "repair_changes": [
+    "scanner_runner.py:372 — fixed constructor argument order: MERLongCLoOosEvaluator(repo, client)",
+    "Applied sql/migrations/054_me_r_long_close_location_oos_prospective_recovery.sql on VPS",
+    "Added registry entry to app/research/prospective_registry.json"
+  ],
+  "tests_passed": "7/7 (test_me_r_long_close_location_oos_evaluator.py)",
+  "production_verification_performed": false,
+  "production_verification_note": "Scanner restart required to load corrected code; outcomes expected on next evaluator cycle",
+  "outcomes_after_verification": null,
+  "backfill_decision": "SAFE_TO_BACKFILL",
+  "backfill_details": {
+    "mature_signals_eligible": 391,
+    "pre_fix_signals": 62,
+    "post_fix_signals": 360,
+    "threshold_ge_070_signals": 8,
+    "dedup_fix_cutoff": "2026-09-25 14:57:00+00"
+  },
+  "research_edge_evaluated": false,
+  "threshold_close_location_070_evaluated": false,
+  "vps_head": "e1bd5df201b4063a4535ee1d053cfc5deb43d1ad",
+  "audit_cutoff": "2026-10-02 15:43:00+00",
+  "signal_schema_sufficient": true,
+  "candle_provider_available": true,
+  "outcome_semantics_defined": true,
+  "outcome_horizons": [15, 30, 60, 120, 240],
+  "risk_model": "hardcoded 2.5% proxy (approximate; atr=NULL in signal table)"
+}
