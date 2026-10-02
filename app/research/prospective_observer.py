@@ -61,6 +61,7 @@ class ProspectiveOOSObserver:
         self._research_repo = research_repo
         self._stats: dict[str, int] = {}
         self._active_cache: dict[str, bool] = {}
+        self._closed_directions_cache: dict[str, set[str]] = {}
 
     @staticmethod
     def _active_status(db_status: str | None) -> bool:
@@ -69,7 +70,7 @@ class ProspectiveOOSObserver:
         Terminal states must never be reactivated by registry reload,
         scanner restart, evaluator restart, or migration/bootstrap logic.
         """
-        return db_status not in {"CANCELLED", "COMPLETED"}
+        return db_status not in {"CANCELLED", "COMPLETED", "CLOSED_NEGATIVE"}
 
     @staticmethod
     def _load_active_registry(registry: dict[str, dict]) -> dict[str, dict]:
@@ -115,6 +116,46 @@ class ProspectiveOOSObserver:
         finally:
             cursor.close()
         return active
+
+    def _is_direction_active(self, exp_id: str, direction: str) -> bool:
+        """Check the direction-level DB lifecycle state before capture.
+
+        Returns True when no direction-level override exists, preserving
+        backward compatibility. Terminal direction states block NEW capture
+        for that direction only.
+        """
+        if self._conn is None:
+            return True
+
+        if exp_id not in self._closed_directions_cache:
+            closed: set[str] = set()
+            cursor = self._conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT direction, status FROM research.prospective_experiment_direction_state "
+                    "WHERE experiment_id = %s",
+                    (exp_id,),
+                )
+                for row in cursor.fetchall():
+                    if row[1] in {"CANCELLED", "COMPLETED", "CLOSED_NEGATIVE"}:
+                        closed.add(row[0])
+                self._closed_directions_cache[exp_id] = closed
+                if closed:
+                    logger.info(
+                        "prospective observer: closed directions for %s: %s",
+                        exp_id, sorted(closed),
+                    )
+            except Exception:
+                self._closed_directions_cache[exp_id] = set()
+                logger.debug(
+                    "prospective observer: direction lifecycle lookup failed for %s; "
+                    "falling back to experiment-level status",
+                    exp_id, exc_info=True,
+                )
+            finally:
+                cursor.close()
+
+        return direction not in self._closed_directions_cache[exp_id]
 
 
     def _make_source_key(
@@ -164,6 +205,12 @@ class ProspectiveOOSObserver:
                 if exp_spec["scanner_name"] != scanner_name:
                     continue
                 if not self._is_db_active(exp_id):
+                    continue
+                if not self._is_direction_active(exp_id, direction):
+                    logger.info(
+                        "prospective observer: skipping closed direction %s for %s",
+                        direction, exp_id,
+                    )
                     continue
 
                 # Check direction match: support multi-direction experiments
