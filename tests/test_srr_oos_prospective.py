@@ -51,9 +51,11 @@ def _make_registry_dict(registry_data):
 def _mock_cursor(insert_return=(42,)):
     cursor = MagicMock()
     if insert_return is None:
-        cursor.fetchone.return_value = None  # conflict → no row
+        # lifecycle rows for each matching experiment, then conflict → no row
+        cursor.fetchone.side_effect = [("RUNNING",), None, None]
     else:
-        cursor.fetchone.return_value = insert_return
+        # lifecycle rows for each matching experiment, then INSERT RETURNING rows
+        cursor.fetchone.side_effect = [("RUNNING",), insert_return, insert_return]
     return cursor
 
 
@@ -70,9 +72,11 @@ def _get_srr_oos_insert_args(conn):
     specific call for our experiment (the second SRR INSERT).
     """
     for call in conn.cursor.return_value.execute.call_args_list:
-        args = call[0][1]
-        if args[0] == "SRR_OOS_SCANNER_V1_PROSPECTIVE":
-            return args
+        sql = call[0][0] if call[0] else ""
+        if "INSERT INTO research.prospective_observation" in sql:
+            args = call[0][1]
+            if args and args[0] == "SRR_OOS_SCANNER_V1_PROSPECTIVE":
+                return args
     pytest.fail("SRR_OOS_SCANNER_V1_PROSPECTIVE INSERT not found")
 
 
@@ -190,7 +194,16 @@ class TestShortExitCalculation:
         )
         observer.observe(**kwargs)
 
-        insert_call = conn.cursor.return_value.execute.call_args_list[0]
+        # Find the SRR_OOS_SCANNER_V1_PROSPECTIVE INSERT call
+        insert_call = None
+        for call in conn.cursor.return_value.execute.call_args_list:
+            sql = call[0][0] if call[0] else ""
+            if "INSERT INTO research.prospective_observation" in sql:
+                args = call[0][1]
+                if args and args[0] == "SRR_OOS_SCANNER_V1_PROSPECTIVE":
+                    insert_call = call
+                    break
+        assert insert_call is not None, "SRR_OOS_SCANNER_V1_PROSPECTIVE INSERT not found"
         args = insert_call[0][1]
         variant_stop = args[13]
         variant_target = args[14]
@@ -416,8 +429,12 @@ class TestObserveOnlySafety:
         kwargs = _make_observe_kwargs(direction="LONG")
         observer.observe(**kwargs)
 
-        insert_call = conn.cursor.return_value.execute.call_args_list[0]
-        sql = insert_call[0][0]
+        insert_calls = [
+            c for c in conn.cursor.return_value.execute.call_args_list
+            if "INSERT INTO research.prospective_observation" in str(c)
+        ]
+        assert insert_calls, "No observation INSERT found"
+        sql = insert_calls[0][0][0]
         assert "prospective_observation" in sql
         assert "scanner_setup" not in sql
 
@@ -502,6 +519,7 @@ class TestRestartIdempotence:
 
         # On conflict, fetchrow returns None → no observation_ids added
         assert result == []
+        assert len(result) == 0
 
     def test_prospective_observer_uses_on_conflict(self):
         """INSERT uses ON CONFLICT DO NOTHING for dedup."""
@@ -529,8 +547,12 @@ class TestBothDirections:
         assert len(result) >= 1
 
         # Verify direction in INSERT args
-        insert_call = conn.cursor.return_value.execute.call_args_list[0]
-        args = insert_call[0][1]
+        insert_calls = [
+            c for c in conn.cursor.return_value.execute.call_args_list
+            if "INSERT INTO research.prospective_observation" in str(c)
+        ]
+        assert insert_calls, "No observation INSERT found"
+        args = insert_calls[0][0][1]
         assert args[4] == "LONG"  # direction column
 
     def test_short_creates_observation(self):
@@ -544,8 +566,12 @@ class TestBothDirections:
         result = observer.observe(**kwargs)
         assert len(result) >= 1
 
-        insert_call = conn.cursor.return_value.execute.call_args_list[0]
-        args = insert_call[0][1]
+        insert_calls = [
+            c for c in conn.cursor.return_value.execute.call_args_list
+            if "INSERT INTO research.prospective_observation" in str(c)
+        ]
+        assert insert_calls, "No observation INSERT found"
+        args = insert_calls[0][0][1]
         assert args[4] == "SHORT"
 
     def test_registry_has_both_directions(self):
@@ -615,7 +641,10 @@ class TestStructuralR:
             direction="LONG", reference_price=100.0, invalidation_price=100.0,
         )
         result = observer.observe(**kwargs)
+        # On conflict, fetchrow returns None → no observation_ids added
         assert result == []
+        assert len(result) == 0
+
 
 
 # ════════════════════════════════════════════════════════════════

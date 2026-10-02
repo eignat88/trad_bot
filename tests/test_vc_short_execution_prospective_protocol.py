@@ -10,13 +10,19 @@ class FakeCursor:
         self.row = row
         self.sql = None
         self.params = None
+        self.history = []
 
     def execute(self, sql, params):
-        self.sql = sql
-        self.params = params
+        self.history.append((sql, params))
+        if "INSERT INTO research.prospective_observation" in sql:
+            self.sql = sql
+            self.params = params
 
     def fetchone(self):
         return self.row
+
+    def close(self):
+        pass
 
 
 class Cursor(FakeCursor):
@@ -87,11 +93,14 @@ def test_invalid_geometry_rejected_and_sl_tp_exact():
 
     conn = Cursor()
     observe(conn)
-    assert conn.params[13] == 100.0
-    assert conn.params[14] == 101.0
-    assert conn.params[15] == 98.0
-    features = __import__("json").loads(conn.params[16])
+    # INSERT params: [12]=filter_reason, [13]=features JSON, [14]=parameters, [15]=market_regime
+    # The frozen SL/TP/structural-R values are embedded in the features JSON.
+    assert conn.params[12] == "vc_bb_width_execution_geometry_frozen"
+    features = __import__("json").loads(conn.params[13])
     assert features["_frozen_structural_r"] == 1.0
+    assert features["_frozen_sl_r"] == 1.0
+    assert features["_frozen_tp_r"] == 2.0
+
 
 
 def test_dedup_key_and_stop_first_timeout_cost_semantics():

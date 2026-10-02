@@ -61,6 +61,23 @@ def _mock_conn_with_cursor():
     return conn, cursor
 
 
+def _mock_conn_for_observer(insert_return=(1,)):
+    """Build conn/cursor for ProspectiveOOSObserver.observe() calls.
+
+    fetchone call order: lifecycle SELECT row, then INSERT RETURNING row.
+    """
+    conn = MagicMock()
+    cursor = MagicMock()
+    conn.cursor.return_value = cursor
+    results = [("RUNNING",)]  # lifecycle SELECT row
+    if insert_return is not None:
+        results.append(insert_return)  # INSERT RETURNING row
+    else:
+        results.append(None)
+    cursor.fetchone.side_effect = results
+    return conn, cursor
+
+
 # ── A. observation → research_signal created ────────────────
 
 
@@ -164,8 +181,7 @@ class TestIdempotency:
 
 class TestPromotedCounterAccuracy:
     def test_promoted_incremented_on_success(self):
-        p_conn, p_cursor = _mock_conn_with_cursor()
-        p_cursor.fetchone.side_effect = [(1,)]  # RETURNING observation_id
+        p_conn, p_cursor = _mock_conn_for_observer(insert_return=(1,))
         p_cursor.rowcount = 1
 
         r_conn, r_cursor = _mock_conn_with_cursor()
@@ -186,8 +202,7 @@ class TestPromotedCounterAccuracy:
         assert observer.stats.get("promoted", 0) >= 1
 
     def test_promote_error_tracked(self):
-        p_conn, p_cursor = _mock_conn_with_cursor()
-        p_cursor.fetchone.side_effect = [(1,)]  # RETURNING observation_id
+        p_conn, p_cursor = _mock_conn_for_observer(insert_return=(1,))
         p_cursor.rowcount = 1
 
         research_repo = MagicMock()
@@ -211,8 +226,7 @@ class TestPromotedCounterAccuracy:
 
 class TestAdapterFailure:
     def test_no_research_repo_skips_promotion(self):
-        p_conn, p_cursor = _mock_conn_with_cursor()
-        p_cursor.fetchone.side_effect = [(1,)]  # RETURNING observation_id
+        p_conn, p_cursor = _mock_conn_for_observer(insert_return=(1,))
         p_cursor.rowcount = 1
 
         observer = ProspectiveOOSObserver(p_conn, _make_registry(), research_repo=None)
@@ -240,8 +254,7 @@ class TestNewExperimentAdapters:
         ("TREND_PULLBACK_V3", "LONG", "TREND_PULLBACK_V3_HIGH_VOL_OOS_V1"),
     ])
     def test_creates_observation_and_promotes(self, scanner_name, direction, exp_id):
-        p_conn, p_cursor = _mock_conn_with_cursor()
-        p_cursor.fetchone.side_effect = [(1,)]  # RETURNING observation_id
+        p_conn, p_cursor = _mock_conn_for_observer(insert_return=(1,))
 
         r_conn, r_cursor = _mock_conn_with_cursor()
         r_cursor.fetchone.side_effect = [_make_observation_row(exp_id=exp_id), None]

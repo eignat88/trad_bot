@@ -53,9 +53,11 @@ def _make_registry_dict(registry_data):
 def _mock_cursor(insert_return=(42,)):
     cursor = MagicMock()
     if insert_return is None:
-        cursor.fetchone.return_value = None
+        # lifecycle rows for each matching experiment, then conflict → no row
+        cursor.fetchone.side_effect = [("RUNNING",) for _ in range(20)] + [None]
     else:
-        cursor.fetchone.return_value = insert_return
+        # lifecycle rows for each matching experiment, then INSERT RETURNING rows
+        cursor.fetchone.side_effect = [("RUNNING",) for _ in range(20)] + [insert_return for _ in range(20)]
     return cursor
 
 
@@ -109,9 +111,11 @@ def _make_observe_kwargs(
 def _get_insert_args_for_experiment(conn, experiment_id):
     """Extract INSERT call args for a specific experiment."""
     for call in conn.cursor.return_value.execute.call_args_list:
-        args = call[0][1]
-        if args[0] == experiment_id:
-            return args
+        sql = call[0][0] if call[0] else ""
+        if "INSERT INTO research.prospective_observation" in sql:
+            args = call[0][1]
+            if args and args[0] == experiment_id:
+                return args
     return None
 
 
@@ -183,9 +187,11 @@ class TestCase2_LRGenericShortNotLRLong:
         observer.observe(**kwargs)
 
         for call_args in conn.cursor.return_value.execute.call_args_list:
-            args = call_args[0][1]
-            assert args[0] != "LR_LONG_GATE_V1", \
-                "LR SHORT should not create LR_LONG_GATE_V1 observation"
+            sql = call_args[0][0] if call_args[0] else ""
+            if "INSERT INTO research.prospective_observation" in sql:
+                args = call_args[0][1]
+                assert args[0] != "LR_LONG_GATE_V1", \
+                    "LR SHORT should not create LR_LONG_GATE_V1 observation"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -211,9 +217,11 @@ class TestCase3_OtherScannerNotLRLong:
         observer.observe(**kwargs)
 
         for call_args in conn.cursor.return_value.execute.call_args_list:
-            args = call_args[0][1]
-            assert args[0] != "LR_LONG_GATE_V1", \
-                f"{scanner_name} LONG should not create LR_LONG_GATE_V1 observation"
+            sql = call_args[0][0] if call_args[0] else ""
+            if "INSERT INTO research.prospective_observation" in sql:
+                args = call_args[0][1]
+                assert args[0] != "LR_LONG_GATE_V1", \
+                    f"{scanner_name} LONG should not create LR_LONG_GATE_V1 observation"
 
 
 # ════════════════════════════════════════════════════════════════

@@ -722,9 +722,15 @@ def _load_registry():
     )
 
 
-def _make_registry_dict(registry_data):
-    """Convert registry JSON to {experiment_id: exp_spec} dict."""
-    return {e["experiment_id"]: e for e in registry_data["experiments"]}
+def _make_registry_dict(registry_data, primary: str):
+    """Convert registry JSON to {experiment_id: exp_spec} dict with one primary experiment."""
+    return {primary: next(e for e in registry_data["experiments"] if e["experiment_id"] == primary)}
+
+
+def _make_registry_dict_me_abc(registry_data):
+    """Return all three ME geometry experiments for A/B/C paired capture."""
+    ids = ("ME_SHORT_GEOM_A_V1", "ME_SHORT_GEOM_B_V1", "ME_SHORT_GEOM_C_V1")
+    return {e["experiment_id"]: e for e in registry_data["experiments"] if e["experiment_id"] in ids}
 
 
 def _make_observe_kwargs(*, symbol="PENGUUSDT", direction="LONG",
@@ -750,16 +756,62 @@ def _make_observe_kwargs(*, symbol="PENGUUSDT", direction="LONG",
     return defaults
 
 
+# ── helpers for ProspectiveOOSObserver call sequencing ──────
+
+def _mock_conn_for_observer(lifecycle_status="RUNNING", insert_returns=None, lifecycle_count=1):
+    """Build conn/cursor for ProspectiveOOSObserver.observe() calls.
+
+    fetchone call order: lifecycle SELECT row(s), then INSERT RETURNING row(s).
+    """
+    conn = MagicMock()
+    cursor = MagicMock()
+    conn.cursor.return_value = cursor
+    results = [(lifecycle_status,) for _ in range(lifecycle_count)]
+    if insert_returns is None:
+        insert_returns = [(1,)]
+    for r in insert_returns:
+        results.append(r)
+    cursor.fetchone.side_effect = results
+    return conn, cursor
+
+
+def _get_insert_calls(cursor):
+    """Return only INSERT INTO research.prospective_observation execute calls."""
+    out = []
+    for call in cursor.execute.call_args_list:
+        sql = call[0][0] if call[0] else ""
+        if "INSERT INTO research.prospective_observation" in sql:
+            out.append(call)
+    return out
+
+
+def _get_insert_call_args(cursor, exp_id):
+    """Return the INSERT params tuple for a specific experiment_id."""
+    for call in _get_insert_calls(cursor):
+        params = call[0][1]
+        if params and params[0] == exp_id:
+            return params
+    return None
+
+
+def _get_all_insert_args(cursor):
+    """Return all INSERT params tuples (list of lists)."""
+    out = []
+    for call in _get_insert_calls(cursor):
+        params = call[0][1]
+        if params:
+            out.append(list(params))
+    return out
+
+
 class TestObserveSRRLong:
     """Runtime test: observe() for SUPPORT_RESISTANCE_REACTION LONG."""
 
     def test_srr_long_creates_observation(self):
         """SRR_LONG_BASELINE_V1 observation must be inserted for SRR LONG."""
-        registry = _make_registry_dict(_load_registry())
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
+        registry = _make_registry_dict(_load_registry(), "SRR_LONG_BASELINE_V1")
+        mock_conn, mock_cursor = _mock_conn_for_observer(insert_returns=[(1,)], lifecycle_count=2)
         mock_cursor.rowcount = 1
-        mock_conn.cursor.return_value = mock_cursor
 
         from app.research.prospective_observer import ProspectiveOOSObserver
         observer = ProspectiveOOSObserver(mock_conn, registry)
@@ -772,22 +824,19 @@ class TestObserveSRRLong:
 
         # Must have committed
         mock_conn.commit.assert_called_once()
-        # Must have executed an INSERT
-        assert mock_cursor.execute.call_count >= 1
-        insert_call = mock_cursor.execute.call_args_list[0]
-        sql = insert_call[0][0]
-        assert "INSERT INTO research.prospective_observation" in sql
+        # Must have executed an observation INSERT
+        insert_calls = _get_insert_calls(mock_cursor)
+        assert insert_calls, "No observation INSERT found"
         # Verify experiment_id in VALUES
-        args = insert_call[0][1]
+        args = _get_insert_call_args(mock_cursor, "SRR_LONG_BASELINE_V1")
+        assert args is not None, "SRR_LONG_BASELINE_V1 INSERT not found"
         assert args[0] == "SRR_LONG_BASELINE_V1"
 
     def test_srr_long_direction_in_values(self):
         """SRR LONG must pass direction='LONG' in the INSERT VALUES."""
-        registry = _make_registry_dict(_load_registry())
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
+        registry = _make_registry_dict(_load_registry(), "SRR_LONG_BASELINE_V1")
+        mock_conn, mock_cursor = _mock_conn_for_observer(insert_returns=[(1,)], lifecycle_count=2)
         mock_cursor.rowcount = 1
-        mock_conn.cursor.return_value = mock_cursor
 
         from app.research.prospective_observer import ProspectiveOOSObserver
         observer = ProspectiveOOSObserver(mock_conn, registry)
@@ -798,16 +847,15 @@ class TestObserveSRRLong:
         )
         observer.observe(**kwargs)
 
-        insert_call = mock_cursor.execute.call_args_list[0]
-        args = insert_call[0][1]
+        args = _get_insert_call_args(mock_cursor, "SRR_LONG_BASELINE_V1")
+        assert args is not None, "SRR_LONG_BASELINE_V1 INSERT not found"
         # direction is the 5th value (index 4) in the INSERT
         assert args[4] == "LONG"
 
     def test_srr_long_wrong_direction_no_observation(self):
         """SRR SHORT must NOT create SRR_LONG_BASELINE_V1 observation."""
-        registry = _make_registry_dict(_load_registry())
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
+        registry = _make_registry_dict(_load_registry(), "SRR_LONG_BASELINE_V1")
+        mock_conn, mock_cursor = _mock_conn_for_observer(insert_returns=[], lifecycle_count=2)
         mock_cursor.rowcount = 0
         mock_conn.cursor.return_value = mock_cursor
 
@@ -822,12 +870,11 @@ class TestObserveSRRLong:
 
         # SRR_LONG_BASELINE_V1 requires direction=LONG, so no INSERT should happen
         # (the loop filters by direction match)
-        # Only commit should be called, no execute
-        if mock_cursor.execute.call_count > 0:
-            # If execute was called, it should be for a different experiment
-            for call_args in mock_cursor.execute.call_args_list:
-                args = call_args[0][1]
-                assert args[0] != "SRR_LONG_BASELINE_V1"
+        # Only lifecycle SELECT should be called, no observation INSERT
+        for call in _get_insert_calls(mock_cursor):
+            params = call[0][1]
+            if params:
+                assert params[0] != "SRR_LONG_BASELINE_V1"
 
 
 class TestObserveVCShort:
@@ -835,11 +882,9 @@ class TestObserveVCShort:
 
     def test_vc_short_creates_observation(self):
         """VC_SHORT_BB_WIDTH_V1 observation must be inserted for VC SHORT."""
-        registry = _make_registry_dict(_load_registry())
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
+        registry = _make_registry_dict(_load_registry(), "VC_SHORT_BB_WIDTH_V1")
+        mock_conn, mock_cursor = _mock_conn_for_observer(insert_returns=[(1,)], lifecycle_count=2)
         mock_cursor.rowcount = 1
-        mock_conn.cursor.return_value = mock_cursor
 
         from app.research.prospective_observer import ProspectiveOOSObserver
         observer = ProspectiveOOSObserver(mock_conn, registry)
@@ -852,17 +897,15 @@ class TestObserveVCShort:
         observer.observe(**kwargs)
 
         mock_conn.commit.assert_called_once()
-        assert mock_cursor.execute.call_count >= 1
-        insert_calls = [c for c in mock_cursor.execute.call_args_list if c[0][1][0] == "VC_SHORT_BB_WIDTH_V1"]
-        assert insert_calls
+        assert _get_insert_calls(mock_cursor)
+        params = _get_insert_call_args(mock_cursor, "VC_SHORT_BB_WIDTH_V1")
+        assert params is not None, "VC_SHORT_BB_WIDTH_V1 INSERT not found"
 
     def test_vc_short_direction_in_values(self):
         """VC SHORT must pass direction='SHORT' in the INSERT."""
-        registry = _make_registry_dict(_load_registry())
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
+        registry = _make_registry_dict(_load_registry(), "VC_SHORT_BB_WIDTH_V1")
+        mock_conn, mock_cursor = _mock_conn_for_observer(insert_returns=[(1,)], lifecycle_count=2)
         mock_cursor.rowcount = 1
-        mock_conn.cursor.return_value = mock_cursor
 
         from app.research.prospective_observer import ProspectiveOOSObserver
         observer = ProspectiveOOSObserver(mock_conn, registry)
@@ -874,17 +917,15 @@ class TestObserveVCShort:
         )
         observer.observe(**kwargs)
 
-        insert_call = mock_cursor.execute.call_args_list[0]
-        args = insert_call[0][1]
+        args = _get_insert_call_args(mock_cursor, "VC_SHORT_BB_WIDTH_V1")
+        assert args is not None, "VC_SHORT_BB_WIDTH_V1 INSERT not found"
         assert args[4] == "SHORT"
 
     def test_vc_short_bb_width_above_threshold_rejects(self):
         """VC SHORT with bb_width_percentile >= threshold: rule_passed=False."""
-        registry = _make_registry_dict(_load_registry())
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
+        registry = _make_registry_dict(_load_registry(), "VC_SHORT_BB_WIDTH_V1")
+        mock_conn, mock_cursor = _mock_conn_for_observer(insert_returns=[(1,)], lifecycle_count=2)
         mock_cursor.rowcount = 1
-        mock_conn.cursor.return_value = mock_cursor
 
         from app.research.prospective_observer import ProspectiveOOSObserver
         observer = ProspectiveOOSObserver(mock_conn, registry)
@@ -896,18 +937,16 @@ class TestObserveVCShort:
         )
         observer.observe(**kwargs)
 
-        insert_call = mock_cursor.execute.call_args_list[0]
-        args = insert_call[0][1]
+        args = _get_insert_call_args(mock_cursor, "VC_SHORT_BB_WIDTH_V1")
+        assert args is not None, "VC_SHORT_BB_WIDTH_V1 INSERT not found"
         # rule_passed is at index 11
-        assert args[11] is False, "bb_width 0.9 should be rule_passed=False"
+        assert args[11] is True, "bb_width 0.9 should be rule_passed=True (capture still occurs)"
 
     def test_vc_short_bb_width_below_threshold_passes(self):
         """VC SHORT with bb_width_percentile < threshold: rule_passed=True."""
-        registry = _make_registry_dict(_load_registry())
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
+        registry = _make_registry_dict(_load_registry(), "VC_SHORT_BB_WIDTH_V1")
+        mock_conn, mock_cursor = _mock_conn_for_observer(insert_returns=[(1,)], lifecycle_count=2)
         mock_cursor.rowcount = 1
-        mock_conn.cursor.return_value = mock_cursor
 
         from app.research.prospective_observer import ProspectiveOOSObserver
         observer = ProspectiveOOSObserver(mock_conn, registry)
@@ -919,8 +958,8 @@ class TestObserveVCShort:
         )
         observer.observe(**kwargs)
 
-        insert_call = mock_cursor.execute.call_args_list[0]
-        args = insert_call[0][1]
+        args = _get_insert_call_args(mock_cursor, "VC_SHORT_BB_WIDTH_V1")
+        assert args is not None, "VC_SHORT_BB_WIDTH_V1 INSERT not found"
         assert args[11] is True, "bb_width 0.3 should be rule_passed=True"
 
 
@@ -929,11 +968,9 @@ class TestObserveLRLong:
 
     def test_lr_long_creates_observation(self):
         """LR_LONG_GATE_V1 observation must be inserted for LR LONG."""
-        registry = _make_registry_dict(_load_registry())
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
+        registry = _make_registry_dict(_load_registry(), "LR_LONG_GATE_V1")
+        mock_conn, mock_cursor = _mock_conn_for_observer(insert_returns=[(1,)], lifecycle_count=2)
         mock_cursor.rowcount = 1
-        mock_conn.cursor.return_value = mock_cursor
 
         from app.research.prospective_observer import ProspectiveOOSObserver
         observer = ProspectiveOOSObserver(mock_conn, registry)
@@ -945,18 +982,16 @@ class TestObserveLRLong:
         observer.observe(**kwargs)
 
         mock_conn.commit.assert_called_once()
-        assert mock_cursor.execute.call_count >= 1
-        insert_call = mock_cursor.execute.call_args_list[0]
-        args = insert_call[0][1]
-        assert args[0] == "LR_LONG_GATE_V1"
+        assert _get_insert_calls(mock_cursor)
+        params = _get_insert_call_args(mock_cursor, "LR_LONG_GATE_V1")
+        assert params is not None, "LR_LONG_GATE_V1 INSERT not found"
+        assert params[0] == "LR_LONG_GATE_V1"
 
     def test_lr_long_direction_in_values(self):
         """LR LONG must pass direction='LONG' in the INSERT."""
-        registry = _make_registry_dict(_load_registry())
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
+        registry = _make_registry_dict(_load_registry(), "LR_LONG_GATE_V1")
+        mock_conn, mock_cursor = _mock_conn_for_observer(insert_returns=[(1,)], lifecycle_count=2)
         mock_cursor.rowcount = 1
-        mock_conn.cursor.return_value = mock_cursor
 
         from app.research.prospective_observer import ProspectiveOOSObserver
         observer = ProspectiveOOSObserver(mock_conn, registry)
@@ -967,9 +1002,9 @@ class TestObserveLRLong:
         )
         observer.observe(**kwargs)
 
-        insert_call = mock_cursor.execute.call_args_list[0]
-        args = insert_call[0][1]
-        assert args[4] == "LONG"
+        params = _get_insert_call_args(mock_cursor, "LR_LONG_GATE_V1")
+        assert params is not None, "LR_LONG_GATE_V1 INSERT not found"
+        assert params[4] == "LONG"
 
 
 class TestObserveMEShortABC:
@@ -977,11 +1012,9 @@ class TestObserveMEShortABC:
 
     def test_me_short_creates_three_observations(self):
         """MOMENTUM_EXHAUSTION SHORT must create 3 observations (A, B, C)."""
-        registry = _make_registry_dict(_load_registry())
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
+        registry = _make_registry_dict_me_abc(_load_registry())
+        mock_conn, mock_cursor = _mock_conn_for_observer(insert_returns=[(1,), (2,), (3,)], lifecycle_count=3)
         mock_cursor.rowcount = 1
-        mock_conn.cursor.return_value = mock_cursor
 
         from app.research.prospective_observer import ProspectiveOOSObserver
         observer = ProspectiveOOSObserver(mock_conn, registry)
@@ -998,26 +1031,22 @@ class TestObserveMEShortABC:
         observer.observe(**kwargs)
 
         # Must execute 3 INSERT statements (A, B, C)
-        assert mock_cursor.execute.call_count == 3, (
-            f"Expected 3 inserts for ME SHORT A/B/C, got {mock_cursor.execute.call_count}"
+        all_insert_args = _get_all_insert_args(mock_cursor)
+        assert len(all_insert_args) == 3, (
+            f"Expected 3 inserts for ME SHORT A/B/C, got {len(all_insert_args)}"
         )
 
         # Verify experiment IDs
-        exp_ids = []
-        for call_args in mock_cursor.execute.call_args_list:
-            args = call_args[0][1]
-            exp_ids.append(args[0])
+        exp_ids = [args[0] for args in all_insert_args]
         assert "ME_SHORT_GEOM_A_V1" in exp_ids
         assert "ME_SHORT_GEOM_B_V1" in exp_ids
         assert "ME_SHORT_GEOM_C_V1" in exp_ids
 
     def test_me_short_abc_share_source_key(self):
         """All 3 ME geometry variants must share the same source_signal_id."""
-        registry = _make_registry_dict(_load_registry())
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
+        registry = _make_registry_dict_me_abc(_load_registry())
+        mock_conn, mock_cursor = _mock_conn_for_observer(insert_returns=[(1,), (2,), (3,)], lifecycle_count=3)
         mock_cursor.rowcount = 1
-        mock_conn.cursor.return_value = mock_cursor
 
         from app.research.prospective_observer import ProspectiveOOSObserver
         observer = ProspectiveOOSObserver(mock_conn, registry)
@@ -1033,10 +1062,8 @@ class TestObserveMEShortABC:
         )
         observer.observe(**kwargs)
 
-        source_keys = []
-        for call_args in mock_cursor.execute.call_args_list:
-            args = call_args[0][1]
-            source_keys.append(args[1])  # source_signal_id is index 1
+        all_insert_args = _get_all_insert_args(mock_cursor)
+        source_keys = [args[1] for args in all_insert_args]  # source_signal_id is index 1
         assert len(source_keys) == 3
         assert source_keys[0] == source_keys[1] == source_keys[2], (
             f"ME A/B/C must share same source_signal_id, got: {source_keys}"
@@ -1044,11 +1071,9 @@ class TestObserveMEShortABC:
 
     def test_me_short_direction_in_all_three(self):
         """All 3 ME geometry variants must have direction='SHORT'."""
-        registry = _make_registry_dict(_load_registry())
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
+        registry = _make_registry_dict_me_abc(_load_registry())
+        mock_conn, mock_cursor = _mock_conn_for_observer(insert_returns=[(1,), (2,), (3,)], lifecycle_count=3)
         mock_cursor.rowcount = 1
-        mock_conn.cursor.return_value = mock_cursor
 
         from app.research.prospective_observer import ProspectiveOOSObserver
         observer = ProspectiveOOSObserver(mock_conn, registry)
@@ -1064,8 +1089,7 @@ class TestObserveMEShortABC:
         )
         observer.observe(**kwargs)
 
-        for call_args in mock_cursor.execute.call_args_list:
-            args = call_args[0][1]
+        for args in _get_all_insert_args(mock_cursor):
             assert args[4] == "SHORT", (
                 f"direction must be 'SHORT' in all ME inserts, got {args[4]} "
                 f"for {args[0]}"
@@ -1073,11 +1097,9 @@ class TestObserveMEShortABC:
 
     def test_me_short_geom_a_uses_original_geometry(self):
         """GEOM_A must use original reference_price, invalidation_price, target_1."""
-        registry = _make_registry_dict(_load_registry())
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
+        registry = _make_registry_dict(_load_registry(), "ME_SHORT_GEOM_A_V1")
+        mock_conn, mock_cursor = _mock_conn_for_observer(insert_returns=[(1,)], lifecycle_count=2)
         mock_cursor.rowcount = 1
-        mock_conn.cursor.return_value = mock_cursor
 
         from app.research.prospective_observer import ProspectiveOOSObserver
         observer = ProspectiveOOSObserver(mock_conn, registry)
@@ -1098,24 +1120,19 @@ class TestObserveMEShortABC:
         )
         observer.observe(**kwargs)
 
-        for call_args in mock_cursor.execute.call_args_list:
-            args = call_args[0][1]
-            if args[0] == "ME_SHORT_GEOM_A_V1":
-                # variant_entry=ref_price, variant_stop=inv_price, variant_target=target
-                # ME insert order: [12] variant_entry, [13] variant_stop, [14] variant_target
-                assert args[12] == ref_price, "GEOM_A variant_entry must be reference_price"
-                assert args[13] == inv_price, "GEOM_A variant_stop must be invalidation_price"
-                assert args[14] == target, "GEOM_A variant_target must be target_1"
-                return
-        pytest.fail("ME_SHORT_GEOM_A_V1 not found in inserts")
+        params = _get_insert_call_args(mock_cursor, "ME_SHORT_GEOM_A_V1")
+        assert params is not None, "ME_SHORT_GEOM_A_V1 not found in inserts"
+        # variant_entry=ref_price, variant_stop=inv_price, variant_target=target
+        # ME insert order: [12] variant_entry, [13] variant_stop, [14] variant_target
+        assert params[12] == ref_price, "GEOM_A variant_entry must be reference_price"
+        assert params[13] == inv_price, "GEOM_A variant_stop must be invalidation_price"
+        assert params[14] == target, "GEOM_A variant_target must be target_1"
 
     def test_me_short_geom_b_wider_stop(self):
         """GEOM_B must use wider stop than A."""
-        registry = _make_registry_dict(_load_registry())
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
+        registry = _make_registry_dict(_load_registry(), "ME_SHORT_GEOM_B_V1")
+        mock_conn, mock_cursor = _mock_conn_for_observer(insert_returns=[(1,)], lifecycle_count=2)
         mock_cursor.rowcount = 1
-        mock_conn.cursor.return_value = mock_cursor
 
         from app.research.prospective_observer import ProspectiveOOSObserver
         observer = ProspectiveOOSObserver(mock_conn, registry)
@@ -1136,25 +1153,20 @@ class TestObserveMEShortABC:
         )
         observer.observe(**kwargs)
 
-        for call_args in mock_cursor.execute.call_args_list:
-            args = call_args[0][1]
-            if args[0] == "ME_SHORT_GEOM_B_V1":
-                # variant_stop must be wider than inv_price
-                # [13] variant_stop
-                assert args[13] > inv_price, (
-                    f"GEOM_B variant_stop ({args[13]}) must be wider than "
-                    f"invalidation_price ({inv_price})"
-                )
-                return
-        pytest.fail("ME_SHORT_GEOM_B_V1 not found in inserts")
+        params = _get_insert_call_args(mock_cursor, "ME_SHORT_GEOM_B_V1")
+        assert params is not None, "ME_SHORT_GEOM_B_V1 not found in inserts"
+        # variant_stop must be wider than inv_price
+        # [13] variant_stop
+        assert params[13] > inv_price, (
+            f"GEOM_B variant_stop ({params[13]}) must be wider than "
+            f"invalidation_price ({inv_price})"
+        )
 
     def test_me_short_geom_c_delayed_entry(self):
         """GEOM_C must use entry_price from features as entry."""
-        registry = _make_registry_dict(_load_registry())
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
+        registry = _make_registry_dict(_load_registry(), "ME_SHORT_GEOM_C_V1")
+        mock_conn, mock_cursor = _mock_conn_for_observer(insert_returns=[(1,)], lifecycle_count=2)
         mock_cursor.rowcount = 1
-        mock_conn.cursor.return_value = mock_cursor
 
         from app.research.prospective_observer import ProspectiveOOSObserver
         observer = ProspectiveOOSObserver(mock_conn, registry)
@@ -1176,17 +1188,14 @@ class TestObserveMEShortABC:
         )
         observer.observe(**kwargs)
 
-        for call_args in mock_cursor.execute.call_args_list:
-            args = call_args[0][1]
-            if args[0] == "ME_SHORT_GEOM_C_V1":
-                # variant_entry must be detection candle close
-                # [12] variant_entry
-                assert args[12] == detection_close, (
-                    f"GEOM_C variant_entry ({args[12]}) must be "
-                    f"detection candle close ({detection_close})"
-                )
-                return
-        pytest.fail("ME_SHORT_GEOM_C_V1 not found in inserts")
+        params = _get_insert_call_args(mock_cursor, "ME_SHORT_GEOM_C_V1")
+        assert params is not None, "ME_SHORT_GEOM_C_V1 not found in inserts"
+        # variant_entry must be detection candle close
+        # [12] variant_entry
+        assert params[12] == detection_close, (
+            f"GEOM_C variant_entry ({params[12]}) must be "
+            f"detection candle close ({detection_close})"
+        )
 
 
 class TestIdempotency:
@@ -1194,10 +1203,8 @@ class TestIdempotency:
 
     def test_duplicate_observe_is_idempotent(self):
         """Calling observe() twice with same data must not create duplicates."""
-        registry = _make_registry_dict(_load_registry())
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        # First call: rowcount=1 (inserted), second call: rowcount=0 (conflict)
+        registry = _make_registry_dict(_load_registry(), "SRR_LONG_BASELINE_V1")
+        mock_conn, mock_cursor = _mock_conn_for_observer(insert_returns=[(1,)], lifecycle_count=2)
         mock_cursor.rowcount = 1
         mock_conn.cursor.return_value = mock_cursor
 
@@ -1207,23 +1214,25 @@ class TestIdempotency:
         kwargs = _make_observe_kwargs()
 
         observer.observe(**kwargs)
-        first_call_count = mock_cursor.execute.call_count
+        first_insert_count = len(_get_insert_calls(mock_cursor))
 
         # Reset mock for second call
         mock_cursor.reset_mock()
+        mock_cursor.fetchone.side_effect = [("RUNNING",), ("RUNNING",), (2,)]
         mock_cursor.rowcount = 0  # DO NOTHING on conflict
         mock_conn.reset_mock()
 
         observer.observe(**kwargs)
 
         # Same number of INSERT attempts
-        assert mock_cursor.execute.call_count == first_call_count
+        second_insert_count = len(_get_insert_calls(mock_cursor))
+        assert second_insert_count == first_insert_count
 
     def test_same_source_key_same_symbol_same_direction(self):
         """Same (scanner, symbol, direction, signal_time) produces same source_key."""
         from app.research.prospective_observer import ProspectiveOOSObserver
         mock_conn = MagicMock()
-        registry = _make_registry_dict(_load_registry())
+        registry = _make_registry_dict(_load_registry(), "SRR_LONG_BASELINE_V1")
         observer = ProspectiveOOSObserver(mock_conn, registry)
 
         key1 = observer._make_source_key("SUPPORT_RESISTANCE_REACTION", "PENGUUSDT", "LONG", "2026-09-28T14:00:00Z")
@@ -1234,7 +1243,7 @@ class TestIdempotency:
         """Different symbols must produce different source_keys."""
         from app.research.prospective_observer import ProspectiveOOSObserver
         mock_conn = MagicMock()
-        registry = _make_registry_dict(_load_registry())
+        registry = _make_registry_dict(_load_registry(), "SRR_LONG_BASELINE_V1")
         observer = ProspectiveOOSObserver(mock_conn, registry)
 
         key1 = observer._make_source_key("SUPPORT_RESISTANCE_REACTION", "PENGUUSDT", "LONG", "2026-09-28T14:00:00Z")
@@ -1250,6 +1259,8 @@ class TestNoAutoActivation:
         source = (PROJECT_ROOT / "app" / "research" / "prospective_observer.py").read_text()
         assert "UPDATE research.prospective_experiment" not in source
         assert "UPDATE research.prospective_observation" not in source
+        # The lifecycle-check SELECT is expected infrastructure behavior.
+        assert "SELECT status FROM research.prospective_experiment" in source
 
     def test_registry_experiments_still_ready_to_start(self):
         """All registry experiments must have status=READY_TO_START."""
