@@ -314,6 +314,11 @@ class ProspectiveOOSEvaluator:
 
         CRITICAL: Only evaluates observations with signal_time >= experiment.started_at.
         Warm-up observations captured before activation are NEVER evaluated.
+
+        Direction-level lifecycle:
+        - Closed directions do NOT receive new observation creation (handled by observer).
+        - Already-created immature observations for closed directions CONTINUE to mature.
+        - Only truly new observations (no outcome row yet) are skipped for closed directions.
         """
         now = datetime.now(timezone.utc)
 
@@ -329,26 +334,74 @@ class ProspectiveOOSEvaluator:
                     "horizons_updated": {}, "finalized": 0, "errors": 0}
         started_at = row[0]
 
+        # Load closed directions for this experiment (if any)
+        closed_directions: set[str] = set()
+        try:
+            cursor.execute(
+                "SELECT direction, status FROM research.prospective_experiment_direction_state "
+                "WHERE experiment_id = %s",
+                (experiment_id,),
+            )
+            for row_dir in cursor.fetchall():
+                if row_dir[1] in {"CANCELLED", "COMPLETED", "CLOSED_NEGATIVE"}:
+                    closed_directions.add(row_dir[0])
+        except Exception:
+            logger.debug(
+                "prospective evaluator: direction lifecycle lookup failed for %s; "
+                "falling back to experiment-level status only",
+                experiment_id, exc_info=True,
+            )
+        finally:
+            cursor.close()
+
         # ONLY observations with signal_time >= started_at are prospective
-        cursor.execute(
-            """
-            SELECT o.observation_id, o.symbol, o.signal_time, o.experiment_id,
-                   o.direction,
-                   o.reference_price, o.invalidation_price, o.target_1, o.target_2,
-                   o.variant_entry, o.variant_stop, o.variant_target,
-                   o.features,
-                   r.evaluated_15m_at, r.evaluated_30m_at, r.evaluated_60m_at,
-                   r.evaluated_120m_at, r.evaluated_240m_at, r.is_final
-            FROM research.prospective_observation o
-            LEFT JOIN research.prospective_outcome r ON r.observation_id = o.observation_id
-            WHERE o.experiment_id = %s
-              AND o.signal_time >= %s
-              AND (r.observation_id IS NULL
-                   OR r.is_final = FALSE)
-            """,
-            (experiment_id, started_at),
-        )
+        # For closed directions: only evaluate observations that ALREADY have an
+        # outcome row (immature = partial horizons, is_final=False). New
+        # observations (no outcome row) for closed directions are excluded —
+        # the observer should not create them, but this is defense in depth.
+        cursor = self._conn.cursor()
+        if closed_directions:
+            direction_filter = " AND NOT (o.direction = ANY(%s) AND r.observation_id IS NULL)"
+            cursor.execute(
+                f"""
+                SELECT o.observation_id, o.symbol, o.signal_time, o.experiment_id,
+                       o.direction,
+                       o.reference_price, o.invalidation_price, o.target_1, o.target_2,
+                       o.variant_entry, o.variant_stop, o.variant_target,
+                       o.features,
+                       r.evaluated_15m_at, r.evaluated_30m_at, r.evaluated_60m_at,
+                       r.evaluated_120m_at, r.evaluated_240m_at, r.is_final
+                FROM research.prospective_observation o
+                LEFT JOIN research.prospective_outcome r ON r.observation_id = o.observation_id
+                WHERE o.experiment_id = %s
+                  AND o.signal_time >= %s
+                  AND (r.observation_id IS NULL
+                       OR r.is_final = FALSE)
+                  {direction_filter}
+                """,
+                (experiment_id, started_at, sorted(closed_directions)),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT o.observation_id, o.symbol, o.signal_time, o.experiment_id,
+                       o.direction,
+                       o.reference_price, o.invalidation_price, o.target_1, o.target_2,
+                       o.variant_entry, o.variant_stop, o.variant_target,
+                       o.features,
+                       r.evaluated_15m_at, r.evaluated_30m_at, r.evaluated_60m_at,
+                       r.evaluated_120m_at, r.evaluated_240m_at, r.is_final
+                FROM research.prospective_observation o
+                LEFT JOIN research.prospective_outcome r ON r.observation_id = o.observation_id
+                WHERE o.experiment_id = %s
+                  AND o.signal_time >= %s
+                  AND (r.observation_id IS NULL
+                       OR r.is_final = FALSE)
+                """,
+                (experiment_id, started_at),
+            )
         eligible = cursor.fetchall()
+        cursor.close()
         self._conn.commit()
 
         stats = {

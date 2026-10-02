@@ -234,6 +234,9 @@ def _load_prospective_experiments(conn) -> list[str]:
 
     Returns experiments with status='RUNNING' AND started_at IS NOT NULL.
     Experiments with started_at=NULL or status != 'RUNNING' are NOT evaluated.
+    Direction-level lifecycle does NOT affect experiment selection — a shared
+    experiment remains in the active list even if some directions are closed,
+    because existing immature outcomes must continue to mature.
     """
     if not conn:
         return []
