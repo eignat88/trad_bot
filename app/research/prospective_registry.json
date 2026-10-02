@@ -477,6 +477,44 @@
         "SIDEWAYS",
         "TREND_DOWN"
       ]
+    },
+    {
+      "experiment_id": "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1",
+      "version": 1,
+      "scanner_name": "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1",
+      "direction": "LONG",
+      "experiment_type": "FEATURE_FILTER_OOS",
+      "hypothesis": "For MOMENTUM_EXHAUSTION_REVERSE_LONG_V1 LONG signals, close_location >= 0.70 indicates buyers defending the upper part of the candle range, producing higher quality signals.",
+      "primary_metric": "MFE_R_60m",
+      "secondary_metrics": [
+        "MAE_R_60m",
+        "MFE_R_15m",
+        "MFE_R_30m",
+        "MFE_R_120m",
+        "MFE_R_240m",
+        "TP_before_SL",
+        "SL_before_TP",
+        "MFE_pct_60m",
+        "MAE_pct_60m"
+      ],
+      "filter_rule": "FROZEN CONTROL POPULATION: capture both close_location >= 0.70 (PASS) and close_location < 0.70 (REJECT); analyze the frozen threshold without filtering the observed population.",
+      "threshold": 0.7,
+      "entry_rule": "Existing production entry semantics from frozen MOMENTUM_EXHAUSTION_REVERSE_LONG_V1",
+      "stop_rule": "Existing production invalidation_price",
+      "target_rule": "Existing production target_1",
+      "position_sizing_rule": "shadow_only",
+      "fee_assumption": "none",
+      "horizons": [
+        "15m",
+        "30m",
+        "60m",
+        "120m",
+        "240m"
+      ],
+      "minimum_n": 30,
+      "minimum_symbols": 5,
+      "started_at": null,
+      "status": "READY_TO_START"
     }
   ],
   "rules": {

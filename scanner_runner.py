@@ -369,7 +369,7 @@ def _run_oos_evaluator(client: BybitClient, repository: ScannerRepository) -> No
     from app.shadow.me_r_long_close_location_oos_repository import MERLongCLoOosRepository
 
     repo = MERLongCLoOosRepository(repository._conn)
-    evaluator = MERLongCLoOosEvaluator(client, repo)
+    evaluator = MERLongCLoOosEvaluator(repo, client)
 
     # Run evaluation cycle
     stats = evaluator.evaluate_pending(limit=100)
