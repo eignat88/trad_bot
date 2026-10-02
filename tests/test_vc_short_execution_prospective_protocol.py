@@ -49,6 +49,21 @@ def observe(conn, **overrides):
     }).observe(**kwargs)
 
 
+def test_freeze_boundary():
+    freeze_ts = "2026-10-02T07:30:21Z"
+
+    conn = Cursor()
+    assert observe(conn, signal_time="2026-10-02T07:30:20Z") == []
+    assert conn.sql is None
+
+    conn = Cursor()
+    assert observe(conn, signal_time=freeze_ts) == []
+    assert conn.sql is None
+
+    conn = Cursor()
+    assert observe(conn, signal_time="2026-10-02T07:30:22Z") == [42]
+
+
 def test_short_and_filter_only():
     conn = Cursor()
     assert observe(conn)[0] == 42

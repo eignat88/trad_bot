@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -184,6 +185,14 @@ class ProspectiveOOSObserver:
         filter_reason = None
 
         if exp_id == "VC_SHORT_EXECUTION_V1":
+            freeze_ts = exp_spec["freeze_ts"]
+            freeze_dt = datetime.fromisoformat(freeze_ts.replace("Z", "+00:00"))
+            signal_dt = signal_time if isinstance(signal_time, datetime) else datetime.fromisoformat(signal_time.replace("Z", "+00:00"))
+            if signal_dt.tzinfo is None:
+                signal_dt = signal_dt.replace(tzinfo=timezone.utc)
+            if signal_dt <= freeze_dt:
+                return None
+
             bb_pct = features.get("bb_width_percentile")
             if bb_pct is None or float(bb_pct) >= float(exp_spec["threshold"]):
                 return None
