@@ -853,9 +853,8 @@ class TestObserveVCShort:
 
         mock_conn.commit.assert_called_once()
         assert mock_cursor.execute.call_count >= 1
-        insert_call = mock_cursor.execute.call_args_list[0]
-        args = insert_call[0][1]
-        assert args[0] == "VC_SHORT_BB_WIDTH_V1"
+        insert_calls = [c for c in mock_cursor.execute.call_args_list if c[0][1][0] == "VC_SHORT_BB_WIDTH_V1"]
+        assert insert_calls
 
     def test_vc_short_direction_in_values(self):
         """VC SHORT must pass direction='SHORT' in the INSERT."""

@@ -30,14 +30,14 @@ class TestFrozenRegistry:
         self.experiments = {e["experiment_id"]: e for e in self.registry["experiments"]}
 
     def test_six_experiments_registered(self):
-        assert len(self.experiments) == 10
+        assert len(self.experiments) == 11
 
     def test_experiment_ids(self):
         expected = {
             "SRR_LONG_BASELINE_V1",
             "SRR_OOS_SCANNER_V1_PROSPECTIVE",
             "ME_SHORT_GEOM_A_V1", "ME_SHORT_GEOM_B_V1", "ME_SHORT_GEOM_C_V1",
-            "VC_SHORT_BB_WIDTH_V1",
+            "VC_SHORT_BB_WIDTH_V1", "VC_SHORT_EXECUTION_V1",
             "LR_LONG_GATE_V1",
             "BREAKOUT_RETEST_LONG_EXPECTANCY_REJECT_OOS_V1",
             "FVG_REACTION_LONG_EXPECTANCY_REJECT_OOS_V1",
@@ -80,7 +80,9 @@ class TestFrozenRegistry:
                          "FVG_REACTION_LONG_EXPECTANCY_REJECT_OOS_V1",
                          "TREND_PULLBACK_V3_HIGH_VOL_OOS_V1"}
         for exp_id, exp in self.experiments.items():
-            if exp_id in r_denominated:
+            if exp_id == "VC_SHORT_EXECUTION_V1":
+                assert exp["primary_metric"] == "Net E[R] after normal project costs"
+            elif exp_id in r_denominated:
                 assert exp["primary_metric"] == "MFE_R_60m"
             else:
                 assert exp["primary_metric"] == "MFE_pct_60m", f"{exp_id} uses {exp['primary_metric']}"
@@ -264,7 +266,7 @@ class TestDBSchema:
         assert reg.exists()
         data = json.loads(reg.read_text())
         assert "experiments" in data
-        assert len(data["experiments"]) == 10
+        assert len(data["experiments"]) == 11
 
     def test_observer_exists(self):
         observer = PROJECT_ROOT / "app" / "research" / "prospective_observer.py"

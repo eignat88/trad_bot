@@ -1,0 +1,89 @@
+{
+  "protocol_id": "VC_SHORT_EXECUTION_PROSPECTIVE_PROTOCOL_V1",
+  "experiment_id": "VC_SHORT_EXECUTION_V1",
+  "scanner": "VOLATILITY_COMPRESSION",
+  "direction": "SHORT",
+  "source_filter_experiment": "VC_SHORT_BB_WIDTH_V1",
+  "freeze_ts": "2026-10-02T07:30:21Z",
+  "git_head": "678166ae42f0c7ea879fa0f5136841720115b6b7",
+  "filter_definition": {
+    "rule": "bb_width_percentile < 0.569723",
+    "threshold": 0.569723,
+    "source": "VC_SHORT_BB_WIDTH_V1 frozen registration"
+  },
+  "population": {
+    "scanner": "VOLATILITY_COMPRESSION",
+    "direction": "SHORT",
+    "dedup_key": ["experiment_id", "source_signal_id"],
+    "pre_freeze_treatment": "PRE_FREEZE / CONTAMINATED_FOR_VALIDATION",
+    "post_freeze_rule": "signal_time > freeze_ts"
+  },
+  "entry": {
+    "ENTRY_PRICE": "reference_price",
+    "ENTRY_TRIGGER": "immediate at scanner signal time",
+    "ENTRY_TIMEOUT": "none",
+    "ENTRY_NOT_FILLED_POLICY": "not applicable to shadow prospective validation"
+  },
+  "structural_r": {
+    "formula": "abs(entry_price - invalidation_price)",
+    "short_requirement": "invalidation_price > entry_price",
+    "invalid_geometry": "exclude before execution evaluation"
+  },
+  "stop_loss": {
+    "SL_R": 1.0,
+    "stop_price": "invalidation_price",
+    "defensibility": "existing scanner structural invalidation semantics"
+  },
+  "take_profit": {
+    "TP_R": "abs(reference_price - target_1) / structural_R",
+    "target_price": "existing production target_1",
+    "requirement": "target_1 < reference_price"
+  },
+  "max_hold_minutes": 120,
+  "intrabar_policy": "STOP_FIRST",
+  "timeout_exit": "close at first 5m candle close at or after signal_time + 120 minutes",
+  "cost_model": {
+    "taker_fee_per_side": 0.00055,
+    "normal_slippage_per_side": 0.0005,
+    "elevated_slippage_per_side": 0.001,
+    "primary_scenario": "NORMAL_COST",
+    "source": "config.yaml / prospective_registry.json"
+  },
+  "primary_metric": "Net E[R] after normal project costs",
+  "bootstrap": {
+    "resamples": 10000,
+    "report": ["95% CI Net E[R]", "P(Net E[R] > 0)"]
+  },
+  "minimum_evidence": {
+    "MIN_ELIGIBLE_FINALIZED_N": 50,
+    "MIN_OOS_DAYS": 7,
+    "MIN_DISTINCT_SYMBOLS": 10,
+    "concentration": "must not depend on one day, one symbol, or one regime bucket"
+  },
+  "stability_tests": [
+    "overall",
+    "per-day Net E[R]",
+    "leave-one-day-out",
+    "symbol concentration",
+    "leave-top-1-positive-symbol-out",
+    "leave-top-3-positive-symbols-out",
+    "market-regime breakdown",
+    "cost sensitivity",
+    "ambiguous-intrabar sensitivity",
+    "candidate/filter funnel"
+  ],
+  "verdict_taxonomy": {
+    "EXECUTABLE_EDGE_CONFIRMED": "minimum evidence reached, Net E[R] > 0, Net PF > 1, bootstrap 95% CI lower bound > 0, survives normal costs and concentration tests",
+    "NO_EXECUTABLE_EDGE": "sufficient eligible finalized sample fails the frozen economic/statistical criteria",
+    "INCONCLUSIVE_CONTINUE_OOS": "insufficient N, days, symbols, or unresolved uncertainty",
+    "INVALIDATED_BY_DATA_QUALITY": "dataset cannot support a valid prospective test",
+    "PIPELINE_FAILURE": "frozen pipeline does not capture/evaluate required observations correctly"
+  },
+  "contamination_guard": {
+    "rule": "signal_time > freeze_ts",
+    "pre_freeze_treatment": "PRE_FREEZE / CONTAMINATED_FOR_VALIDATION",
+    "backfill": "FORBIDDEN",
+    "expected_initial_post_freeze_raw_n": 0
+  },
+  "no_automatic_paper_promotion": true
+}

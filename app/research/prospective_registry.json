@@ -219,6 +219,61 @@
       "status": "READY_TO_START"
     },
     {
+      "experiment_id": "VC_SHORT_EXECUTION_V1",
+      "version": 1,
+      "scanner_name": "VOLATILITY_COMPRESSION",
+      "direction": "SHORT",
+      "experiment_type": "EXECUTION_PROSPECTIVE_VALIDATION",
+      "hypothesis": "VC SHORT signals satisfying the frozen BB-width filter can become executable under pre-frozen structural geometry and project costs.",
+      "primary_metric": "Net E[R] after normal project costs",
+      "secondary_metrics": [
+        "Gross E[R]",
+        "Net E[R]",
+        "Gross PF",
+        "Net PF",
+        "win rate",
+        "TP count",
+        "SL count",
+        "timeout count",
+        "ambiguous count",
+        "total Net R",
+        "max losing streak"
+      ],
+      "filter_rule": "PASS: bb_width_percentile < 0.569723. Strictly post-freeze only.",
+      "threshold": 0.569723,
+      "freeze_ts": "2026-10-02T07:30:21Z",
+      "entry_rule": "Immediate SHORT entry at reference_price.",
+      "stop_rule": "SL = invalidation_price; structural_R = abs(reference_price - invalidation_price).",
+      "target_rule": "TP = existing production target_1; target_1 must be below reference_price.",
+      "max_hold_minutes": 120,
+      "intrabar_policy": "STOP_FIRST",
+      "cost_model": {
+        "taker_fee_per_side": 0.00055,
+        "normal_slippage_per_side": 0.0005,
+        "elevated_slippage_per_side": 0.001,
+        "primary_scenario": "NORMAL_COST"
+      },
+      "position_sizing_rule": "shadow_only",
+      "fee_assumption": "taker 0.055% per side + normal slippage 0.05% per side",
+      "horizons": [
+        "15m",
+        "30m",
+        "60m",
+        "120m",
+        "240m"
+      ],
+      "minimum_n": 50,
+      "minimum_symbols": 10,
+      "minimum_oos_days": 7,
+      "contamination_guard": {
+        "rule": "signal_time > freeze_ts",
+        "pre_freeze_treatment": "PRE_FREEZE / CONTAMINATED_FOR_VALIDATION",
+        "backfill": "FORBIDDEN"
+      },
+      "started_at": null,
+      "status": "READY_TO_START"
+    },
+    {
       "experiment_id": "VC_SHORT_BB_WIDTH_V1",
       "version": 1,
       "scanner_name": "VOLATILITY_COMPRESSION",
