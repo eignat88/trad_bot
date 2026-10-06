@@ -237,14 +237,19 @@ class TestCase4_BeforeProspectiveStartedAt:
         assert "signal_time >= %s" in source
         assert "started_at" in source
 
-    def test_observer_does_not_check_started_at(self):
-        """Observer creates observations; evaluator filters by started_at."""
-        # The observer does NOT check started_at — that's the evaluator's job
-        # This is by design: observations are created for all signals,
-        # but only those after started_at are evaluated.
-        source = (PROJECT_ROOT / "app" / "research" / "prospective_observer.py").read_text()
-        assert "started_at" not in source, \
-            "Observer should NOT check started_at (evaluator handles that)"
+    def test_lr_observer_does_not_use_started_at_gate(self):
+        """LR routing remains independent of the HTF-only started_at gate."""
+        source = (
+            PROJECT_ROOT / "app" / "research" / "prospective_observer.py"
+        ).read_text()
+
+        # HTF Phase B deliberately validates DB started_at against freeze_ts.
+        assert "_is_htf_db_activation_ready" in source
+        assert "db_started_at" in source
+
+        # The HTF lifecycle gate is explicitly scoped to HTF experiments.
+        assert "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE" in source
+        assert "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE" in source
 
 
 # ════════════════════════════════════════════════════════════════

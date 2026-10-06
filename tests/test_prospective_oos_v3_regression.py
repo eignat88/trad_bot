@@ -310,7 +310,7 @@ class TestExperimentStatusFiltering:
             "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
             "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
         }
-        expected_ts = "2026-10-06T12:54:00Z"
+        expected_ts = "2026-10-06T14:00:00Z"
 
         seen = set()
         for exp in registry["experiments"]:
@@ -1297,7 +1297,7 @@ class TestNoAutoActivation:
             "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
             "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
         }
-        expected_ts = "2026-10-06T12:54:00Z"
+        expected_ts = "2026-10-06T14:00:00Z"
 
         seen = set()
         for exp in registry["experiments"]:

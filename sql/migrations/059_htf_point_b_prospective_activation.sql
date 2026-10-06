@@ -3,7 +3,7 @@
 -- ============================================================
 -- One immutable activation boundary for Point-B and baseline.
 --
--- freeze_ts / started_at = 2026-10-06T12:54:00Z
+-- freeze_ts / started_at = 2026-10-06T14:00:00Z
 --
 -- Runtime eligibility remains strictly:
 --     signal_time > freeze_ts
@@ -54,7 +54,7 @@ BEGIN
           OR
           (
               status = 'RUNNING'
-              AND started_at = '2026-10-06T12:54:00Z'::timestamptz
+              AND started_at = '2026-10-06T14:00:00Z'::timestamptz
           )
       );
 
@@ -69,7 +69,7 @@ $$;
 UPDATE research.prospective_experiment
 SET
     status = 'RUNNING',
-    started_at = '2026-10-06T12:54:00Z'::timestamptz
+    started_at = '2026-10-06T14:00:00Z'::timestamptz
 WHERE experiment_id IN (
     'HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE',
     'HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE'
@@ -89,7 +89,7 @@ BEGIN
         'HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE'
     )
       AND status = 'RUNNING'
-      AND started_at = '2026-10-06T12:54:00Z'::timestamptz;
+      AND started_at = '2026-10-06T14:00:00Z'::timestamptz;
 
     IF activated_count <> 2 THEN
         RAISE EXCEPTION

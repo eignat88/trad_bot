@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 from app.research.prospective_observer import ProspectiveOOSObserver
 
 
-FREEZE_TS = "2026-10-06T12:54:00Z"
+FREEZE_TS = "2026-10-06T14:00:00Z"
 
 
 def _observer_with_db_row(row):

@@ -87,7 +87,7 @@ class TestFrozenRegistry:
             "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
             "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
         }
-        expected_ts = "2026-10-06T12:54:00Z"
+        expected_ts = "2026-10-06T14:00:00Z"
 
         seen = set()
         for exp in registry["experiments"]:
@@ -448,7 +448,7 @@ class TestGateResultCapture:
         import inspect
         source = inspect.getsource(ProspectiveOOSObserver._observe_standard)
         # For LR gate experiment, rule_passed should be True for all
-        # (observational вЂ” we capture everything, evaluate gate later)
+        # (observational — we capture everything, evaluate gate later)
         assert "rule_passed = True" in source
 
 
@@ -533,7 +533,7 @@ class TestMEGeometryFormulas:
 # ============================================================
 
 class TestAPILoad:
-    """Verify candle fetch strategy вЂ” one HTTP request per unique symbol."""
+    """Verify candle fetch strategy — one HTTP request per unique symbol."""
 
     def test_evaluator_groups_by_symbol(self):
         """Evaluator fetches candles per unique symbol, shared across observations."""
@@ -869,7 +869,7 @@ class TestMigration050:
             "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
             "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
         }
-        expected_ts = "2026-10-06T12:54:00Z"
+        expected_ts = "2026-10-06T14:00:00Z"
 
         seen = set()
         for exp in registry["experiments"]:
