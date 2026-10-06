@@ -376,12 +376,12 @@ def _observe_htf_keylevel_point_b(repository: ScannerRepository, prospective_obs
         return
     try:
         from app.research.htf_keylevel_point_b import (
-            BASELINE_EXPERIMENT_ID, EXPERIMENT_ID, detect_point_b_setup,
+            BASELINE_EXPERIMENT_ID, EXPERIMENT_ID, detect_point_b_setups,
         )
         for symbol in symbols:
             for direction in ("LONG", "SHORT"):
                 try:
-                    result = detect_point_b_setup(
+                    results = detect_point_b_setups(
                         symbol=symbol,
                         direction=direction,
                         execution_candles=list(ctx.candles_5m),
@@ -392,11 +392,13 @@ def _observe_htf_keylevel_point_b(repository: ScannerRepository, prospective_obs
                 except Exception:
                     logger.debug("HTF key-level detector failed for %s %s", symbol, direction, exc_info=True)
                     continue
+
                 candidates = []
-                if result.signal is not None:
-                    candidates.append((EXPERIMENT_ID, result.signal, result))
-                if result.baseline is not None:
-                    candidates.append((BASELINE_EXPERIMENT_ID, result.baseline, None))
+                for result in results:
+                    if result.signal is not None:
+                        candidates.append((EXPERIMENT_ID, result.signal, result))
+                    if result.baseline is not None:
+                        candidates.append((BASELINE_EXPERIMENT_ID, result.baseline, None))
 
                 for experiment_id, candidate, detection_result in candidates:
                     try:

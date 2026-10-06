@@ -556,8 +556,9 @@
       "minimum_n_per_direction": 100,
       "minimum_symbols": 30,
       "minimum_oos_days": 14,
-      "started_at": null,
-      "status": "READY_TO_START"
+      "started_at": "2026-10-06T14:00:00Z",
+      "status": "RUNNING",
+      "freeze_ts": "2026-10-06T14:00:00Z"
     },
     {
       "experiment_id": "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
@@ -599,8 +600,9 @@
       "minimum_n_per_direction": 100,
       "minimum_symbols": 30,
       "minimum_oos_days": 14,
-      "started_at": null,
-      "status": "READY_TO_START"
+      "started_at": "2026-10-06T14:00:00Z",
+      "status": "RUNNING",
+      "freeze_ts": "2026-10-06T14:00:00Z"
     }
   ],
   "rules": {

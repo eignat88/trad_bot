@@ -117,7 +117,10 @@ def test_observer_freezes_first_valid_point_b_completion():
     conn = MagicMock()
     cursor = MagicMock()
     conn.cursor.return_value = cursor
-    cursor.fetchone.return_value = ("RUNNING",)
+    cursor.fetchone.return_value = (
+        "RUNNING",
+        datetime.fromisoformat("2026-10-03T11:19:00+00:00"),
+    )
 
     features = _snapshot()
     features["key_level_price"] = features.pop("level_price")
@@ -205,7 +208,13 @@ def _observe_point_b(
     conn = MagicMock()
     cursor = MagicMock()
     conn.cursor.return_value = cursor
-    cursor.fetchone.return_value = (db_status,)
+    freeze_ts = registry.get(scanner_name, {}).get("freeze_ts")
+    started_at = (
+        datetime.fromisoformat(str(freeze_ts).replace("Z", "+00:00"))
+        if db_status == "RUNNING" and freeze_ts
+        else None
+    )
+    cursor.fetchone.return_value = (db_status, started_at)
     cursor.fetchall.return_value = []
 
     completed_repo = MagicMock()
@@ -321,6 +330,10 @@ def test_htf_authoritative_snapshot_drives_point_b_observation():
     conn.cursor.return_value = cursor
     cursor.fetchone.side_effect = [
         ("RUNNING",),
+        (
+            "RUNNING",
+            datetime.fromisoformat("2026-10-03T11:19:00+00:00"),
+        ),
         (77,),
         None,
     ]

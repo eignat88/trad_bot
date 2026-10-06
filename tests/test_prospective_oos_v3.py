@@ -30,7 +30,7 @@ class TestFrozenRegistry:
         self.experiments = {e["experiment_id"]: e for e in self.registry["experiments"]}
 
     def test_six_experiments_registered(self):
-        assert len(self.experiments) == 11
+        assert len(self.experiments) == 14
 
     def test_experiment_ids(self):
         expected = {
@@ -42,6 +42,9 @@ class TestFrozenRegistry:
             "BREAKOUT_RETEST_LONG_EXPECTANCY_REJECT_OOS_V1",
             "FVG_REACTION_LONG_EXPECTANCY_REJECT_OOS_V1",
             "TREND_PULLBACK_V3_HIGH_VOL_OOS_V1",
+            "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1",
+            "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
+            "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
         }
         assert set(self.experiments.keys()) == expected
 
@@ -71,14 +74,45 @@ class TestFrozenRegistry:
         assert self.registry["rules"]["no_paper_orders"] is True
 
     def test_started_at_null(self):
-        for exp_id, exp in self.experiments.items():
-            assert exp["started_at"] is None, f"{exp_id} has started_at set before deployment"
+        """Registry lifecycle matches explicit HTF Phase B activation."""
+        import json
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        registry = json.loads(
+            (root / "app" / "research" / "prospective_registry.json").read_text()
+        )
+
+        activated = {
+            "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
+            "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
+        }
+        expected_ts = "2026-10-06T14:00:00Z"
+
+        seen = set()
+        for exp in registry["experiments"]:
+            exp_id = exp["experiment_id"]
+            if exp_id in activated:
+                seen.add(exp_id)
+                assert exp.get("status") == "RUNNING"
+                assert exp.get("started_at") == expected_ts
+                assert exp.get("freeze_ts") == expected_ts
+            else:
+                assert exp.get("status") == "READY_TO_START", (
+                    f"{exp_id} has unexpected status {exp.get('status')}"
+                )
+                assert exp.get("started_at") is None
+
+        assert seen == activated
 
     def test_all_use_mfe_pct_primary(self):
         r_denominated = {"SRR_OOS_SCANNER_V1_PROSPECTIVE",
                          "BREAKOUT_RETEST_LONG_EXPECTANCY_REJECT_OOS_V1",
                          "FVG_REACTION_LONG_EXPECTANCY_REJECT_OOS_V1",
-                         "TREND_PULLBACK_V3_HIGH_VOL_OOS_V1"}
+                         "TREND_PULLBACK_V3_HIGH_VOL_OOS_V1",
+                         "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1",
+                         "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
+                         "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE"}
         for exp_id, exp in self.experiments.items():
             if exp_id == "VC_SHORT_EXECUTION_V1":
                 assert exp["primary_metric"] == "Net E[R] after normal project costs"
@@ -266,7 +300,7 @@ class TestDBSchema:
         assert reg.exists()
         data = json.loads(reg.read_text())
         assert "experiments" in data
-        assert len(data["experiments"]) == 11
+        assert len(data["experiments"]) == 14
 
     def test_observer_exists(self):
         observer = PROJECT_ROOT / "app" / "research" / "prospective_observer.py"
@@ -822,15 +856,36 @@ class TestMigration050:
             assert f"'{exp['primary_metric']}'" in migration, f"Missing metric for {eid}"
 
     def test_registry_json_status_boundary(self):
-        """JSON status must be READY_TO_START, not READY or ACTIVE."""
+        """Registry lifecycle matches explicit HTF Phase B activation."""
         import json
-        reg_path = PROJECT_ROOT / "app" / "research" / "prospective_registry.json"
-        registry = json.loads(reg_path.read_text())
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        registry = json.loads(
+            (root / "app" / "research" / "prospective_registry.json").read_text()
+        )
+
+        activated = {
+            "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
+            "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
+        }
+        expected_ts = "2026-10-06T14:00:00Z"
+
+        seen = set()
         for exp in registry["experiments"]:
-            assert exp["status"] == "READY_TO_START", \
-                f"{exp['experiment_id']} has status '{exp['status']}', expected 'READY_TO_START'"
-            assert exp["started_at"] is None, \
-                f"{exp['experiment_id']} has started_at != NULL"
+            exp_id = exp["experiment_id"]
+            if exp_id in activated:
+                seen.add(exp_id)
+                assert exp.get("status") == "RUNNING"
+                assert exp.get("started_at") == expected_ts
+                assert exp.get("freeze_ts") == expected_ts
+            else:
+                assert exp.get("status") == "READY_TO_START", (
+                    f"{exp_id} has unexpected status {exp.get('status')}"
+                )
+                assert exp.get("started_at") is None
+
+        assert seen == activated
 
     def test_invariant_checks_all_frozen_fields(self):
         """Invariant must compare ALL 21 frozen fields, not just scanner/direction."""
