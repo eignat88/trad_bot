@@ -38,6 +38,7 @@ REQUIRED_SNAPSHOT_FIELDS = (
     "structural_stop_price",
     "risk_abs",
     "risk_pct",
+    "target_1",
 )
 
 _FREEZE_SQL = """

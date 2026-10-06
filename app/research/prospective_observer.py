@@ -28,6 +28,7 @@ Persistence:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from datetime import datetime, timezone
@@ -169,6 +170,22 @@ class ProspectiveOOSObserver:
         key_str = f"{scanner_name}:{symbol}:{direction}:{signal_time}"
         return -abs(hash(key_str)) % (2**31)
 
+    @staticmethod
+    def _make_htf_source_key(exp_id: str, setup_event_id: str) -> int:
+        """Build restart-stable HTF observation identity.
+
+        Generic scanner identity may use process-randomized Python ``hash``.
+        HTF prospective OOS cannot: the same immutable completed event must
+        retain the same source_signal_id across scanner restarts and retries.
+        The stable digest covers experiment_id + setup_event_id, so Point-B
+        and BASELINE remain distinct while each experiment's touch identity
+        remains stable.
+        """
+        payload = f"{exp_id}:{setup_event_id}".encode("utf-8")
+        digest = hashlib.sha256(payload).digest()
+        value = int.from_bytes(digest[:8], "big") % (2**31 - 1)
+        return -(value + 1)
+
     def observe(
         self,
         scanner_name: str,
@@ -236,10 +253,19 @@ class ProspectiveOOSObserver:
                 # frozen protocol timestamp.  Registry presence alone must
                 # never backfill historical detector candidates.
                 if exp_id.startswith("HTF_KEYLEVEL_"):
+                    setup_event_id = (
+                        detection_result.signal.features.get("setup_event_id")
+                        if detection_result is not None
+                        and getattr(detection_result, "signal", None) is not None
+                        and isinstance(getattr(detection_result.signal, "features", None), dict)
+                        else features.get("setup_event_id")
+                    )
+                    if not setup_event_id:
+                        continue
+
                     freeze_ts = exp_spec.get("freeze_ts")
                     if not freeze_ts:
                         continue
-
                     freeze_dt = datetime.fromisoformat(
                         str(freeze_ts).replace("Z", "+00:00")
                     )
@@ -261,20 +287,26 @@ class ProspectiveOOSObserver:
                     if signal_dt <= freeze_dt:
                         continue
 
+                    htf_source_key = self._make_htf_source_key(exp_id, setup_event_id)
+
                     # Only the Point-B experiment owns immutable completion
-                    # state.  BASELINE remains observational/control-only.
+                    # state. BASELINE remains observational/control-only.
+                    authoritative: dict[str, Any] | None = None
                     if (
-                        exp_id
-                        == "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE"
+                        exp_id == "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE"
                         and detection_result is not None
                     ):
-                        self._freeze_htf_point_b_completion(detection_result)
+                        authoritative = self._freeze_htf_point_b_completion(detection_result)
+                        if authoritative is None:
+                            continue
 
                     obs_id = self._observe_htf_keylevel(
                         cursor, exp_id, exp_spec,
-                        source_key, symbol, direction, signal_time,
+                        htf_source_key, symbol, direction, signal_time,
                         reference_price, invalidation_price, target_1, target_2,
                         score, features, parameters, market_regime,
+                        setup_event_id=setup_event_id,
+                        authoritative=authoritative,
                     )
                 elif exp_id.startswith("ME_SHORT_GEOM_"):
                     obs_id = self._observe_me_geometry(
@@ -402,27 +434,29 @@ class ProspectiveOOSObserver:
             "structural_stop_price": features["structural_stop_price"],
             "risk_abs": features["risk_abs"],
             "risk_pct": features["risk_pct"],
+            "target_1": features.get("target_1"),
+            "target_2": features.get("target_2"),
             "experiment_id": features.get("experiment_id"),
             "setup_event_id": features["setup_event_id"],
             "frozen_at": features["signal_time"],
         }
 
-    def _freeze_htf_point_b_completion(self, result: Any) -> None:
-        """Freeze one immutable HTF Point-B completion when a valid candidate exists.
+    def _freeze_htf_point_b_completion(self, result: Any) -> dict[str, Any] | None:
+        """Freeze and return the authoritative immutable Point-B completion.
 
         First-writer-wins is enforced by PostgreSQL:
         ``ON CONFLICT (experiment_id, setup_event_id) DO NOTHING`` followed by
         an authoritative SELECT.  Existing frozen geometry is never updated.
         """
         if self._completed_event_repo is None:
-            return
+            return None
         signal = getattr(result, "signal", None)
         features = getattr(signal, "features", None) if signal is not None else None
         if not isinstance(features, dict):
-            return
+            return None
         snapshot = self._completion_snapshot_from_features(features)
         if snapshot is None:
-            return
+            return None
         experiment_id = snapshot.get("experiment_id") or (
             "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE"
         )
@@ -437,14 +471,15 @@ class ProspectiveOOSObserver:
                 self._stats["htf_completion_errors"] = (
                     self._stats.get("htf_completion_errors", 0) + 1
                 )
-            else:
-                key = f"{experiment_id}:completed"
-                self._stats[key] = self._stats.get(key, 0) + 1
-                logger.debug(
-                    "HTF Point-B completion authoritative for %s/%s",
-                    experiment_id,
-                    setup_event_id,
-                )
+                return None
+            key = f"{experiment_id}:completed"
+            self._stats[key] = self._stats.get(key, 0) + 1
+            logger.debug(
+                "HTF Point-B completion authoritative for %s/%s",
+                experiment_id,
+                setup_event_id,
+            )
+            return frozen
         except Exception:
             self._stats["htf_completion_errors"] = (
                 self._stats.get("htf_completion_errors", 0) + 1
@@ -454,6 +489,7 @@ class ProspectiveOOSObserver:
                 experiment_id,
                 setup_event_id,
             )
+            return None
 
     def _observe_standard(
         self, cursor, exp_id: str, exp_spec: dict,
@@ -591,16 +627,39 @@ class ProspectiveOOSObserver:
         reference_price: float, invalidation_price: float | None,
         target_1: float | None, target_2: float | None, score: float,
         features: dict, parameters: dict, market_regime: str | None,
+        *,
+        setup_event_id: str | None,
+        authoritative: dict[str, Any] | None,
     ) -> int | None:
         """Capture the isolated HTF key-level Point-B/BASELINE cohort.
 
-        This branch is additive and keyed only by the two experiment IDs.  It
+        This branch is additive and keyed only by the two experiment IDs. It
         never changes existing frozen experiment observation semantics.
+
+        For Point-B, ``authoritative`` is the first immutable completion row
+        returned by the completed-event repository. It overrides every
+        recomputed detector value for restart-safe FIRST VALID POINT-B WINS.
+        BASELINE continues to use its contemporaneous detector snapshot and
+        never owns completion state.
         """
         if exp_id not in {"HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
                           "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE"}:
             return None
-        if not features or features.get("setup_event_id") is None:
+        if not setup_event_id:
+            return None
+        if authoritative is not None:
+            snapshot = authoritative.get("snapshot")
+            if not isinstance(snapshot, dict):
+                return None
+            features = snapshot
+            symbol = str(snapshot["symbol"])
+            direction = str(snapshot["direction"])
+            signal_time = snapshot["signal_time"]
+            reference_price = float(snapshot["entry_reference_price"])
+            invalidation_price = float(snapshot["structural_stop_price"])
+            target_1 = snapshot.get("target_1")
+            target_2 = snapshot.get("target_2")
+        elif not features or features.get("setup_event_id") != setup_event_id:
             return None
         if direction not in {"LONG", "SHORT"}:
             return None
@@ -617,6 +676,7 @@ class ProspectiveOOSObserver:
         features_with_protocol["_frozen_max_hold"] = 240
         features_with_protocol["_frozen_intrabar_policy"] = "STOP_FIRST"
         features_with_protocol["_structural_r"] = risk_abs
+        features_with_protocol["_authoritative_completion"] = authoritative is not None
         cursor.execute(
             """
             INSERT INTO research.prospective_observation (

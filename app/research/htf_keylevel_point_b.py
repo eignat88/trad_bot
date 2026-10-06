@@ -438,6 +438,8 @@ def _make_candidate(
         "structural_stop_price": float(structural_stop),
         "risk_abs": float(risk_abs),
         "risk_pct": float(risk_abs / entry * 100.0) if entry > 0 else None,
+        "target_1": float(target_1),
+        "target_2": float(target_2),
         "atr_at_signal": float(event_atr),
         "cost_treatment": "research_metrics_only_no_execution_costs",
         "invalidation_type": (

@@ -1,6 +1,7 @@
 """Focused persistence test for HTF Point-B first-writer-wins lifecycle storage."""
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
@@ -40,6 +41,8 @@ def _snapshot(direction: str = "LONG") -> dict:
         "structural_stop_price": 99.4 if direction == "LONG" else 104.0,
         "risk_abs": 5.7 if direction == "LONG" else 9.0,
         "risk_pct": 5.423406279733587 if direction == "LONG" else 9.473684210526315,
+        "target_1": 116.5 if direction == "LONG" else 77.0,
+        "target_2": 122.2 if direction == "LONG" else 71.3,
         "experiment_id": EXPERIMENT_ID,
         "setup_event_id": SETUP_EVENT_ID,
         "frozen_at": FROZEN_AT.isoformat(),
@@ -75,6 +78,8 @@ def test_freeze_completed_event_insert_wins_first():
     assert result is not None
     assert result["status"] == COMPLETED_IMMUTABLE
     assert result["snapshot"]["point_b_price"] == 105.1
+    assert result["snapshot"]["target_1"] == 116.5
+    assert result["snapshot"]["target_2"] == 122.2
     insert_call = cursor.execute.call_args_list[0]
     assert "INSERT INTO research.prospective_completed_event" in insert_call[0][0]
     assert "ON CONFLICT (experiment_id, setup_event_id) DO NOTHING" in insert_call[0][0]
@@ -310,6 +315,72 @@ def test_htf_completion_not_frozen_for_terminal_experiment():
     completed_repo.freeze_completed_event.assert_not_called()
 
 
+def test_htf_authoritative_snapshot_drives_point_b_observation():
+    conn = MagicMock()
+    cursor = MagicMock()
+    conn.cursor.return_value = cursor
+    cursor.fetchone.side_effect = [
+        ("RUNNING",),
+        (77,),
+        None,
+    ]
+
+    frozen_snapshot = _snapshot()
+    frozen_snapshot["cohort"] = "POINT_B"
+    frozen_snapshot["point_b_retrace_pct"] = 33.2653
+    frozen_snapshot["target_1"] = 116.5
+    frozen_snapshot["target_2"] = 122.2
+    completed_repo = MagicMock()
+    completed_repo.freeze_completed_event.return_value = {"snapshot": frozen_snapshot}
+
+    current_result, features = _make_point_b_detection_result()
+    features["point_b_retrace_pct"] = 66.8581
+    features["entry_reference_price"] = 999.0
+    features["structural_stop_price"] = 1.0
+    features["target_1"] = 999.0
+    features["target_2"] = 888.0
+    current_result.signal.features = features
+
+    registry = {
+        EXPERIMENT_ID: {
+            "scanner_name": EXPERIMENT_ID,
+            "direction": "LONG",
+            "freeze_ts": "2026-10-03T11:19:00+00:00",
+        }
+    }
+    observer = ProspectiveOOSObserver(conn, registry, completed_event_repo=completed_repo)
+    assert observer.observe(
+        scanner_name=EXPERIMENT_ID,
+        direction="LONG",
+        symbol="BTCUSDT",
+        signal_time=FROZEN_AT,
+        reference_price=999.0,
+        invalidation_price=1.0,
+        target_1=999.0,
+        target_2=888.0,
+        score=0.0,
+        features=dict(features),
+        parameters={},
+        market_regime=None,
+        detection_result=current_result,
+    ) == [77]
+
+    observation_call = next(
+        call for call in cursor.execute.call_args_list
+        if "INSERT INTO research.prospective_observation" in str(call)
+    )
+    params = observation_call[0][1]
+    assert params[1] == ProspectiveOOSObserver._make_htf_source_key(EXPERIMENT_ID, SETUP_EVENT_ID)
+    assert params[3:5] == ("BTCUSDT", "LONG")
+    assert params[6] == frozen_snapshot["entry_reference_price"]
+    assert params[7] == frozen_snapshot["structural_stop_price"]
+    assert params[8] == frozen_snapshot["target_1"]
+    assert params[9] == frozen_snapshot["target_2"]
+    assert '"point_b_retrace_pct": 33.2653' in params[13]
+    assert "999.0" not in params[13]
+    assert "66.8581" not in params[13]
+
+
 def test_htf_completion_requires_freeze_ts():
     registry = {
         EXPERIMENT_ID: {
@@ -344,3 +415,18 @@ def test_htf_baseline_never_freezes_point_b_completion():
     )
 
     completed_repo.freeze_completed_event.assert_not_called()
+
+
+def test_htf_source_identity_is_restart_stable_and_experiment_scoped():
+    first = ProspectiveOOSObserver._make_htf_source_key(EXPERIMENT_ID, SETUP_EVENT_ID)
+    second = ProspectiveOOSObserver._make_htf_source_key(EXPERIMENT_ID, SETUP_EVENT_ID)
+    baseline_id = "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE"
+    baseline = ProspectiveOOSObserver._make_htf_source_key(baseline_id, SETUP_EVENT_ID)
+    other_setup = ProspectiveOOSObserver._make_htf_source_key(EXPERIMENT_ID, "other-touch")
+
+    payload = f"{EXPERIMENT_ID}:{SETUP_EVENT_ID}".encode("utf-8")
+    expected = -(int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % (2**31 - 1)) - 1
+    assert first == second == expected
+    assert first != baseline
+    assert first != other_setup
+    assert all(-2**31 < key < -1 for key in (first, second, baseline, other_setup))
