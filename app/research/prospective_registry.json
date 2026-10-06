@@ -515,6 +515,92 @@
       "minimum_symbols": 5,
       "started_at": null,
       "status": "READY_TO_START"
+    },
+    {
+      "experiment_id": "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
+      "scanner_name": "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
+      "direction": "LONG",
+      "experiment_type": "PROSPECTIVE_EDGE_VALIDATION",
+      "hypothesis": "After causal HTF support/resistance interaction, reaction and local structure break, the first valid Point-B retracement may identify a reproducible directional edge.",
+      "filter_rule": "FROZEN DETECTOR; FIRST VALID POINT-B WINS; strictly post-freeze only.",
+      "threshold": null,
+      "entry_rule": "First qualifying Point-B candle close/reference_price.",
+      "stop_rule": "Structural stop at reaction extreme; risk_abs > 0.",
+      "target_rule": "Detector target geometry frozen at detection; evaluate path through 30m/60m/120m/240m.",
+      "position_sizing_rule": "shadow_only",
+      "fee_assumption": "none for path-health metrics; separate frozen execution protocol required for executable-edge verdict",
+      "paired_with": "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
+      "version": 1,
+      "directions": [
+        "LONG",
+        "SHORT"
+      ],
+      "primary_metric": "MFE_R_60m",
+      "secondary_metrics": [
+        "MAE_R_60m",
+        "MFE_R_30m",
+        "MFE_R_120m",
+        "MFE_R_240m",
+        "TP_before_SL",
+        "SL_before_TP",
+        "MFE_pct_60m",
+        "MAE_pct_60m"
+      ],
+      "horizons": [
+        "30m",
+        "60m",
+        "120m",
+        "240m"
+      ],
+      "minimum_n": 300,
+      "minimum_n_per_direction": 100,
+      "minimum_symbols": 30,
+      "minimum_oos_days": 14,
+      "started_at": null,
+      "status": "READY_TO_START"
+    },
+    {
+      "experiment_id": "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
+      "scanner_name": "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
+      "direction": "LONG",
+      "experiment_type": "BASELINE_CONTROL",
+      "hypothesis": "Observational control cohort for comparison with Point-B geometry.",
+      "filter_rule": "OBSERVATIONAL CONTROL ONLY; baseline unavailability must never suppress a valid Point-B completion; strictly post-freeze only.",
+      "threshold": null,
+      "entry_rule": "Detector baseline reference_price when valid.",
+      "stop_rule": "Detector baseline invalidation geometry when valid and risk_abs > 0.",
+      "target_rule": "Detector baseline target geometry when valid.",
+      "position_sizing_rule": "shadow_only",
+      "fee_assumption": "none; observational control only",
+      "paired_with": "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
+      "version": 1,
+      "directions": [
+        "LONG",
+        "SHORT"
+      ],
+      "primary_metric": "MFE_R_60m",
+      "secondary_metrics": [
+        "MAE_R_60m",
+        "MFE_R_30m",
+        "MFE_R_120m",
+        "MFE_R_240m",
+        "TP_before_SL",
+        "SL_before_TP",
+        "MFE_pct_60m",
+        "MAE_pct_60m"
+      ],
+      "horizons": [
+        "30m",
+        "60m",
+        "120m",
+        "240m"
+      ],
+      "minimum_n": 300,
+      "minimum_n_per_direction": 100,
+      "minimum_symbols": 30,
+      "minimum_oos_days": 14,
+      "started_at": null,
+      "status": "READY_TO_START"
     }
   ],
   "rules": {

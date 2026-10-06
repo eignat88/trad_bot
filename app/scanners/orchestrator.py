@@ -122,6 +122,13 @@ class ScannerOrchestrator:
         "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2",
     })
 
+    # Isolated observe-only research scanner.  It never participates in
+    # production scoring, gate acceptance, or paper/live execution.
+    HTF_KEYLEVEL_PROSPECTIVE_SCANNERS: frozenset[str] = frozenset({
+        "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
+        "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
+    })
+
     # Scanners whose LONG candidates should be captured for research
     # outcome tracking, independently of direction gate / paper trading.
     # Every valid, deduplicated, score-passing candidate is captured
@@ -254,7 +261,8 @@ class ScannerOrchestrator:
             # SCORE_BYPASS scanners use deterministic fixed-geometry rules where
             # the generic cross-scanner score provides no additional quality signal.
             if (
-                c.score >= 30
+                c.scanner_name in self.HTF_KEYLEVEL_PROSPECTIVE_SCANNERS
+                or c.score >= 30
                 or c.features.get("_oos_rejected")
                 or c.scanner_name in self.SHADOW_CONTROL_SCANNERS
                 or c.scanner_name in self.SCORE_BYPASS_SCANNERS

@@ -274,6 +274,9 @@ def _get_prospective_observer(repository: ScannerRepository):
         try:
             import pg8000
             from app.research.prospective_observer import ProspectiveOOSObserver
+            from app.research.prospective_completed_event_repository import (
+                ProspectiveCompletedEventRepository,
+            )
             import json
             from pathlib import Path
 
@@ -315,12 +318,15 @@ def _get_prospective_observer(repository: ScannerRepository):
             except Exception:
                 logger.debug("prospective promote repo init failed — observations will not be promoted", exc_info=True)
 
+            completed_event_repo = ProspectiveCompletedEventRepository(_prospective_conn)
+
             _prospective_observer = ProspectiveOOSObserver(
                 _prospective_conn, experiments,
                 research_repo=research_repo_for_promote,
+                completed_event_repo=completed_event_repo,
             )
             logger.info(
-                "prospective observer initialized: experiments=%s promote=%s",
+                "prospective observer initialized: experiments=%s promote=%s completed_freeze=ON",
                 list(experiments.keys()),
                 "ON" if research_repo_for_promote else "OFF",
             )
@@ -357,6 +363,67 @@ def _observe_me_r_long_cl_oos(repository: ScannerRepository, candidate: SetupCan
 
     repo = MERLongCLoOosRepository(repository._conn)
     observe_oos_candidate(repo, candidate)
+
+
+def _observe_htf_keylevel_point_b(repository: ScannerRepository, prospective_obs: ProspectiveOOSObserver | None, ctx, symbols: list[str]) -> None:
+    """Evaluate the isolated HTF key-level detector without changing scanner output.
+
+    The detector is research-only.  It does not create READY_TO_TRADE setups,
+    does not pass through paper gates, and emits observations only when a
+    completed Point-B or matched BASELINE cohort has objective metadata.
+    """
+    if prospective_obs is None:
+        return
+    try:
+        from app.research.htf_keylevel_point_b import (
+            BASELINE_EXPERIMENT_ID, EXPERIMENT_ID, detect_point_b_setup,
+        )
+        for symbol in symbols:
+            for direction in ("LONG", "SHORT"):
+                try:
+                    result = detect_point_b_setup(
+                        symbol=symbol,
+                        direction=direction,
+                        execution_candles=list(ctx.candles_5m),
+                        htf_candles=list(ctx.candles_1h),
+                        current_time=ctx.evaluated_at,
+                        market_regime=ctx.market_regime,
+                    )
+                except Exception:
+                    logger.debug("HTF key-level detector failed for %s %s", symbol, direction, exc_info=True)
+                    continue
+                candidates = []
+                if result.signal is not None:
+                    candidates.append((EXPERIMENT_ID, result.signal, result))
+                if result.baseline is not None:
+                    candidates.append((BASELINE_EXPERIMENT_ID, result.baseline, None))
+
+                for experiment_id, candidate, detection_result in candidates:
+                    try:
+                        prospective_obs.observe(
+                            scanner_name=experiment_id,
+                            direction=candidate.direction,
+                            symbol=candidate.symbol,
+                            signal_time=candidate.detected_at,
+                            reference_price=candidate.reference_price,
+                            invalidation_price=candidate.invalidation_price,
+                            target_1=candidate.target_1,
+                            target_2=candidate.target_2,
+                            score=candidate.score,
+                            features=dict(candidate.features),
+                            parameters={},
+                            market_regime=candidate.market_regime,
+                            detection_result=detection_result,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "HTF key-level prospective observation failed for %s %s",
+                            experiment_id,
+                            symbol,
+                            exc_info=True,
+                        )
+    except Exception:
+        logger.debug("HTF key-level prospective capture failed", exc_info=True)
 
 
 def _run_oos_evaluator(client: BybitClient, repository: ScannerRepository) -> None:
@@ -656,6 +723,12 @@ def run_scan_cycle(
                                 )
                     except Exception:
                         logger.debug("research resolve/promote failed", exc_info=True)
+
+                if prospective_obs is not None:
+                    try:
+                        _observe_htf_keylevel_point_b(repository, prospective_obs, ctx, [symbol])
+                    except Exception:
+                        logger.debug("HTF key-level observation failed for %s", symbol, exc_info=True)
 
                 # ── Prospective OOS: log observation stats ──
                 # Promotion happens immediately inside prospective_obs.observe()
