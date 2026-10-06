@@ -941,3 +941,56 @@ def test_completed_event_does_not_mask_later_independent_event():
     assert len(completed) >= 2
     assert completed[0].setup_event_id != completed[1].setup_event_id
     assert completed[0].signal.detected_at < completed[1].signal.detected_at
+
+def test_terminally_invalidated_event_does_not_mask_later_valid_event():
+    """A terminal invalidation must not mask a later independent completion."""
+    from app.research.htf_keylevel_point_b import detect_point_b_setups
+
+    rows = _long_history()
+
+    # Turn the first event's first post-break candle into a terminal
+    # structural invalidation.
+    rows[24] = candle(
+        30 + 24,
+        high=105.2,
+        low=99.0,
+        close=99.3,
+        volume=15,
+    )
+
+    base_index = 30 + 29
+
+    # Quiet history after the invalidated event.
+    for offset in range(1, 22):
+        rows.append(
+            candle(
+                base_index + offset,
+                high=100.4,
+                low=100.0,
+                close=100.2,
+                volume=10,
+            )
+        )
+
+    second_start = base_index + 22
+
+    rows.extend([
+        candle(second_start,     high=100.3, low=99.4,   close=100.1, volume=20),
+        candle(second_start + 1, high=104.0, low=99.5,   close=103.7, volume=100),
+        candle(second_start + 2, high=104.0, low=103.3,  close=103.6, volume=20),
+        candle(second_start + 3, high=106.0, low=103.8,  close=105.7, volume=30),
+        candle(second_start + 4, high=105.5, low=104.85, close=105.1, volume=15),
+    ])
+
+    results = detect_point_b_setups(
+        symbol="BTCUSDT",
+        direction="LONG",
+        execution_candles=rows,
+        htf_candles=_flat_htf("LONG"),
+        current_time=_candle_time(rows[-1]) + timedelta(minutes=5),
+    )
+
+    completed = [result for result in results if result.signal is not None]
+
+    assert len(completed) == 1
+    assert completed[0].signal.detected_at == _candle_time(rows[-1])

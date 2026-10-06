@@ -72,6 +72,7 @@ class DetectionResult:
     funnel: dict[str, int] | None = None
     setup_event_id: str | None = None
     reason: str | None = None
+    terminal_timestamp: int | None = None
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -590,6 +591,7 @@ def detect_point_b_setup(
                     "KEY_LEVEL_DETECTED", "KEY_LEVEL_TOUCHED",
                     "REACTION_CONFIRMED", "STRUCTURE_BROKEN",
                 ),
+                terminal_timestamp=int(candle.timestamp),
             )
         if direction == "SHORT" and float(candle.close) >= reaction_high:
             return DetectionResult(
@@ -598,6 +600,7 @@ def detect_point_b_setup(
                     "KEY_LEVEL_DETECTED", "KEY_LEVEL_TOUCHED",
                     "REACTION_CONFIRMED", "STRUCTURE_BROKEN",
                 ),
+                terminal_timestamp=int(candle.timestamp),
             )
 
         if direction == "LONG":
@@ -759,7 +762,20 @@ def detect_point_b_setups(
             touch_after_timestamp=touch_after_timestamp,
         )
 
-        if result.signal is None or not result.setup_event_id:
+        if result.signal is None:
+            if (
+                result.reason == "structural_invalidation_before_entry"
+                and result.terminal_timestamp is not None
+                and (
+                    touch_after_timestamp is None
+                    or result.terminal_timestamp > touch_after_timestamp
+                )
+            ):
+                touch_after_timestamp = result.terminal_timestamp
+                continue
+            break
+
+        if not result.setup_event_id:
             break
 
         if result.setup_event_id in seen_event_ids:
