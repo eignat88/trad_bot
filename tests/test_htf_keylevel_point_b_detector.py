@@ -351,6 +351,59 @@ def test_short_valid_path() -> None:
     assert result.signal.features["key_level_type"] == "resistance"
 
 
+
+def test_long_post_break_invalidation_prevents_later_point_b_reentry() -> None:
+    rows = _long_history()
+
+    # Index 24 is the first post-break candle. Force structural invalidation:
+    # reaction_low is 99.4, so close=99.3 invalidates the setup.
+    # Later candles still contain valid-looking Point-B retracement geometry,
+    # but the event must remain terminal.
+    rows[24] = candle(
+        30 + 24,
+        high=105.2,
+        low=99.0,
+        close=99.3,
+        volume=15,
+    )
+
+    result = detect_point_b_setup(
+        symbol="BTCUSDT",
+        direction="LONG",
+        execution_candles=rows,
+        htf_candles=_flat_htf("LONG"),
+        current_time=_candle_time(rows[-1]) + timedelta(minutes=5),
+    )
+
+    assert result.signal is None
+    assert result.reason == "structural_invalidation_before_entry"
+
+
+def test_short_post_break_invalidation_prevents_later_point_b_reentry() -> None:
+    rows = _short_history()
+
+    # reaction_high is above 101; force a close beyond it immediately
+    # after the bearish structure break. Later rows must not resurrect it.
+    rows[24] = candle(
+        24,
+        high=103.0,
+        low=94.7,
+        close=102.5,
+        volume=15,
+    )
+
+    result = detect_point_b_setup(
+        symbol="BTCUSDT",
+        direction="SHORT",
+        execution_candles=rows,
+        htf_candles=_flat_htf("SHORT"),
+        current_time=_candle_time(rows[-1]) + timedelta(minutes=5),
+    )
+
+    assert result.signal is None
+    assert result.reason == "structural_invalidation_before_entry"
+
+
 def test_touch_without_reaction_has_no_signal() -> None:
     rows = []
     for i in range(20):

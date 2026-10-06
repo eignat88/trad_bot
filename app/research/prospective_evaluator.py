@@ -171,6 +171,29 @@ class ProspectiveOOSEvaluator:
 
         return ProspectiveOOSEvaluator._DEFAULT_MAX_HOLD_MINUTES
 
+    @staticmethod
+    def _get_frozen_intrabar_policy(obs: dict) -> str:
+        """Extract frozen intrabar policy from observation features."""
+        features = obs.get("features")
+        if features is None:
+            return "ORDER_FIRST"
+
+        if isinstance(features, str):
+            try:
+                import json as _json
+                features = _json.loads(features)
+            except (ValueError, TypeError):
+                return "ORDER_FIRST"
+
+        if not isinstance(features, dict):
+            return "ORDER_FIRST"
+
+        policy = features.get("_frozen_intrabar_policy")
+        if policy in {"STOP_FIRST", "TP_FIRST", "ORDER_FIRST"}:
+            return policy
+
+        return "ORDER_FIRST"
+
     def _get_candles(self, symbol: str, from_time: datetime, to_time: datetime) -> list[Candle]:
         try:
             start_ms = int((from_time - timedelta(minutes=5)).timestamp() * 1000)
@@ -264,7 +287,7 @@ class ProspectiveOOSEvaluator:
             tp_sl = _check_tp_sl(
                 post_candles, entry_price, stop_price, target_price,
                 frozen_max_hold, signal_time, is_short,
-                intrabar_policy="STOP_FIRST" if obs.get("experiment_id") == "VC_SHORT_EXECUTION_V1" else "ORDER_FIRST",
+                intrabar_policy=self._get_frozen_intrabar_policy(obs),
             )
             updates.update(tp_sl)
             updates["is_final"] = True

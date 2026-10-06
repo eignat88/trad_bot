@@ -573,6 +573,27 @@ def detect_point_b_setup(
         )
     for index in range(break_index + 1, len(closed)):
         candle = closed[index]
+
+        # Once structural invalidation happens after the break and before
+        # Point-B entry, this event is terminal. A later re-entry must not
+        # resurrect the same setup.
+        if direction == "LONG" and float(candle.close) <= reaction_low:
+            return DetectionResult(
+                reason="structural_invalidation_before_entry",
+                stages=(
+                    "KEY_LEVEL_DETECTED", "KEY_LEVEL_TOUCHED",
+                    "REACTION_CONFIRMED", "STRUCTURE_BROKEN",
+                ),
+            )
+        if direction == "SHORT" and float(candle.close) >= reaction_high:
+            return DetectionResult(
+                reason="structural_invalidation_before_entry",
+                stages=(
+                    "KEY_LEVEL_DETECTED", "KEY_LEVEL_TOUCHED",
+                    "REACTION_CONFIRMED", "STRUCTURE_BROKEN",
+                ),
+            )
+
         if direction == "LONG":
             low = float(candle.low)
             retrace = (float(break_price) - low) / leg
@@ -581,6 +602,7 @@ def detect_point_b_setup(
             high = float(candle.high)
             retrace = (high - float(break_price)) / leg
             candidate_price = float(candle.close)
+
         if POINT_B_RETRACE_MIN <= retrace <= POINT_B_RETRACE_MAX:
             point_b_index, point_b_price, point_b_retrace = index, candidate_price, retrace
             break
