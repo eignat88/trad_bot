@@ -529,6 +529,34 @@ def test_directional_structure_break_short_symmetry() -> None:
     assert result.signal.reference_price < result.signal.invalidation_price
 
 
+def test_valid_point_b_signal_survives_zero_risk_baseline_case() -> None:
+    rows = _long_history()
+    rows.append(candle(30 + 29, high=105.4, low=105.0, close=105.0, volume=10))
+    result = detect_point_b_setup(symbol="BTCUSDT", direction="LONG", execution_candles=rows, htf_candles=_flat_htf("LONG"), current_time=_candle_time(rows[28]))
+    assert result.signal is not None
+    assert result.signal.features["risk_abs"] > 0
+
+
+def test_baseline_handling_does_not_change_point_b_geometry() -> None:
+    rows = _long_history()
+    rows.append(candle(30 + 29, high=105.4, low=105.0, close=105.0, volume=10))
+
+    result = detect_point_b_setup(
+        symbol="BTCUSDT",
+        direction="LONG",
+        execution_candles=rows,
+        htf_candles=_flat_htf("LONG"),
+        current_time=_candle_time(rows[28]),
+    )
+
+    assert result.signal is not None
+    assert result.signal.features["entry_reference_price"] == 105.1
+    assert result.signal.features["structural_stop_price"] == 99.4
+    assert result.signal.features["risk_abs"] == pytest.approx(5.7)
+    assert result.signal.features["point_b_price"] == 105.1
+    assert result.signal.features["point_b_retrace_pct"] == pytest.approx(50.0)
+
+
 def test_reaction_stage_uses_only_causal_atr_prefix() -> None:
     prefix = [
         candle(index, high=100.2, low=99.8, close=100.0, volume=10.0)

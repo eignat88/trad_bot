@@ -274,6 +274,9 @@ def _get_prospective_observer(repository: ScannerRepository):
         try:
             import pg8000
             from app.research.prospective_observer import ProspectiveOOSObserver
+            from app.research.prospective_completed_event_repository import (
+                ProspectiveCompletedEventRepository,
+            )
             import json
             from pathlib import Path
 
@@ -315,12 +318,15 @@ def _get_prospective_observer(repository: ScannerRepository):
             except Exception:
                 logger.debug("prospective promote repo init failed — observations will not be promoted", exc_info=True)
 
+            completed_event_repo = ProspectiveCompletedEventRepository(_prospective_conn)
+
             _prospective_observer = ProspectiveOOSObserver(
                 _prospective_conn, experiments,
                 research_repo=research_repo_for_promote,
+                completed_event_repo=completed_event_repo,
             )
             logger.info(
-                "prospective observer initialized: experiments=%s promote=%s",
+                "prospective observer initialized: experiments=%s promote=%s completed_freeze=ON",
                 list(experiments.keys()),
                 "ON" if research_repo_for_promote else "OFF",
             )
@@ -386,26 +392,36 @@ def _observe_htf_keylevel_point_b(repository: ScannerRepository, prospective_obs
                 except Exception:
                     logger.debug("HTF key-level detector failed for %s %s", symbol, direction, exc_info=True)
                     continue
-                if result.signal is None or result.baseline is None:
-                    continue
-                for experiment_id, candidate in (
-                    (EXPERIMENT_ID, result.signal),
-                    (BASELINE_EXPERIMENT_ID, result.baseline),
-                ):
-                    prospective_obs.observe(
-                        scanner_name=experiment_id,
-                        direction=candidate.direction,
-                        symbol=candidate.symbol,
-                        signal_time=candidate.detected_at,
-                        reference_price=candidate.reference_price,
-                        invalidation_price=candidate.invalidation_price,
-                        target_1=candidate.target_1,
-                        target_2=candidate.target_2,
-                        score=candidate.score,
-                        features=dict(candidate.features),
-                        parameters={},
-                        market_regime=candidate.market_regime,
-                    )
+                candidates = []
+                if result.signal is not None:
+                    candidates.append((EXPERIMENT_ID, result.signal, result))
+                if result.baseline is not None:
+                    candidates.append((BASELINE_EXPERIMENT_ID, result.baseline, None))
+
+                for experiment_id, candidate, detection_result in candidates:
+                    try:
+                        prospective_obs.observe(
+                            scanner_name=experiment_id,
+                            direction=candidate.direction,
+                            symbol=candidate.symbol,
+                            signal_time=candidate.detected_at,
+                            reference_price=candidate.reference_price,
+                            invalidation_price=candidate.invalidation_price,
+                            target_1=candidate.target_1,
+                            target_2=candidate.target_2,
+                            score=candidate.score,
+                            features=dict(candidate.features),
+                            parameters={},
+                            market_regime=candidate.market_regime,
+                            detection_result=detection_result,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "HTF key-level prospective observation failed for %s %s",
+                            experiment_id,
+                            symbol,
+                            exc_info=True,
+                        )
     except Exception:
         logger.debug("HTF key-level prospective capture failed", exc_info=True)
 

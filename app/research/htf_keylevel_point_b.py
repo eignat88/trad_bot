@@ -406,6 +406,8 @@ def _make_candidate(
             event["reaction_high"] if direction == "LONG" else event["reaction_low"]
         ),
         "reaction_distance_atr": float(event["reaction_distance_atr"]),
+        "reaction_high": float(event["reaction_high"]),
+        "reaction_low": float(event["reaction_low"]),
         "reaction_candles": int(event["reaction_candles"]),
         "reaction_body_atr": float(event["reaction_body_atr"]),
         "reaction_volume_ratio": float(event["reaction_volume_ratio"]),
@@ -450,6 +452,10 @@ def _make_candidate(
         "volume_regime": None,
         "key_level_detected_time": _as_utc(event["level_time"]).isoformat(),
         "key_level_detected_price": float(event["level_price"]),
+        "symbol": str(event["symbol"]),
+        "direction": direction,
+        "level_price": float(event["key_level_price"]),
+        "level_type": str(event["key_level_type"]),
     }
     return SetupCandidate(
         scanner_name=SCANNER_NAME,
@@ -666,16 +672,19 @@ def detect_point_b_setup(
         cohort="POINT_B",
     )
     baseline_signal_time = _candle_time(closed[reaction_end])
-    baseline = _make_candidate(
-        direction=direction,
-        event=event,
-        stage="BASELINE",
-        signal_time=baseline_signal_time,
-        signal_candle=closed[reaction_end],
-        event_atr=atr_by_index[reaction_end],
-        setup_event_id=setup_event_id,
-        cohort="BASELINE",
-    )
+    try:
+        baseline = _make_candidate(
+            direction=direction,
+            event=event,
+            stage="BASELINE",
+            signal_time=baseline_signal_time,
+            signal_candle=closed[reaction_end],
+            event_atr=atr_by_index[reaction_end],
+            setup_event_id=setup_event_id,
+            cohort="BASELINE",
+        )
+    except ValueError:
+        baseline = None
     return DetectionResult(
         signal=signal,
         baseline=baseline,
