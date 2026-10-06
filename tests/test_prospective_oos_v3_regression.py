@@ -297,15 +297,36 @@ class TestExperimentStatusFiltering:
         )
 
     def test_registry_experiments_are_ready_to_start(self):
-        """All registry experiments start with status='READY_TO_START' (not auto-activated)."""
+        """Registry lifecycle matches explicit HTF Phase B activation."""
         import json
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
         registry = json.loads(
-            (PROJECT_ROOT / "app" / "research" / "prospective_registry.json").read_text()
+            (root / "app" / "research" / "prospective_registry.json").read_text()
         )
+
+        activated = {
+            "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
+            "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
+        }
+        expected_ts = "2026-10-06T12:54:00Z"
+
+        seen = set()
         for exp in registry["experiments"]:
-            assert exp.get("status") == "READY_TO_START", (
-                f"Registry experiment {exp['experiment_id']} has unexpected status: {exp.get('status')}"
-            )
+            exp_id = exp["experiment_id"]
+            if exp_id in activated:
+                seen.add(exp_id)
+                assert exp.get("status") == "RUNNING"
+                assert exp.get("started_at") == expected_ts
+                assert exp.get("freeze_ts") == expected_ts
+            else:
+                assert exp.get("status") == "READY_TO_START", (
+                    f"{exp_id} has unexpected status {exp.get('status')}"
+                )
+                assert exp.get("started_at") is None
+
+        assert seen == activated
 
     def test_no_auto_activation_in_code(self):
         """No code should automatically set experiment status to RUNNING."""
@@ -1263,9 +1284,33 @@ class TestNoAutoActivation:
         assert "SELECT status FROM research.prospective_experiment" in source
 
     def test_registry_experiments_still_ready_to_start(self):
-        """All registry experiments must have status=READY_TO_START."""
-        registry = _load_registry()
+        """Registry lifecycle matches explicit HTF Phase B activation."""
+        import json
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        registry = json.loads(
+            (root / "app" / "research" / "prospective_registry.json").read_text()
+        )
+
+        activated = {
+            "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
+            "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
+        }
+        expected_ts = "2026-10-06T12:54:00Z"
+
+        seen = set()
         for exp in registry["experiments"]:
-            assert exp.get("status") == "READY_TO_START", (
-                f"{exp['experiment_id']} has status {exp.get('status')}, expected READY_TO_START"
-            )
+            exp_id = exp["experiment_id"]
+            if exp_id in activated:
+                seen.add(exp_id)
+                assert exp.get("status") == "RUNNING"
+                assert exp.get("started_at") == expected_ts
+                assert exp.get("freeze_ts") == expected_ts
+            else:
+                assert exp.get("status") == "READY_TO_START", (
+                    f"{exp_id} has unexpected status {exp.get('status')}"
+                )
+                assert exp.get("started_at") is None
+
+        assert seen == activated

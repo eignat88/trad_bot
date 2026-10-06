@@ -122,6 +122,71 @@ class ProspectiveOOSObserver:
             cursor.close()
         return active
 
+    def _is_htf_db_activation_ready(
+        self, exp_id: str, expected_freeze_ts: str | None,
+    ) -> bool:
+        """Require successful DB activation before HTF prospective capture.
+
+        Registry activation alone is insufficient.  HTF capture is allowed
+        only when the authoritative DB lifecycle row is RUNNING and its
+        started_at boundary exactly matches the registry freeze_ts.
+
+        Fail closed on missing rows, malformed timestamps, DB errors, PAUSED,
+        READY_TO_START, or conflicting activation boundaries.
+        """
+        if self._conn is None or not expected_freeze_ts:
+            return False
+
+        cursor = None
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                "SELECT status, started_at "
+                "FROM research.prospective_experiment "
+                "WHERE experiment_id = %s",
+                (exp_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return False
+
+            db_status, db_started_at = row
+            if str(db_status) != "RUNNING" or db_started_at is None:
+                return False
+
+            expected_dt = datetime.fromisoformat(
+                str(expected_freeze_ts).replace("Z", "+00:00")
+            )
+
+            if isinstance(db_started_at, datetime):
+                actual_dt = db_started_at
+            else:
+                actual_dt = datetime.fromisoformat(
+                    str(db_started_at).replace("Z", "+00:00")
+                )
+
+            if expected_dt.tzinfo is None:
+                expected_dt = expected_dt.replace(tzinfo=timezone.utc)
+            else:
+                expected_dt = expected_dt.astimezone(timezone.utc)
+
+            if actual_dt.tzinfo is None:
+                actual_dt = actual_dt.replace(tzinfo=timezone.utc)
+            else:
+                actual_dt = actual_dt.astimezone(timezone.utc)
+
+            return actual_dt == expected_dt
+
+        except Exception:
+            logger.exception(
+                "HTF prospective activation lookup failed for %s",
+                exp_id,
+            )
+            return False
+        finally:
+            if cursor is not None:
+                cursor.close()
+
     def _is_direction_active(self, exp_id: str, direction: str) -> bool:
         """Check the direction-level DB lifecycle state before capture.
 
@@ -266,6 +331,13 @@ class ProspectiveOOSObserver:
                     freeze_ts = exp_spec.get("freeze_ts")
                     if not freeze_ts:
                         continue
+
+                    # Registry activation alone must never enable capture.
+                    # The authoritative DB lifecycle must be RUNNING at the
+                    # exact same frozen boundary.
+                    if not self._is_htf_db_activation_ready(exp_id, freeze_ts):
+                        continue
+
                     freeze_dt = datetime.fromisoformat(
                         str(freeze_ts).replace("Z", "+00:00")
                     )
