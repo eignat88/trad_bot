@@ -262,9 +262,19 @@ def _find_reaction_end(
             if direction == "LONG"
             else reaction_high - reaction_low
         )
-        aligned_extreme = reaction_low if direction == "LONG" else reaction_high
         candle_atr = atr_by_index[index]
-        extreme_distance = abs(float(aligned_extreme) - level.price) / candle_atr if candle_atr > 0 else 0.0
+        if direction == "LONG":
+            extreme_distance = (
+                (reaction_high - level.price) / candle_atr
+                if candle_atr > 0
+                else 0.0
+            )
+        else:
+            extreme_distance = (
+                (level.price - reaction_low) / candle_atr
+                if candle_atr > 0
+                else 0.0
+            )
         body_atr = body / candle_atr if candle_atr > 0 else 0.0
         average_volume = (
             sum(float(item.volume) for item in closed[: index + 1]) / (index + 1)
@@ -328,12 +338,16 @@ def _structure_reference(
         reference = max(float(item.high) for item in window)
     else:
         reference = min(float(item.low) for item in window)
-    reference_index = start + max(
-        range(len(window)),
-        key=lambda offset: (window[offset].high, -offset)
-        if direction == "LONG"
-        else (window[offset].low, -offset),
-    )
+    if direction == "LONG":
+        reference_index = start + max(
+            range(len(window)),
+            key=lambda offset: (window[offset].high, -offset),
+        )
+    else:
+        reference_index = start + min(
+            range(len(window)),
+            key=lambda offset: (window[offset].low, offset),
+        )
     return reference, reference_index
 
 
@@ -361,7 +375,11 @@ def _make_candidate(
         invalidation = structural_stop
         target_2 = entry - 3.0 * (structural_stop - entry)
 
-    risk_abs = float(event["reaction_high"]) - float(event["reaction_low"]) if direction == "SHORT" else entry - structural_stop
+    risk_abs = (
+        structural_stop - entry
+        if direction == "SHORT"
+        else entry - structural_stop
+    )
     if risk_abs <= 0:
         raise ValueError(f"invalid structural risk: {risk_abs}")
 

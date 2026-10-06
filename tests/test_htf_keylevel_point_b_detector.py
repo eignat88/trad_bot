@@ -222,19 +222,99 @@ def _long_history() -> list[Candle]:
 
 def _short_history() -> list[Candle]:
     rows = []
+
+    # Stable execution history below HTF resistance.
     for i in range(20):
-        rows.append(candle(i, high=100.2, low=99.8, close=100.0))
+        rows.append(
+            candle(
+                i,
+                high=100.2,
+                low=99.8,
+                close=100.0,
+                volume=10,
+            )
+        )
+
     rows.extend([
-        candle(20, high=102.1, low=100.0, close=101.6, volume=20),
-        candle(21, high=100.4, low=96.5, close=96.8, volume=100),
-        candle(22, high=100.4, low=96.2, close=96.5, volume=15),
-        candle(23, high=100.4, low=96.0, close=96.4, volume=10),
-        candle(24, high=100.4, low=95.5, close=96.1, volume=10),
-        candle(25, high=100.4, low=95.5, close=96.8, volume=10),
-        candle(26, high=100.4, low=95.0, close=96.0, volume=10),
-        candle(27, high=100.4, low=95.0, close=96.0, volume=10),
-        candle(28, high=100.4, low=94.5, close=96.0, volume=10),
+        # Resistance touch.
+        candle(
+            20,
+            high=102.2,
+            low=100.0,
+            close=101.6,
+            volume=20,
+        ),
+
+        # First bearish reaction candle.
+        candle(
+            21,
+            high=101.7,
+            low=96.5,
+            close=96.8,
+            volume=100,
+        ),
+
+        # Reaction confirmation.
+        # Its low becomes the causal local structure reference.
+        candle(
+            22,
+            high=97.0,
+            low=96.0,
+            close=96.3,
+            volume=20,
+        ),
+
+        # Genuine bearish structure break.
+        # prior_low ~= 96.0; this close is deliberately far below it.
+        candle(
+            23,
+            high=95.0,
+            low=94.2,
+            close=94.5,
+            volume=30,
+        ),
+
+        # Point-B retracement.
+        # break=94.5, structure~=96.0, leg~=1.5
+        # high=95.25 -> retrace ~= 0.50.
+        candle(
+            24,
+            high=95.25,
+            low=94.7,
+            close=95.0,
+            volume=15,
+        ),
+
+        candle(
+            25,
+            high=95.2,
+            low=94.7,
+            close=94.9,
+            volume=10,
+        ),
+        candle(
+            26,
+            high=95.1,
+            low=94.6,
+            close=94.8,
+            volume=10,
+        ),
+        candle(
+            27,
+            high=95.0,
+            low=94.5,
+            close=94.7,
+            volume=10,
+        ),
+        candle(
+            28,
+            high=95.0,
+            low=94.4,
+            close=94.7,
+            volume=10,
+        ),
     ])
+
     return rows
 
 
@@ -311,10 +391,12 @@ def test_reaction_without_break_has_no_signal() -> None:
 
 
 def test_break_without_point_b_has_no_signal() -> None:
-    rows = _long_history()[:23]
+    # Include the genuine structure-break candle, but never retrace
+    # deeply enough to enter the frozen 0.25-0.75 Point-B band.
+    rows = _long_history()[:24]
     neutral_tail = [
-        candle(53 + index, high=103.0, low=102.6, close=102.9, volume=10)
-        for index in range(13)
+        candle(54 + index, high=105.9, low=105.4, close=105.6, volume=10)
+        for index in range(12)
     ]
     rows.extend(neutral_tail)
     result = detect_point_b_setup(
@@ -330,7 +412,18 @@ def test_break_without_point_b_has_no_signal() -> None:
 
 def test_point_b_outside_frozen_bounds_has_no_signal() -> None:
     rows = _long_history()[:26]
-    rows[25] = candle(30 + 25, high=102.3, low=99.99, close=101.0, volume=20)
+
+    # Point-B is evaluated first at position 24.
+    # break=105.7, structure~=104.0, leg~=1.7.
+    # low=105.4 gives retrace~=0.176, below frozen minimum 0.25.
+    rows[24] = candle(
+        30 + 24,
+        high=105.9,
+        low=105.4,
+        close=105.6,
+        volume=20,
+    )
+
     result = detect_point_b_setup(
         symbol="BTCUSDT",
         direction="LONG",
@@ -574,7 +667,8 @@ def test_structure_break_decision_is_historically_stable_after_later_closed_cand
         candle(100, high=100.2, low=99.8, close=100.0, volume=10.0),
         candle(101, high=100.2, low=99.4, close=100.1, volume=10.0),
         candle(102, high=104.0, low=99.4, close=103.7, volume=100.0),
-        candle(103, high=103.8, low=103.5, close=103.6, volume=10.0),
+        # Genuine causal break above the prior local HIGH at 104.0.
+        candle(103, high=105.0, low=103.5, close=104.8, volume=10.0),
         candle(104, high=104.1, low=100.0, close=104.0, volume=10.0),
     ] + [
         candle(index, high=104.2, low=103.8, close=104.0, volume=10.0)
@@ -608,7 +702,8 @@ def test_structure_break_decision_is_historically_stable_after_later_closed_cand
     assert history_a[105:] != history_b[105:]
     assert atr_a[104] == atr_b[104]
     assert result_a[0] == result_b[0] == 103
-    assert result_a[2] == result_b[2] == 99.4
+    assert result_a[2] == result_b[2] == 104.0
+    assert result_a[3] == result_b[3] == 102
     assert full_a != full_b
 
 
