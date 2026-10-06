@@ -492,6 +492,7 @@ def detect_point_b_setup(
     htf_candles: Sequence[Candle],
     current_time: datetime,
     market_regime: str | None = None,
+    touch_after_timestamp: int | None = None,
 ) -> DetectionResult:
     """Detect one HTF key-level setup using only the supplied candle prefix."""
     if direction not in {"LONG", "SHORT"}:
@@ -521,6 +522,11 @@ def detect_point_b_setup(
     touch_price: float | None = None
     for index, candle in enumerate(closed):
         if candle.timestamp < level.available_timestamp:
+            continue
+        if (
+            touch_after_timestamp is not None
+            and int(candle.timestamp) <= int(touch_after_timestamp)
+        ):
             continue
         candle_atr = atr_by_index[index]
         low_distance = (float(candle.low) - level.price) / candle_atr if candle_atr > 0 else float("inf")
@@ -717,6 +723,65 @@ def detect_point_b_setup(
         setup_event_id=setup_event_id,
     )
 
+
+
+def detect_point_b_setups(
+    *,
+    symbol: str,
+    direction: str,
+    execution_candles: Sequence[Candle],
+    htf_candles: Sequence[Candle],
+    current_time: datetime,
+    market_regime: str | None = None,
+) -> list[DetectionResult]:
+    """Return sequential independent completed Point-B events.
+
+    The frozen single-event geometry remains unchanged.  After one completed
+    event, the next search may only begin with a key-level touch strictly
+    after that event's Point-B candle.  This prevents an older immutable
+    completion from masking later completions in the same rolling window.
+    """
+    results: list[DetectionResult] = []
+    seen_event_ids: set[str] = set()
+    touch_after_timestamp: int | None = None
+
+    # A completed event advances the cursor, so the loop is strictly
+    # monotonic.  The defensive bound also guarantees termination if malformed
+    # candidate metadata ever reaches this research-only path.
+    for _ in range(len(execution_candles)):
+        result = detect_point_b_setup(
+            symbol=symbol,
+            direction=direction,
+            execution_candles=execution_candles,
+            htf_candles=htf_candles,
+            current_time=current_time,
+            market_regime=market_regime,
+            touch_after_timestamp=touch_after_timestamp,
+        )
+
+        if result.signal is None or not result.setup_event_id:
+            break
+
+        if result.setup_event_id in seen_event_ids:
+            break
+
+        seen_event_ids.add(result.setup_event_id)
+        results.append(result)
+
+        signal_open_time = result.signal.features.get("signal_candle_open_time")
+        if signal_open_time is None:
+            break
+
+        next_cursor = int(signal_open_time)
+        if (
+            touch_after_timestamp is not None
+            and next_cursor <= touch_after_timestamp
+        ):
+            break
+
+        touch_after_timestamp = next_cursor
+
+    return results
 
 def detect_context_setup(ctx: MarketContext, direction: str) -> DetectionResult:
     """Adapter for an existing MarketContext without changing scanner output."""

@@ -865,3 +865,79 @@ def test_short_signal_risk_is_entry_to_reaction_high() -> None:
 
     assert risk > 0
     assert abs(risk - (stop - entry)) < 1e-12
+
+def test_completed_event_does_not_mask_later_independent_event():
+    """A completed event must not permanently mask a later independent event."""
+    from app.research.htf_keylevel_point_b import detect_point_b_setups
+
+    first = _long_history()
+
+    # Create enough quiet space after the first completed Point-B.
+    rows = list(first)
+    base_index = 30 + 29
+
+    for offset in range(1, 22):
+        rows.append(
+            candle(
+                base_index + offset,
+                high=100.4,
+                low=100.0,
+                close=100.2,
+                volume=10,
+            )
+        )
+
+    # Second independent interaction with the same support.
+    second_start = base_index + 22
+
+    rows.extend([
+        candle(
+            second_start,
+            high=100.3,
+            low=99.4,
+            close=100.1,
+            volume=20,
+        ),
+        candle(
+            second_start + 1,
+            high=104.0,
+            low=99.5,
+            close=103.7,
+            volume=100,
+        ),
+        candle(
+            second_start + 2,
+            high=104.0,
+            low=103.3,
+            close=103.6,
+            volume=20,
+        ),
+        candle(
+            second_start + 3,
+            high=106.0,
+            low=103.8,
+            close=105.7,
+            volume=30,
+        ),
+        candle(
+            second_start + 4,
+            high=105.5,
+            low=104.85,
+            close=105.1,
+            volume=15,
+        ),
+    ])
+
+    results = detect_point_b_setups(
+        symbol="BTCUSDT",
+        direction="LONG",
+        execution_candles=rows,
+        htf_candles=_flat_htf("LONG"),
+        current_time=_candle_time(rows[-1]) + timedelta(minutes=5),
+    )
+
+    completed = [r for r in results if r.signal is not None]
+
+    assert len(completed) >= 2
+    assert completed[0].setup_event_id != completed[1].setup_event_id
+    assert completed[0].signal.detected_at < completed[1].signal.detected_at
