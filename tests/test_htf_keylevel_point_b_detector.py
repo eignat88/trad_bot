@@ -728,3 +728,59 @@ def test_future_candles_do_not_change_already_emitted_signal() -> None:
     assert before.setup_event_id == after.setup_event_id
     assert before.signal.reference_price == after.signal.reference_price
     assert before.signal.signal_candle_open_time == after.signal.signal_candle_open_time
+
+def test_short_structure_reference_index_matches_minimum_low() -> None:
+    import app.research.htf_keylevel_point_b as detector
+
+    rows = [
+        candle(
+            index,
+            high=101.0 + index * 0.01,
+            low=99.0,
+            close=100.0,
+            volume=10.0,
+        )
+        for index in range(20)
+    ]
+
+    # Put the unique causal minimum inside the active structure window.
+    rows[15] = candle(
+        15,
+        high=100.5,
+        low=95.25,
+        close=99.0,
+        volume=10.0,
+    )
+
+    reference = detector._structure_reference(
+        rows,
+        end_index=20,
+        direction="SHORT",
+    )
+
+    assert reference is not None
+    reference_price, reference_index = reference
+    assert reference_price == 95.25
+    assert reference_index == 15
+
+
+def test_short_signal_risk_is_entry_to_reaction_high() -> None:
+    history = _short_history()
+
+    result = detect_point_b_setup(
+        symbol="BTCUSDT",
+        direction="SHORT",
+        execution_candles=history,
+        htf_candles=_flat_htf("SHORT"),
+        current_time=_candle_time(history[26]),
+    )
+
+    assert result.signal is not None
+
+    features = result.signal.features
+    entry = float(features["entry_reference_price"])
+    stop = float(features["structural_stop_price"])
+    risk = float(features["risk_abs"])
+
+    assert risk > 0
+    assert abs(risk - (stop - entry)) < 1e-12
