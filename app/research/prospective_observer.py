@@ -221,7 +221,14 @@ class ProspectiveOOSObserver:
                 elif exp_spec["direction"] != direction:
                     continue
 
-                if exp_id.startswith("ME_SHORT_GEOM_"):
+                if exp_id.startswith("HTF_KEYLEVEL_"):
+                    obs_id = self._observe_htf_keylevel(
+                        cursor, exp_id, exp_spec,
+                        source_key, symbol, direction, signal_time,
+                        reference_price, invalidation_price, target_1, target_2,
+                        score, features, parameters, market_regime,
+                    )
+                elif exp_id.startswith("ME_SHORT_GEOM_"):
                     obs_id = self._observe_me_geometry(
                         cursor, exp_id, exp_spec,
                         source_key, symbol, direction, signal_time,
@@ -410,6 +417,60 @@ class ProspectiveOOSObserver:
             RETURNING observation_id
             """,
             insert_rows,
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+    def _observe_htf_keylevel(
+        self, cursor, exp_id: str, exp_spec: dict,
+        source_key: int, symbol: str, direction: str, signal_time: Any,
+        reference_price: float, invalidation_price: float | None,
+        target_1: float | None, target_2: float | None, score: float,
+        features: dict, parameters: dict, market_regime: str | None,
+    ) -> int | None:
+        """Capture the isolated HTF key-level Point-B/BASELINE cohort.
+
+        This branch is additive and keyed only by the two experiment IDs.  It
+        never changes existing frozen experiment observation semantics.
+        """
+        if exp_id not in {"HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
+                          "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE"}:
+            return None
+        if not features or features.get("setup_event_id") is None:
+            return None
+        if direction not in {"LONG", "SHORT"}:
+            return None
+        if reference_price <= 0 or invalidation_price is None or invalidation_price <= 0:
+            return None
+        risk_abs = reference_price - invalidation_price if direction == "LONG" else invalidation_price - reference_price
+        if risk_abs <= 0:
+            return None
+        if exp_id.startswith("HTF_KEYLEVEL_SR_BREAK_") and features.get("cohort") != "POINT_B":
+            return None
+        if exp_id.endswith("BASELINE_V1_PROSPECTIVE") and features.get("cohort") != "BASELINE":
+            return None
+        features_with_protocol = dict(features)
+        features_with_protocol["_frozen_max_hold"] = 240
+        features_with_protocol["_frozen_intrabar_policy"] = "STOP_FIRST"
+        features_with_protocol["_structural_r"] = risk_abs
+        cursor.execute(
+            """
+            INSERT INTO research.prospective_observation (
+                experiment_id, source_signal_id, source_observation_id,
+                symbol, direction, signal_time,
+                reference_price, invalidation_price, target_1, target_2,
+                score, rule_passed, filter_reason,
+                features, parameters, market_regime
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (experiment_id, source_signal_id) DO NOTHING
+            RETURNING observation_id
+            """,
+            (
+                exp_id, source_key, None, symbol, direction, signal_time,
+                reference_price, invalidation_price, target_1, target_2,
+                score, True, "HTF_KEYLEVEL_PROSPECTIVE_COHORT_CAPTURE",
+                json.dumps(features_with_protocol), json.dumps(parameters), market_regime,
+            ),
         )
         row = cursor.fetchone()
         return row[0] if row else None
