@@ -493,6 +493,7 @@ class ProspectiveOOSObserver:
         return {
             "symbol": features["symbol"],
             "direction": direction,
+            "cohort": features["cohort"],
             "level_price": features["key_level_price"],
             "level_type": features["key_level_type"],
             "touch_time": features["touch_time"],
@@ -700,6 +701,104 @@ class ProspectiveOOSObserver:
         row = cursor.fetchone()
         return row[0] if row else None
 
+    @staticmethod
+    def _build_htf_point_b_observation_payload(
+        *,
+        exp_id: str,
+        authoritative: dict[str, Any] | None,
+        setup_event_id: str | None,
+        default_symbol: str,
+        default_direction: str,
+        default_signal_time: Any,
+        default_reference_price: float,
+        default_invalidation_price: float | None,
+        default_target_1: float | None,
+        default_target_2: float | None,
+        parameters: dict,
+        market_regime: str | None,
+        source_key: int,
+    ) -> dict[str, Any] | None:
+        """Build the shared HTF Point-B observation payload.
+
+        This is the single authoritative mapping used by runtime capture and
+        completed-event recovery.  It is deliberately scoped to the two HTF
+        key-level experiments and never mutates the authoritative source row.
+        """
+        if exp_id not in {
+            "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
+            "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
+        } or not setup_event_id:
+            return None
+
+        features: dict[str, Any] | None = None
+        if authoritative is not None:
+            snapshot = authoritative.get("snapshot")
+            if not isinstance(snapshot, dict):
+                return None
+            snapshot_experiment_id = snapshot.get("experiment_id") or authoritative.get("experiment_id")
+            if snapshot_experiment_id != exp_id:
+                return None
+            features = dict(snapshot)
+            if (
+                exp_id == "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE"
+                and features.get("cohort") is None
+                and snapshot.get("setup_event_id") == setup_event_id
+                and bool(snapshot.get("symbol"))
+            ):
+                features.setdefault("cohort", "POINT_B")
+            symbol = str(snapshot["symbol"])
+            direction = str(snapshot["direction"])
+            signal_time = snapshot["signal_time"]
+            reference_price = float(snapshot["entry_reference_price"])
+            invalidation_price = float(snapshot["structural_stop_price"])
+            target_1 = snapshot.get("target_1")
+            target_2 = snapshot.get("target_2")
+        else:
+            return None
+
+        if not features or features.get("setup_event_id") != setup_event_id:
+            return None
+        if direction not in {"LONG", "SHORT"}:
+            return None
+        if reference_price <= 0 or invalidation_price is None or invalidation_price <= 0:
+            return None
+        risk_abs = (
+            reference_price - invalidation_price
+            if direction == "LONG"
+            else invalidation_price - reference_price
+        )
+        if risk_abs <= 0:
+            return None
+        if exp_id.startswith("HTF_KEYLEVEL_SR_BREAK_") and features.get("cohort") != "POINT_B":
+            return None
+        if exp_id.endswith("BASELINE_V1_PROSPECTIVE") and features.get("cohort") != "BASELINE":
+            return None
+        features_with_protocol = dict(features)
+        features_with_protocol["_frozen_max_hold"] = 240
+        features_with_protocol["_frozen_intrabar_policy"] = "STOP_FIRST"
+        features_with_protocol["_structural_r"] = risk_abs
+        features_with_protocol["_authoritative_completion"] = (
+            authoritative is not None
+            and exp_id == "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE"
+        )
+        return {
+            "experiment_id": exp_id,
+            "source_signal_id": source_key,
+            "symbol": symbol,
+            "direction": direction,
+            "signal_time": signal_time,
+            "reference_price": reference_price,
+            "invalidation_price": invalidation_price,
+            "target_1": target_1,
+            "target_2": target_2,
+            "score": 0.0,
+            "rule_passed": True,
+            "filter_reason": "HTF_KEYLEVEL_PROSPECTIVE_COHORT_CAPTURE",
+            "features": json.dumps(features_with_protocol),
+            "parameters": json.dumps(parameters),
+            "market_regime": market_regime,
+        }
+
     def _observe_htf_keylevel(
         self, cursor, exp_id: str, exp_spec: dict,
         source_key: int, symbol: str, direction: str, signal_time: Any,
@@ -721,41 +820,46 @@ class ProspectiveOOSObserver:
         BASELINE continues to use its contemporaneous detector snapshot and
         never owns completion state.
         """
-        if exp_id not in {"HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
-                          "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE"}:
-            return None
-        if not setup_event_id:
-            return None
         if authoritative is not None:
-            snapshot = authoritative.get("snapshot")
-            if not isinstance(snapshot, dict):
-                return None
-            features = snapshot
-            symbol = str(snapshot["symbol"])
-            direction = str(snapshot["direction"])
-            signal_time = snapshot["signal_time"]
-            reference_price = float(snapshot["entry_reference_price"])
-            invalidation_price = float(snapshot["structural_stop_price"])
-            target_1 = snapshot.get("target_1")
-            target_2 = snapshot.get("target_2")
-        elif not features or features.get("setup_event_id") != setup_event_id:
+            payload = self._build_htf_point_b_observation_payload(
+                exp_id=exp_id,
+                authoritative=authoritative,
+                setup_event_id=setup_event_id,
+                default_symbol=symbol,
+                default_direction=direction,
+                default_signal_time=signal_time,
+                default_reference_price=reference_price,
+                default_invalidation_price=invalidation_price,
+                default_target_1=target_1,
+                default_target_2=target_2,
+                parameters=parameters,
+                market_regime=market_regime,
+                source_key=source_key,
+            )
+        elif exp_id == "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE":
+            payload = self._build_htf_point_b_observation_payload(
+                exp_id=exp_id,
+                authoritative={
+                    "experiment_id": exp_id,
+                    "setup_event_id": setup_event_id,
+                    "snapshot": {**dict(features), "experiment_id": exp_id},
+                },
+                setup_event_id=setup_event_id,
+                default_symbol=symbol,
+                default_direction=direction,
+                default_signal_time=signal_time,
+                default_reference_price=reference_price,
+                default_invalidation_price=invalidation_price,
+                default_target_1=target_1,
+                default_target_2=target_2,
+                parameters=parameters,
+                market_regime=market_regime,
+                source_key=source_key,
+            )
+        else:
             return None
-        if direction not in {"LONG", "SHORT"}:
+        if payload is None:
             return None
-        if reference_price <= 0 or invalidation_price is None or invalidation_price <= 0:
-            return None
-        risk_abs = reference_price - invalidation_price if direction == "LONG" else invalidation_price - reference_price
-        if risk_abs <= 0:
-            return None
-        if exp_id.startswith("HTF_KEYLEVEL_SR_BREAK_") and features.get("cohort") != "POINT_B":
-            return None
-        if exp_id.endswith("BASELINE_V1_PROSPECTIVE") and features.get("cohort") != "BASELINE":
-            return None
-        features_with_protocol = dict(features)
-        features_with_protocol["_frozen_max_hold"] = 240
-        features_with_protocol["_frozen_intrabar_policy"] = "STOP_FIRST"
-        features_with_protocol["_structural_r"] = risk_abs
-        features_with_protocol["_authoritative_completion"] = authoritative is not None
         cursor.execute(
             """
             INSERT INTO research.prospective_observation (
@@ -769,10 +873,22 @@ class ProspectiveOOSObserver:
             RETURNING observation_id
             """,
             (
-                exp_id, source_key, None, symbol, direction, signal_time,
-                reference_price, invalidation_price, target_1, target_2,
-                score, True, "HTF_KEYLEVEL_PROSPECTIVE_COHORT_CAPTURE",
-                json.dumps(features_with_protocol), json.dumps(parameters), market_regime,
+                payload["experiment_id"],
+                payload["source_signal_id"],
+                None,
+                payload["symbol"],
+                payload["direction"],
+                payload["signal_time"],
+                payload["reference_price"],
+                payload["invalidation_price"],
+                payload["target_1"],
+                payload["target_2"],
+                payload["score"],
+                payload["rule_passed"],
+                payload["filter_reason"],
+                payload["features"],
+                payload["parameters"],
+                payload["market_regime"],
             ),
         )
         row = cursor.fetchone()
