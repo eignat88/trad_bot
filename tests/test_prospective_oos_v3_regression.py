@@ -232,6 +232,20 @@ class TestMEABCExactPairing:
         assert exp_ids["ME_SHORT_GEOM_B_V1"].get("paired_with") == "ME_SHORT_GEOM_A_V1"
         assert exp_ids["ME_SHORT_GEOM_C_V1"].get("paired_with") == "ME_SHORT_GEOM_A_V1"
 
+    def test_srr_execution_r_expansion_registry_entry_is_inactive(self):
+        """New SRR execution-R expansion experiment remains registered but inactive."""
+        import json
+        registry = json.loads(
+            (PROJECT_ROOT / "app" / "research" / "prospective_registry.json").read_text()
+        )
+        exp_ids = {e["experiment_id"]: e for e in registry["experiments"]}
+        exp = exp_ids["SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1"]
+        assert exp["scanner_name"] == "SUPPORT_RESISTANCE_REACTION"
+        assert exp["direction"] == "SHORT"
+        assert exp["status"] == "READY_TO_START"
+        assert exp["started_at"] is None
+        assert exp["freeze_ts"] is None
+
     def test_me_geometry_variant_formulas_are_distinct(self):
         """A/B/C must compute different variant geometry values."""
         source = (PROJECT_ROOT / "app" / "research" / "prospective_observer.py").read_text()

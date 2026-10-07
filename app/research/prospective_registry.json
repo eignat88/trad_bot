@@ -517,6 +517,88 @@
       "status": "READY_TO_START"
     },
     {
+      "experiment_id": "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1",
+      "version": 1,
+      "scanner_name": "SUPPORT_RESISTANCE_REACTION",
+      "direction": "SHORT",
+      "experiment_type": "OOS_EXECUTION_VALIDATION",
+      "hypothesis": "A frozen SRR SHORT execution protocol using entry at reference_price, SL at 2.00 structural_R, TP at 1.50 structural_R, 120-minute max hold, and STOP_FIRST same-candle handling has positive net expectancy after normal project transaction costs on strictly new prospective OOS data.",
+      "primary_metric": "Net E[R] after normal project costs, normalized by execution_R = 2.00 * structural_R",
+      "secondary_metrics": [
+        "Gross E[R]",
+        "Net PF normal",
+        "Gross PF",
+        "Total Net R",
+        "win rate",
+        "TP count",
+        "SL count",
+        "AMBIGUOUS count",
+        "TIMEOUT count",
+        "normal cost_R distribution",
+        "elevated Net E[R]",
+        "elevated PF",
+        "day concentration",
+        "symbol concentration"
+      ],
+      "filter_rule": "NONE - capture every valid new SUPPORT_RESISTANCE_REACTION SHORT candidate after strict freeze; this is an execution-geometry validation experiment, not a signal-filter experiment.",
+      "threshold": null,
+      "freeze_ts": null,
+      "entry_rule": "FROZEN: entry = reference_price; structural_R = abs(reference_price - invalidation_price); entry > 0, invalidation_price > 0, and structural_R > 0.",
+      "stop_rule": "FROZEN SHORT stop = entry + 2.00 * structural_R.",
+      "target_rule": "FROZEN SHORT target = entry - 1.50 * structural_R.",
+      "max_hold_minutes": 120,
+      "intrabar_policy": "STOP_FIRST",
+      "cost_model": {
+        "normal_round_trip_pct": 0.0021,
+        "elevated_round_trip_pct": 0.0031,
+        "normal_cost_r_formula": "0.0021 * entry / (2.00 * structural_R)",
+        "elevated_cost_r_formula": "0.0031 * entry / (2.00 * structural_R)",
+        "primary_scenario": "NORMAL_COST"
+      },
+      "execution_normalization": {
+        "structural_r": "abs(entry - invalidation_price)",
+        "execution_r": "2.00 * structural_R",
+        "tp_execution_r": 0.75,
+        "sl_execution_r": -1.0,
+        "stop_first_ambiguous_execution_r": -1.0,
+        "timeout_gross_r": "-(return_at_120m / 100.0) * entry / execution_R",
+        "timeout_return_source": "last eligible 5m candle close before the 120m cutoff"
+      },
+      "position_sizing_rule": "shadow_only",
+      "fee_assumption": "normal round-trip 0.21%; elevated sensitivity round-trip 0.31%; no paper or live execution.",
+      "horizons": [
+        "15m",
+        "30m",
+        "60m",
+        "120m",
+        "240m"
+      ],
+      "minimum_n": 300,
+      "minimum_symbols": 30,
+      "minimum_oos_days": 14,
+      "contamination_guard": {
+        "rule": "signal_time > freeze_ts",
+        "pre_freeze_treatment": "FORBIDDEN_FOR_VALIDATION",
+        "backfill": "FORBIDDEN",
+        "historical_688_population": "DISCOVERY_ONLY",
+        "expected_initial_observations": 0
+      },
+      "validation_criteria": {
+        "before_sample_gates": "INCONCLUSIVE_CONTINUE_OOS",
+        "normal_cost_requires": [
+          "Net E[R] > 0",
+          "Net PF > 1",
+          "bootstrap 95% CI lower bound > 0",
+          "no catastrophic day or symbol concentration"
+        ],
+        "elevated_cost_treatment": "mandatory sensitivity; negative elevated results are reported as execution fragility and are not represented as cost robustness"
+      },
+      "parent_discovery": "SRR_SHORT_EXECUTION_R_EXPANSION_COUNTERFACTUAL_V1",
+      "parent_closed_experiment": "SRR_OOS_SCANNER_V1_PROSPECTIVE / SHORT / CLOSED_NEGATIVE",
+      "started_at": null,
+      "status": "READY_TO_START"
+    },
+    {
       "experiment_id": "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
       "scanner_name": "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
       "direction": "LONG",

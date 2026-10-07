@@ -1,4 +1,4 @@
-"""Prospective OOS Observer — captures candidates for prospective OOS experiments.
+"""Prospective OOS Observer вЂ” captures candidates for prospective OOS experiments.
 
 Positioned AFTER the generic research observer but BEFORE any further filtering.
 For each candidate from a registered scanner x direction:
@@ -394,6 +394,13 @@ class ProspectiveOOSObserver:
                         reference_price, invalidation_price, target_1, target_2,
                         score, features, parameters, market_regime,
                     )
+                elif exp_id == "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1":
+                    obs_id = self._observe_srr_short_execution_r_expansion(
+                        cursor, exp_id, exp_spec,
+                        source_key, symbol, direction, signal_time,
+                        reference_price, invalidation_price, target_1, target_2,
+                        score, features, parameters, market_regime,
+                    )
                 else:
                     obs_id = self._observe_standard(
                         cursor, exp_id, exp_spec,
@@ -405,7 +412,7 @@ class ProspectiveOOSObserver:
                 if obs_id is not None:
                     observation_ids.append(obs_id)
                     self._stats[exp_id] = self._stats.get(exp_id, 0) + 1
-                    # ── Immediately promote to research_signal ──
+                    # в”Ђв”Ђ Immediately promote to research_signal в”Ђв”Ђ
                     self._promote_observation(obs_id)
 
             self._conn.commit()
@@ -907,6 +914,113 @@ class ProspectiveOOSObserver:
         if row:
             return row[0]
         return None
+
+    def _observe_srr_short_execution_r_expansion(
+        self, cursor, exp_id: str, exp_spec: dict,
+        source_key: int, symbol: str, direction: str, signal_time: Any,
+        reference_price: float, invalidation_price: float | None,
+        target_1: float | None, target_2: float | None, score: float,
+        features: dict, parameters: dict, market_regime: str | None,
+    ) -> int | None:
+        """Insert the frozen SRR SHORT execution-R expansion observation.
+
+        This is an independent, observe-only prospective experiment. It does
+        not alter SRR_OOS_SCANNER_V1_PROSPECTIVE or any scanner/paper/live
+        behavior. It captures only valid SUPPORT_RESISTANCE_REACTION SHORT
+        candidates with positive structural R after the strict freeze boundary.
+        """
+        freeze_ts = exp_spec.get("freeze_ts")
+        if not freeze_ts:
+            return None
+
+        # Registry freeze alone must never activate prospective capture.
+        # Require authoritative DB RUNNING state with started_at exactly
+        # equal to the frozen registry boundary.
+        if not self._is_htf_db_activation_ready(exp_id, freeze_ts):
+            return None
+
+        if direction != "SHORT":
+            return None
+        if invalidation_price is None:
+            return None
+        if reference_price <= 0 or invalidation_price <= 0:
+            return None
+
+        signal_dt = (
+            signal_time
+            if isinstance(signal_time, datetime)
+            else datetime.fromisoformat(
+                str(signal_time).replace("Z", "+00:00")
+            )
+        )
+        freeze_dt = datetime.fromisoformat(
+            str(freeze_ts).replace("Z", "+00:00")
+        )
+        if signal_dt.tzinfo is None:
+            signal_dt = signal_dt.replace(tzinfo=timezone.utc)
+        else:
+            signal_dt = signal_dt.astimezone(timezone.utc)
+        if freeze_dt.tzinfo is None:
+            freeze_dt = freeze_dt.replace(tzinfo=timezone.utc)
+        else:
+            freeze_dt = freeze_dt.astimezone(timezone.utc)
+        if signal_dt <= freeze_dt:
+            return None
+
+        entry_price = float(reference_price)
+        invalidation = float(invalidation_price)
+        structural_r = abs(entry_price - invalidation)
+        if entry_price <= 0 or structural_r <= 0:
+            return None
+        if direction == "SHORT" and invalidation <= entry_price:
+            return None
+
+        frozen_sl_r = float(exp_spec.get("frozen_sl_r", 2.0))
+        frozen_tp_r = float(exp_spec.get("frozen_tp_r", 1.5))
+        frozen_max_hold = int(exp_spec.get("max_hold_minutes", 120))
+        execution_r = frozen_sl_r * structural_r
+
+        variant_entry = entry_price
+        variant_stop = entry_price + frozen_sl_r * structural_r
+        variant_target = entry_price - frozen_tp_r * structural_r
+
+        frozen_features = dict(features)
+        frozen_features.update({
+            "_structural_r": structural_r,
+            "_frozen_sl_r": frozen_sl_r,
+            "_frozen_tp_r": frozen_tp_r,
+            "_frozen_max_hold": frozen_max_hold,
+            "_frozen_intrabar_policy": "STOP_FIRST",
+            "_execution_r_abs": execution_r,
+            "_execution_r_definition": f"{frozen_sl_r:.2f} * structural_R",
+            "_frozen_freeze_ts": freeze_ts,
+        })
+
+        cursor.execute(
+            """
+            INSERT INTO research.prospective_observation (
+                experiment_id, source_signal_id, source_observation_id,
+                symbol, direction, signal_time,
+                reference_price, invalidation_price, target_1, target_2,
+                score, rule_passed, filter_reason,
+                variant_entry, variant_stop, variant_target,
+                features, parameters, market_regime
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (experiment_id, source_signal_id) DO NOTHING
+            RETURNING observation_id
+            """,
+            (
+                exp_id, source_key, None,
+                symbol, direction, signal_time,
+                entry_price, invalidation_price, target_1, target_2,
+                score,
+                "srr_short_execution_r_expansion_frozen_geometry",
+                variant_entry, variant_stop, variant_target,
+                json.dumps(frozen_features), json.dumps(parameters), market_regime,
+            ),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
 
     @property
     def stats(self) -> dict[str, int]:
