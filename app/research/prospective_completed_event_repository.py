@@ -231,6 +231,8 @@ class ProspectiveCompletedEventRepository:
         snapshot_dict.setdefault("frozen_at", frozen_at.isoformat() if hasattr(frozen_at, "isoformat") else frozen_at)
         symbol = str(snapshot_dict["symbol"])
         direction = str(snapshot_dict["direction"])
+        if experiment_id == "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE":
+            snapshot_dict.setdefault("cohort", "POINT_B")
         frozen_value = frozen_at
         payload = json.dumps(
             snapshot_dict,
