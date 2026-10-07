@@ -48,6 +48,11 @@ ENV_PATH = PROJECT_ROOT / ".env"
 LOG_DIR = PROJECT_ROOT / "logs"
 logger = logging.getLogger("paper_runner")
 
+# Paper-entry routing only. Scanner and research/OOS continue to receive the
+# canonical signal, while similarly named research/production variants remain
+# independently routable.
+PAPER_DISABLED_SCANNERS: frozenset[str] = frozenset({"MOMENTUM_EXHAUSTION"})
+
 
 def setup_logging() -> None:
     """Configure runner logging only when the executable is started."""
@@ -310,6 +315,25 @@ def _load_ready_setups(repo: ScannerRepository) -> list[dict]:
     return repo.load_ready_setups()
 
 
+def _filter_paper_entry_candidates(candidates: list[Any]) -> tuple[list[Any], int]:
+    """Remove strategies disabled only at the production paper-entry boundary."""
+    allowed = []
+    disabled = 0
+    for candidate in candidates:
+        if candidate.scanner_name in PAPER_DISABLED_SCANNERS:
+            disabled += 1
+            logger.info(
+                "paper entry strategy disabled: setup=%s scanner=%s direction=%s "
+                "reason_code=PAPER_STRATEGY_DISABLED",
+                candidate.setup_id,
+                candidate.scanner_name,
+                candidate.direction,
+            )
+            continue
+        allowed.append(candidate)
+    return allowed, disabled
+
+
 def run_entry_cycle(
     engine: PaperTradingEngine,
     client: BybitClient,
@@ -330,6 +354,7 @@ def run_entry_cycle(
     stats: dict[str, Any] = {
         "entries": 0, "skipped_no_setup": 0,
         "expectancy_rejected": 0, "emergency_stop": 0,
+        "strategy_disabled": 0,
     }
 
     # --- 1. CHECK ENTRIES (read from DB, fetch prices only) ---
@@ -370,6 +395,7 @@ def run_entry_cycle(
             )
             for s in ready_setups
         ]
+        candidates, stats["strategy_disabled"] = _filter_paper_entry_candidates(candidates)
 
         # Re-check at entry time: an operator gate update is applied on the
         # next paper cycle even to setups that were READY before the update.
@@ -596,8 +622,8 @@ def main() -> None:
                 shadow_engine=shadow_engine,
             )
             logger.info(
-                "cycle #%d: entries=%d open=%d balance=$%.2f",
-                cycle, stats["entries"],
+                "cycle #%d: entries=%d strategy_disabled=%d open=%d balance=$%.2f",
+                cycle, stats["entries"], stats["strategy_disabled"],
                 len(engine.open_trades), engine.balance,
             )
         except Exception:
