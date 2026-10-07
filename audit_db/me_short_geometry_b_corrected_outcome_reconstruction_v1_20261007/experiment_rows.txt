@@ -1,0 +1,29 @@
+-[ RECORD 1 ]---+--------------------------------------
+experiment_id   | ME_SHORT_GEOM_A_V1
+version         | 1
+scanner_name    | MOMENTUM_EXHAUSTION
+direction       | SHORT
+experiment_type | GEOMETRY_CONTROL
+status          | RUNNING
+started_at      | 2026-09-28 16:30:39.751355+00
+primary_metric  | MFE_pct_60m
+horizons        | ["15m", "30m", "60m", "120m", "240m"]
+paired_with     | 
+minimum_n       | 50
+minimum_symbols | 10
+created_at      | 2026-09-28 13:18:12.452347+00
+-[ RECORD 2 ]---+--------------------------------------
+experiment_id   | ME_SHORT_GEOM_B_V1
+version         | 1
+scanner_name    | MOMENTUM_EXHAUSTION
+direction       | SHORT
+experiment_type | GEOMETRY_INTERVENTION_WIDER_STOP
+status          | RUNNING
+started_at      | 2026-09-28 16:30:39.751355+00
+primary_metric  | MFE_pct_60m
+horizons        | ["15m", "30m", "60m", "120m", "240m"]
+paired_with     | ME_SHORT_GEOM_A_V1
+minimum_n       | 50
+minimum_symbols | 10
+created_at      | 2026-09-28 13:18:12.452347+00
+

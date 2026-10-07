@@ -1,0 +1,22 @@
+=== EXPORT METADATA ===
+export_started_utc=2026-10-07T13:45:01Z
+database=trad_bot
+timezone=Etc/UTC
+git_head=7c5e0959c5a8e6ce82f455f1ca727f56810ce0b1
+observation_fingerprint=6f4ebf099bdb7af6df2a29a0972b4bad
+outcome_fingerprint=a470122ec9f5ec35da89cb2490539fb8
+=== ROW COUNTS ===
+    503 /tmp/me_short_geometry_b_corrected_outcome_reconstruction_v1_20261007_v2/candle_coverage.tsv
+      0 /tmp/me_short_geometry_b_corrected_outcome_reconstruction_v1_20261007_v2/candle_duplicate_keys.tsv
+   2963 /tmp/me_short_geometry_b_corrected_outcome_reconstruction_v1_20261007_v2/candles.tsv
+   1006 /tmp/me_short_geometry_b_corrected_outcome_reconstruction_v1_20261007_v2/dataset_pairs.tsv
+     29 /tmp/me_short_geometry_b_corrected_outcome_reconstruction_v1_20261007_v2/experiment_rows.txt
+     13 /tmp/me_short_geometry_b_corrected_outcome_reconstruction_v1_20261007_v2/export_metadata.txt
+     50 /tmp/me_short_geometry_b_corrected_outcome_reconstruction_v1_20261007_v2/instruments.tsv
+      1 /tmp/me_short_geometry_b_corrected_outcome_reconstruction_v1_20261007_v2/observation_fingerprint.txt
+      1 /tmp/me_short_geometry_b_corrected_outcome_reconstruction_v1_20261007_v2/outcome_fingerprint.txt
+   1006 /tmp/me_short_geometry_b_corrected_outcome_reconstruction_v1_20261007_v2/outcomes.tsv
+      7 /tmp/me_short_geometry_b_corrected_outcome_reconstruction_v1_20261007_v2/snapshot_meta.txt
+   5579 total
+=== EXPORT FINISHED ===
+export_finished_utc=2026-10-07T13:45:01Z

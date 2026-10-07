@@ -1,0 +1,173 @@
+﻿=== GIT ===
+7c5e0959c5a8e6ce82f455f1ca727f56810ce0b1
+## main...origin/main
+?? =
+?? audit_db/
+?? docs/research/LSCO_EXPIRY_COUNTERFACTUAL_V1_2026-10-01.md
+?? "on.tool \\"
+=== DB IDENTITY ===
+trad_bot|postgres|Etc/UTC|2026-10-07 13:41:15.761404+00|1229316
+=== OBSERVATION DDL ===
+                                                      Table "research.prospective_observation"
+        Column         |           Type           | Collation | Nullable |                                 Default                                  
+-----------------------+--------------------------+-----------+----------+--------------------------------------------------------------------------
+ observation_id        | bigint                   |           | not null | nextval('research.prospective_observation_observation_id_seq'::regclass)
+ experiment_id         | text                     |           | not null | 
+ source_signal_id      | bigint                   |           | not null | 
+ source_observation_id | bigint                   |           |          | 
+ symbol                | text                     |           | not null | 
+ direction             | text                     |           | not null | 
+ signal_time           | timestamp with time zone |           | not null | 
+ reference_price       | numeric                  |           | not null | 
+ invalidation_price    | numeric                  |           |          | 
+ target_1              | numeric                  |           |          | 
+ target_2              | numeric                  |           |          | 
+ score                 | numeric                  |           | not null | 0
+ variant_entry         | numeric                  |           |          | 
+ variant_stop          | numeric                  |           |          | 
+ variant_target        | numeric                  |           |          | 
+ rule_passed           | boolean                  |           | not null | true
+ filter_reason         | text                     |           |          | 
+ gate_result           | text                     |           |          | 
+ features              | jsonb                    |           | not null | '{}'::jsonb
+ parameters            | jsonb                    |           | not null | '{}'::jsonb
+ market_regime         | text                     |           |          | 
+ created_at            | timestamp with time zone |           | not null | now()
+Indexes:
+    "prospective_observation_pkey" PRIMARY KEY, btree (observation_id)
+    "idx_pobs_experiment" btree (experiment_id)
+    "idx_pobs_source_signal" btree (source_signal_id)
+    "idx_pobs_symbol_time" btree (symbol, signal_time DESC)
+    "prospective_observation_experiment_id_source_signal_id_key" UNIQUE CONSTRAINT, btree (experiment_id, source_signal_id)
+Foreign-key constraints:
+    "prospective_observation_experiment_id_fkey" FOREIGN KEY (experiment_id) REFERENCES research.prospective_experiment(experiment_id)
+Referenced by:
+    TABLE "research.prospective_outcome" CONSTRAINT "prospective_outcome_observation_id_fkey" FOREIGN KEY (observation_id) REFERENCES research.prospective_observation(observation_id) ON DELETE CASCADE
+    TABLE "research.research_signal" CONSTRAINT "research_signal_prospective_obs_fkey" FOREIGN KEY (prospective_observation_id) REFERENCES research.prospective_observation(observation_id) ON DELETE CASCADE
+
+=== OUTCOME DDL ===
+                      Table "research.prospective_outcome"
+       Column       |           Type           | Collation | Nullable | Default 
+--------------------+--------------------------+-----------+----------+---------
+ observation_id     | bigint                   |           | not null | 
+ experiment_id      | text                     |           | not null | 
+ mfe_15m            | numeric                  |           |          | 
+ mae_15m            | numeric                  |           |          | 
+ mfe_30m            | numeric                  |           |          | 
+ mae_30m            | numeric                  |           |          | 
+ mfe_60m            | numeric                  |           |          | 
+ mae_60m            | numeric                  |           |          | 
+ mfe_120m           | numeric                  |           |          | 
+ mae_120m           | numeric                  |           |          | 
+ mfe_240m           | numeric                  |           |          | 
+ mae_240m           | numeric                  |           |          | 
+ mfe_r_15m          | numeric                  |           |          | 
+ mae_r_15m          | numeric                  |           |          | 
+ mfe_r_30m          | numeric                  |           |          | 
+ mae_r_30m          | numeric                  |           |          | 
+ mfe_r_60m          | numeric                  |           |          | 
+ mae_r_60m          | numeric                  |           |          | 
+ mfe_r_120m         | numeric                  |           |          | 
+ mae_r_120m         | numeric                  |           |          | 
+ mfe_r_240m         | numeric                  |           |          | 
+ mae_r_240m         | numeric                  |           |          | 
+ return_at_15m      | numeric                  |           |          | 
+ return_at_30m      | numeric                  |           |          | 
+ return_at_60m      | numeric                  |           |          | 
+ return_at_120m     | numeric                  |           |          | 
+ return_at_240m     | numeric                  |           |          | 
+ tp_hit             | boolean                  |           | not null | false
+ sl_hit             | boolean                  |           | not null | false
+ tp_before_sl       | boolean                  |           | not null | false
+ sl_before_tp       | boolean                  |           | not null | false
+ ambiguous_intrabar | boolean                  |           | not null | false
+ time_to_tp         | numeric                  |           |          | 
+ time_to_sl         | numeric                  |           |          | 
+ evaluated_15m_at   | timestamp with time zone |           |          | 
+ evaluated_30m_at   | timestamp with time zone |           |          | 
+ evaluated_60m_at   | timestamp with time zone |           |          | 
+ evaluated_120m_at  | timestamp with time zone |           |          | 
+ evaluated_240m_at  | timestamp with time zone |           |          | 
+ is_final           | boolean                  |           | not null | false
+ created_at         | timestamp with time zone |           | not null | now()
+ updated_at         | timestamp with time zone |           | not null | now()
+Indexes:
+    "prospective_outcome_pkey" PRIMARY KEY, btree (observation_id)
+    "idx_pout_experiment" btree (experiment_id)
+    "idx_pout_mfe60" btree (mfe_60m DESC NULLS LAST)
+    "idx_pout_pending" btree (is_final) WHERE is_final = false
+Foreign-key constraints:
+    "prospective_outcome_observation_id_fkey" FOREIGN KEY (observation_id) REFERENCES research.prospective_observation(observation_id) ON DELETE CASCADE
+Triggers:
+    trg_prospective_outcome_updated_at BEFORE UPDATE ON research.prospective_outcome FOR EACH ROW EXECUTE FUNCTION research.fn_set_updated_at()
+
+=== INSTRUMENT DDL ===
+                                                 Table "dds.instrument"
+    Column     |           Type           | Collation | Nullable |                        Default                        
+---------------+--------------------------+-----------+----------+-------------------------------------------------------
+ instrument_id | bigint                   |           | not null | nextval('dds.instrument_instrument_id_seq'::regclass)
+ symbol        | text                     |           | not null | 
+ base_asset    | text                     |           | not null | 
+ quote_asset   | text                     |           | not null | 'USDT'::text
+ category      | text                     |           | not null | 'linear'::text
+ status        | text                     |           | not null | 'Trading'::text
+ created_at    | timestamp with time zone |           | not null | now()
+Indexes:
+    "instrument_pkey" PRIMARY KEY, btree (instrument_id)
+    "instrument_symbol_key" UNIQUE CONSTRAINT, btree (symbol)
+Referenced by:
+    TABLE "dds.market_signal" CONSTRAINT "market_signal_instrument_id_fkey" FOREIGN KEY (instrument_id) REFERENCES dds.instrument(instrument_id)
+    TABLE "dds.scanner_run_instrument" CONSTRAINT "scanner_run_instrument_instrument_id_fkey" FOREIGN KEY (instrument_id) REFERENCES dds.instrument(instrument_id)
+    TABLE "dds.scanner_setup" CONSTRAINT "scanner_setup_instrument_id_fkey" FOREIGN KEY (instrument_id) REFERENCES dds.instrument(instrument_id)
+
+=== CANDLE DDL ===
+                                  Table "market.candle"
+       Column       |           Type           | Collation | Nullable |      Default      
+--------------------+--------------------------+-----------+----------+-------------------
+ exchange           | text                     |           | not null | 'bybit'::text
+ market_type        | text                     |           | not null | 'linear'::text
+ instrument_id      | bigint                   |           | not null | 
+ timeframe          | text                     |           | not null | 
+ open_time          | timestamp with time zone |           | not null | 
+ close_time         | timestamp with time zone |           | not null | 
+ open               | numeric                  |           | not null | 
+ high               | numeric                  |           | not null | 
+ low                | numeric                  |           | not null | 
+ close              | numeric                  |           | not null | 
+ volume             | numeric                  |           | not null | 
+ turnover           | numeric                  |           |          | 
+ is_closed          | boolean                  |           | not null | true
+ source             | text                     |           | not null | 'bybit_api'::text
+ source_received_at | timestamp with time zone |           |          | 
+ ingested_at        | timestamp with time zone |           | not null | now()
+ quality_status     | text                     |           | not null | 'validated'::text
+Indexes:
+    "candle_pkey" PRIMARY KEY, btree (exchange, market_type, instrument_id, timeframe, open_time)
+    "idx_candle_exchange_market_type" btree (exchange, market_type)
+    "idx_candle_ingested_at" btree (ingested_at)
+    "idx_candle_instrument_timeframe" btree (instrument_id, timeframe, open_time)
+    "idx_candle_open_time" btree (open_time)
+    "idx_candle_quality_status" btree (quality_status)
+Check constraints:
+    "candle_check" CHECK (close_time > open_time)
+    "candle_check1" CHECK (high >= open)
+    "candle_check2" CHECK (high >= close)
+    "candle_check3" CHECK (high >= low)
+    "candle_check4" CHECK (low <= open)
+    "candle_check5" CHECK (low <= close)
+    "candle_close_check" CHECK (close > 0::numeric)
+    "candle_high_check" CHECK (high > 0::numeric)
+    "candle_is_closed_check" CHECK (is_closed = true)
+    "candle_low_check" CHECK (low > 0::numeric)
+    "candle_open_check" CHECK (open > 0::numeric)
+    "candle_quality_status_check" CHECK (quality_status = ANY (ARRAY['validated'::text, 'suspect'::text, 'invalid'::text]))
+    "candle_turnover_check" CHECK (turnover IS NULL OR turnover >= 0::numeric)
+    "candle_volume_check" CHECK (volume >= 0::numeric)
+Triggers:
+    validate_candle_data BEFORE INSERT OR UPDATE ON market.candle FOR EACH ROW EXECUTE FUNCTION market.validate_candle()
+
+=== EXPERIMENTS ===
+ERROR:  column "stopped_at" does not exist
+LINE 1: ..., direction, experiment_type, status, started_at, stopped_at...
+                                                             ^
+HINT:  Perhaps you meant to reference the column "prospective_experiment.started_at".

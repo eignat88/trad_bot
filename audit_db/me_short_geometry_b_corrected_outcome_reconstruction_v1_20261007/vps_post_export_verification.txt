@@ -1,0 +1,16 @@
+﻿=== POST-EXPORT VPS VERIFICATION ===
+verified_utc=2026-10-07T13:43:41Z
+git_head=7c5e0959c5a8e6ce82f455f1ca727f56810ce0b1
+git_status=?? =
+?? audit_db/
+?? docs/research/LSCO_EXPIRY_COUNTERFACTUAL_V1_2026-10-01.md
+?? "on.tool \\"
+db_now=2026-10-07 13:43:41.534522+00|database=trad_bot|user=postgres|timezone=Etc/UTC|txid=1229388
+observation_fingerprint=6f4ebf099bdb7af6df2a29a0972b4bad
+outcome_fingerprint=a470122ec9f5ec35da89cb2490539fb8
+=== SERVICES (NO RESTART) ===
+active
+active
+ExecMainStartTimestamp=
+ExecMainPID=0
+=== END ===

@@ -1,0 +1,7 @@
+-[ RECORD 1 ]+------------------------------
+db_now       | 2026-10-07 13:45:00.965005+00
+database     | trad_bot
+current_user | postgres
+timezone     | Etc/UTC
+txid         | 1229392
+

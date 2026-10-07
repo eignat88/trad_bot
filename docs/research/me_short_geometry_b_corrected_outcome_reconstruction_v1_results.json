@@ -1,0 +1,286 @@
+{
+  "analysis": "ME_SHORT_GEOMETRY_B_CORRECTED_OUTCOME_RECONSTRUCTION_V1",
+  "analysis_type": "HISTORICAL_SEMANTICS_VALIDATION_AND_DB_SNAPSHOT_SENSITIVITY",
+  "fix_deploy_ts": "2026-10-07T13:04:55Z",
+  "analysis_cutoff_ts": "2026-10-07T15:52:45.588035Z",
+  "git_head": "80b10108cdceaf133cc405c0bd725cabc6aac459",
+  "production_db_modified": false,
+  "production_outcomes_rewritten": false,
+  "authoritative_semantics": {
+    "scanner": "MOMENTUM_EXHAUSTION",
+    "direction": "SHORT",
+    "variant": "GEOMETRY_INTERVENTION_WIDER_STOP",
+    "B": "same entry as A; stop=max(abs(reference_price-invalidation_price), 0.5*ATR_14_5m); target=A target distance adjusted to entry",
+    "primary_metric": "MFE_pct_60m",
+    "frozen_primary_metric_field": "mfe_60m",
+    "production_evaluator_tuple_rule": "Use variant_entry, variant_stop, and variant_target atomically when all three are non-NULL; otherwise use base reference/invalidation/target.",
+    "mfe_mae_window": "signal_time < candle.timestamp < signal_time + horizon",
+    "return_at_horizon": "last close from post-signal candles with candle.timestamp < signal_time + horizon",
+    "evaluated_at_semantics": "recorded evaluation write time; not a candle cutoff"
+  },
+  "candle_source": {
+    "database": "trad_bot",
+    "schema_table": "market.candle",
+    "role": "OFFLINE_DB_SNAPSHOT_ONLY_NOT_HISTORICAL_TRUTH",
+    "exchange": "bybit",
+    "market_type": "linear",
+    "timeframe": "5",
+    "quality_exclusion": "quality_status <> 'invalid'",
+    "is_closed_required": true,
+    "time_basis": "UTC",
+    "naive_timestamp_policy": "naive export timestamps are UTC",
+    "raw_rows": 2963,
+    "unique_keys": 2963,
+    "duplicate_rows_removed": 0,
+    "duplicate_keys": false
+  },
+  "integrity": {
+    "raw_B_observations": 503,
+    "raw_A_observations": 503,
+    "unique_source_signals_B": 503,
+    "paired_A_B": 503,
+    "missing_A_pairs": 0,
+    "duplicate_B": 0,
+    "duplicate_A": 0,
+    "cohort_counts": {
+      "PRE_FIX_SIGNAL_PRE_FIX_EVALUATION": 1006
+    }
+  },
+  "frozen_tuple": {
+    "complete": 503,
+    "partial": 0,
+    "invalid": 0,
+    "expected_partial": 0
+  },
+  "geometry": {
+    "entry_equal": 503,
+    "stop_wider": 503,
+    "target_same": 503
+  },
+  "cohort_boundary": {
+    "rule": "signal_time > FIX_DEPLOY_TS is POST_FIX_SIGNAL",
+    "evaluation_timestamp_rule": "evaluated_*_at may still be used for evaluation-time classification",
+    "boundary_exactly_equal_is_pre_fix": true
+  },
+  "historical_semantics_validation": {
+    "checked_n": 203,
+    "hypothesis_h1": "COMPLETE_PERSISTED_VARIANT",
+    "hypothesis_h2": "VARIANT_ENTRY_PLUS_BASE_STOP_TARGET",
+    "h1_exact": 35,
+    "h2_exact": 0,
+    "h1_better": 203,
+    "h2_better": 0,
+    "ties": 0,
+    "h1_mean_mismatch_count": 2.857142857142857,
+    "h2_mean_mismatch_count": 11.03448275862069,
+    "geometry_semantics_verdict": "COMPLETE_VARIANT_STRONGLY_SUPPORTED"
+  },
+  "historical_tuple_bug_impact": "NOT_OBSERVED_FOR_B",
+  "path_reproduction": {
+    "status": "NOT_EXACTLY_REPRODUCIBLE_FROM_CURRENT_DB_SNAPSHOT",
+    "historical_source": "LIVE_BYBIT_GET_KLINES",
+    "offline_source": "MARKET_CANDLE_DB_SNAPSHOT",
+    "exact_historical_reproduction_available": false,
+    "historical_production_candle_retrieval": "production evaluator live Bybit klines retrieval via its own client",
+    "offline_candle_retrieval": "current market.candle DB snapshot export",
+    "interpretation": "DB_SNAPSHOT_SENSITIVITY_RECONSTRUCTION; stored prospective outcomes remain authoritative"
+  },
+  "horizon_specific_coverage": {
+    "15m": {
+      "minutes": 15,
+      "valid_n": 226,
+      "analysis_n": 226,
+      "ineligible_n": 277,
+      "expected_post_signal_candles": 3,
+      "sql_coarse_coverage_rule": "open_time >= date_trunc('minute', signal_time)",
+      "evaluator_equivalent_coverage_rule": "candle.timestamp > exact signal_time",
+      "coverage_basis": "DB_SNAPSHOT_COARSE_SQL_AUDIT",
+      "horizon_specific_eligibility_required": true
+    },
+    "30m": {
+      "minutes": 30,
+      "valid_n": 223,
+      "analysis_n": 223,
+      "ineligible_n": 280,
+      "expected_post_signal_candles": 6,
+      "sql_coarse_coverage_rule": "open_time >= date_trunc('minute', signal_time)",
+      "evaluator_equivalent_coverage_rule": "candle.timestamp > exact signal_time",
+      "coverage_basis": "DB_SNAPSHOT_COARSE_SQL_AUDIT",
+      "horizon_specific_eligibility_required": true
+    },
+    "60m": {
+      "minutes": 60,
+      "valid_n": 221,
+      "analysis_n": 221,
+      "ineligible_n": 282,
+      "expected_post_signal_candles": 12,
+      "sql_coarse_coverage_rule": "open_time >= date_trunc('minute', signal_time)",
+      "evaluator_equivalent_coverage_rule": "candle.timestamp > exact signal_time",
+      "coverage_basis": "DB_SNAPSHOT_COARSE_SQL_AUDIT",
+      "horizon_specific_eligibility_required": true
+    },
+    "120m": {
+      "minutes": 120,
+      "valid_n": 219,
+      "analysis_n": 219,
+      "ineligible_n": 284,
+      "expected_post_signal_candles": 24,
+      "sql_coarse_coverage_rule": "open_time >= date_trunc('minute', signal_time)",
+      "evaluator_equivalent_coverage_rule": "candle.timestamp > exact signal_time",
+      "coverage_basis": "DB_SNAPSHOT_COARSE_SQL_AUDIT",
+      "horizon_specific_eligibility_required": true
+    },
+    "240m": {
+      "minutes": 240,
+      "valid_n": 203,
+      "analysis_n": 203,
+      "ineligible_n": 300,
+      "expected_post_signal_candles": 48,
+      "sql_coarse_coverage_rule": "open_time >= date_trunc('minute', signal_time)",
+      "evaluator_equivalent_coverage_rule": "candle.timestamp > exact signal_time",
+      "coverage_basis": "DB_SNAPSHOT_COARSE_SQL_AUDIT",
+      "horizon_specific_eligibility_required": true
+    }
+  },
+  "db_snapshot_sensitivity": {
+    "role": "DB_SNAPSHOT_SENSITIVITY",
+    "secondary_to_historical_semantics_validation": true,
+    "primary_metric": "mfe_60m",
+    "paired_240m_complete_n": 203,
+    "delta_metrics": {
+      "mfe_60m": {
+        "n": 203,
+        "mean": 0.037693340324399,
+        "median": 0.0,
+        "p25": 0.0,
+        "p75": 0.0,
+        "min": 0.0,
+        "max": 4.71755725190839,
+        "positive": 11,
+        "zero": 192,
+        "negative": 0,
+        "wins": 11,
+        "ties": 192,
+        "losses": 0,
+        "bootstrap": {
+          "iterations": 10000,
+          "seed": 20261007,
+          "mean": 0.03782654963727258,
+          "median": 0.03440399619375398,
+          "ci_95": [
+            0.005181897355296558,
+            0.09433710199790137
+          ],
+          "p_gt_0": 1.0
+        }
+      },
+      "mfe_r_60m": {
+        "n": 203,
+        "mean": -5.673393103448276,
+        "median": -3.9586000000000006,
+        "p25": -7.1684,
+        "p75": -1.98285,
+        "min": -25.750500000000002,
+        "max": 0.0,
+        "positive": 0,
+        "zero": 2,
+        "negative": 201,
+        "wins": 0,
+        "ties": 2,
+        "losses": 201,
+        "bootstrap": {
+          "iterations": 10000,
+          "seed": 20261007,
+          "mean": -5.684747013891625,
+          "median": -5.6791793103448285,
+          "ci_95": [
+            -6.468436366995074,
+            -4.940310960591133
+          ],
+          "p_gt_0": 0.0
+        }
+      },
+      "mae_r_60m": {
+        "n": 203,
+        "mean": -2.7698320197044333,
+        "median": -0.41900000000000004,
+        "p25": -2.7588500000000002,
+        "p75": 0.0,
+        "min": -35.835,
+        "max": 0.0,
+        "positive": 0,
+        "zero": 86,
+        "negative": 117,
+        "wins": 0,
+        "ties": 86,
+        "losses": 117,
+        "bootstrap": {
+          "iterations": 10000,
+          "seed": 20261007,
+          "mean": -2.7723690830541874,
+          "median": -2.758518226600985,
+          "ci_95": [
+            -3.6098404433497535,
+            -2.0130812438423646
+          ],
+          "p_gt_0": 0.0
+        }
+      },
+      "return_at_60m": {
+        "n": 203,
+        "mean": -0.03186106612940657,
+        "median": 0.0,
+        "p25": 0.0,
+        "p75": 0.0,
+        "min": -3.6030534351145054,
+        "max": 0.47601611131454524,
+        "positive": 47,
+        "zero": 116,
+        "negative": 40,
+        "wins": 47,
+        "ties": 116,
+        "losses": 40,
+        "bootstrap": {
+          "iterations": 10000,
+          "seed": 20261007,
+          "mean": -0.03204442468781636,
+          "median": -0.02960623501606998,
+          "ci_95": [
+            -0.07774227597851929,
+            -0.0015906546101606238
+          ],
+          "p_gt_0": 0.0192
+        }
+      }
+    }
+  },
+  "historical_stored_outcome_interpretation": {
+    "stored_prospective_outcomes_are_authoritative": true,
+    "wider_variant_stop_use_evidence": "strongly supported by stored outcomes",
+    "offline_mismatch_interpretation": "consistent with non-identical candle sources; not evidence of a B geometry bug"
+  },
+  "cost_model": {
+    "preregistered": false,
+    "fee_assumption_registry": "none",
+    "cost_model_available": false,
+    "fees_slippage_spread_execution_delay_invented": false,
+    "executable_edge": "NOT_ESTABLISHED"
+  },
+  "reconstruction_validity_verdict": "EXACT_PATH_RECONSTRUCTION_NOT_AVAILABLE",
+  "historical_geometry_semantics_verdict": "B_COMPLETE_VARIANT_GEOMETRY_CONFIRMED",
+  "db_snapshot_sensitivity_verdict": "SECONDARY_POSITIVE_MFE_60M_SENSITIVITY_NOT_EXECUTABLE_EDGE",
+  "db_snapshot_sensitivity_role": "DB_SNAPSHOT_SENSITIVITY",
+  "path_reproduction_status": "NOT_EXACTLY_REPRODUCIBLE_FROM_CURRENT_DB_SNAPSHOT",
+  "executable_edge": "NOT_ESTABLISHED",
+  "retune_recommended": false,
+  "new_oos_created": false,
+  "lifecycle_recommendation": "KEEP_BLOCKED",
+  "final_conclusion": "KEEP_BLOCKED",
+  "artifacts": {
+    "trades_csv": "docs/research/me_short_geometry_b_corrected_outcome_reconstruction_v1_trades.csv",
+    "old_vs_corrected_csv": "docs/research/me_short_geometry_b_old_vs_corrected_outcomes_v1.csv",
+    "h1_vs_h2_csv": "docs/research/me_short_geometry_b_h1_vs_h2_semantics_v1.csv",
+    "results_json": "docs/research/me_short_geometry_b_corrected_outcome_reconstruction_v1_results.json",
+    "report_md": "docs/research/ME_SHORT_GEOMETRY_B_CORRECTED_OUTCOME_RECONSTRUCTION_V1_2026-10-07.md"
+  }
+}
