@@ -289,7 +289,8 @@ def recover_completed_events(
                         elif apply:
                             final_verdict = "already_observed"
                             report["would_insert"] -= 1
-            report[final_verdict] = report.get(final_verdict, 0) + 1
+            if final_verdict != "WOULD_INSERT":
+                report[final_verdict] = report.get(final_verdict, 0) + 1
             if final_verdict in {"WOULD_INSERT", "already_observed"}:
                 report["eligible"] += 1
         if apply:

@@ -261,3 +261,18 @@ def test_dry_run_makes_zero_writes_and_reconciles_all_rows():
     assert conn.inserts == []
     assert conn.commits == 0
     assert conn.rollbacks == 1
+
+def test_report_does_not_create_uppercase_would_insert_counter():
+    rows = [_row("report-key")]
+    conn = FakeConnection()
+
+    report = recover_completed_events(
+        None,
+        conn,
+        rows,
+        apply=False,
+    )
+
+    assert report["would_insert"] == 1
+    assert report["eligible"] == 1
+    assert "WOULD_INSERT" not in report

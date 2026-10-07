@@ -839,7 +839,7 @@ class ProspectiveOOSObserver:
                 authoritative={
                     "experiment_id": exp_id,
                     "setup_event_id": setup_event_id,
-                    "snapshot": dict(features),
+                    "snapshot": {**dict(features), "experiment_id": exp_id},
                 },
                 setup_event_id=setup_event_id,
                 default_symbol=symbol,

@@ -294,9 +294,10 @@ def test_baseline_does_not_use_point_b_authoritative_completion():
     registry = _registry(BASELINE_EXPERIMENT_ID)
     observer = ProspectiveOOSObserver(conn, registry, completed_event_repo=completed_repo)
     detection = _detection()
-    features = dict(detection.signal.features)
-    features["cohort"] = "BASELINE"
-    features["experiment_id"] = BASELINE_EXPERIMENT_ID
+    assert detection.baseline is not None
+    features = dict(detection.baseline.features)
+    assert features["cohort"] == "BASELINE"
+    assert features["experiment_id"] == EXPERIMENT_ID
     assert observer.observe(
         scanner_name=BASELINE_EXPERIMENT_ID,
         direction="LONG",
