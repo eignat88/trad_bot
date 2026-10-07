@@ -300,8 +300,9 @@ def test_default_connection_uses_project_load_settings(monkeypatch, tmp_path):
     fake_conn = object()
 
     class FakeScannerRepository:
-        def __init__(self, host, port, database, user, password):
+        def __init__(self, host, port, database, user, password, backend=None):
             captured["repo"] = (host, port, database, user, password)
+            captured["backend"] = backend
             self._conn = fake_conn
 
     monkeypatch.setattr("app.config.settings.load_settings", fake_load_settings)
@@ -327,6 +328,7 @@ def test_default_connection_uses_project_load_settings(monkeypatch, tmp_path):
         "configured_user",
         "configured_password",
     )
+    assert captured["backend"] == "postgres"
 
 def test_invalid_signal_time_uses_declared_report_bucket():
     row = _row("bad-signal-time")
@@ -341,3 +343,42 @@ def test_invalid_signal_time_uses_declared_report_bucket():
     assert report["eligible"] == 0
     assert report["would_insert"] == 0
     assert conn.inserts == []
+
+def test_default_connection_rejects_missing_postgres_connection(monkeypatch):
+    import argparse
+    import types
+    import pytest
+    import app.research.htf_point_b_observation_recovery as recovery
+
+    fake_settings = types.SimpleNamespace(
+        db_host="db.example",
+        db_port=5432,
+        db_name="trad_bot",
+        db_user="user",
+        db_password="password",
+    )
+
+    def fake_load_settings(*, path, env_file):
+        return fake_settings
+
+    class FakeScannerRepository:
+        def __init__(self, host, port, database, user, password, backend=None):
+            assert backend == "postgres"
+            self._conn = None
+
+    monkeypatch.setattr("app.config.settings.load_settings", fake_load_settings)
+    monkeypatch.setattr("app.db.repository.ScannerRepository", FakeScannerRepository)
+
+    args = argparse.Namespace(
+        host=None,
+        port=5432,
+        database=None,
+        user=None,
+        password=None,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="PostgreSQL recovery connection was not established",
+    ):
+        recovery._load_connection(args)

@@ -340,13 +340,17 @@ def _load_connection(args: argparse.Namespace):
         path=root / "config.yaml",
         env_file=root / ".env",
     )
-    return ScannerRepository(
+    repository = ScannerRepository(
         settings.db_host,
         settings.db_port,
         settings.db_name,
         settings.db_user,
         settings.db_password,
-    )._conn
+        backend="postgres",
+    )
+    if repository._conn is None:
+        raise RuntimeError("PostgreSQL recovery connection was not established")
+    return repository._conn
 
 
 def build_parser() -> argparse.ArgumentParser:
