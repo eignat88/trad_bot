@@ -360,7 +360,17 @@ class TestCase7_ExistingExperimentsUnchanged:
         from app.research.prospective_observer import ProspectiveOOSObserver
         observer = ProspectiveOOSObserver(conn, registry)
 
-        kwargs = _make_observe_kwargs(scanner_name="MOMENTUM_EXHAUSTION", direction="SHORT")
+        kwargs = _make_observe_kwargs(
+            scanner_name="MOMENTUM_EXHAUSTION",
+            direction="SHORT",
+            reference_price=100.0,
+            invalidation_price=100.2,
+            target_1=95.0,
+            features={
+                "atr": 1.5,
+                "trigger_5m_close": 99.9,
+            },
+        )
         observer.observe(**kwargs)
 
         # Should create 3 observations (A, B, C)

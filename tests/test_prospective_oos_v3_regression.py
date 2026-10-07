@@ -1061,7 +1061,10 @@ class TestObserveMEShortABC:
             overrides={
                 "invalidation_price": 0.01234 * 1.002,
                 "target_1": 0.01180,
-                "features": {"atr": 0.0001, "entry_price": 0.01230},
+                "features": {
+                    "atr": 0.0001,
+                    "trigger_5m_close": 0.01230,
+                },
             },
         )
         observer.observe(**kwargs)
@@ -1093,7 +1096,10 @@ class TestObserveMEShortABC:
             overrides={
                 "invalidation_price": 0.01234 * 1.002,
                 "target_1": 0.01180,
-                "features": {"atr": 0.0001, "entry_price": 0.01230},
+                "features": {
+                    "atr": 0.0001,
+                    "trigger_5m_close": 0.01230,
+                },
             },
         )
         observer.observe(**kwargs)
@@ -1219,7 +1225,10 @@ class TestObserveMEShortABC:
                 "reference_price": ref_price,
                 "invalidation_price": inv_price,
                 "target_1": target,
-                "features": {"atr": 1.5, "entry_price": detection_close},
+                "features": {
+                    "atr": 1.5,
+                    "trigger_5m_close": detection_close,
+                },
             },
         )
         observer.observe(**kwargs)
@@ -1232,6 +1241,58 @@ class TestObserveMEShortABC:
             f"GEOM_C variant_entry ({params[12]}) must be "
             f"detection candle close ({detection_close})"
         )
+
+        # Frozen C geometry must preserve the original A distances.
+        base_risk_distance = abs(ref_price - inv_price)
+        base_target_distance = abs(ref_price - target)
+
+        assert params[13] == pytest.approx(
+            detection_close + base_risk_distance
+        )
+        assert params[14] == pytest.approx(
+            detection_close - base_target_distance
+        )
+
+        assert params[13] - params[12] == pytest.approx(
+            base_risk_distance
+        )
+        assert params[12] - params[14] == pytest.approx(
+            base_target_distance
+        )
+
+    def test_me_short_geom_c_missing_trigger_close_fails_closed(self):
+        """GEOM_C must not substitute reference_price when trigger close is absent."""
+        registry = _make_registry_dict(_load_registry(), "ME_SHORT_GEOM_C_V1")
+        mock_conn, mock_cursor = _mock_conn_for_observer(
+            insert_returns=[(1,)],
+            lifecycle_count=2,
+        )
+        mock_cursor.rowcount = 1
+
+        from app.research.prospective_observer import ProspectiveOOSObserver
+        observer = ProspectiveOOSObserver(mock_conn, registry)
+
+        kwargs = _make_observe_kwargs(
+            scanner_name="MOMENTUM_EXHAUSTION",
+            direction="SHORT",
+            overrides={
+                "reference_price": 100.0,
+                "invalidation_price": 100.2,
+                "target_1": 95.0,
+                "features": {
+                    "atr": 1.5,
+                    # Deliberately retain the legacy field to prove that
+                    # GEOM_C no longer accepts it as an entry source.
+                    "entry_price": 99.9,
+                },
+            },
+        )
+
+        result = observer.observe(**kwargs)
+
+        params = _get_insert_call_args(mock_cursor, "ME_SHORT_GEOM_C_V1")
+        assert params is None
+        assert result == []
 
 
 class TestIdempotency:
