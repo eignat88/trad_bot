@@ -12,6 +12,7 @@ import json
 import logging
 import math
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from app.research.prospective_observer import ProspectiveOOSObserver
@@ -327,10 +328,14 @@ def _load_connection(args: argparse.Namespace):
             password=args.password,
         )
 
-    from app.config.settings import Settings
+    from app.config.settings import load_settings
     from app.db.repository import ScannerRepository
 
-    settings = Settings()
+    root = Path(__file__).resolve().parents[2]
+    settings = load_settings(
+        path=root / "config.yaml",
+        env_file=root / ".env",
+    )
     return ScannerRepository(
         settings.db_host,
         settings.db_port,

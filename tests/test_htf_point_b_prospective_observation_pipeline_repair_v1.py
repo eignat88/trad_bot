@@ -315,7 +315,9 @@ def test_baseline_does_not_use_point_b_authoritative_completion():
     )
     completed_repo.freeze_completed_event.assert_not_called()
     insert = next(call for call in cursor.execute.call_args_list if "INSERT INTO research.prospective_observation" in str(call))
-    assert json.loads(insert[0][1][13])["cohort"] == "BASELINE"
+    inserted_features = json.loads(insert[0][1][13])
+    assert inserted_features["cohort"] == "BASELINE"
+    assert inserted_features["_authoritative_completion"] is False
 
 
 def test_legacy_observation_retains_evaluator_contract():

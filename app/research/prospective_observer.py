@@ -777,7 +777,10 @@ class ProspectiveOOSObserver:
         features_with_protocol["_frozen_max_hold"] = 240
         features_with_protocol["_frozen_intrabar_policy"] = "STOP_FIRST"
         features_with_protocol["_structural_r"] = risk_abs
-        features_with_protocol["_authoritative_completion"] = authoritative is not None
+        features_with_protocol["_authoritative_completion"] = (
+            authoritative is not None
+            and exp_id == "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE"
+        )
         return {
             "experiment_id": exp_id,
             "source_signal_id": source_key,

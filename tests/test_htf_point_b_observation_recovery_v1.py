@@ -276,3 +276,54 @@ def test_report_does_not_create_uppercase_would_insert_counter():
     assert report["would_insert"] == 1
     assert report["eligible"] == 1
     assert "WOULD_INSERT" not in report
+
+def test_default_connection_uses_project_load_settings(monkeypatch, tmp_path):
+    import argparse
+    import types
+    import app.research.htf_point_b_observation_recovery as recovery
+
+    captured = {}
+
+    fake_settings = types.SimpleNamespace(
+        db_host="db.example",
+        db_port=5439,
+        db_name="configured_db",
+        db_user="configured_user",
+        db_password="configured_password",
+    )
+
+    def fake_load_settings(*, path, env_file):
+        captured["path"] = path
+        captured["env_file"] = env_file
+        return fake_settings
+
+    fake_conn = object()
+
+    class FakeScannerRepository:
+        def __init__(self, host, port, database, user, password):
+            captured["repo"] = (host, port, database, user, password)
+            self._conn = fake_conn
+
+    monkeypatch.setattr("app.config.settings.load_settings", fake_load_settings)
+    monkeypatch.setattr("app.db.repository.ScannerRepository", FakeScannerRepository)
+
+    args = argparse.Namespace(
+        host=None,
+        port=5432,
+        database=None,
+        user=None,
+        password=None,
+    )
+
+    conn = recovery._load_connection(args)
+
+    assert conn is fake_conn
+    assert captured["path"].name == "config.yaml"
+    assert captured["env_file"].name == ".env"
+    assert captured["repo"] == (
+        "db.example",
+        5439,
+        "configured_db",
+        "configured_user",
+        "configured_password",
+    )
