@@ -1,0 +1,144 @@
+{
+  "protocol_id": "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1_PROTOCOL",
+  "experiment_id": "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1",
+  "version": 1,
+  "protocol_date": "2026-10-07",
+  "implementation_branch": "research/srr-short-execution-r-expansion-prospective-v1",
+  "parent_discovery": "SRR_SHORT_EXECUTION_R_EXPANSION_COUNTERFACTUAL_V1",
+  "parent_closed_experiment": "SRR_OOS_SCANNER_V1_PROSPECTIVE / SHORT / CLOSED_NEGATIVE",
+  "hypothesis": "A frozen SRR SHORT execution protocol using entry at reference_price, SL at 2.00 structural_R, TP at 1.50 structural_R, 120-minute max hold, and STOP_FIRST same-candle handling has positive net expectancy after normal project transaction costs on strictly new prospective OOS data.",
+  "scanner": "SUPPORT_RESISTANCE_REACTION",
+  "direction": "SHORT",
+  "experiment_type": "OOS_EXECUTION_VALIDATION",
+  "activation_state": "NOT_ACTIVATED",
+  "freeze_ts": null,
+  "started_at": null,
+  "registry_status": "READY_TO_START",
+  "population": {
+    "capture_rule": "signal_time > freeze_ts",
+    "strict_boundary": true,
+    "direction": "SHORT",
+    "dedup_key": ["experiment_id", "source_signal_id"],
+    "valid_geometry": "entry > 0, invalidation_price > 0, structural_R > 0",
+    "additional_filters": [],
+    "historical_688_population": "DISCOVERY_ONLY",
+    "backfill": "FORBIDDEN"
+  },
+  "entry": {
+    "entry_rule": "reference_price",
+    "structural_r": "abs(reference_price - invalidation_price)",
+    "source_mapping": {
+      "reference_price": "closest_resistance",
+      "invalidation_price": "closest_resistance * 1.005"
+    }
+  },
+  "execution_geometry": {
+    "direction": "SHORT",
+    "entry": "reference_price",
+    "sl": "entry + 2.00 * structural_R",
+    "tp": "entry - 1.50 * structural_R",
+    "execution_r": "2.00 * structural_R",
+    "target_execution_r": 0.75,
+    "stop_execution_r": -1.0,
+    "max_hold_minutes": 120,
+    "intrabar_policy": "STOP_FIRST",
+    "execution_window": "signal_time < candle.open_time < signal_time + 120 minutes",
+    "timeout_exit": "last eligible 5m candle close before the 120m cutoff"
+  },
+  "path_classification": {
+    "rule": "if ambiguous_intrabar then AMBIGUOUS elif tp_before_sl then TP_FIRST elif sl_before_tp then SL_FIRST else TIMEOUT",
+    "forbidden_rule": "if tp_hit and sl_hit then AMBIGUOUS",
+    "stop_first_ambiguous_gross_r": -1.0
+  },
+  "normalization": {
+    "authoritative_execution_r": "2.00 * structural_R",
+    "tp_gross_r": 0.75,
+    "sl_gross_r": -1.0,
+    "ambiguous_gross_r": -1.0,
+    "timeout_gross_r": "(entry - timeout_close) / execution_R",
+    "timeout_close_from_return_at_120m": "entry * (1.0 - return_at_120m / 100.0)",
+    "timeout_return_source": "last eligible 5m close before the 120m cutoff",
+    "never_mix_units": true
+  },
+  "cost_model": {
+    "primary_scenario": "NORMAL_COST",
+    "normal_round_trip_pct": 0.0021,
+    "normal_cost_abs": "0.0021 * entry",
+    "normal_cost_r": "(0.0021 * entry) / execution_R",
+    "elevated_round_trip_pct": 0.0031,
+    "elevated_cost_abs": "0.0031 * entry",
+    "elevated_cost_r": "(0.0031 * entry) / execution_R",
+    "elevated_role": "mandatory sensitivity; negative elevated results are execution fragility"
+  },
+  "metrics": {
+    "primary": "Net E[R] after normal project costs, normalized by execution_R = 2.00 * structural_R",
+    "secondary": [
+      "Gross E[R]",
+      "Net PF normal",
+      "Gross PF",
+      "Total Net R",
+      "win rate",
+      "TP count",
+      "SL count",
+      "AMBIGUOUS count",
+      "TIMEOUT count",
+      "normal cost_R distribution",
+      "elevated Net E[R]",
+      "elevated PF",
+      "day concentration",
+      "symbol concentration",
+      "bootstrap 95% CI",
+      "P(E[R] > 0)",
+      "leave-one-day-out",
+      "top-positive-symbol exclusion diagnostics"
+    ]
+  },
+  "sample_gates": {
+    "minimum_n": 300,
+    "minimum_symbols": 30,
+    "minimum_oos_days": 14,
+    "pre_gate_verdict": "INCONCLUSIVE_CONTINUE_OOS"
+  },
+  "predeclared_verdict_rules": {
+    "before_sample_gates": "INCONCLUSIVE_CONTINUE_OOS",
+    "primary_normal_cost_requires": [
+      "Net E[R] > 0",
+      "Net PF > 1",
+      "bootstrap 95% CI lower bound > 0",
+      "no catastrophic day or symbol concentration"
+    ],
+    "elevated_negative_label": "POSITIVE_PRIMARY_NORMAL_COST_ELEVATED_COST_NEGATIVE / EXECUTION_FRAGILE",
+    "no_post_accumulation_threshold_changes": true
+  },
+  "activation_procedure": {
+    "one_controlled_event": true,
+    "shared_timestamp_T": "T must be used exactly in registry freeze_ts and DB started_at",
+    "registry_status_at_activation": "RUNNING",
+    "db_status_at_activation": "RUNNING",
+    "capture_after_activation": "signal_time > T",
+    "pre_activation_requirements": [
+      "migration 060 applied",
+      "registry entry inactive",
+      "DB row inactive",
+      "observation count = 0",
+      "outcome count = 0",
+      "services healthy"
+    ],
+    "post_activation_checks": [
+      "registry freeze_ts == T",
+      "DB started_at == T",
+      "pre-freeze observation count = 0",
+      "first natural signal satisfies signal_time > T"
+    ]
+  },
+  "deployment_scope": {
+    "merge": false,
+    "push": false,
+    "deploy": false,
+    "restart_services": false,
+    "activate": false,
+    "production_db_mutation": false,
+    "paper_or_live_change": false
+  },
+  "no_retuning_statement": "This experiment validates exactly one frozen candidate. No additional filter, cost_R eligibility threshold, stop/TP retuning, symbol/regime filter, timeout optimization, or score threshold is permitted."
+}

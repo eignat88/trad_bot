@@ -30,7 +30,7 @@ class TestFrozenRegistry:
         self.experiments = {e["experiment_id"]: e for e in self.registry["experiments"]}
 
     def test_six_experiments_registered(self):
-        assert len(self.experiments) == 14
+        assert len(self.experiments) == 15
 
     def test_experiment_ids(self):
         expected = {
@@ -45,6 +45,7 @@ class TestFrozenRegistry:
             "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1",
             "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
             "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
+            "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1",
         }
         assert set(self.experiments.keys()) == expected
 
@@ -112,10 +113,15 @@ class TestFrozenRegistry:
                          "TREND_PULLBACK_V3_HIGH_VOL_OOS_V1",
                          "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1",
                          "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
-                         "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE"}
+                         "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
+                         "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1"}
         for exp_id, exp in self.experiments.items():
             if exp_id == "VC_SHORT_EXECUTION_V1":
                 assert exp["primary_metric"] == "Net E[R] after normal project costs"
+            elif exp_id == "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1":
+                assert exp["primary_metric"] == (
+                    "Net E[R] after normal project costs, normalized by execution_R = 2.00 * structural_R"
+                )
             elif exp_id in r_denominated:
                 assert exp["primary_metric"] == "MFE_R_60m"
             else:
@@ -300,7 +306,7 @@ class TestDBSchema:
         assert reg.exists()
         data = json.loads(reg.read_text())
         assert "experiments" in data
-        assert len(data["experiments"]) == 14
+        assert len(data["experiments"]) == 15
 
     def test_observer_exists(self):
         observer = PROJECT_ROOT / "app" / "research" / "prospective_observer.py"
@@ -886,6 +892,14 @@ class TestMigration050:
                 assert exp.get("started_at") is None
 
         assert seen == activated
+
+        new_exp = next(
+            exp for exp in registry["experiments"]
+            if exp["experiment_id"] == "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1"
+        )
+        assert new_exp["status"] == "READY_TO_START"
+        assert new_exp["started_at"] is None
+        assert new_exp["freeze_ts"] is None
 
     def test_invariant_checks_all_frozen_fields(self):
         """Invariant must compare ALL 21 frozen fields, not just scanner/direction."""
