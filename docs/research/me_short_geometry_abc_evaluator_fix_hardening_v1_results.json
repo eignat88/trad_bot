@@ -1,0 +1,76 @@
+{
+  "analysis": "ME_SHORT_GEOMETRY_ABC_EVALUATOR_FIX_HARDENING_V1",
+  "audit_ts": "2026-10-07T12:36:39Z",
+  "git_head": "0d98b56aeab083ab97d19698b4b24d2f52e201e2",
+  "branch": "main",
+  "variant_tuple_policy": {
+    "complete_tuple": "use variant_entry, variant_stop, variant_target atomically",
+    "partial_tuple": "fall back to complete base tuple",
+    "base_tuple": "reference_price, invalidation_price, target_1"
+  },
+  "db_blast_radius": {
+    "complete_tuple_experiments": [
+      "ME_SHORT_GEOM_A_V1",
+      "ME_SHORT_GEOM_B_V1",
+      "ME_SHORT_GEOM_C_V1",
+      "SRR_OOS_SCANNER_V1_PROSPECTIVE",
+      "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1",
+      "VC_SHORT_EXECUTION_V1"
+    ],
+    "partial_tuple_experiments": [],
+    "affected_historical_experiments": [
+      "ME_SHORT_GEOM_A_V1",
+      "ME_SHORT_GEOM_B_V1",
+      "ME_SHORT_GEOM_C_V1",
+      "SRR_OOS_SCANNER_V1_PROSPECTIVE",
+      "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1",
+      "VC_SHORT_EXECUTION_V1"
+    ],
+    "me_inventory": {
+      "ME_SHORT_GEOM_A_V1": {"total_n": 503, "complete_tuple_n": 503, "partial_tuple_n": 0},
+      "ME_SHORT_GEOM_B_V1": {"total_n": 503, "complete_tuple_n": 503, "partial_tuple_n": 0},
+      "ME_SHORT_GEOM_C_V1": {"total_n": 503, "complete_tuple_n": 503, "partial_tuple_n": 0}
+    },
+    "srr_inventory": {
+      "SRR_OOS_SCANNER_V1_PROSPECTIVE": {"total_n": 1122, "complete_tuple_n": 1122, "partial_tuple_n": 0},
+      "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1": {"total_n": 14, "complete_tuple_n": 14, "partial_tuple_n": 0}
+    },
+    "vc_inventory": {
+      "VC_SHORT_EXECUTION_V1": {"total_n": 1122, "complete_tuple_n": 62, "partial_tuple_n": 0}
+    }
+  },
+  "fix_behavior": {
+    "variant_entry_used": true,
+    "variant_stop_used": true,
+    "variant_target_used": true,
+    "tuple_atomicity": true,
+    "partial_tuple_deterministic_fallback": true,
+    "mfe_uses_effective_entry": true,
+    "r_normalization_uses_effective_tuple": true,
+    "return_metrics_use_effective_entry": true,
+    "ambiguity_logic_unchanged": true,
+    "base_path_unchanged": true,
+    "a_control_unchanged": true,
+    "non_me_without_variant_tuple_unchanged": true
+  },
+  "test_result": {
+    "dedicated_hardening_tests": "14 passed",
+    "relevant_bounded_suite": "170 passed",
+    "full_repository_suite": "not run in this phase"
+  },
+  "historical_outcome_policy": {
+    "production_rows_rewritten": false,
+    "affected_rows": "preserve as historical evidence"
+  },
+  "c_observer_bug": {
+    "fixed_by_this_task": false,
+    "requires_separate_fix": true
+  },
+  "fix_verdict": "FIX_SAFE_TO_MERGE",
+  "merge_ready": true,
+  "current_me_status": {
+    "A": "VALIDATION_BLOCKED pending merge/deploy; historical control remains usable",
+    "B": "VALIDATION_BLOCKED; requires corrected offline reconstruction",
+    "C": "VALIDATION_BLOCKED; requires observer fix plus new clean holdout"
+  }
+}
