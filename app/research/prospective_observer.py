@@ -929,9 +929,41 @@ class ProspectiveOOSObserver:
                 variant_target = reference_price - target_dist_A
 
         elif exp_id == "ME_SHORT_GEOM_C_V1":
-            current_price = features.get("entry_price", reference_price)
-            if current_price is None or current_price <= 0:
-                current_price = reference_price
+            # Frozen C protocol: delayed entry is the close of the exact 5m
+            # candle that triggered MOMENTUM_EXHAUSTION detection.
+            # Fail closed: never silently substitute reference_price.
+            trigger_5m_close = features.get("trigger_5m_close")
+            if trigger_5m_close is None:
+                logger.warning(
+                    "ME_SHORT_GEOM_C_V1 skipped: missing trigger_5m_close "
+                    "for source_signal_id=%s symbol=%s",
+                    source_key,
+                    symbol,
+                )
+                return None
+
+            try:
+                current_price = float(trigger_5m_close)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "ME_SHORT_GEOM_C_V1 skipped: invalid trigger_5m_close=%r "
+                    "for source_signal_id=%s symbol=%s",
+                    trigger_5m_close,
+                    source_key,
+                    symbol,
+                )
+                return None
+
+            if current_price <= 0:
+                logger.warning(
+                    "ME_SHORT_GEOM_C_V1 skipped: non-positive trigger_5m_close=%r "
+                    "for source_signal_id=%s symbol=%s",
+                    trigger_5m_close,
+                    source_key,
+                    symbol,
+                )
+                return None
+
             variant_entry = current_price
             variant_stop = current_price + risk_dist_A
             if target_1 is not None:

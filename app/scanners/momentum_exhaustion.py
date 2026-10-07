@@ -143,6 +143,10 @@ class MomentumExhaustionScanner:
             candles_5m, prev_high, recent_high,
             current_price, invalidation, target_1, atr, ctx.indicators.rsi,
         )
+        # Research execution metadata for ME_SHORT_GEOM_C_V1.
+        # This is the exact close of the 5m candle that triggered detection.
+        features["trigger_5m_close"] = current_price
+
         return SetupCandidate(
             scanner_name=self.name, scanner_version=self.version, symbol=ctx.symbol,
             direction=ScannerDirection.SHORT.value, htf_timeframe="1h", setup_timeframe="15m", entry_timeframe="5m",

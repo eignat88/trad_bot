@@ -1,0 +1,19 @@
+﻿{
+  "experiment": "ME_SHORT_GEOMETRY_C_DELAYED_ENTRY_OBSERVER_REPAIR_V1",
+  "date": "2026-10-07",
+  "root_cause": "C observer expected unavailable entry_price metadata and silently fell back to reference_price",
+  "authoritative_entry_source": "candles_5m[-1].close",
+  "persisted_feature": "trigger_5m_close",
+  "fallback_to_reference_price": false,
+  "missing_trigger_behavior": "FAIL_CLOSED_SKIP_C",
+  "historical_c_rewritten": false,
+  "production_outcomes_recomputed": false,
+  "pre_fix_c_valid_for_final_validation": false,
+  "clean_holdout_boundary": "C_OBSERVER_FIX_DEPLOY_TS",
+  "tests": {
+    "momentum_exhaustion_r": "19 passed",
+    "bounded_repair_suite": "115 passed"
+  },
+  "repair_verdict": "REPAIR_SAFE_TO_DEPLOY",
+  "current_c_status": "PIPELINE_REPAIRED_BUT_VALIDATION_NOT_COMPLETE"
+}
