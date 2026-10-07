@@ -89,10 +89,9 @@ scanned =
   + invalid_stop
   + invalid_risk
   + identity_collision
-  + already_observed
 ```
 
-The `eligible` count includes both `WOULD_INSERT` and `already_observed`; the rejection categories exclude already-observed rows so they are not double-counted.
+The `eligible` count includes both `WOULD_INSERT` and `already_observed`; therefore `already_observed` must not be added separately in the reconciliation sum. The rejection categories exclude already-observed rows so they are not double-counted.
 
 ## Legacy snapshot handling
 
