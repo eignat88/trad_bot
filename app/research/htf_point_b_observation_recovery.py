@@ -148,7 +148,11 @@ def classify_completed_event(
         snapshot_direction = snapshot.get("direction")
         cohort = snapshot.get("cohort")
         signal_time_raw = snapshot.get("signal_time")
-        signal_dt = _parse_utc(signal_time_raw)
+        try:
+            signal_dt = _parse_utc(signal_time_raw)
+        except (TypeError, ValueError, OverflowError):
+            verdict["verdict"] = "invalid_signal_time"
+            return verdict
         entry = snapshot.get("entry_reference_price")
         stop = snapshot.get("structural_stop_price")
         risk = snapshot.get("risk_abs")

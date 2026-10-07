@@ -171,7 +171,7 @@ def test_all_required_rejections_have_single_final_verdict():
         "invalid-stop": "invalid_stop",
         "nan-entry": "invalid_entry",
         "inf-entry": "invalid_entry",
-        "malformed-time": "malformed",
+        "malformed-time": "invalid_signal_time",
         "wrong-cohort": "wrong_cohort",
     }
 
@@ -327,3 +327,17 @@ def test_default_connection_uses_project_load_settings(monkeypatch, tmp_path):
         "configured_user",
         "configured_password",
     )
+
+def test_invalid_signal_time_uses_declared_report_bucket():
+    row = _row("bad-signal-time")
+    row["snapshot"]["signal_time"] = "not-a-timestamp"
+
+    conn = FakeConnection()
+    report = recover_completed_events(None, conn, [row], apply=False)
+
+    assert report["scanned"] == 1
+    assert report["invalid_signal_time"] == 1
+    assert report["malformed"] == 0
+    assert report["eligible"] == 0
+    assert report["would_insert"] == 0
+    assert conn.inserts == []
