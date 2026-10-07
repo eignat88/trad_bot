@@ -213,11 +213,18 @@ class ProspectiveOOSEvaluator:
         symbol = obs["symbol"]
         is_short = obs["direction"] == "SHORT"
 
-        # Determine entry/stop/target for this experiment variant
-        if obs.get("variant_entry") is not None:
+        # Determine entry/stop/target for this experiment variant.
+        # The ME SHORT geometry protocol freezes each variant's complete
+        # entry/stop/target tuple in variant_* columns, so variant_stop and
+        # variant_target must override the original observation values.
+        if (
+            obs.get("variant_entry") is not None
+            and obs.get("variant_stop") is not None
+            and obs.get("variant_target") is not None
+        ):
             entry_price = float(obs["variant_entry"])
-            stop_price = float(obs["variant_stop"]) if obs["variant_stop"] is not None else None
-            target_price = float(obs["variant_target"]) if obs["variant_target"] is not None else None
+            stop_price = float(obs["variant_stop"])
+            target_price = float(obs["variant_target"])
         else:
             entry_price = float(obs["reference_price"])
             stop_price = float(obs["invalidation_price"]) if obs["invalidation_price"] is not None else None
