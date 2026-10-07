@@ -85,16 +85,17 @@ class TestFrozenRegistry:
         )
 
         activated = {
-            "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
-            "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
+            "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE": "2026-10-06T14:00:00Z",
+            "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE": "2026-10-06T14:00:00Z",
+            "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1": "2026-10-07T08:17:50Z",
         }
-        expected_ts = "2026-10-06T14:00:00Z"
 
         seen = set()
         for exp in registry["experiments"]:
             exp_id = exp["experiment_id"]
             if exp_id in activated:
                 seen.add(exp_id)
+                expected_ts = activated[exp_id]
                 assert exp.get("status") == "RUNNING"
                 assert exp.get("started_at") == expected_ts
                 assert exp.get("freeze_ts") == expected_ts
@@ -104,7 +105,7 @@ class TestFrozenRegistry:
                 )
                 assert exp.get("started_at") is None
 
-        assert seen == activated
+        assert seen == set(activated)
 
     def test_all_use_mfe_pct_primary(self):
         r_denominated = {"SRR_OOS_SCANNER_V1_PROSPECTIVE",
@@ -872,16 +873,17 @@ class TestMigration050:
         )
 
         activated = {
-            "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
-            "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
+            "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE": "2026-10-06T14:00:00Z",
+            "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE": "2026-10-06T14:00:00Z",
+            "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1": "2026-10-07T08:17:50Z",
         }
-        expected_ts = "2026-10-06T14:00:00Z"
 
         seen = set()
         for exp in registry["experiments"]:
             exp_id = exp["experiment_id"]
             if exp_id in activated:
                 seen.add(exp_id)
+                expected_ts = activated[exp_id]
                 assert exp.get("status") == "RUNNING"
                 assert exp.get("started_at") == expected_ts
                 assert exp.get("freeze_ts") == expected_ts
@@ -891,15 +893,15 @@ class TestMigration050:
                 )
                 assert exp.get("started_at") is None
 
-        assert seen == activated
+        assert seen == set(activated)
 
         new_exp = next(
             exp for exp in registry["experiments"]
             if exp["experiment_id"] == "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1"
         )
-        assert new_exp["status"] == "READY_TO_START"
-        assert new_exp["started_at"] is None
-        assert new_exp["freeze_ts"] is None
+        assert new_exp["status"] == "RUNNING"
+        assert new_exp["started_at"] == "2026-10-07T08:17:50Z"
+        assert new_exp["freeze_ts"] == "2026-10-07T08:17:50Z"
 
     def test_invariant_checks_all_frozen_fields(self):
         """Invariant must compare ALL 21 frozen fields, not just scanner/direction."""

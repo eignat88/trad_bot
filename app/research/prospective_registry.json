@@ -542,7 +542,7 @@
       ],
       "filter_rule": "NONE - capture every valid new SUPPORT_RESISTANCE_REACTION SHORT candidate after strict freeze; this is an execution-geometry validation experiment, not a signal-filter experiment.",
       "threshold": null,
-      "freeze_ts": null,
+      "freeze_ts": "2026-10-07T08:17:50Z",
       "entry_rule": "FROZEN: entry = reference_price; structural_R = abs(reference_price - invalidation_price); entry > 0, invalidation_price > 0, and structural_R > 0.",
       "stop_rule": "FROZEN SHORT stop = entry + 2.00 * structural_R.",
       "target_rule": "FROZEN SHORT target = entry - 1.50 * structural_R.",
@@ -595,8 +595,8 @@
       },
       "parent_discovery": "SRR_SHORT_EXECUTION_R_EXPANSION_COUNTERFACTUAL_V1",
       "parent_closed_experiment": "SRR_OOS_SCANNER_V1_PROSPECTIVE / SHORT / CLOSED_NEGATIVE",
-      "started_at": null,
-      "status": "READY_TO_START"
+      "started_at": "2026-10-07T08:17:50Z",
+      "status": "RUNNING"
     },
     {
       "experiment_id": "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",

@@ -138,9 +138,9 @@ class TestFrozenGeometry:
         )
         assert experiment["max_hold_minutes"] == 120
         assert experiment["intrabar_policy"] == "STOP_FIRST"
-        assert experiment["freeze_ts"] is None
-        assert experiment["started_at"] is None
-        assert experiment["status"] == "READY_TO_START"
+        assert experiment["freeze_ts"] == "2026-10-07T08:17:50Z"
+        assert experiment["started_at"] == "2026-10-07T08:17:50Z"
+        assert experiment["status"] == "RUNNING"
         assert experiment["minimum_n"] == 300
         assert experiment["minimum_symbols"] == 30
         assert experiment["minimum_oos_days"] == 14
