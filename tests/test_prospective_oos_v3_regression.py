@@ -232,8 +232,8 @@ class TestMEABCExactPairing:
         assert exp_ids["ME_SHORT_GEOM_B_V1"].get("paired_with") == "ME_SHORT_GEOM_A_V1"
         assert exp_ids["ME_SHORT_GEOM_C_V1"].get("paired_with") == "ME_SHORT_GEOM_A_V1"
 
-    def test_srr_execution_r_expansion_registry_entry_is_inactive(self):
-        """New SRR execution-R expansion experiment remains registered but inactive."""
+    def test_srr_execution_r_expansion_registry_entry_is_activated(self):
+        """SRR execution-R expansion experiment is explicitly activated."""
         import json
         registry = json.loads(
             (PROJECT_ROOT / "app" / "research" / "prospective_registry.json").read_text()
@@ -242,9 +242,9 @@ class TestMEABCExactPairing:
         exp = exp_ids["SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1"]
         assert exp["scanner_name"] == "SUPPORT_RESISTANCE_REACTION"
         assert exp["direction"] == "SHORT"
-        assert exp["status"] == "READY_TO_START"
-        assert exp["started_at"] is None
-        assert exp["freeze_ts"] is None
+        assert exp["status"] == "RUNNING"
+        assert exp["freeze_ts"] == "2026-10-07T08:17:50Z"
+        assert exp["started_at"] == "2026-10-07T08:17:50Z"
 
     def test_me_geometry_variant_formulas_are_distinct(self):
         """A/B/C must compute different variant geometry values."""
@@ -321,16 +321,17 @@ class TestExperimentStatusFiltering:
         )
 
         activated = {
-            "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
-            "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
+            "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE": "2026-10-06T14:00:00Z",
+            "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE": "2026-10-06T14:00:00Z",
+            "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1": "2026-10-07T08:17:50Z",
         }
-        expected_ts = "2026-10-06T14:00:00Z"
 
         seen = set()
         for exp in registry["experiments"]:
             exp_id = exp["experiment_id"]
             if exp_id in activated:
                 seen.add(exp_id)
+                expected_ts = activated[exp_id]
                 assert exp.get("status") == "RUNNING"
                 assert exp.get("started_at") == expected_ts
                 assert exp.get("freeze_ts") == expected_ts
@@ -340,7 +341,7 @@ class TestExperimentStatusFiltering:
                 )
                 assert exp.get("started_at") is None
 
-        assert seen == activated
+        assert seen == set(activated)
 
     def test_no_auto_activation_in_code(self):
         """No code should automatically set experiment status to RUNNING."""
@@ -1308,16 +1309,17 @@ class TestNoAutoActivation:
         )
 
         activated = {
-            "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE",
-            "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE",
+            "HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE": "2026-10-06T14:00:00Z",
+            "HTF_KEYLEVEL_KEYLEVEL_BASELINE_V1_PROSPECTIVE": "2026-10-06T14:00:00Z",
+            "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1": "2026-10-07T08:17:50Z",
         }
-        expected_ts = "2026-10-06T14:00:00Z"
 
         seen = set()
         for exp in registry["experiments"]:
             exp_id = exp["experiment_id"]
             if exp_id in activated:
                 seen.add(exp_id)
+                expected_ts = activated[exp_id]
                 assert exp.get("status") == "RUNNING"
                 assert exp.get("started_at") == expected_ts
                 assert exp.get("freeze_ts") == expected_ts
@@ -1327,4 +1329,4 @@ class TestNoAutoActivation:
                 )
                 assert exp.get("started_at") is None
 
-        assert seen == activated
+        assert seen == set(activated)
