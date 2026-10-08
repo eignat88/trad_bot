@@ -858,7 +858,7 @@
         }
       }
     ],
-    "old_evaluator_tuple": "variant_entry when non-NULL; otherwise reference_price; stop/target selected field-by-field from variant_* when non-NULL, otherwise base",
+    "old_evaluator_tuple": "when variant_entry is non-NULL, use variant_entry/variant_stop/variant_target together, preserving NULL stop or target; otherwise use reference_price/invalidation_price/target_1 together",
     "fixed_evaluator_tuple": "complete variant_entry/variant_stop/variant_target atomically; otherwise complete base tuple",
     "material_mismatch_possible": true,
     "exact_historical_path_reconstruction_available": false,

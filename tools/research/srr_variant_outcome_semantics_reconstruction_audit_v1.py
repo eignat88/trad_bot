@@ -672,7 +672,7 @@ def synthetic_semantics() -> dict[str, Any]:
     })
     return {
         "cases": cases,
-        "old_evaluator_tuple": "variant_entry when non-NULL; otherwise reference_price; stop/target selected field-by-field from variant_* when non-NULL, otherwise base",
+        "old_evaluator_tuple": "when variant_entry is non-NULL, use variant_entry/variant_stop/variant_target together, preserving NULL stop or target; otherwise use reference_price/invalidation_price/target_1 together",
         "fixed_evaluator_tuple": "complete variant_entry/variant_stop/variant_target atomically; otherwise complete base tuple",
         "material_mismatch_possible": True,
         "exact_historical_path_reconstruction_available": False,
@@ -908,7 +908,7 @@ def main() -> None:
         fieldnames = [
             "observation_id", "experiment_id", "source_signal_id", "symbol", "direction",
             "signal_time_utc", "observation_created_at_utc", "outcome_created_at_utc",
-            "outcome_updated_at_utc", "tuple_class", "geometry_exposure", "mismatched_fields",
+            "outcome_updated_at_utc", "tuple_class", "geometry_exposure", "mismatched_fields", "expected_frozen_protocol_mismatched_fields",
             "entry_intervention", "stop_intervention", "target_intervention",
             "frozen_effective_entry", "frozen_effective_stop", "frozen_effective_target",
             "historical_effective_entry", "historical_effective_stop", "historical_effective_target",

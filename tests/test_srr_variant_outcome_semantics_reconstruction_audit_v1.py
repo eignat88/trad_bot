@@ -312,3 +312,106 @@ def test_historical_partial_tuple_exact_semantics():
         variant_entry="99", variant_stop="103", variant_target="93"
     )
     assert historical_tuple(complete) == frozen_tuple(complete)
+
+
+def test_codex_review_regressions_v1():
+    from pathlib import Path
+    import ast
+
+    source_path = Path(
+        "tools/research/srr_variant_outcome_semantics_reconstruction_audit_v1.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    # Confirm the affected CSV schema includes the key emitted by aggregate().
+    field_lists = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "fieldnames"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.List)
+    ]
+    assert any(
+        "expected_frozen_protocol_mismatched_fields"
+        in [item.value for item in values.elts if isinstance(item, ast.Constant)]
+        for values in field_lists
+    )
+
+    # Historical partial tuples must preserve missing stop/target values.
+    partial = observation(variant_entry="99")
+    assert historical_tuple(partial) == (99.0, None, None)
+
+    # The published description must agree with the historical evaluator.
+    assert "preserving NULL stop or target" in source
+    assert "field-by-field" not in source
+
+
+def test_affected_csv_nonempty_export_regression(tmp_path):
+    """A real DictWriter must accept every field emitted by affected rows."""
+    import ast
+    import csv
+
+    script_path = Path(
+        "tools/research/srr_variant_outcome_semantics_reconstruction_audit_v1.py"
+    )
+    tree = ast.parse(script_path.read_text(encoding="utf-8"))
+
+    main_function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+
+    writer_fields = None
+    for node in ast.walk(main_function):
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "fieldnames"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.List)
+        ):
+            values = [
+                item.value
+                for item in node.value.elts
+                if isinstance(item, ast.Constant)
+            ]
+            if "affected_observations_definition" in values:
+                continue
+            if "historical_effective_entry" in values:
+                writer_fields = values
+
+    assert writer_fields is not None
+
+    source = script_path.read_text(encoding="utf-8")
+    assert '"expected_frozen_protocol_mismatched_fields"' in source
+
+    affected = {
+        field: "" for field in writer_fields
+    }
+    affected.update({
+        "observation_id": "synthetic-partial-variant",
+        "experiment_id": "TEST",
+        "tuple_class": "PARTIAL_VARIANT",
+        "mismatched_fields": "entry|stop|target",
+        "expected_frozen_protocol_mismatched_fields": "",
+    })
+
+    output = tmp_path / "affected.csv"
+
+    with output.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=writer_fields)
+        writer.writeheader()
+        writer.writerow(affected)
+
+    with output.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert len(rows) == 1
+    assert rows[0]["observation_id"] == "synthetic-partial-variant"
+    assert rows[0]["mismatched_fields"] == "entry|stop|target"
+    assert "expected_frozen_protocol_mismatched_fields" in rows[0]
