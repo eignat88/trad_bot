@@ -51,6 +51,10 @@ def main() -> None:
     from app.research.evaluator import ResearchEvaluator
     from app.research.prospective_evaluator import ProspectiveOOSEvaluator
     from app.research.repository import ResearchRepository
+    from app.research.srr_short_execution_r_expansion_prospective_evaluator import (
+        BybitHistoricalCandleSource,
+        SrrShortExecutionRExpansionProspectiveEvaluator,
+    )
 
     settings = load_settings(args.config)
     db_repo = ScannerRepository(
@@ -67,21 +71,45 @@ def main() -> None:
 
     # Prospective evaluator: injected with ResearchRepository (not BybitClient)
     research_repo = ResearchRepository(db_repo._conn)
-    prospective_eval = ProspectiveOOSEvaluator(
-        conn=db_repo._conn, client=client, repo=research_repo,
-    )
+    from contextlib import ExitStack
+    from app.research.srr_short_runtime_wiring import prepare_srr_short_writer
 
-    if args.once:
-        _run_single_cycle(db_repo._conn, evaluator, prospective_eval)
-        return
+    with ExitStack() as srr_writer_stack:
+        srr_writer = srr_writer_stack.enter_context(
+            prepare_srr_short_writer(
+                reader_conn=db_repo._conn,
+                host=settings.db_host,
+                port=settings.db_port,
+                database=settings.db_name,
+                user=settings.db_user,
+                password=settings.db_password,
+                enable_writes=False,
+            )
+        )
+        assert srr_writer is None, "SRR runtime writer unexpectedly enabled"
 
-    # ── Daemon mode: unified scheduler loop ────────────────────
-    _run_scheduler_loop(
-        conn=db_repo._conn,
-        evaluator=evaluator,
-        prospective_eval=prospective_eval,
-        interval_seconds=args.interval_seconds,
-    )
+        srr_eval = SrrShortExecutionRExpansionProspectiveEvaluator(
+            conn=db_repo._conn,
+            candle_source=BybitHistoricalCandleSource(client),
+            dry_run=True,
+        )
+
+        prospective_eval = ProspectiveOOSEvaluator(
+            conn=db_repo._conn, client=client, repo=research_repo,
+            srr_policy_router=srr_eval,
+        )
+
+        if args.once:
+            _run_single_cycle(db_repo._conn, evaluator, prospective_eval)
+            return
+
+        # ── Daemon mode: unified scheduler loop ────────────────────
+        _run_scheduler_loop(
+            conn=db_repo._conn,
+            evaluator=evaluator,
+            prospective_eval=prospective_eval,
+            interval_seconds=args.interval_seconds,
+        )
 
 
 def _run_single_cycle(

@@ -133,10 +133,15 @@ def _check_tp_sl(
 class ProspectiveOOSEvaluator:
     """Multi-horizon evaluator for prospective OOS experiments."""
 
-    def __init__(self, conn: Any, client: BybitClient, repo: Any = None) -> None:
+    def __init__(self, conn: Any, client: BybitClient, repo: Any = None,
+                 srr_policy_router: Any | None = None) -> None:
         self._conn = conn
         self.client = client
         self._repo = repo  # ResearchRepository for get_eligible_signals if needed
+        # Optional SRR-specific adapter. It is only consulted for the frozen
+        # SRR execution-R expansion experiment; all other experiments retain
+        # the existing prospective evaluator path unchanged.
+        self._srr_policy_router = srr_policy_router
 
     # Maximum fallback horizon for TP/SL checking when no frozen_max_hold is set.
     _DEFAULT_MAX_HOLD_MINUTES = 240
@@ -363,6 +368,30 @@ class ProspectiveOOSEvaluator:
             return {"experiment_id": experiment_id, "signals_checked": 0,
                     "horizons_updated": {}, "finalized": 0, "errors": 0}
         started_at = row[0]
+
+        # SRR-specific lifecycle must not depend on generic prospective_outcome.
+        if experiment_id == "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1":
+            router = self._srr_policy_router
+            stats = {
+                "experiment_id": experiment_id,
+                "signals_checked": 0,
+                "horizons_updated": {},
+                "finalized": 0,
+                "errors": 0,
+            }
+            if router is None:
+                logger.error("SRR experiment has no specialized policy router")
+                stats["errors"] = 1
+                return stats
+            try:
+                route_stats = router.run_evaluation_cycle(experiment_id)
+                stats["signals_checked"] = route_stats.get("signals_checked", 0)
+                stats["finalized"] = route_stats.get("finalized", 0)
+                stats["errors"] = route_stats.get("errors", 0)
+            except Exception:
+                logger.exception("SRR specialized evaluation cycle failed")
+                stats["errors"] = 1
+            return stats
 
         # Load closed directions for this experiment (if any)
         closed_directions: set[str] = set()
