@@ -304,16 +304,17 @@ class SrrOutcomeWriter:
             return rejected
 
         # At this point the FOR SHARE lock on the activation record is held
-        # inside the writer's transaction. Everything below — validation,
-        # value construction, and all persistence SQL — must either COMMIT
-        # or ROLLBACK. Any exception must roll back so the lock is released.
-        #
-        # Test-only sync hook: allows the concurrency IT to pause between
-        # the FOR SHARE acquisition and the INSERT/UPDATE.
-        if self._after_lock_hook is not None:
-            self._after_lock_hook()
-
+        # inside the writer's transaction. Everything below — the test-only
+        # hook, validation, value construction, and all persistence SQL —
+        # must either COMMIT or ROLLBACK. Any exception must roll back so
+        # the lock is released.
         try:
+            # Test-only sync hook: allows the concurrency IT to pause between
+            # the FOR SHARE acquisition and the INSERT/UPDATE. If the hook
+            # raises, the rollback below releases the lock.
+            if self._after_lock_hook is not None:
+                self._after_lock_hook()
+
             return self._write_locked(
                 observation_id=observation_id,
                 experiment_id=experiment_id,

@@ -395,3 +395,85 @@ def test_real_reverse_order_revoke_before_writer(it_db):
             assert cur.fetchone()[0] == 0
     finally:
         writer_conn.close()
+
+
+def test_hook_exception_releases_for_share_lock(it_db):
+    """A _after_lock_hook exception after FOR SHARE acquisition triggers
+    rollback; a subsequent ACTIVE -> REVOKED on a second connection
+    completes immediately (no lock_timeout needed). No outcome rows are
+    created; the reader transaction is unaffected."""
+    from app.research.srr_short_execution_outcome_persistence import SrrOutcomeWriter
+
+    gate = _make_gate()
+
+    writer_conn = _connect(it_db)
+    revoke_conn = _connect(it_db)
+    reader_conn = _connect(it_db)
+
+    writer = SrrOutcomeWriter(writer_conn, activation_gate=gate)
+
+    try:
+        # Reader opens a transaction to verify it is unaffected.
+        with reader_conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            assert cur.fetchone()[0] == 1
+
+        # Set a hook that raises after FOR SHARE is acquired.
+        def raising_hook():
+            raise RuntimeError("INJECTED_HOOK_FAILURE")
+
+        writer._after_lock_hook = raising_hook
+
+        # The write must raise; the rollback inside write() releases the lock.
+        with pytest.raises(RuntimeError, match="INJECTED_HOOK_FAILURE"):
+            writer.write(
+                observation_id=1001,
+                experiment_id=SRR_EXPERIMENT_ID,
+                observation=_make_observation(1001),
+                result=_nonfinal_result(),
+            )
+
+        # A second connection performs ACTIVE -> REVOKED. Because the lock
+        # was rolled back, this must complete immediately. We do NOT set
+        # lock_timeout: if the lock were still held, this UPDATE would
+        # block until the statement timeout (default 0 = wait forever),
+        # causing the test to hang and be caught by the outer test timeout.
+        with revoke_conn.cursor() as cur:
+            cur.execute(
+                "UPDATE research.srr_short_writer_activation "
+                "SET status = 'REVOKED' WHERE experiment_id = %s",
+                (SRR_EXPERIMENT_ID,),
+            )
+        revoke_conn.commit()
+
+        # Verify no outcome row was created by the failed write.
+        with writer_conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM "
+                "research.srr_short_execution_prospective_outcome "
+                "WHERE observation_id = %s",
+                (1001,),
+            )
+            assert cur.fetchone()[0] == 0
+
+        # Reader transaction is still open and unaffected.
+        with reader_conn.cursor() as cur:
+            cur.execute("SELECT 2")
+            assert cur.fetchone()[0] == 2
+    finally:
+        # Cleanup: ensure no leaked transactions.
+        try:
+            writer_conn.rollback()
+        except Exception:
+            pass
+        writer_conn.close()
+        try:
+            revoke_conn.rollback()
+        except Exception:
+            pass
+        revoke_conn.close()
+        try:
+            reader_conn.rollback()
+        except Exception:
+            pass
+        reader_conn.close()
