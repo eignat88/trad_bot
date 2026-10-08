@@ -102,6 +102,12 @@ class SrrOutcomeWriter:
             raise ValueError("SrrOutcomeWriter requires a PostgreSQL connection")
         self._conn = conn
         self._activation_gate = activation_gate
+        # Test-only synchronization hook. When set, it is called after the
+        # FOR SHARE lock is acquired and before any outcome SQL. Used by the
+        # PostgreSQL concurrency integration test to deterministically pause
+        # the writer between the lock and the INSERT/UPDATE. Never set in
+        # production.
+        self._after_lock_hook: Any = None
 
     def _safe_rollback(self) -> None:
         """Roll back the writer transaction, ignoring secondary errors.
@@ -301,6 +307,12 @@ class SrrOutcomeWriter:
         # inside the writer's transaction. Everything below — validation,
         # value construction, and all persistence SQL — must either COMMIT
         # or ROLLBACK. Any exception must roll back so the lock is released.
+        #
+        # Test-only sync hook: allows the concurrency IT to pause between
+        # the FOR SHARE acquisition and the INSERT/UPDATE.
+        if self._after_lock_hook is not None:
+            self._after_lock_hook()
+
         try:
             return self._write_locked(
                 observation_id=observation_id,
