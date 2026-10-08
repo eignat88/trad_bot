@@ -1,4 +1,4 @@
-﻿import json
+import json
 import uuid
 from datetime import datetime, timezone
 
@@ -13,6 +13,7 @@ from app.research.srr_short_execution_r_expansion_prospective_evaluator import (
 from tests.test_srr_short_prospective_evaluator_policy_routing_v1 import (
     _ArchiveSource, _clean_candles, _obs, SIGNAL_MS,
 )
+from tests.test_srr_short_execution_outcome_persistence_v1 import make_activation_gate
 
 DB = "trad_bot_srr_persistence_it_20261008"
 CUTOFF = SIGNAL_MS + 120 * 60_000
@@ -171,7 +172,9 @@ def test_timeout_callback_nonfinal_final_excluded():
             conn=ScopedConnection(reader, observation_id),
             candle_source=_ArchiveSource(_clean_candles()),
             dry_run=False,
-            write_outcomes=SrrOutcomeWriter(writer_conn).write,
+            write_outcomes=SrrOutcomeWriter(
+                writer_conn, activation_gate=make_activation_gate()
+            ).write,
         )
 
         for asof, expected_action, expected_final in (

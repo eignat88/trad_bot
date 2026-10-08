@@ -13,6 +13,7 @@ from tests.test_srr_short_execution_outcome_persistence_v1 import (
     observation,
     final_result,
     nonfinal_result,
+    make_activation_gate,
 )
 
 DB = "trad_bot_srr_persistence_it_20261008"
@@ -107,7 +108,7 @@ def run_two_writers(connect, observation_id, result):
         conn = connect()
         try:
             barrier.wait(timeout=10)
-            return SrrOutcomeWriter(conn).write(
+            return SrrOutcomeWriter(conn, activation_gate=make_activation_gate()).write(
                 observation_id=observation_id,
                 experiment_id=EXP_ID,
                 observation=observation(),
@@ -150,7 +151,7 @@ def test_concurrent_finalization_and_immutability(connect):
 
     conn = connect()
     try:
-        initial = SrrOutcomeWriter(conn).write(
+        initial = SrrOutcomeWriter(conn, activation_gate=make_activation_gate()).write(
             observation_id=observation_id,
             experiment_id=EXP_ID,
             observation=observation(),

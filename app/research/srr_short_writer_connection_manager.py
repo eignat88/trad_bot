@@ -21,8 +21,15 @@ def open_srr_outcome_writer(
     password: str | None = None,
     reader_conn: Any = None,
     connect_factory: Callable[..., Any] | None = None,
+    activation_gate: Any = None,
 ) -> Iterator[SrrOutcomeWriter]:
-    """Create and own a separate writer connection."""
+    """Create and own a separate writer connection.
+
+    ``activation_gate`` is an optional ``SrrShortWriterActivationGate``. When
+    provided, the gate is consulted for every write before any SQL is issued.
+    Without an explicitly authorized gate the writer remains observe-only at
+    the evaluator level; this manager itself does not enable writes.
+    """
 
     factory = connect_factory or pg8000.connect
     conn = None
@@ -42,7 +49,7 @@ def open_srr_outcome_writer(
                 "SRR writer must own an independent PostgreSQL connection"
             )
 
-        yield SrrOutcomeWriter(conn)
+        yield SrrOutcomeWriter(conn, activation_gate=activation_gate)
 
     finally:
         if conn is not None and conn is not reader_conn:
