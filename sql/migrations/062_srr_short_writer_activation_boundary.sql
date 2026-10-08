@@ -60,27 +60,60 @@ BEGIN
     END IF;
 END $$;
 
--- ── 3. Finalization immutability guard ────────────────────────
--- Once an activation record is ACTIVE its activation_ts can never change.
--- A REVOKED record may not be re-activated in place.
+-- ── 3. State machine and immutability guard ───────────────────
+-- Immutable fields: experiment_id, direction, boundary_version,
+-- activation_ts. They may never change after the initial INSERT,
+-- regardless of status.
+-- Permitted status transitions: PENDING → ACTIVE → REVOKED,
+-- and PENDING → REVOKED (cancel-before-activation).
+-- A REVOKED record is terminal; no reactivation is permitted.
+-- DELETE of an activation record is always prohibited.
 
 CREATE OR REPLACE FUNCTION research.fn_block_srr_short_writer_activation_change()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $trigger$
 BEGIN
-    IF OLD.status = 'ACTIVE' AND NEW.activation_ts IS DISTINCT FROM OLD.activation_ts THEN
+    -- Immutable fields may never change after INSERT.
+    IF NEW.experiment_id IS DISTINCT FROM OLD.experiment_id THEN
         RAISE EXCEPTION
-            'active SRR writer activation record is immutable: experiment_id=%',
+            'SRR writer activation experiment_id is immutable: experiment_id=%',
             OLD.experiment_id
             USING ERRCODE = 'restrict_violation';
     END IF;
-    IF OLD.status = 'REVOKED' AND NEW.status = 'ACTIVE' THEN
+    IF NEW.direction IS DISTINCT FROM OLD.direction THEN
         RAISE EXCEPTION
-            'revoked SRR writer activation record cannot be reactivated: experiment_id=%',
+            'SRR writer activation direction is immutable: experiment_id=%',
             OLD.experiment_id
             USING ERRCODE = 'restrict_violation';
     END IF;
+    IF NEW.boundary_version IS DISTINCT FROM OLD.boundary_version THEN
+        RAISE EXCEPTION
+            'SRR writer activation boundary_version is immutable: experiment_id=%',
+            OLD.experiment_id
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+    IF NEW.activation_ts IS DISTINCT FROM OLD.activation_ts THEN
+        RAISE EXCEPTION
+            'SRR writer activation activation_ts is immutable: experiment_id=%',
+            OLD.experiment_id
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+
+    -- Status transitions: only PENDING → ACTIVE, PENDING → REVOKED,
+    -- and ACTIVE → REVOKED are permitted. Self-transitions are a no-op.
+    IF NEW.status IS DISTINCT FROM OLD.status THEN
+        IF NOT (
+            (OLD.status = 'PENDING' AND NEW.status IN ('ACTIVE', 'REVOKED'))
+            OR (OLD.status = 'ACTIVE' AND NEW.status = 'REVOKED')
+        ) THEN
+            RAISE EXCEPTION
+                'SRR writer activation status transition % → % is not permitted: experiment_id=%',
+                OLD.status, NEW.status, OLD.experiment_id
+                USING ERRCODE = 'restrict_violation';
+        END IF;
+    END IF;
+
     RETURN NEW;
 END;
 $trigger$;
@@ -99,6 +132,37 @@ BEGIN
         BEFORE UPDATE ON research.srr_short_writer_activation
         FOR EACH ROW
         EXECUTE FUNCTION research.fn_block_srr_short_writer_activation_change();
+    END IF;
+END $$;
+
+-- DELETE of an activation record is always prohibited.
+
+CREATE OR REPLACE FUNCTION research.fn_block_srr_short_writer_activation_delete()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $trigger$
+BEGIN
+    RAISE EXCEPTION
+        'SRR writer activation record cannot be deleted: experiment_id=%',
+        OLD.experiment_id
+        USING ERRCODE = 'restrict_violation';
+END;
+$trigger$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgrelid =
+            'research.srr_short_writer_activation'::regclass
+          AND tgname = 'trg_srr_short_writer_activation_block_delete'
+          AND NOT tgisinternal
+    ) THEN
+        CREATE TRIGGER trg_srr_short_writer_activation_block_delete
+        BEFORE DELETE ON research.srr_short_writer_activation
+        FOR EACH ROW
+        EXECUTE FUNCTION research.fn_block_srr_short_writer_activation_delete();
     END IF;
 END $$;
 

@@ -35,6 +35,16 @@ SRR_ACTIVATION_EXPERIMENT_ID = (
 )
 SRR_ACTIVATION_DIRECTION = "SHORT"
 
+# Activation record lifecycle states.
+ACTIVATION_STATUS_PENDING = "PENDING"
+ACTIVATION_STATUS_ACTIVE = "ACTIVE"
+ACTIVATION_STATUS_REVOKED = "REVOKED"
+ACTIVATION_VALID_STATUSES = (
+    ACTIVATION_STATUS_PENDING,
+    ACTIVATION_STATUS_ACTIVE,
+    ACTIVATION_STATUS_REVOKED,
+)
+
 # Canonical storage format for ACTIVATION_TS. All comparisons use the
 # normalized UTC millisecond representation derived from this format.
 ACTIVATION_TS_STORAGE_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
@@ -54,6 +64,18 @@ class SrrActivationRecordMismatch(SrrActivationBoundaryError):
 
 class SrrActivationRecordUnavailable(SrrActivationBoundaryError):
     """Persisted activation record lookup failed or is absent."""
+
+
+class SrrActivationRecordNotActive(SrrActivationBoundaryError):
+    """Persisted activation record exists but is not in ``ACTIVE`` status."""
+
+
+class SrrActivationRecordImmutableViolation(SrrActivationBoundaryError):
+    """An immutable activation record field was changed."""
+
+
+class SrrActivationInvalidTransition(SrrActivationBoundaryError):
+    """Requested activation record status transition is not permitted."""
 
 
 class SrrPreActivationObservation(SrrActivationBoundaryError):
@@ -111,6 +133,86 @@ def normalize_activation_ts(value: Any) -> tuple[int, str]:
         ACTIVATION_TS_STORAGE_FORMAT
     )
     return ms, canonical
+
+
+# ── Activation record state machine ─────────────────────────────
+# The only permitted transitions are PENDING → ACTIVE → REVOKED.
+# A direct PENDING → REVOKED transition (cancel-before-activation) is
+# explicitly permitted; see module docstring for the rationale.
+ACTIVATION_ALLOWED_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    ACTIVATION_STATUS_PENDING: (ACTIVATION_STATUS_ACTIVE, ACTIVATION_STATUS_REVOKED),
+    ACTIVATION_STATUS_ACTIVE: (ACTIVATION_STATUS_REVOKED,),
+    ACTIVATION_STATUS_REVOKED: (),  # terminal; no reactivation
+}
+
+# Immutable fields that may never change after the initial INSERT.
+ACTIVATION_IMMUTABLE_FIELDS = (
+    "experiment_id",
+    "direction",
+    "boundary_version",
+    "activation_ts",
+)
+
+
+def validate_activation_transition(current: str, target: str) -> None:
+    """Raise ``SrrActivationInvalidTransition`` for a disallowed transition.
+
+    Self-transitions (``current == target``) are permitted as a no-op so
+    that idempotent status updates do not fail.
+    """
+    if current == target:
+        return
+    allowed = ACTIVATION_ALLOWED_TRANSITIONS.get(current)
+    if allowed is None:
+        raise SrrActivationInvalidTransition(
+            f"SRR activation status {current!r} is not a known state"
+        )
+    if target not in allowed:
+        raise SrrActivationInvalidTransition(
+            f"SRR activation transition {current!r} → {target!r} is not permitted; "
+            f"allowed from {current!r}: {list(allowed)!r}"
+        )
+
+
+def validate_activation_record_immutability(
+    original: Mapping[str, Any],
+    updated: Mapping[str, Any],
+) -> None:
+    """Raise ``SrrActivationRecordImmutableViolation`` if any immutable field changed.
+
+    ``activation_ts`` may never change after INSERT, regardless of status.
+    ``experiment_id``, ``direction``, and ``boundary_version`` may never change.
+    Only ``status``, ``notes``, ``updated_at``, and lifecycle timestamps may
+    be modified.
+    """
+    for field in ACTIVATION_IMMUTABLE_FIELDS:
+        old_value = original.get(field)
+        new_value = updated.get(field)
+        if field == "activation_ts":
+            # Compare as normalized UTC ms to tolerate format differences.
+            try:
+                old_ms, _ = normalize_activation_ts(old_value)
+            except SrrActivationConfigError as exc:
+                raise SrrActivationRecordImmutableViolation(
+                    f"original activation_ts is invalid: {old_value!r}"
+                ) from exc
+            try:
+                new_ms, _ = normalize_activation_ts(new_value)
+            except SrrActivationConfigError as exc:
+                raise SrrActivationRecordImmutableViolation(
+                    f"updated activation_ts is invalid: {new_value!r}"
+                ) from exc
+            if old_ms != new_ms:
+                raise SrrActivationRecordImmutableViolation(
+                    f"activation_ts is immutable and cannot change: "
+                    f"original={old_value!r} updated={new_value!r}"
+                )
+        else:
+            if str(old_value or "") != str(new_value or ""):
+                raise SrrActivationRecordImmutableViolation(
+                    f"{field} is immutable and cannot change: "
+                    f"original={old_value!r} updated={new_value!r}"
+                )
 
 
 @dataclass(frozen=True)
@@ -217,6 +319,10 @@ class SrrShortWriterActivationGate:
         self._boundary = boundary
         self._mode = mode
         self._record: Mapping[str, Any] | None = None
+        # Status of the record as last verified; ``assert_writer_allowed``
+        # re-checks this at call time so a revoked record blocks writes even
+        # if the in-memory copy has not been refreshed.
+        self._record_status: str | None = None
 
     @property
     def boundary(self) -> SrrShortWriterActivationBoundary | None:
@@ -233,8 +339,9 @@ class SrrShortWriterActivationGate:
     def verify_persisted_record(self, record: Mapping[str, Any] | None) -> None:
         """Compare the runtime boundary against a persisted activation record.
 
-        A missing record or any mismatch raises; only an exact match clears
-        the gate for writer-mode operation.
+        A missing record, a non-ACTIVE status, or any mismatch raises; only
+        an exact match on ``ACTIVE`` clears the gate for writer-mode
+        operation.
         """
         if self._boundary is None:
             raise SrrActivationConfigError(
@@ -244,6 +351,14 @@ class SrrShortWriterActivationGate:
             raise SrrActivationRecordUnavailable(
                 "SRR activation record is absent; writer mode is blocked"
             )
+
+        status = str(record.get("status", "") or "")
+        if status != ACTIVATION_STATUS_ACTIVE:
+            raise SrrActivationRecordNotActive(
+                "SRR activation record is not ACTIVE; writer mode is blocked: "
+                f"status={status!r}"
+            )
+
         record_text = str(record.get("activation_ts", "") or "")
         if not record_text:
             raise SrrActivationRecordUnavailable(
@@ -266,6 +381,12 @@ class SrrShortWriterActivationGate:
                 "SRR activation record experiment mismatch: "
                 f"record={experiment!r}"
             )
+        direction = str(record.get("direction", "") or "")
+        if direction != SRR_ACTIVATION_DIRECTION:
+            raise SrrActivationRecordMismatch(
+                "SRR activation record direction mismatch: "
+                f"record={direction!r}"
+            )
         version = str(record.get("boundary_version", "") or "")
         if version != SRR_ACTIVATION_BOUNDARY_V1:
             raise SrrActivationRecordMismatch(
@@ -273,9 +394,20 @@ class SrrShortWriterActivationGate:
                 f"record={version!r} expected={SRR_ACTIVATION_BOUNDARY_V1!r}"
             )
         self._record = dict(record)
+        self._record_status = status
+
+    @property
+    def verified_record_status(self) -> str | None:
+        """Status of the last verified record, or ``None`` if not verified."""
+        return self._record_status
 
     def assert_writer_allowed(self) -> None:
-        """Raise unless writer mode is explicitly enabled and verified."""
+        """Raise unless writer mode is explicitly enabled and verified.
+
+        Re-checks the record status at call time: a record that has been
+        revoked or has fallen out of ACTIVE state since verification blocks
+        the write.
+        """
         if self._mode is None or not self._mode.allows_writes:
             raise SrrActivationBoundaryError(
                 "SRR_SHORT_WRITER_DISABLED: explicit activation authorization required"
@@ -287,6 +419,12 @@ class SrrShortWriterActivationGate:
         if self._record is None:
             raise SrrActivationRecordUnavailable(
                 "SRR activation record has not been verified; writer mode is blocked"
+            )
+        current_status = self._record_status
+        if current_status != ACTIVATION_STATUS_ACTIVE:
+            raise SrrActivationRecordNotActive(
+                "SRR activation record is no longer ACTIVE; writer mode is blocked: "
+                f"status={current_status!r}"
             )
 
 

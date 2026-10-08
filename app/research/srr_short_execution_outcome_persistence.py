@@ -32,10 +32,10 @@ logger = logging.getLogger(__name__)
 SRR_ADAPTER_VERSION = "SRR_SHORT_PROSPECTIVE_EVALUATOR_POLICY_ROUTING_V1"
 SRR_FROZEN_POLICY_VERSION = "SRR_SHORT_TIMEOUT_CANDLE_POLICY_V1"
 
-# Optional activation-boundary guard. When a guard is attached, every write
-# must pass the boundary check before any SQL is executed. The default writer
-# (no guard) preserves the pre-existing behavior used by dry-run wiring.
-SRR_WRITER_BOUNDARY_DISABLED = None
+# Fail-closed sentinel: ``SrrOutcomeWriter`` must never be constructed
+# without a verified activation gate. ``None`` is a valid value here because
+# a missing gate is an immediate, pre-SQL rejection.
+SRR_WRITER_GATE_REQUIRED = True
 
 
 def _json_text(value: Any) -> str:
@@ -86,6 +86,10 @@ class SrrOutcomeWriter:
     The writer owns its transaction boundary for each write. It never calls
     ``ResearchRepository.upsert_outcome`` and never writes the generic
     ``prospective_outcome`` table. A failed operation always rolls back.
+
+    Every write requires a fully verified ``SrrShortWriterActivationGate``.
+    A writer constructed without a gate is rejected at call time before any
+    SQL is issued — the absence of a gate is never treated as permission.
     """
 
     def __init__(
@@ -112,10 +116,22 @@ class SrrOutcomeWriter:
         Returns ``None`` when the write may proceed, otherwise a rejection
         result. The check runs before any SQL statement is issued so that a
         pre-activation observation cannot touch the database at all.
+
+        A missing gate is a hard rejection: the writer must never persist
+        anything without a verified activation record.
         """
         gate = self._activation_gate
         if gate is None:
-            return None
+            logger.warning(
+                "SRR outcome write rejected (no activation gate): observation_id=%s",
+                observation_id,
+            )
+            return SrrOutcomeWriteResult(
+                observation_id=int(observation_id),
+                action="REJECTED_NO_ACTIVATION_GATE",
+                is_final=False,
+            )
+
         try:
             gate.assert_writer_allowed()
         except Exception as exc:
@@ -162,6 +178,22 @@ class SrrOutcomeWriter:
             return SrrOutcomeWriteResult(
                 observation_id=int(observation_id),
                 action="REJECTED_PRE_ACTIVATION",
+                is_final=False,
+            )
+
+        # The explicit experiment_id parameter must also match the frozen
+        # experiment. A substituted experiment_id is rejected before SQL.
+        if experiment_id != boundary.experiment_id:
+            logger.warning(
+                "SRR outcome write rejected (experiment mismatch): observation_id=%s "
+                "experiment_id=%s expected=%s",
+                observation_id,
+                experiment_id,
+                boundary.experiment_id,
+            )
+            return SrrOutcomeWriteResult(
+                observation_id=int(observation_id),
+                action="REJECTED_EXPERIMENT_MISMATCH",
                 is_final=False,
             )
         return None

@@ -6,8 +6,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone, timedelta
-from types import SimpleNamespace
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import Mock, MagicMock
 
 import pytest
 
@@ -15,9 +14,15 @@ from app.research.srr_short_writer_activation_boundary_v1 import (
     SRR_ACTIVATION_BOUNDARY_V1,
     SRR_ACTIVATION_DIRECTION,
     SRR_ACTIVATION_EXPERIMENT_ID,
+    ACTIVATION_STATUS_ACTIVE,
+    ACTIVATION_STATUS_PENDING,
+    ACTIVATION_STATUS_REVOKED,
     SrrActivationBoundaryError,
     SrrActivationConfigError,
+    SrrActivationInvalidTransition,
+    SrrActivationRecordImmutableViolation,
     SrrActivationRecordMismatch,
+    SrrActivationRecordNotActive,
     SrrActivationRecordUnavailable,
     SrrPreActivationObservation,
     SrrShortWriterActivationBoundary,
@@ -25,6 +30,8 @@ from app.research.srr_short_writer_activation_boundary_v1 import (
     SrrShortWriterActivationMode,
     build_activation_sql_filters,
     normalize_activation_ts,
+    validate_activation_record_immutability,
+    validate_activation_transition,
 )
 from app.research.srr_short_execution_outcome_persistence import SrrOutcomeWriter
 from app.research.srr_short_execution_r_expansion_prospective_evaluator import (
@@ -142,6 +149,8 @@ def test_t07_restart_with_same_boundary_pass():
         "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
         "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
         "activation_ts": ACTIVATION_TS,
+        "direction": SRR_ACTIVATION_DIRECTION,
+        "status": ACTIVATION_STATUS_ACTIVE,
     })
 
     gate2 = SrrShortWriterActivationGate(
@@ -152,6 +161,8 @@ def test_t07_restart_with_same_boundary_pass():
         "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
         "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
         "activation_ts": ACTIVATION_TS,
+        "direction": SRR_ACTIVATION_DIRECTION,
+        "status": ACTIVATION_STATUS_ACTIVE,
     })
 
     # Both gates allow writes
@@ -171,6 +182,8 @@ def test_t08_restart_with_different_boundary_fails_closed():
         "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
         "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
         "activation_ts": ACTIVATION_TS,
+        "direction": SRR_ACTIVATION_DIRECTION,
+        "status": ACTIVATION_STATUS_ACTIVE,
     })
     gate1.assert_writer_allowed()
 
@@ -183,6 +196,8 @@ def test_t08_restart_with_different_boundary_fails_closed():
             "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
             "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
             "activation_ts": ACTIVATION_TS,  # old record, new runtime boundary
+            "direction": SRR_ACTIVATION_DIRECTION,
+            "status": ACTIVATION_STATUS_ACTIVE,
         })
 
 
@@ -333,6 +348,8 @@ def test_t14_direct_writer_call_rejected():
         "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
         "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
         "activation_ts": ACTIVATION_TS,
+        "direction": SRR_ACTIVATION_DIRECTION,
+        "status": ACTIVATION_STATUS_ACTIVE,
     })
 
     fake_conn = MagicMock()
@@ -365,6 +382,8 @@ def test_t14_direct_writer_call_without_gate_rejected():
         "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
         "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
         "activation_ts": ACTIVATION_TS,
+        "direction": SRR_ACTIVATION_DIRECTION,
+        "status": ACTIVATION_STATUS_ACTIVE,
     })
 
     fake_conn = MagicMock()
@@ -399,6 +418,8 @@ def test_t15_repeated_nonfinal_write_idempotent():
         "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
         "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
         "activation_ts": ACTIVATION_TS,
+        "direction": SRR_ACTIVATION_DIRECTION,
+        "status": ACTIVATION_STATUS_ACTIVE,
     })
 
     fake_conn = MagicMock()
@@ -438,6 +459,8 @@ def test_t16_nonfinal_to_final_pass():
         "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
         "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
         "activation_ts": ACTIVATION_TS,
+        "direction": SRR_ACTIVATION_DIRECTION,
+        "status": ACTIVATION_STATUS_ACTIVE,
     })
 
     fake_conn = MagicMock()
@@ -500,6 +523,8 @@ def test_t17_repeated_final_write_immutable():
         "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
         "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
         "activation_ts": ACTIVATION_TS,
+        "direction": SRR_ACTIVATION_DIRECTION,
+        "status": ACTIVATION_STATUS_ACTIVE,
     })
 
     fake_conn = MagicMock()
@@ -561,6 +586,8 @@ def test_t18_final_to_other_final_blocked():
         "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
         "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
         "activation_ts": ACTIVATION_TS,
+        "direction": SRR_ACTIVATION_DIRECTION,
+        "status": ACTIVATION_STATUS_ACTIVE,
     })
 
     fake_conn = MagicMock()
@@ -895,6 +922,9 @@ def test_t24_writer_cannot_rollback_reader():
         open_srr_outcome_writer,
     )
 
+    boundary = make_boundary()
+    gate = _make_active_gate(boundary)
+
     reader_conn = MagicMock(name="reader_conn")
     reader_conn.cursor.side_effect = AssertionError("reader cursor not allowed")
 
@@ -910,6 +940,7 @@ def test_t24_writer_cannot_rollback_reader():
         password="test",
         reader_conn=reader_conn,
         connect_factory=fake_connect,
+        activation_gate=gate,
     ) as writer:
         # Simulate a write failure that triggers rollback
         cursor = MagicMock()
@@ -920,14 +951,8 @@ def test_t24_writer_cannot_rollback_reader():
             writer.write(
                 observation_id=1,
                 experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
-                observation={
-                    "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
-                    "direction": "SHORT",
-                    "signal_time": datetime(2026, 10, 8, 13, 0, tzinfo=timezone.utc),
-                    "symbol": "BTCUSDT",
-                    "features": json.dumps({"_frozen_freeze_ts": "2026-10-07T08:17:50Z"}),
-                },
-                result={"status": "TEST", "reason_code": "TEST"},
+                observation=_eligible_observation(),
+                result={"status": "TEST", "reason_code": "TEST", "finalization_eligible": False},
             )
 
     # reader_conn.rollback was never called
@@ -975,6 +1000,8 @@ def test_gate_with_matching_record_allows_writes():
         "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
         "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
         "activation_ts": ACTIVATION_TS,
+        "direction": SRR_ACTIVATION_DIRECTION,
+        "status": ACTIVATION_STATUS_ACTIVE,
     })
     gate.assert_writer_allowed()  # no exception
 
@@ -990,6 +1017,8 @@ def test_gate_with_mismatched_experiment_rejected():
             "experiment_id": "WRONG_EXPERIMENT",
             "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
             "activation_ts": ACTIVATION_TS,
+            "direction": SRR_ACTIVATION_DIRECTION,
+            "status": ACTIVATION_STATUS_ACTIVE,
         })
 
 
@@ -1004,6 +1033,8 @@ def test_gate_with_mismatched_version_rejected():
             "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
             "boundary_version": "SOME_OTHER_VERSION",
             "activation_ts": ACTIVATION_TS,
+            "direction": SRR_ACTIVATION_DIRECTION,
+            "status": ACTIVATION_STATUS_ACTIVE,
         })
 
 
@@ -1113,3 +1144,393 @@ def test_runtime_writes_with_naive_activation_ts_blocked():
             activation_mode=SrrShortWriterActivationMode(enabled=True),
         ):
             pass
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PRE-PR HARDENING TESTS (task D)
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _make_active_gate(boundary=None):
+    """Helper: create a fully verified ACTIVE gate."""
+    boundary = boundary or make_boundary()
+    gate = SrrShortWriterActivationGate(
+        boundary=boundary,
+        mode=SrrShortWriterActivationMode(enabled=True),
+    )
+    gate.verify_persisted_record({
+        "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
+        "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
+        "activation_ts": ACTIVATION_TS,
+        "direction": SRR_ACTIVATION_DIRECTION,
+        "status": ACTIVATION_STATUS_ACTIVE,
+    })
+    return gate
+
+
+def _eligible_observation(observation_id=900, **overrides):
+    """Helper: an observation strictly after the activation boundary."""
+    base = {
+        "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
+        "direction": "SHORT",
+        "signal_time": datetime(2026, 10, 8, 13, 0, tzinfo=timezone.utc),
+        "symbol": "BTCUSDT",
+        "features": json.dumps({"_frozen_freeze_ts": "2026-10-07T08:17:50Z"}),
+        "reference_price": 100.0,
+        "invalidation_price": 102.0,
+        "variant_entry": 100.0,
+        "variant_stop": 102.0,
+        "variant_target": 98.5,
+    }
+    base.update(overrides)
+    return base
+
+
+# ── D1: Writer without gate ─────────────────────────────────────
+
+def test_d1_writer_without_gate_rejected_before_sql():
+    """A writer constructed without a gate must reject before any SQL."""
+    fake_conn = MagicMock()
+    writer = SrrOutcomeWriter(fake_conn, activation_gate=None)
+
+    result = writer.write(
+        observation_id=1,
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        observation=_eligible_observation(),
+        result={"status": "TEST", "reason_code": "TEST", "finalization_eligible": False},
+    )
+    assert result.action == "REJECTED_NO_ACTIVATION_GATE"
+    fake_conn.cursor.assert_not_called()
+
+
+# ── D2: Writer with unauthorized gate ───────────────────────────
+
+def test_d2_writer_with_unauthorized_gate_rejected():
+    """An unverified gate (no record) blocks the write."""
+    boundary = make_boundary()
+    gate = SrrShortWriterActivationGate(
+        boundary=boundary,
+        mode=SrrShortWriterActivationMode(enabled=True),
+    )
+    # Gate exists but record was never verified.
+    fake_conn = MagicMock()
+    writer = SrrOutcomeWriter(fake_conn, activation_gate=gate)
+
+    result = writer.write(
+        observation_id=1,
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        observation=_eligible_observation(),
+        result={"status": "TEST", "reason_code": "TEST", "finalization_eligible": False},
+    )
+    assert result.action == "REJECTED_ACTIVATION_GATE"
+    fake_conn.cursor.assert_not_called()
+
+
+# ── D3: Activation status PENDING ───────────────────────────────
+
+def test_d3_pending_record_blocks_writer():
+    boundary = make_boundary()
+    gate = SrrShortWriterActivationGate(
+        boundary=boundary,
+        mode=SrrShortWriterActivationMode(enabled=True),
+    )
+    with pytest.raises(SrrActivationRecordNotActive):
+        gate.verify_persisted_record({
+            "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
+            "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
+            "activation_ts": ACTIVATION_TS,
+            "direction": SRR_ACTIVATION_DIRECTION,
+            "status": ACTIVATION_STATUS_PENDING,
+        })
+
+
+# ── D4: Activation status REVOKED ───────────────────────────────
+
+def test_d4_revoked_record_blocks_writer():
+    boundary = make_boundary()
+    gate = SrrShortWriterActivationGate(
+        boundary=boundary,
+        mode=SrrShortWriterActivationMode(enabled=True),
+    )
+    with pytest.raises(SrrActivationRecordNotActive):
+        gate.verify_persisted_record({
+            "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
+            "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
+            "activation_ts": ACTIVATION_TS,
+            "direction": SRR_ACTIVATION_DIRECTION,
+            "status": ACTIVATION_STATUS_REVOKED,
+        })
+
+
+# ── D5: Changing timestamp in PENDING state ─────────────────────
+
+def test_d5_activation_ts_immutable_in_pending():
+    original = {
+        "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
+        "direction": SRR_ACTIVATION_DIRECTION,
+        "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
+        "activation_ts": ACTIVATION_TS,
+        "status": ACTIVATION_STATUS_PENDING,
+    }
+    updated = dict(original)
+    updated["activation_ts"] = "2026-10-08T13:00:00.000000Z"
+    with pytest.raises(SrrActivationRecordImmutableViolation):
+        validate_activation_record_immutability(original, updated)
+
+
+def test_d5_activation_ts_immutable_in_active():
+    original = {
+        "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
+        "direction": SRR_ACTIVATION_DIRECTION,
+        "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
+        "activation_ts": ACTIVATION_TS,
+        "status": ACTIVATION_STATUS_ACTIVE,
+    }
+    updated = dict(original)
+    updated["activation_ts"] = "2026-10-08T13:00:00.000000Z"
+    updated["status"] = ACTIVATION_STATUS_REVOKED
+    with pytest.raises(SrrActivationRecordImmutableViolation):
+        validate_activation_record_immutability(original, updated)
+
+
+def test_d5_activation_ts_same_value_in_different_format_allowed():
+    """The same timestamp in a different string format is not a change."""
+    original = {
+        "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
+        "direction": SRR_ACTIVATION_DIRECTION,
+        "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
+        "activation_ts": ACTIVATION_TS,  # "2026-10-08T12:00:00Z"
+        "status": ACTIVATION_STATUS_PENDING,
+    }
+    updated = dict(original)
+    updated["activation_ts"] = "2026-10-08T14:00:00+02:00"  # same instant
+    # No exception: normalize_activation_ts maps both to the same ms.
+    validate_activation_record_immutability(original, updated)
+
+
+# ── D6: DELETE activation record ────────────────────────────────
+
+def test_d6_delete_blocked_in_sql_migration():
+    """The migration must install a DELETE-blocking trigger."""
+    from pathlib import Path
+
+    sql_text = Path(
+        "sql/migrations/062_srr_short_writer_activation_boundary.sql"
+    ).read_text(encoding="utf-8")
+    assert "BEFORE DELETE ON research.srr_short_writer_activation" in sql_text
+    assert "fn_block_srr_short_writer_activation_delete" in sql_text
+    assert "cannot be deleted" in sql_text
+
+
+# ── D7: Invalid state machine transitions ───────────────────────
+
+def test_d7_pending_to_active_allowed():
+    validate_activation_transition(ACTIVATION_STATUS_PENDING, ACTIVATION_STATUS_ACTIVE)
+
+
+def test_d7_pending_to_revoked_allowed():
+    validate_activation_transition(ACTIVATION_STATUS_PENDING, ACTIVATION_STATUS_REVOKED)
+
+
+def test_d7_active_to_revoked_allowed():
+    validate_activation_transition(ACTIVATION_STATUS_ACTIVE, ACTIVATION_STATUS_REVOKED)
+
+
+def test_d7_active_to_pending_blocked():
+    with pytest.raises(SrrActivationInvalidTransition):
+        validate_activation_transition(ACTIVATION_STATUS_ACTIVE, ACTIVATION_STATUS_PENDING)
+
+
+def test_d7_revoked_to_active_blocked():
+    with pytest.raises(SrrActivationInvalidTransition):
+        validate_activation_transition(ACTIVATION_STATUS_REVOKED, ACTIVATION_STATUS_ACTIVE)
+
+
+def test_d7_revoked_to_pending_blocked():
+    with pytest.raises(SrrActivationInvalidTransition):
+        validate_activation_transition(ACTIVATION_STATUS_REVOKED, ACTIVATION_STATUS_PENDING)
+
+
+def test_d7_self_transition_is_noop():
+    validate_activation_transition(ACTIVATION_STATUS_PENDING, ACTIVATION_STATUS_PENDING)
+    validate_activation_transition(ACTIVATION_STATUS_ACTIVE, ACTIVATION_STATUS_ACTIVE)
+    validate_activation_transition(ACTIVATION_STATUS_REVOKED, ACTIVATION_STATUS_REVOKED)
+
+
+def test_d7_unknown_status_blocked():
+    with pytest.raises(SrrActivationInvalidTransition):
+        validate_activation_transition("SOMETHING_ELSE", ACTIVATION_STATUS_ACTIVE)
+
+
+# ── D8: Substituted experiment/direction/version ────────────────
+
+def test_d8_direction_mismatch_rejected():
+    boundary = make_boundary()
+    gate = SrrShortWriterActivationGate(
+        boundary=boundary,
+        mode=SrrShortWriterActivationMode(enabled=True),
+    )
+    with pytest.raises(SrrActivationRecordMismatch):
+        gate.verify_persisted_record({
+            "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
+            "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
+            "activation_ts": ACTIVATION_TS,
+            "direction": "LONG",  # substituted
+            "status": ACTIVATION_STATUS_ACTIVE,
+        })
+
+
+def test_d8_immutable_field_change_detected():
+    original = {
+        "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
+        "direction": SRR_ACTIVATION_DIRECTION,
+        "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
+        "activation_ts": ACTIVATION_TS,
+        "status": ACTIVATION_STATUS_ACTIVE,
+    }
+    for field, new_value in [
+        ("experiment_id", "WRONG"),
+        ("direction", "LONG"),
+        ("boundary_version", "OTHER"),
+        ("activation_ts", "2026-10-08T13:00:00.000000Z"),
+    ]:
+        updated = dict(original)
+        updated[field] = new_value
+        with pytest.raises(SrrActivationRecordImmutableViolation):
+            validate_activation_record_immutability(original, updated)
+
+
+def test_d8_status_change_alone_is_allowed():
+    """Changing only status/notes is permitted (lifecycle updates)."""
+    original = {
+        "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
+        "direction": SRR_ACTIVATION_DIRECTION,
+        "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
+        "activation_ts": ACTIVATION_TS,
+        "status": ACTIVATION_STATUS_ACTIVE,
+        "notes": "initial",
+    }
+    updated = dict(original)
+    updated["status"] = ACTIVATION_STATUS_REVOKED
+    updated["notes"] = "revoked per operator request"
+    validate_activation_record_immutability(original, updated)  # no exception
+
+
+# ── D9: Correct ACTIVE record with eligible observation ─────────
+
+def test_d9_active_record_and_eligible_observation_allows_write():
+    gate = _make_active_gate()
+    fake_conn = MagicMock()
+    cursor = MagicMock()
+    fake_conn.cursor.return_value = cursor
+    cursor.fetchone.side_effect = [
+        (900,),     # SELECT FOR UPDATE → existing row
+        (False,),   # SELECT is_final → not yet final
+        (900, True),# UPDATE RETURNING
+    ]
+
+    writer = SrrOutcomeWriter(fake_conn, activation_gate=gate)
+    result = writer.write(
+        observation_id=900,
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        observation=_eligible_observation(),
+        result={
+            "status": "INCOMPLETE_COVERAGE",
+            "reason_code": "OK",
+            "finalization_eligible": False,
+        },
+    )
+    # Action may be REFRESHED (non-final update of an existing row).
+    assert not result.action.startswith("REJECTED_")
+    assert result.action in {"INSERTED", "REFRESHED"}
+
+
+# ── D10: SQL parameters and pre-fetch boundary ──────────────────
+
+def test_d10_sql_filter_parameter_order():
+    boundary = make_boundary()
+    fragment, params = build_activation_sql_filters(boundary)
+
+    # Fragment must have exactly 3 placeholders in this order:
+    # experiment_id, direction, activation_ts.
+    assert fragment.count("%s") == 3
+    assert "o.experiment_id = %s" in fragment
+    assert "o.direction = %s" in fragment
+    assert "o.signal_time > %s::timestamptz" in fragment
+
+    # Parameter order must match placeholder order.
+    assert params[0] == SRR_ACTIVATION_EXPERIMENT_ID
+    assert params[1] == SRR_ACTIVATION_DIRECTION
+    assert params[2] == "2026-10-08T12:00:00.000000Z"
+
+
+def test_d10_prefetch_boundary_no_bybit_no_policy_no_writer():
+    """In writer-enabled mode, pre-activation observations are excluded
+    by the SQL filter and never reach the Bybit source, frozen policy,
+    or the writer callback."""
+    boundary = make_boundary()
+    conn = _FakeConnForBoundary()
+    candle_source = Mock()
+    writer = Mock()
+
+    evaluator = SrrShortExecutionRExpansionProspectiveEvaluator(
+        conn=conn,
+        candle_source=candle_source,
+        dry_run=False,
+        write_outcomes=writer,
+        activation_boundary=boundary,
+    )
+    evaluator._current_asof_ms = lambda: ACTIVATION_TS_MS + 3600_000
+
+    # Simulate: SQL returns empty list (filter excluded pre-activation rows).
+    def fake_fetchall():
+        return []
+    conn.cursor_obj.fetchall = fake_fetchall
+
+    stats = evaluator.run_evaluation_cycle(SRR_EXPERIMENT_ID)
+
+    # The SQL query included the activation boundary parameter.
+    assert len(conn.cursor_obj.sql) >= 1
+    sql, params = conn.cursor_obj.sql[0]
+    assert "o.signal_time > %s::timestamptz" in sql
+    assert params[0] == SRR_EXPERIMENT_ID
+    assert params[1] == "2026-10-07T08:17:50Z"  # FROZEN_FREEZE_TS
+    assert params[2] == SRR_ACTIVATION_EXPERIMENT_ID
+    assert params[3] == SRR_ACTIVATION_DIRECTION
+    assert params[4] == "2026-10-08T12:00:00.000000Z"
+
+    # Zero downstream calls.
+    assert stats["signals_checked"] == 0
+    assert candle_source.fetch_5m_candles.call_count == 0
+    assert writer.call_count == 0
+
+
+# ── D-extra: direction mismatch in record vs boundary ───────────
+
+def test_d_extra_missing_direction_rejected():
+    """A record with no direction field is rejected."""
+    boundary = make_boundary()
+    gate = SrrShortWriterActivationGate(
+        boundary=boundary,
+        mode=SrrShortWriterActivationMode(enabled=True),
+    )
+    with pytest.raises(SrrActivationRecordMismatch):
+        gate.verify_persisted_record({
+            "experiment_id": SRR_ACTIVATION_EXPERIMENT_ID,
+            "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
+            "activation_ts": ACTIVATION_TS,
+            # direction missing
+            "status": ACTIVATION_STATUS_ACTIVE,
+        })
+
+
+def test_d_extra_revoked_record_status_recheck_blocks_write():
+    """A record that was ACTIVE at verification but later marked REVOKED
+    in-memory is caught by assert_writer_allowed's status re-check."""
+    gate = _make_active_gate()
+    gate.assert_writer_allowed()  # initially OK
+
+    # Simulate in-memory revocation.
+    gate._record_status = ACTIVATION_STATUS_REVOKED
+    with pytest.raises(SrrActivationRecordNotActive):
+        gate.assert_writer_allowed()

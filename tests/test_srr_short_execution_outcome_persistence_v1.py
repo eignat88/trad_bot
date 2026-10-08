@@ -15,6 +15,32 @@ OBS_ID = 424242
 EXP_ID = "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1"
 FREEZE = "2026-10-07T08:17:50Z"
 SIGNAL_TIME = datetime(2026, 10, 7, 9, 20, tzinfo=timezone.utc)
+ACTIVATION_TS = "2026-10-07T09:00:00Z"
+
+
+def make_activation_gate():
+    """Helper: an ACTIVE gate valid for OBS_ID's signal time."""
+    from app.research.srr_short_writer_activation_boundary_v1 import (
+        ACTIVATION_STATUS_ACTIVE,
+        SRR_ACTIVATION_BOUNDARY_V1,
+        SrrShortWriterActivationBoundary,
+        SrrShortWriterActivationGate,
+        SrrShortWriterActivationMode,
+    )
+
+    boundary = SrrShortWriterActivationBoundary.create(ACTIVATION_TS)
+    gate = SrrShortWriterActivationGate(
+        boundary=boundary,
+        mode=SrrShortWriterActivationMode(enabled=True),
+    )
+    gate.verify_persisted_record({
+        "experiment_id": EXP_ID,
+        "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
+        "activation_ts": ACTIVATION_TS,
+        "direction": "SHORT",
+        "status": ACTIVATION_STATUS_ACTIVE,
+    })
+    return gate
 
 
 class Cursor:
@@ -143,7 +169,7 @@ def nonfinal_result(status="SOURCE_UNVERIFIABLE", reason="SOURCE_FETCH_EXCEPTION
 
 def test_insert_is_atomic_idempotent_and_preserves_frozen_snapshot():
     conn = Conn(rows=[None])
-    writer = SrrOutcomeWriter(conn)
+    writer = SrrOutcomeWriter(conn, activation_gate=make_activation_gate())
     result = writer.write(
         observation_id=OBS_ID,
         experiment_id=EXP_ID,
@@ -166,7 +192,7 @@ def test_insert_is_atomic_idempotent_and_preserves_frozen_snapshot():
 
 def test_nonfinal_source_error_persists_without_fictitious_economics():
     conn = Conn(rows=[None])
-    result = SrrOutcomeWriter(conn).write(
+    result = SrrOutcomeWriter(conn, activation_gate=make_activation_gate()).write(
         observation_id=OBS_ID,
         experiment_id=EXP_ID,
         observation=observation(),
@@ -182,7 +208,7 @@ def test_nonfinal_source_error_persists_without_fictitious_economics():
 
 def test_finalization_conflict_is_not_overwritten():
     conn = Conn(rows=[(OBS_ID, False), (OBS_ID, True)])
-    result = SrrOutcomeWriter(conn).write(
+    result = SrrOutcomeWriter(conn, activation_gate=make_activation_gate()).write(
         observation_id=OBS_ID,
         experiment_id=EXP_ID,
         observation=observation(),
@@ -196,7 +222,7 @@ def test_finalization_conflict_is_not_overwritten():
 
 def test_conditional_finalization_updates_only_nonfinal_rows():
     conn = Conn(rows=[(OBS_ID, False), (False,)])
-    result = SrrOutcomeWriter(conn).write(
+    result = SrrOutcomeWriter(conn, activation_gate=make_activation_gate()).write(
         observation_id=OBS_ID,
         experiment_id=EXP_ID,
         observation=observation(),
@@ -212,7 +238,7 @@ def test_conditional_finalization_updates_only_nonfinal_rows():
 def test_write_failure_rolls_back_transaction():
     conn = Conn(rows=[None], fail_on="INSERT INTO research.srr_short_execution_prospective_outcome")
     with pytest.raises(RuntimeError):
-        SrrOutcomeWriter(conn).write(
+        SrrOutcomeWriter(conn, activation_gate=make_activation_gate()).write(
             observation_id=OBS_ID,
             experiment_id=EXP_ID,
             observation=observation(),
@@ -227,7 +253,7 @@ def test_final_result_with_missing_economics_is_rejected():
     bad["net_r_normal"] = None
     conn = Conn(rows=[None])
     with pytest.raises(ValueError):
-        SrrOutcomeWriter(conn).write(
+        SrrOutcomeWriter(conn, activation_gate=make_activation_gate()).write(
             observation_id=OBS_ID,
             experiment_id=EXP_ID,
             observation=observation(),
@@ -240,7 +266,7 @@ def test_nonfinal_result_with_economics_is_rejected():
     bad = nonfinal_result()
     bad["gross_r"] = 0.75
     with pytest.raises(ValueError):
-        SrrOutcomeWriter(conn).write(
+        SrrOutcomeWriter(conn, activation_gate=make_activation_gate()).write(
             observation_id=OBS_ID,
             experiment_id=EXP_ID,
             observation=observation(),
@@ -249,13 +275,53 @@ def test_nonfinal_result_with_economics_is_rejected():
 
 
 def test_prefreeze_observation_is_rejected():
+    """A pre-freeze observation is rejected either by the activation boundary
+    (pre-activation) or by the writer's own freeze check."""
+    from app.research.srr_short_writer_activation_boundary_v1 import (
+        SrrShortWriterActivationBoundary,
+    )
+
     early = observation()
     early["signal_time"] = datetime(2026, 10, 7, 8, 0, tzinfo=timezone.utc)
+    # Boundary before the freeze ts, so the pre-freeze check is reached.
+    boundary = SrrShortWriterActivationBoundary.create("2026-10-07T00:00:00Z")
+    from app.research.srr_short_writer_activation_boundary_v1 import (
+        ACTIVATION_STATUS_ACTIVE,
+        SRR_ACTIVATION_BOUNDARY_V1,
+        SrrShortWriterActivationGate,
+        SrrShortWriterActivationMode,
+    )
+    gate = SrrShortWriterActivationGate(
+        boundary=boundary,
+        mode=SrrShortWriterActivationMode(enabled=True),
+    )
+    gate.verify_persisted_record({
+        "experiment_id": EXP_ID,
+        "boundary_version": SRR_ACTIVATION_BOUNDARY_V1,
+        "activation_ts": "2026-10-07T00:00:00Z",
+        "direction": "SHORT",
+        "status": ACTIVATION_STATUS_ACTIVE,
+    })
     conn = Conn(rows=[None])
     with pytest.raises(ValueError, match="after freeze"):
-        SrrOutcomeWriter(conn).write(
+        SrrOutcomeWriter(conn, activation_gate=gate).write(
             observation_id=OBS_ID,
             experiment_id=EXP_ID,
             observation=early,
             result=final_result(),
         )
+
+
+def test_writer_without_gate_is_rejected_before_sql():
+    """Regression: writer with no gate must fail closed before any SQL."""
+    conn = Conn(rows=[None])
+    result = SrrOutcomeWriter(conn).write(
+        observation_id=OBS_ID,
+        experiment_id=EXP_ID,
+        observation=observation(),
+        result=final_result(),
+    )
+    assert result.action == "REJECTED_NO_ACTIVATION_GATE"
+    assert conn.cursor_obj.executed == []
+    assert conn.commits == 0
+    assert conn.rollbacks == 0
