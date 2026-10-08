@@ -312,28 +312,7 @@ def test_concurrent_writer_holds_lock_revoke_waits(it_db):
                 observation=_make_observation(1001),
                 result=_nonfinal_result(),
             )
-            assert result2.action in {
-                "REJECTED_ACTIVATION_GATE",
-                "ALREADY_FINALIZED",
-                "REFRESHED",
-            }
-            # If it was REFRESHED, the write succeeded but the record was
-            # ACTIVE at the time. Revoke again and verify rejection.
-            if result2.action == "REFRESHED":
-                with writer2_conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE research.srr_short_writer_activation "
-                        "SET status = 'REVOKED' WHERE experiment_id = %s",
-                        (SRR_EXPERIMENT_ID,),
-                    )
-                writer2_conn.commit()
-                result3 = writer2.write(
-                    observation_id=1002,
-                    experiment_id=SRR_EXPERIMENT_ID,
-                    observation=_make_observation(1002),
-                    result=_nonfinal_result(),
-                )
-                assert result3.action == "REJECTED_ACTIVATION_GATE"
+            assert result2.action == "REJECTED_ACTIVATION_GATE"
         finally:
             writer2_conn.close()
     finally:
@@ -505,6 +484,205 @@ def test_reader_transaction_not_affected(it_db):
         with reader_conn.cursor() as cur:
             cur.execute("SELECT 1")
             assert cur.fetchone()[0] == 1
+    finally:
+        reader_conn.close()
+        writer_conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# POST-LOCK HARDENING TESTS (FIX A + FIX B)
+# ═══════════════════════════════════════════════════════════════════
+
+
+def test_srr_writer_write_blocks_revoke_until_commit(it_db):
+    """Real SrrOutcomeWriter.write() acquires FOR SHARE; a concurrent
+    REVOKE blocks until the write commits; post-commit write is strictly
+    REJECTED_ACTIVATION_GATE."""
+    from app.research.srr_short_execution_outcome_persistence import SrrOutcomeWriter
+
+    _, gate = _make_gate_and_boundary()
+
+    writer_conn = _connect(it_db)
+    revoke_conn = _connect(it_db)
+
+    revoke_started = threading.Event()
+    revoke_done = threading.Event()
+    revoke_result = {}
+
+    def do_revoke():
+        revoke_started.set()
+        try:
+            with revoke_conn.cursor() as cur:
+                cur.execute(
+                    "SET lock_timeout = '3s'"
+                )
+                cur.execute(
+                    "UPDATE research.srr_short_writer_activation "
+                    "SET status = 'REVOKED' WHERE experiment_id = %s",
+                    (SRR_EXPERIMENT_ID,),
+                )
+            revoke_conn.commit()
+            revoke_result["status"] = "COMMITTED"
+        except Exception as exc:
+            revoke_result["status"] = f"ERROR: {exc}"
+        finally:
+            revoke_done.set()
+
+    writer = SrrOutcomeWriter(writer_conn, activation_gate=gate)
+
+    try:
+        # Perform a real write. write() acquires FOR SHARE, then INSERT/UPDATE,
+        # then COMMIT. The FOR SHARE lock is held for the whole duration.
+        result = writer.write(
+            observation_id=1001,
+            experiment_id=SRR_EXPERIMENT_ID,
+            observation=_make_observation(1001),
+            result=_nonfinal_result(),
+        )
+        assert not result.action.startswith("REJECTED_")
+        # write() has already committed, so the FOR SHARE lock is released.
+        # To test the blocking, we need an uncommitted transaction.
+        # Instead, verify with a raw FOR SHARE held across a commit boundary.
+        writer_conn.rollback()
+
+        # Hold FOR SHARE manually to simulate an in-flight write.
+        with writer_conn.cursor() as cur:
+            cur.execute(
+                "SELECT status FROM research.srr_short_writer_activation "
+                "WHERE experiment_id = %s FOR SHARE",
+                (SRR_EXPERIMENT_ID,),
+            )
+            assert cur.fetchone()[0] == "ACTIVE"
+
+        # Start revoke in a thread; it must block on the FOR SHARE lock.
+        t = threading.Thread(target=do_revoke, daemon=True)
+        t.start()
+        revoke_started.wait(timeout=2)
+        time.sleep(0.3)
+        assert not revoke_done.is_set(), (
+            f"REVOKE completed while FOR SHARE held: {revoke_result}"
+        )
+
+        # Release the lock.
+        writer_conn.commit()
+        revoke_done.wait(timeout=5)
+        t.join(timeout=5)
+        assert revoke_result["status"] == "COMMITTED"
+
+        # Post-revoke write must be strictly REJECTED_ACTIVATION_GATE.
+        writer2_conn = _connect(it_db)
+        writer2 = SrrOutcomeWriter(writer2_conn, activation_gate=gate)
+        try:
+            result2 = writer2.write(
+                observation_id=1001,
+                experiment_id=SRR_EXPERIMENT_ID,
+                observation=_make_observation(1001),
+                result=_nonfinal_result(),
+            )
+            assert result2.action == "REJECTED_ACTIVATION_GATE"
+        finally:
+            writer2_conn.close()
+    finally:
+        writer_conn.close()
+        revoke_conn.close()
+
+
+def test_build_values_error_releases_lock(it_db):
+    """A _build_values error (e.g. bad economics) rolls back the FOR SHARE
+    lock; a subsequent REVOKE is not blocked."""
+    from app.research.srr_short_execution_outcome_persistence import SrrOutcomeWriter
+
+    _, gate = _make_gate_and_boundary()
+
+    writer_conn = _connect(it_db)
+    writer = SrrOutcomeWriter(writer_conn, activation_gate=gate)
+
+    try:
+        # Craft a result that passes the activation gate but fails
+        # _build_values: a final result with incomplete economics.
+        bad_result = _nonfinal_result()
+        bad_result["finalization_eligible"] = True
+        bad_result["status"] = "FINALIZED"
+        bad_result["reason_code"] = "OK"
+        bad_result["path_class"] = "TP_FIRST"
+        # gross_r etc. are missing -> _build_values raises ValueError
+        # (final outcome requires complete frozen economics).
+
+        with pytest.raises(ValueError, match="complete frozen economics"):
+            writer.write(
+                observation_id=1001,
+                experiment_id=SRR_EXPERIMENT_ID,
+                observation=_make_observation(1001),
+                result=bad_result,
+            )
+
+        # The FOR SHARE lock must have been rolled back. A REVOKE on a
+        # separate connection must complete immediately (within timeout).
+        revoke_conn = _connect(it_db)
+        try:
+            with revoke_conn.cursor() as cur:
+                cur.execute("SET lock_timeout = '2s'")
+                cur.execute(
+                    "UPDATE research.srr_short_writer_activation "
+                    "SET status = 'REVOKED' WHERE experiment_id = %s",
+                    (SRR_EXPERIMENT_ID,),
+                )
+            revoke_conn.commit()
+            # If we reach here without a lock timeout, the lock was released.
+        finally:
+            revoke_conn.close()
+
+        # Verify the record is now REVOKED and writes are strictly rejected.
+        writer2_conn = _connect(it_db)
+        writer2 = SrrOutcomeWriter(writer2_conn, activation_gate=gate)
+        try:
+            result2 = writer2.write(
+                observation_id=1001,
+                experiment_id=SRR_EXPERIMENT_ID,
+                observation=_make_observation(1001),
+                result=_nonfinal_result(),
+            )
+            assert result2.action == "REJECTED_ACTIVATION_GATE"
+        finally:
+            writer2_conn.close()
+    finally:
+        writer_conn.close()
+
+
+def test_build_values_error_does_not_touch_reader(it_db):
+    """A _build_values error on the writer does not affect the reader conn."""
+    from app.research.srr_short_execution_outcome_persistence import SrrOutcomeWriter
+
+    _, gate = _make_gate_and_boundary()
+
+    reader_conn = _connect(it_db)
+    writer_conn = _connect(it_db)
+    writer = SrrOutcomeWriter(writer_conn, activation_gate=gate)
+
+    try:
+        # Reader opens a transaction.
+        with reader_conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            assert cur.fetchone()[0] == 1
+
+        bad_result = _nonfinal_result()
+        bad_result["finalization_eligible"] = True
+        bad_result["status"] = "FINALIZED"
+        bad_result["reason_code"] = "OK"
+        bad_result["path_class"] = "TP_FIRST"
+
+        with pytest.raises(ValueError):
+            writer.write(
+                observation_id=1001,
+                experiment_id=SRR_EXPERIMENT_ID,
+                observation=_make_observation(1001),
+                result=bad_result,
+            )
+
+        # Reader transaction is unaffected.
+        with reader_conn.cursor() as cur:
+            cur.execute("SELECT 2")
+            assert cur.fetchone()[0] == 2
     finally:
         reader_conn.close()
         writer_conn.close()

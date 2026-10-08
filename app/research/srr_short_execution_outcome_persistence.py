@@ -297,6 +297,36 @@ class SrrOutcomeWriter:
         if rejected is not None:
             return rejected
 
+        # At this point the FOR SHARE lock on the activation record is held
+        # inside the writer's transaction. Everything below — validation,
+        # value construction, and all persistence SQL — must either COMMIT
+        # or ROLLBACK. Any exception must roll back so the lock is released.
+        try:
+            return self._write_locked(
+                observation_id=observation_id,
+                experiment_id=experiment_id,
+                observation=observation,
+                result=result,
+            )
+        except Exception:
+            self._safe_rollback()
+            raise
+
+    def _write_locked(
+        self,
+        *,
+        observation_id: int,
+        experiment_id: str,
+        observation: Mapping[str, Any],
+        result: Mapping[str, Any],
+    ) -> SrrOutcomeWriteResult:
+        """Perform the outcome write while holding the FOR SHARE lock.
+
+        This method is only called after ``_enforce_activation_boundary``
+        has confirmed the activation record is ACTIVE and the FOR SHARE
+        lock is held. It must COMMIT or ROLLBACK on every path; the caller
+        guarantees rollback on any exception.
+        """
         is_final = _bool(result.get("finalization_eligible", False))
         status = str(result.get("status", ""))
         reason_code = str(result.get("reason_code", ""))
