@@ -553,10 +553,12 @@ class SrrShortExecutionRExpansionProspectiveEvaluator:
         *,
         dry_run: bool = True,
         write_outcomes: Callable[..., None] | None = None,
+        activation_boundary: Any = None,
     ) -> None:
         self._conn = conn
         self._candle_source = candle_source
         self._dry_run = bool(dry_run)
+        self._activation_boundary = activation_boundary
         if not self._dry_run and write_outcomes is None:
             raise ValueError(
                 "SRR persistence requires write_outcomes when dry_run=False"
@@ -772,8 +774,27 @@ class SrrShortExecutionRExpansionProspectiveEvaluator:
 
         cursor = self._conn.cursor()
         try:
+            # The SRR-specific lifecycle never depends on the generic
+            # prospective_outcome table. When an activation boundary is
+            # configured, the strict eligibility filter is applied here in
+            # SQL so that pre-activation observations never reach the queue,
+            # never trigger candle fetches, and never invoke the frozen
+            # policy. The boundary filter is intentionally stricter than the
+            # generic prospective evaluator path.
+            activation_filter = ""
+            activation_params: tuple[Any, ...] = ()
+            if self._activation_boundary is not None:
+                from app.research.srr_short_writer_activation_boundary_v1 import (
+                    build_activation_sql_filters,
+                )
+
+                activation_filter, activation_params = build_activation_sql_filters(
+                    self._activation_boundary
+                )
+                activation_filter = f"AND {activation_filter}"
+
             cursor.execute(
-                """
+                f"""
                 SELECT o.observation_id, o.symbol, o.signal_time, o.experiment_id,
                        o.direction, o.reference_price, o.invalidation_price,
                        o.variant_entry, o.variant_stop, o.variant_target, o.features,
@@ -797,9 +818,10 @@ class SrrShortExecutionRExpansionProspectiveEvaluator:
                       OR d.status = 'RUNNING'
                       OR r.observation_id IS NOT NULL
                   )
+                  {activation_filter}
                 ORDER BY o.observation_id
                 """,
-                (SRR_EXPERIMENT_ID, FROZEN_FREEZE_TS),
+                (SRR_EXPERIMENT_ID, FROZEN_FREEZE_TS, *activation_params),
             )
             rows = cursor.fetchall()
         except Exception:
@@ -863,6 +885,33 @@ class SrrShortExecutionRExpansionProspectiveEvaluator:
 
             if not self._dry_run:
                 try:
+                    # Defense-in-depth: re-check the activation boundary
+                    # immediately before persistence. This protects against
+                    # upstream routing regressions that could otherwise leak a
+                    # pre-activation observation into the writer path.
+                    if self._activation_boundary is not None:
+                        from app.research.srr_short_writer_activation_boundary_v1 import (
+                            SrrPreActivationObservation,
+                        )
+
+                        try:
+                            self._activation_boundary.require_eligible(
+                                experiment_id=obs.get("experiment_id"),
+                                direction=obs.get("direction"),
+                                signal_time=obs.get("signal_time"),
+                                observation_id=obs.get("observation_id"),
+                            )
+                        except SrrPreActivationObservation:
+                            record["write_action"] = "SKIPPED_PRE_ACTIVATION"
+                            if result.source_status in {
+                                SOURCE_FETCH_ERROR,
+                                SOURCE_INCOMPLETE_COVERAGE,
+                                SOURCE_TIMESTAMP_INVALID,
+                                SOURCE_CONFLICTING_CANDLES,
+                            }:
+                                stats["source_errors"] += 1
+                            continue
+
                     from app.research.srr_short_timeout_persistence_gate import (
                         prepare_srr_persistence_result,
                     )
@@ -906,7 +955,8 @@ class SrrShortExecutionRExpansionProspectiveEvaluator:
                 SOURCE_CONFLICTING_CANDLES,
             }
             ):
-                stats["source_errors"] += 1
+                if record.get("write_action") != "SKIPPED_PRE_ACTIVATION":
+                    stats["source_errors"] += 1
             elif not result.finalization_eligible and result.status in {
                 "FIRST_CANDLE_BOUNDARY_UNCERTAIN",
                 "CUTOFF_BOUNDARY_UNCERTAIN",

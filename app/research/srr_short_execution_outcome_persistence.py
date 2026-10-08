@@ -21,13 +21,21 @@ evaluator. Production activation is not enabled by this module.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
+logger = logging.getLogger(__name__)
+
 SRR_ADAPTER_VERSION = "SRR_SHORT_PROSPECTIVE_EVALUATOR_POLICY_ROUTING_V1"
 SRR_FROZEN_POLICY_VERSION = "SRR_SHORT_TIMEOUT_CANDLE_POLICY_V1"
+
+# Optional activation-boundary guard. When a guard is attached, every write
+# must pass the boundary check before any SQL is executed. The default writer
+# (no guard) preserves the pre-existing behavior used by dry-run wiring.
+SRR_WRITER_BOUNDARY_DISABLED = None
 
 
 def _json_text(value: Any) -> str:
@@ -80,10 +88,83 @@ class SrrOutcomeWriter:
     ``prospective_outcome`` table. A failed operation always rolls back.
     """
 
-    def __init__(self, conn: Any) -> None:
+    def __init__(
+        self,
+        conn: Any,
+        *,
+        activation_gate: Any = None,
+    ) -> None:
         if conn is None:
             raise ValueError("SrrOutcomeWriter requires a PostgreSQL connection")
         self._conn = conn
+        self._activation_gate = activation_gate
+
+    def _enforce_activation_boundary(
+        self,
+        *,
+        observation_id: int,
+        experiment_id: str,
+        observation: Mapping[str, Any],
+        result: Mapping[str, Any],
+    ) -> "SrrOutcomeWriteResult | None":
+        """Reject any write that could bypass the activation boundary.
+
+        Returns ``None`` when the write may proceed, otherwise a rejection
+        result. The check runs before any SQL statement is issued so that a
+        pre-activation observation cannot touch the database at all.
+        """
+        gate = self._activation_gate
+        if gate is None:
+            return None
+        try:
+            gate.assert_writer_allowed()
+        except Exception as exc:
+            logger.warning(
+                "SRR outcome write rejected (activation gate): observation_id=%s error=%s",
+                observation_id,
+                exc,
+            )
+            return SrrOutcomeWriteResult(
+                observation_id=int(observation_id),
+                action="REJECTED_ACTIVATION_GATE",
+                is_final=False,
+            )
+
+        boundary = gate.boundary
+        if boundary is None:
+            logger.warning(
+                "SRR outcome write rejected (activation boundary missing): observation_id=%s",
+                observation_id,
+            )
+            return SrrOutcomeWriteResult(
+                observation_id=int(observation_id),
+                action="REJECTED_ACTIVATION_GATE",
+                is_final=False,
+            )
+
+        signal_time = observation.get("signal_time")
+        direction = observation.get("direction")
+        obs_experiment_id = observation.get("experiment_id", experiment_id)
+        if not boundary.is_eligible(
+            experiment_id=obs_experiment_id,
+            direction=direction,
+            signal_time=signal_time,
+        ):
+            logger.warning(
+                "SRR outcome write rejected (pre-activation): observation_id=%s "
+                "experiment_id=%s direction=%s signal_time=%s activation_ts=%s",
+                observation_id,
+                obs_experiment_id,
+                direction,
+                signal_time,
+                boundary.activation_ts_text,
+            )
+            return SrrOutcomeWriteResult(
+                observation_id=int(observation_id),
+                action="REJECTED_PRE_ACTIVATION",
+                is_final=False,
+            )
+        return None
 
     def write(
         self,
@@ -94,6 +175,16 @@ class SrrOutcomeWriter:
         result: Mapping[str, Any],
     ) -> SrrOutcomeWriteResult:
         observation_id = int(observation_id)
+
+        rejected = self._enforce_activation_boundary(
+            observation_id=observation_id,
+            experiment_id=experiment_id,
+            observation=observation,
+            result=result,
+        )
+        if rejected is not None:
+            return rejected
+
         is_final = _bool(result.get("finalization_eligible", False))
         status = str(result.get("status", ""))
         reason_code = str(result.get("reason_code", ""))
