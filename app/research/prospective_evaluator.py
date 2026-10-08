@@ -476,24 +476,6 @@ class ProspectiveOOSEvaluator:
             sym = row[1]
             by_symbol.setdefault(sym, []).append(row)
 
-        if experiment_id == "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1":
-            router = self._srr_policy_router
-            if router is None:
-                logger.error(
-                    "SRR execution-R experiment %s is active but no SRR policy router is configured",
-                    experiment_id,
-                )
-                stats["errors"] += len(eligible)
-                return stats
-            try:
-                route_stats = router.run_evaluation_cycle(experiment_id)
-                for key in ("finalized", "errors"):
-                    stats[key] = stats.get(key, 0) + route_stats.get(key, 0)
-            except Exception:
-                stats["errors"] += 1
-                logger.exception("SRR policy routing failed for experiment %s", experiment_id)
-            return stats
-
         for symbol, rows in by_symbol.items():
             if not rows:
                 continue
