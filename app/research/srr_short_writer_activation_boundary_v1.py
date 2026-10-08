@@ -485,6 +485,14 @@ class SrrShortWriterActivationGate:
         A caller-supplied record dict can be forged; a row read inside the
         writer's own transaction cannot. Returns ``None`` when no row exists
         or the read fails; raises on any mismatch with the runtime boundary.
+
+        The row is locked with ``FOR SHARE`` inside the caller's
+        transaction. This holds a shared row lock on the activation record
+        until the writer's transaction commits or rolls back. A concurrent
+        ``ACTIVE → REVOKED`` UPDATE must therefore wait for the writer to
+        finish, guaranteeing that the writer either sees the record before
+        the revoke or after it — never a torn read. The lock is released on
+        every commit and rollback path of the outcome write.
         """
         try:
             cursor = conn.cursor()
@@ -495,6 +503,7 @@ class SrrShortWriterActivationGate:
                            activation_ts, status
                     FROM research.srr_short_writer_activation
                     WHERE experiment_id = %s
+                    FOR SHARE
                     """,
                     (SRR_ACTIVATION_EXPERIMENT_ID,),
                 )

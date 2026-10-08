@@ -103,6 +103,21 @@ class SrrOutcomeWriter:
         self._conn = conn
         self._activation_gate = activation_gate
 
+    def _safe_rollback(self) -> None:
+        """Roll back the writer transaction, ignoring secondary errors.
+
+        Used when the activation-record FOR SHARE lock has been taken but
+        a subsequent check rejects the write. The rollback releases the
+        shared lock so a concurrent REVOKE is not blocked. Never touches
+        the reader connection.
+        """
+        try:
+            self._conn.rollback()
+        except Exception:
+            logger.debug(
+                "SRR writer rollback failed (ignored)", exc_info=True,
+            )
+
     def _enforce_activation_boundary(
         self,
         *,
@@ -137,11 +152,17 @@ class SrrOutcomeWriter:
             )
 
         # Load the authoritative record from the database inside this
-        # writer's transaction. This closes the race between a cached
-        # ACTIVE status and a concurrent ACTIVE → REVOKED transition.
+        # writer's transaction with a FOR SHARE row lock. This closes the
+        # race between a cached ACTIVE status and a concurrent
+        # ACTIVE → REVOKED transition: the revoke UPDATE must wait until
+        # this transaction commits or rolls back.
+        #
+        # If the load fails, or any subsequent pre-SQL check rejects, the
+        # shared lock is rolled back before returning so no lock leaks.
         try:
             record = gate.load_authoritative_record(self._conn)
         except Exception as exc:
+            self._safe_rollback()
             # A non-ACTIVE status from the DB is a normal rejection, not a
             # read failure. Surface it as REJECTED_ACTIVATION_GATE so the
             # operator sees the real reason.
@@ -178,6 +199,9 @@ class SrrOutcomeWriter:
                 "observation_id=%s",
                 observation_id,
             )
+            # No FOR SHARE lock was taken (row is absent), but the implicit
+            # transaction may have started; roll back for cleanliness.
+            self._safe_rollback()
             return SrrOutcomeWriteResult(
                 observation_id=int(observation_id),
                 action="REJECTED_ACTIVATION_RECORD_UNAVAILABLE",
@@ -187,6 +211,7 @@ class SrrOutcomeWriter:
         try:
             gate.assert_writer_allowed()
         except Exception as exc:
+            self._safe_rollback()
             logger.warning(
                 "SRR outcome write rejected (activation gate): observation_id=%s error=%s",
                 observation_id,
@@ -200,6 +225,7 @@ class SrrOutcomeWriter:
 
         boundary = gate.boundary
         if boundary is None:
+            self._safe_rollback()
             logger.warning(
                 "SRR outcome write rejected (activation boundary missing): observation_id=%s",
                 observation_id,
@@ -218,6 +244,7 @@ class SrrOutcomeWriter:
             direction=direction,
             signal_time=signal_time,
         ):
+            self._safe_rollback()
             logger.warning(
                 "SRR outcome write rejected (pre-activation): observation_id=%s "
                 "experiment_id=%s direction=%s signal_time=%s activation_ts=%s",
@@ -236,6 +263,7 @@ class SrrOutcomeWriter:
         # The explicit experiment_id parameter must also match the frozen
         # experiment. A substituted experiment_id is rejected before SQL.
         if experiment_id != boundary.experiment_id:
+            self._safe_rollback()
             logger.warning(
                 "SRR outcome write rejected (experiment mismatch): observation_id=%s "
                 "experiment_id=%s expected=%s",
