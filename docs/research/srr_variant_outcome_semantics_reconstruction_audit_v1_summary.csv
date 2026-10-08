@@ -1,0 +1,4 @@
+experiment_id,base_only_n,complete_variant_n,partial_variant_n,variant_tuple_present_n,material_geometry_intervention_n,historical_exposed_n,proven_outcome_mismatch_n,affected_finalized_outcomes_n,decision
+SRR_LONG_BASELINE_V1,1130,0,0,0,0,0,0,0,NO_ACTION_REQUIRED
+SRR_OOS_SCANNER_V1_PROSPECTIVE,0,1122,0,1122,1122,1120,0,0,NO_ACTION_REQUIRED
+SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1,0,50,0,50,50,14,0,0,NO_ACTION_REQUIRED

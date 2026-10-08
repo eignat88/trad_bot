@@ -1,0 +1,881 @@
+{
+  "analysis_id": "SRR_VARIANT_OUTCOME_SEMANTICS_RECONSTRUCTION_AUDIT_V1",
+  "audit_cutoff_utc": "2026-10-08T05:54:56.705000Z",
+  "audit_export_sha256": "bfb7b4eb8a412e4b2dd893b52ec4b62736974e4f5cb55f9a32fdd18d335a391a",
+  "local_git_head": "93a060f9eba309c80a76b3fb1713a4f95e838376",
+  "vps_git_head": "93a060f9eba309c80a76b3fb1713a4f95e838376",
+  "evaluator_fix": {
+    "commit": "38e6ef197dba9b648f22fc56952b295919e61063",
+    "merge_commit": "80b10108cdceaf133cc405c0bd725cabc6aac459",
+    "deploy_ts": "2026-10-07T13:04:55Z",
+    "source_evidence": [
+      "audit_db/me_short_geometry_abc_evaluator_fix_deploy_v1_20261007_restart.txt",
+      "audit_db/me_short_geometry_abc_evaluator_fix_deploy_v1_20261007_vps_deploy.txt",
+      "docs/research/ME_SHORT_GEOMETRY_ABC_EVALUATOR_FIX_DEPLOY_V1_2026-10-07.md"
+    ]
+  },
+  "schema_evidence": {
+    "prospective_observation_columns": [
+      "observation_id\tbigint\tNO\tnextval('research.prospective_observation_observation_id_seq'::regclass)",
+      "experiment_id\ttext\tNO\t",
+      "source_signal_id\tbigint\tNO\t",
+      "source_observation_id\tbigint\tYES\t",
+      "symbol\ttext\tNO\t",
+      "direction\ttext\tNO\t",
+      "signal_time\ttimestamp with time zone\tNO\t",
+      "reference_price\tnumeric\tNO\t",
+      "invalidation_price\tnumeric\tYES\t",
+      "target_1\tnumeric\tYES\t",
+      "target_2\tnumeric\tYES\t",
+      "score\tnumeric\tNO\t0",
+      "variant_entry\tnumeric\tYES\t",
+      "variant_stop\tnumeric\tYES\t",
+      "variant_target\tnumeric\tYES\t",
+      "rule_passed\tboolean\tNO\ttrue",
+      "filter_reason\ttext\tYES\t",
+      "gate_result\ttext\tYES\t",
+      "features\tjsonb\tNO\t'{}'::jsonb",
+      "parameters\tjsonb\tNO\t'{}'::jsonb",
+      "market_regime\ttext\tYES\t",
+      "created_at\ttimestamp with time zone\tNO\tnow()"
+    ],
+    "prospective_outcome_columns": [
+      "observation_id\tbigint\tNO\t",
+      "experiment_id\ttext\tNO\t",
+      "mfe_15m\tnumeric\tYES\t",
+      "mae_15m\tnumeric\tYES\t",
+      "mfe_30m\tnumeric\tYES\t",
+      "mae_30m\tnumeric\tYES\t",
+      "mfe_60m\tnumeric\tYES\t",
+      "mae_60m\tnumeric\tYES\t",
+      "mfe_120m\tnumeric\tYES\t",
+      "mae_120m\tnumeric\tYES\t",
+      "mfe_240m\tnumeric\tYES\t",
+      "mae_240m\tnumeric\tYES\t",
+      "mfe_r_15m\tnumeric\tYES\t",
+      "mae_r_15m\tnumeric\tYES\t",
+      "mfe_r_30m\tnumeric\tYES\t",
+      "mae_r_30m\tnumeric\tYES\t",
+      "mfe_r_60m\tnumeric\tYES\t",
+      "mae_r_60m\tnumeric\tYES\t",
+      "mfe_r_120m\tnumeric\tYES\t",
+      "mae_r_120m\tnumeric\tYES\t",
+      "mfe_r_240m\tnumeric\tYES\t",
+      "mae_r_240m\tnumeric\tYES\t",
+      "return_at_15m\tnumeric\tYES\t",
+      "return_at_30m\tnumeric\tYES\t",
+      "return_at_60m\tnumeric\tYES\t",
+      "return_at_120m\tnumeric\tYES\t",
+      "return_at_240m\tnumeric\tYES\t",
+      "tp_hit\tboolean\tNO\tfalse",
+      "sl_hit\tboolean\tNO\tfalse",
+      "tp_before_sl\tboolean\tNO\tfalse",
+      "sl_before_tp\tboolean\tNO\tfalse",
+      "ambiguous_intrabar\tboolean\tNO\tfalse",
+      "time_to_tp\tnumeric\tYES\t",
+      "time_to_sl\tnumeric\tYES\t",
+      "evaluated_15m_at\ttimestamp with time zone\tYES\t",
+      "evaluated_30m_at\ttimestamp with time zone\tYES\t",
+      "evaluated_60m_at\ttimestamp with time zone\tYES\t",
+      "evaluated_120m_at\ttimestamp with time zone\tYES\t",
+      "evaluated_240m_at\ttimestamp with time zone\tYES\t",
+      "is_final\tboolean\tNO\tfalse",
+      "created_at\ttimestamp with time zone\tNO\tnow()",
+      "updated_at\ttimestamp with time zone\tNO\tnow()"
+    ]
+  },
+  "experiment_registry": [
+    {
+      "experiment_id": "SRR_GENERIC_V1",
+      "version": "",
+      "scanner_name": "SUPPORT_RESISTANCE_REACTION",
+      "direction": "",
+      "experiment_type": "",
+      "entry_rule": "",
+      "stop_rule": "",
+      "target_rule": "",
+      "paired_with": "",
+      "status": "",
+      "started_at_utc": "",
+      "created_at_utc": "",
+      "updated_at_utc": "",
+      "framework": "generic_research",
+      "observations_observed_in_export": "0",
+      "outcomes_observed_in_export": "0"
+    },
+    {
+      "experiment_id": "SRR_LONG_BASELINE_V1",
+      "version": "1",
+      "scanner_name": "SUPPORT_RESISTANCE_REACTION",
+      "direction": "LONG",
+      "experiment_type": "BASELINE_VALIDATION",
+      "entry_rule": "Existing production entry semantics",
+      "stop_rule": "Existing production invalidation_price",
+      "target_rule": "Existing production target_1",
+      "paired_with": "",
+      "status": "RUNNING",
+      "started_at_utc": "2026-09-28T16:30:39.751Z",
+      "created_at_utc": "2026-09-28T13:18:12.452Z",
+      "updated_at_utc": "2026-09-28T16:30:39.751Z",
+      "framework": "prospective",
+      "observations_observed_in_export": "1",
+      "outcomes_observed_in_export": "1"
+    },
+    {
+      "experiment_id": "SRR_OOS_SCANNER_V1_PROSPECTIVE",
+      "version": "1",
+      "scanner_name": "SUPPORT_RESISTANCE_REACTION",
+      "direction": "LONG",
+      "experiment_type": "OOS_EXIT_VALIDATION",
+      "entry_rule": "FROZEN: entry at reference_price (rejection candle close)",
+      "stop_rule": "FROZEN: for LONG, stop = entry - 0.75R; for SHORT, stop = entry + 0.75R; where R = abs(reference_price - invalidation_price)",
+      "target_rule": "FROZEN: for LONG, target = entry + 1.50R; for SHORT, target = entry - 1.50R; where R = abs(reference_price - invalidation_price)",
+      "paired_with": "",
+      "status": "RUNNING",
+      "started_at_utc": "2026-09-29T10:58:40.339Z",
+      "created_at_utc": "2026-09-29T10:58:24.446Z",
+      "updated_at_utc": "2026-09-29T10:58:40.339Z",
+      "framework": "prospective",
+      "observations_observed_in_export": "1",
+      "outcomes_observed_in_export": "1"
+    },
+    {
+      "experiment_id": "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1",
+      "version": "1",
+      "scanner_name": "SUPPORT_RESISTANCE_REACTION",
+      "direction": "SHORT",
+      "experiment_type": "OOS_EXECUTION_VALIDATION",
+      "entry_rule": "FROZEN: entry = reference_price; structural_R = abs(reference_price - invalidation_price); entry > 0, invalidation_price > 0, structural_R > 0; capture only signal_time > freeze_ts.",
+      "stop_rule": "FROZEN SHORT stop = entry + 2.00 * structural_R; execution_R = 2.00 * structural_R.",
+      "target_rule": "FROZEN SHORT target = entry - 1.50 * structural_R; MAX_HOLD = 120 minutes; timeout at last eligible 5m candle close before cutoff; PRIMARY_INTRABAR_POLICY = STOP_FIRST.",
+      "paired_with": "",
+      "status": "RUNNING",
+      "started_at_utc": "2026-10-07T08:17:50.000Z",
+      "created_at_utc": "2026-10-07T08:17:20.234Z",
+      "updated_at_utc": "2026-10-07T08:29:58.800Z",
+      "framework": "prospective",
+      "observations_observed_in_export": "1",
+      "outcomes_observed_in_export": "1"
+    }
+  ],
+  "generic_framework_classification": [
+    {
+      "experiment_id": "SRR_GENERIC_V1",
+      "scanner_name": "SUPPORT_RESISTANCE_REACTION",
+      "research_observation_n": "2665",
+      "min_signal_time": "2026-09-25 18:03:15.831304+00",
+      "max_signal_time": "2026-10-08 05:25:37.736735+00"
+    }
+  ],
+  "experiments": [
+    {
+      "experiment_id": "SRR_LONG_BASELINE_V1",
+      "direction": "LONG",
+      "observations_n": 1130,
+      "outcomes_n": 1128,
+      "finalized_n": 1111,
+      "missing_outcome_n": 2,
+      "orphan_outcome_n": 0,
+      "duplicate_observation_id_n": 0,
+      "duplicate_outcome_id_n": 0,
+      "duplicate_source_signal_n": 0,
+      "duplicate_symbol_direction_signal_n": 0,
+      "directions": {
+        "LONG": 1130
+      },
+      "tuple_counts": {
+        "BASE_ONLY": 1130
+      },
+      "geometry_exposure_counts": {
+        "BASE_ONLY": 1130
+      },
+      "evaluation_cohort_counts": {
+        "MIXED_COHORT": 16,
+        "NO_OUTCOME": 2,
+        "POST_FIX_SIGNAL_POST_FIX_EVALUATION": 80,
+        "PRE_FIX_SIGNAL_PRE_FIX_EVALUATION": 1032
+      },
+      "intervention_counts": {},
+      "per_direction": {
+        "LONG": {
+          "BASE_ONLY": 1130,
+          "observations": 1130
+        }
+      },
+      "horizon_evaluation_counts": {
+        "120m:NOT_EVALUATED": 5,
+        "120m:POST_FIX": 87,
+        "120m:PRE_FIX": 1036,
+        "15m:POST_FIX": 80,
+        "15m:PRE_FIX": 1048,
+        "240m:NOT_EVALUATED": 17,
+        "240m:POST_FIX": 79,
+        "240m:PRE_FIX": 1032,
+        "30m:NOT_EVALUATED": 1,
+        "30m:POST_FIX": 79,
+        "30m:PRE_FIX": 1048,
+        "60m:NOT_EVALUATED": 4,
+        "60m:POST_FIX": 78,
+        "60m:PRE_FIX": 1046
+      },
+      "pre_fix_signal_observations_n": 1050,
+      "pre_fix_signal_outcomes_n": 1048,
+      "pre_fix_signal_finalized_outcomes_n": 1048,
+      "unknown_evaluation_boundary_n": 0,
+      "material_historical_tuple_mismatch_n": 0,
+      "pre_fix_variant_outcomes_n": 0,
+      "pre_fix_variant_finalized_n": 0,
+      "pre_fix_variant_horizons_n": 0,
+      "pre_fix_variant_tuple_mismatch_outcomes_n": 0,
+      "expected_frozen_protocol_mismatch_n": 0,
+      "pre_fix_evaluated_horizons": {
+        "120m": 1036,
+        "15m": 1048,
+        "240m": 1032,
+        "30m": 1048,
+        "60m": 1046
+      },
+      "post_fix_evaluated_horizons": {
+        "120m": 87,
+        "15m": 80,
+        "240m": 79,
+        "30m": 79,
+        "60m": 78
+      },
+      "final_outcome_evaluation_boundary": {
+        "POST_FIX": 79,
+        "PRE_FIX": 1032
+      },
+      "first_signal_time_utc": "2026-09-28T16:29:01.131000Z",
+      "last_signal_time_utc": "2026-10-08T05:25:37.736000Z",
+      "decision": {
+        "variant_tuple_present_n": 0,
+        "material_geometry_intervention_n": 0,
+        "historical_exposed_n": 0,
+        "historical_exposed_finalized_n": 0,
+        "historical_exposed_horizons_n": 0,
+        "historical_tuple_mismatch_n": 0,
+        "historical_exposed_tuple_mismatch_n": 0,
+        "frozen_protocol_mismatch_n": 0,
+        "proven_outcome_mismatch_n": 0,
+        "affected_finalized_outcomes_n": 0,
+        "historical_exposure": "NO_VARIANT_TUPLE_EXPOSURE",
+        "historical_outcome_trust": "NO_VARIANT_SEMANTICS_DEFECT_DETECTED",
+        "decision": "NO_ACTION_REQUIRED",
+        "reconstruction_feasibility": "NOT_REQUIRED",
+        "next_action": "No variant tuple exposure. Retain historical outcomes for this specific evaluator semantics audit."
+      }
+    },
+    {
+      "experiment_id": "SRR_OOS_SCANNER_V1_PROSPECTIVE",
+      "direction": "MIXED",
+      "observations_n": 1122,
+      "outcomes_n": 1120,
+      "finalized_n": 1120,
+      "missing_outcome_n": 2,
+      "orphan_outcome_n": 0,
+      "duplicate_observation_id_n": 0,
+      "duplicate_outcome_id_n": 0,
+      "duplicate_source_signal_n": 0,
+      "duplicate_symbol_direction_signal_n": 0,
+      "directions": {
+        "LONG": 413,
+        "SHORT": 709
+      },
+      "tuple_counts": {
+        "COMPLETE_VARIANT": 1122
+      },
+      "geometry_exposure_counts": {
+        "COMPLETE_VARIANT_DIFFERENT_FROM_BASE": 1122
+      },
+      "evaluation_cohort_counts": {
+        "NO_OUTCOME": 2,
+        "PRE_FIX_SIGNAL_PRE_FIX_EVALUATION": 1120
+      },
+      "intervention_counts": {
+        "any_variant_intervention_n": 1122,
+        "variant_stop_intervention_n": 1122,
+        "variant_target_intervention_n": 1122
+      },
+      "per_direction": {
+        "LONG": {
+          "COMPLETE_VARIANT": 413,
+          "observations": 413,
+          "variant_stop_intervention": 413,
+          "variant_target_intervention": 413
+        },
+        "SHORT": {
+          "COMPLETE_VARIANT": 709,
+          "observations": 709,
+          "variant_stop_intervention": 709,
+          "variant_target_intervention": 709
+        }
+      },
+      "horizon_evaluation_counts": {
+        "120m:PRE_FIX": 1120,
+        "15m:PRE_FIX": 1120,
+        "240m:PRE_FIX": 1120,
+        "30m:PRE_FIX": 1120,
+        "60m:PRE_FIX": 1120
+      },
+      "pre_fix_signal_observations_n": 1122,
+      "pre_fix_signal_outcomes_n": 1120,
+      "pre_fix_signal_finalized_outcomes_n": 1120,
+      "unknown_evaluation_boundary_n": 0,
+      "material_historical_tuple_mismatch_n": 0,
+      "pre_fix_variant_outcomes_n": 1120,
+      "pre_fix_variant_finalized_n": 1120,
+      "pre_fix_variant_horizons_n": 5600,
+      "pre_fix_variant_tuple_mismatch_outcomes_n": 0,
+      "expected_frozen_protocol_mismatch_n": 0,
+      "pre_fix_evaluated_horizons": {
+        "120m": 1120,
+        "15m": 1120,
+        "240m": 1120,
+        "30m": 1120,
+        "60m": 1120
+      },
+      "post_fix_evaluated_horizons": {},
+      "final_outcome_evaluation_boundary": {
+        "POST_FIX": 0,
+        "PRE_FIX": 1120
+      },
+      "first_signal_time_utc": "2026-09-29T11:36:28.277000Z",
+      "last_signal_time_utc": "2026-10-06T14:06:34.879000Z",
+      "decision": {
+        "variant_tuple_present_n": 1122,
+        "material_geometry_intervention_n": 1122,
+        "historical_exposed_n": 1120,
+        "historical_exposed_finalized_n": 1120,
+        "historical_exposed_horizons_n": 5600,
+        "historical_tuple_mismatch_n": 0,
+        "historical_exposed_tuple_mismatch_n": 0,
+        "frozen_protocol_mismatch_n": 0,
+        "proven_outcome_mismatch_n": 0,
+        "affected_finalized_outcomes_n": 0,
+        "historical_exposure": "PRE_FIX_COMPLETE_VARIANT_EVALUATION",
+        "historical_outcome_trust": "TUPLE_SELECTION_VALIDATED_OUTCOMES_NOT_REPLAYED",
+        "decision": "NO_ACTION_REQUIRED",
+        "reconstruction_feasibility": "NOT_REQUIRED_FOR_TUPLE_SELECTION",
+        "next_action": "No historical tuple-selection mismatch demonstrated. Do not reconstruct outcomes solely because a complete variant tuple was evaluated before the fix. Exact candle-path correctness remains unverified."
+      }
+    },
+    {
+      "experiment_id": "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1",
+      "direction": "SHORT",
+      "observations_n": 50,
+      "outcomes_n": 50,
+      "finalized_n": 47,
+      "missing_outcome_n": 0,
+      "orphan_outcome_n": 0,
+      "duplicate_observation_id_n": 0,
+      "duplicate_outcome_id_n": 0,
+      "duplicate_source_signal_n": 0,
+      "duplicate_symbol_direction_signal_n": 0,
+      "directions": {
+        "SHORT": 50
+      },
+      "tuple_counts": {
+        "COMPLETE_VARIANT": 50
+      },
+      "geometry_exposure_counts": {
+        "COMPLETE_VARIANT_DIFFERENT_FROM_BASE": 50
+      },
+      "evaluation_cohort_counts": {
+        "MIXED_COHORT": 11,
+        "POST_FIX_SIGNAL_POST_FIX_EVALUATION": 36,
+        "PRE_FIX_SIGNAL_PRE_FIX_EVALUATION": 3
+      },
+      "intervention_counts": {
+        "any_variant_intervention_n": 50,
+        "variant_stop_intervention_n": 50,
+        "variant_target_intervention_n": 50
+      },
+      "per_direction": {
+        "SHORT": {
+          "COMPLETE_VARIANT": 50,
+          "observations": 50,
+          "variant_stop_intervention": 50,
+          "variant_target_intervention": 50
+        }
+      },
+      "horizon_evaluation_counts": {
+        "120m:POST_FIX": 41,
+        "120m:PRE_FIX": 9,
+        "15m:POST_FIX": 36,
+        "15m:PRE_FIX": 14,
+        "240m:NOT_EVALUATED": 3,
+        "240m:POST_FIX": 44,
+        "240m:PRE_FIX": 3,
+        "30m:POST_FIX": 36,
+        "30m:PRE_FIX": 14,
+        "60m:POST_FIX": 38,
+        "60m:PRE_FIX": 12
+      },
+      "pre_fix_signal_observations_n": 14,
+      "pre_fix_signal_outcomes_n": 14,
+      "pre_fix_signal_finalized_outcomes_n": 14,
+      "unknown_evaluation_boundary_n": 0,
+      "material_historical_tuple_mismatch_n": 0,
+      "pre_fix_variant_outcomes_n": 14,
+      "pre_fix_variant_finalized_n": 14,
+      "pre_fix_variant_horizons_n": 52,
+      "pre_fix_variant_tuple_mismatch_outcomes_n": 0,
+      "expected_frozen_protocol_mismatch_n": 0,
+      "pre_fix_evaluated_horizons": {
+        "120m": 9,
+        "15m": 14,
+        "240m": 3,
+        "30m": 14,
+        "60m": 12
+      },
+      "post_fix_evaluated_horizons": {
+        "120m": 41,
+        "15m": 36,
+        "240m": 44,
+        "30m": 36,
+        "60m": 38
+      },
+      "final_outcome_evaluation_boundary": {
+        "POST_FIX": 44,
+        "PRE_FIX": 3
+      },
+      "first_signal_time_utc": "2026-10-07T08:56:18.230000Z",
+      "last_signal_time_utc": "2026-10-08T03:30:00.675000Z",
+      "decision": {
+        "variant_tuple_present_n": 50,
+        "material_geometry_intervention_n": 50,
+        "historical_exposed_n": 14,
+        "historical_exposed_finalized_n": 14,
+        "historical_exposed_horizons_n": 52,
+        "historical_tuple_mismatch_n": 0,
+        "historical_exposed_tuple_mismatch_n": 0,
+        "frozen_protocol_mismatch_n": 0,
+        "proven_outcome_mismatch_n": 0,
+        "affected_finalized_outcomes_n": 0,
+        "historical_exposure": "PRE_FIX_COMPLETE_VARIANT_EVALUATION",
+        "historical_outcome_trust": "TUPLE_SELECTION_VALIDATED_OUTCOMES_NOT_REPLAYED",
+        "decision": "NO_ACTION_REQUIRED",
+        "reconstruction_feasibility": "NOT_REQUIRED_FOR_TUPLE_SELECTION",
+        "next_action": "No historical tuple-selection mismatch demonstrated. Do not reconstruct outcomes solely because a complete variant tuple was evaluated before the fix. Exact candle-path correctness remains unverified."
+      }
+    }
+  ],
+  "experiment_inventory": [
+    {
+      "experiment_id": "SRR_LONG_BASELINE_V1",
+      "registry_direction": "LONG",
+      "registry_status": "RUNNING",
+      "direction": "LONG",
+      "observations_n": 1130,
+      "outcomes_n": 1128,
+      "finalized_n": 1111,
+      "base_only_n": 1130,
+      "complete_variant_n": 0,
+      "partial_variant_n": 0,
+      "material_geometry_mismatch_n": 0,
+      "pre_fix_signal_outcomes_n": 1048,
+      "pre_fix_signal_finalized_n": 1048,
+      "pre_fix_evaluated_horizons": {
+        "120m": 1036,
+        "15m": 1048,
+        "240m": 1032,
+        "30m": 1048,
+        "60m": 1046
+      },
+      "post_fix_evaluated_horizons": {
+        "120m": 87,
+        "15m": 80,
+        "240m": 79,
+        "30m": 79,
+        "60m": 78
+      },
+      "final_outcome_evaluation_boundary": {
+        "POST_FIX": 79,
+        "PRE_FIX": 1032
+      },
+      "variant_tuple_present_n": 0,
+      "material_geometry_intervention_n": 0,
+      "historical_exposed_n": 0,
+      "proven_outcome_mismatch_n": 0,
+      "affected_finalized_outcomes_n": 0,
+      "unknown_evaluation_boundary_n": 0,
+      "missing_outcome_n": 2,
+      "orphan_outcome_n": 0,
+      "duplicate_source_signal_n": 0,
+      "decision": "NO_ACTION_REQUIRED",
+      "decision_evidence": "No variant tuple exposure. Retain historical outcomes for this specific evaluator semantics audit."
+    },
+    {
+      "experiment_id": "SRR_OOS_SCANNER_V1_PROSPECTIVE",
+      "registry_direction": "LONG",
+      "registry_status": "RUNNING",
+      "direction": "MIXED",
+      "observations_n": 1122,
+      "outcomes_n": 1120,
+      "finalized_n": 1120,
+      "base_only_n": 0,
+      "complete_variant_n": 1122,
+      "partial_variant_n": 0,
+      "material_geometry_mismatch_n": 0,
+      "pre_fix_signal_outcomes_n": 1120,
+      "pre_fix_signal_finalized_n": 1120,
+      "pre_fix_evaluated_horizons": {
+        "120m": 1120,
+        "15m": 1120,
+        "240m": 1120,
+        "30m": 1120,
+        "60m": 1120
+      },
+      "post_fix_evaluated_horizons": {},
+      "final_outcome_evaluation_boundary": {
+        "POST_FIX": 0,
+        "PRE_FIX": 1120
+      },
+      "variant_tuple_present_n": 1122,
+      "material_geometry_intervention_n": 1122,
+      "historical_exposed_n": 1120,
+      "proven_outcome_mismatch_n": 0,
+      "affected_finalized_outcomes_n": 0,
+      "unknown_evaluation_boundary_n": 0,
+      "missing_outcome_n": 2,
+      "orphan_outcome_n": 0,
+      "duplicate_source_signal_n": 0,
+      "decision": "NO_ACTION_REQUIRED",
+      "decision_evidence": "No historical tuple-selection mismatch demonstrated. Do not reconstruct outcomes solely because a complete variant tuple was evaluated before the fix. Exact candle-path correctness remains unverified."
+    },
+    {
+      "experiment_id": "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1",
+      "registry_direction": "SHORT",
+      "registry_status": "RUNNING",
+      "direction": "SHORT",
+      "observations_n": 50,
+      "outcomes_n": 50,
+      "finalized_n": 47,
+      "base_only_n": 0,
+      "complete_variant_n": 50,
+      "partial_variant_n": 0,
+      "material_geometry_mismatch_n": 0,
+      "pre_fix_signal_outcomes_n": 14,
+      "pre_fix_signal_finalized_n": 14,
+      "pre_fix_evaluated_horizons": {
+        "120m": 9,
+        "15m": 14,
+        "240m": 3,
+        "30m": 14,
+        "60m": 12
+      },
+      "post_fix_evaluated_horizons": {
+        "120m": 41,
+        "15m": 36,
+        "240m": 44,
+        "30m": 36,
+        "60m": 38
+      },
+      "final_outcome_evaluation_boundary": {
+        "POST_FIX": 44,
+        "PRE_FIX": 3
+      },
+      "variant_tuple_present_n": 50,
+      "material_geometry_intervention_n": 50,
+      "historical_exposed_n": 14,
+      "proven_outcome_mismatch_n": 0,
+      "affected_finalized_outcomes_n": 0,
+      "unknown_evaluation_boundary_n": 0,
+      "missing_outcome_n": 0,
+      "orphan_outcome_n": 0,
+      "duplicate_source_signal_n": 0,
+      "decision": "NO_ACTION_REQUIRED",
+      "decision_evidence": "No historical tuple-selection mismatch demonstrated. Do not reconstruct outcomes solely because a complete variant tuple was evaluated before the fix. Exact candle-path correctness remains unverified."
+    }
+  ],
+  "affected_observations_n": 0,
+  "affected_observations_definition": "Observations with a material persisted variant tuple vs old-evaluator tuple mismatch; BASE_ONLY rows and PRE_FIX cohorts alone are excluded.",
+  "synthetic_semantics": {
+    "cases": [
+      {
+        "case": "base_only_short",
+        "direction": "SHORT",
+        "tuple_class": "BASE_ONLY",
+        "geometry_exposure": "BASE_ONLY",
+        "frozen_effective_tuple": [
+          100.0,
+          101.0,
+          97.0
+        ],
+        "historical_effective_tuple": [
+          100.0,
+          101.0,
+          97.0
+        ],
+        "mismatched_fields": [],
+        "interventions": {
+          "entry": false,
+          "stop": false,
+          "target": false
+        },
+        "old_evaluator_uses_variant_entry": false,
+        "fixed_evaluator_uses_complete_variant": false
+      },
+      {
+        "case": "base_only_long",
+        "direction": "LONG",
+        "tuple_class": "BASE_ONLY",
+        "geometry_exposure": "BASE_ONLY",
+        "frozen_effective_tuple": [
+          100.0,
+          99.0,
+          103.0
+        ],
+        "historical_effective_tuple": [
+          100.0,
+          99.0,
+          103.0
+        ],
+        "mismatched_fields": [],
+        "interventions": {
+          "entry": false,
+          "stop": false,
+          "target": false
+        },
+        "old_evaluator_uses_variant_entry": false,
+        "fixed_evaluator_uses_complete_variant": false
+      },
+      {
+        "case": "complete_variant_entry",
+        "direction": "SHORT",
+        "tuple_class": "COMPLETE_VARIANT",
+        "geometry_exposure": "COMPLETE_VARIANT_DIFFERENT_FROM_BASE",
+        "frozen_effective_tuple": [
+          99.5,
+          101.0,
+          97.0
+        ],
+        "historical_effective_tuple": [
+          99.5,
+          101.0,
+          97.0
+        ],
+        "mismatched_fields": [],
+        "interventions": {
+          "entry": true,
+          "stop": false,
+          "target": false
+        },
+        "old_evaluator_uses_variant_entry": true,
+        "fixed_evaluator_uses_complete_variant": true
+      },
+      {
+        "case": "complete_variant_stop",
+        "direction": "SHORT",
+        "tuple_class": "COMPLETE_VARIANT",
+        "geometry_exposure": "COMPLETE_VARIANT_DIFFERENT_FROM_BASE",
+        "frozen_effective_tuple": [
+          100.0,
+          102.0,
+          97.0
+        ],
+        "historical_effective_tuple": [
+          100.0,
+          102.0,
+          97.0
+        ],
+        "mismatched_fields": [],
+        "interventions": {
+          "entry": false,
+          "stop": true,
+          "target": false
+        },
+        "old_evaluator_uses_variant_entry": true,
+        "fixed_evaluator_uses_complete_variant": true
+      },
+      {
+        "case": "complete_variant_target",
+        "direction": "SHORT",
+        "tuple_class": "COMPLETE_VARIANT",
+        "geometry_exposure": "COMPLETE_VARIANT_DIFFERENT_FROM_BASE",
+        "frozen_effective_tuple": [
+          100.0,
+          101.0,
+          95.0
+        ],
+        "historical_effective_tuple": [
+          100.0,
+          101.0,
+          95.0
+        ],
+        "mismatched_fields": [],
+        "interventions": {
+          "entry": false,
+          "stop": false,
+          "target": true
+        },
+        "old_evaluator_uses_variant_entry": true,
+        "fixed_evaluator_uses_complete_variant": true
+      },
+      {
+        "case": "complete_multiple_variant",
+        "direction": "SHORT",
+        "tuple_class": "COMPLETE_VARIANT",
+        "geometry_exposure": "COMPLETE_VARIANT_DIFFERENT_FROM_BASE",
+        "frozen_effective_tuple": [
+          99.5,
+          102.0,
+          95.0
+        ],
+        "historical_effective_tuple": [
+          99.5,
+          102.0,
+          95.0
+        ],
+        "mismatched_fields": [],
+        "interventions": {
+          "entry": true,
+          "stop": true,
+          "target": true
+        },
+        "old_evaluator_uses_variant_entry": true,
+        "fixed_evaluator_uses_complete_variant": true
+      },
+      {
+        "case": "partial_variant_entry",
+        "direction": "SHORT",
+        "tuple_class": "PARTIAL_VARIANT",
+        "geometry_exposure": "PARTIAL_VARIANT",
+        "frozen_effective_tuple": [
+          100.0,
+          101.0,
+          97.0
+        ],
+        "historical_effective_tuple": [
+          99.5,
+          null,
+          null
+        ],
+        "mismatched_fields": [
+          "entry",
+          "stop",
+          "target"
+        ],
+        "interventions": {
+          "entry": true,
+          "stop": false,
+          "target": false
+        },
+        "old_evaluator_uses_variant_entry": true,
+        "fixed_evaluator_uses_complete_variant": false
+      },
+      {
+        "case": "partial_variant_stop",
+        "direction": "SHORT",
+        "tuple_class": "PARTIAL_VARIANT",
+        "geometry_exposure": "PARTIAL_VARIANT",
+        "frozen_effective_tuple": [
+          100.0,
+          101.0,
+          97.0
+        ],
+        "historical_effective_tuple": [
+          100.0,
+          101.0,
+          97.0
+        ],
+        "mismatched_fields": [],
+        "interventions": {
+          "entry": false,
+          "stop": true,
+          "target": false
+        },
+        "old_evaluator_uses_variant_entry": false,
+        "fixed_evaluator_uses_complete_variant": false
+      },
+      {
+        "case": "partial_variant_target",
+        "direction": "SHORT",
+        "tuple_class": "PARTIAL_VARIANT",
+        "geometry_exposure": "PARTIAL_VARIANT",
+        "frozen_effective_tuple": [
+          100.0,
+          101.0,
+          97.0
+        ],
+        "historical_effective_tuple": [
+          100.0,
+          101.0,
+          97.0
+        ],
+        "mismatched_fields": [],
+        "interventions": {
+          "entry": false,
+          "stop": false,
+          "target": true
+        },
+        "old_evaluator_uses_variant_entry": false,
+        "fixed_evaluator_uses_complete_variant": false
+      },
+      {
+        "case": "invalid_short_orientation",
+        "direction": "SHORT",
+        "tuple_class": "COMPLETE_VARIANT",
+        "geometry_exposure": "INVALID_GEOMETRY",
+        "frozen_effective_tuple": [
+          100.0,
+          99.0,
+          101.0
+        ],
+        "historical_effective_tuple": [
+          100.0,
+          99.0,
+          101.0
+        ],
+        "mismatched_fields": [],
+        "interventions": {
+          "entry": false,
+          "stop": true,
+          "target": true
+        },
+        "old_evaluator_uses_variant_entry": true,
+        "fixed_evaluator_uses_complete_variant": true
+      },
+      {
+        "case": "same_candle_tp_sl_ambiguity_long",
+        "same_candle_result": {
+          "tp_hit": true,
+          "sl_hit": true,
+          "tp_before_sl": false,
+          "sl_before_tp": false,
+          "ambiguous_intrabar": true
+        }
+      },
+      {
+        "case": "same_candle_tp_sl_ambiguity_short_stop_first",
+        "same_candle_result": {
+          "tp_hit": true,
+          "sl_hit": true,
+          "tp_before_sl": false,
+          "sl_before_tp": true,
+          "ambiguous_intrabar": true
+        }
+      }
+    ],
+    "old_evaluator_tuple": "when variant_entry is non-NULL, use variant_entry/variant_stop/variant_target together, preserving NULL stop or target; otherwise use reference_price/invalidation_price/target_1 together",
+    "fixed_evaluator_tuple": "complete variant_entry/variant_stop/variant_target atomically; otherwise complete base tuple",
+    "material_mismatch_possible": true,
+    "exact_historical_path_reconstruction_available": false,
+    "exact_historical_path_status": "EXACT_HISTORICAL_PATH_RECONSTRUCTION_NOT_AVAILABLE"
+  },
+  "candle_source": {
+    "production_evaluator_source": "app/research/prospective_evaluator.py::_get_candles -> BybitClient.get_klines",
+    "market_db_snapshot_equivalence": false,
+    "exact_historical_path_reconstruction_available": false,
+    "limitation": "Historical outcomes were produced from time-of-evaluation Bybit klines; current DB/API snapshots are not proven byte-equivalent. Exact H1/H2 replay is EXACT_HISTORICAL_PATH_RECONSTRUCTION_NOT_AVAILABLE."
+  },
+  "production_safety": {
+    "db_writes": false,
+    "scanner_restart": false,
+    "paper_restart": false,
+    "evaluator_restart": false,
+    "registry_changes": false,
+    "outcome_rewrite": false
+  }
+}
