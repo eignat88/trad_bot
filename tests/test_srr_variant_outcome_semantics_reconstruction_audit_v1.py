@@ -415,3 +415,56 @@ def test_affected_csv_nonempty_export_regression(tmp_path):
     assert rows[0]["observation_id"] == "synthetic-partial-variant"
     assert rows[0]["mismatched_fields"] == "entry|stop|target"
     assert "expected_frozen_protocol_mismatched_fields" in rows[0]
+
+
+def test_protocol_only_mismatch_is_reported():
+    from tools.research.srr_variant_outcome_semantics_reconstruction_audit_v1 import (
+        aggregate,
+    )
+
+    row = observation(
+        experiment_id="SRR_OOS_SCANNER_V1_PROSPECTIVE",
+        direction="SHORT",
+        reference_price="100",
+        invalidation_price="101",
+        target_1="97",
+        variant_entry="100",
+        variant_stop="102",
+        variant_target="98.5",
+    )
+    result, affected = aggregate([row], [], row["experiment_id"])
+
+    assert result["material_historical_tuple_mismatch_n"] == 0
+    assert result["expected_frozen_protocol_mismatch_n"] == 1
+    assert len(affected) == 1
+    assert affected[0]["mismatched_fields"] == ""
+    assert affected[0]["expected_frozen_protocol_mismatched_fields"] == "stop"
+    assert affected[0]["exposure_reason"] == "FROZEN_PROTOCOL_GEOMETRY_MISMATCH"
+
+
+def test_mixed_experiment_direction_is_not_first_observation():
+    from tools.research.srr_variant_outcome_semantics_reconstruction_audit_v1 import (
+        aggregate,
+    )
+
+    long_row = observation(
+        observation_id=10,
+        source_signal_id=10,
+        direction="LONG",
+    )
+    short_row = observation(
+        observation_id=11,
+        source_signal_id=11,
+        direction="SHORT",
+    )
+
+    mixed, _ = aggregate([long_row, short_row], [], "TEST")
+    reversed_mixed, _ = aggregate([short_row, long_row], [], "TEST")
+
+    assert mixed["direction"] == "MIXED"
+    assert reversed_mixed["direction"] == "MIXED"
+    assert mixed["directions"] == {"LONG": 1, "SHORT": 1}
+
+    single, _ = aggregate([short_row], [], "TEST")
+    assert single["direction"] == "SHORT"
+    assert single["directions"] == {"SHORT": 1}

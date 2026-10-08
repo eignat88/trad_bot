@@ -268,7 +268,7 @@
     },
     {
       "experiment_id": "SRR_OOS_SCANNER_V1_PROSPECTIVE",
-      "direction": "LONG",
+      "direction": "MIXED",
       "observations_n": 1122,
       "outcomes_n": 1120,
       "finalized_n": 1120,
@@ -510,7 +510,7 @@
       "experiment_id": "SRR_OOS_SCANNER_V1_PROSPECTIVE",
       "registry_direction": "LONG",
       "registry_status": "RUNNING",
-      "direction": "LONG",
+      "direction": "MIXED",
       "observations_n": 1122,
       "outcomes_n": 1120,
       "finalized_n": 1120,

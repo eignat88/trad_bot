@@ -30,6 +30,15 @@ This verdict applies only to the historical selection of entry/stop/target. It d
 - `SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1` has 14 outcomes containing pre-fix evaluations (52 horizons).
 - The affected-observations CSV is empty because no material historical tuple-selection mismatch was identified.
 
+## Direction composition
+
+- `SRR_LONG_BASELINE_V1`: LONG only.
+- `SRR_OOS_SCANNER_V1_PROSPECTIVE`: MIXED, 413 LONG and 709 SHORT observations.
+- `SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1`: SHORT only.
+- Registry direction and observed direction composition are reported separately.
+- Protocol-only mismatches are included in affected observations when present;
+  they are not treated as historical tuple-selection mismatches.
+
 ## Limitations
 
 - Exact time-of-evaluation Bybit candle responses were not preserved or proven equivalent to current market data.

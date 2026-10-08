@@ -530,7 +530,7 @@ def aggregate(observations: list[dict[str, Any]], outcomes: list[dict[str, Any]]
         if outcome is not None:
             for horizon_cohort in horizon_cohorts(outcome):
                 horizon_counts[horizon_cohort] += 1
-        if label != "BASE_ONLY" and mismatches:
+        if kind != "BASE_ONLY" and (mismatches or expected_mismatches):
             frozen = frozen_tuple(observation)
             historical = historical_tuple(observation)
             affected_rows.append({
@@ -560,13 +560,25 @@ def aggregate(observations: list[dict[str, Any]], outcomes: list[dict[str, Any]]
                 "mixed_evaluation_cohorts": "|".join(mixed),
                 "horizon_cohorts": "|".join(horizon_cohorts(outcome)) if outcome else "",
                 "is_final": outcome["is_final"] if outcome else None,
-                "exposure_reason": "VARIANT_BASE_GEOMETRY_MISMATCH" if mismatches else "PRE_FIX_EVALUATION_BOUNDARY",
+                "exposure_reason": (
+                    "HISTORICAL_TUPLE_AND_FROZEN_PROTOCOL_MISMATCH"
+                    if mismatches and expected_mismatches
+                    else "HISTORICAL_TUPLE_SELECTION_MISMATCH"
+                    if mismatches
+                    else "FROZEN_PROTOCOL_GEOMETRY_MISMATCH"
+                ),
             })
 
     integrity = integrity_counts(observations, outcomes)
     result = {
         "experiment_id": experiment_id,
-        "direction": observations[0]["direction"] if observations else None,
+        "direction": (
+            next(iter(integrity["directions"]))
+            if len(integrity["directions"]) == 1
+            else "MIXED"
+            if integrity["directions"]
+            else None
+        ),
         **integrity,
         "tuple_counts": dict(sorted(tuple_counts.items())),
         "geometry_exposure_counts": dict(sorted(geometry_counts.items())),
