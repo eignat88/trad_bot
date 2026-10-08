@@ -85,9 +85,49 @@ class SrrPreActivationObservation(SrrActivationBoundaryError):
 def _parse_utc_ms(value: Any, *, field: str) -> int:
     """Parse an explicit timezone-aware timestamp into UTC milliseconds.
 
-    Naive datetimes, booleans, and non-timestamp scalars are rejected. A
-    timezone offset other than UTC is converted to UTC; the result carries
-    exactly the input's calendar and clock time interpreted in UTC.
+    Delegates to ``_parse_utc_ns`` and truncates toward the past. A
+    timestamp 1µs after the boundary stays strictly after it; a timestamp
+    1µs before stays strictly before it. No rounding can flip the side.
+    """
+    return _parse_utc_ns(value, field=field) // 1_000_000
+
+
+def normalize_activation_ts(value: Any) -> tuple[int, str]:
+    """Return the normalized ``(utc_ns, canonical_text)`` pair for a boundary.
+
+    The canonical text is the single storage format used for activation
+    records and SQL parameters. Nanosecond precision is preserved so that
+    PostgreSQL ``timestamptz`` (6-digit fractional seconds) round-trips
+    without loss. When the value has only microsecond precision the
+    canonical text is emitted with 6 fractional digits (PostgreSQL-native).
+    """
+    ns = _parse_utc_ns(value, field="ACTIVATION_TS")
+    whole_seconds = ns // 1_000_000_000
+    ns_remainder = ns % 1_000_000_000
+
+    base_dt = datetime.fromtimestamp(whole_seconds, tz=timezone.utc)
+
+    if ns_remainder == 0:
+        # No fractional part: emit with zero microseconds for uniformity.
+        canonical = base_dt.strftime(ACTIVATION_TS_STORAGE_FORMAT)
+    elif ns_remainder % 1000 == 0:
+        # Microsecond precision: emit exactly 6 fractional digits (PG-native).
+        micro = ns_remainder // 1000
+        canonical = base_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{micro:06d}Z"
+    else:
+        # Sub-microsecond precision: emit 9 fractional digits (full ns).
+        canonical = base_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ns_remainder:09d}Z"
+
+    return ns, canonical
+
+
+def _parse_utc_ns(value: Any, *, field: str) -> int:
+    """Parse an explicit timezone-aware timestamp into UTC nanoseconds.
+
+    Preserves full nanosecond precision (PostgreSQL ``timestamptz`` stores
+    6-digit fractional seconds = microsecond; Python ``datetime`` stores
+    microsecond). Sub-microsecond values in ISO-8601 strings (e.g. 9 digits
+    after the decimal point) are truncated toward the past, never rounded up.
     """
     if isinstance(value, bool):
         raise SrrActivationConfigError(f"{field} must be a timestamp, not a boolean")
@@ -98,12 +138,13 @@ def _parse_utc_ms(value: Any, *, field: str) -> int:
         )
     if isinstance(value, datetime):
         parsed = value
+        raw_text: str | None = None
     elif isinstance(value, str):
-        text = value.strip()
-        if not text:
+        raw_text = value.strip()
+        if not raw_text:
             raise SrrActivationConfigError(f"{field} must not be empty")
         try:
-            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(raw_text.replace("Z", "+00:00"))
         except ValueError as exc:
             raise SrrActivationConfigError(f"{field} is not a valid ISO-8601 timestamp: {value!r}") from exc
     else:
@@ -118,21 +159,47 @@ def _parse_utc_ms(value: Any, *, field: str) -> int:
             f"rejected: {value!r}"
         )
 
+    # Capture nanosecond precision from the raw string if available.
+    # Python's fromisoformat truncates sub-microsecond digits; re-extract
+    # them from the original text so the boundary comparison is exact.
+    frac_ns: int | None = None
+    if raw_text is not None:
+        frac_ns = _extract_fraction_ns(raw_text)
+
     utc = parsed.astimezone(timezone.utc)
-    return int(round(utc.timestamp() * 1000))
+    seconds = int(utc.timestamp())
+    micro = utc.microsecond
+
+    if frac_ns is not None:
+        # Replace the microsecond-derived sub-nanosecond digits with the
+        # raw string's exact fraction. Truncation toward the past already
+        # happened in ``_extract_fraction_ns``.
+        ns_total = seconds * 1_000_000_000 + frac_ns
+    else:
+        ns_total = seconds * 1_000_000_000 + micro * 1000
+
+    return ns_total
 
 
-def normalize_activation_ts(value: Any) -> tuple[int, str]:
-    """Return the normalized ``(utc_ms, canonical_text)`` pair for a boundary.
+def _extract_fraction_ns(text: str) -> int | None:
+    """Extract the fractional-second portion of an ISO-8601 string as ns.
 
-    The canonical text is the single storage format used for activation
-    records and SQL parameters. Milliseconds are always present.
+    Returns nanoseconds after the whole second, or ``None`` if the string
+    has no fractional part. Truncates (does not round) digits beyond
+    nanosecond precision.
     """
-    ms = _parse_utc_ms(value, field="ACTIVATION_TS")
-    canonical = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime(
-        ACTIVATION_TS_STORAGE_FORMAT
-    )
-    return ms, canonical
+    import re
+
+    # Strip the timezone suffix for fraction extraction.
+    tz_match = re.search(r"[+-]\d{2}:?\d{2}$|Z$", text)
+    base = text[: tz_match.start()] if tz_match else text
+    frac_match = re.search(r"\.(\d+)", base)
+    if not frac_match:
+        return None
+    frac_digits = frac_match.group(1)
+    # Truncate to 9 digits (nanoseconds); do not round up.
+    frac_padded = (frac_digits + "0" * 9)[:9]
+    return int(frac_padded)
 
 
 # ── Activation record state machine ─────────────────────────────
@@ -219,13 +286,18 @@ def validate_activation_record_immutability(
 class SrrShortWriterActivationBoundary:
     """Immutable runtime activation boundary for SRR SHORT outcome writes."""
 
-    activation_ts_ms: int
+    activation_ts_ns: int
     activation_ts_text: str
 
     @classmethod
     def create(cls, activation_ts: Any) -> "SrrShortWriterActivationBoundary":
-        ms, text = normalize_activation_ts(activation_ts)
-        return cls(activation_ts_ms=ms, activation_ts_text=text)
+        ns, text = normalize_activation_ts(activation_ts)
+        return cls(activation_ts_ns=ns, activation_ts_text=text)
+
+    @property
+    def activation_ts_ms(self) -> int:
+        """UTC milliseconds since the epoch (truncated toward the past)."""
+        return self.activation_ts_ns // 1_000_000
 
     @property
     def boundary_version(self) -> str:
@@ -246,16 +318,21 @@ class SrrShortWriterActivationBoundary:
         direction: Any,
         signal_time: Any,
     ) -> bool:
-        """Return True only for observations strictly after the boundary."""
+        """Return True only for observations strictly after the boundary.
+
+        The comparison is performed at nanosecond precision so that a
+        timestamp exactly at the boundary is rejected and a timestamp 1µs
+        after the boundary is accepted. No rounding can flip the side.
+        """
         if experiment_id != SRR_ACTIVATION_EXPERIMENT_ID:
             return False
         if direction != SRR_ACTIVATION_DIRECTION:
             return False
         try:
-            signal_ms = _parse_utc_ms(signal_time, field="signal_time")
+            signal_ns = _parse_utc_ns(signal_time, field="signal_time")
         except SrrActivationConfigError:
             return False
-        return signal_ms > self.activation_ts_ms
+        return signal_ns > self.activation_ts_ns
 
     def require_eligible(
         self,
@@ -365,12 +442,12 @@ class SrrShortWriterActivationGate:
                 "SRR activation record has no activation_ts; writer mode is blocked"
             )
         try:
-            record_ms, _ = normalize_activation_ts(record_text)
+            record_ns, _ = normalize_activation_ts(record_text)
         except SrrActivationConfigError as exc:
             raise SrrActivationRecordUnavailable(
                 f"SRR activation record activation_ts is invalid: {record_text!r}"
             ) from exc
-        if record_ms != self._boundary.activation_ts_ms:
+        if record_ns != self._boundary.activation_ts_ns:
             raise SrrActivationRecordMismatch(
                 "SRR activation record mismatch: "
                 f"record={record_text!r} runtime={self._boundary.activation_ts_text!r}"
@@ -400,6 +477,47 @@ class SrrShortWriterActivationGate:
     def verified_record_status(self) -> str | None:
         """Status of the last verified record, or ``None`` if not verified."""
         return self._record_status
+
+    def load_authoritative_record(self, conn: Any) -> Mapping[str, Any] | None:
+        """Load the activation record from PostgreSQL and verify it.
+
+        This is the ONLY trusted source for the writer's authorization.
+        A caller-supplied record dict can be forged; a row read inside the
+        writer's own transaction cannot. Returns ``None`` when no row exists
+        or the read fails; raises on any mismatch with the runtime boundary.
+        """
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    """
+                    SELECT experiment_id, direction, boundary_version,
+                           activation_ts, status
+                    FROM research.srr_short_writer_activation
+                    WHERE experiment_id = %s
+                    """,
+                    (SRR_ACTIVATION_EXPERIMENT_ID,),
+                )
+                row = cursor.fetchone()
+            finally:
+                cursor.close()
+        except Exception as exc:
+            raise SrrActivationRecordUnavailable(
+                "SRR activation record read failed; writer mode is blocked"
+            ) from exc
+
+        if row is None:
+            return None
+
+        record = {
+            "experiment_id": row[0],
+            "direction": row[1],
+            "boundary_version": row[2],
+            "activation_ts": row[3],
+            "status": row[4],
+        }
+        self.verify_persisted_record(record)
+        return record
 
     def assert_writer_allowed(self) -> None:
         """Raise unless writer mode is explicitly enabled and verified.

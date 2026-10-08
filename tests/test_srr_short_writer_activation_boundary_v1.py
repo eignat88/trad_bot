@@ -42,7 +42,8 @@ from app.research.srr_short_execution_r_expansion_prospective_evaluator import (
 )
 
 ACTIVATION_TS = "2026-10-08T12:00:00Z"
-ACTIVATION_TS_MS = 1791460800000  # 2026-10-08T12:00:00Z
+ACTIVATION_TS_NS = 1791460800000000000  # 2026-10-08T12:00:00Z in nanoseconds
+ACTIVATION_TS_MS = 1791460800000        # 2026-10-08T12:00:00Z in milliseconds
 
 
 def make_boundary():
@@ -353,6 +354,14 @@ def test_t14_direct_writer_call_rejected():
     })
 
     fake_conn = MagicMock()
+    cursor = MagicMock()
+    fake_conn.cursor.return_value = cursor
+    # 1) activation record read → ACTIVE
+    cursor.fetchone.side_effect = [
+        (SRR_ACTIVATION_EXPERIMENT_ID, SRR_ACTIVATION_DIRECTION,
+         SRR_ACTIVATION_BOUNDARY_V1, ACTIVATION_TS, ACTIVATION_STATUS_ACTIVE),
+    ]
+
     writer = SrrOutcomeWriter(fake_conn, activation_gate=gate)
 
     result = writer.write(
@@ -367,8 +376,8 @@ def test_t14_direct_writer_call_rejected():
         result={"status": "TEST", "reason_code": "TEST", "finalization_eligible": False},
     )
     assert result.action == "REJECTED_PRE_ACTIVATION"
-    # No SQL was executed
-    fake_conn.cursor.assert_not_called()
+    # No outcome SQL was executed
+    assert cursor.execute.call_count == 1  # only the activation record read
 
 
 def test_t14_direct_writer_call_without_gate_rejected():
@@ -387,6 +396,14 @@ def test_t14_direct_writer_call_without_gate_rejected():
     })
 
     fake_conn = MagicMock()
+    cursor = MagicMock()
+    fake_conn.cursor.return_value = cursor
+    # 1) activation record read → ACTIVE
+    cursor.fetchone.side_effect = [
+        (SRR_ACTIVATION_EXPERIMENT_ID, SRR_ACTIVATION_DIRECTION,
+         SRR_ACTIVATION_BOUNDARY_V1, ACTIVATION_TS, ACTIVATION_STATUS_ACTIVE),
+    ]
+
     writer = SrrOutcomeWriter(fake_conn, activation_gate=gate)
 
     result = writer.write(
@@ -426,8 +443,12 @@ def test_t15_repeated_nonfinal_write_idempotent():
     cursor = MagicMock()
     fake_conn.cursor.return_value = cursor
 
-    # Existing non-final row
+    # 1) activation record read → ACTIVE
+    # 2) SELECT FOR UPDATE → existing
+    # 3) UPDATE RETURNING → success
     cursor.fetchone.side_effect = [
+        (SRR_ACTIVATION_EXPERIMENT_ID, SRR_ACTIVATION_DIRECTION,
+         SRR_ACTIVATION_BOUNDARY_V1, ACTIVATION_TS, ACTIVATION_STATUS_ACTIVE),
         (100,),  # SELECT FOR UPDATE returns existing
         (100, False),  # UPDATE RETURNING
     ]
@@ -467,9 +488,12 @@ def test_t16_nonfinal_to_final_pass():
     cursor = MagicMock()
     fake_conn.cursor.return_value = cursor
 
-    # SELECT FOR UPDATE → existing, SELECT is_final → False (returns observation_id, is_final),
-    # UPDATE RETURNING → success
+    # 1) activation record read → ACTIVE
+    # 2) SELECT FOR UPDATE → existing, 3) SELECT is_final → False,
+    # 4) UPDATE RETURNING → success
     cursor.fetchone.side_effect = [
+        (SRR_ACTIVATION_EXPERIMENT_ID, SRR_ACTIVATION_DIRECTION,
+         SRR_ACTIVATION_BOUNDARY_V1, ACTIVATION_TS, ACTIVATION_STATUS_ACTIVE),
         (200,),      # SELECT FOR UPDATE → existing
         (False,),    # SELECT is_final → returns (is_final,)= (False,)
         (200, True), # UPDATE RETURNING
@@ -531,10 +555,13 @@ def test_t17_repeated_final_write_immutable():
     cursor = MagicMock()
     fake_conn.cursor.return_value = cursor
 
-    # SELECT FOR UPDATE → existing, SELECT is_final → True (returns is_final,)
+    # 1) activation record read → ACTIVE
+    # 2) SELECT FOR UPDATE → existing, 3) SELECT is_final → True (returns is_final,)
     cursor.fetchone.side_effect = [
-        (300,),     # SELECT FOR UPDATE
-        (True,),    # SELECT is_final → (True,)
+        (SRR_ACTIVATION_EXPERIMENT_ID, SRR_ACTIVATION_DIRECTION,
+         SRR_ACTIVATION_BOUNDARY_V1, ACTIVATION_TS, ACTIVATION_STATUS_ACTIVE),
+        (300,),      # SELECT FOR UPDATE
+        (True,),     # SELECT is_final → (True,)
     ]
 
     writer = SrrOutcomeWriter(fake_conn, activation_gate=gate)
@@ -594,10 +621,13 @@ def test_t18_final_to_other_final_blocked():
     cursor = MagicMock()
     fake_conn.cursor.return_value = cursor
 
-    # SELECT FOR UPDATE → existing, SELECT is_final → True (returns is_final,)
+    # 1) activation record read → ACTIVE
+    # 2) SELECT FOR UPDATE → existing, 3) SELECT is_final → True (returns is_final,)
     cursor.fetchone.side_effect = [
-        (400,),     # SELECT FOR UPDATE
-        (True,),    # SELECT is_final → (True,)
+        (SRR_ACTIVATION_EXPERIMENT_ID, SRR_ACTIVATION_DIRECTION,
+         SRR_ACTIVATION_BOUNDARY_V1, ACTIVATION_TS, ACTIVATION_STATUS_ACTIVE),
+        (400,),      # SELECT FOR UPDATE
+        (True,),     # SELECT is_final → (True,)
     ]
 
     writer = SrrOutcomeWriter(fake_conn, activation_gate=gate)
@@ -945,7 +975,15 @@ def test_t24_writer_cannot_rollback_reader():
         # Simulate a write failure that triggers rollback
         cursor = MagicMock()
         writer._conn.cursor.return_value = cursor
-        cursor.execute.side_effect = RuntimeError("TEST")
+
+        # First fetchone is the activation record read → row exists (ACTIVE)
+        # Second fetchone triggers the injected failure.
+        cursor.fetchone.side_effect = [
+            (SRR_ACTIVATION_EXPERIMENT_ID, SRR_ACTIVATION_DIRECTION,
+             SRR_ACTIVATION_BOUNDARY_V1, ACTIVATION_TS, ACTIVATION_STATUS_ACTIVE),
+            RuntimeError("TEST"),
+        ]
+        cursor.execute.side_effect = [None, RuntimeError("TEST")]
 
         with pytest.raises(RuntimeError):
             writer.write(
@@ -1044,28 +1082,28 @@ def test_gate_with_mismatched_version_rejected():
 
 def test_normalize_activation_ts_with_offset():
     """A timezone offset is converted to UTC."""
-    ms, text = normalize_activation_ts("2026-10-08T14:00:00+02:00")
-    assert ms == ACTIVATION_TS_MS
+    ns, text = normalize_activation_ts("2026-10-08T14:00:00+02:00")
+    assert ns == ACTIVATION_TS_NS
     assert text == "2026-10-08T12:00:00.000000Z"
 
 
 def test_normalize_activation_ts_with_milliseconds():
-    ms, text = normalize_activation_ts("2026-10-08T12:00:00.500Z")
-    assert ms == ACTIVATION_TS_MS + 500
+    ns, text = normalize_activation_ts("2026-10-08T12:00:00.500Z")
+    assert ns == ACTIVATION_TS_NS + 500_000_000
     assert text == "2026-10-08T12:00:00.500000Z"
 
 
 def test_normalize_activation_ts_with_datetime_object():
     dt = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
-    ms, text = normalize_activation_ts(dt)
-    assert ms == ACTIVATION_TS_MS
+    ns, text = normalize_activation_ts(dt)
+    assert ns == ACTIVATION_TS_NS
 
 
 def test_normalize_activation_ts_with_offset_datetime():
     tz = timezone(timedelta(hours=2))
     dt = datetime(2026, 10, 8, 14, 0, 0, tzinfo=tz)
-    ms, text = normalize_activation_ts(dt)
-    assert ms == ACTIVATION_TS_MS
+    ns, text = normalize_activation_ts(dt)
+    assert ns == ACTIVATION_TS_NS
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1206,14 +1244,20 @@ def test_d1_writer_without_gate_rejected_before_sql():
 # ── D2: Writer with unauthorized gate ───────────────────────────
 
 def test_d2_writer_with_unauthorized_gate_rejected():
-    """An unverified gate (no record) blocks the write."""
+    """An unverified gate (no record loaded from DB) blocks the write."""
     boundary = make_boundary()
     gate = SrrShortWriterActivationGate(
         boundary=boundary,
         mode=SrrShortWriterActivationMode(enabled=True),
     )
-    # Gate exists but record was never verified.
+    # Gate exists but no activation record is loaded from the DB.
+    # The writer tries to read the record and fails (no row / no DB).
     fake_conn = MagicMock()
+    cursor = MagicMock()
+    fake_conn.cursor.return_value = cursor
+    # load_authoritative_record returns None → no row found
+    cursor.fetchone.return_value = None
+
     writer = SrrOutcomeWriter(fake_conn, activation_gate=gate)
 
     result = writer.write(
@@ -1222,8 +1266,12 @@ def test_d2_writer_with_unauthorized_gate_rejected():
         observation=_eligible_observation(),
         result={"status": "TEST", "reason_code": "TEST", "finalization_eligible": False},
     )
-    assert result.action == "REJECTED_ACTIVATION_GATE"
-    fake_conn.cursor.assert_not_called()
+    assert result.action == "REJECTED_ACTIVATION_RECORD_UNAVAILABLE"
+    # Only the activation record read was attempted
+    assert cursor.execute.call_count == 1
+    # No outcome SQL was executed
+    sqls = [c[0][0] for c in cursor.execute.call_args_list]
+    assert not any("srr_short_execution_prospective_outcome" in s for s in sqls)
 
 
 # ── D3: Activation status PENDING ───────────────────────────────
@@ -1424,9 +1472,13 @@ def test_d9_active_record_and_eligible_observation_allows_write():
     cursor = MagicMock()
     fake_conn.cursor.return_value = cursor
     cursor.fetchone.side_effect = [
-        (900,),     # SELECT FOR UPDATE → existing row
-        (False,),   # SELECT is_final → not yet final
-        (900, True),# UPDATE RETURNING
+        # 1) activation record read → ACTIVE
+        (SRR_ACTIVATION_EXPERIMENT_ID, SRR_ACTIVATION_DIRECTION,
+         SRR_ACTIVATION_BOUNDARY_V1, ACTIVATION_TS, ACTIVATION_STATUS_ACTIVE),
+        # 2) SELECT FOR UPDATE → existing row
+        (900,),
+        # 3) UPDATE RETURNING
+        (900, True),
     ]
 
     writer = SrrOutcomeWriter(fake_conn, activation_gate=gate)
@@ -1534,3 +1586,444 @@ def test_d_extra_revoked_record_status_recheck_blocks_write():
     gate._record_status = ACTIVATION_STATUS_REVOKED
     with pytest.raises(SrrActivationRecordNotActive):
         gate.assert_writer_allowed()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FINAL REVIEW FIX TESTS (task FIX 1-3)
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _make_db_conn(active_row=True, revoke_row=False):
+    """Helper: fake connection returning the activation record row."""
+    fake_conn = MagicMock()
+    cursor = MagicMock()
+    fake_conn.cursor.return_value = cursor
+
+    active_row_tuple = (
+        SRR_ACTIVATION_EXPERIMENT_ID, SRR_ACTIVATION_DIRECTION,
+        SRR_ACTIVATION_BOUNDARY_V1, ACTIVATION_TS, ACTIVATION_STATUS_ACTIVE,
+    )
+    revoked_row_tuple = (
+        SRR_ACTIVATION_EXPERIMENT_ID, SRR_ACTIVATION_DIRECTION,
+        SRR_ACTIVATION_BOUNDARY_V1, ACTIVATION_TS, ACTIVATION_STATUS_REVOKED,
+    )
+
+    if revoke_row:
+        cursor.fetchone.side_effect = [revoked_row_tuple]
+    elif active_row:
+        cursor.fetchone.side_effect = [active_row_tuple]
+    else:
+        cursor.fetchone.return_value = None
+
+    return fake_conn, cursor
+
+
+# ── 1. ACTIVE → REVOKED after first verification ────────────────
+
+def test_fr1_active_to_revoked_after_verification_blocks_write():
+    """A record verified as ACTIVE, then changed to REVOKED in the DB,
+    is caught by the per-write authoritative read."""
+    gate = _make_active_gate()
+
+    # First write: DB returns ACTIVE
+    fake_conn, cursor = _make_db_conn(active_row=True)
+    # After the activation row, the writer proceeds to outcome SQL
+    cursor.fetchone.side_effect = [
+        (SRR_ACTIVATION_EXPERIMENT_ID, SRR_ACTIVATION_DIRECTION,
+         SRR_ACTIVATION_BOUNDARY_V1, ACTIVATION_TS, ACTIVATION_STATUS_ACTIVE),
+        (900,),        # SELECT FOR UPDATE
+        (900, True),   # UPDATE RETURNING
+    ]
+
+    writer = SrrOutcomeWriter(fake_conn, activation_gate=gate)
+    result = writer.write(
+        observation_id=900,
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        observation=_eligible_observation(),
+        result={"status": "INCOMPLETE_COVERAGE", "reason_code": "OK",
+                "finalization_eligible": False},
+    )
+    assert result.action in {"INSERTED", "REFRESHED"}
+
+    # Second write: DB now returns REVOKED
+    fake_conn2, cursor2 = _make_db_conn(active_row=False, revoke_row=True)
+    writer2 = SrrOutcomeWriter(fake_conn2, activation_gate=gate)
+    result2 = writer2.write(
+        observation_id=901,
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        observation=_eligible_observation(observation_id=901),
+        result={"status": "INCOMPLETE_COVERAGE", "reason_code": "OK",
+                "finalization_eligible": False},
+    )
+    assert result2.action == "REJECTED_ACTIVATION_GATE"
+    # No outcome SQL was executed after the record read
+    outcome_sqls = [c[0][0] for c in cursor2.execute.call_args_list
+                    if "srr_short_execution_prospective_outcome" in c[0][0]]
+    assert outcome_sqls == []
+
+
+# ── 2. REVOKED between two writer calls ─────────────────────────
+
+def test_fr2_revoked_between_two_writer_calls():
+    """A revoke between two writer calls blocks the second write."""
+    gate = _make_active_gate()
+
+    # Call 1: DB returns ACTIVE
+    fake_conn, cursor = _make_db_conn(active_row=True)
+    cursor.fetchone.side_effect = [
+        (SRR_ACTIVATION_EXPERIMENT_ID, SRR_ACTIVATION_DIRECTION,
+         SRR_ACTIVATION_BOUNDARY_V1, ACTIVATION_TS, ACTIVATION_STATUS_ACTIVE),
+        (900,), (900, True),
+    ]
+    writer = SrrOutcomeWriter(fake_conn, activation_gate=gate)
+    result = writer.write(
+        observation_id=900,
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        observation=_eligible_observation(),
+        result={"status": "INCOMPLETE_COVERAGE", "reason_code": "OK",
+                "finalization_eligible": False},
+    )
+    assert result.action in {"INSERTED", "REFRESHED"}
+
+    # Call 2: DB now returns REVOKED
+    fake_conn2, cursor2 = _make_db_conn(revoke_row=True)
+    writer2 = SrrOutcomeWriter(fake_conn2, activation_gate=gate)
+    result2 = writer2.write(
+        observation_id=901,
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        observation=_eligible_observation(observation_id=901),
+        result={"status": "INCOMPLETE_COVERAGE", "reason_code": "OK",
+                "finalization_eligible": False},
+    )
+    assert result2.action == "REJECTED_ACTIVATION_GATE"
+
+
+# ── 3. Concurrent write and revoke ──────────────────────────────
+
+def test_fr3_concurrent_write_and_revoke():
+    """A concurrent revoke (between the record read and the outcome write)
+    is detected: the writer re-reads the record before every write."""
+    gate = _make_active_gate()
+
+    # First call succeeds (ACTIVE)
+    fake_conn, cursor = _make_db_conn(active_row=True)
+    cursor.fetchone.side_effect = [
+        (SRR_ACTIVATION_EXPERIMENT_ID, SRR_ACTIVATION_DIRECTION,
+         SRR_ACTIVATION_BOUNDARY_V1, ACTIVATION_TS, ACTIVATION_STATUS_ACTIVE),
+        (900,), (900, True),
+    ]
+    writer = SrrOutcomeWriter(fake_conn, activation_gate=gate)
+    result = writer.write(
+        observation_id=900,
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        observation=_eligible_observation(),
+        result={"status": "INCOMPLETE_COVERAGE", "reason_code": "OK",
+                "finalization_eligible": False},
+    )
+    assert result.action in {"INSERTED", "REFRESHED"}
+
+    # Second call: DB returns REVOKED (revoke committed between calls)
+    fake_conn2, cursor2 = _make_db_conn(revoke_row=True)
+    writer2 = SrrOutcomeWriter(fake_conn2, activation_gate=gate)
+    result2 = writer2.write(
+        observation_id=901,
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        observation=_eligible_observation(observation_id=901),
+        result={"status": "INCOMPLETE_COVERAGE", "reason_code": "OK",
+                "finalization_eligible": False},
+    )
+    assert result2.action == "REJECTED_ACTIVATION_GATE"
+
+
+# ── 4. Forged ACTIVE record without DB row ──────────────────────
+
+def test_fr4_forged_active_record_without_db_row():
+    """A gate with a verified ACTIVE record but no matching row in the DB
+    is rejected: the writer loads the record from the DB, not from memory."""
+    # Gate is verified with a caller-supplied ACTIVE record.
+    gate = _make_active_gate()
+
+    # DB returns no row (activation record was never persisted).
+    fake_conn = MagicMock()
+    cursor = MagicMock()
+    fake_conn.cursor.return_value = cursor
+    cursor.fetchone.return_value = None  # no activation record in DB
+
+    writer = SrrOutcomeWriter(fake_conn, activation_gate=gate)
+    result = writer.write(
+        observation_id=1,
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        observation=_eligible_observation(),
+        result={"status": "TEST", "reason_code": "TEST",
+                "finalization_eligible": False},
+    )
+    assert result.action == "REJECTED_ACTIVATION_RECORD_UNAVAILABLE"
+
+
+# ── 5. Deleted or missing activation record ─────────────────────
+
+def test_fr5_missing_activation_record():
+    """A deleted or never-created activation record blocks the write."""
+    gate = _make_active_gate()
+
+    fake_conn = MagicMock()
+    cursor = MagicMock()
+    fake_conn.cursor.return_value = cursor
+    cursor.fetchone.return_value = None  # record absent
+
+    writer = SrrOutcomeWriter(fake_conn, activation_gate=gate)
+    result = writer.write(
+        observation_id=1,
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        observation=_eligible_observation(),
+        result={"status": "TEST", "reason_code": "TEST",
+                "finalization_eligible": False},
+    )
+    assert result.action == "REJECTED_ACTIVATION_RECORD_UNAVAILABLE"
+
+
+# ── 6. DB read exception → zero writes ──────────────────────────
+
+def test_fr6_db_read_exception_zero_writes():
+    """Any exception while reading the activation record blocks the write."""
+    gate = _make_active_gate()
+
+    fake_conn = MagicMock()
+    cursor = MagicMock()
+    fake_conn.cursor.return_value = cursor
+    cursor.execute.side_effect = RuntimeError("DB connection lost")
+
+    writer = SrrOutcomeWriter(fake_conn, activation_gate=gate)
+    result = writer.write(
+        observation_id=1,
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        observation=_eligible_observation(),
+        result={"status": "TEST", "reason_code": "TEST",
+                "finalization_eligible": False},
+    )
+    assert result.action == "REJECTED_ACTIVATION_RECORD_UNAVAILABLE"
+    # No outcome SQL was executed
+    outcome_sqls = [c[0][0] for c in cursor.execute.call_args_list
+                    if "srr_short_execution_prospective_outcome" in c[0][0]]
+    assert outcome_sqls == []
+
+
+# ── 7. Timestamp exactly on boundary ────────────────────────────
+
+def test_fr7_timestamp_exactly_on_boundary_rejected():
+    """A signal_time exactly at the boundary is rejected (strict >)."""
+    boundary = make_boundary()
+    assert not boundary.is_eligible(
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        direction="SHORT",
+        signal_time="2026-10-08T12:00:00.000000Z",
+    )
+
+
+# ── 8. Timestamp 1µs after boundary ─────────────────────────────
+
+def test_fr8_timestamp_one_microsecond_after_boundary():
+    """A signal_time 1µs after the boundary is eligible."""
+    boundary = make_boundary()
+    assert boundary.is_eligible(
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        direction="SHORT",
+        signal_time="2026-10-08T12:00:00.000001Z",
+    )
+
+
+# ── 9. Timestamp 1µs before boundary ────────────────────────────
+
+def test_fr9_timestamp_one_microsecond_before_boundary():
+    """A signal_time 1µs before the boundary is rejected."""
+    boundary = make_boundary()
+    assert not boundary.is_eligible(
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        direction="SHORT",
+        signal_time="2026-10-08T11:59:59.999999Z",
+    )
+
+
+# ── 10. UTC offset equivalence ──────────────────────────────────
+
+def test_fr10_utc_offset_equivalence():
+    """The same instant expressed with different UTC offsets produces
+    the same normalized boundary."""
+    b1 = SrrShortWriterActivationBoundary.create("2026-10-08T12:00:00Z")
+    b2 = SrrShortWriterActivationBoundary.create("2026-10-08T14:00:00+02:00")
+    b3 = SrrShortWriterActivationBoundary.create("2026-10-08T07:00:00-05:00")
+    assert b1.activation_ts_ns == b2.activation_ts_ns == b3.activation_ts_ns
+    assert b1.activation_ts_text == b2.activation_ts_text == b3.activation_ts_text
+
+
+# ── 11. Restart with same ACTIVATION_TS ─────────────────────────
+
+def test_fr11_restart_with_same_activation_ts():
+    """A restart with the same ACTIVATION_TS is a pass."""
+    b1 = SrrShortWriterActivationBoundary.create(ACTIVATION_TS)
+    b2 = SrrShortWriterActivationBoundary.create(ACTIVATION_TS)
+    assert b1.activation_ts_ns == b2.activation_ts_ns
+
+    g1 = _make_active_gate(b1)
+    g2 = _make_active_gate(b2)
+    g1.assert_writer_allowed()
+    g2.assert_writer_allowed()
+
+
+# ── 12. Pre-activation → zero Bybit / zero policy / zero writes ─
+
+def test_fr12_pre_activation_zero_downstream():
+    """A pre-activation observation in writer-enabled mode triggers
+    zero Bybit requests, zero frozen-policy calls, and zero writes."""
+    boundary = make_boundary()
+    conn = _FakeConnForBoundary()
+    candle_source = Mock()
+    writer = Mock()
+
+    evaluator = SrrShortExecutionRExpansionProspectiveEvaluator(
+        conn=conn,
+        candle_source=candle_source,
+        dry_run=False,
+        write_outcomes=writer,
+        activation_boundary=boundary,
+    )
+    evaluator._current_asof_ms = lambda: ACTIVATION_TS_NS // 1_000_000 + 3600_000
+
+    # SQL returns an empty list (pre-activation rows are excluded by the filter).
+    conn.cursor_obj.fetchall = lambda: []
+
+    stats = evaluator.run_evaluation_cycle(SRR_EXPERIMENT_ID)
+
+    assert stats["signals_checked"] == 0
+    assert candle_source.fetch_5m_candles.call_count == 0
+    assert writer.call_count == 0
+
+
+# ── Authoritative record load tests ─────────────────────────────
+
+def test_fr_authoritative_record_loaded_from_db():
+    """The writer loads the record from the DB, not from a caller dict."""
+    gate = _make_active_gate()
+
+    fake_conn = MagicMock()
+    cursor = MagicMock()
+    fake_conn.cursor.return_value = cursor
+    cursor.fetchone.side_effect = [
+        # Activation record: ACTIVE
+        (SRR_ACTIVATION_EXPERIMENT_ID, SRR_ACTIVATION_DIRECTION,
+         SRR_ACTIVATION_BOUNDARY_V1, ACTIVATION_TS, ACTIVATION_STATUS_ACTIVE),
+        # SELECT FOR UPDATE → existing
+        (900,),
+        # UPDATE RETURNING
+        (900, True),
+    ]
+
+    writer = SrrOutcomeWriter(fake_conn, activation_gate=gate)
+    result = writer.write(
+        observation_id=900,
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        observation=_eligible_observation(),
+        result={"status": "INCOMPLETE_COVERAGE", "reason_code": "OK",
+                "finalization_eligible": False},
+    )
+    assert not result.action.startswith("REJECTED_")
+    # Verify the record read SQL was executed first
+    first_sql = cursor.execute.call_args_list[0][0][0]
+    assert "srr_short_writer_activation" in first_sql
+
+
+def test_fr_no_authoritative_record_loads_from_db():
+    """When no record is loaded, the writer returns None and blocks."""
+    gate = SrrShortWriterActivationGate(
+        boundary=make_boundary(),
+        mode=SrrShortWriterActivationMode(enabled=True),
+    )
+    fake_conn = MagicMock()
+    cursor = MagicMock()
+    fake_conn.cursor.return_value = cursor
+    cursor.fetchone.return_value = None
+
+    record = gate.load_authoritative_record(fake_conn)
+    assert record is None
+    with pytest.raises(SrrActivationRecordUnavailable):
+        gate.assert_writer_allowed()
+
+
+# ── Runtime wiring: no caller-supplied record ───────────────────
+
+def test_fr_runtime_wiring_no_caller_supplied_record():
+    """prepare_srr_short_writer no longer accepts activation_record."""
+    import inspect
+    from app.research.srr_short_runtime_wiring import prepare_srr_short_writer
+
+    sig = inspect.signature(prepare_srr_short_writer)
+    assert "activation_record" not in sig.parameters
+
+
+# ── Sub-microsecond precision tests ─────────────────────────────
+
+def test_fr_sub_microsecond_boundary_exact():
+    """A timestamp with sub-microsecond precision is compared exactly."""
+    boundary = SrrShortWriterActivationBoundary.create(
+        "2026-10-08T12:00:00.000000000Z"
+    )
+    # Exactly on the boundary
+    assert not boundary.is_eligible(
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        direction="SHORT",
+        signal_time="2026-10-08T12:00:00.000000000Z",
+    )
+    # 1 nanosecond after
+    assert boundary.is_eligible(
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        direction="SHORT",
+        signal_time="2026-10-08T12:00:00.000000001Z",
+    )
+    # 1 nanosecond before
+    assert not boundary.is_eligible(
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        direction="SHORT",
+        signal_time="2026-10-08T11:59:59.999999999Z",
+    )
+
+
+def test_fr_ns_truncation_does_not_flip_side():
+    """Sub-microsecond values are truncated toward the past; no rounding
+    can move a timestamp across the boundary."""
+    # Boundary at exactly 12:00:00.000000000
+    boundary = SrrShortWriterActivationBoundary.create(
+        "2026-10-08T12:00:00.000000000Z"
+    )
+    # 11:59:59.999999999 is strictly before → rejected
+    assert not boundary.is_eligible(
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        direction="SHORT",
+        signal_time="2026-10-08T11:59:59.999999999Z",
+    )
+    # 12:00:00.000000001 is strictly after → eligible
+    assert boundary.is_eligible(
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        direction="SHORT",
+        signal_time="2026-10-08T12:00:00.000000001Z",
+    )
+    # 12:00:01.000000001 is strictly after → eligible
+    assert boundary.is_eligible(
+        experiment_id=SRR_ACTIVATION_EXPERIMENT_ID,
+        direction="SHORT",
+        signal_time="2026-10-08T12:00:01.000000001Z",
+    )
+
+
+def test_fr_activation_ts_text_ns_precision():
+    """The canonical text preserves nanosecond precision when present."""
+    ns, text = normalize_activation_ts("2026-10-08T12:00:00.000000001Z")
+    assert text == "2026-10-08T12:00:00.000000001Z"
+    # And the ns value is exact
+    assert ns == ACTIVATION_TS_NS + 1
+
+
+def test_fr_activation_ts_text_us_precision():
+    """The canonical text preserves microsecond precision when present."""
+    ns, text = normalize_activation_ts("2026-10-08T12:00:00.000001Z")
+    assert text == "2026-10-08T12:00:00.000001Z"
+    assert ns == ACTIVATION_TS_NS + 1000

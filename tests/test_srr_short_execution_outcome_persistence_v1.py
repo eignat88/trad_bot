@@ -49,12 +49,20 @@ class Cursor:
         self.fail_on = fail_on
         self.executed = []
         self.closed = False
+        self._next = None
 
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
         if self.fail_on and self.fail_on in sql:
             raise RuntimeError("injected persistence failure")
-        if sql.strip().startswith("SELECT observation_id"):
+        if "srr_short_writer_activation" in sql:
+            # Activation record read → return an ACTIVE row
+            self._next = (
+                EXP_ID, "SHORT",
+                "SRR_SHORT_WRITER_ACTIVATION_BOUNDARY_V1",
+                ACTIVATION_TS, "ACTIVE",
+            )
+        elif sql.strip().startswith("SELECT observation_id"):
             self._next = self.rows.pop(0) if self.rows else None
         elif sql.strip().startswith("SELECT is_final"):
             self._next = self.rows.pop(0) if self.rows else None
@@ -302,7 +310,27 @@ def test_prefreeze_observation_is_rejected():
         "direction": "SHORT",
         "status": ACTIVATION_STATUS_ACTIVE,
     })
-    conn = Conn(rows=[None])
+
+    # Override the Cursor's activation record read to return this boundary.
+    class EarlyCursor(Cursor):
+        def execute(self, sql, params=None):
+            self.executed.append((sql, params))
+            if "srr_short_writer_activation" in sql:
+                self._next = (
+                    EXP_ID, "SHORT",
+                    "SRR_SHORT_WRITER_ACTIVATION_BOUNDARY_V1",
+                    "2026-10-07T00:00:00Z", "ACTIVE",
+                )
+            else:
+                super().execute(sql, params)
+
+    class EarlyConn(Conn):
+        def __init__(self):
+            self.cursor_obj = EarlyCursor([None])
+            self.commits = 0
+            self.rollbacks = 0
+
+    conn = EarlyConn()
     with pytest.raises(ValueError, match="after freeze"):
         SrrOutcomeWriter(conn, activation_gate=gate).write(
             observation_id=OBS_ID,

@@ -119,6 +119,10 @@ class SrrOutcomeWriter:
 
         A missing gate is a hard rejection: the writer must never persist
         anything without a verified activation record.
+
+        The authoritative activation record is loaded from PostgreSQL on
+        every call; a caller-supplied record dict is never trusted. Any
+        read failure is a rejection (fail-closed).
         """
         gate = self._activation_gate
         if gate is None:
@@ -129,6 +133,54 @@ class SrrOutcomeWriter:
             return SrrOutcomeWriteResult(
                 observation_id=int(observation_id),
                 action="REJECTED_NO_ACTIVATION_GATE",
+                is_final=False,
+            )
+
+        # Load the authoritative record from the database inside this
+        # writer's transaction. This closes the race between a cached
+        # ACTIVE status and a concurrent ACTIVE → REVOKED transition.
+        try:
+            record = gate.load_authoritative_record(self._conn)
+        except Exception as exc:
+            # A non-ACTIVE status from the DB is a normal rejection, not a
+            # read failure. Surface it as REJECTED_ACTIVATION_GATE so the
+            # operator sees the real reason.
+            from app.research.srr_short_writer_activation_boundary_v1 import (
+                SrrActivationRecordNotActive,
+            )
+            if isinstance(exc, SrrActivationRecordNotActive):
+                logger.warning(
+                    "SRR outcome write rejected (activation record not active): "
+                    "observation_id=%s error=%s",
+                    observation_id,
+                    exc,
+                )
+                return SrrOutcomeWriteResult(
+                    observation_id=int(observation_id),
+                    action="REJECTED_ACTIVATION_GATE",
+                    is_final=False,
+                )
+            logger.warning(
+                "SRR outcome write rejected (activation record read failed): "
+                "observation_id=%s error=%s",
+                observation_id,
+                exc,
+            )
+            return SrrOutcomeWriteResult(
+                observation_id=int(observation_id),
+                action="REJECTED_ACTIVATION_RECORD_UNAVAILABLE",
+                is_final=False,
+            )
+
+        if record is None:
+            logger.warning(
+                "SRR outcome write rejected (activation record absent): "
+                "observation_id=%s",
+                observation_id,
+            )
+            return SrrOutcomeWriteResult(
+                observation_id=int(observation_id),
+                action="REJECTED_ACTIVATION_RECORD_UNAVAILABLE",
                 is_final=False,
             )
 

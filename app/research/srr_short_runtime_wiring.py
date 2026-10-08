@@ -33,7 +33,6 @@ def prepare_srr_short_writer(
     enable_writes: bool = False,
     activation_ts: Any = None,
     activation_mode: SrrShortWriterActivationMode | None = None,
-    activation_record: dict[str, Any] | None = None,
 ) -> Iterator[Any]:
     """Prepare writer integration without allowing runtime activation.
 
@@ -48,6 +47,10 @@ def prepare_srr_short_writer(
     Any missing or inconsistent input raises and no database connection is
     opened. The production runner calls this with ``enable_writes=False`` and
     therefore never reaches the activation checks.
+
+    The authoritative activation record is loaded from PostgreSQL inside the
+    writer's own transaction on every write; no caller-supplied record is
+    accepted.
     """
 
     # Deliberate hard gate; no DB connection may be opened here.
@@ -71,11 +74,10 @@ def prepare_srr_short_writer(
         gate = SrrShortWriterActivationGate(
             boundary=boundary, mode=activation_mode
         )
-        if activation_record is not None:
-            gate.verify_persisted_record(activation_record)
-        # Without a persisted record the gate is never cleared for writes;
-        # a direct writer call is still rejected by the gate itself.
-        writer_activation_gate = gate
+        # The gate is intentionally left unverified here. The writer loads
+        # the authoritative activation record from PostgreSQL on every write
+        # inside its own transaction; a caller-supplied record is never used.
+        # Any verification failure at that point blocks the write (fail-closed).
 
         with open_srr_outcome_writer(
             host=host,
@@ -84,7 +86,7 @@ def prepare_srr_short_writer(
             user=user,
             password=password,
             reader_conn=reader_conn,
-            activation_gate=writer_activation_gate,
+            activation_gate=gate,
         ) as writer:
             yield writer
         return
