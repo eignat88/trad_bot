@@ -46,6 +46,8 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from dataclasses import replace
+from app.scanners.me_r_close_location_asof_context import build_me_clean_asof_context
 
 from app.scanners.close_location import (
     CLOSE_LOCATION_THRESHOLD,
@@ -73,7 +75,7 @@ class MERLongCloseLocationOOSValidationV1Scanner:
     """
 
     name = "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
-    version = "1.0.0"
+    version = "1.2.0"
 
     def __init__(
         self,
@@ -154,8 +156,37 @@ class MERLongCloseLocationOOSValidationV1Scanner:
         and state=EXPIRED.  They are persisted to ``dds.scanner_setup`` for
         analytical tracking but never executed by the paper engine.
         """
-        # Step 1: Run frozen base detection
-        base_candidates = self._base_scanner.scan(ctx)
+        # Build isolated closed-candle 5m/15m/1h context.
+        # Recompute RSI, ATR and market regime from closed 1h.
+        clean_ctx = build_me_clean_asof_context(ctx)
+        if clean_ctx is None:
+            return []
+
+        def candle_open_ms(candle) -> int:
+            ts = candle.timestamp
+            if isinstance(ts, datetime):
+                if ts.tzinfo is None:
+                    raise ValueError("Naive candle timestamp")
+                return int(ts.timestamp() * 1000)
+            if isinstance(ts, int) and not isinstance(ts, bool):
+                return ts
+            raise ValueError("Unsupported candle timestamp")
+
+        # Fail closed if an unclosed candle reaches frozen V1.
+        for timeframe, candles, duration_ms in (
+            ("5m", clean_ctx.candles_5m, 300_000),
+            ("15m", clean_ctx.candles_15m, 900_000),
+            ("1h", clean_ctx.candles_1h, 3_600_000),
+        ):
+            for candle in candles:
+                if candle_open_ms(candle) + duration_ms > int(
+                    ctx.evaluated_at.timestamp() * 1000
+                ):
+                    raise ValueError(
+                        f"ME OOS ASOF violation: {timeframe}"
+                    )
+
+        base_candidates = self._base_scanner.scan(clean_ctx)
         if not base_candidates:
             return []
 
@@ -164,7 +195,7 @@ class MERLongCloseLocationOOSValidationV1Scanner:
         for candidate in base_candidates:
             # Step 2: Compute close_location from signal candle
             close_location, signal_ts = self._compute_close_location_from_signal_candle(
-                list(ctx.candles_5m)
+                list(clean_ctx.candles_5m)
             )
 
             # Step 3: Evaluate close_location filter
@@ -178,8 +209,28 @@ class MERLongCloseLocationOOSValidationV1Scanner:
                 candidate, close_location, filter_passed, signal_ts,
             )
 
+            # Preserve the real source candle, not entry-zone OHLC proxies.
+            signal_candle = clean_ctx.candles_5m[-1]
+            features = dict(enriched.features)
+
+            features["oos_signal_open"] = float(signal_candle.open)
+            features["oos_signal_high"] = float(signal_candle.high)
+            features["oos_signal_low"] = float(signal_candle.low)
+            features["oos_signal_close"] = float(signal_candle.close)
+            features["oos_signal_volume"] = float(signal_candle.volume)
+            features["oos_signal_candle_open_ms"] = candle_open_ms(signal_candle)
+            features["oos_signal_entry_price"] = float(signal_candle.close)
+            features["oos_clean_observer_version"] = "1.2.0"
+
+            enriched = replace(
+                enriched,
+                features=features,
+                scanner_version=self.version,
+                signal_candle_open_time=candle_open_ms(signal_candle),
+            )
+
             if filter_passed:
-                # TREATMENT PASS: emit signal for paper/live entry
+                # TREATMENT PASS: research observation only; never paper/live
                 logger.info(
                     "ME_R_LONG OOS candidate %s close_location=%.4f threshold=%.2f PASS",
                     ctx.symbol,
@@ -189,7 +240,6 @@ class MERLongCloseLocationOOSValidationV1Scanner:
                 results.append(enriched)
             else:
                 # TREATMENT REJECT: persist as non-executable analytical record
-                from dataclasses import replace
                 rejected_features = dict(enriched.features)
                 rejected_features["_oos_rejected"] = True
                 rejected_features["_oos_rejection_reason"] = REJECTION_REASON

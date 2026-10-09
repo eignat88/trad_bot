@@ -215,6 +215,19 @@ class ScannerOrchestrator:
 
         unique = self.dedup.filter_new(scored)
 
+        # Clean ME OOS observations are idempotent at the dedicated DB layer.
+        # A previous observation may have failed after in-memory dedup.
+        # Re-deliver deduplicated ME candidates to research-only capture.
+        me_clean_retry_candidates = [
+            c for c in scored
+            if (
+                c.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
+                and c.scanner_version == "1.2.0"
+                and c.features.get("oos_clean_observer_version") == "1.2.0"
+                and all(kept is not c for kept in unique)
+            )
+        ]
+
         # Track dedup-rejected candidates for research status resolution
         unique_ids = {c.setup_id for c in unique}
         for c in scored:
@@ -239,6 +252,16 @@ class ScannerOrchestrator:
         valid: list[SetupCandidate] = []
         invalid_geometry_by_scanner: dict[str, int] = {}
         for c in unique:
+            # ME clean OOS captures frozen base events independently of
+            # execution risk geometry. Never route these to paper/live.
+            if (
+                c.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
+                and c.scanner_version == "1.2.0"
+                and c.features.get("oos_clean_observer_version") == "1.2.0"
+            ):
+                valid.append(c)
+                continue
+
             risk_ok, reason = validate_risk_geometry(c)
             if not risk_ok:
                 invalid_geometry_by_scanner[c.scanner_name] = (
@@ -264,6 +287,8 @@ class ScannerOrchestrator:
                 c.scanner_name in self.HTF_KEYLEVEL_PROSPECTIVE_SCANNERS
                 or c.score >= 30
                 or c.features.get("_oos_rejected")
+                # ME research PASS must bypass generic score gate.
+                or c.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
                 or c.scanner_name in self.SHADOW_CONTROL_SCANNERS
                 or c.scanner_name in self.SCORE_BYPASS_SCANNERS
             ):
@@ -306,13 +331,33 @@ class ScannerOrchestrator:
         # (e.g. FVG) can capture their defined population.
         shadow_candidates: list[SetupCandidate] = []
         observe_candidates: list[SetupCandidate] = []
+
+        # Retry only through the analytical observe-only channel.
+        # Never restore these candidates into valid/tradeable.
+        from dataclasses import replace as _me_retry_replace
+        for candidate in me_clean_retry_candidates:
+            features = dict(candidate.features)
+            features["_observe_only"] = True
+            features["_observe_only_reason"] = "ME_CLEAN_OOS_IDEMPOTENT_REDELIVERY"
+            observe_candidates.append(
+                _me_retry_replace(candidate, features=features)
+            )
+
         if gate_policy is not None:
             gate_accepted: list[SetupCandidate] = []
             for candidate in valid:
                 decision = gate_policy.evaluate(
                     candidate.scanner_name, candidate.direction, candidate.market_regime or ctx.market_regime
                 )
-                if decision.allowed:
+                if candidate.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1":
+                    from dataclasses import replace as _me_replace
+                    me_features = dict(candidate.features)
+                    me_features["_observe_only"] = True
+                    me_features["_observe_only_reason"] = "ME_CLOSE_LOCATION_RESEARCH_ONLY"
+                    observe_candidates.append(
+                        _me_replace(candidate, features=me_features)
+                    )
+                elif decision.allowed:
                     gate_accepted.append(candidate)
                 elif candidate.features.get("_oos_rejected"):
                     # Treatment REJECT: persist as analytical record, not shadow
@@ -381,6 +426,22 @@ class ScannerOrchestrator:
                         decision.status,
                     )
             valid = gate_accepted + shadow_candidates
+
+        else:
+            # ME research-only even without direction gate.
+            from dataclasses import replace as _me_replace
+            retained = []
+            for candidate in valid:
+                if candidate.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1":
+                    features = dict(candidate.features)
+                    features["_observe_only"] = True
+                    features["_observe_only_reason"] = "ME_CLOSE_LOCATION_RESEARCH_ONLY"
+                    observe_candidates.append(
+                        _me_replace(candidate, features=features)
+                    )
+                else:
+                    retained.append(candidate)
+            valid = retained
 
         # Attach research candidates to stats for caller access.
         # The caller (scanner_runner) reads stats["_research_candidates"]

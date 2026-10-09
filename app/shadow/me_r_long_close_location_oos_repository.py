@@ -55,6 +55,8 @@ class MERLongCLoOosRepository:
         rsi: float | None = None,
         atr: float | None = None,
         signal_version: str = "1.0.0",
+        decision_time: datetime | None = None,
+        signal_candle_open_time: datetime | None = None,
     ) -> MERLongCLoOosSaveResult:
         """Save a ME_R_LONG_CLOSE_LOCATION_OOS candidate to the database.
 
@@ -77,16 +79,18 @@ class MERLongCLoOosRepository:
                     open, high, low, close, volume,
                     close_location, close_location_threshold, filter_passed,
                     rsi, atr,
-                    signal_version
+                    signal_version,
+                    decision_time, signal_candle_open_time
                 ) VALUES (
                     'ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1', %s, '5m', 'LONG',
                     %s, %s,
                     %s, %s, %s, %s, %s,
                     %s, %s, %s,
                     %s, %s,
-                    %s
+                    %s,
+                    %s, %s
                 )
-                ON CONFLICT (experiment_id, symbol, signal_time) DO NOTHING
+                ON CONFLICT (experiment_id, signal_version, symbol, signal_time) DO NOTHING
                 RETURNING signal_id
                 """,
                 (
@@ -97,6 +101,8 @@ class MERLongCLoOosRepository:
                     close_location, close_location_threshold, filter_passed,
                     rsi, atr,
                     signal_version,
+                    decision_time,
+                    signal_candle_open_time,
                 ),
             )
             # fetchone BEFORE commit — pg8000 requires this
@@ -113,7 +119,7 @@ class MERLongCLoOosRepository:
             logger.exception("Failed to save ME_R_LONG_CL_OOS signal for %s", symbol)
             return MERLongCLoOosSaveResult(MERLongCLoOosSaveStatus.ERROR)
 
-    def signal_exists(self, symbol: str, signal_time: datetime) -> bool:
+    def signal_exists(self, symbol: str, signal_time: datetime, signal_version: str = '1.0.0') -> bool:
         """Check if a signal already exists for this symbol and time."""
         if not self._conn:
             return False
@@ -125,18 +131,14 @@ class MERLongCLoOosRepository:
             WHERE experiment_id = 'ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1'
               AND symbol = %s
               AND signal_time = %s
+              AND signal_version = %s
             """,
-            (symbol, signal_time),
+            (symbol, signal_time, signal_version),
         )
         return cursor.fetchone() is not None
 
     def get_eligible_signals(self, limit: int = 1000) -> list[dict]:
-        """Get signals that need evaluation of at least one horizon.
-
-        A signal is eligible when:
-        - It has no outcome row (brand new), OR
-        - It has an outcome row with at least one un-evaluated mature horizon
-        """
+        """Select only clean, mature ME Close Location signals."""
         if not self._conn:
             return []
 
@@ -144,30 +146,54 @@ class MERLongCLoOosRepository:
         cursor.execute(
             """
             SELECT
-                s.signal_id, s.symbol, s.signal_time, s.signal_price,
-                s.close_location, s.close_location_threshold, s.filter_passed,
+                s.signal_id,
+                s.symbol,
+                s.signal_time,
+                s.signal_price,
+                s.close_location,
+                s.close_location_threshold,
+                s.filter_passed,
                 o.signal_id AS outcome_id,
-                o.evaluated_15m_at, o.evaluated_30m_at, o.evaluated_60m_at,
-                o.evaluated_120m_at, o.evaluated_240m_at,
-                o.is_final
+                o.evaluated_15m_at,
+                o.evaluated_30m_at,
+                o.evaluated_60m_at,
+                o.evaluated_120m_at,
+                o.evaluated_240m_at,
+                o.is_final,
+                s.decision_time,
+                s.signal_version
             FROM dds.me_r_long_close_location_oos_signal s
-            LEFT JOIN dds.me_r_long_close_location_oos_outcome o ON o.signal_id = s.signal_id
-            WHERE s.experiment_id = 'ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1'
-              AND (
-                -- New signals: at least 15m old
-                (o.signal_id IS NULL AND s.signal_time <= now() - interval '15 minutes')
-                OR
-                -- Existing outcomes with incomplete mature horizons
-                (o.signal_id IS NOT NULL AND o.is_final = FALSE
-                 AND (
-                    (o.evaluated_15m_at IS NULL AND s.signal_time <= now() - interval '15 minutes')
-                    OR (o.evaluated_30m_at IS NULL AND s.signal_time <= now() - interval '30 minutes')
-                    OR (o.evaluated_60m_at IS NULL AND s.signal_time <= now() - interval '60 minutes')
-                    OR (o.evaluated_120m_at IS NULL AND s.signal_time <= now() - interval '120 minutes')
-                    OR (o.evaluated_240m_at IS NULL AND s.signal_time <= now() - interval '240 minutes')
-                 ))
-              )
-            ORDER BY s.signal_time ASC
+            LEFT JOIN dds.me_r_long_close_location_oos_outcome o
+                ON o.signal_id = s.signal_id
+            WHERE
+                s.experiment_id = 'ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1'
+                AND s.signal_version = '1.2.0'
+                AND s.decision_time IS NOT NULL
+                AND s.signal_candle_open_time IS NOT NULL
+                AND s.decision_time <= now() - interval '15 minutes'
+                AND (
+                    o.signal_id IS NULL
+                    OR (
+                        o.is_final = FALSE
+                        AND (
+                            (o.evaluated_15m_at IS NULL
+                             AND s.decision_time <= now() - interval '15 minutes')
+                            OR
+                            (o.evaluated_30m_at IS NULL
+                             AND s.decision_time <= now() - interval '30 minutes')
+                            OR
+                            (o.evaluated_60m_at IS NULL
+                             AND s.decision_time <= now() - interval '60 minutes')
+                            OR
+                            (o.evaluated_120m_at IS NULL
+                             AND s.decision_time <= now() - interval '120 minutes')
+                            OR
+                            (o.evaluated_240m_at IS NULL
+                             AND s.decision_time <= now() - interval '240 minutes')
+                        )
+                    )
+                )
+            ORDER BY s.decision_time DESC, s.signal_id DESC
             LIMIT %s
             """,
             (limit,),
@@ -190,6 +216,8 @@ class MERLongCLoOosRepository:
                 "evaluated_120m_at": r[11],
                 "evaluated_240m_at": r[12],
                 "is_final": r[13],
+                "decision_time": r[14],
+                "signal_version": r[15],
             }
             for r in rows
         ]
@@ -241,6 +269,24 @@ class MERLongCLoOosRepository:
         if not self._conn:
             return False
 
+        # Each supplied horizon must be complete and internally consistent.
+        horizon_values = {
+            15: (mfe_15m, mae_15m, mfe_15m_r, mae_15m_r, evaluated_15m_at),
+            30: (mfe_30m, mae_30m, mfe_30m_r, mae_30m_r, evaluated_30m_at),
+            60: (mfe_60m, mae_60m, mfe_60m_r, mae_60m_r, evaluated_60m_at),
+            120: (mfe_120m, mae_120m, mfe_120m_r, mae_120m_r, evaluated_120m_at),
+            240: (mfe_240m, mae_240m, mfe_240m_r, mae_240m_r, evaluated_240m_at),
+        }
+
+        for horizon, values in horizon_values.items():
+            supplied = sum(value is not None for value in values)
+            if supplied not in (0, 5):
+                logger.warning(
+                    "Rejecting incomplete %dm outcome for signal %d: %d/5 fields",
+                    horizon, signal_id, supplied,
+                )
+                return False
+
         # --- collect non-None columns ---
         all_pairs = [
             ("mfe_15m", mfe_15m), ("mae_15m", mae_15m), ("evaluated_15m_at", evaluated_15m_at),
@@ -265,7 +311,7 @@ class MERLongCLoOosRepository:
                 values.append(val)
 
         if not columns:
-            return True
+            return False
 
         # Build INSERT column list and placeholders
         insert_cols = ["signal_id", "experiment_id", "symbol"] + columns
@@ -275,7 +321,15 @@ class MERLongCLoOosRepository:
         ] + values
 
         # Build ON CONFLICT UPDATE clause using EXCLUDED.* for each column
-        update_clauses = [f"{col} = EXCLUDED.{col}" for col in columns]
+        # Preserve previously persisted outcomes under concurrent retries.
+        update_clauses = [
+            (
+                f"{col} = COALESCE("
+                f"me_r_long_close_location_oos_outcome.{col}, "
+                f"EXCLUDED.{col})"
+            )
+            for col in columns
+        ]
 
         # is_final: only write when caller passes True (prevent reset)
         if is_final:
@@ -297,6 +351,85 @@ class MERLongCLoOosRepository:
 
         cursor = self._conn.cursor()
         try:
+            # Serialize writers for the same signal, including the first
+            # outcome INSERT when no outcome row exists yet.
+            cursor.execute(
+                "SELECT signal_id FROM "
+                "dds.me_r_long_close_location_oos_signal "
+                "WHERE signal_id = %s FOR UPDATE",
+                (signal_id,),
+            )
+            if cursor.fetchone() is None:
+                self._conn.rollback()
+                return False
+
+            field_names = [
+                f"{name}_{h}m{suffix}"
+                for h in (15, 30, 60, 120, 240)
+                for name, suffix in (
+                    ("mfe", ""),
+                    ("mae", ""),
+                    ("mfe", "_r"),
+                    ("mae", "_r"),
+                )
+            ]
+            field_names += [
+                f"evaluated_{h}m_at"
+                for h in (15, 30, 60, 120, 240)
+            ]
+
+            cursor.execute(
+                "SELECT " + ", ".join(field_names) +
+                " FROM dds.me_r_long_close_location_oos_outcome "
+                "WHERE signal_id = %s FOR UPDATE",
+                (signal_id,),
+            )
+            existing_row = cursor.fetchone()
+            existing = (
+                dict(zip(field_names, existing_row))
+                if existing_row is not None else {}
+            )
+
+            supplied = dict(all_pairs)
+            resulting = {}
+
+            for horizon in (15, 30, 60, 120, 240):
+                keys = (
+                    f"mfe_{horizon}m",
+                    f"mae_{horizon}m",
+                    f"mfe_{horizon}m_r",
+                    f"mae_{horizon}m_r",
+                    f"evaluated_{horizon}m_at",
+                )
+
+                old_values = [existing.get(key) for key in keys]
+                old_count = sum(v is not None for v in old_values)
+
+                if old_count not in (0, 5):
+                    logger.warning(
+                        "Rejecting damaged %dm horizon for signal %d",
+                        horizon, signal_id,
+                    )
+                    self._conn.rollback()
+                    return False
+
+                new_values = [supplied.get(key) for key in keys]
+                new_count = sum(v is not None for v in new_values)
+
+                if new_count not in (0, 5):
+                    self._conn.rollback()
+                    return False
+
+                resulting[horizon] = old_count == 5 or new_count == 5
+
+            if is_final and not all(resulting.values()):
+                logger.warning(
+                    "Rejecting premature finalization for signal %d",
+                    signal_id,
+                )
+                self._conn.rollback()
+                return False
+
             cursor.execute(sql, insert_values)
             self._conn.commit()
             return True
@@ -306,40 +439,40 @@ class MERLongCLoOosRepository:
             return False
 
     def get_cohort_stats(self) -> list[dict]:
-        """Get ME_R_LONG_CLOSE_LOCATION_OOS cohort statistics."""
+        """Canonical clean v1.2.0 cohort, including INVALID records."""
         if not self._conn:
             return []
 
         cursor = self._conn.cursor()
-        cursor.execute(
-            """
+        cursor.execute("""
             SELECT
-                s.experiment_id,
-                COUNT(*) AS signals,
-                COUNT(*) FILTER (WHERE s.filter_passed = TRUE) AS pass_count,
-                COUNT(*) FILTER (WHERE s.filter_passed = FALSE) AS reject_count,
-                COUNT(o.signal_id) AS outcomes,
-                MIN(s.signal_time) AS first_signal,
-                MAX(s.signal_time) AS last_signal
-            FROM dds.me_r_long_close_location_oos_signal s
-            LEFT JOIN dds.me_r_long_close_location_oos_outcome o ON o.signal_id = s.signal_id
-            WHERE s.experiment_id = 'ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1'
-            GROUP BY s.experiment_id
-            """
-        )
-        rows = cursor.fetchall()
-        return [
-            {
-                "experiment_id": r[0],
-                "signals": r[1],
-                "pass_count": r[2],
-                "reject_count": r[3],
-                "outcomes": r[4],
-                "first_signal": r[5],
-                "last_signal": r[6],
-            }
-            for r in rows
-        ]
+                clean_base_n,
+                pass_n,
+                reject_n,
+                invalid_n,
+                first_signal,
+                last_signal,
+                accounting_integrity
+            FROM dds.v_me_r_cl_clean_cohort_v120
+        """)
+
+        row = cursor.fetchone()
+        if row is None:
+            return []
+
+        total, passed, rejected, invalid, first, last, integrity = row
+
+        return [{
+            "experiment_id": "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1",
+            "signal_version": "1.2.0",
+            "signals": total,
+            "pass_count": passed,
+            "reject_count": rejected,
+            "invalid_count": invalid,
+            "first_signal": first,
+            "last_signal": last,
+            "cohort_integrity": integrity,
+        }]
 
     def validate_filter_compliance(self) -> dict[str, Any]:
         """Validate that all signals comply with the filter rules.
