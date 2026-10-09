@@ -54,20 +54,45 @@ class MERLongCLoOosObserver:
         close_location_threshold = candidate.features.get("close_location_threshold", 0.70)
         filter_passed = candidate.features.get("close_location_passed", False)
 
-        # Extract signal candle OHLCV from features or candidate fields
-        # The OOS scanner doesn't store raw OHLCV in features,
-        # so we use reference_price as signal_price and entry_zone for range
-        signal_price = candidate.reference_price or candidate.entry_zone_high
+        # Strict clean observer contract: no proxy candle data.
+        features = candidate.features
 
-        # For now, use entry_zone as proxy for candle range
-        # In production, this should come from the actual candle data
-        open_price = candidate.entry_zone_low
-        high_price = candidate.entry_zone_high
-        low_price = candidate.invalidation_price
-        close_price = candidate.entry_zone_high  # Approximation
+        if features.get("oos_clean_observer_version") != "1.2.0":
+            logger.warning(
+                "ME_R_LONG_CL_OOS: skipping non-clean candidate %s",
+                candidate.symbol,
+            )
+            return
 
-        # Calculate candle range for volume proxy
-        volume = 1000.0  # Placeholder - not critical for OOS analysis
+        required = (
+            "oos_signal_open",
+            "oos_signal_high",
+            "oos_signal_low",
+            "oos_signal_close",
+            "oos_signal_volume",
+            "oos_signal_entry_price",
+            "oos_signal_candle_open_ms",
+        )
+
+        if any(features.get(key) is None for key in required):
+            logger.error(
+                "ME_R_LONG_CL_OOS: missing clean candle fields for %s",
+                candidate.symbol,
+            )
+            return
+
+        open_price = float(features["oos_signal_open"])
+        high_price = float(features["oos_signal_high"])
+        low_price = float(features["oos_signal_low"])
+        close_price = float(features["oos_signal_close"])
+        volume = float(features["oos_signal_volume"])
+        signal_price = float(features["oos_signal_entry_price"])
+
+        decision_time = candidate.detected_at
+        signal_candle_open_time = datetime.fromtimestamp(
+            int(features["oos_signal_candle_open_ms"]) / 1000,
+            tz=timezone.utc,
+        )
 
         # Extract indicators from features if available
         rsi = candidate.features.get("rsi")
@@ -98,6 +123,8 @@ class MERLongCLoOosObserver:
             rsi=rsi,
             atr=atr,
             signal_version=candidate.scanner_version or "1.0.0",
+            decision_time=decision_time,
+            signal_candle_open_time=signal_candle_open_time,
         )
 
         if result.status == MERLongCLoOosSaveStatus.INSERTED:

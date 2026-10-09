@@ -264,6 +264,8 @@ class ScannerOrchestrator:
                 c.scanner_name in self.HTF_KEYLEVEL_PROSPECTIVE_SCANNERS
                 or c.score >= 30
                 or c.features.get("_oos_rejected")
+                # ME research PASS must bypass generic score gate.
+                or c.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
                 or c.scanner_name in self.SHADOW_CONTROL_SCANNERS
                 or c.scanner_name in self.SCORE_BYPASS_SCANNERS
             ):
@@ -312,7 +314,15 @@ class ScannerOrchestrator:
                 decision = gate_policy.evaluate(
                     candidate.scanner_name, candidate.direction, candidate.market_regime or ctx.market_regime
                 )
-                if decision.allowed:
+                if candidate.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1":
+                    from dataclasses import replace as _me_replace
+                    me_features = dict(candidate.features)
+                    me_features["_observe_only"] = True
+                    me_features["_observe_only_reason"] = "ME_CLOSE_LOCATION_RESEARCH_ONLY"
+                    observe_candidates.append(
+                        _me_replace(candidate, features=me_features)
+                    )
+                elif decision.allowed:
                     gate_accepted.append(candidate)
                 elif candidate.features.get("_oos_rejected"):
                     # Treatment REJECT: persist as analytical record, not shadow
@@ -381,6 +391,22 @@ class ScannerOrchestrator:
                         decision.status,
                     )
             valid = gate_accepted + shadow_candidates
+
+        else:
+            # ME research-only even without direction gate.
+            from dataclasses import replace as _me_replace
+            retained = []
+            for candidate in valid:
+                if candidate.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1":
+                    features = dict(candidate.features)
+                    features["_observe_only"] = True
+                    features["_observe_only_reason"] = "ME_CLOSE_LOCATION_RESEARCH_ONLY"
+                    observe_candidates.append(
+                        _me_replace(candidate, features=features)
+                    )
+                else:
+                    retained.append(candidate)
+            valid = retained
 
         # Attach research candidates to stats for caller access.
         # The caller (scanner_runner) reads stats["_research_candidates"]

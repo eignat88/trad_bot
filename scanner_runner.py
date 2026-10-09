@@ -537,7 +537,10 @@ def run_scan_cycle(
                     # never READY_TO_TRADE.  Scanners set state=SETUP_READY by
                     # default which save_setup maps to READY_TO_TRADE; override
                     # that for shadow candidates so paper_runner never sees them.
-                    if c.features.get("_shadow_control"):
+                    if (
+                        c.features.get("_shadow_control")
+                        or c.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
+                    ):
                         from app.scanners.models import SetupState as _ShadowState
                         from dataclasses import replace as _shadow_replace
                         c = _shadow_replace(c, state=_ShadowState.DETECTED)
@@ -605,6 +608,14 @@ def run_scan_cycle(
                         repository.save_setup(obs_c, run_id=run_id)
                     except Exception:
                         logger.debug("observe-only setup save failed for %s", oc.scanner_name, exc_info=True)
+                    # Dedicated ME PASS/REJECT research capture.
+                    if oc.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1":
+                        try:
+                            _observe_me_r_long_cl_oos(repository, obs_c)
+                        except Exception:
+                            logger.exception(
+                                "ME close-location dedicated OOS capture failed"
+                            )
                     # Capture for prospective OOS
                     if prospective_obs is not None:
                         try:
