@@ -33,6 +33,7 @@ def test_clean_observer_persists_real_candle_and_timing():
             "oos_signal_volume": 1200.0,
             "oos_signal_entry_price": 100.0,
             "oos_signal_candle_open_ms": candle_open_ms,
+            "close_location_source_timestamp": "2026-10-09T13:30:00+00:00",
             "close_location": 0.25,
             "close_location_threshold": 0.70,
             "close_location_passed": False,

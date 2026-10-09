@@ -1,6 +1,7 @@
 """Real PostgreSQL integration test. Local ME isolation only."""
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from uuid import uuid4
 
 import pg8000.dbapi
@@ -44,9 +45,46 @@ def connect_isolated():
     return conn
 
 
+
+class NoCommitAdapter:
+    """Keep repository writes inside the test transaction."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def cursor(self):
+        return self.connection.cursor()
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        raise RuntimeError(
+            "Unexpected repository rollback in integration test"
+        )
+
+
 def test_me_repository_real_postgres():
     conn = connect_isolated()
-    repo = MERLongCLoOosRepository(conn)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SET LOCAL lock_timeout = '5s'")
+        cursor.execute("SET LOCAL statement_timeout = '60s'")
+
+        # Transactional application of migration 064.
+        # No COMMIT from migration file is executed.
+        migration = (
+            Path("sql/migrations/064_me_r_close_location_versioned_uniqueness.sql")
+            .read_text(encoding="utf-8")
+        )
+        body = migration.split("BEGIN;", 1)[1].rsplit("COMMIT;", 1)[0]
+        cursor.execute(body)
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+
+    repo = MERLongCLoOosRepository(NoCommitAdapter(conn))
 
     # Unique symbols avoid collisions with other test runs.
     suffix = uuid4().hex[:10].upper()
@@ -227,22 +265,8 @@ def test_me_repository_real_postgres():
         }
 
     finally:
-        # Delete only rows explicitly created by this test.
+        # Roll back migration 064, signals and outcomes together.
         try:
             conn.rollback()
-            if created_ids:
-                cursor = conn.cursor()
-                placeholders = ", ".join(["%s"] * len(created_ids))
-                cursor.execute(
-                    "DELETE FROM dds.me_r_long_close_location_oos_outcome "
-                    f"WHERE signal_id IN ({placeholders})",
-                    tuple(created_ids),
-                )
-                cursor.execute(
-                    "DELETE FROM dds.me_r_long_close_location_oos_signal "
-                    f"WHERE signal_id IN ({placeholders})",
-                    tuple(created_ids),
-                )
-                conn.commit()
         finally:
             conn.close()

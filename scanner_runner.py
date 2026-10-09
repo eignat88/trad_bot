@@ -6,6 +6,7 @@ Scans every 5 minutes, saves results to PostgreSQL, logs to file.
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import sys
 import time
@@ -349,7 +350,7 @@ def _get_me_r_long_cl_oos_observer(repository: ScannerRepository):
     return _me_r_long_cl_oos_observer
 
 
-def _observe_me_r_long_cl_oos(repository: ScannerRepository, candidate: SetupCandidate) -> None:
+def _observe_me_r_long_cl_oos(repository: ScannerRepository, candidate: SetupCandidate) -> str:
     """Record an ME_R_LONG_CLOSE_LOCATION_OOS candidate for OOS analysis.
 
     Called from the scanner runner for every candidate from the OOS scanner.
@@ -357,10 +358,33 @@ def _observe_me_r_long_cl_oos(repository: ScannerRepository, candidate: SetupCan
     This is a fire-and-forget observation — never blocks the signal.
     """
     from app.shadow.me_r_long_close_location_oos_repository import MERLongCLoOosRepository
-    from app.shadow.me_r_long_close_location_oos_runner import observe_oos_candidate
+    from app.shadow.me_r_long_close_location_oos_runner import (
+        MERLongCLoOosAck,
+        observe_oos_candidate,
+    )
 
     repo = MERLongCLoOosRepository(repository._conn)
-    observe_oos_candidate(repo, candidate)
+    ack = observe_oos_candidate(repo, candidate)
+
+    if ack in (
+        MERLongCLoOosAck.ERROR,
+        MERLongCLoOosAck.INVALID_SOURCE,
+    ):
+        logger.error(
+            "ME clean OOS capture not acknowledged: symbol=%s "
+            "scanner_version=%s ack=%s",
+            candidate.symbol,
+            candidate.scanner_version,
+            ack,
+        )
+    elif ack == MERLongCLoOosAck.SKIPPED_VERSION:
+        logger.warning(
+            "ME clean OOS capture skipped version: symbol=%s "
+            "scanner_version=%s",
+            candidate.symbol,
+            candidate.scanner_version,
+        )
+    return ack
 
 
 def _observe_htf_keylevel_point_b(repository: ScannerRepository, prospective_obs: ProspectiveOOSObserver | None, ctx, symbols: list[str]) -> None:
@@ -457,6 +481,7 @@ def run_scan_cycle(
     settings: Settings | None = None,
     expectancy_filter: ExpectancyFilter | None = None,
     prospective_obs: ProspectiveOOSObserver | None = None,
+    me_capture_spool: Any | None = None,
 ) -> tuple[int, int, int]:
     """Returns (total_found, scanned, failed)."""
     settings = settings or _load_runner_settings()
@@ -469,6 +494,60 @@ def run_scan_cycle(
                "setups_saved": 0, "errors_count": 0, "duration_ms": 0.0}
         for name in orchestrator.scanners
     }
+
+    # ME clean OOS research delivery is independent of new scanner signals.
+    # A previously captured observation survives a scanner restart.
+    if me_capture_spool is not None:
+        from app.shadow.me_r_close_location_capture_replay import (
+            replay_me_clean_capture,
+        )
+        from app.shadow.me_r_long_close_location_oos_repository import (
+            MERLongCLoOosRepository,
+        )
+
+        # Independent connection: ME research must never commit/rollback
+        # the scanner's main PostgreSQL transaction.
+        replay_conn = None
+        try:
+            import pg8000
+
+            connect_kwargs = {
+                "database": repository._database,
+                "user": repository._user,
+                "password": repository._password,
+            }
+
+            if repository._unix_sock:
+                connect_kwargs["unix_sock"] = repository._unix_sock
+            else:
+                connect_kwargs["host"] = repository._host
+                connect_kwargs["port"] = repository._port
+
+            replay_conn = pg8000.connect(**connect_kwargs)
+            replay_repo = MERLongCLoOosRepository(replay_conn)
+
+            replay_stats = replay_me_clean_capture(
+                me_capture_spool,
+                replay_repo,
+                limit=100,
+            )
+            logger.info(
+                "ME clean capture replay: %s",
+                replay_stats,
+            )
+        except Exception:
+            logger.exception(
+                "ME clean capture replay deferred: dedicated "
+                "PostgreSQL connection unavailable"
+            )
+        finally:
+            if replay_conn is not None:
+                try:
+                    replay_conn.close()
+                except Exception:
+                    logger.exception(
+                        "ME clean capture replay connection close failed"
+                    )
 
     if not symbols:
         return 0, 0, 0
@@ -544,6 +623,21 @@ def run_scan_cycle(
                         from app.scanners.models import SetupState as _ShadowState
                         from dataclasses import replace as _shadow_replace
                         c = _shadow_replace(c, state=_ShadowState.DETECTED)
+                    if (
+                        c.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
+                        and me_capture_spool is not None
+                    ):
+                        try:
+                            me_capture_spool.enqueue(c)
+                        except Exception:
+                            logger.critical(
+                                "ME CLEAN CAPTURE LOSS RISK: enqueue failed "
+                                "symbol=%s version=%s",
+                                c.symbol, c.scanner_version,
+                                exc_info=True,
+                            )
+                            failed += 1
+
                     repository.save_setup(c, run_id=run_id)
                     repository.save_event(
                         "SETUP_DETECTED", c.scanner_name, symbol,
@@ -566,10 +660,11 @@ def run_scan_cycle(
                     # ME_R_LONG_CLOSE_LOCATION_OOS: capture every OOS scanner candidate
                     # Both PASS and REJECT are saved for OOS analysis
                     if c.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1":
-                        try:
-                            _observe_me_r_long_cl_oos(repository, c)
-                        except Exception:
-                            logger.debug("ME_R_LONG_CL_OOS observation failed", exc_info=True)
+                        if me_capture_spool is None:
+                            try:
+                                _observe_me_r_long_cl_oos(repository, c)
+                            except Exception:
+                                logger.exception("ME direct OOS capture failed")
 
                     # Prospective OOS: capture for frozen experiments
                     # Fail-open: never blocks scanner cycle.
@@ -604,18 +699,34 @@ def run_scan_cycle(
                     from app.scanners.models import SetupState as _ObsState
                     from dataclasses import replace as _obs_replace
                     obs_c = _obs_replace(oc, state=_ObsState.DETECTED)
+                    if (
+                        obs_c.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
+                        and me_capture_spool is not None
+                    ):
+                        try:
+                            me_capture_spool.enqueue(obs_c)
+                        except Exception:
+                            logger.critical(
+                                "ME CLEAN CAPTURE LOSS RISK: enqueue failed "
+                                "symbol=%s version=%s",
+                                obs_c.symbol, obs_c.scanner_version,
+                                exc_info=True,
+                            )
+                            failed += 1
+
                     try:
                         repository.save_setup(obs_c, run_id=run_id)
                     except Exception:
                         logger.debug("observe-only setup save failed for %s", oc.scanner_name, exc_info=True)
                     # Dedicated ME PASS/REJECT research capture.
                     if oc.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1":
-                        try:
-                            _observe_me_r_long_cl_oos(repository, obs_c)
-                        except Exception:
-                            logger.exception(
-                                "ME close-location dedicated OOS capture failed"
-                            )
+                        if me_capture_spool is None:
+                            try:
+                                _observe_me_r_long_cl_oos(repository, obs_c)
+                            except Exception:
+                                logger.exception(
+                                    "ME close-location dedicated OOS capture failed"
+                                )
                     # Capture for prospective OOS
                     if prospective_obs is not None:
                         try:
@@ -881,6 +992,23 @@ def main() -> None:
         "ON" if expectancy_filter else "OFF",
     )
 
+    # Research-only durable capture. Disabled unless explicitly enabled.
+    me_capture_spool = None
+    if os.getenv("ME_CL_DURABLE_CAPTURE_ENABLED", "0") == "1":
+        from app.shadow.me_r_close_location_capture_spool import (
+            MECleanCaptureSpool,
+        )
+
+        spool_path = Path(
+            os.getenv(
+                "ME_CL_DURABLE_CAPTURE_PATH",
+                str(PROJECT_ROOT / "data" / "me_cl_clean_capture.sqlite3"),
+            )
+        )
+
+        me_capture_spool = MECleanCaptureSpool(spool_path)
+        logger.info("ME clean durable capture enabled: %s", spool_path)
+
     cycle = 0
     while not SHUTDOWN:
         # ------------------------------------------------------------------
@@ -943,6 +1071,7 @@ def main() -> None:
                 client, orchestrator, repository, symbols, run_id, settings,
                 expectancy_filter=expectancy_filter,
                 prospective_obs=prospective_obs,
+                me_capture_spool=me_capture_spool,
             )
 
             # -- SIGNAL_FUNNEL_DIAGNOSTICS_V1: flush counters to DB --
@@ -1013,6 +1142,16 @@ def main() -> None:
             if SHUTDOWN:
                 break
             time.sleep(1)
+
+    if me_capture_spool is not None:
+        try:
+            logger.info(
+                "ME clean capture final stats: %s",
+                me_capture_spool.stats(),
+            )
+            me_capture_spool.close()
+        except Exception:
+            logger.exception("ME clean capture spool close failed")
 
     repository.close()
     logger.info("scanner stopped")

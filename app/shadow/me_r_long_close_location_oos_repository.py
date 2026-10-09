@@ -90,7 +90,7 @@ class MERLongCLoOosRepository:
                     %s,
                     %s, %s
                 )
-                ON CONFLICT (experiment_id, symbol, signal_time) DO NOTHING
+                ON CONFLICT (experiment_id, signal_version, symbol, signal_time) DO NOTHING
                 RETURNING signal_id
                 """,
                 (
@@ -119,7 +119,7 @@ class MERLongCLoOosRepository:
             logger.exception("Failed to save ME_R_LONG_CL_OOS signal for %s", symbol)
             return MERLongCLoOosSaveResult(MERLongCLoOosSaveStatus.ERROR)
 
-    def signal_exists(self, symbol: str, signal_time: datetime) -> bool:
+    def signal_exists(self, symbol: str, signal_time: datetime, signal_version: str = '1.0.0') -> bool:
         """Check if a signal already exists for this symbol and time."""
         if not self._conn:
             return False
@@ -131,8 +131,9 @@ class MERLongCLoOosRepository:
             WHERE experiment_id = 'ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1'
               AND symbol = %s
               AND signal_time = %s
+              AND signal_version = %s
             """,
-            (symbol, signal_time),
+            (symbol, signal_time, signal_version),
         )
         return cursor.fetchone() is not None
 
@@ -438,40 +439,40 @@ class MERLongCLoOosRepository:
             return False
 
     def get_cohort_stats(self) -> list[dict]:
-        """Get ME_R_LONG_CLOSE_LOCATION_OOS cohort statistics."""
+        """Canonical clean v1.2.0 cohort, including INVALID records."""
         if not self._conn:
             return []
 
         cursor = self._conn.cursor()
-        cursor.execute(
-            """
+        cursor.execute("""
             SELECT
-                s.experiment_id,
-                COUNT(*) AS signals,
-                COUNT(*) FILTER (WHERE s.filter_passed = TRUE) AS pass_count,
-                COUNT(*) FILTER (WHERE s.filter_passed = FALSE) AS reject_count,
-                COUNT(o.signal_id) AS outcomes,
-                MIN(s.signal_time) AS first_signal,
-                MAX(s.signal_time) AS last_signal
-            FROM dds.me_r_long_close_location_oos_signal s
-            LEFT JOIN dds.me_r_long_close_location_oos_outcome o ON o.signal_id = s.signal_id
-            WHERE s.experiment_id = 'ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1'
-            GROUP BY s.experiment_id
-            """
-        )
-        rows = cursor.fetchall()
-        return [
-            {
-                "experiment_id": r[0],
-                "signals": r[1],
-                "pass_count": r[2],
-                "reject_count": r[3],
-                "outcomes": r[4],
-                "first_signal": r[5],
-                "last_signal": r[6],
-            }
-            for r in rows
-        ]
+                clean_base_n,
+                pass_n,
+                reject_n,
+                invalid_n,
+                first_signal,
+                last_signal,
+                accounting_integrity
+            FROM dds.v_me_r_cl_clean_cohort_v120
+        """)
+
+        row = cursor.fetchone()
+        if row is None:
+            return []
+
+        total, passed, rejected, invalid, first, last, integrity = row
+
+        return [{
+            "experiment_id": "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1",
+            "signal_version": "1.2.0",
+            "signals": total,
+            "pass_count": passed,
+            "reject_count": rejected,
+            "invalid_count": invalid,
+            "first_signal": first,
+            "last_signal": last,
+            "cohort_integrity": integrity,
+        }]
 
     def validate_filter_compliance(self) -> dict[str, Any]:
         """Validate that all signals comply with the filter rules.
