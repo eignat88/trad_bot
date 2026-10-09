@@ -219,7 +219,6 @@ def _get_research_observer(repository: ScannerRepository):
             from app.research.adapters.liquidity_sweep_choch import EXPERIMENT_CONFIG as LSCO_CONFIG
             from app.research.adapters.trend_pullback_v3 import EXPERIMENT_CONFIG as TPV3_CONFIG
             from app.research.adapters.momentum_exhaustion_reverse_long_v2 import EXPERIMENT_CONFIG as ME_RL_V2_CONFIG
-            from app.research.adapters.momentum_exhaustion_reverse_long_v1 import EXPERIMENT_CONFIG as ME_RL_V1_CONFIG
             from app.research.adapters.fvg_reaction_long import EXPERIMENT_CONFIG as FVG_CONFIG
 
             # Dedicated connection — never shares with production
@@ -242,7 +241,6 @@ def _get_research_observer(repository: ScannerRepository):
                 LSCO_CONFIG["scanner_name"]: LSCO_CONFIG,
                 TPV3_CONFIG["scanner_name"]: TPV3_CONFIG,
                 ME_RL_V2_CONFIG["scanner_name"]: ME_RL_V2_CONFIG,
-                ME_RL_V1_CONFIG["scanner_name"]: ME_RL_V1_CONFIG,
                 FVG_CONFIG["scanner_name"]: FVG_CONFIG,
             }
             _research_observer = ResearchObserver(research_repo, experiments)
