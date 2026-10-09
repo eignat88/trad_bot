@@ -33,6 +33,7 @@ def prepare_srr_short_writer(
     enable_writes: bool = False,
     activation_ts: Any = None,
     activation_mode: SrrShortWriterActivationMode | None = None,
+    connect_factory: Any = None,
 ) -> Iterator[Any]:
     """Prepare writer integration without allowing runtime activation.
 
@@ -86,6 +87,7 @@ def prepare_srr_short_writer(
             user=user,
             password=password,
             reader_conn=reader_conn,
+            connect_factory=connect_factory,
             activation_gate=gate,
         ) as writer:
             yield writer
