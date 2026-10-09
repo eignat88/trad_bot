@@ -1,0 +1,147 @@
+{
+  "task": "ME_RL_V1_ENTRY_GEOMETRY_COUNTERFACTUAL_CLOSURE_V1",
+  "date_utc": "2026-10-09T13:02:35.321442+00:00",
+  "experiment": "ME_RL_V1_GENERIC_V1",
+  "research_verdict": "NO_POSITIVE_EXECUTABLE_EDGE_DEMONSTRATED",
+  "closure_scope": "FROZEN_802_OFFLINE_DIAGNOSTIC",
+  "execution_verdict": "NOT_EXECUTION_VERIFIED",
+  "model_metrics": {
+    "V1_AS_RECORDED": {
+      "cohort_n": 802,
+      "finalized_n": 713,
+      "status_counts": {
+        "FINALIZED": 713,
+        "INVALID": 84,
+        "INCOMPLETE": 5
+      },
+      "net_e_r": -0.313385511924825,
+      "profit_factor": 0.29005406580952164,
+      "win_rate": 0.3394109396914446,
+      "exit_types": {
+        "TIMEOUT": 353,
+        "TP_FIRST": 161,
+        "SL_FIRST": 199
+      }
+    },
+    "V1_CLOSE_ANCHORED_CF": {
+      "cohort_n": 802,
+      "finalized_n": 797,
+      "status_counts": {
+        "FINALIZED": 797,
+        "INCOMPLETE": 5
+      },
+      "net_e_r": -0.1548104003271569,
+      "profit_factor": 0.6585692614271489,
+      "win_rate": 0.3751568381430364,
+      "exit_types": {
+        "TIMEOUT": 353,
+        "TP_FIRST": 186,
+        "SL_FIRST": 258
+      }
+    },
+    "V1_SOURCE_PRICE_ANCHORED_CF": {
+      "cohort_n": 802,
+      "finalized_n": 797,
+      "status_counts": {
+        "FINALIZED": 797,
+        "INCOMPLETE": 5
+      },
+      "net_e_r": -0.12539079522691468,
+      "profit_factor": 0.7138072841691163,
+      "win_rate": 0.39523212045169387,
+      "exit_types": {
+        "TIMEOUT": 355,
+        "TP_FIRST": 196,
+        "SL_FIRST": 246
+      }
+    }
+  },
+  "next_bar_open": {
+    "cohort_n": 802,
+    "finalized_n": 797,
+    "status_counts": {
+      "FINALIZED": 797,
+      "INCOMPLETE": 5
+    },
+    "net_e_r": -0.154810400327157,
+    "profit_factor": 0.6585692614271491,
+    "win_rate": 0.3751568381430364,
+    "exit_types": {
+      "TIMEOUT": 353,
+      "TP_FIRST": 186,
+      "SL_FIRST": 258
+    }
+  },
+  "statistics": {
+    "model_c_day_cluster_ci95": [
+      -0.2964299149180475,
+      0.018733771074251334
+    ],
+    "paired_c_minus_a_n": 713,
+    "paired_c_minus_a_mean_r": 0.18997196066084956,
+    "paired_c_minus_a_ci95": [
+      0.1382912599297989,
+      0.24967433953169443
+    ],
+    "paired_d_minus_c_n": 797,
+    "paired_d_minus_c_mean_r": -0.029419605100242316,
+    "paired_d_minus_c_ci95": [
+      -0.05896442235782899,
+      -0.002901199983226829
+    ],
+    "b_d_mismatches": 0,
+    "bootstrap": {
+      "unit": "UTC_SIGNAL_DAY",
+      "replications": 10000,
+      "seed": 20261009
+    }
+  },
+  "source_integrity": {
+    "candle_rows": 10426,
+    "complete_240m_paths": 797,
+    "incomplete_observation_ids": [
+      "30412",
+      "30419",
+      "30430",
+      "30435",
+      "30446"
+    ],
+    "source_range_mismatch_observation_id": "20839",
+    "source_range_mismatch_symbol": "XRPUSDT",
+    "original_signal_candle_identity": "UNAVAILABLE",
+    "historical_source_equivalence": "NOT_PROVABLE"
+  },
+  "limitations": [
+    "All models are diagnostic counterfactuals.",
+    "Next-bar open is a fill proxy, not an actual fill.",
+    "240m path starts after the signal's current 5m bucket.",
+    "Five XAGUSDT observations have incomplete candle paths.",
+    "One XRPUSDT source price lies slightly outside the candle range.",
+    "The 802 observations are historical and not an independent prospective OOS.",
+    "Bootstrap clusters by UTC day, not jointly by day and symbol.",
+    "MFE/MAE are not validated as to-exit excursion metrics.",
+    "A confidence interval including zero does not prove negative true expectancy."
+  ],
+  "decisions": {
+    "shadow_promotion_deploy": "BLOCKED",
+    "paper_live_execution": "NO_DEPLOY",
+    "production_database_modified": false,
+    "production_registry_modified": false,
+    "new_oos": "NOT_AUTHORIZED_FOR_UNCHANGED_V1_HYPOTHESIS",
+    "production_experiment_lifecycle": "UNCHANGED"
+  },
+  "sha256": {
+    "data/research/me_rl_v1_geometry/observations_802.csv": "500230a3a62b077db58df25d512254a0c4c68c54ea0e605b525f665281e3a0e2",
+    "data/research/me_rl_v1_geometry/bybit_5m_802.csv": "1b92b1a532ba4f389e7331df5df363697d418148f5273beca80c3ed7055e6be2",
+    "data/research/me_rl_v1_geometry/bybit_download_report.json": "e84808ae958f75ee8f5eac434f9b151bda949bcc93703bfd39e54a1555b9cf25",
+    "data/research/me_rl_v1_geometry/diagnostic_replay_outcomes.csv": "82b801f0ddebeee28d82593f162842167a93404a54ec7c1c2aeb41a8bfa0af8e",
+    "data/research/me_rl_v1_geometry/diagnostic_replay_summary.json": "13a30d488746ccadc3709a4d98e88ce547502ee37b99d930b3a5586e177f361d",
+    "data/research/me_rl_v1_geometry/execution_sensitivity_v1.csv": "1a963e6096b3a47d2600be44edaeedd67f2b33b3b1454056ee85b7848015a0a3",
+    "data/research/me_rl_v1_geometry/execution_sensitivity_v1.json": "ae9d5cf5f1942852bf263ebb6f8e36adbce60450c0c31c6a163dfcabf7d15a40",
+    "tools/research/me_rl_v1_entry_geometry_counterfactual_audit_v1.py": "c03d15e89b13b160ac01882b80b3fa8a4215dce889a7eeee2018ab8b8b494e97",
+    "tools/research/me_rl_v1_diagnostic_replay_runner.py": "09acb0de4089ed47ea4f31ba9c1ebc8414f70e452c210bbe6f803cb3da81cb64",
+    "tools/research/me_rl_v1_execution_sensitivity_v1.py": "288c6cc94657d678a9afebe2348422cba0cae0221df071cdb928623429db4f6c",
+    "tools/research/me_rl_v1_bybit_candle_download_v1.py": "9b72bff68653b5e00774d61289f48dfa1f1fd2364359a069368e8485692df0f7",
+    "tests/test_me_rl_v1_entry_geometry_counterfactual_audit_v1.py": "1b1cbae39f3d158c080a389626a173eb19b6f6bd1acb2f9e41868a3d4f83e1cf"
+  }
+}
