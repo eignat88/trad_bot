@@ -24,56 +24,92 @@ import time
 
 import pytest
 
+from tests.srr_postgres_test_safety import (
+    SrrPostgresTestSafetyError,
+    close_admin_connection,
+    load_srr_postgres_test_config,
+    open_admin_connection,
+    validate_disposable_database,
+    validate_server_identity,
+)
+
 pg8000 = pytest.importorskip("pg8000")
 
 ENABLE = "SRR_PERSISTENCE_POSTGRES_IT"
-ACTIVATION_DB = "trad_bot_srr_activation_it_20261008"
 
 SRR_EXPERIMENT_ID = "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1"
 BOUNDARY_VERSION = "SRR_SHORT_WRITER_ACTIVATION_BOUNDARY_V1"
 ACTIVATION_TS = "2026-10-08T12:00:00Z"
 
 
+def _config():
+    return load_srr_postgres_test_config()
+
+
 def _connect(dbname: str, autocommit: bool = False):
-    if os.getenv("TEST_DB_HOST", "127.0.0.1") != "127.0.0.1":
-        pytest.fail("STOP: TEST_DB_HOST must be 127.0.0.1")
+    config = _config()
+    if dbname not in {config.database, config.activation_database, "postgres"}:
+        raise SrrPostgresTestSafetyError(f"STOP: unexpected test database {dbname!r}")
     conn = pg8000.connect(
-        host="127.0.0.1",
-        port=5432,
+        host=config.host,
+        port=config.port,
         database=dbname,
-        user="postgres",
+        user=config.user,
         timeout=5,
     )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT current_database(), current_setting('server_version'), "
+                "inet_server_addr(), inet_server_port()"
+            )
+            database, version, address, port = cur.fetchone()
+            validate_server_identity(
+                config,
+                {
+                    "current_database": database,
+                    "server_version": version,
+                    "inet_server_addr": address,
+                    "inet_server_port": port,
+                },
+            )
+    except Exception:
+        conn.close()
+        raise
     conn.autocommit = autocommit
     return conn
 
 
 def _ensure_activation_db():
-    admin = _connect("postgres", autocommit=True)
+    config = _config()
+    validate_disposable_database(config.activation_database)
+    admin = open_admin_connection(config, pg8000.connect)
     try:
         with admin.cursor() as cur:
             cur.execute(
                 "SELECT 1 FROM pg_database WHERE datname = %s",
-                (ACTIVATION_DB,),
+                (config.activation_database,),
             )
             if cur.fetchone() is None:
-                cur.execute(f'CREATE DATABASE "{ACTIVATION_DB}"')
+                cur.execute(f'CREATE DATABASE "{config.activation_database}"')
     finally:
-        admin.close()
+        close_admin_connection(admin)
 
 
 def _drop_activation_db():
-    admin = _connect("postgres", autocommit=True)
+    config = _config()
+    validate_disposable_database(config.activation_database)
+    admin = open_admin_connection(config, pg8000.connect)
     try:
         with admin.cursor() as cur:
             cur.execute(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
                 "WHERE datname = %s AND pid <> pg_backend_pid()",
-                (ACTIVATION_DB,),
+                (config.activation_database,),
             )
-            cur.execute(f'DROP DATABASE IF EXISTS "{ACTIVATION_DB}"')
+            cur.execute(f'DROP DATABASE IF EXISTS "{config.activation_database}"')
     finally:
-        admin.close()
+        close_admin_connection(admin)
 
 
 def _apply_bootstrap():
@@ -82,7 +118,7 @@ def _apply_bootstrap():
     )
     with open(path, "r", encoding="utf-8") as fh:
         sql = fh.read()
-    conn = _connect(ACTIVATION_DB, autocommit=True)
+    conn = _connect(_config().activation_database, autocommit=True)
     try:
         with conn.cursor() as cur:
             cur.execute(sql)
@@ -91,6 +127,7 @@ def _apply_bootstrap():
 
 
 def _apply_migration(migration_num: str):
+    config = _config()
     path = os.path.join(
         os.path.dirname(__file__), "..", "sql", "migrations",
         f"{migration_num}_srr_short_execution_outcome_persistence.sql"
@@ -99,7 +136,7 @@ def _apply_migration(migration_num: str):
     )
     with open(path, "r", encoding="utf-8") as fh:
         sql = fh.read()
-    conn = _connect(ACTIVATION_DB, autocommit=True)
+    conn = _connect(config.activation_database, autocommit=True)
     try:
         with conn.cursor() as cur:
             cur.execute(sql)
@@ -204,12 +241,12 @@ def it_db():
     _apply_migration("061")
     _apply_migration("062")
 
-    setup = _connect(ACTIVATION_DB)
+    setup = _connect(_config().activation_database)
     _seed_observation(setup, 1001)
     _seed_activation(setup, "ACTIVE")
     setup.close()
 
-    yield ACTIVATION_DB
+    yield _config().activation_database
 
     _drop_activation_db()
 

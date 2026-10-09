@@ -49,6 +49,17 @@ def open_srr_outcome_writer(
                 "SRR writer must own an independent PostgreSQL connection"
             )
 
+        try:
+            conn.autocommit = False
+        except Exception as exc:
+            raise RuntimeError(
+                "SRR writer connection must explicitly use transactional mode"
+            ) from exc
+        if getattr(conn, "autocommit", False):
+            raise RuntimeError(
+                "SRR writer connection must explicitly use transactional mode"
+            )
+
         yield SrrOutcomeWriter(conn, activation_gate=activation_gate)
 
     finally:

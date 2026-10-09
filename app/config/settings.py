@@ -50,6 +50,20 @@ class ExecutionPolicyConfig:
 
 
 @dataclass(frozen=True)
+class SrrShortWriterSettings:
+    """Strictly scoped runtime controls for the SRR SHORT outcome writer.
+
+    Configuration is only an explicit runtime intent signal. It never
+    authorizes persistence by itself: the PostgreSQL activation record remains
+    authoritative and is verified inside every writer transaction.
+    """
+
+    enabled: bool = False
+    activation_ts: str = ""
+    approval_reference: str = ""
+
+
+@dataclass(frozen=True)
 class ExperimentalScannerConfig:
     """Configuration for an experimental shadow/counterfactual scanner.
 
@@ -236,6 +250,9 @@ class Settings:
     # Experimental scanners configuration (shadow/counterfactual strategies).
     # Key structure: { scanner_name: ExperimentalScannerConfig }
     experimental_scanners: dict[str, ExperimentalScannerConfig] = field(default_factory=dict, repr=False)
+    # SRR SHORT writer runtime configuration. Scoped to one experiment only
+    # and disabled by default; activation_mode is never sourced from config.
+    srr_short_writer: SrrShortWriterSettings = field(default_factory=SrrShortWriterSettings)
     analytics_schedule_time: str = "06:00"
     analytics_timezone: str = "Europe/Sofia"
     analytics_post_exit_hours: int = 4
@@ -323,6 +340,125 @@ def _load_execution_policies(settings: Settings, raw: dict) -> None:
 
     # Use object.__setattr__ because Settings is a frozen dataclass
     object.__setattr__(settings, "execution_policy_configs", parsed)
+
+
+def _validate_srr_activation_ts_precision(activation_ts: str) -> None:
+    """Reject timestamp precision that PostgreSQL cannot round-trip exactly.
+
+    PostgreSQL ``timestamptz`` stores at most six fractional-second digits.
+    The runtime parser deliberately preserves longer ISO fractions, so the
+    configuration layer must reject seven to nine digits rather than round or
+    truncate them. Zero through six digits remain valid and are checked
+    against the canonical UTC representation by the caller.
+    """
+    import re
+
+    fraction = re.search(r"\.\d+", activation_ts)
+    if fraction and len(fraction.group(0)) - 1 > 6:
+        raise ValueError(
+            "SRR_SHORT_WRITER_ACTIVATION_TS fractional seconds must not "
+            "exceed PostgreSQL microsecond precision: "
+            f"{activation_ts!r}"
+        )
+
+
+def _load_srr_short_writer(settings: Settings, raw: dict) -> None:
+    """Load strictly scoped SRR SHORT writer runtime controls.
+
+    The environment is authoritative when present. An unset or explicitly
+    false flag keeps the writer disabled without requiring a timestamp or
+    approval reference. Any invalid enabled flag fails closed. Enabling the
+    flag requires both an explicit timestamp and approval reference; neither
+    value is inferred or defaulted.
+    """
+    raw_config = raw.get("srr_short_writer", {})
+    if raw_config is None:
+        raw_config = {}
+    if not isinstance(raw_config, dict):
+        raise ValueError(
+            "srr_short_writer must be an object with enabled, activation_ts, "
+            "and approval_reference fields"
+        )
+
+    enabled_raw = os.getenv("SRR_SHORT_WRITER_ENABLED")
+    if enabled_raw is None:
+        enabled_raw = raw_config.get("enabled", False)
+        if isinstance(enabled_raw, bool):
+            enabled = enabled_raw
+        elif isinstance(enabled_raw, str):
+            enabled = _parse_bool_env(enabled_raw, "SRR_SHORT_WRITER_ENABLED")
+        else:
+            raise ValueError(
+                "srr_short_writer.enabled must be a boolean or "
+                "true/1/yes/on/false/0/no/off string"
+            )
+    else:
+        enabled = _parse_bool_env(enabled_raw, "SRR_SHORT_WRITER_ENABLED")
+
+    activation_ts = str(
+        os.getenv(
+            "SRR_SHORT_WRITER_ACTIVATION_TS",
+            raw_config.get("activation_ts", ""),
+        )
+    ).strip()
+    approval_reference = str(
+        os.getenv(
+            "SRR_SHORT_WRITER_APPROVAL_REFERENCE",
+            raw_config.get("approval_reference", ""),
+        )
+    ).strip()
+
+    if not enabled:
+        object.__setattr__(
+            settings,
+            "srr_short_writer",
+            SrrShortWriterSettings(
+                enabled=False,
+                activation_ts=activation_ts,
+                approval_reference=approval_reference,
+            ),
+        )
+        return
+
+    if not activation_ts:
+        raise ValueError(
+            "SRR_SHORT_WRITER_ENABLED=true requires "
+            "SRR_SHORT_WRITER_ACTIVATION_TS"
+        )
+    if not approval_reference:
+        raise ValueError(
+            "SRR_SHORT_WRITER_ENABLED=true requires "
+            "SRR_SHORT_WRITER_APPROVAL_REFERENCE"
+        )
+
+    # Validate timestamp shape and strict UTC precision before runtime wiring.
+    # This does not authorize writes; the persisted ACTIVE record remains
+    # authoritative and must exactly match this value.
+    _validate_srr_activation_ts_precision(activation_ts)
+    from app.research.srr_short_writer_activation_boundary_v1 import (
+        normalize_activation_ts,
+    )
+    _, canonical_ts = normalize_activation_ts(activation_ts)
+    # Zero fractional digits is valid PostgreSQL input; normalize emits a
+    # uniform six-digit form. Accept that exact instant and store the
+    # PostgreSQL-native canonical representation.
+    if canonical_ts != activation_ts and not (
+        activation_ts.endswith("Z") and "." not in activation_ts
+    ):
+        raise ValueError(
+            "SRR_SHORT_WRITER_ACTIVATION_TS must be the canonical UTC value "
+            f"{canonical_ts!r}; got {activation_ts!r}"
+        )
+
+    object.__setattr__(
+        settings,
+        "srr_short_writer",
+        SrrShortWriterSettings(
+            enabled=True,
+            activation_ts=canonical_ts,
+            approval_reference=approval_reference,
+        ),
+    )
 
 
 def _load_experimental_scanners(settings: Settings, raw: dict) -> None:
@@ -465,6 +601,8 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
     _load_execution_policies(settings, raw)
     # Load experimental scanners from config
     _load_experimental_scanners(settings, raw)
+    # Load strictly scoped SRR writer controls
+    _load_srr_short_writer(settings, raw)
     if settings.category != "linear":
         raise ValueError("Price/OI strategy requires category=linear")
     if settings.trading_mode not in {"paper", "live"}:

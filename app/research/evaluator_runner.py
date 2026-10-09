@@ -73,7 +73,11 @@ def main() -> None:
     research_repo = ResearchRepository(db_repo._conn)
     from contextlib import ExitStack
     from app.research.srr_short_runtime_wiring import prepare_srr_short_writer
+    from app.research.srr_short_writer_activation_boundary_v1 import (
+        SrrShortWriterActivationMode,
+    )
 
+    srr_writer_cfg = settings.srr_short_writer
     with ExitStack() as srr_writer_stack:
         srr_writer = srr_writer_stack.enter_context(
             prepare_srr_short_writer(
@@ -83,15 +87,21 @@ def main() -> None:
                 database=settings.db_name,
                 user=settings.db_user,
                 password=settings.db_password,
-                enable_writes=False,
+                enable_writes=srr_writer_cfg.enabled,
+                activation_ts=srr_writer_cfg.activation_ts or None,
+                activation_mode=SrrShortWriterActivationMode(
+                    enabled=srr_writer_cfg.enabled
+                ),
             )
         )
-        assert srr_writer is None, "SRR runtime writer unexpectedly enabled"
 
+        # Only the SRR-specific evaluator can leave dry-run mode. All other
+        # prospective experiments remain on the unchanged observe-only path.
         srr_eval = SrrShortExecutionRExpansionProspectiveEvaluator(
             conn=db_repo._conn,
             candle_source=BybitHistoricalCandleSource(client),
-            dry_run=True,
+            dry_run=not srr_writer_cfg.enabled,
+            write_outcomes=srr_writer.write if srr_writer is not None else None,
         )
 
         prospective_eval = ProspectiveOOSEvaluator(

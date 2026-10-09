@@ -8,6 +8,12 @@ from uuid import uuid4
 import pytest
 
 from app.research.srr_short_execution_outcome_persistence import SrrOutcomeWriter
+from tests.srr_postgres_test_safety import (
+    SRR_TEST_ACTIVATION_TS,
+    load_srr_postgres_test_config,
+    seed_test_activation_record,
+    validate_server_identity,
+)
 from tests.test_srr_short_execution_outcome_persistence_v1 import (
     EXP_ID,
     observation,
@@ -16,7 +22,6 @@ from tests.test_srr_short_execution_outcome_persistence_v1 import (
     make_activation_gate,
 )
 
-DB = "trad_bot_srr_persistence_it_20261008"
 ENABLE = "SRR_PERSISTENCE_POSTGRES_IT"
 
 
@@ -26,30 +31,48 @@ def connect():
         pytest.skip(f"Set {ENABLE}=1 to run isolated PostgreSQL integration tests")
 
     psycopg = pytest.importorskip("psycopg")
-
-    if os.getenv("TEST_DB_HOST", "127.0.0.1") != "127.0.0.1":
-        pytest.fail("STOP: TEST_DB_HOST must be 127.0.0.1")
-    if os.getenv("TEST_DB_NAME", DB) != DB:
-        pytest.fail("STOP: unexpected TEST_DB_NAME")
+    config = load_srr_postgres_test_config()
+    seed_conn = psycopg.connect(
+        host=config.host,
+        port=config.port,
+        dbname=config.database,
+        user=config.user,
+        connect_timeout=5,
+    )
+    try:
+        seed_test_activation_record(
+            seed_conn,
+            signal_times=(observation()["signal_time"],),
+            config=config,
+        )
+    finally:
+        seed_conn.close()
 
     def make_connection():
         conn = psycopg.connect(
-            host="127.0.0.1",
-            port=5432,
-            dbname=DB,
-            user="postgres",
+            host=config.host,
+            port=config.port,
+            dbname=config.database,
+            user=config.user,
             connect_timeout=5,
         )
 
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT current_database(), inet_server_addr(), inet_server_port()"
+                "SELECT current_database(), current_setting('server_version'), "
+                "inet_server_addr(), inet_server_port()"
             )
-            name, address, port = cur.fetchone()
+            name, version, address, port = cur.fetchone()
 
-            if name != DB or str(address) != "127.0.0.1" or port != 5432:
-                conn.close()
-                raise RuntimeError("STOP: PostgreSQL safety boundary failed")
+            validate_server_identity(
+                config,
+                {
+                    "current_database": name,
+                    "server_version": version,
+                    "inet_server_addr": address,
+                    "inet_server_port": port,
+                },
+            )
 
             cur.execute(
                 "SELECT to_regclass("
@@ -58,6 +81,13 @@ def connect():
             if cur.fetchone()[0] is None:
                 conn.close()
                 raise RuntimeError("STOP: migration 061 not installed")
+            cur.execute(
+                "SELECT to_regclass("
+                "'research.srr_short_writer_activation')"
+            )
+            if cur.fetchone()[0] is None:
+                conn.close()
+                raise RuntimeError("STOP: migration 062 not installed")
 
         conn.commit()
         return conn
@@ -71,11 +101,24 @@ def create_observation(connect):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO research.prospective_experiment (experiment_id)
-                VALUES (%s) ON CONFLICT DO NOTHING
+                SELECT scanner_name, direction, status, started_at
+                FROM research.prospective_experiment
+                WHERE experiment_id = %s
                 """,
                 (EXP_ID,),
             )
+            registration = cur.fetchone()
+            if registration != (
+                "SUPPORT_RESISTANCE_REACTION",
+                "SHORT",
+                "READY_TO_START",
+                None,
+            ):
+                raise RuntimeError(
+                    "STOP: unexpected SRR SHORT experiment registration: "
+                    f"{registration!r}"
+                )
+
             cur.execute(
                 """
                 INSERT INTO research.prospective_observation
