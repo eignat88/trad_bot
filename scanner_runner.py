@@ -336,6 +336,64 @@ def _get_prospective_observer(repository: ScannerRepository):
     return _prospective_observer
 
 
+# --- ME Early MAE V2 independent research capture -----------------------
+
+_me_early_mae_v2_pipeline = None
+_me_early_mae_v2_conn = None
+
+
+def _get_me_early_mae_v2_pipeline(repository: ScannerRepository):
+    """Opt-in research capture; never uses the scanner DB transaction."""
+    import os
+
+    if os.environ.get("ME_EARLY_MAE_V2_CAPTURE_ENABLED") != "1":
+        return None
+
+    # A capture flag alone must never activate an unfrozen experiment.
+    if os.environ.get("ME_EARLY_MAE_V2_FREEZE_APPROVED") != "1":
+        logger.warning(
+            "ME Early MAE V2 capture refused: protocol freeze not approved"
+        )
+        return None
+
+    global _me_early_mae_v2_pipeline, _me_early_mae_v2_conn
+
+    if _me_early_mae_v2_pipeline is not None:
+        return _me_early_mae_v2_pipeline
+
+    conn = None
+    try:
+        import pg8000
+        from app.research.me_r_long_early_mae_v2.pipeline import (
+            MeEarlyMaeV2Pipeline,
+        )
+
+        conn = pg8000.connect(
+            host=repository._host,
+            port=repository._port,
+            database=repository._database,
+            user=repository._user,
+            password=repository._password,
+        )
+        pipeline = MeEarlyMaeV2Pipeline(conn)
+        pipeline.initialize()
+
+        _me_early_mae_v2_conn = conn
+        _me_early_mae_v2_pipeline = pipeline
+
+        logger.info("ME Early MAE V2 research capture initialized")
+        return pipeline
+
+    except Exception:
+        logger.exception("ME Early MAE V2 capture initialization failed")
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                logger.debug("ME Early MAE V2 connection close failed", exc_info=True)
+        return None
+
+
 # --- ME_R_LONG_CLOSE_LOCATION_OOS Experiment ------------------------------
 
 _me_r_long_cl_oos_observer = None
@@ -481,6 +539,7 @@ def run_scan_cycle(
     settings: Settings | None = None,
     expectancy_filter: ExpectancyFilter | None = None,
     prospective_obs: ProspectiveOOSObserver | None = None,
+    me_early_mae_v2_pipeline: Any = None,
     me_capture_spool: Any | None = None,
 ) -> tuple[int, int, int]:
     """Returns (total_found, scanned, failed)."""
@@ -747,6 +806,24 @@ def run_scan_cycle(
                         except Exception:
                             logger.debug("observe-only prospective observation failed for %s", oc.scanner_name, exc_info=True)
 
+                # Independent ME Early MAE V2 prospective capture.
+                # Candidates were selected before direction/expectancy gates.
+                # No setup state or paper routing is modified.
+                if me_early_mae_v2_pipeline is not None:
+                    for me_candidate in symbol_stats.get(
+                        "_me_early_mae_v2_candidates", []
+                    ):
+                        try:
+                            me_early_mae_v2_pipeline.capture_candidate(
+                                me_candidate
+                            )
+                        except Exception:
+                            logger.exception(
+                                "ME Early MAE V2 capture failed: symbol=%s setup_id=%s",
+                                me_candidate.symbol,
+                                me_candidate.setup_id,
+                            )
+
                 # SRR LONG Research: capture every SRR LONG candidate for
                 # research outcome tracking (independent of paper trading).
                 research_candidates = symbol_stats.get("_research_candidates", [])
@@ -955,6 +1032,8 @@ def main() -> None:
     if prospective_obs is not None:
         logger.info("prospective OOS observer enabled: experiments=%s", list(prospective_obs._registry.keys()))
 
+    me_early_mae_v2_pipeline = _get_me_early_mae_v2_pipeline(repository)
+
     orchestrator = ScannerOrchestrator(repository=repository, research_observer=research_obs)
 
     # Sync scanner direction gates to config.scanner_direction_gate (canonical source)
@@ -1071,6 +1150,7 @@ def main() -> None:
                 client, orchestrator, repository, symbols, run_id, settings,
                 expectancy_filter=expectancy_filter,
                 prospective_obs=prospective_obs,
+                me_early_mae_v2_pipeline=me_early_mae_v2_pipeline,
                 me_capture_spool=me_capture_spool,
             )
 
