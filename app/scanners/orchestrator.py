@@ -320,6 +320,12 @@ class ScannerOrchestrator:
                     candidate.score, candidate.setup_id,
                 )
 
+        research_me_early_mae_v2_candidates = [
+            candidate for candidate in valid
+            if candidate.scanner_name == "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1"
+            and candidate.direction == "LONG"
+        ]
+
         # Direction gates are independent of expectancy.  Candidates were still
         # generated/scored above, so blocked strategies remain observable.
         # Shadow/control scanners: their blocked candidates are saved with a
@@ -387,7 +393,10 @@ class ScannerOrchestrator:
                     shadow_features = dict(candidate.features)
                     shadow_features["_shadow_control"] = True
                     shadow_features["_shadow_control_reason"] = "oos_experiment_baseline"
-                    shadow_candidates.append(replace(candidate, features=shadow_features))
+                    shadow_state = candidate.state
+                    if candidate.scanner_name == 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V1' and candidate.direction == 'LONG':
+                        shadow_state = type(candidate.state)['DETECTED']
+                    shadow_candidates.append(replace(candidate, features=shadow_features, state=shadow_state))
                     # Note: V1 shadow control doesn't have close_location
                     # because it's the baseline scanner without the OOS filter.
                     # close_location is only computed by the OOS scanner.
@@ -442,6 +451,15 @@ class ScannerOrchestrator:
                 else:
                     retained.append(candidate)
             valid = retained
+
+        # Independent ME Early MAE V2 research cohort.
+        # Capture after dedup/geometry/score, before paper direction gating
+        # by retaining references to the original pre-gate valid candidates.
+        # This collection is never routed to paper or SRR research capture.
+        stats["_me_early_mae_v2_candidates"] = [
+            candidate
+            for candidate in research_me_early_mae_v2_candidates
+        ]
 
         # Attach research candidates to stats for caller access.
         # The caller (scanner_runner) reads stats["_research_candidates"]
