@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS research_me_early_mae_v2.source_event (
     scanner_version        TEXT NOT NULL,
     direction              TEXT NOT NULL,
     detected_at            TIMESTAMPTZ NOT NULL,
+    source_available_at   TIMESTAMPTZ,
     signal_candle_open_at  TIMESTAMPTZ NOT NULL,
     entry_zone_low         NUMERIC NOT NULL,
     entry_zone_high        NUMERIC NOT NULL,

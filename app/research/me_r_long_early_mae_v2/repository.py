@@ -511,6 +511,25 @@ class MeEarlyMaeV2Repository:
                     )
 
             self._conn.commit()
+
+            # Publish only after source and seven variants are committed.
+            cursor = self._cursor()
+            try:
+                cursor.execute(
+                    f"""
+                    UPDATE {SOURCE_SCHEMA}.source_event
+                    SET source_available_at = clock_timestamp()
+                    WHERE source_event_id = %s
+                      AND protocol_version = %s
+                      AND source_available_at IS NULL
+                    """,
+                    (source_id, PROTOCOL_VERSION),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
             return source_id
 
         except Exception:
@@ -915,7 +934,8 @@ class MeEarlyMaeV2Repository:
                    detected_at, signal_candle_open_at, entry_zone_low,
                    entry_zone_high, invalidation_price, target_price,
                    source_status, eligibility, entry_filled_at, entry_price,
-                   virtual_stop_price, virtual_target_price, source_features
+                   virtual_stop_price, virtual_target_price, source_features,
+                   source_available_at
             FROM {SOURCE_SCHEMA}.source_event
             WHERE protocol_version = %(protocol_version)s
               AND source_status IN ('DETECTED', 'ENTRY_PENDING', 'ENTRY_FILLED')
@@ -943,6 +963,7 @@ class MeEarlyMaeV2Repository:
                 "virtual_stop_price": float(row[14]) if row[14] is not None else None,
                 "virtual_target_price": float(row[15]) if row[15] is not None else None,
                 "features": row[16] if isinstance(row[16], dict) else {},
+                "source_available_at": row[17],
             }
             for row in rows
         ]

@@ -51,7 +51,7 @@ logger = logging.getLogger("paper_runner")
 # Paper-entry routing only. Scanner and research/OOS continue to receive the
 # canonical signal, while similarly named research/production variants remain
 # independently routable.
-PAPER_DISABLED_SCANNERS: frozenset[str] = frozenset({"MOMENTUM_EXHAUSTION"})
+PAPER_DISABLED_SCANNERS: frozenset[str] = frozenset({"MOMENTUM_EXHAUSTION", "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1"})
 
 
 def setup_logging() -> None:

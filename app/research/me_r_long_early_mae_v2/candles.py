@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,8 @@ def validate_window(
     for candle in candles:
         if candle.close_at <= start or candle.open_at >= end:
             continue
+        if candle.close_at - candle.open_at != timedelta(minutes=5):
+            return [], "INVALID_CANDLE_DURATION"
         if candle.close_at > end or candle.open_at < start:
             return [], "WINDOW_BOUNDARY_CROSSES_ENTRY"
         key = candle.open_at

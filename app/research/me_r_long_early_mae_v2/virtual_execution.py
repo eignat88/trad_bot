@@ -27,13 +27,17 @@ def evaluate_virtual_fill(
 ) -> VirtualFill | None:
     """Create a deterministic virtual fill from completed candles only."""
     detected_at = source["detected_at"]
+    available_at = source.get("source_available_at")
+    if available_at is None:
+        return None
+
     expiry_at = detected_at + timedelta(minutes=ENTRY_EXPIRY_MINUTES)
-    if asof < expiry_at:
+    if available_at >= expiry_at or asof < expiry_at:
         return None
 
     eligible_candles = [
         candle for candle in candles
-        if candle.open_at >= detected_at
+        if candle.open_at >= available_at
         and candle.close_at <= asof
         and candle.close_at <= expiry_at
         and candle.close_at > candle.open_at
@@ -43,14 +47,14 @@ def evaluate_virtual_fill(
         eligible_candles,
         float(source["entry_zone_low"]),
         float(source["entry_zone_high"]),
-        detected_at,
+        available_at,
     )
     if touched is None or touched.close_at > expiry_at:
         return None
 
     complete, _ = check_entry_coverage(
         eligible_candles,
-        detected_at,
+        available_at,
         touched.close_at,
         asof,
     )
@@ -64,7 +68,7 @@ def evaluate_virtual_fill(
         return None
 
     return VirtualFill(
-        entry_available_at=detected_at,
+        entry_available_at=available_at,
         entry_at=touched.close_at,
         entry_price=entry_price,
         stop_price=stop_price,

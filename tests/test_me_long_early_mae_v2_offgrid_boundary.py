@@ -1,4 +1,4 @@
-﻿"""Off-grid detection boundary tests for Early MAE V2."""
+"""Off-grid detection boundary tests for Early MAE V2."""
 
 from datetime import timedelta
 
@@ -9,7 +9,11 @@ from app.research.me_r_long_early_mae_v2.virtual_execution import evaluate_virtu
 
 def test_detection_inside_candle_skips_partial_candle():
     detected = BASE + timedelta(minutes=2)
-    source = make_source(detected_at=detected)
+    source = make_source(
+        detected_at=detected,
+        source_available_at=detected,
+        entry_observable_at=detected,
+    )
 
     candles = [
         candle(0, 100.2, 99.9),

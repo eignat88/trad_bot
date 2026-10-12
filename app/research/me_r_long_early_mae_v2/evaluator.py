@@ -46,6 +46,9 @@ class MeEarlyMaeV2Evaluator:
         stats: dict[str, int],
     ) -> None:
         source_id = int(source["source_event_id"])
+        if source.get("source_available_at") is None:
+            stats["unpublished_sources"] = stats.get("unpublished_sources", 0) + 1
+            return
         if source["source_status"] in {"DETECTED", "ENTRY_PENDING"}:
             self._attempt_fill(source, now, stats)
             return
@@ -149,17 +152,23 @@ class MeEarlyMaeV2Evaluator:
     ) -> None:
         source_id = int(source["source_event_id"])
         detected_at = parse_utc(source["detected_at"])
+        available_at = parse_utc(source["source_available_at"])
         expiry_at = detected_at + timedelta(minutes=ENTRY_EXPIRY_MINUTES)
         if now < expiry_at:
             return
+        if available_at >= expiry_at:
+            self.repository.mark_source_not_filled(
+                source_id, "SOURCE_AVAILABLE_AFTER_EXPIRY",
+            )
+            return
 
         candles = self.repository.fetch_candles(
-            int(source["instrument_id"]), detected_at, now,
+            int(source["instrument_id"]), available_at, now,
         )
         fill = evaluate_virtual_fill(source, candles, now)
         if fill is None:
             complete, reason = check_entry_coverage(
-                candles, detected_at, expiry_at, now,
+                candles, available_at, expiry_at, now,
             )
             if not complete:
                 stats["incomplete_entry_coverage"] = (

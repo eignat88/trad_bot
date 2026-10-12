@@ -54,12 +54,25 @@ class MeEarlyMaeV2SourceAdapter:
             self._rejected += 1
             return None
 
+        from datetime import timedelta
+
+        if candidate.entry_timeframe != '5m':
+            self._rejected += 1
+            return None
+
+        signal_open_at = self._from_ms(candidate.signal_candle_open_time)
+        signal_close_at = signal_open_at + timedelta(minutes=5)
+
+        if signal_close_at > candidate.detected_at:
+            self._rejected += 1
+            return None
+
         source = {
             "source_setup_id": candidate.setup_id,
             "instrument_id": self.repository.ensure_instrument(candidate.symbol),
             "symbol": candidate.symbol,
             "detected_at": candidate.detected_at,
-            "signal_candle_open_at": self._from_ms(candidate.signal_candle_open_time),
+            "signal_candle_open_at": signal_open_at,
             "entry_zone_low": candidate.entry_zone_low,
             "entry_zone_high": candidate.entry_zone_high,
             "reference_price": candidate.reference_price,

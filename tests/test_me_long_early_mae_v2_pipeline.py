@@ -80,7 +80,7 @@ class TestSourceCapture:
             scanner_version="1.0.0",
             direction="LONG",
             detected_at=TEST_ACTIVATION_AT + timedelta(minutes=1),
-            signal_candle_open_time=1791643200000,
+            signal_candle_open_time=int((TEST_ACTIVATION_AT - timedelta(minutes=5)).timestamp() * 1000),
             entry_zone_low=99.8,
             entry_zone_high=100.1,
             reference_price=100.0,
@@ -212,6 +212,13 @@ class FakeRepository:
     def load_pending_sources(self):
         return [self.source] if self.source else []
 
+    def mark_entry_observable(self, source_event_id):
+        assert self.source["source_event_id"] == source_event_id
+        assert self.source["source_available_at"] is not None
+        if self.source.get("entry_observable_at") is None:
+            self.source["entry_observable_at"] = self.source["source_available_at"]
+        return self.source["entry_observable_at"]
+
     def fetch_candles(self, instrument_id, start, end):
         return self.candles
 
@@ -249,6 +256,8 @@ def make_source(**changes):
         "instrument_id": 1,
         "symbol": "BTCUSDT",
         "detected_at": BASE,
+        "source_available_at": BASE,
+        "entry_observable_at": BASE,
         "entry_zone_low": 99.8,
         "entry_zone_high": 100.1,
         "invalidation_price": 97.5,
