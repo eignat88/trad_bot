@@ -6,6 +6,7 @@ gates or production exit handlers.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -18,8 +19,23 @@ SOURCE_SCHEMA = "research_me_early_mae_v2"
 
 # Operator approval is required for both immutable boundaries. Both remain
 # intentionally unset until a reviewed freeze decision assigns UTC values.
-FROZEN_AT: datetime | None = None
-ACTIVATION_AT: datetime | None = None
+def _read_utc_boundary(name: str) -> datetime | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RuntimeError(f"ME V2 INVALID_UTC_BOUNDARY: {name}") from exc
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise RuntimeError(f"ME V2 INVALID_UTC_BOUNDARY: {name}")
+    if value.utcoffset().total_seconds() != 0:
+        raise RuntimeError(f"ME V2 NON_UTC_BOUNDARY: {name}")
+    return value.astimezone(timezone.utc)
+
+
+FROZEN_AT: datetime | None = _read_utc_boundary("ME_EARLY_MAE_V2_FROZEN_AT")
+ACTIVATION_AT: datetime | None = _read_utc_boundary("ME_EARLY_MAE_V2_ACTIVATION_AT")
 
 ENTRY_EXPIRY_MINUTES = 240
 BASELINE_MAX_HOLD_MINUTES = 240
@@ -183,7 +199,10 @@ def protocol_payload(
     }
 
 
-PROTOCOL_FINGERPRINT: str | None = None
+PROTOCOL_FINGERPRINT: str | None = (
+    os.environ.get("ME_EARLY_MAE_V2_PROTOCOL_FINGERPRINT", "").strip().lower()
+    or None
+)
 
 
 def _iso_utc(value: datetime) -> str:
@@ -196,4 +215,18 @@ def require_protocol_fingerprint(
     activation_at: datetime | None = None,
 ) -> str:
     """Fail closed unless an approved protocol can produce a SHA256."""
-    return calculate_protocol_fingerprint(protocol_payload(frozen_at, activation_at))
+    import hmac
+
+    calculated = calculate_protocol_fingerprint(
+        protocol_payload(frozen_at, activation_at)
+    )
+    approved = PROTOCOL_FINGERPRINT
+
+    if approved is None:
+        raise RuntimeError("ME V2 FINGERPRINT_NOT_APPROVED")
+    if len(approved) != 64 or any(c not in "0123456789abcdef" for c in approved):
+        raise RuntimeError("ME V2 FINGERPRINT_INVALID")
+    if not hmac.compare_digest(calculated, approved):
+        raise RuntimeError("ME V2 FINGERPRINT_MISMATCH")
+
+    return calculated

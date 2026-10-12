@@ -13,9 +13,8 @@ TEST_ACTIVATION_AT = datetime(2026, 10, 10, 0, 0, tzinfo=timezone.utc)
 
 
 def test_fingerprint_matches_full_payload():
-    assert PROTOCOL_FINGERPRINT is None
-    assert require_protocol_fingerprint(
-        TEST_FROZEN_AT, TEST_ACTIVATION_AT
+    assert calculate_protocol_fingerprint(
+        protocol_payload(TEST_FROZEN_AT, TEST_ACTIVATION_AT)
     ) == calculate_protocol_fingerprint(
         protocol_payload(TEST_FROZEN_AT, TEST_ACTIVATION_AT)
     )

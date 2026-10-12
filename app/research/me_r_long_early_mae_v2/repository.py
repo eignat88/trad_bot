@@ -104,7 +104,7 @@ class MeEarlyMaeV2Repository:
         )
         cursor = self._cursor()
         payload = protocol_payload(FROZEN_AT, ACTIVATION_AT)
-        fingerprint = calculate_protocol_fingerprint(payload)
+        fingerprint = require_protocol_fingerprint(FROZEN_AT, ACTIVATION_AT)
 
         try:
             cursor.execute(
