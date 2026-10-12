@@ -1,0 +1,20 @@
+[Unit]
+Description=trad_bot ME Early MAE V2 research evaluator
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trad_bot
+EnvironmentFile=/opt/trad_bot/.env
+ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.me_r_long_early_mae_v2.runner --interval-seconds 300
+Restart=on-failure
+RestartSec=30
+User=tradbot
+Group=tradbot
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trad-bot-me-mae-v2-evaluator
+
+[Install]
+WantedBy=multi-user.target
