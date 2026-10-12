@@ -1,0 +1,128 @@
+{
+  "experiment": "ME_RL_V2_EXHAUSTION_FILTER_EXECUTION_REASSESSMENT_V1",
+  "source_experiment": "ME_RL_V2_GENERIC_V1",
+  "research_only": true,
+  "historical_not_prospective": true,
+  "source_n": 318,
+  "full_windows_after_finalization_filter": 130,
+  "exclusion_counts": {
+    "COVERAGE_NO_CLOSED_CANDLES": 109,
+    "COVERAGE_INCOMPLETE_WINDOW_START": 66,
+    "COVERAGE_INCOMPLETE_WINDOW_END": 10,
+    "NOT_FINALIZED": 3
+  },
+  "costs": {
+    "fee_per_side": 0.00055,
+    "slippage_normal_per_side": 0.0005,
+    "slippage_elevated_per_side": 0.001
+  },
+  "limitations": [
+    "Historical selection, not clean prospective OOS",
+    "No proof of real next-open fill availability",
+    "Full 240m coverage selection can bias the cohort",
+    "No confidence intervals or cluster-robust uncertainty yet",
+    "Backfill of missing historical candles not performed"
+  ],
+  "models": {
+    "A_SIGNAL_REFERENCE": {
+      "CONTROL": {
+        "n": 130,
+        "symbols": 36,
+        "days": 15,
+        "gross_e_r": 0.002386,
+        "net_e_r_normal": -0.081616,
+        "net_e_r_elevated": -0.121618,
+        "net_pf_normal": 0.775687,
+        "total_net_r_normal": -10.61014,
+        "win_rate_net": 0.4,
+        "exit_reasons": {
+          "STOP_LOSS": 31,
+          "FIXED_HORIZON": 71,
+          "TAKE_PROFIT": 28
+        }
+      },
+      "PASS": {
+        "n": 105,
+        "symbols": 30,
+        "days": 14,
+        "gross_e_r": -0.09917,
+        "net_e_r_normal": -0.183066,
+        "net_e_r_elevated": -0.223017,
+        "net_pf_normal": 0.495177,
+        "total_net_r_normal": -19.221943,
+        "win_rate_net": 0.342857,
+        "exit_reasons": {
+          "STOP_LOSS": 23,
+          "FIXED_HORIZON": 70,
+          "TAKE_PROFIT": 12
+        }
+      },
+      "REJECT": {
+        "n": 25,
+        "symbols": 17,
+        "days": 11,
+        "gross_e_r": 0.428922,
+        "net_e_r_normal": 0.344472,
+        "net_e_r_elevated": 0.304258,
+        "net_pf_normal": 1.933626,
+        "total_net_r_normal": 8.611802,
+        "win_rate_net": 0.64,
+        "exit_reasons": {
+          "FIXED_HORIZON": 1,
+          "STOP_LOSS": 8,
+          "TAKE_PROFIT": 16
+        }
+      }
+    },
+    "B_NEXT_OPEN": {
+      "CONTROL": {
+        "n": 130,
+        "symbols": 36,
+        "days": 15,
+        "gross_e_r": -0.009528,
+        "net_e_r_normal": -0.094309,
+        "net_e_r_elevated": -0.134681,
+        "net_pf_normal": 0.743097,
+        "total_net_r_normal": -12.26017,
+        "win_rate_net": 0.376923,
+        "exit_reasons": {
+          "STOP_LOSS": 31,
+          "FIXED_HORIZON": 71,
+          "TAKE_PROFIT": 28
+        }
+      },
+      "PASS": {
+        "n": 105,
+        "symbols": 30,
+        "days": 14,
+        "gross_e_r": -0.094397,
+        "net_e_r_normal": -0.179305,
+        "net_e_r_elevated": -0.219737,
+        "net_pf_normal": 0.510239,
+        "total_net_r_normal": -18.827009,
+        "win_rate_net": 0.314286,
+        "exit_reasons": {
+          "STOP_LOSS": 23,
+          "FIXED_HORIZON": 70,
+          "TAKE_PROFIT": 12
+        }
+      },
+      "REJECT": {
+        "n": 25,
+        "symbols": 17,
+        "days": 11,
+        "gross_e_r": 0.346918,
+        "net_e_r_normal": 0.262674,
+        "net_e_r_elevated": 0.222557,
+        "net_pf_normal": 1.707495,
+        "total_net_r_normal": 6.566839,
+        "win_rate_net": 0.64,
+        "exit_reasons": {
+          "FIXED_HORIZON": 1,
+          "STOP_LOSS": 8,
+          "TAKE_PROFIT": 16
+        }
+      }
+    }
+  }
+}
