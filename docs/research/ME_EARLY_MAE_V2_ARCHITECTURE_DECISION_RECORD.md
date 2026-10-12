@@ -47,3 +47,21 @@ The pipeline is research-only. It must not be deployed with any change to:
 - direction gates;
 - paper/live engines;
 - production balances or risk controls.
+
+## B03 publication boundary and execution limitation
+
+- `source_available_at` is written only after the transaction registering
+  the source and all seven variants has committed successfully.
+- The field is immutable on idempotent replay (`IS NULL` update guard).
+- Virtual entry eligibility uses completed 5m candles whose opening
+  timestamps are not earlier than this database-availability boundary.
+- This boundary establishes that the source was durably available in
+  PostgreSQL. It does not prove the evaluator actually observed the source
+  at that instant.
+- Consequently the research is a database-available prospective
+  counterfactual, not verified real-time execution or paper/live fills.
+- The capture pipeline remains disabled pending a separately approved
+  protocol freeze and activation.
+- `PAPER_DISABLED_SCANNERS` blocks the exact scanner name
+  `MOMENTUM_EXHAUSTION_REVERSE_LONG_V1` across directions; this is broader
+  than a LONG-only direction gate.
