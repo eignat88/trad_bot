@@ -222,7 +222,7 @@ class TestMERLongCloseLocationOOSValidation:
     def test_scanner_version(self):
         """Scanner must have correct version."""
         scanner = MERLongCloseLocationOOSValidationV1Scanner()
-        assert scanner.version == "1.0.0"
+        assert scanner.version == "1.2.0"
 
     def test_scanner_uses_base_scanner(self):
         """Scanner must delegate to frozen V1 base scanner."""
@@ -1132,11 +1132,44 @@ class TestTreatmentIdentity:
         last.open = mid + 0.02
         last.close = mid - 0.02
 
+        # Deterministic, exchange-aligned candles for clean ASOF.
+        from datetime import timedelta
+
+        asof = datetime(2026, 10, 9, 14, 0, tzinfo=timezone.utc)
+
+        start_5m = asof - timedelta(minutes=5 * len(candles_5m))
+        for i, candle in enumerate(candles_5m):
+            candle.timestamp = start_5m + timedelta(minutes=5 * i)
+
+        candles_15m = make_candles_15m(prices_15m)
+        start_15m = asof - timedelta(minutes=15 * len(candles_15m))
+        for i, candle in enumerate(candles_15m):
+            candle.timestamp = start_15m + timedelta(minutes=15 * i)
+
+        # Rising 1h history with pullbacks: RSI is derived from
+        # closed candles, never injected through ctx.indicators.
+        prices_1h = [
+            base + i * 30.0 - (15.0 if i % 5 == 0 else 0.0)
+            for i in range(40)
+        ]
+        candles_1h = make_candles_15m(prices_1h)
+        start_1h = asof - timedelta(hours=len(candles_1h))
+        for i, candle in enumerate(candles_1h):
+            candle.timestamp = start_1h + timedelta(hours=i)
+
         ctx = MockMarketContext(
-            candles_15m=make_candles_15m(prices_15m),
+            evaluated_at=asof,
+            candles_15m=candles_15m,
             candles_5m=candles_5m,
+            candles_1h=candles_1h,
             indicators=MockIndicators(rsi=70.0, atr=base * 0.01),
         )
+
+        from app.scanners.me_r_close_location_asof_context import (
+            build_me_clean_asof_context,
+        )
+        clean = build_me_clean_asof_context(ctx)
+        assert clean is not None
 
         candidates, stats = orch.scan_all_with_stats(ctx, gate_policy=gate_policy)
 
@@ -1146,9 +1179,19 @@ class TestTreatmentIdentity:
         assert shadow[0].scanner_name == "MOMENTUM_EXHAUSTION_REVERSE_LONG_V1"
         assert shadow[0].features["_shadow_control"] is True
 
-        # TREATMENT: REJECT from OOS scanner
-        treatment = [c for c in candidates if c.features.get("_oos_rejected")]
-        assert len(treatment) > 0, "TREATMENT REJECT candidate missing"
+        # TREATMENT REJECT must remain observable but non-tradeable.
+        observed = stats.get("_observe_candidates", [])
+        treatment = [
+            c for c in observed
+            if c.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
+            and c.features.get("_oos_rejected")
+        ]
+        assert len(treatment) > 0, "TREATMENT REJECT observation missing"
+        assert all(
+            c.scanner_name != "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
+            for c in candidates
+        ), "ME research candidate leaked into tradeable candidates"
+        assert treatment[0].features.get("_observe_only") is True
         assert treatment[0].scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
         assert treatment[0].features["_oos_rejected"] is True
         assert treatment[0].state == SetupState.EXPIRED

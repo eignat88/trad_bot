@@ -10,6 +10,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.exchange.bybit_client import BybitClient
+from app.shadow.me_r_close_location_historical_source import (
+    CANDLE_MS,
+    fetch_historical_5m,
+)
 from app.shadow.me_r_long_close_location_oos_repository import MERLongCLoOosRepository
 
 logger = logging.getLogger(__name__)
@@ -18,6 +22,11 @@ EXPERIMENT_ID = "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
 
 # Evaluation horizons in minutes
 HORIZONS = [15, 30, 60, 120, 240]
+
+
+def _utc_now() -> datetime:
+    """Current UTC time, independently mockable in tests."""
+    return datetime.now(timezone.utc)
 
 
 class MERLongCLoOosEvaluator:
@@ -32,163 +41,110 @@ class MERLongCLoOosEvaluator:
         self.client = client
 
     def evaluate_pending(self, limit: int = 100) -> dict[str, int]:
-        """Evaluate pending signals and return stats.
-
-        Returns dict with:
-        - checked: number of eligible signals checked
-        - updated: number of signals with at least one horizon updated
-        - errors: number of signals that failed evaluation
-        """
+        """Evaluate clean prospective signals only."""
         eligible = self.repo.get_eligible_signals(limit=limit)
         stats = {"checked": 0, "updated": 0, "errors": 0}
 
         for signal in eligible:
             stats["checked"] += 1
             try:
-                self._evaluate_signal(signal)
-                stats["updated"] += 1
+                saved = self._evaluate_signal(signal)
+                if saved is True:
+                    stats["updated"] += 1
             except Exception:
                 stats["errors"] += 1
                 logger.exception(
-                    "Failed to evaluate signal %d for %s",
-                    signal["signal_id"], signal["symbol"],
+                    "ME Close Location evaluation failed: signal_id=%s symbol=%s",
+                    signal["signal_id"],
+                    signal["symbol"],
                 )
 
         return stats
 
-    def _evaluate_signal(self, signal: dict) -> None:
-        """Evaluate a single signal across all horizons."""
-        signal_id = signal["signal_id"]
-        symbol = signal["symbol"]
-        signal_time = signal["signal_time"]
-        signal_price = signal["signal_price"]
-        outcome_id = signal["outcome_id"]
+    def _evaluate_signal(self, signal: dict) -> bool:
+        """Calculate only fully covered, closed-candle horizons."""
+        if signal.get("signal_version") != "1.2.0":
+            return False
 
-        # Fetch candles for evaluation
-        candles = self.client.get_klines(symbol, "5", 500)
-        if not candles:
-            logger.warning("No candles available for %s", symbol)
-            return
+        decision_time = signal.get("decision_time")
+        if not isinstance(decision_time, datetime):
+            return False
 
-        # Convert signal_time to milliseconds for comparison
-        if isinstance(signal_time, datetime):
-            signal_time_ms = int(signal_time.timestamp() * 1000)
-        else:
-            signal_time_ms = signal_time
+        if decision_time.tzinfo is None:
+            raise ValueError("Naive decision_time")
 
-        # Calculate risk (distance to invalidation)
-        # For LONG: risk = entry - invalidation
-        # We'll use a default 2.5% risk for now
+        signal_price = float(signal["signal_price"])
+        if not 0 < signal_price < float("inf"):
+            raise ValueError("Invalid signal_price")
+
+        decision_ms = int(decision_time.timestamp() * 1000)
+        asof = _utc_now()
+        asof_ms = int(asof.timestamp() * 1000)
         risk = signal_price * 0.025
 
-        # Evaluate each horizon
+        # Only whole candles beginning at or after the decision.
+        first_open = (
+            (decision_ms + CANDLE_MS - 1) // CANDLE_MS
+        ) * CANDLE_MS
+
         outcome_data = {}
+        evaluated_horizons = []
+
         for horizon in HORIZONS:
-            horizon_ms = horizon * 60 * 1000
-            horizon_time_ms = signal_time_ms + horizon_ms
+            field = f"evaluated_{horizon}m_at"
 
-            # Find the candle at or after horizon time
-            horizon_candle = None
-            for candle in candles:
-                if candle.timestamp >= horizon_time_ms:
-                    horizon_candle = candle
-                    break
-
-            if horizon_candle is None:
-                # Horizon not yet reached
+            # Never recompute a previously evaluated horizon.
+            if signal.get(field) is not None:
                 continue
 
-            # Calculate MFE and MAE from signal_time to horizon_time
-            # Get all candles in the interval
-            interval_candles = [
-                c for c in candles
-                if signal_time_ms <= c.timestamp <= horizon_time_ms
-            ]
+            horizon_end_ms = decision_ms + horizon * 60_000
 
-            if not interval_candles:
+            if horizon_end_ms > asof_ms:
                 continue
 
-            # For LONG: MFE = max high - entry, MAE = entry - min low
-            highs = [c.high for c in interval_candles]
-            lows = [c.low for c in interval_candles]
+            # Last candle must close by horizon_end_ms.
+            last_open = (
+                (horizon_end_ms - CANDLE_MS) // CANDLE_MS
+            ) * CANDLE_MS
 
-            max_high = max(highs)
-            min_low = min(lows)
+            if last_open < first_open:
+                continue
 
-            mfe = max_high - signal_price
-            mae = signal_price - min_low
+            window = fetch_historical_5m(
+                self.client,
+                signal["symbol"],
+                first_open,
+                last_open,
+                asof_ms=asof_ms,
+            )
 
-            # Convert to R units
-            mfe_r = mfe / risk if risk > 0 else 0
-            mae_r = mae / risk if risk > 0 else 0
+            highs = [float(c.high) for c in window.candles]
+            lows = [float(c.low) for c in window.candles]
 
-            # Store horizon data
+            mfe = max(highs) - signal_price
+            mae = signal_price - min(lows)
+
             outcome_data[f"mfe_{horizon}m"] = mfe
             outcome_data[f"mae_{horizon}m"] = mae
-            outcome_data[f"mfe_{horizon}m_r"] = mfe_r
-            outcome_data[f"mae_{horizon}m_r"] = mae_r
-            outcome_data[f"evaluated_{horizon}m_at"] = datetime.now(timezone.utc)
+            outcome_data[f"mfe_{horizon}m_r"] = mfe / risk
+            outcome_data[f"mae_{horizon}m_r"] = mae / risk
+            outcome_data[field] = asof
+            evaluated_horizons.append(horizon)
 
-        # Determine target hits
-        hit_0_5r = False
-        hit_1r = False
-        hit_1_5r = False
-        hit_2r = False
+        if not evaluated_horizons:
+            return False
 
-        # Check if any horizon reached the targets
-        for horizon in HORIZONS:
-            mfe_r = outcome_data.get(f"mfe_{horizon}m_r", 0)
-            if mfe_r >= 0.5:
-                hit_0_5r = True
-            if mfe_r >= 1.0:
-                hit_1r = True
-            if mfe_r >= 1.5:
-                hit_1_5r = True
-            if mfe_r >= 2.0:
-                hit_2r = True
+        if 240 in evaluated_horizons:
+            # Hit flags are final-path statistics, not interim values.
+            final_mfe_r = outcome_data["mfe_240m_r"]
+            outcome_data["hit_0_5r"] = final_mfe_r >= 0.5
+            outcome_data["hit_1r"] = final_mfe_r >= 1.0
+            outcome_data["hit_1_5r"] = final_mfe_r >= 1.5
+            outcome_data["hit_2r"] = final_mfe_r >= 2.0
 
-        # Determine if this is the final evaluation (240m horizon)
-        is_final = outcome_data.get("evaluated_240m_at") is not None
-
-        # Save outcome
-        self.repo.save_outcome_partial(
-            signal_id=signal_id,
-            symbol=symbol,
-            mfe_15m=outcome_data.get("mfe_15m"),
-            mae_15m=outcome_data.get("mae_15m"),
-            evaluated_15m_at=outcome_data.get("evaluated_15m_at"),
-            mfe_30m=outcome_data.get("mfe_30m"),
-            mae_30m=outcome_data.get("mae_30m"),
-            evaluated_30m_at=outcome_data.get("evaluated_30m_at"),
-            mfe_60m=outcome_data.get("mfe_60m"),
-            mae_60m=outcome_data.get("mae_60m"),
-            evaluated_60m_at=outcome_data.get("evaluated_60m_at"),
-            mfe_120m=outcome_data.get("mfe_120m"),
-            mae_120m=outcome_data.get("mae_120m"),
-            evaluated_120m_at=outcome_data.get("evaluated_120m_at"),
-            mfe_240m=outcome_data.get("mfe_240m"),
-            mae_240m=outcome_data.get("mae_240m"),
-            evaluated_240m_at=outcome_data.get("evaluated_240m_at"),
-            mfe_15m_r=outcome_data.get("mfe_15m_r"),
-            mae_15m_r=outcome_data.get("mae_15m_r"),
-            mfe_30m_r=outcome_data.get("mfe_30m_r"),
-            mae_30m_r=outcome_data.get("mae_30m_r"),
-            mfe_60m_r=outcome_data.get("mfe_60m_r"),
-            mae_60m_r=outcome_data.get("mae_60m_r"),
-            mfe_120m_r=outcome_data.get("mfe_120m_r"),
-            mae_120m_r=outcome_data.get("mae_120m_r"),
-            mfe_240m_r=outcome_data.get("mfe_240m_r"),
-            mae_240m_r=outcome_data.get("mae_240m_r"),
-            hit_0_5r=hit_0_5r,
-            hit_1r=hit_1r,
-            hit_1_5r=hit_1_5r,
-            hit_2r=hit_2r,
-            is_final=is_final,
-        )
-
-        logger.debug(
-            "Evaluated signal %d for %s: MFE_60m=%.4f MAE_60m=%.4f",
-            signal_id, symbol,
-            outcome_data.get("mfe_60m", 0),
-            outcome_data.get("mae_60m", 0),
+        return self.repo.save_outcome_partial(
+            signal_id=signal["signal_id"],
+            symbol=signal["symbol"],
+            is_final=(240 in evaluated_horizons),
+            **outcome_data,
         )

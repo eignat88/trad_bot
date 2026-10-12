@@ -14,7 +14,8 @@ No backfill of historical observations.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.scanners.me_r_long_close_location_oos_validation import (
@@ -31,6 +32,14 @@ logger = logging.getLogger(__name__)
 EXPERIMENT_ID = "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
 
 
+class MERLongCLoOosAck:
+    INSERTED = "INSERTED"
+    DUPLICATE = "DUPLICATE"
+    ERROR = "ERROR"
+    INVALID_SOURCE = "INVALID_SOURCE"
+    SKIPPED_VERSION = "SKIPPED_VERSION"
+
+
 class MERLongCLoOosObserver:
     """Observer for ME_R_LONG_CLOSE_LOCATION_OOS signals.
 
@@ -43,8 +52,10 @@ class MERLongCLoOosObserver:
         self._inserted = 0
         self._duplicates = 0
         self._errors = 0
+        self._invalid_source = 0
+        self._skipped_version = 0
 
-    def observe(self, candidate: SetupCandidate) -> None:
+    def observe(self, candidate: SetupCandidate) -> str:
         """Observe a single candidate and persist if new.
 
         Both PASS and REJECT candidates are saved for OOS analysis.
@@ -54,34 +65,111 @@ class MERLongCLoOosObserver:
         close_location_threshold = candidate.features.get("close_location_threshold", 0.70)
         filter_passed = candidate.features.get("close_location_passed", False)
 
-        # Extract signal candle OHLCV from features or candidate fields
-        # The OOS scanner doesn't store raw OHLCV in features,
-        # so we use reference_price as signal_price and entry_zone for range
-        signal_price = candidate.reference_price or candidate.entry_zone_high
+        # Strict clean observer contract: no proxy candle data.
+        features = candidate.features
 
-        # For now, use entry_zone as proxy for candle range
-        # In production, this should come from the actual candle data
-        open_price = candidate.entry_zone_low
-        high_price = candidate.entry_zone_high
-        low_price = candidate.invalidation_price
-        close_price = candidate.entry_zone_high  # Approximation
+        if (
+            features.get("oos_clean_observer_version") != "1.2.0"
+            or candidate.scanner_version != "1.2.0"
+        ):
+            logger.warning(
+                "ME_R_LONG_CL_OOS: skipping non-clean candidate %s",
+                candidate.symbol,
+            )
+            self._skipped_version += 1
+            return MERLongCLoOosAck.SKIPPED_VERSION
 
-        # Calculate candle range for volume proxy
-        volume = 1000.0  # Placeholder - not critical for OOS analysis
+        required = (
+            "oos_signal_open",
+            "oos_signal_high",
+            "oos_signal_low",
+            "oos_signal_close",
+            "oos_signal_volume",
+            "oos_signal_entry_price",
+            "oos_signal_candle_open_ms",
+        )
 
-        # Extract indicators from features if available
-        rsi = candidate.features.get("rsi")
-        atr = candidate.features.get("atr")
+        if any(features.get(key) is None for key in required):
+            logger.error(
+                "ME_R_LONG_CL_OOS: missing clean candle fields for %s",
+                candidate.symbol,
+            )
+            self._invalid_source += 1
+            return MERLongCLoOosAck.INVALID_SOURCE
 
-        # Get signal time from features or use detected_at
-        signal_time_str = candidate.features.get("close_location_source_timestamp")
-        if signal_time_str:
-            try:
-                signal_time = datetime.fromisoformat(signal_time_str.replace("Z", "+00:00"))
-            except (ValueError, AttributeError):
-                signal_time = candidate.detected_at
-        else:
-            signal_time = candidate.detected_at
+        try:
+            numeric_keys = (
+                "oos_signal_open",
+                "oos_signal_high",
+                "oos_signal_low",
+                "oos_signal_close",
+                "oos_signal_volume",
+                "oos_signal_entry_price",
+            )
+            values = {key: float(features[key]) for key in numeric_keys}
+
+            if not all(math.isfinite(value) for value in values.values()):
+                raise ValueError("non-finite candle numeric field")
+
+            candle_open_ms = int(features["oos_signal_candle_open_ms"])
+            signal_candle_open_time = datetime.fromtimestamp(
+                candle_open_ms / 1000,
+                tz=timezone.utc,
+            )
+
+            raw_timestamp = features.get("close_location_source_timestamp")
+            if not isinstance(raw_timestamp, str) or not raw_timestamp:
+                raise ValueError("missing signal source timestamp")
+
+            signal_time = datetime.fromisoformat(
+                raw_timestamp.replace("Z", "+00:00")
+            )
+            if signal_time.tzinfo is None:
+                raise ValueError("naive signal source timestamp")
+
+            decision_time = candidate.detected_at
+            if (
+                not isinstance(decision_time, datetime)
+                or decision_time.tzinfo is None
+            ):
+                raise ValueError("invalid decision timestamp")
+
+            source_utc = signal_time.astimezone(timezone.utc)
+            candle_utc = signal_candle_open_time.astimezone(timezone.utc)
+            decision_utc = decision_time.astimezone(timezone.utc)
+
+            if source_utc != candle_utc:
+                raise ValueError("signal source and candle open mismatch")
+
+            if decision_utc < candle_utc + timedelta(minutes=5):
+                raise ValueError("signal candle not closed at decision time")
+
+        except (TypeError, ValueError, OverflowError, OSError) as exc:
+            self._invalid_source += 1
+            logger.error(
+                "ME_R_LONG_CL_OOS invalid source: symbol=%s reason=%s",
+                candidate.symbol,
+                exc,
+            )
+            return MERLongCLoOosAck.INVALID_SOURCE
+
+        open_price = values["oos_signal_open"]
+        high_price = values["oos_signal_high"]
+        low_price = values["oos_signal_low"]
+        close_price = values["oos_signal_close"]
+        volume = values["oos_signal_volume"]
+        signal_price = values["oos_signal_entry_price"]
+
+        close_location = features.get("close_location")
+        close_location_threshold = features.get(
+            "close_location_threshold", 0.70
+        )
+        filter_passed = features.get("close_location_passed", False)
+
+        # Preserve geometrically invalid but representable candles
+        # for SQL INVALID classification.
+        rsi = features.get("rsi")
+        atr = features.get("atr")
 
         result = self.repo.save_signal(
             symbol=candidate.symbol,
@@ -98,30 +186,39 @@ class MERLongCLoOosObserver:
             rsi=rsi,
             atr=atr,
             signal_version=candidate.scanner_version or "1.0.0",
+            decision_time=decision_time,
+            signal_candle_open_time=signal_candle_open_time,
         )
 
         if result.status == MERLongCLoOosSaveStatus.INSERTED:
             self._inserted += 1
             logger.info(
-                "ME_R_LONG_CL_OOS observation saved: symbol=%s signal_time=%s "
-                "close_location=%.4f filter_passed=%s signal_id=%d",
-                candidate.symbol, signal_time,
-                close_location if close_location is not None else 0.0,
+                "ME_R_LONG_CL_OOS inserted: symbol=%s signal_time=%s "
+                "close_location=%s filter_passed=%s signal_id=%s",
+                candidate.symbol,
+                signal_time,
+                close_location,
                 filter_passed,
-                result.signal_id or 0,
+                result.signal_id,
             )
-        elif result.status == MERLongCLoOosSaveStatus.DUPLICATE:
+            return MERLongCLoOosAck.INSERTED
+
+        if result.status == MERLongCLoOosSaveStatus.DUPLICATE:
             self._duplicates += 1
             logger.debug(
                 "ME_R_LONG_CL_OOS duplicate: symbol=%s signal_time=%s",
-                candidate.symbol, signal_time,
+                candidate.symbol,
+                signal_time,
             )
-        else:
-            self._errors += 1
-            logger.error(
-                "ME_R_LONG_CL_OOS save error: symbol=%s signal_time=%s",
-                candidate.symbol, signal_time,
-            )
+            return MERLongCLoOosAck.DUPLICATE
+
+        self._errors += 1
+        logger.error(
+            "ME_R_LONG_CL_OOS save error: symbol=%s signal_time=%s",
+            candidate.symbol,
+            signal_time,
+        )
+        return MERLongCLoOosAck.ERROR
 
     def get_stats(self) -> dict[str, int]:
         """Get observer statistics."""
@@ -129,16 +226,18 @@ class MERLongCLoOosObserver:
             "inserted": self._inserted,
             "duplicates": self._duplicates,
             "errors": self._errors,
+            "invalid_source": self._invalid_source,
+            "skipped_version": self._skipped_version,
         }
 
 
 def observe_oos_candidate(
     repo: MERLongCLoOosRepository,
     candidate: SetupCandidate,
-) -> None:
-    """Convenience function to observe a single OOS candidate."""
+) -> str:
+    """Observe one candidate and return its persistence ACK."""
     observer = MERLongCLoOosObserver(repo)
-    observer.observe(candidate)
+    return observer.observe(candidate)
 
 
 def observe_oos_candidates(
