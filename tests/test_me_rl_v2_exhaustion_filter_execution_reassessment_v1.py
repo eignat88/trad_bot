@@ -187,3 +187,74 @@ def test_replay_rejects_invalid_candle_before_outcome(monkeypatch, tmp_path):
     assert summary["source_n"] == 1
     assert summary["full_windows_after_finalization_filter"] == 0
     assert summary["exclusion_counts"]["COVERAGE_INVALID_CANDLE_QUALITY"] == 1
+
+
+def test_empty_replay_replaces_stale_trades(monkeypatch, tmp_path):
+    import csv
+    import json
+    import sys
+    import types
+
+    from tools.research import (
+        me_rl_v2_exhaustion_filter_execution_reassessment_v1 as mod,
+    )
+
+    class EmptyCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params):
+            pass
+
+        def fetchall(self):
+            return []
+
+    class FakeConnection:
+        def set_session(self, **kwargs):
+            assert kwargs["readonly"] is True
+
+        def cursor(self, **kwargs):
+            return EmptyCursor()
+
+        def close(self):
+            pass
+
+    fake_psycopg2 = types.ModuleType("psycopg2")
+    fake_psycopg2.connect = lambda **kwargs: FakeConnection()
+
+    fake_extras = types.ModuleType("psycopg2.extras")
+    fake_extras.RealDictCursor = object
+
+    monkeypatch.setitem(sys.modules, "psycopg2", fake_psycopg2)
+    monkeypatch.setitem(sys.modules, "psycopg2.extras", fake_extras)
+
+    trades = tmp_path / (mod.PREFIX + "_TRADES.csv")
+    trades.write_text("STALE_TRADE_DATA", encoding="utf-8")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["replay", "--outdir", str(tmp_path), "--overwrite"],
+    )
+
+    mod.main()
+
+    with trades.open(newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    assert rows == []
+    assert "STALE_TRADE_DATA" not in trades.read_text(encoding="utf-8")
+    with trades.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        assert reader.fieldnames is not None
+        assert reader.fieldnames[0] == "observation_id"
+
+    summary = json.loads(
+        (tmp_path / (mod.PREFIX + "_SUMMARY.json")).read_text()
+    )
+
+    assert summary["source_n"] == 0
+    assert summary["models"]["B_NEXT_OPEN"]["CONTROL"]["n"] == 0

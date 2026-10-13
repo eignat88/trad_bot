@@ -266,11 +266,33 @@ def main():
     exclude_path = outdir / (PREFIX + "_EXCLUSIONS.csv")
     report_path = outdir / (PREFIX + "_SUMMARY.json")
 
-    if records:
-        with data_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(records[0]), lineterminator="\n")
-            writer.writeheader()
-            writer.writerows(records)
+    trade_fields = [
+        "observation_id",
+        "symbol",
+        "signal_day",
+        "filter_group",
+        "model",
+        "entry",
+        "source_entry",
+        "stop",
+        "target",
+        "exit_price",
+        "exit_reason",
+        "ambiguous",
+        "gross_r",
+        "net_r_normal",
+        "net_r_elevated",
+        "next_open_gap_pct",
+    ]
+
+    with data_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=trade_fields,
+            lineterminator="\\n",
+        )
+        writer.writeheader()
+        writer.writerows(records)
 
     with exclude_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
