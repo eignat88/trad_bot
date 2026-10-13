@@ -63,6 +63,14 @@ ORDER BY open_time, close_time
 """
 
 
+
+def has_invalid_candles(rows):
+    return any(
+        str(r["quality_status"]).strip().lower() == "invalid"
+        for r in rows
+    )
+
+
 def next_boundary(t: datetime) -> datetime:
     if t.tzinfo is None:
         raise ValueError("Naive signal timestamp")
@@ -108,8 +116,23 @@ def summarize(rows):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
+    parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     outdir = args.outdir
+
+    output_paths = [
+        outdir / (PREFIX + suffix)
+        for suffix in ("_TRADES.csv", "_EXCLUSIONS.csv", "_SUMMARY.json")
+    ]
+
+    if not args.overwrite:
+        existing = [str(p) for p in output_paths if p.exists()]
+        if existing:
+            parser.error(
+                "Existing research artifacts are protected: "
+                + ", ".join(existing)
+                + ". Use a new --outdir for reproduction."
+            )
 
     import psycopg2
     from psycopg2.extras import RealDictCursor
@@ -167,6 +190,10 @@ def main():
 
                 cur.execute(CANDLE_SQL, (source["instrument_id"], start, end))
                 raw = cur.fetchall()
+                if has_invalid_candles(raw):
+                    exclude("COVERAGE_INVALID_CANDLE_QUALITY")
+                    continue
+
                 candles = [
                     ClosedCandle(
                         open_at=r["open_time"],
