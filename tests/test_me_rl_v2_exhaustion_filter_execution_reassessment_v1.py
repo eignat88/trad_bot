@@ -74,7 +74,7 @@ def test_invalid_candle_quality_rejected():
 def test_valid_candle_quality_allowed():
     from tools.research.me_rl_v2_exhaustion_filter_execution_reassessment_v1 import has_invalid_candles
 
-    rows = [{"quality_status": "valid"}]
+    rows = [{"quality_status": "validated"}]
     assert has_invalid_candles(rows) is False
 
 
@@ -277,3 +277,28 @@ def test_trade_csv_newline_configuration():
 
     assert bad not in source
     assert good in source
+
+
+def test_suspect_candle_quality_rejected():
+    from tools.research.me_rl_v2_exhaustion_filter_execution_reassessment_v1 import has_invalid_candles
+
+    assert has_invalid_candles([
+        {"quality_status": "validated"},
+        {"quality_status": "suspect"},
+    ]) is True
+
+
+def test_unknown_candle_quality_rejected():
+    from tools.research.me_rl_v2_exhaustion_filter_execution_reassessment_v1 import has_invalid_candles
+
+    assert has_invalid_candles([{"quality_status": None}]) is True
+    assert has_invalid_candles([{"quality_status": "unknown"}]) is True
+
+
+def test_validated_candle_quality_allowed():
+    from tools.research.me_rl_v2_exhaustion_filter_execution_reassessment_v1 import has_invalid_candles
+
+    assert has_invalid_candles([
+        {"quality_status": "validated"},
+        {"quality_status": "validated"},
+    ]) is False

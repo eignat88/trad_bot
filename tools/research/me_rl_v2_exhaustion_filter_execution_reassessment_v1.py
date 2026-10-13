@@ -66,7 +66,7 @@ ORDER BY open_time, close_time
 
 def has_invalid_candles(rows):
     return any(
-        str(r["quality_status"]).strip().lower() == "invalid"
+        str(r["quality_status"]).strip().lower() != "validated"
         for r in rows
     )
 
