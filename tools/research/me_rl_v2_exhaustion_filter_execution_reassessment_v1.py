@@ -138,7 +138,7 @@ def main():
     from psycopg2.extras import RealDictCursor
 
     conn = psycopg2.connect(dbname="trad_bot")
-    conn.set_session(readonly=True, autocommit=True)
+    conn.set_session(readonly=True, autocommit=False, isolation_level="REPEATABLE READ")
     records = []
     exclusions = []
     counts = Counter()

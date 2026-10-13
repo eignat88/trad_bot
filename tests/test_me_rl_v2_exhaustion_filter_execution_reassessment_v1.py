@@ -149,6 +149,8 @@ def test_replay_rejects_invalid_candle_before_outcome(monkeypatch, tmp_path):
     class FakeConnection:
         def set_session(self, **kwargs):
             assert kwargs["readonly"] is True
+            assert kwargs["autocommit"] is False
+            assert kwargs["isolation_level"] == "REPEATABLE READ"
 
         def cursor(self, **kwargs):
             return FakeCursor()
@@ -215,6 +217,8 @@ def test_empty_replay_replaces_stale_trades(monkeypatch, tmp_path):
     class FakeConnection:
         def set_session(self, **kwargs):
             assert kwargs["readonly"] is True
+            assert kwargs["autocommit"] is False
+            assert kwargs["isolation_level"] == "REPEATABLE READ"
 
         def cursor(self, **kwargs):
             return EmptyCursor()
