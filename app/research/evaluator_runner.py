@@ -25,6 +25,10 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from app.research.me_reverse_long_v3.scheduler_route import (
+    route_prospective_experiment,
+)
+
 logger = logging.getLogger("research_evaluator")
 
 
@@ -33,6 +37,12 @@ def main() -> None:
         description="Research Evaluator — unified generic + prospective scheduler",
     )
     parser.add_argument("--once", action="store_true", help="Single cycle then exit")
+    parser.add_argument(
+        "--enable-me-v3-evaluator",
+        action="store_true",
+        default=False,
+        help="Explicit opt-in for V3 research outcomes",
+    )
     parser.add_argument("--interval-seconds", type=int, default=300)
     parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--log-level", type=str, default="INFO",
@@ -109,8 +119,62 @@ def main() -> None:
             srr_policy_router=srr_eval,
         )
 
+        from app.research.me_reverse_long_v3.activation import (
+            resolve_startup_v3_activation,
+        )
+        from app.research.me_reverse_long_v3.evaluator import (
+            MEReverseLongV3ExecutionEvaluator,
+        )
+        from app.research.me_reverse_long_v3.historical_source import (
+            make_v3_historical_source,
+        )
+        import json
+        from pathlib import Path
+
+        # V3 activation is startup-bound by design.
+        # After a separately approved registry/DB activation, restart
+        # the evaluator with explicit CLI opt-in.
+        # Per-cycle guard still stops evaluation after deactivation.
+        v3_evaluator = None
+        if args.enable_me_v3_evaluator:
+            v3_registry_path = (
+                Path(__file__).parent / "prospective_registry.json"
+            )
+            v3_startup_activation = resolve_startup_v3_activation(
+                conn=db_repo._conn,
+                registry_path=v3_registry_path,
+                explicitly_enabled=True,
+            )
+            if v3_startup_activation is not None:
+                from app.research.me_reverse_long_v3.guarded_evaluator import (
+                    GuardedV3Evaluator,
+                )
+                v3_evaluator = GuardedV3Evaluator(
+                    conn=db_repo._conn,
+                    evaluator=MEReverseLongV3ExecutionEvaluator(
+                        db_repo._conn,
+                        make_v3_historical_source(client),
+                    ),
+                    registry_path=(
+                        Path(__file__).parent / "prospective_registry.json"
+                    ),
+                    explicitly_enabled=True,
+                    startup_activation=v3_startup_activation,
+                )
+
+                logger.info(
+                    "ME V3 evaluator activated at startup; "
+                    "later activation requires evaluator restart"
+                )
+
+        if args.enable_me_v3_evaluator and v3_evaluator is None:
+            logger.warning(
+                "ME V3 evaluator inactive at startup; "
+                "activation requires explicit evaluator restart"
+            )
+
         if args.once:
-            _run_single_cycle(db_repo._conn, evaluator, prospective_eval)
+            _run_single_cycle(db_repo._conn, evaluator, prospective_eval, v3_evaluator)
             return
 
         # ── Daemon mode: unified scheduler loop ────────────────────
@@ -118,6 +182,7 @@ def main() -> None:
             conn=db_repo._conn,
             evaluator=evaluator,
             prospective_eval=prospective_eval,
+            v3_evaluator=v3_evaluator,
             interval_seconds=args.interval_seconds,
         )
 
@@ -126,6 +191,7 @@ def _run_single_cycle(
     conn: Any,
     evaluator: ResearchEvaluator,
     prospective_eval: ProspectiveOOSEvaluator,
+    v3_evaluator: Any | None = None,
 ) -> None:
     """Execute one evaluation cycle for BOTH generic + prospective, then exit."""
     # ── Generic ──
@@ -153,7 +219,11 @@ def _run_single_cycle(
     if prospective_ids:
         logger.info("Active prospective experiments: %s", prospective_ids)
         for exp_id in prospective_ids:
-            summary = prospective_eval.run_evaluation_cycle(exp_id)
+            summary = route_prospective_experiment(
+                exp_id, prospective_eval,
+                v3_evaluator=v3_evaluator,
+                v3_enabled=v3_evaluator is not None,
+            )
             print(f"\n{'=' * 80}")
             print(f"PROSPECTIVE EVALUATION CYCLE — {exp_id}")
             print(f"{'=' * 80}")
@@ -175,6 +245,7 @@ def _run_scheduler_loop(
     evaluator: ResearchEvaluator,
     prospective_eval: ProspectiveOOSEvaluator,
     interval_seconds: int = 300,
+    v3_evaluator: Any | None = None,
 ) -> None:
     """Unified daemon scheduler: generic + prospective in one loop.
 
@@ -227,7 +298,11 @@ def _run_scheduler_loop(
             if not running:
                 break
             try:
-                stats = prospective_eval.run_evaluation_cycle(exp_id)
+                stats = route_prospective_experiment(
+                    exp_id, prospective_eval,
+                v3_evaluator=v3_evaluator,
+                v3_enabled=v3_evaluator is not None,
+                )
                 logger.info(
                     "prospective evaluation [%s]: checked=%d finalized=%d errors=%d",
                     exp_id, stats["signals_checked"],

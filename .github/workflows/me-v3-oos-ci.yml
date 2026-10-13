@@ -1,0 +1,63 @@
+name: ME V3 OOS CI
+
+on:
+  pull_request:
+    paths:
+      - 'app/research/me_reverse_long_v3/**'
+      - 'app/research/evaluator_runner.py'
+      - 'app/research/prospective_observer.py'
+      - 'app/research/prospective_registry.json'
+      - 'app/scanners/momentum_exhaustion_reverse_long_v2.py'
+      - 'app/scanners/context_builder.py'
+      - 'app/scanners/models.py'
+      - 'scanner_runner.py'
+      - 'sql/migrations/067_me_reverse_long_v3_execution_outcome.sql'
+      - 'tests/test_me_reverse_long_v3_*.py'
+      - 'tests/test_momentum_exhaustion_reverse_long_v2.py'
+      - 'tests/test_signal_funnel_diagnostics.py'
+      - '.github/workflows/me-v3-oos-ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  v3-regression:
+    name: V3 research regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest numpy pandas scipy pyyaml python-dotenv
+
+      - name: Compile Python
+        run: |
+          python -m compileall -q \
+            app/research/me_reverse_long_v3 \
+            app/research/evaluator_runner.py \
+            app/research/prospective_observer.py \
+            scanner_runner.py
+
+      - name: V3 and V2 regression
+        env:
+          PYTHONPATH: .
+        run: |
+          python -m pytest -q -p no:cacheprovider \
+            tests/test_me_reverse_long_v3_*.py \
+            tests/test_momentum_exhaustion_reverse_long_v2.py \
+            tests/test_signal_funnel_diagnostics.py \
+            --tb=short

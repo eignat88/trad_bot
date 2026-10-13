@@ -68,6 +68,7 @@ class MarketContext:
     market_regime: str | None
     levels: MarketLevels
     evaluated_at: datetime
+    source_fetch_started_at: datetime | None = None
 
 
 @dataclass(frozen=True)

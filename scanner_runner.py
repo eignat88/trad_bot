@@ -806,6 +806,94 @@ def run_scan_cycle(
                         except Exception:
                             logger.debug("observe-only prospective observation failed for %s", oc.scanner_name, exc_info=True)
 
+                # Independent V3 closed-candle detector, research only.
+                # Never changes production candidates or paper routing.
+                # Registry INACTIVE must not invoke the detector.
+                from app.research.me_reverse_long_v3.protocol import (
+                    EXPERIMENT_ID as _ME_V3_ID,
+                )
+                _me_v3_spec = (
+                    prospective_obs._registry.get(_ME_V3_ID)
+                    if prospective_obs is not None else None
+                )
+                if (
+                    _me_v3_spec is not None
+                    and _me_v3_spec.get("status") == "RUNNING"
+                    and _me_v3_spec.get("freeze_ts")
+                ):
+                    try:
+                        from app.research.me_reverse_long_v3.detector import (
+                            detect_v3_closed,
+                        )
+                        detection = detect_v3_closed(ctx)
+                        if detection.status == "SIGNAL":
+                            c = detection.candidate
+                            clean_ctx = detection.clean_context
+                            # Fail closed if processing crossed the planned entry.
+                            from datetime import datetime, timezone
+                            from app.research.me_reverse_long_v3.entry_policy import (
+                                next_executable_entry_at,
+                            )
+                            capture_now = datetime.now(timezone.utc)
+                            capture_timely = (
+                                capture_now < next_executable_entry_at(c.detected_at)
+                            )
+                            if not capture_timely:
+                                logger.info(
+                                    "ME V3 late capture rejected: symbol=%s",
+                                    symbol,
+                                )
+                            from app.research.me_reverse_long_v3.temporal import (
+                                verify_trigger_candle,
+                                verify_source_timeframes,
+                            )
+                            temporal = verify_trigger_candle(
+                                clean_ctx.candles_5m, c.detected_at,
+                            )
+                            source_ok, source_reason = verify_source_timeframes(
+                                clean_ctx, c.detected_at,
+                            )
+                            if capture_timely:
+                                prospective_obs.observe(
+                                    scanner_name=c.scanner_name,
+                                    direction=c.direction,
+                                    symbol=c.symbol,
+                                    signal_time=c.detected_at,
+                                    reference_price=c.reference_price,
+                                    invalidation_price=c.invalidation_price,
+                                    target_1=c.target_1,
+                                    target_2=c.target_2,
+                                    score=c.score,
+                                    features=dict(c.features or {}),
+                                    parameters={
+                                        "_v3_shadow_capture": True,
+                                        "_v3_scanner_version": c.scanner_version,
+                                        "_v3_trigger_open_at": (
+                                            temporal.trigger_open_at.isoformat()
+                                            if temporal.trigger_open_at else None
+                                        ),
+                                        "_v3_entry_zone_low": c.entry_zone_low,
+                                        "_v3_temporal_status": temporal.status,
+                                        "_v3_temporal_reason": temporal.reason,
+                                        "_v3_source_timeframes_validated": source_ok,
+                                        "_v3_source_timeframes_reason": source_reason,
+                                        "_v3_trigger_close_at": (
+                                            temporal.trigger_close_at.isoformat()
+                                            if temporal.trigger_close_at else None
+                                        ),
+                                        "_v3_execution_entry_at": (
+                                            temporal.execution_entry_at.isoformat()
+                                            if temporal.execution_entry_at else None
+                                        ),
+                                    },
+                                    market_regime=c.market_regime,
+                                )
+                    except Exception:
+                        logger.exception(
+                            "ME V3 closed-candle research capture failed: symbol=%s",
+                            symbol,
+                        )
+
                 # Independent ME Early MAE V2 prospective capture.
                 # Candidates were selected before direction/expectancy gates.
                 # No setup state or paper routing is modified.

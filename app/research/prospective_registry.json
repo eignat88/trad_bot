@@ -685,6 +685,37 @@
       "started_at": "2026-10-06T14:00:00Z",
       "status": "RUNNING",
       "freeze_ts": "2026-10-06T14:00:00Z"
+    },
+    {
+      "experiment_id": "MOMENTUM_EXHAUSTION_REVERSE_LONG_V3_OOS",
+      "version": 1,
+      "scanner_name": "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2",
+      "direction": "LONG",
+      "experiment_type": "PROSPECTIVE_EXECUTION_SHADOW",
+      "hypothesis": "Prospectively compare exhaustion_magnitude <= 0.4 against > 0.4, with all eligible signals as CONTROL.",
+      "primary_metric": "net_r_normal",
+      "secondary_metrics": [
+        "gross_r",
+        "net_r_elevated",
+        "coverage_reason",
+        "exit_reason"
+      ],
+      "filter_rule": "Research classification only: exhaustion_magnitude <= 0.4",
+      "threshold": 0.4,
+      "entry_rule": "NEXT_OPEN_5M: opening price of the first strictly later 5m execution candle; hypothetical shadow fill, not executable proof",
+      "stop_rule": "2.5% below reference entry",
+      "target_rule": "3.0% above reference entry",
+      "max_hold_minutes": 240,
+      "position_sizing_rule": "shadow_only",
+      "fee_assumption": "taker 0.055%/side; normal slippage 0.05%/side; elevated 0.10%/side",
+      "horizons": [
+        "240m"
+      ],
+      "minimum_n": 100,
+      "minimum_symbols": 10,
+      "freeze_ts": null,
+      "started_at": null,
+      "status": "INACTIVE"
     }
   ],
   "rules": {
