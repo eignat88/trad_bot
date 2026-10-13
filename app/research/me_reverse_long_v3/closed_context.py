@@ -60,9 +60,23 @@ def build_closed_v3_context(
     if ctx.evaluated_at.tzinfo is None:
         raise ValueError("NAIVE_CONTEXT_TIME")
 
-    asof_ms = int(
-        ctx.evaluated_at.astimezone(timezone.utc).timestamp() * 1000
-    )
+    fetch_started_at = ctx.source_fetch_started_at
+    if (
+        fetch_started_at is None
+        or fetch_started_at.tzinfo is None
+        or fetch_started_at.utcoffset() is None
+    ):
+        raise ValueError("MISSING_SOURCE_FETCH_TIME")
+
+    fetch_started_at = fetch_started_at.astimezone(timezone.utc)
+    evaluated_at = ctx.evaluated_at.astimezone(timezone.utc)
+
+    if fetch_started_at > evaluated_at:
+        raise ValueError("SOURCE_FETCH_AFTER_EVALUATION")
+
+    # Conservative acquisition boundary: no candle may be certified
+    # closed using a later timestamp from context construction.
+    asof_ms = int(fetch_started_at.timestamp() * 1000)
 
     closed = {
         name: _closed_only(

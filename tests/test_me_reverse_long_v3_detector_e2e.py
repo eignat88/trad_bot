@@ -58,6 +58,7 @@ def make_context():
         market_regime="HIGH_VOLATILITY",
         levels=MarketLevels(),
         evaluated_at=ASOF,
+        source_fetch_started_at=ASOF,
     )
 
 

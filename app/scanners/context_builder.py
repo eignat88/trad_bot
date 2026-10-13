@@ -62,6 +62,7 @@ def build_market_context(
     symbol: str,
     settings: Settings,
 ) -> MarketContext:
+    source_fetch_started_at = datetime.now(timezone.utc)
     candles_5m = client.get_klines(symbol, "5", 200)
     candles_15m = client.get_klines(symbol, "15", 200)
     candles_1h = client.get_klines(symbol, "60", 200)
@@ -79,4 +80,5 @@ def build_market_context(
         market_regime=_classify_market_regime(indicators, candles_1h[-1].close),
         levels=levels,
         evaluated_at=datetime.now(timezone.utc),
+        source_fetch_started_at=source_fetch_started_at,
     )

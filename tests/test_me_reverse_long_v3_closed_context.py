@@ -45,6 +45,7 @@ def test_closed_context_does_not_mutate_source():
         market_regime="HIGH_VOLATILITY",
         levels=MarketLevels(),
         evaluated_at=ASOF,
+        source_fetch_started_at=ASOF,
     )
 
     clean = build_closed_v3_context(ctx)
