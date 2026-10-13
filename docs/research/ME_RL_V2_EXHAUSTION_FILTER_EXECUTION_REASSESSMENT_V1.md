@@ -7,41 +7,23 @@ HISTORICAL_REPLAY_COMPLETED
 Verdict:
 PRELIMINARY_NEGATIVE_PASS_EDGE / REVERSE_FILTER_INCONCLUSIVE
 
-Research only. Not a prospective OOS validation.
+Research only. Not prospective OOS validation.
 No production deployment or trading enablement.
 
 ## Source
 
-Experiment: ME_RL_V2_GENERIC_V1
+- Experiment: ME_RL_V2_GENERIC_V1
+- Source observations: 321
+- Complete 240-minute candle windows: 144
+- Filter: exhaustion_magnitude <= 0.4 (historical candidate)
 
-Source observations: 318
-Finalized outcomes at replay: 315
-Complete 240-minute candle windows: 130
-Excluded observations: 188
+## Replay integrity
 
-Filter hypothesis under assessment:
-exhaustion_magnitude <= 0.4
-
-This threshold is a candidate historical filter, not an
-independently verified frozen V3 protocol.
-
-## Execution models
-
-A_SIGNAL_REFERENCE:
-- Entry reconstructed from entry_zone_low / 0.998
-- Original absolute SL/TP
-- Hypothetical execution from next 5m boundary
-
-B_NEXT_OPEN:
-- Entry at first eligible 5m candle open
-- Original absolute SL/TP preserved
-- Actual risk distance recalculated
-- Diagnostic execution sensitivity model only
-
-Common settings:
-- LONG
-- 240-minute horizon
-- STOP_FIRST
+- PostgreSQL transaction: READ ONLY, REPEATABLE READ
+- Candle quality: only validated candles accepted
+- Entry models: A_SIGNAL_REFERENCE and B_NEXT_OPEN
+- Horizon: 240 minutes
+- Intrabar collision: STOP_FIRST
 - Taker fee: 0.055% per side
 - Normal slippage: 0.05% per side
 - Elevated slippage: 0.10% per side
@@ -50,80 +32,48 @@ Common settings:
 
 | Model | Group | N | Net E[R] | Net PF |
 |---|---|---:|---:|---:|
-| A | CONTROL | 130 | -0.081616 | 0.775687 |
-| A | PASS | 105 | -0.183066 | 0.495177 |
-| A | REJECT | 25 | +0.344472 | 1.933626 |
-| B | CONTROL | 130 | -0.094309 | 0.743097 |
-| B | PASS | 105 | -0.179305 | 0.510239 |
-| B | REJECT | 25 | +0.262674 | 1.707495 |
-
-## Model B outcome distribution
-
-PASS:
-- TP: 12
-- SL: 23
-- TIMEOUT: 70
-- Total Net R: -18.827009
-- Positive days: 4/14
-
-REJECT:
-- TP: 16
-- SL: 8
-- TIMEOUT: 1
-- Total Net R: +6.566839
-- Positive days: 7/11
+| A_SIGNAL_REFERENCE | CONTROL | 144 | -0.118331 | 0.687265 |
+| A_SIGNAL_REFERENCE | PASS | 116 | -0.193126 | 0.46677 |
+| A_SIGNAL_REFERENCE | REJECT | 28 | +0.191534 | 1.429969 |
+| B_NEXT_OPEN | CONTROL | 144 | -0.132586 | 0.655615 |
+| B_NEXT_OPEN | PASS | 116 | -0.189310 | 0.482784 |
+| B_NEXT_OPEN | REJECT | 28 | +0.102413 | 1.220902 |
 
 ## Exclusions
 
-PASS: 152
-- No closed candles: 91
-- Incomplete window start: 51
-- Incomplete window end: 10
-
-REJECT: 36
-- No closed candles: 18
-- Incomplete window start: 15
-- Not finalized: 3
+| Reason | N |
+|---|---:|
+| COVERAGE_INCOMPLETE_WINDOW_END | 10 |
+| COVERAGE_INCOMPLETE_WINDOW_START | 66 |
+| COVERAGE_NO_CLOSED_CANDLES | 98 |
+| NOT_FINALIZED | 3 |
 
 ## Limitations
 
-1. Historical retrospective analysis; not clean prospective OOS.
-2. Only 130/318 observations have fully eligible windows.
-3. The missing-candle cohort may introduce selection bias.
-4. REJECT contains only 25 executed replay observations.
-5. Next-open execution is not proven achievable in live trading.
-6. No cluster-robust confidence interval or independent holdout.
-7. The frozen V3 filter protocol was not independently located.
-8. Results may change with historical candle backfill.
-9. Runtime availability of signal/features was not independently audited.
-10. The results are diagnostic, not authorization for paper/live execution.
+- Retrospective historical replay, not clean prospective OOS.
+- Dataset changed after the original snapshot; historical cohorts are not identical.
+- Only complete 240-minute candle windows are included.
+- Missing candle coverage may introduce selection bias.
+- Next-open execution is not proven achievable in live trading.
+- No cluster-robust confidence interval or independent holdout.
+- Frozen V3 filter protocol has not been independently verified.
 
 ## Decision
 
-Do not promote exhaustion_magnitude <= 0.4 as a
-validated V3 execution gate.
+Do not promote exhaustion_magnitude <= 0.4 as a validated V3 execution gate.
 
-Do not automatically substitute exhaustion_magnitude > 0.4.
+Do not automatically replace it with exhaustion_magnitude > 0.4.
 
-Keep V3 prospective implementation pending protocol review,
-coverage repair, and independent validation.
+Keep V3 pending protocol review, coverage repair, and independent validation.
 
-Do not modify V2 scanner, paper/live routing, active OOS
-experiments, existing outcomes, or production configuration.
+No scanner, paper/live, database, OOS registry, or production configuration changes.
 
-## Reproduction
+## Artifacts
 
-Script:
-tools/research/me_rl_v2_exhaustion_filter_execution_reassessment_v1.py
-
-Tests:
-tests/test_me_rl_v2_exhaustion_filter_execution_reassessment_v1.py
-
-Artifacts:
 - ME_RL_V2_EXHAUSTION_FILTER_EXECUTION_REASSESSMENT_V1_SUMMARY.json
 - ME_RL_V2_EXHAUSTION_FILTER_EXECUTION_REASSESSMENT_V1_TRADES.csv
 - ME_RL_V2_EXHAUSTION_FILTER_EXECUTION_REASSESSMENT_V1_EXCLUSIONS.csv
 
-The script reads a live database snapshot and may not reproduce
-the exact historical cohort after new outcomes or backfill.
-Preserved CSV/JSON files are the recorded replay artifacts.
+The original historical snapshot was preserved separately before regeneration.
+The updated artifacts represent one later database snapshot and must not be
+presented as the unchanged original 318-observation cohort.
