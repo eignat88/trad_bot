@@ -146,7 +146,11 @@ class MomentumExhaustionReverseLongV2Scanner:
         Every gate incrementally counts PASS/REJECT for observability.
         No production behavior is changed.
         """
-        funnel = get_funnel_collector(self.name)
+        funnel = (
+            self._research_funnel
+            if getattr(self, "_research_funnel", None) is not None
+            else get_funnel_collector(self.name)
+        )
         funnel.increment("TOTAL_SCANS")
 
         candles_15m, candles_5m = list(ctx.candles_15m), list(ctx.candles_5m)

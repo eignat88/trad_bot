@@ -380,6 +380,16 @@ class ProspectiveOOSObserver:
                         setup_event_id=setup_event_id,
                         authoritative=authoritative,
                     )
+                elif exp_id == "MOMENTUM_EXHAUSTION_REVERSE_LONG_V3_OOS":
+                    # Only the independent pre-gate V3 channel is accepted.
+                    if parameters.get("_v3_shadow_capture") is not True:
+                        continue
+                    obs_id = self._observe_me_reverse_long_v3(
+                        cursor, exp_id, exp_spec,
+                        source_key, symbol, direction, signal_time,
+                        reference_price, invalidation_price, target_1, target_2,
+                        score, features, parameters, market_regime,
+                    )
                 elif exp_id.startswith("ME_SHORT_GEOM_"):
                     obs_id = self._observe_me_geometry(
                         cursor, exp_id, exp_spec,
@@ -570,6 +580,213 @@ class ProspectiveOOSObserver:
                 setup_event_id,
             )
             return None
+
+    def _observe_me_reverse_long_v3(
+        self, cursor, exp_id, exp_spec,
+        source_key, symbol, direction, signal_time,
+        reference_price, invalidation_price, target_1, target_2,
+        score, features, parameters, market_regime,
+    ):
+        """Independent, strictly post-freeze V3 shadow capture."""
+        from app.research.me_reverse_long_v3.protocol import (
+            SOURCE_SCANNER,
+            MAX_HOLD_MINUTES,
+            classify_exhaustion,
+            reconstruct_geometry,
+            is_post_activation,
+        )
+
+        if exp_spec.get("scanner_name") != SOURCE_SCANNER:
+            return None
+        if direction != "LONG":
+            return None
+        if parameters.get("_v3_shadow_capture") is not True:
+            return None
+
+        freeze_ts = exp_spec.get("freeze_ts")
+        if not freeze_ts:
+            return None
+
+        # DB RUNNING and DB started_at == registry freeze_ts.
+        if not self._is_htf_db_activation_ready(exp_id, freeze_ts):
+            return None
+
+        try:
+            freeze_dt = datetime.fromisoformat(
+                str(freeze_ts).replace("Z", "+00:00")
+            )
+            signal_dt = (
+                signal_time if isinstance(signal_time, datetime)
+                else datetime.fromisoformat(
+                    str(signal_time).replace("Z", "+00:00")
+                )
+            )
+        except (TypeError, ValueError):
+            return None
+
+        if not is_post_activation(signal_dt, freeze_dt):
+            return None
+
+        if parameters.get("_v3_temporal_status") != "TEMPORAL_VALIDATED":
+            logger.info(
+                "ME V3 temporal exclusion: symbol=%s reason=%s",
+                symbol,
+                parameters.get("_v3_temporal_reason", "MISSING_TEMPORAL_PROOF"),
+            )
+            return None
+
+        # Independent defense-in-depth: a caller cannot bypass
+        # multi-timeframe source validation.
+        if parameters.get("_v3_source_timeframes_validated") is not True:
+            logger.info(
+                "ME V3 source timeframe exclusion: symbol=%s reason=%s",
+                symbol,
+                parameters.get(
+                    "_v3_source_timeframes_reason",
+                    "SOURCE_TIMEFRAMES_NOT_VERIFIED",
+                ),
+            )
+            return None
+
+        trigger_close = parameters.get("_v3_trigger_close_at")
+        execution_entry = parameters.get("_v3_execution_entry_at")
+        try:
+            trigger_close_dt = datetime.fromisoformat(
+                str(trigger_close).replace("Z", "+00:00")
+            )
+            execution_entry_dt = datetime.fromisoformat(
+                str(execution_entry).replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            return None
+
+        if (
+            trigger_close_dt.tzinfo is None
+            or execution_entry_dt.tzinfo is None
+            or trigger_close_dt > signal_dt
+            or execution_entry_dt <= signal_dt
+        ):
+            return None
+
+        from app.research.me_reverse_long_v3.entry_policy import (
+            next_executable_entry_at,
+        )
+        if execution_entry_dt != next_executable_entry_at(signal_dt):
+            return None
+
+        from app.research.me_reverse_long_v3.identity import (
+            v3_source_key,
+        )
+
+        try:
+            trigger_open_dt = datetime.fromisoformat(
+                str(parameters["_v3_trigger_open_at"]).replace("Z", "+00:00")
+            )
+            if trigger_open_dt + __import__(
+                "datetime"
+            ).timedelta(minutes=5) != trigger_close_dt:
+                return None
+
+            source_key = v3_source_key(
+                symbol=symbol,
+                direction=direction,
+                scanner_version=str(parameters["_v3_scanner_version"]),
+                trigger_open_at=trigger_open_dt,
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+
+        # Fail closed on incomplete or modified geometry.
+        try:
+            geometry = reconstruct_geometry(
+                parameters.get("_v3_entry_zone_low"),
+                invalidation_price,
+                target_1,
+            )
+        except (TypeError, ValueError):
+            return None
+
+        classification = classify_exhaustion(
+            features.get("exhaustion_magnitude")
+        )
+
+        frozen_features = dict(features)
+        frozen_features.update({
+            "_v3_shadow_only": True,
+            "_v3_filter_group": classification.group,
+            "_v3_filter_reason": classification.reason,
+            "_frozen_entry": "NEXT_OPEN_5M",
+            "_v3_source_entry": geometry.entry,
+            "_v3_source_stop": geometry.stop,
+            "_v3_source_target": geometry.target,
+            "_frozen_max_hold": MAX_HOLD_MINUTES,
+            "_frozen_intrabar_policy": "STOP_FIRST",
+            "_frozen_freeze_ts": freeze_ts,
+            "_v3_trigger_close_at": trigger_close_dt.isoformat(),
+            "_v3_execution_entry_at": execution_entry_dt.isoformat(),
+            "_v3_temporal_status": "TEMPORAL_VALIDATED",
+        })
+
+        frozen_parameters = {
+            "_v3_protocol": "PROSPECTIVE_SHADOW_V1",
+            "_v3_source_scanner": SOURCE_SCANNER,
+            "_v3_candidate_threshold": 0.4,
+            "_v3_execution_model": "NEXT_OPEN_5M",
+        }
+
+        # Prospective integrity: capture must precede executable entry.
+        # This is checked at the observer write boundary independently
+        # of scanner_runner's early rejection.
+        capture_now = datetime.now(timezone.utc)
+        if capture_now >= execution_entry_dt:
+            logger.info(
+                "ME V3 observer late capture rejected: symbol=%s "
+                "capture_now=%s execution_entry=%s",
+                symbol,
+                capture_now.isoformat(),
+                execution_entry_dt.isoformat(),
+            )
+            return None
+
+        cursor.execute(
+            """
+            INSERT INTO research.prospective_observation (
+                experiment_id, source_signal_id, source_observation_id,
+                symbol, direction, signal_time,
+                reference_price, invalidation_price, target_1, target_2,
+                score, rule_passed, filter_reason,
+                variant_entry, variant_stop, variant_target,
+                features, parameters, market_regime
+            )
+            SELECT
+                %s, %s, NULL,
+                %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s
+            WHERE clock_timestamp() < %s::timestamptz
+            ON CONFLICT (experiment_id, source_signal_id)
+            DO NOTHING
+            RETURNING observation_id
+            """,
+            (
+                exp_id, source_key,
+                symbol, direction, signal_time,
+                reference_price, invalidation_price, target_1, target_2,
+                score,
+                classification.group == "PASS",
+                classification.reason,
+                None, None, None,
+                json.dumps(frozen_features),
+                json.dumps(frozen_parameters),
+                market_regime,
+                execution_entry_dt,
+            ),
+        )
+
+        row = cursor.fetchone()
+        return row[0] if row else None
 
     def _observe_standard(
         self, cursor, exp_id: str, exp_spec: dict,
