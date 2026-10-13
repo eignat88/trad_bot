@@ -81,6 +81,11 @@ class MEReverseLongV3ExecutionEvaluator:
                 (EXPERIMENT_ID,),
             )
             return list(cursor.fetchall())
+        except Exception:
+            # A failed PostgreSQL statement aborts the transaction.
+            # Restore the shared connection before other evaluators use it.
+            self.conn.rollback()
+            raise
         finally:
             cursor.close()
 
