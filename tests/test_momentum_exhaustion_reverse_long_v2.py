@@ -368,6 +368,21 @@ class TestMomentumExhaustionReverseLongV2:
         assert decision.allowed is False
         assert decision.status == GATE_BLOCKED
 
+    def test_direction_gate_blocks_long_after_negative_edge_validation(self):
+        """New V2 LONG paper entries are blocked; V2 remains registered."""
+        from app.scanners.direction_gate import ScannerDirectionGatePolicy, GATE_BLOCKED
+        settings = load_settings()
+        blocked = frozenset(settings.blocked_scanner_directions)
+        assert ("MOMENTUM_EXHAUSTION_REVERSE_LONG_V2", "LONG") in blocked
+        gate = ScannerDirectionGatePolicy.static_fallback(
+            scanner_names=["MOMENTUM_EXHAUSTION_REVERSE_LONG_V2"],
+            blocked_combinations=blocked,
+            regime_whitelist=settings.scanner_regime_whitelist,
+        )
+        decision = gate.evaluate("MOMENTUM_EXHAUSTION_REVERSE_LONG_V2", "LONG", None)
+        assert decision.allowed is False
+        assert decision.status == GATE_BLOCKED
+
     def test_no_dca_trailing_breakeven(self):
         settings = load_settings()
         policy = settings.execution_policy_configs.get("MOMENTUM_EXHAUSTION_REVERSE_LONG_V2", {}).get("LONG")

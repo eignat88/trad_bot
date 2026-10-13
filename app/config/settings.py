@@ -178,6 +178,7 @@ class Settings:
         ("MOMENTUM_EXHAUSTION_REVERSE_LONG_V1", "LONG"),  # Blocked for OOS validation
         ("MOMENTUM_EXHAUSTION_REVERSE_LONG_V1", "SHORT"),  # Reverse long only trades LONG
         ("MOMENTUM_EXHAUSTION_REVERSE_LONG_V2", "SHORT"),  # Reverse long V2 only trades LONG
+        ("MOMENTUM_EXHAUSTION_REVERSE_LONG_V2", "LONG"),  # Blocked after negative edge validation
         ("ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1", "SHORT"),  # OOS scanner only trades LONG
     )
     # Optional scanner/direction regime allow-lists. Unspecified scanners use
