@@ -120,8 +120,7 @@ def main() -> None:
         )
 
         from app.research.me_reverse_long_v3.activation import (
-            is_v3_evaluator_activated,
-            load_v3_db_activation,
+            resolve_startup_v3_activation,
         )
         from app.research.me_reverse_long_v3.evaluator import (
             MEReverseLongV3ExecutionEvaluator,
@@ -138,23 +137,15 @@ def main() -> None:
         # Per-cycle guard still stops evaluation after deactivation.
         v3_evaluator = None
         if args.enable_me_v3_evaluator:
-            registry = json.loads(
-                (Path(__file__).parent / "prospective_registry.json").read_text()
+            v3_registry_path = (
+                Path(__file__).parent / "prospective_registry.json"
             )
-            specs = registry.get("experiments", [])
-            spec = next(
-                (item for item in specs
-                 if item.get("experiment_id") ==
-                 "MOMENTUM_EXHAUSTION_REVERSE_LONG_V3_OOS"),
-                None,
+            v3_startup_activation = resolve_startup_v3_activation(
+                conn=db_repo._conn,
+                registry_path=v3_registry_path,
+                explicitly_enabled=True,
             )
-            db_status, db_started_at = load_v3_db_activation(db_repo._conn)
-            if is_v3_evaluator_activated(
-                enabled=True,
-                registry_spec=spec,
-                db_status=db_status,
-                db_started_at=db_started_at,
-            ):
+            if v3_startup_activation is not None:
                 from app.research.me_reverse_long_v3.guarded_evaluator import (
                     GuardedV3Evaluator,
                 )
@@ -168,6 +159,7 @@ def main() -> None:
                         Path(__file__).parent / "prospective_registry.json"
                     ),
                     explicitly_enabled=True,
+                    startup_activation=v3_startup_activation,
                 )
 
                 logger.info(

@@ -1,17 +1,17 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from app.models import Candle
-from types import SimpleNamespace
-from app.research.srr_short_execution_r_expansion_prospective_evaluator import (
-    SOURCE_VALIDATED,
-)
 
 from app.research.me_reverse_long_v3.entry_policy import (
     next_executable_entry_at,
 )
 from app.research.me_reverse_long_v3.evaluator import (
     MEReverseLongV3ExecutionEvaluator,
+)
+from app.research.srr_short_execution_r_expansion_prospective_evaluator import (
+    SOURCE_VALIDATED,
 )
 
 UTC = timezone.utc
@@ -93,6 +93,25 @@ def test_missing_candle_does_not_finalize():
     evaluator, source = make_evaluator()
     data = candles()
     data.pop(12)
+    source.fetch_5m_candles.return_value = SimpleNamespace(
+        status=SOURCE_VALIDATED,
+        candles=data,
+        reason_code="SOURCE_VALIDATED",
+    )
+
+    stats = evaluator.run_evaluation_cycle(
+        next_executable_entry_at(SIGNAL) + timedelta(minutes=240)
+    )
+
+    assert stats["coverage_invalid"] == 1
+    record = evaluator.repository.upsert.call_args.args[0]
+    assert record.status == "COVERAGE_INVALID"
+    assert record.gross_r is None
+
+
+def test_incomplete_source_never_finalizes():
+    evaluator, source = make_evaluator()
+    data = candles()[:-1]
     source.fetch_5m_candles.return_value = SimpleNamespace(
         status=SOURCE_VALIDATED,
         candles=data,
