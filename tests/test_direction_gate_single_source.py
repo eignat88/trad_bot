@@ -392,6 +392,7 @@ class TestStaticBlocklistConfig:
         ("MOMENTUM_EXHAUSTION_REVERSE_LONG_V1", "LONG"),
         ("MOMENTUM_EXHAUSTION_REVERSE_LONG_V1", "SHORT"),
         ("MOMENTUM_EXHAUSTION_REVERSE_LONG_V2", "SHORT"),
+        ("MOMENTUM_EXHAUSTION_REVERSE_LONG_V2", "LONG"),  # Blocked after negative edge validation
         ("ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1", "SHORT"),
     })
 
