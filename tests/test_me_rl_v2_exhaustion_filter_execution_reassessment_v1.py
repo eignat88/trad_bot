@@ -258,3 +258,18 @@ def test_empty_replay_replaces_stale_trades(monkeypatch, tmp_path):
 
     assert summary["source_n"] == 0
     assert summary["models"]["B_NEXT_OPEN"]["CONTROL"]["n"] == 0
+
+
+def test_trade_csv_newline_configuration():
+    from pathlib import Path
+
+    p = Path(
+        "tools/research/me_rl_v2_exhaustion_filter_execution_reassessment_v1.py"
+    )
+    source = p.read_text(encoding="utf-8")
+
+    bad = 'lineterminator=' + '"' + chr(92) * 2 + 'n"'
+    good = 'lineterminator=' + '"' + chr(92) + 'n"'
+
+    assert bad not in source
+    assert good in source

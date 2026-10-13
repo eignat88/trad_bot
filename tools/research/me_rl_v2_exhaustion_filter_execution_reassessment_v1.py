@@ -289,7 +289,7 @@ def main():
         writer = csv.DictWriter(
             f,
             fieldnames=trade_fields,
-            lineterminator="\\n",
+            lineterminator="\n",
         )
         writer.writeheader()
         writer.writerows(records)
