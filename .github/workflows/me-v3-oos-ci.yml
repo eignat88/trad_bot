@@ -8,6 +8,8 @@ on:
       - 'app/research/prospective_observer.py'
       - 'app/research/prospective_registry.json'
       - 'app/scanners/momentum_exhaustion_reverse_long_v2.py'
+      - 'app/scanners/context_builder.py'
+      - 'app/scanners/models.py'
       - 'scanner_runner.py'
       - 'sql/migrations/067_me_reverse_long_v3_execution_outcome.sql'
       - 'tests/test_me_reverse_long_v3_*.py'
