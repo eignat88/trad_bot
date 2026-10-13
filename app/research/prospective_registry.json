@@ -702,7 +702,7 @@
       ],
       "filter_rule": "Research classification only: exhaustion_magnitude <= 0.4",
       "threshold": 0.4,
-      "entry_rule": "V2 signal candle close reference; hypothetical fill, not executable proof",
+      "entry_rule": "NEXT_OPEN_5M: opening price of the first strictly later 5m execution candle; hypothetical shadow fill, not executable proof",
       "stop_rule": "2.5% below reference entry",
       "target_rule": "3.0% above reference entry",
       "max_hold_minutes": 240,

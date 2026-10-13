@@ -132,6 +132,10 @@ def main() -> None:
         import json
         from pathlib import Path
 
+        # V3 activation is startup-bound by design.
+        # After a separately approved registry/DB activation, restart
+        # the evaluator with explicit CLI opt-in.
+        # Per-cycle guard still stops evaluation after deactivation.
         v3_evaluator = None
         if args.enable_me_v3_evaluator:
             registry = json.loads(
@@ -165,6 +169,17 @@ def main() -> None:
                     ),
                     explicitly_enabled=True,
                 )
+
+                logger.info(
+                    "ME V3 evaluator activated at startup; "
+                    "later activation requires evaluator restart"
+                )
+
+        if args.enable_me_v3_evaluator and v3_evaluator is None:
+            logger.warning(
+                "ME V3 evaluator inactive at startup; "
+                "activation requires explicit evaluator restart"
+            )
 
         if args.once:
             _run_single_cycle(db_repo._conn, evaluator, prospective_eval, v3_evaluator)

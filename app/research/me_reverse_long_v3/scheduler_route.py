@@ -18,6 +18,7 @@ def route_prospective_experiment(
         if not v3_enabled or v3_evaluator is None:
             return {
                 "signals_checked": 0,
+                "horizons_updated": 0,
                 "finalized": 0,
                 "errors": 0,
                 "skipped_v3": 1,
@@ -26,6 +27,7 @@ def route_prospective_experiment(
         stats = v3_evaluator.run_evaluation_cycle()
         return {
             "signals_checked": stats.get("checked", 0),
+            "horizons_updated": 0,
             "finalized": stats.get("finalized", 0),
             "errors": stats.get("errors", 0),
             "skipped_v3": 0,

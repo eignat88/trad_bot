@@ -151,6 +151,7 @@ class MEReverseLongV3OutcomeRepository:
                   AND o.features->>'_v3_filter_group' = %s
                   AND o.features->>'_v3_execution_entry_at' = %s
                 FOR UPDATE OF o
+                FOR SHARE OF e
                 """,
                 (
                     record.observation_id,
