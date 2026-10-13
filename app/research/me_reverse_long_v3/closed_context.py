@@ -36,7 +36,22 @@ def _closed_only(candles, interval_ms: int, asof_ms: int):
     if len({c.timestamp for c in selected}) != len(selected):
         raise ValueError("DUPLICATE_SOURCE_CANDLE")
 
-    return tuple(sorted(selected, key=lambda c: c.timestamp))
+    ordered = tuple(sorted(selected, key=lambda c: c.timestamp))
+
+    if not ordered:
+        raise ValueError("NO_CLOSED_SOURCE_CANDLES")
+
+    for previous, current in zip(ordered, ordered[1:]):
+        if int(current.timestamp) - int(previous.timestamp) != interval_ms:
+            raise ValueError("GAPPED_SOURCE_CANDLES")
+
+    expected_close = (asof_ms // interval_ms) * interval_ms
+    actual_close = int(ordered[-1].timestamp) + interval_ms
+
+    if actual_close != expected_close:
+        raise ValueError("STALE_SOURCE_CANDLES")
+
+    return ordered
 
 
 def build_closed_v3_context(

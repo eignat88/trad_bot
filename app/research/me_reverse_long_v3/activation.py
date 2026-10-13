@@ -62,6 +62,9 @@ def load_v3_db_activation(conn: Any) -> tuple[str | None, datetime | None]:
         row = cursor.fetchone()
         return (row[0], row[1]) if row else (None, None)
     except Exception:
+        # PostgreSQL requires rollback after a failed statement.
+        # Prevent the shared evaluator connection remaining aborted.
+        conn.rollback()
         return None, None
     finally:
         if cursor is not None:

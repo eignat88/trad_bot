@@ -748,6 +748,35 @@ class ProspectiveOOSObserver:
             )
             return None
 
+        # Lock the authoritative experiment lifecycle row until the
+        # surrounding observer transaction commits. A concurrent PAUSE
+        # or COMPLETE must not race the V3 observation INSERT.
+        cursor.execute(
+            """
+            SELECT started_at
+            FROM research.prospective_experiment
+            WHERE experiment_id = %s
+              AND status = 'RUNNING'
+              AND started_at IS NOT NULL
+            FOR SHARE
+            """,
+            (exp_id,),
+        )
+        lifecycle_row = cursor.fetchone()
+        if lifecycle_row is None:
+            return None
+
+        db_started_at = lifecycle_row[0]
+        if (
+            not hasattr(db_started_at, "astimezone")
+            or not hasattr(db_started_at, "utcoffset")
+            or db_started_at.tzinfo is None
+            or db_started_at.utcoffset() is None
+        ):
+            return None
+        if db_started_at.astimezone(timezone.utc) != freeze_dt.astimezone(timezone.utc):
+            return None
+
         cursor.execute(
             """
             INSERT INTO research.prospective_observation (

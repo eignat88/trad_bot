@@ -49,10 +49,14 @@ def capture(
     activation_ready=True,
     entry_zone_low=99.8,
     shadow=True,
+    locked_started_at=FREEZE,
 ):
     observer = make_observer(activation_ready)
     cursor = MagicMock()
-    cursor.fetchone.return_value = (123,)
+    cursor.fetchone.side_effect = [
+        (locked_started_at,) if locked_started_at is not None else None,
+        (123,),
+    ]
 
     result = observer._observe_me_reverse_long_v3(
         cursor=cursor,
@@ -333,4 +337,39 @@ def test_capture_just_before_execution_entry_allowed(fixed_observer_clock):
     result, cursor, _ = capture()
 
     assert result == 123
-    cursor.execute.assert_called_once()
+    assert cursor.execute.call_count == 2
+    lock_sql = cursor.execute.call_args_list[0].args[0]
+    insert_sql = cursor.execute.call_args_list[1].args[0]
+    assert "FOR SHARE" in lock_sql
+    assert "INSERT INTO research.prospective_observation" in insert_sql
+
+
+
+def test_v3_capture_requires_lifecycle_lock_before_insert():
+    result, cursor, _ = capture()
+
+    assert result == 123
+    assert cursor.execute.call_count == 2
+    assert "FOR SHARE" in cursor.execute.call_args_list[0].args[0]
+    assert "INSERT INTO research.prospective_observation" in (
+        cursor.execute.call_args_list[1].args[0]
+    )
+
+
+@pytest.mark.parametrize("locked_started_at", [
+    None,
+    FREEZE + timedelta(seconds=1),
+    123,
+])
+def test_v3_invalid_locked_lifecycle_never_inserts(locked_started_at):
+    result, cursor, _ = capture(
+        locked_started_at=locked_started_at,
+    )
+
+    assert result is None
+    assert cursor.execute.call_count == 1
+    assert "FOR SHARE" in cursor.execute.call_args_list[0].args[0]
+    assert all(
+        "INSERT INTO research.prospective_observation" not in call.args[0]
+        for call in cursor.execute.call_args_list
+    )
