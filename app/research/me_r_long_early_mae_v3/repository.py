@@ -310,6 +310,8 @@ class MeEarlyMaeV3Repository:
             v.variant_id for v in VARIANTS
         }:
             raise ValueError("EXPECTED_EXACTLY_SEVEN_VARIANTS")
+        if baseline.get("baseline_exit_reason") == "AMBIGUOUS_STOP_FIRST":
+            raise ValueError("AMBIGUOUS_BASELINE_CANNOT_FINALIZE")
         if not can_finalize(evaluations):
             raise ValueError("INCOMPLETE_NONFINAL_OUTCOME")
         cursor = self._cursor()

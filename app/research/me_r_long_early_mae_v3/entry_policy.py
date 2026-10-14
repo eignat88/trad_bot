@@ -55,6 +55,10 @@ def decide_next_open(
         return EntryDecision("ENTRY_NOT_FILLED", "EXPIRED_BEFORE_NEXT_OPEN")
 
     window_end = entry_at + timedelta(minutes=5)
+    if observed < window_end:
+        return EntryDecision(
+            "ENTRY_PENDING", "SELECTED_ENTRY_CANDLE_UNCLOSED"
+        )
     window, error = validate_window(candles, entry_at, window_end)
     if error:
         return EntryDecision("INCOMPLETE_COVERAGE", error)
