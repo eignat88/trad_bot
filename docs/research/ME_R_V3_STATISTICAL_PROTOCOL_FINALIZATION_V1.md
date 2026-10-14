@@ -1,6 +1,6 @@
 # ME_R_V3_STATISTICAL_PROTOCOL_FINALIZATION_V1
 
-**Status:** PROPOSED FOR OPERATOR REVIEW — NOT FROZEN / NOT ACTIVATED  
+**Status:** PARTIALLY OPERATOR-APPROVED STATISTICAL PRINCIPLES — METHOD PENDING / NOT FROZEN / NOT ACTIVATED  
 **Recorded:** 2026-10-14  
 **Experiment:** `ME_R_LONG_EARLY_MAE_EXIT_OOS_V3`  
 **Protocol:** `3.0.0-DRAFT`  
@@ -19,7 +19,18 @@ Each eligible, naturally captured, post-activation **filled source event** is on
 
 Primary paired inference only includes sources with valid, fully mature, unambiguous finalized baseline and exactly seven consistent finalized variant outcomes, complete candle coverage and non-null paired fields. **Do not silently omit** filled rows with ambiguous, invalid, incomplete, immature or missing outcomes: enumerate reasons and rates in an eligibility-flow table; unresolved integrity violations suspend a positive verdict. Never backfill history. A finalized paired cohort may contain multiple records per symbol/day; do not treat them as independent for uncertainty estimation.
 
-`filled_n` is the number of eligible prospective filled source events for the checkpoints; `paired_finalized_n` is the analysis-ready subset. At minimum both checkpoint coverage and sufficient finalized paired records must be established before a statistical verdict; the precise required finalized minimum must be agreed before freeze (a 100-filled threshold alone does not guarantee 100 analyzable observations).
+`filled_n` is the number of eligible prospective filled source events for the checkpoints; `paired_finalized_n` is the analysis-ready subset. **Operator-approved additional minimum (2026-10-14): at least 100 valid paired finalized source events**, in addition to the 100 filled / 20 symbols / 20 OOS days checkpoint. The checkpoint does not guarantee enough finalized pairs. Formal quality/concentration gates remain pending.
+
+## 2A. Additional operator decisions — 2026-10-14
+
+**Approved in conversation, for preregistration in this research-only draft:**
+
+- Require **at least 100 valid paired FINALIZED source events** for the first statistical evaluation, as well as the independently approved >=100 filled / >=20 symbols / >=20 OOS days thresholds.
+- Perform **exactly one planned confirmatory PRIMARY analysis** for `MAE_15m_050`; additional confirmatory looks or repeated testing for a favorable result are forbidden.
+- The six other variants remain **SECONDARY, descriptive/exploratory only**; no promotion to PRIMARY on the same holdout and no independent positive-edge claim.
+- Preserve the ban on any early positive verdict and on treating a passed sample-size checkpoint as proof of edge.
+
+**Not approved by this decision:** an exact clustering/bootstrap algorithm, objective quality or concentration cutoffs, data-exclusion sensitivity policy, final negative/inconclusive disposition, analysis-lock procedure, protocol freeze, migrations, runtime deployment, or activation.
 
 ## 3. Proposed confidence interval — IMPLEMENTATION DETAILS PENDING
 
@@ -37,11 +48,11 @@ Only `MAE_15m_050` is confirmatory. The other six predeclared variants are descr
 
 - **Before 30/10/5:** integrity monitoring only.
 - **At/after 30/10/5:** one operational review; no positive statistical conclusion.
-- **At/after 100/20/20:** perform the first preregistered PRIMARY statistical evaluation *when all required paired records and integrity checks are mature*. Do not run a positive-edge test repeatedly while waiting for more observations.
+- **At/after 100/20/20 AND >=100 valid paired finalized:** perform the **one operator-approved, preregistered confirmatory PRIMARY analysis** when maturity and integrity conditions are met. No additional confirmatory looks or repeated peeking to seek a positive verdict. The exact analysis lock/cutoff procedure remains to be specified before freeze.
 - **PRIMARY positive relative-improvement candidate:** paired delta point estimate > 0 and lower bound of validated 95% CI > 0, with integrity/coverage and concentration gates satisfied. This supports relative research-proxy improvement only; **not** positive absolute strategy expectancy and **not** live-price executability.
 - **PRIMARY negative relative-improvement result:** upper bound of 95% CI < 0 after a valid planned analysis.
 - **INCONCLUSIVE:** CI spans/touches zero, insufficient analyzable coverage/clusters, or uncertainty is not trustworthy.
-- **No automatic termination** on a negative or inconclusive result. The action following the first statistical checkpoint (close versus extend, future analysis dates/sample bounds, and any sequential-error correction) requires a **separate preregistered operator decision before freeze**. Without that decision, no further confirmatory repeated testing is authorized.
+- **No automatic termination** on a negative or inconclusive result. The action following the first statistical checkpoint (close versus extend, future analysis dates/sample bounds, and any sequential-error correction) requires a **separate preregistered operator decision before freeze**. Without that decision, no further confirmatory repeated testing is authorized. The operator explicitly approved **only one confirmatory PRIMARY look** on 2026-10-14.
 
 For reporting a **tradeable edge**, additionally require evidence of positive absolute variant Net E[R] after costs, execution realism/price feasibility, and a separately authorized validation; paired relative improvement alone is insufficient.
 
@@ -52,7 +63,7 @@ The `HORIZON_END_CONDITIONAL_MAE_EXIT` uses the completed 5m horizon candle's CL
 ## 7. Approval gates still open
 
 - Specify and test the exact bootstrap/resampling implementation, missingness/ambiguity policy and objective concentration gates.
-- Approve full stopping rules, analysis-ready finalized minimum, negative/inconclusive handling and any future looks.
+- Specify remaining stopping implementation details (analysis lock/cutoff, negative/inconclusive handling and disposition following the sole confirmatory look). The >=100 paired-finalized minimum and single PRIMARY confirmatory look are already operator-approved.
 - Agree on whether exploratory uncertainty intervals need multiplicity adjustment or only descriptive status (default here is strictly descriptive).
 - Complete the causal executability qualification.
 - Separate operator authorizations for frozen payload/fingerprint/timestamp, PostgreSQL migrations 068–070, dedicated service deployment, and activation.
