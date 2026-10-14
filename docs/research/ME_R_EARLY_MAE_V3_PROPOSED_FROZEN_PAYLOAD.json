@@ -1,0 +1,132 @@
+{
+  "draft": true,
+  "approved_for_activation": false,
+  "experiment_id": "ME_R_LONG_EARLY_MAE_EXIT_OOS_V3",
+  "protocol_version": "3.0.0-DRAFT",
+  "schema": "research_me_early_mae_v3",
+  "source": {
+    "scanner_name": "ME_R_LONG_CLOSED_V1",
+    "scanner_version": "1.0.0-DRAFT",
+    "direction": "LONG",
+    "ruleset": "FROZEN_V1_RULES_ON_COMPLETED_CANDLES",
+    "source_candle_version": "MARKET_CANDLE_CLOSED_5M_V1",
+    "required_timeframes": [
+      "5m",
+      "15m",
+      "1h"
+    ],
+    "historical_backfill": "FORBIDDEN",
+    "production_scanner_modification": "FORBIDDEN"
+  },
+  "temporal": {
+    "timezone": "UTC",
+    "source_candle_must_close_before_detection": true,
+    "indicators_must_use_closed_candles": true,
+    "source_available_at_rule": "source_candle_close_at + configured_processing_latency",
+    "detected_at_must_be_at_or_after_source_available_at": true,
+    "duplicates": "REJECT_WINDOW",
+    "gaps": "INCOMPLETE_COVERAGE",
+    "future_candles": "REJECT",
+    "clock_skew": "FAIL_CLOSED",
+    "max_source_delay_seconds": 300,
+    "late_or_incomplete_source_data": "REJECT"
+  },
+  "entry": {
+    "primary_model": "NEXT_OPEN_5M",
+    "secondary_model": "NOT_USED",
+    "expiry_minutes": 240,
+    "fill_rule": "First completed 5m candle open at or after entry_eligible_at",
+    "reference_price_as_fill": "FORBIDDEN",
+    "incomplete_coverage": "NO_FILL"
+  },
+  "baseline": {
+    "policy": "FIXED_TP_SL_HORIZON_V3",
+    "direction": "LONG",
+    "stop_pct": 0.025,
+    "target_pct": 0.03,
+    "max_hold_minutes": 240,
+    "intrabar_policy": "STOP_FIRST",
+    "timeout_policy": "FIRST_COMPLETED_5M_CLOSE_AT_OR_AFTER_DEADLINE",
+    "taker_fee_per_side": 0.00055,
+    "normal_slippage_per_side": 0.0005,
+    "elevated_slippage_per_side": 0.001,
+    "funding": "NOT_MODELED",
+    "dca": false,
+    "trailing": false,
+    "breakeven": false
+  },
+  "variants": [
+    {
+      "variant_id": "MAE_10m_040",
+      "horizon_minutes": 10,
+      "threshold_mae_r": 0.4,
+      "is_primary": false,
+      "role": "SECONDARY"
+    },
+    {
+      "variant_id": "MAE_10m_050",
+      "horizon_minutes": 10,
+      "threshold_mae_r": 0.5,
+      "is_primary": false,
+      "role": "SECONDARY"
+    },
+    {
+      "variant_id": "MAE_15m_040",
+      "horizon_minutes": 15,
+      "threshold_mae_r": 0.4,
+      "is_primary": false,
+      "role": "SECONDARY"
+    },
+    {
+      "variant_id": "MAE_15m_050",
+      "horizon_minutes": 15,
+      "threshold_mae_r": 0.5,
+      "is_primary": true,
+      "role": "PRIMARY"
+    },
+    {
+      "variant_id": "MAE_15m_060",
+      "horizon_minutes": 15,
+      "threshold_mae_r": 0.6,
+      "is_primary": false,
+      "role": "SECONDARY"
+    },
+    {
+      "variant_id": "MAE_15m_075",
+      "horizon_minutes": 15,
+      "threshold_mae_r": 0.75,
+      "is_primary": false,
+      "role": "SECONDARY"
+    },
+    {
+      "variant_id": "MAE_30m_050",
+      "horizon_minutes": 30,
+      "threshold_mae_r": 0.5,
+      "is_primary": false,
+      "role": "SECONDARY"
+    }
+  ],
+  "frozen_at": null,
+  "activation_at": null,
+  "protocol_fingerprint": null,
+  "paper_live_side_effects": "FORBIDDEN",
+  "existing_v2_immutable": true,
+  "existing_me_reverse_long_v3_independent": true,
+  "mae_exit": {
+    "policy": "HORIZON_END_CONDITIONAL_MAE_EXIT",
+    "observe_over_complete_horizon": true,
+    "baseline_sl_tp_precedence": true,
+    "immediate_first_touch_exit": "FORBIDDEN",
+    "research_execution_proxy": "COMPLETED_5M_CLOSE_AT_HORIZON_BOUNDARY",
+    "causal_executability_verification_required": true
+  },
+  "statistics": {
+    "primary_comparison": "PAIRED_NET_DELTA_E_R_VS_BASELINE",
+    "primary_variant_id": "MAE_15m_050",
+    "secondary_variants_role": "EXPLORATORY",
+    "edge_claim_before_prospective_evidence": "FORBIDDEN",
+    "sample_size_checkpoints": "PENDING_OPERATOR_APPROVAL",
+    "statistical_stopping_rules": "PENDING_OPERATOR_APPROVAL",
+    "multiple_comparison_adjustment": "PENDING_OPERATOR_APPROVAL"
+  }
+}

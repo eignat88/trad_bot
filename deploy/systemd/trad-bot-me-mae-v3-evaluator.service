@@ -1,0 +1,17 @@
+[Unit]
+Description=ME_R_EARLY_MAE_V3 research-only evaluator (disabled by default)
+After=postgresql.service
+ConditionEnvironment=ME_EARLY_MAE_V3_CAPTURE_ENABLED=true
+
+[Service]
+Type=simple
+User=tradbot
+WorkingDirectory=/opt/trad_bot
+Environment=ME_EARLY_MAE_V3_CAPTURE_ENABLED=false
+ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.me_r_long_early_mae_v3.runner --once
+NoNewPrivileges=true
+PrivateTmp=true
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
