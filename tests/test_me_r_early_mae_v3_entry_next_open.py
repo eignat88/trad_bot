@@ -28,9 +28,14 @@ def test_duplicate_entry_candle_is_incomplete():
     d = decision([c(1), c(1)], eligible=T, asof=T + timedelta(minutes=10))
     assert d.state == "INCOMPLETE_COVERAGE"
 
-def test_expiry_after_entry_window_is_not_filled():
-    d = decision([c(i) for i in range(48)], eligible=T, asof=T + timedelta(minutes=241))
-    assert d.state == "ENTRY_NOT_FILLED" and d.reason == "EXPIRED_AFTER_ENTRY_WINDOW"
+def test_late_evaluation_preserves_prospective_next_open_fill():
+    d = decision(
+        [c(i) for i in range(48)],
+        eligible=T,
+        asof=T + timedelta(minutes=241),
+    )
+    assert d.state == "ENTRY_FILLED"
+    assert d.entry.entry_at == T + timedelta(minutes=5)
 
 def test_incomplete_coverage_retry_remains_pending():
     d = decision([c(1)], eligible=T, asof=T + timedelta(minutes=10))

@@ -40,9 +40,22 @@ class MeEarlyMaeV3SourceAdapter:
         validate_measured_source_availability(
             close_at, measured_available, detected_at
         )
+        fetch_completed_raw = source.get("source_fetch_completed_at")
+        if fetch_completed_raw is None:
+            raise ValueError("SOURCE_FETCH_COMPLETION_PROVENANCE_REQUIRED")
+
+        fetch_started = parse_utc(source["source_fetch_started_at"])
+        fetch_completed = parse_utc(fetch_completed_raw)
+
+        if fetch_completed < fetch_started:
+            raise ValueError("FETCH_COMPLETED_BEFORE_START")
+
         temporal = validate_detection_temporal(
-            close_at, detected_at, parse_utc(source["source_fetch_started_at"])
+            close_at, detected_at, fetch_completed
         )
+
+        if measured_available < fetch_completed:
+            raise ValueError("SOURCE_AVAILABILITY_BEFORE_FETCH_COMPLETION")
         entry_price, stop_price, target_price = execution_geometry(
             float(source["reference_price"])
         )

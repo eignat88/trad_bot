@@ -66,8 +66,9 @@ def decide_next_open(
         return EntryDecision("INCOMPLETE_COVERAGE", "SELECTED_ENTRY_CANDLE_MISSING")
     if candle.close_at > observed:
         return EntryDecision("ENTRY_PENDING", "SELECTED_ENTRY_CANDLE_UNCLOSED")
-    if observed > expiry:
-        return EntryDecision("ENTRY_NOT_FILLED", "EXPIRED_AFTER_ENTRY_WINDOW")
+    # Expiry constrains when entry may occur, not when a previously
+    # captured prospective source may be evaluated after a restart.
+    # The selected entry candle must still be closed as of observation.
     entry_price, stop_price, target_price = execution_geometry(candle.open)
     return EntryDecision(
         "ENTRY_FILLED",
