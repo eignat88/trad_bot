@@ -62,6 +62,18 @@ class MeEarlyMaeV3Repository:
                     json.dumps(payload), fingerprint,
                 ),
             )
+            for variant in VARIANTS:
+                cursor.execute(
+                    f"""INSERT INTO {SOURCE_SCHEMA}.variant (
+                        protocol_version, variant_id, horizon_minutes,
+                        threshold_mae_r, role, is_primary
+                    ) VALUES (%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (protocol_version, variant_id) DO NOTHING""",
+                    (
+                        PROTOCOL_VERSION, variant.variant_id, variant.horizon_minutes,
+                        variant.threshold_mae_r, variant.role, variant.is_primary,
+                    ),
+                )
             cursor.execute(
                 f"""SELECT experiment_id, scanner_name, scanner_version, direction,
                            source_candle_version, frozen_at, activation_at,
@@ -182,8 +194,8 @@ class MeEarlyMaeV3Repository:
                 f"""SELECT variant_id, variant_status, horizon_minutes, threshold_mae_r,
                            role, is_primary
                     FROM {SOURCE_SCHEMA}.variant_outcome
-                    WHERE protocol_version=%s AND source_event_id=%s FOR UPDATE
-                    ORDER BY variant_id""",
+                    WHERE protocol_version=%s AND source_event_id=%s
+                    ORDER BY variant_id FOR UPDATE""",
                 (PROTOCOL_VERSION, source_id),
             )
             stored = {row[0]: row for row in cursor.fetchall()}
@@ -268,13 +280,18 @@ class MeEarlyMaeV3Repository:
             cursor.execute(
                 f"""UPDATE {SOURCE_SCHEMA}.source_event
                     SET source_status='ENTRY_FILLED', coverage_status='PENDING',
-                        entry_filled_at=%(entry_filled_at)s, entry_price=%(entry_price)s,
-                        stop_price=%(stop_price)s, target_price=%(target_price)s,
-                        risk_distance=%(risk_distance)s, baseline_deadline_at=%(baseline_deadline_at)s
-                    WHERE source_event_id=%(source_event_id)s
+                        entry_filled_at=%s, entry_price=%s,
+                        stop_price=%s, target_price=%s,
+                        risk_distance=%s, baseline_deadline_at=%s
+                    WHERE source_event_id=%s
                       AND source_status IN ('DETECTED','ENTRY_PENDING')
                       AND entry_filled_at IS NULL""",
-                {"source_event_id": source_event_id, **entry},
+                (
+                    entry["entry_filled_at"], entry["entry_price"],
+                    entry["stop_price"], entry["target_price"],
+                    entry["risk_distance"], entry["baseline_deadline_at"],
+                    source_event_id,
+                ),
             )
             if cursor.rowcount != 1:
                 raise ValueError("CONFLICTING_OR_DUPLICATE_ENTRY_UPDATE")
@@ -311,7 +328,7 @@ class MeEarlyMaeV3Repository:
                 raise ValueError("SOURCE_NOT_ENTRY_FILLED")
             cursor.execute(
                 f"""SELECT variant_id, variant_status FROM {SOURCE_SCHEMA}.variant_outcome
-                    WHERE protocol_version=%s AND source_event_id=%s FOR UPDATE ORDER BY variant_id""",
+                    WHERE protocol_version=%s AND source_event_id=%s ORDER BY variant_id FOR UPDATE""",
                 (PROTOCOL_VERSION, source_event_id),
             )
             stored = {r[0]: r[1] for r in cursor.fetchall()}
@@ -320,46 +337,76 @@ class MeEarlyMaeV3Repository:
                 raise ValueError("INCOMPLETE_VARIANT_TUPLE")
             if any(status == "FINALIZED" for status in stored.values()):
                 raise ValueError("FINALIZED_VARIANT_IMMUTABLE")
+            if any(
+                row.get("variant_status") not in ("EVALUATED", "AMBIGUOUS", "BASELINE_EXITED_EARLY")
+                for row in evaluations
+            ):
+                raise ValueError("INVALID_FINALIZED_VARIANT_STATUS")
             for evaluation in evaluations:
                 cursor.execute(
                     f"""UPDATE {SOURCE_SCHEMA}.variant_outcome
-                        SET variant_status='FINALIZED', evaluated_at=now(),
-                            trigger_result=%(trigger_result)s, mae_r=%(mae_r)s,
-                            mfe_r=%(mfe_r)s, window_low=%(window_low)s,
-                            window_high=%(window_high)s, horizon_end_at=%(horizon_end_at)s,
-                            variant_exit_at=%(variant_exit_at)s,
-                            variant_exit_price=%(variant_exit_price)s,
-                            variant_exit_reason=%(variant_exit_reason)s,
-                            variant_gross_r=%(variant_gross_r)s,
-                            net_r_normal=%(net_r_normal)s, net_r_elevated=%(net_r_elevated)s,
-                            delta_net_r_normal=%(delta_net_r_normal)s,
-                            delta_net_r_elevated=%(delta_net_r_elevated)s,
-                            ambiguous_ordering=%(ambiguous_ordering)s,
+                        SET variant_status=%s, evaluated_at=now(),
+                            trigger_result=%s, mae_r=%s,
+                            mfe_r=%s, window_low=%s,
+                            window_high=%s, horizon_end_at=%s,
+                            variant_exit_at=%s,
+                            variant_exit_price=%s,
+                            variant_exit_reason=%s,
+                            variant_gross_r=%s,
+                            net_r_normal=%s, net_r_elevated=%s,
+                            delta_net_r_normal=%s,
+                            delta_net_r_elevated=%s,
+                            ambiguous_ordering=%s,
                             coverage_status='COMPLETE', coverage_reason=NULL,
-                            execution_price_semantics=%(execution_price_semantics)s
-                        WHERE protocol_version=%(protocol_version)s
-                          AND source_event_id=%(source_event_id)s
-                          AND variant_id=%(variant_id)s
+                            execution_price_semantics=%s
+                        WHERE protocol_version=%s
+                          AND source_event_id=%s
+                          AND variant_id=%s
                           AND variant_status<>'FINALIZED'""",
-                    {"protocol_version": PROTOCOL_VERSION, "source_event_id": source_event_id, **evaluation},
+                    (
+                        "EVALUATED", evaluation["trigger_result"], evaluation["mae_r"],
+                        evaluation["mfe_r"], evaluation["window_low"],
+                        evaluation["window_high"], evaluation["horizon_end_at"],
+                        evaluation["variant_exit_at"], evaluation["variant_exit_price"],
+                        evaluation["variant_exit_reason"], evaluation["variant_gross_r"],
+                        evaluation["net_r_normal"], evaluation["net_r_elevated"],
+                        evaluation["delta_net_r_normal"], evaluation["delta_net_r_elevated"],
+                        evaluation["ambiguous_ordering"], evaluation["execution_price_semantics"],
+                        PROTOCOL_VERSION, source_event_id, evaluation["variant_id"],
+                    ),
                 )
                 if cursor.rowcount != 1:
                     raise RuntimeError("VARIANT_UPDATE_ROW_COUNT")
             cursor.execute(
                 f"""UPDATE {SOURCE_SCHEMA}.source_event
                     SET source_status='FINALIZED', coverage_status='COMPLETE',
-                        baseline_exit_at=%(baseline_exit_at)s,
-                        baseline_exit_price=%(baseline_exit_price)s,
-                        baseline_exit_reason=%(baseline_exit_reason)s,
-                        baseline_gross_r=%(baseline_gross_r)s,
-                        baseline_net_r_normal=%(baseline_net_r_normal)s,
-                        baseline_net_r_elevated=%(baseline_net_r_elevated)s
-                    WHERE source_event_id=%(source_event_id)s
+                        baseline_exit_at=%s,
+                        baseline_exit_price=%s,
+                        baseline_exit_reason=%s,
+                        baseline_gross_r=%s,
+                        baseline_net_r_normal=%s,
+                        baseline_net_r_elevated=%s
+                    WHERE source_event_id=%s
                       AND source_status='ENTRY_FILLED'""",
-                {"source_event_id": source_event_id, **baseline},
+                (
+                    baseline["baseline_exit_at"], baseline["baseline_exit_price"],
+                    baseline["baseline_exit_reason"], baseline["baseline_gross_r"],
+                    baseline["baseline_net_r_normal"], baseline["baseline_net_r_elevated"],
+                    source_event_id,
+                ),
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("SOURCE_FINALIZATION_ROW_COUNT")
+            for evaluation in evaluations:
+                cursor.execute(
+                    f"""UPDATE {SOURCE_SCHEMA}.variant_outcome
+                        SET variant_status='FINALIZED'
+                        WHERE protocol_version=%s AND source_event_id=%s
+                          AND variant_id=%s AND variant_status<>'FINALIZED'""",
+                    (PROTOCOL_VERSION, source_event_id, evaluation["variant_id"]),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("VARIANT_FINALIZATION_ROW_COUNT")
             self.connection.commit()
         except Exception:
             self.connection.rollback()
