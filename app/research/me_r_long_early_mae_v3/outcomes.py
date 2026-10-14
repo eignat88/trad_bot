@@ -84,33 +84,50 @@ def evaluate_baseline(
     target_price: float,
 ) -> BaselineOutcome:
     step = timedelta(minutes=5)
-    elapsed = int((deadline - entry_at).total_seconds() // 300)
-    if elapsed <= 0 or (deadline - entry_at).total_seconds() % 300 != 0:
+    duration = (deadline - entry_at).total_seconds()
+    if duration <= 0 or duration % 300 != 0:
         return _coverage_error("INVALID_BASELINE_WINDOW")
+
+    elapsed = int(duration // 300)
     window = []
     seen = set()
+
     for candle in candles:
-        if candle.close_at <= entry_at or candle.open_at > deadline:
+        if candle.close_at <= entry_at or candle.open_at >= deadline:
             continue
         if candle.open_at in seen:
             return _coverage_error("DUPLICATE_CANDLE_TIMESTAMP")
         seen.add(candle.open_at)
         window.append(candle)
+
     window.sort(key=lambda c: c.open_at)
-    if len(window) < elapsed:
-        # If terminal evidence is present in the first candle, allow earlier terminal
-        # while retaining fail-closed handling for timeout paths.
-        terminal_probe = first_terminal(window, entry_price, stop_price, target_price)
-        if terminal_probe is None:
+    expected_open = entry_at
+
+    for candle in window:
+        if candle.open_at != expected_open:
             return _coverage_error("INCOMPLETE_BASELINE_COVERAGE")
-    terminal = first_terminal(window[:elapsed], entry_price, stop_price, target_price)
-    if terminal is None:
-        return outcome(
-            entry_price, stop_price, deadline, window[elapsed - 1].close,
-            "FIXED_HORIZON_TIMEOUT",
+        if candle.close_at != expected_open + step:
+            return _coverage_error("INCOMPLETE_BASELINE_COVERAGE")
+
+        terminal = first_terminal(
+            [candle], entry_price, stop_price, target_price
         )
-    candle, reason, ambiguous, exit_price = terminal
-    return outcome(entry_price, stop_price, candle.close_at, exit_price, reason, ambiguous)
+        if terminal is not None:
+            hit_candle, reason, ambiguous, exit_price = terminal
+            return outcome(
+                entry_price, stop_price, hit_candle.close_at,
+                exit_price, reason, ambiguous,
+            )
+
+        expected_open += step
+
+    if len(window) != elapsed:
+        return _coverage_error("INCOMPLETE_BASELINE_COVERAGE")
+
+    return outcome(
+        entry_price, stop_price, deadline, window[-1].close,
+        "FIXED_HORIZON_TIMEOUT",
+    )
 
 
 def _coverage_error(reason: str) -> BaselineOutcome:

@@ -157,7 +157,7 @@ def _source_payload(
 
     return {
         "source_setup_id": source_identity(
-            context.symbol, candidate.signal_candle_open_time
+            context.symbol, SCANNER_NAME, open_at
         ),
         "symbol": context.symbol,
         "instrument_id": None,

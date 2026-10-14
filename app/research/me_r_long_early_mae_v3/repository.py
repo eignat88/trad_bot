@@ -421,7 +421,13 @@ class MeEarlyMaeV3Repository:
     def mark_source_invalid(self, source_event_id: int, reason: str) -> None:
         self._mark_source(source_event_id, "INVALID", "INCOMPLETE", reason)
 
-    def _mark_source(self, source_event_id: int, status: str | None, coverage: str | None, reason: str) -> None:
+    def _mark_source(
+        self,
+        source_event_id: int,
+        status: str | None,
+        coverage: str | None,
+        reason: str,
+    ) -> None:
         cursor = self._cursor()
         try:
             cursor.execute(
@@ -430,17 +436,39 @@ class MeEarlyMaeV3Repository:
                 (source_event_id,),
             )
             row = cursor.fetchone()
-            if row is None or row[0] in ("ENTRY_FILLED", "FINALIZED", "ENTRY_NOT_FILLED", "INVALID"):
+            if row is None:
                 raise ValueError("SOURCE_STATE_IMMUTABLE_OR_TERMINAL")
+
+            current_state = row[0]
+            coverage_only = status is None and coverage == "INCOMPLETE"
+
+            allowed = current_state in ("DETECTED", "ENTRY_PENDING")
+            if current_state == "ENTRY_FILLED" and coverage_only:
+                allowed = True
+
+            if not allowed:
+                raise ValueError("SOURCE_STATE_IMMUTABLE_OR_TERMINAL")
+
+            allowed_sql_states = (
+                ("DETECTED", "ENTRY_PENDING", "ENTRY_FILLED")
+                if coverage_only
+                else ("DETECTED", "ENTRY_PENDING")
+            )
+
             cursor.execute(
                 f"""UPDATE {SOURCE_SCHEMA}.source_event
-                    SET source_status=COALESCE(%(status)s, source_status),
-                        coverage_status=COALESCE(%(coverage_status)s, coverage_status),
-                        invalid_reason=%(reason)s
-                    WHERE source_event_id=%(source_event_id)s
-                      AND source_status IN ('DETECTED','ENTRY_PENDING')""",
-                {"status": status, "coverage_status": coverage, "reason": reason,
-                 "source_event_id": source_event_id},
+                    SET source_status=COALESCE(%s, source_status),
+                        coverage_status=COALESCE(%s, coverage_status),
+                        invalid_reason=%s
+                    WHERE source_event_id=%s
+                      AND source_status IN ({",".join(["%s"] * len(allowed_sql_states))})""",
+                (
+                    status,
+                    coverage,
+                    reason,
+                    source_event_id,
+                    *allowed_sql_states,
+                ),
             )
             if cursor.rowcount != 1:
                 raise ValueError("SOURCE_STATE_TRANSITION_REJECTED")
