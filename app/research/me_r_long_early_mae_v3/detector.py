@@ -16,7 +16,7 @@ from .closed_context import (
     to_frozen_v1_candles,
 )
 from .identity import source_identity
-from .protocol import SCANNER_NAME, SCANNER_VERSION, SOURCE_DIRECTION
+from .protocol import SCANNER_NAME, SCANNER_VERSION, SOURCE_DIRECTION, validate_measured_source_availability
 from .temporal import validate_detection_temporal
 
 
@@ -137,6 +137,13 @@ def _source_payload(
     context: DetectionContext, candidate: SetupCandidate
 ) -> dict:
     signal = context.signal_candle
+    if context.source_fetch_completed_at is None:
+        raise ValueError("SOURCE_FETCH_COMPLETION_PROVENANCE_REQUIRED")
+    validate_measured_source_availability(
+        signal.close_at,
+        context.source_fetch_completed_at,
+        candidate.detected_at,
+    )
     temporal = validate_detection_temporal(
         signal.close_at,
         candidate.detected_at,

@@ -156,8 +156,168 @@ RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN NEW.updated_at = now(); RETURN NEW; END;
 $$;
 
+CREATE OR REPLACE FUNCTION research_me_early_mae_v3.fn_block_finalized_source_update()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.source_status = 'FINALIZED' THEN
+        RAISE EXCEPTION 'FINALIZED_SOURCE_IMMUTABLE';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION research_me_early_mae_v3.fn_block_finalized_source_delete()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.source_status = 'FINALIZED' THEN
+        RAISE EXCEPTION 'FINALIZED_SOURCE_IMMUTABLE';
+    END IF;
+    RETURN OLD;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION research_me_early_mae_v3.fn_block_finalized_variant_update()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.variant_status = 'FINALIZED' THEN
+        RAISE EXCEPTION 'FINALIZED_VARIANT_IMMUTABLE';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION research_me_early_mae_v3.fn_block_finalized_variant_delete()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.variant_status = 'FINALIZED' THEN
+        RAISE EXCEPTION 'FINALIZED_VARIANT_IMMUTABLE';
+    END IF;
+    RETURN OLD;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION research_me_early_mae_v3.fn_validate_finalized_variant_batch()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    v_count integer;
+    p_count integer;
+BEGIN
+    IF NEW.variant_status <> 'FINALIZED' THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.coverage_status <> 'COMPLETE'
+       OR NEW.variant_exit_at IS NULL
+       OR NEW.variant_exit_price IS NULL
+       OR NEW.net_r_normal IS NULL
+       OR NEW.net_r_elevated IS NULL
+       OR NEW.delta_net_r_normal IS NULL
+       OR NEW.delta_net_r_elevated IS NULL
+       OR NEW.execution_price_semantics IS NULL THEN
+        RAISE EXCEPTION 'FINALIZED_VARIANT_INCOMPLETE';
+    END IF;
+    IF NEW.execution_price_semantics NOT IN (
+        'RESEARCH_PRICE_PROXY_NOT_VERIFIED_EXECUTABLE',
+        'BASELINE_EXECUTION_PROXY'
+    ) THEN
+        RAISE EXCEPTION 'UNAPPROVED_EXECUTION_PRICE_SEMANTICS';
+    END IF;
+    SELECT count(*) INTO v_count
+    FROM research_me_early_mae_v3.variant_outcome
+    WHERE protocol_version = NEW.protocol_version
+      AND source_event_id = NEW.source_event_id
+      AND variant_status <> 'FINALIZED';
+    SELECT count(*) INTO p_count
+    FROM research_me_early_mae_v3.variant
+    WHERE protocol_version = NEW.protocol_version AND is_primary;
+    IF v_count <> 0 OR p_count <> 1 THEN
+        RAISE EXCEPTION 'FINALIZED_VARIANT_BATCH_INVALID';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION research_me_early_mae_v3.fn_validate_source_finalization()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    v_count integer;
+    p_count integer;
+BEGIN
+    IF NEW.source_status <> 'FINALIZED' THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.coverage_status <> 'COMPLETE'
+       OR NEW.baseline_exit_at IS NULL
+       OR NEW.baseline_exit_price IS NULL
+       OR NEW.baseline_net_r_normal IS NULL
+       OR NEW.baseline_net_r_elevated IS NULL THEN
+        RAISE EXCEPTION 'FINALIZED_SOURCE_INCOMPLETE';
+    END IF;
+    SELECT count(*) INTO v_count
+    FROM research_me_early_mae_v3.variant_outcome
+    WHERE protocol_version = NEW.protocol_version
+      AND source_event_id = NEW.source_event_id;
+    SELECT count(*) INTO p_count
+    FROM research_me_early_mae_v3.variant
+    WHERE protocol_version = NEW.protocol_version AND is_primary;
+    IF v_count <> 7 OR p_count <> 1 THEN
+        RAISE EXCEPTION 'FINALIZED_SOURCE_VARIANT_TUPLE_INVALID';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION research_me_early_mae_v3.fn_lock_variant_tuple()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.source_status = 'FINALIZED' THEN
+        PERFORM 1 FROM research_me_early_mae_v3.variant_outcome
+        WHERE protocol_version = NEW.protocol_version
+          AND source_event_id = NEW.source_event_id
+        FOR UPDATE;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
 DO $$
 BEGIN
+ IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_me_mae_v3_source_immutable_update') THEN
+  CREATE TRIGGER trg_me_mae_v3_source_immutable_update
+  BEFORE UPDATE ON research_me_early_mae_v3.source_event
+  FOR EACH ROW EXECUTE FUNCTION research_me_early_mae_v3.fn_block_finalized_source_update();
+ END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_me_mae_v3_source_immutable_delete') THEN
+  CREATE TRIGGER trg_me_mae_v3_source_immutable_delete
+  BEFORE DELETE ON research_me_early_mae_v3.source_event
+  FOR EACH ROW EXECUTE FUNCTION research_me_early_mae_v3.fn_block_finalized_source_delete();
+ END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_me_mae_v3_variant_immutable_update') THEN
+  CREATE TRIGGER trg_me_mae_v3_variant_immutable_update
+  BEFORE UPDATE ON research_me_early_mae_v3.variant_outcome
+  FOR EACH ROW EXECUTE FUNCTION research_me_early_mae_v3.fn_block_finalized_variant_update();
+ END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_me_mae_v3_variant_immutable_delete') THEN
+  CREATE TRIGGER trg_me_mae_v3_variant_immutable_delete
+  BEFORE DELETE ON research_me_early_mae_v3.variant_outcome
+  FOR EACH ROW EXECUTE FUNCTION research_me_early_mae_v3.fn_block_finalized_variant_delete();
+ END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_me_mae_v3_variant_finalized_batch') THEN
+  CREATE TRIGGER trg_me_mae_v3_variant_finalized_batch
+  BEFORE UPDATE ON research_me_early_mae_v3.variant_outcome
+  FOR EACH ROW WHEN (NEW.variant_status = 'FINALIZED')
+  EXECUTE FUNCTION research_me_early_mae_v3.fn_validate_finalized_variant_batch();
+ END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_me_mae_v3_source_finalized') THEN
+  CREATE TRIGGER trg_me_mae_v3_source_finalized
+  BEFORE UPDATE ON research_me_early_mae_v3.source_event
+  FOR EACH ROW WHEN (NEW.source_status = 'FINALIZED')
+  EXECUTE FUNCTION research_me_early_mae_v3.fn_validate_source_finalization();
+ END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_me_mae_v3_source_lock_variant_tuple') THEN
+  CREATE TRIGGER trg_me_mae_v3_source_lock_variant_tuple
+  BEFORE UPDATE ON research_me_early_mae_v3.source_event
+  FOR EACH ROW EXECUTE FUNCTION research_me_early_mae_v3.fn_lock_variant_tuple();
+ END IF;
  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_me_mae_v3_source_updated_at') THEN
   CREATE TRIGGER trg_me_mae_v3_source_updated_at
   BEFORE UPDATE ON research_me_early_mae_v3.source_event

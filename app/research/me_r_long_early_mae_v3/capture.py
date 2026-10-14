@@ -11,7 +11,7 @@ from .protocol import (
     SOURCE_DIRECTION,
     execution_geometry,
     parse_utc,
-    source_available_at,
+    validate_measured_source_availability,
 )
 from .temporal import validate_detection_temporal
 
@@ -34,6 +34,12 @@ class MeEarlyMaeV3SourceAdapter:
         detected_at = parse_utc(source["detected_at"])
         if detected_at <= parse_utc(ACTIVATION_AT):
             return None
+        if "source_available_at" not in source or source["source_available_at"] is None:
+            raise ValueError("MEASURED_SOURCE_AVAILABILITY_REQUIRED")
+        measured_available = parse_utc(source["source_available_at"])
+        validate_measured_source_availability(
+            close_at, measured_available, detected_at
+        )
         temporal = validate_detection_temporal(
             close_at, detected_at, parse_utc(source["source_fetch_started_at"])
         )
@@ -48,7 +54,7 @@ class MeEarlyMaeV3SourceAdapter:
         payload = {
             **source,
             "instrument_id": instrument_id,
-            "source_available_at": temporal.source_available_at,
+            "source_available_at": measured_available,
             "entry_eligible_at": max(
                 temporal.source_available_at,
                 detected_at,

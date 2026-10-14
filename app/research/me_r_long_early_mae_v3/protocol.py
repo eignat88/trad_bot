@@ -110,10 +110,22 @@ def validate_source_availability(source_candle_close_at, detected_at) -> None:
         raise ValueError("SOURCE_DELAY_EXCEEDS_300_SECONDS")
 
 
-def source_available_at(source_candle_close_at: datetime) -> datetime:
-    return parse_utc(source_candle_close_at) + timedelta(
-        seconds=MAX_SOURCE_DELAY_SECONDS
-    )
+def validate_measured_source_availability(
+    source_candle_close_at: datetime,
+    source_available_at: datetime,
+    detected_at: datetime,
+) -> None:
+    close_at = parse_utc(source_candle_close_at)
+    available = parse_utc(source_available_at)
+    detected = parse_utc(detected_at)
+    if available < close_at:
+        raise ValueError("SOURCE_AVAILABILITY_BEFORE_CLOSE")
+    if available > detected:
+        raise ValueError("SOURCE_AVAILABILITY_AFTER_DETECTION")
+    if (available - close_at).total_seconds() > MAX_SOURCE_DELAY_SECONDS:
+        raise ValueError("SOURCE_AVAILABILITY_EXCEEDS_300_SECONDS")
+    if (detected - close_at).total_seconds() > MAX_SOURCE_DELAY_SECONDS:
+        raise ValueError("SOURCE_DELAY_EXCEEDS_300_SECONDS")
 
 
 def entry_eligible_at(source_available_at_value, detected_at, activation_at):

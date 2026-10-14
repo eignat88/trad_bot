@@ -7,7 +7,7 @@ from datetime import datetime
 from .protocol import (
     MAX_SOURCE_DELAY_SECONDS,
     parse_utc,
-    source_available_at,
+    validate_measured_source_availability,
 )
 
 
@@ -29,14 +29,18 @@ def validate_detection_temporal(
     detected = parse_utc(detected_at)
     completed = None if fetch_completed_at is None else parse_utc(fetch_completed_at)
 
-    if completed is not None and completed > detected:
+    if completed is None:
+        raise ValueError("SOURCE_FETCH_COMPLETION_PROVENANCE_REQUIRED")
+    if completed > detected:
         raise ValueError("DETECTION_BEFORE_FETCH_COMPLETION")
     delay = int((detected - close_at).total_seconds())
     if delay < 0:
         raise ValueError("SOURCE_CANDLE_NOT_CLOSED")
     if delay > MAX_SOURCE_DELAY_SECONDS:
         raise ValueError("SOURCE_DELAY_EXCEEDS_300_SECONDS")
-    available = min(detected, source_available_at(close_at))
+    if completed is None:
+        raise ValueError("SOURCE_FETCH_COMPLETION_PROVENANCE_REQUIRED")
+    available = completed
     return SourceTemporal(close_at, available, detected, completed, delay)
 
 
