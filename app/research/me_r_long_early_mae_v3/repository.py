@@ -338,7 +338,8 @@ class MeEarlyMaeV3Repository:
             if any(status == "FINALIZED" for status in stored.values()):
                 raise ValueError("FINALIZED_VARIANT_IMMUTABLE")
             if any(
-                row.get("variant_status") not in ("EVALUATED", "AMBIGUOUS", "BASELINE_EXITED_EARLY")
+                row.get("variant_status") not in ("EVALUATED", "BASELINE_EXITED_EARLY")
+                or row.get("ambiguous_ordering") is not False
                 for row in evaluations
             ):
                 raise ValueError("INVALID_FINALIZED_VARIANT_STATUS")
@@ -407,6 +408,173 @@ class MeEarlyMaeV3Repository:
                 )
                 if cursor.rowcount != 1:
                     raise RuntimeError("VARIANT_FINALIZATION_ROW_COUNT")
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+
+    def save_ambiguous_outcome(
+        self,
+        source_event_id: int,
+        baseline: dict[str, Any],
+        evaluations: list[dict[str, Any]],
+    ) -> None:
+        """Atomically persist seven diagnostic outcomes without finalization."""
+        expected = {v.variant_id for v in VARIANTS}
+        actual = [row.get("variant_id") for row in evaluations]
+
+        if len(actual) != 7 or set(actual) != expected:
+            raise ValueError("EXPECTED_EXACTLY_SEVEN_VARIANTS")
+
+        if any(
+            row.get("variant_status") == "INCOMPLETE_COVERAGE"
+            or row.get("coverage_reason") is not None
+            for row in evaluations
+        ):
+            raise ValueError("INCOMPLETE_DIAGNOSTIC_TUPLE")
+
+        allowed = {"EVALUATED", "AMBIGUOUS", "BASELINE_EXITED_EARLY"}
+        if any(
+            row.get("variant_status") not in allowed
+            for row in evaluations
+        ):
+            raise ValueError("INVALID_DIAGNOSTIC_VARIANT_STATUS")
+
+        if not any(
+            row.get("variant_status") == "AMBIGUOUS"
+            or row.get("ambiguous_ordering") is True
+            for row in evaluations
+        ):
+            raise ValueError("AMBIGUOUS_OUTCOME_REQUIRED")
+
+        if baseline.get("source_status") != "AMBIGUOUS_NONFINAL":
+            raise ValueError("INVALID_DIAGNOSTIC_SOURCE_STATUS")
+
+        if baseline.get("coverage_status") != "COMPLETE":
+            raise ValueError("INCOMPLETE_DIAGNOSTIC_BASELINE")
+
+        required = (
+            "variant_exit_at",
+            "variant_exit_price",
+            "variant_gross_r",
+            "net_r_normal",
+            "net_r_elevated",
+            "delta_net_r_normal",
+            "delta_net_r_elevated",
+            "execution_price_semantics",
+        )
+        if any(
+            any(row.get(field) is None for field in required)
+            or type(row.get("ambiguous_ordering")) is not bool
+            for row in evaluations
+        ):
+            raise ValueError("INCOMPLETE_DIAGNOSTIC_TUPLE")
+
+        cursor = self._cursor()
+        try:
+            cursor.execute(
+                f"""SELECT source_status
+                    FROM {SOURCE_SCHEMA}.source_event
+                    WHERE source_event_id=%s FOR UPDATE""",
+                (source_event_id,),
+            )
+            source = cursor.fetchone()
+            if source is None or source[0] != "ENTRY_FILLED":
+                raise ValueError("DIAGNOSTIC_SOURCE_NOT_ENTRY_FILLED")
+
+            cursor.execute(
+                f"""SELECT variant_id, variant_status
+                    FROM {SOURCE_SCHEMA}.variant_outcome
+                    WHERE protocol_version=%s
+                      AND source_event_id=%s
+                    ORDER BY variant_id FOR UPDATE""",
+                (PROTOCOL_VERSION, source_event_id),
+            )
+            stored = cursor.fetchall()
+            if (
+                len(stored) != 7
+                or {row[0] for row in stored} != expected
+                or any(row[1] == "FINALIZED" for row in stored)
+            ):
+                raise ValueError("DIAGNOSTIC_VARIANT_TUPLE_INVALID")
+
+            for item in evaluations:
+                cursor.execute(
+                    f"""UPDATE {SOURCE_SCHEMA}.variant_outcome
+                        SET variant_status=%s,
+                            evaluated_at=now(),
+                            trigger_result=%s,
+                            mae_r=%s, mfe_r=%s,
+                            window_low=%s, window_high=%s,
+                            horizon_end_at=%s,
+                            variant_exit_at=%s,
+                            variant_exit_price=%s,
+                            variant_exit_reason=%s,
+                            variant_gross_r=%s,
+                            net_r_normal=%s,
+                            net_r_elevated=%s,
+                            delta_net_r_normal=%s,
+                            delta_net_r_elevated=%s,
+                            ambiguous_ordering=%s,
+                            coverage_status='COMPLETE',
+                            coverage_reason=NULL,
+                            execution_price_semantics=%s
+                        WHERE protocol_version=%s
+                          AND source_event_id=%s
+                          AND variant_id=%s
+                          AND variant_status<>'FINALIZED'""",
+                    (
+                        item["variant_status"],
+                        item["trigger_result"],
+                        item["mae_r"],
+                        item["mfe_r"],
+                        item["window_low"],
+                        item["window_high"],
+                        item["horizon_end_at"],
+                        item["variant_exit_at"],
+                        item["variant_exit_price"],
+                        item["variant_exit_reason"],
+                        item["variant_gross_r"],
+                        item["net_r_normal"],
+                        item["net_r_elevated"],
+                        item["delta_net_r_normal"],
+                        item["delta_net_r_elevated"],
+                        item["ambiguous_ordering"],
+                        item["execution_price_semantics"],
+                        PROTOCOL_VERSION,
+                        source_event_id,
+                        item["variant_id"],
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("DIAGNOSTIC_VARIANT_UPDATE_ROW_COUNT")
+
+            cursor.execute(
+                f"""UPDATE {SOURCE_SCHEMA}.source_event
+                    SET source_status='AMBIGUOUS_NONFINAL',
+                        coverage_status='COMPLETE',
+                        baseline_exit_at=%s,
+                        baseline_exit_price=%s,
+                        baseline_exit_reason=%s,
+                        baseline_gross_r=%s,
+                        baseline_net_r_normal=%s,
+                        baseline_net_r_elevated=%s
+                    WHERE source_event_id=%s
+                      AND source_status='ENTRY_FILLED'""",
+                (
+                    baseline["baseline_exit_at"],
+                    baseline["baseline_exit_price"],
+                    baseline["baseline_exit_reason"],
+                    baseline["baseline_gross_r"],
+                    baseline["baseline_net_r_normal"],
+                    baseline["baseline_net_r_elevated"],
+                    source_event_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("DIAGNOSTIC_SOURCE_UPDATE_ROW_COUNT")
+
             self.connection.commit()
         except Exception:
             self.connection.rollback()

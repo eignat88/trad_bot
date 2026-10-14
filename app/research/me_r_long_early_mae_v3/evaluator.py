@@ -14,7 +14,12 @@ from .protocol import (
 )
 from .variants import evaluate_all
 
-FINAL_STATES = frozenset({"ENTRY_NOT_FILLED", "INVALID", "FINALIZED"})
+FINAL_STATES = frozenset({
+    "ENTRY_NOT_FILLED",
+    "INVALID",
+    "FINALIZED",
+    "AMBIGUOUS_NONFINAL",
+})
 
 
 class MeEarlyMaeV3Evaluator:
@@ -130,6 +135,27 @@ class MeEarlyMaeV3Evaluator:
             float(source["target_price"]),
             baseline,
         )
+        if baseline.ambiguous or any(
+            outcome.ambiguous_ordering or outcome.variant_status == "AMBIGUOUS"
+            for outcome in outcomes
+        ):
+            self.repository.save_ambiguous_outcome(
+                int(source["source_event_id"]),
+                {
+                    "source_status": "AMBIGUOUS_NONFINAL",
+                    "coverage_status": "COMPLETE",
+                    "baseline_exit_at": baseline.exit_at,
+                    "baseline_exit_price": baseline.exit_price,
+                    "baseline_exit_reason": baseline.exit_reason,
+                    "baseline_gross_r": baseline.gross_r,
+                    "baseline_net_r_normal": baseline.net_r_normal,
+                    "baseline_net_r_elevated": baseline.net_r_elevated,
+                },
+                [outcome.__dict__ for outcome in outcomes],
+            )
+            stats["variants"] += len(outcomes)
+            return
+
         self.repository.save_paired_outcome(
             int(source["source_event_id"]),
             {

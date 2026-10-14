@@ -38,6 +38,27 @@ class VariantOutcome:
     execution_price_semantics: str | None
 
 
+
+def _terminal_threshold_collision(
+    candle: ClosedCandle,
+    variant: VariantDef,
+    entry_price: float,
+    stop_price: float,
+    target_price: float,
+) -> bool:
+    """Diagnostic same-candle threshold/terminal overlap; never executes MAE."""
+    risk = entry_price - stop_price
+    if risk <= 0:
+        return False
+
+    threshold_hit = (
+        (entry_price - candle.low) / risk >= variant.threshold_mae_r
+    )
+    terminal_hit = (
+        candle.low <= stop_price or candle.high >= target_price
+    )
+    return threshold_hit and terminal_hit
+
 def evaluate_variant(
     variant: VariantDef,
     candles: list[ClosedCandle],
@@ -49,30 +70,58 @@ def evaluate_variant(
 ) -> VariantOutcome:
     horizon_end = entry_at + timedelta(minutes=variant.horizon_minutes)
     if baseline.exit_at is not None and baseline.exit_at < horizon_end:
-        inherited = _baseline_inherit(variant, baseline)
-        if baseline.exit_reason in ("STOP_LOSS", "TAKE_PROFIT", "AMBIGUOUS_STOP_FIRST"):
-            inherited = VariantOutcome(
-                variant_status=inherited.variant_status,
-                variant_id=inherited.variant_id,
-                mae_r=inherited.mae_r,
-                mfe_r=inherited.mfe_r,
-                window_low=inherited.window_low,
-                window_high=inherited.window_high,
-                trigger_result="BASELINE_SL_TP_PRECEDENCE",
-                horizon_end_at=inherited.horizon_end_at,
-                variant_exit_at=inherited.variant_exit_at,
-                variant_exit_price=inherited.variant_exit_price,
-                variant_exit_reason=inherited.variant_exit_reason,
-                variant_gross_r=inherited.variant_gross_r,
-                net_r_normal=inherited.net_r_normal,
-                net_r_elevated=inherited.net_r_elevated,
-                delta_net_r_normal=inherited.delta_net_r_normal,
-                delta_net_r_elevated=inherited.delta_net_r_elevated,
-                ambiguous_ordering=inherited.ambiguous_ordering,
-                coverage_reason=inherited.coverage_reason,
-                execution_price_semantics=inherited.execution_price_semantics,
+        early_window, error = validate_window(
+            candles, entry_at, baseline.exit_at,
+        )
+        if error:
+            return _incomplete(variant, horizon_end, error)
+
+        risk = entry_price - stop_price
+        if risk <= 0:
+            return _incomplete(variant, horizon_end, "INVALID_RISK_DISTANCE")
+
+        low = min(c.low for c in early_window)
+        high = max(c.high for c in early_window)
+
+        trigger_result = (
+            "BASELINE_SL_TP_PRECEDENCE"
+            if baseline.exit_reason in (
+                "STOP_LOSS", "TAKE_PROFIT", "AMBIGUOUS_STOP_FIRST"
             )
-        return inherited
+            else "BASELINE_EXITED_EARLY"
+        )
+
+        terminal_candle = early_window[-1]
+        diagnostic_ambiguous = (
+            baseline.ambiguous
+            or (
+                baseline.exit_reason in (
+                    "STOP_LOSS", "TAKE_PROFIT", "AMBIGUOUS_STOP_FIRST"
+                )
+                and _terminal_threshold_collision(
+                    terminal_candle, variant,
+                    entry_price, stop_price, target_price,
+                )
+            )
+        )
+        execution = outcome(
+            entry_price, stop_price,
+            baseline.exit_at, baseline.exit_price,
+            baseline.exit_reason, diagnostic_ambiguous,
+        )
+
+        return _from_execution(
+            variant,
+            execution,
+            baseline,
+            trigger_result=trigger_result,
+            coverage="COMPLETE",
+            horizon_end=horizon_end,
+            window=early_window,
+            mae_r=(entry_price - low) / risk,
+            mfe_r=(high - entry_price) / risk,
+        )
+
     window, error = validate_window(
         candles, entry_at, horizon_end, variant.horizon_minutes
     )
@@ -82,14 +131,28 @@ def evaluate_variant(
     if terminal is not None:
         candle, reason, ambiguous, exit_price = terminal
         if candle.close_at <= horizon_end:
+            diagnostic_ambiguous = (
+                ambiguous
+                or _terminal_threshold_collision(
+                    candle, variant,
+                    entry_price, stop_price, target_price,
+                )
+            )
             return _from_execution(
                 variant,
-                outcome(entry_price, stop_price, candle.close_at, exit_price, reason, ambiguous),
+                outcome(
+                    entry_price, stop_price, candle.close_at,
+                    exit_price, reason, diagnostic_ambiguous,
+                ),
                 baseline,
                 trigger_result="BASELINE_SL_TP_PRECEDENCE",
                 coverage="COMPLETE",
                 horizon_end=horizon_end,
                 window=window,
+                mae_r=(entry_price - min(c.low for c in window))
+                / (entry_price - stop_price),
+                mfe_r=(max(c.high for c in window) - entry_price)
+                / (entry_price - stop_price),
             )
     window_low = min(c.low for c in window)
     window_high = max(c.high for c in window)

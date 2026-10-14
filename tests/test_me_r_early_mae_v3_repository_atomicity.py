@@ -1,7 +1,8 @@
 from app.research.me_r_long_early_mae_v3.lifecycle import can_finalize
 
 BASE = {
-    "variant_status": "EVALUATED", "coverage_reason": None,
+    "variant_status": "EVALUATED",
+            "ambiguous_ordering": False, "coverage_reason": None,
     "net_r_normal": 1.0, "net_r_elevated": 0.9,
     "delta_net_r_normal": 0.1, "delta_net_r_elevated": 0.05,
     "variant_exit_at": "2026-01-01T00:10:00+00:00",

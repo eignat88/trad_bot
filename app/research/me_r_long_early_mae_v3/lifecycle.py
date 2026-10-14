@@ -5,7 +5,7 @@ from typing import Any
 
 from .protocol import VARIANTS
 
-COMPLETE_STATUSES = frozenset({"EVALUATED", "AMBIGUOUS", "BASELINE_EXITED_EARLY"})
+COMPLETE_STATUSES = frozenset({"EVALUATED", "BASELINE_EXITED_EARLY"})
 
 
 def can_finalize(evaluations: list[dict[str, Any]]) -> bool:
@@ -15,6 +15,7 @@ def can_finalize(evaluations: list[dict[str, Any]]) -> bool:
         return False
     return all(
         row.get("variant_status") in COMPLETE_STATUSES
+        and row.get("ambiguous_ordering") is False
         and row.get("coverage_reason") is None
         and row.get("net_r_normal") is not None
         and row.get("net_r_elevated") is not None
