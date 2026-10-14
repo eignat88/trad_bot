@@ -1,28 +1,33 @@
 from datetime import datetime, timedelta, timezone
-from app.research.me_r_long_early_mae_v3.temporal import validate_detection_temporal
+from app.research.me_r_long_early_mae_v3.temporal import (
+    require_fetch_completion_provenance,
+    validate_detection_temporal,
+)
 
-T = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+T = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
-def test_299_seconds_allowed():
-    x = validate_detection_temporal(T, T + timedelta(seconds=299), T + timedelta(seconds=299))
-    assert x.delay_seconds == 299
+def test_299_300_and_301_seconds():
+    for seconds, allowed in ((299, True), (300, True), (301, False)):
+        try:
+            validate_detection_temporal(T, T + timedelta(seconds=seconds), T + timedelta(seconds=seconds))
+        except ValueError as exc:
+            assert allowed is False and "300" in str(exc)
+        else:
+            assert allowed
 
-def test_300_seconds_allowed():
-    x = validate_detection_temporal(T, T + timedelta(seconds=300), T + timedelta(seconds=300))
-    assert x.delay_seconds == 300
-
-def test_301_seconds_rejected():
+def test_fetch_completion_is_required_or_measured():
     try:
-        validate_detection_temporal(T, T + timedelta(seconds=301), T + timedelta(seconds=301))
+        require_fetch_completion_provenance(None)
     except ValueError as exc:
-        assert "300" in str(exc)
+        assert "PROVENANCE_REQUIRED" in str(exc)
     else:
         raise AssertionError
+    assert require_fetch_completion_provenance(T) == T
 
-def test_future_detection_rejected():
+def test_detection_before_fetch_completion_rejected():
     try:
-        validate_detection_temporal(T + timedelta(seconds=1), T, T)
+        validate_detection_temporal(T, T, T + timedelta(seconds=1))
     except ValueError as exc:
-        assert "CLOSED" in str(exc)
+        assert "COMPLETION" in str(exc)
     else:
         raise AssertionError
