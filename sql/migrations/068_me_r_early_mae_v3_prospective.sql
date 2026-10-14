@@ -225,7 +225,8 @@ BEGIN
     FROM research_me_early_mae_v3.variant_outcome
     WHERE protocol_version = NEW.protocol_version
       AND source_event_id = NEW.source_event_id
-      AND variant_status <> 'FINALIZED';
+      AND variant_status <> 'FINALIZED'
+      AND variant_id <> NEW.variant_id;
     SELECT count(*) INTO p_count
     FROM research_me_early_mae_v3.variant
     WHERE protocol_version = NEW.protocol_version AND is_primary;
