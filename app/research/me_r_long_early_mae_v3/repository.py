@@ -175,6 +175,8 @@ class MeEarlyMaeV3Repository:
                       AND entry_filled_at IS NULL""",
                 {"source_event_id": source_event_id, **entry},
             )
+            if cursor.rowcount != 1:
+                raise ValueError("CONFLICTING_OR_DUPLICATE_ENTRY_UPDATE")
             self.connection.commit()
         except Exception:
             self.connection.rollback()
@@ -191,11 +193,7 @@ class MeEarlyMaeV3Repository:
         }:
             raise ValueError("EXPECTED_EXACTLY_SEVEN_VARIANTS")
         if not can_finalize(evaluations):
-            if any(
-                row.get("variant_status") != "INCOMPLETE_COVERAGE"
-                for row in evaluations
-            ):
-                raise ValueError("INCOMPLETE_NONFINAL_OUTCOME")
+            raise ValueError("INCOMPLETE_NONFINAL_OUTCOME")
         cursor = self._cursor()
         try:
             cursor.execute(
@@ -204,25 +202,25 @@ class MeEarlyMaeV3Repository:
                 (source_event_id,),
             )
             status = cursor.fetchone()
-            if status is None or status[0] not in ("ENTRY_FILLED", "FINALIZED"):
+            if status is None or status[0] == "FINALIZED":
+                raise ValueError("FINALIZED_SOURCE_IMMUTABLE")
+            if status[0] != "ENTRY_FILLED":
                 raise ValueError("SOURCE_NOT_ENTRY_FILLED")
             cursor.execute(
-                f"""UPDATE {SOURCE_SCHEMA}.source_event
-                    SET source_status=%(source_status)s, coverage_status=%(coverage_status)s,
-                        baseline_exit_at=%(baseline_exit_at)s,
-                        baseline_exit_price=%(baseline_exit_price)s,
-                        baseline_exit_reason=%(baseline_exit_reason)s,
-                        baseline_gross_r=%(baseline_gross_r)s,
-                        baseline_net_r_normal=%(baseline_net_r_normal)s,
-                        baseline_net_r_elevated=%(baseline_net_r_elevated)s
-                    WHERE source_event_id=%(source_event_id)s
-                      AND source_status<>'FINALIZED'""",
-                {"source_event_id": source_event_id, **baseline},
+                f"""SELECT variant_id, variant_status
+                    FROM {SOURCE_SCHEMA}.variant_outcome
+                    WHERE protocol_version=%s AND source_event_id=%s FOR UPDATE""",
+                ("3.0.0-DRAFT", source_event_id),
             )
+            stored = dict(cursor.fetchall())
+            if set(stored) != {v.variant_id for v in VARIANTS}:
+                raise ValueError("INCOMPLETE_VARIANT_TUPLE")
+            if any(value == "FINALIZED" for value in stored.values()):
+                raise ValueError("FINALIZED_VARIANT_IMMUTABLE")
             for row in evaluations:
                 cursor.execute(
                     f"""UPDATE {SOURCE_SCHEMA}.variant_outcome
-                        SET variant_status=%(variant_status)s,
+                        SET variant_status='FINALIZED', evaluated_at=now(),
                             trigger_result=%(trigger_result)s, mae_r=%(mae_r)s,
                             mfe_r=%(mfe_r)s, window_low=%(window_low)s,
                             window_high=%(window_high)s,
@@ -236,19 +234,75 @@ class MeEarlyMaeV3Repository:
                             delta_net_r_normal=%(delta_net_r_normal)s,
                             delta_net_r_elevated=%(delta_net_r_elevated)s,
                             ambiguous_ordering=%(ambiguous_ordering)s,
-                            coverage_status=%(coverage_status)s,
-                            coverage_reason=%(coverage_reason)s,
+                            coverage_status='COMPLETE',
+                            coverage_reason=NULL,
                             execution_price_semantics=%(execution_price_semantics)s
                         WHERE protocol_version=%s AND source_event_id=%s
                           AND variant_id=%(variant_id)s
                           AND variant_status<>'FINALIZED'""",
-                    {
-                        **row,
-                        "source_event_id": source_event_id,
-                    },
+                    {"source_event_id": source_event_id, **row},
                 )
                 if cursor.rowcount != 1:
                     raise RuntimeError("VARIANT_UPDATE_ROW_COUNT")
+            cursor.execute(
+                f"""UPDATE {SOURCE_SCHEMA}.source_event
+                    SET source_status='FINALIZED', coverage_status='COMPLETE',
+                        baseline_exit_at=%(baseline_exit_at)s,
+                        baseline_exit_price=%(baseline_exit_price)s,
+                        baseline_exit_reason=%(baseline_exit_reason)s,
+                        baseline_gross_r=%(baseline_gross_r)s,
+                        baseline_net_r_normal=%(baseline_net_r_normal)s,
+                        baseline_net_r_elevated=%(baseline_net_r_elevated)s
+                    WHERE source_event_id=%s AND source_status='ENTRY_FILLED'""",
+                (source_event_id, baseline),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("SOURCE_FINALIZATION_ROW_COUNT")
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def mark_source_not_filled(self, source_event_id: int, reason: str = "ENTRY_NOT_FILLED") -> None:
+        cursor = self._cursor()
+        try:
+            cursor.execute(
+                f"""UPDATE {SOURCE_SCHEMA}.source_event
+                    SET source_status='ENTRY_NOT_FILLED', invalid_reason=%s
+                    WHERE source_event_id=%s
+                      AND source_status IN ('DETECTED','ENTRY_PENDING')""",
+                (reason, source_event_id),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def mark_source_incomplete(self, source_event_id: int, reason: str) -> None:
+        cursor = self._cursor()
+        try:
+            cursor.execute(
+                f"""UPDATE {SOURCE_SCHEMA}.source_event
+                    SET coverage_status='INCOMPLETE', invalid_reason=%s
+                    WHERE source_event_id=%s
+                      AND source_status IN ('DETECTED','ENTRY_PENDING')""",
+                (reason, source_event_id),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def mark_source_invalid(self, source_event_id: int, reason: str) -> None:
+        cursor = self._cursor()
+        try:
+            cursor.execute(
+                f"""UPDATE {SOURCE_SCHEMA}.source_event
+                    SET source_status='INVALID', coverage_status='INCOMPLETE', invalid_reason=%s
+                    WHERE source_event_id=%s
+                      AND source_status IN ('DETECTED','ENTRY_PENDING')""",
+                (reason, source_event_id),
+            )
             self.connection.commit()
         except Exception:
             self.connection.rollback()
@@ -277,10 +331,11 @@ class MeEarlyMaeV3Repository:
         cursor = self._cursor()
         cursor.execute(
             f"""SELECT source_event_id, instrument_id, entry_filled_at, entry_price,
-                       stop_price, target_price, baseline_deadline_at, source_status
+                       stop_price, target_price, baseline_deadline_at, source_status,
+                       entry_eligible_at, detected_at
                 FROM {SOURCE_SCHEMA}.source_event
                 WHERE protocol_version=%s AND source_status IN
-                      ('ENTRY_PENDING','ENTRY_FILLED') ORDER BY detected_at""",
+                      ('DETECTED','ENTRY_PENDING','ENTRY_FILLED') ORDER BY detected_at""",
             ("3.0.0-DRAFT",),
         )
         return [
@@ -290,6 +345,7 @@ class MeEarlyMaeV3Repository:
                 "stop_price": float(r[4]) if r[4] is not None else None,
                 "target_price": float(r[5]) if r[5] is not None else None,
                 "baseline_deadline_at": r[6], "source_status": r[7],
+                "entry_eligible_at": r[8], "detected_at": r[9],
             }
             for r in cursor.fetchall()
         ]
