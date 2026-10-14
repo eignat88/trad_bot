@@ -32,7 +32,29 @@ CREATE TABLE IF NOT EXISTS research_me_early_mae_v3.variant (
     role TEXT NOT NULL CHECK (role IN ('PRIMARY','SECONDARY')),
     is_primary BOOLEAN NOT NULL,
     PRIMARY KEY (protocol_version, variant_id),
-    CHECK ((role = 'PRIMARY') = is_primary)
+    CHECK ((role = 'PRIMARY') = is_primary),
+    CONSTRAINT chk_me_mae_v3_exact_variant_definitions CHECK (
+        (variant_id = 'MAE_10m_040' AND horizon_minutes = 10
+         AND threshold_mae_r = 0.40 AND role = 'SECONDARY' AND NOT is_primary)
+        OR
+        (variant_id = 'MAE_10m_050' AND horizon_minutes = 10
+         AND threshold_mae_r = 0.50 AND role = 'SECONDARY' AND NOT is_primary)
+        OR
+        (variant_id = 'MAE_15m_040' AND horizon_minutes = 15
+         AND threshold_mae_r = 0.40 AND role = 'SECONDARY' AND NOT is_primary)
+        OR
+        (variant_id = 'MAE_15m_050' AND horizon_minutes = 15
+         AND threshold_mae_r = 0.50 AND role = 'PRIMARY' AND is_primary)
+        OR
+        (variant_id = 'MAE_15m_060' AND horizon_minutes = 15
+         AND threshold_mae_r = 0.60 AND role = 'SECONDARY' AND NOT is_primary)
+        OR
+        (variant_id = 'MAE_15m_075' AND horizon_minutes = 15
+         AND threshold_mae_r = 0.75 AND role = 'SECONDARY' AND NOT is_primary)
+        OR
+        (variant_id = 'MAE_30m_050' AND horizon_minutes = 30
+         AND threshold_mae_r = 0.50 AND role = 'SECONDARY' AND NOT is_primary)
+    )
 );
 
 CREATE TABLE IF NOT EXISTS research_me_early_mae_v3.source_event (
@@ -60,6 +82,12 @@ CREATE TABLE IF NOT EXISTS research_me_early_mae_v3.source_event (
     entry_zone_high NUMERIC,
     reference_price NUMERIC,
     baseline_deadline_at TIMESTAMPTZ,
+    baseline_exit_at TIMESTAMPTZ,
+    baseline_exit_price NUMERIC,
+    baseline_exit_reason TEXT,
+    baseline_gross_r NUMERIC,
+    baseline_net_r_normal NUMERIC,
+    baseline_net_r_elevated NUMERIC,
     source_features JSONB NOT NULL DEFAULT '{}'::jsonb,
     source_status TEXT NOT NULL DEFAULT 'DETECTED'
         CHECK (source_status IN ('DETECTED','ENTRY_PENDING','ENTRY_FILLED','ENTRY_NOT_FILLED','INVALID','FINALIZED')),
@@ -198,13 +226,11 @@ $$;
 
 CREATE OR REPLACE FUNCTION research_me_early_mae_v3.fn_validate_finalized_variant_batch()
 RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE
-    v_count integer;
-    p_count integer;
 BEGIN
     IF NEW.variant_status <> 'FINALIZED' THEN
         RETURN NEW;
     END IF;
+
     IF NEW.coverage_status <> 'COMPLETE'
        OR NEW.variant_exit_at IS NULL
        OR NEW.variant_exit_price IS NULL
@@ -215,24 +241,14 @@ BEGIN
        OR NEW.execution_price_semantics IS NULL THEN
         RAISE EXCEPTION 'FINALIZED_VARIANT_INCOMPLETE';
     END IF;
+
     IF NEW.execution_price_semantics NOT IN (
         'RESEARCH_PRICE_PROXY_NOT_VERIFIED_EXECUTABLE',
         'BASELINE_EXECUTION_PROXY'
     ) THEN
         RAISE EXCEPTION 'UNAPPROVED_EXECUTION_PRICE_SEMANTICS';
     END IF;
-    SELECT count(*) INTO v_count
-    FROM research_me_early_mae_v3.variant_outcome
-    WHERE protocol_version = NEW.protocol_version
-      AND source_event_id = NEW.source_event_id
-      AND variant_status <> 'FINALIZED'
-      AND variant_id <> NEW.variant_id;
-    SELECT count(*) INTO p_count
-    FROM research_me_early_mae_v3.variant
-    WHERE protocol_version = NEW.protocol_version AND is_primary;
-    IF v_count <> 0 OR p_count <> 1 THEN
-        RAISE EXCEPTION 'FINALIZED_VARIANT_BATCH_INVALID';
-    END IF;
+
     RETURN NEW;
 END;
 $$;
@@ -330,5 +346,173 @@ BEGIN
   FOR EACH ROW EXECUTE FUNCTION research_me_early_mae_v3.fn_set_updated_at();
  END IF;
 END $$;
+
+
+-- Final state is checked at transaction end, not during each row update.
+CREATE OR REPLACE FUNCTION research_me_early_mae_v3.fn_validate_finalization_commit()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    v_source_id BIGINT;
+    v_protocol_version TEXT;
+    v_status TEXT;
+    v_total INTEGER;
+    v_final INTEGER;
+    v_primary INTEGER;
+    v_invalid INTEGER;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        v_source_id := OLD.source_event_id;
+        v_protocol_version := OLD.protocol_version;
+    ELSE
+        v_source_id := NEW.source_event_id;
+        v_protocol_version := NEW.protocol_version;
+    END IF;
+
+    SELECT source_status INTO v_status
+    FROM research_me_early_mae_v3.source_event
+    WHERE source_event_id = v_source_id
+      AND protocol_version = v_protocol_version;
+
+    -- A deleted source has no remaining finalization contract here.
+    IF NOT FOUND THEN
+        RETURN NULL;
+    END IF;
+
+    SELECT count(*),
+           count(*) FILTER (WHERE variant_status = 'FINALIZED'),
+           count(*) FILTER (WHERE is_primary),
+           count(*) FILTER (
+               WHERE coverage_status <> 'COMPLETE'
+                  OR variant_id IS NULL
+           )
+    INTO v_total, v_final, v_primary, v_invalid
+    FROM research_me_early_mae_v3.variant_outcome
+    WHERE source_event_id = v_source_id
+      AND protocol_version = v_protocol_version;
+
+    IF v_status = 'FINALIZED' THEN
+        IF v_total <> 7 OR v_final <> 7
+           OR v_primary <> 1 OR v_invalid <> 0 THEN
+            RAISE EXCEPTION 'FINALIZED_COMMIT_TUPLE_INVALID';
+        END IF;
+
+        IF EXISTS (
+            SELECT 1
+            FROM research_me_early_mae_v3.variant_outcome o
+            LEFT JOIN research_me_early_mae_v3.variant v
+              ON v.protocol_version = o.protocol_version
+             AND v.variant_id = o.variant_id
+            WHERE o.source_event_id = v_source_id
+              AND o.protocol_version = v_protocol_version
+              AND (
+                  v.variant_id IS NULL
+                  OR v.role IS DISTINCT FROM o.role
+                  OR v.is_primary IS DISTINCT FROM o.is_primary
+                  OR v.horizon_minutes IS DISTINCT FROM o.horizon_minutes
+                  OR v.threshold_mae_r IS DISTINCT FROM o.threshold_mae_r
+              )
+        ) THEN
+            RAISE EXCEPTION 'FINALIZED_COMMIT_VARIANT_MISMATCH';
+        END IF;
+    ELSIF v_final > 0 THEN
+        RAISE EXCEPTION 'FINALIZED_VARIANT_WITHOUT_FINALIZED_SOURCE';
+    END IF;
+
+    RETURN NULL;
+END;
+$$;
+
+
+CREATE OR REPLACE FUNCTION research_me_early_mae_v3.fn_validate_source_commit()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    v_total INTEGER;
+    v_final INTEGER;
+    v_primary INTEGER;
+    v_mismatch INTEGER;
+BEGIN
+    IF NEW.source_status <> 'FINALIZED' THEN
+        RETURN NULL;
+    END IF;
+
+    SELECT count(*),
+           count(*) FILTER (WHERE o.variant_status = 'FINALIZED'),
+           count(*) FILTER (WHERE o.is_primary),
+           count(*) FILTER (
+               WHERE v.variant_id IS NULL
+                  OR v.role IS DISTINCT FROM o.role
+                  OR v.is_primary IS DISTINCT FROM o.is_primary
+                  OR v.horizon_minutes IS DISTINCT FROM o.horizon_minutes
+                  OR v.threshold_mae_r IS DISTINCT FROM o.threshold_mae_r
+           )
+    INTO v_total, v_final, v_primary, v_mismatch
+    FROM research_me_early_mae_v3.variant_outcome o
+    LEFT JOIN research_me_early_mae_v3.variant v
+      ON v.protocol_version = o.protocol_version
+     AND v.variant_id = o.variant_id
+    WHERE o.protocol_version = NEW.protocol_version
+      AND o.source_event_id = NEW.source_event_id;
+
+    IF v_total <> 7 OR v_final <> 7 OR v_primary <> 1
+       OR v_mismatch <> 0 THEN
+        RAISE EXCEPTION 'FINALIZED_SOURCE_COMMIT_INVALID';
+    END IF;
+
+    RETURN NULL;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER trg_me_mae_v3_variant_commit_check
+AFTER INSERT OR UPDATE OR DELETE
+ON research_me_early_mae_v3.variant_outcome
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW
+EXECUTE FUNCTION research_me_early_mae_v3.fn_validate_finalization_commit();
+
+CREATE CONSTRAINT TRIGGER trg_me_mae_v3_source_commit_check
+AFTER UPDATE OF source_status
+ON research_me_early_mae_v3.source_event
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW
+EXECUTE FUNCTION research_me_early_mae_v3.fn_validate_source_commit();
+
+
+-- Registered variant definitions are immutable.
+-- Initial INSERT of the seven definitions remains permitted.
+CREATE OR REPLACE FUNCTION research_me_early_mae_v3.fn_block_variant_definition_mutation()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'REGISTERED_VARIANT_DEFINITION_IMMUTABLE';
+END;
+$$;
+
+CREATE TRIGGER trg_me_mae_v3_variant_definition_immutable_update
+BEFORE UPDATE ON research_me_early_mae_v3.variant
+FOR EACH ROW
+EXECUTE FUNCTION research_me_early_mae_v3.fn_block_variant_definition_mutation();
+
+CREATE TRIGGER trg_me_mae_v3_variant_definition_immutable_delete
+BEFORE DELETE ON research_me_early_mae_v3.variant
+FOR EACH ROW
+EXECUTE FUNCTION research_me_early_mae_v3.fn_block_variant_definition_mutation();
+
+
+-- Source finalization must occur through a validated UPDATE.
+-- Direct INSERT as FINALIZED would bypass transition checks.
+CREATE OR REPLACE FUNCTION research_me_early_mae_v3.fn_block_direct_finalized_source_insert()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.source_status = 'FINALIZED' THEN
+        RAISE EXCEPTION 'DIRECT_FINALIZED_SOURCE_INSERT_FORBIDDEN';
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_me_mae_v3_source_block_direct_finalized_insert
+BEFORE INSERT ON research_me_early_mae_v3.source_event
+FOR EACH ROW
+EXECUTE FUNCTION research_me_early_mae_v3.fn_block_direct_finalized_source_insert();
 
 COMMIT;

@@ -37,7 +37,22 @@ def test_migration_contains_finalization_immutability_guards():
         "fn_lock_variant_tuple",
     ):
         assert token in text
-    assert "AND variant_id <> NEW.variant_id" in text
+    # Finalization is validated transactionally, after all seven
+    # variant rows have been updated.
+    for token in (
+        "fn_validate_finalization_commit",
+        "fn_validate_source_commit",
+        "CREATE CONSTRAINT TRIGGER trg_me_mae_v3_variant_commit_check",
+        "CREATE CONSTRAINT TRIGGER trg_me_mae_v3_source_commit_check",
+        "DEFERRABLE INITIALLY DEFERRED",
+        "FINALIZED_COMMIT_TUPLE_INVALID",
+        "FINALIZED_SOURCE_COMMIT_INVALID",
+        "FINALIZED_VARIANT_WITHOUT_FINALIZED_SOURCE",
+    ):
+        assert token in text
+
+    # The old per-row cross-variant gate must not be reintroduced.
+    assert "AND variant_id <> NEW.variant_id" not in text
     assert "RESEARCH_PRICE_PROXY_NOT_VERIFIED_EXECUTABLE" in text
     assert "BASELINE_EXECUTION_PROXY" in text
 
@@ -79,3 +94,59 @@ def test_repository_paired_outcome_complete():
     section = text[text.index("def save_paired_outcome"):text.index("def mark_source_not_filled")]
     for key in ("trigger_result","variant_exit_at","net_r_normal","delta_net_r_elevated","execution_price_semantics","variant_id","source_event_id","protocol_version"):
         assert key in section
+
+
+def test_variant_definitions_immutable():
+    from pathlib import Path
+
+    sql = Path(
+        "sql/migrations/068_me_r_early_mae_v3_prospective.sql"
+    ).read_text()
+
+    for token in (
+        "fn_block_variant_definition_mutation",
+        "REGISTERED_VARIANT_DEFINITION_IMMUTABLE",
+        "trg_me_mae_v3_variant_definition_immutable_update",
+        "trg_me_mae_v3_variant_definition_immutable_delete",
+        "BEFORE UPDATE ON research_me_early_mae_v3.variant",
+        "BEFORE DELETE ON research_me_early_mae_v3.variant",
+    ):
+        assert token in sql
+
+
+def test_migration_exact_variant_whitelist():
+    from pathlib import Path
+
+    sql = Path(
+        "sql/migrations/068_me_r_early_mae_v3_prospective.sql"
+    ).read_text()
+
+    assert "chk_me_mae_v3_exact_variant_definitions" in sql
+
+    for variant_id in (
+        "MAE_10m_040",
+        "MAE_10m_050",
+        "MAE_15m_040",
+        "MAE_15m_050",
+        "MAE_15m_060",
+        "MAE_15m_075",
+        "MAE_30m_050",
+    ):
+        assert f"variant_id = '{variant_id}'" in sql
+
+
+def test_direct_finalized_source_insert_forbidden():
+    from pathlib import Path
+
+    sql = Path(
+        "sql/migrations/068_me_r_early_mae_v3_prospective.sql"
+    ).read_text()
+
+    for token in (
+        "fn_block_direct_finalized_source_insert",
+        "DIRECT_FINALIZED_SOURCE_INSERT_FORBIDDEN",
+        "trg_me_mae_v3_source_block_direct_finalized_insert",
+        "BEFORE INSERT ON research_me_early_mae_v3.source_event",
+        "IF NEW.source_status = 'FINALIZED' THEN",
+    ):
+        assert token in sql
