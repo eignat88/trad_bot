@@ -55,7 +55,7 @@ def test_no_late_retroactive_candle(monkeypatch):
     assert module.store_latest_5m(
         NoCallConnection(), "BTCUSDT", candle(opened),
         opened + timedelta(minutes=11),
-    ) is False
+    ) == (False, None)
 
 
 def test_sql_migration_requires_exact_database():
