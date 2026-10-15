@@ -218,3 +218,36 @@ Production activation: NO_GO
 
 This record does not authorize deployment, production environment
 configuration, historical backfill, or V3 capture.
+
+## Immutable specification SHA-256 clarification
+
+Verified: 2026-10-15
+
+Immutable specification:
+docs/research/ME_R_V3_PROTOCOL_3_0_0_IMMUTABLE_SPEC.json
+
+RAW_FILE_SHA256:
+1b2a7fad3bcfb277ebdcd22a4d4e23fdbec125b9b2b3e830cab3087818ae7f25
+
+CANONICAL_JSON_SHA256:
+b626700a04b679d67fa4db029e4968dd9feba62123d5145f428e22a87c2e5ed3
+
+Canonical serialization:
+json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+Verification:
+- Base commit raw SHA-256: MATCH
+- Current HEAD raw SHA-256: MATCH
+- Canonical JSON SHA-256: MATCH
+- JSON integrity: PASS
+- Immutable specification modified: NO
+
+Important:
+RAW_FILE_SHA256 and CANONICAL_JSON_SHA256 are different
+representations of the same unchanged immutable specification.
+
+The runtime fingerprint additionally incorporates the proposed
+freeze and activation timestamps and must not be confused
+with either immutable specification hash.
+
+Verdict: IMMUTABLE_SPEC_VERIFIED
