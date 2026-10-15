@@ -71,8 +71,9 @@ def _insert_test_fixtures(conn) -> None:
             (INSTRUMENT_ID, "ISSUE152TEST"),
         )
     entry = datetime(2026, 10, 19, 12, 10, tzinfo=timezone.utc)
-    for offset in range(244):
-        opened = entry + timedelta(minutes=offset)
+    # Exactly 48 contiguous closed 5m candles for a 240-minute baseline.
+    for offset in range(48):
+        opened = entry + timedelta(minutes=5 * offset)
         closed = opened + timedelta(minutes=5)
         cur.execute(
             """INSERT INTO market.candle
@@ -164,15 +165,48 @@ def test_isolated_postgres_real_lifecycle():
             )
             assert tuple(cur.fetchone()) == ("FINALIZED", "COMPLETE")
     finally:
-        for query, params in (
-            (f"DELETE FROM {SCHEMA}.variant_outcome WHERE source_setup_id LIKE 'ISSUE152-%'", ()),
-            (f"DELETE FROM {SCHEMA}.source_event WHERE source_setup_id LIKE 'ISSUE152-%'", ()),
-            ("DELETE FROM market.candle WHERE source = 'ISSUE152_TEST_ONLY'", ()),
-            ("DELETE FROM dds.instrument WHERE symbol = 'ISSUE152TEST'", ()),
-        ):
-            try:
-                conn.cursor().execute(query, params)
-                conn.commit()
-            except Exception:
-                conn.rollback()
+        # Disposable cleanup is guarded by exact TEST_ONLY identity. No
+        # arbitrary schemas or production rows are deleted. Finalized rows
+        # are not force-mutated; immutable triggers remain authoritative.
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f"DELETE FROM {SCHEMA}.variant_outcome "
+                f"WHERE source_event_id IN ("
+                f"  SELECT source_event_id FROM {SCHEMA}.source_event "
+                f"  WHERE protocol_version=%s AND source_setup_id LIKE %s"
+                f")",
+                (protocol.PROTOCOL_VERSION, "ISSUE152-%"),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f"DELETE FROM {SCHEMA}.source_event "
+                f"WHERE protocol_version=%s AND source_setup_id LIKE %s",
+                (protocol.PROTOCOL_VERSION, "ISSUE152-%"),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM market.candle WHERE source = %s",
+                ("ISSUE152_TEST_ONLY",),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM dds.instrument WHERE symbol = %s",
+                ("ISSUE152TEST",),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
         conn.close()

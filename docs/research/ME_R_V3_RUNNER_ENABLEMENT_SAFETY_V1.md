@@ -38,8 +38,15 @@ paper/live routing, systemd and production configuration were not changed.
 - `tests/test_me_r_early_mae_v3_pg_integration_issue152.py`
   - Real `pg8000` integration test remains explicit opt-in via
     `ME_EARLY_MAE_V3_PG_INTEGRATION=true`.
-  - Uses only the dedicated `trad_bot_runner_152_it` contour and temporary
+  - Uses only the dedicated `trad_bot_runner_152_it` contour and disposable
     fixture rows with cleanup in `finally`.
+  - TEST_ONLY synthetic baseline now uses exactly 48 consecutive 5-minute
+    candles: `open_at = entry + 5*i minutes`,
+    `close_at = open_at + 5 minutes`.
+  - Cleanup deletes only exact TEST_ONLY rows identified by
+    `source_setup_id LIKE 'ISSUE152-%'` through the source FK,
+    `source='ISSUE152_TEST_ONLY'`, and `symbol='ISSUE152TEST'`.
+    Immutable triggers remain authoritative and are not bypassed.
   - Covers protocol idempotency, seven approved variants, pre-activation
     rejection, missing measured provenance rejection, source capture,
     entry-fill persistence, evaluator lifecycle, seven-outcome finalization
@@ -59,39 +66,31 @@ Targeted regression:
 Integration without explicit opt-in:
 1 skipped
 
-git diff --check:
-PASS
+Integration with explicit opt-in, as trad_bot_runner_152_it:
+1 passed
 
 PostgreSQL 17.11 isolated database:
 trad_bot_runner_152_it, Unix socket peer authentication
 schemas: dds, market, research_me_early_mae_v3
+
+Post-E2E disposable DB identity counts:
+protocols=0, variants=0, sources=0, outcomes=0,
+candles=0, instruments=0
 ```
 
 The skipped integration test is intentional fail-closed behavior without
 `ME_EARLY_MAE_V3_PG_INTEGRATION=true`.
 
-## PostgreSQL E2E status: BLOCKED
+## PostgreSQL E2E status: PASS
 
-The explicit integration test was run under the dedicated
-`trad_bot_runner_152_it` role against a disposable
-`trad_bot_runner_152_it_pg_test` database with migrations 068-070. Protocol
-registration and variant counts passed, but the deterministic synthetic candle
-fixture cannot produce a finalized timeout outcome with the approved runtime
-semantics:
+The previous deterministic blocker was in the TEST_ONLY fixture only: the
+fixture generated 244 one-minute-spaced candles instead of the approved
+240-minute baseline represented by 48 sequential 5-minute candles. The fixture
+was corrected without changing runtime protocol, evaluator, repository or
+freeze guards.
 
-```text
-approved BASELINE_MAX_HOLD_MINUTES = 240
-240 x 5m candles = 14400 seconds
-repository fetch uses close_time > entry_at
-expected baseline window = 240 candles
-retrieved deterministic window = 236 candles
-result = INCOMPLETE_BASELINE_COVERAGE
-```
-
-The blocker is intentionally not worked around by changing approved runtime
-semantics, migrations, freeze/activation values or guards. The failing
-integration test is preserved for reproducible follow-up. Existing unit and
-mock lifecycle tests remain green.
+The real PostgreSQL lifecycle test passed under the dedicated role and then
+cleaned all disposable rows.
 
 ## Safety confirmation
 
@@ -106,6 +105,5 @@ mock lifecycle tests remain green.
 
 ## Verdict
 
-`READY_FOR_REVIEW` with PostgreSQL E2E explicitly marked `BLOCKED` by the
-documented deterministic baseline-window mismatch. Regression and diff checks
-are `PASS`.
+`READY_FOR_REVIEW`. Regression, `git diff --check` and PostgreSQL E2E are
+`PASS`. Production remains `NO_GO`.
