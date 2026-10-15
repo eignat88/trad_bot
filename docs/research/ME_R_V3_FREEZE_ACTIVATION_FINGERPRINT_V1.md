@@ -251,3 +251,56 @@ freeze and activation timestamps and must not be confused
 with either immutable specification hash.
 
 Verdict: IMMUTABLE_SPEC_VERIFIED
+
+## OPERATOR-APPROVED FREEZE RECORD — 2026-10-15
+
+**Authoritative current decision.** This section supersedes any earlier
+`PENDING_OPERATOR_APPROVAL`, `BOUNDARIES_PROPOSED`, or approval-pending
+status in the historical checkpoint sections above. Their original wording
+is retained as an audit trail, not a representation of current approval.
+
+Source of authorization: explicit operator instruction in the Issue #151
+workflow, recorded in GitHub Issue #151 comment 6189856367 and
+PR #157 comment 6189857004.
+
+Experiment: ME_R_LONG_EARLY_MAE_EXIT_OOS_V3
+Protocol version: 3.0.0
+Reviewed code/evidence HEAD at approval: d0ac4ede3079e8d68345e3ec5302c4c1ebaf05fb
+
+**APPROVED_FROZEN_AT:** 2026-10-16T12:00:00Z
+**APPROVED_ACTIVATION_AT:** 2026-10-19T12:00:00Z
+**APPROVED_RUNTIME_PROTOCOL_FINGERPRINT_SHA256:**
+ed1cd8e48d3617fec66b5eac220ec8f7dab3b963e53a4ea51874f12ceddf131a
+
+Approval status: OPERATOR_BOUNDARIES_AND_FINGERPRINT_APPROVED
+Boundary order: PASS (72-hour gap)
+Runtime SHA-256 independently reproduced from `protocol_payload()`: MATCH
+
+Immutable spec raw-file SHA-256:
+1b2a7fad3bcfb277ebdcd22a4d4e23fdbec125b9b2b3e830cab3087818ae7f25
+Immutable spec canonical-JSON SHA-256:
+b626700a04b679d67fa4db029e4968dd9feba62123d5145f428e22a87c2e5ed3
+
+Strict prospective inclusion requires both
+`source_candle_close_at > APPROVED_ACTIVATION_AT`
+and `detected_at > APPROVED_ACTIVATION_AT`.
+Historical backfill or retrospective inclusion: FORBIDDEN.
+
+**Scope of approval is limited to the offline freeze record.**
+- No permission to merge PR #157, deploy, configure production environment,
+  apply production migrations, start V3 capture/OOS, or affect paper/live.
+- The timestamp named ACTIVATION_AT is a prospective cutoff, **not** an
+  instruction to activate any service automatically on October 19.
+- V3 must remain disabled until a separate operator-authorized deployment
+  and runtime provenance/clock-integrity gate.
+- Preflight demonstrated 185 regression tests and isolated PostgreSQL
+  registration, replay, variants and concurrency smoke. In-repo end-to-end
+  integration, forced repository INSERT collision, natural scanner provenance,
+  and production clock synchronization remain unverified.
+- If release timing makes the approved prospective window unsuitable,
+  stop and obtain a fresh explicit operator decision; never backdate,
+  reclassify past signals, or silently recalculate the approved fingerprint.
+
+**FINAL ISS151 FREEZE RECORD VERDICT:**
+OPERATOR_FREEZE_APPROVED / CODE_DB_PREFLIGHT_PASS_WITH_LIMITATIONS /
+PRODUCTION_ACTIVATION_NO_GO.
