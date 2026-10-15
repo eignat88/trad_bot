@@ -1,0 +1,86 @@
+{
+  "baseline_policy": "FIXED_TP_SL_HORIZON_V3",
+  "baseline_sl_tp_precedence": true,
+  "elevated_slippage_per_side": 0.001,
+  "entry_boundary": "STRICTLY_NEXT_5M_OPEN_AFTER_ELIGIBILITY",
+  "entry_expiry_minutes": 240,
+  "entry_model": "NEXT_OPEN_5M",
+  "experiment_id": "ME_R_LONG_EARLY_MAE_EXIT_OOS_V3",
+  "funding": "NOT_MODELED",
+  "historical_backfill": "FORBIDDEN",
+  "immediate_first_touch_exit": "FORBIDDEN",
+  "intrabar_policy": "STOP_FIRST",
+  "mae_execution_proxy": "COMPLETED_5M_CLOSE_AT_HORIZON_BOUNDARY",
+  "mae_exit_policy": "HORIZON_END_CONDITIONAL_MAE_EXIT",
+  "max_hold_minutes": 240,
+  "max_source_delay_seconds": 300,
+  "normal_slippage_per_side": 0.0005,
+  "paper_live_side_effects": "FORBIDDEN",
+  "protocol_version": "3.0.0",
+  "required_timeframes": [
+    "5m",
+    "15m",
+    "1h"
+  ],
+  "ruleset": "FROZEN_V1_RULES_ON_COMPLETED_CANDLES",
+  "scanner_name": "ME_R_LONG_CLOSED_V1",
+  "scanner_version": "1.0.0",
+  "source_candle_version": "MARKET_CANDLE_CLOSED_5M_V1",
+  "source_direction": "LONG",
+  "source_schema": "research_me_early_mae_v3",
+  "stop_pct": 0.025,
+  "taker_fee_per_side": 0.00055,
+  "target_pct": 0.03,
+  "timeout_policy": "FIRST_COMPLETED_5M_CLOSE_AT_OR_AFTER_DEADLINE",
+  "variants": [
+    {
+      "horizon_minutes": 10,
+      "is_primary": false,
+      "role": "SECONDARY",
+      "threshold_mae_r": 0.4,
+      "variant_id": "MAE_10m_040"
+    },
+    {
+      "horizon_minutes": 10,
+      "is_primary": false,
+      "role": "SECONDARY",
+      "threshold_mae_r": 0.5,
+      "variant_id": "MAE_10m_050"
+    },
+    {
+      "horizon_minutes": 15,
+      "is_primary": false,
+      "role": "SECONDARY",
+      "threshold_mae_r": 0.4,
+      "variant_id": "MAE_15m_040"
+    },
+    {
+      "horizon_minutes": 15,
+      "is_primary": true,
+      "role": "PRIMARY",
+      "threshold_mae_r": 0.5,
+      "variant_id": "MAE_15m_050"
+    },
+    {
+      "horizon_minutes": 15,
+      "is_primary": false,
+      "role": "SECONDARY",
+      "threshold_mae_r": 0.6,
+      "variant_id": "MAE_15m_060"
+    },
+    {
+      "horizon_minutes": 15,
+      "is_primary": false,
+      "role": "SECONDARY",
+      "threshold_mae_r": 0.75,
+      "variant_id": "MAE_15m_075"
+    },
+    {
+      "horizon_minutes": 30,
+      "is_primary": false,
+      "role": "SECONDARY",
+      "threshold_mae_r": 0.5,
+      "variant_id": "MAE_30m_050"
+    }
+  ]
+}

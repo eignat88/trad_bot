@@ -14,9 +14,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 EXPERIMENT_ID = "ME_R_LONG_EARLY_MAE_EXIT_OOS_V3"
-PROTOCOL_VERSION = "3.0.0-DRAFT"
+PROTOCOL_VERSION = "3.0.0"
 SCANNER_NAME = "ME_R_LONG_CLOSED_V1"
-SCANNER_VERSION = "1.0.0-DRAFT"
+SCANNER_VERSION = "1.0.0"
 SOURCE_DIRECTION = "LONG"
 SOURCE_SCHEMA = "research_me_early_mae_v3"
 SOURCE_CANDLE_VERSION = "MARKET_CANDLE_CLOSED_5M_V1"
