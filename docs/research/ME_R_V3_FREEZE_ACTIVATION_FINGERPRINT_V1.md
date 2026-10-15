@@ -164,3 +164,57 @@ Status:
 These are candidate boundaries only.
 No production environment variables have been configured.
 Historical observations must not be backfilled or counted.
+
+## Final consolidated preflight status — 2026-10-15
+
+This section supersedes earlier historical checkpoint statuses.
+Historical checkpoints are retained for auditability.
+
+### Verification
+
+- Immutable protocol 3.0.0 SHA-256: PASS
+- Runtime fingerprint calculation: PASS
+- Runtime fingerprint independent VPS comparison: MATCH
+- UTC freeze/activation ordering: PASS
+- Strict prospective guards: PASS in regression tests
+- Regression suite: 185 PASS
+- PostgreSQL migration 068: PASS in isolated database
+- register_protocol(): PASS
+- Seven variant definitions: PASS
+- Source + seven variant outcomes: PASS
+- Identical replay: PASS
+- Candle identity collision: PASS
+- Transaction rollback: PASS
+- Concurrent PostgreSQL COMMIT/ROLLBACK: PASS in SQL tests
+- Concurrent Python repository smoke: PASS
+
+### Remaining limitations
+
+- Python concurrency test did not force collision at the INSERT statement.
+- Integration tests executed manually; permanent in-repo integration
+  regression coverage is not yet committed.
+- Natural scanner-to-capture timestamp provenance is not verified.
+- Production clock synchronization has not been verified in this preflight.
+- Operator approval of proposed UTC boundaries is pending.
+- No production deployment or activation is authorized.
+
+### Candidate operator freeze record
+
+Protocol version: 3.0.0
+
+FROZEN_AT: 2026-10-16T12:00:00Z
+ACTIVATION_AT: 2026-10-19T12:00:00Z
+
+APPROVED_RUNTIME_FINGERPRINT_CANDIDATE:
+ed1cd8e48d3617fec66b5eac220ec8f7dab3b963e53a4ea51874f12ceddf131a
+
+Immutable specification SHA-256:
+b626700a04b679d67fa4db029e4968dd9feba62123d5145f428e22a87c2e5ed3
+
+Boundary and fingerprint verification: PASS
+Operator approval: PENDING
+Freeze effective: NOT YET EFFECTIVE
+Production activation: NO_GO
+
+This record does not authorize deployment, production environment
+configuration, historical backfill, or V3 capture.
