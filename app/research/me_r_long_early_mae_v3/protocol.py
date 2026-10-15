@@ -69,10 +69,12 @@ def _read_utc_boundary(name: str) -> datetime | None:
     raw = os.environ.get(name, "").strip()
     if not raw:
         return None
-    value = parse_utc(datetime.fromisoformat(raw.replace("Z", "+00:00")))
+    value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise RuntimeError(f"ME_R_EARLY_MAE_V3_NON_UTC_BOUNDARY:{name}")
     if value.utcoffset().total_seconds() != 0:
         raise RuntimeError(f"ME_R_EARLY_MAE_V3_NON_UTC_BOUNDARY:{name}")
-    return value
+    return parse_utc(value)
 
 
 FROZEN_AT = _read_utc_boundary("ME_EARLY_MAE_V3_FROZEN_AT")

@@ -32,6 +32,8 @@ class MeEarlyMaeV3SourceAdapter:
             return None
         close_at = parse_utc(source["source_candle_close_at"])
         detected_at = parse_utc(source["detected_at"])
+        if close_at <= parse_utc(ACTIVATION_AT):
+            return None
         if detected_at <= parse_utc(ACTIVATION_AT):
             return None
         if "source_available_at" not in source or source["source_available_at"] is None:

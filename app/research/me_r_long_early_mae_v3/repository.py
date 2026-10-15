@@ -141,10 +141,12 @@ class MeEarlyMaeV3Repository:
         fingerprint = require_protocol_fingerprint(FROZEN_AT, ACTIVATION_AT)
         detected = parse_utc(source["detected_at"])
         close_at = parse_utc(source["source_candle_close_at"])
-        measured_available = parse_utc(source["source_available_at"])
-        validate_measured_source_availability(close_at, measured_available, detected)
+        if close_at <= parse_utc(ACTIVATION_AT):
+            raise ValueError("PRE_ACTIVATION_CANDLE_REJECTED")
         if detected <= parse_utc(ACTIVATION_AT):
             raise ValueError("PRE_ACTIVATION_SOURCE_REJECTED")
+        measured_available = parse_utc(source["source_available_at"])
+        validate_measured_source_availability(close_at, measured_available, detected)
         cursor = self._cursor()
         try:
             cursor.execute(
