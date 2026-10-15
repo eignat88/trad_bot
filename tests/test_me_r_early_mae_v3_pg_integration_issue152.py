@@ -66,8 +66,8 @@ def _insert_test_fixtures(conn) -> None:
     if cur.fetchone() is None:
         cur.execute(
             """INSERT INTO dds.instrument
-               (instrument_id, symbol, base_asset, quote_asset, category, status)
-               VALUES (%s, %s, 'ISSUE', 'USDT', 'ISOLATED_TEST_ONLY', 'ACTIVE')""",
+               (instrument_id, symbol)
+               VALUES (%s, %s)""",
             (INSTRUMENT_ID, "ISSUE152TEST"),
         )
     entry = datetime(2026, 10, 19, 12, 10, tzinfo=timezone.utc)
@@ -90,9 +90,53 @@ def _insert_test_fixtures(conn) -> None:
 @pytest.mark.skipif(not _opted_in(), reason="ME_EARLY_MAE_V3_PG_INTEGRATION=true required")
 def test_isolated_postgres_real_lifecycle():
     require_isolated_os_user()
-    conn = connect_isolated_database()
+    import pg8000.dbapi
+    conn = pg8000.dbapi.connect(
+        user="trad_bot_runner_152_it",
+        database="trad_bot_runner_152_it_pg_test",
+        unix_sock="/var/run/postgresql/.s.PGSQL.5432",
+    )
+    cur = conn.cursor()
+    cur.execute("SELECT current_database(), current_user, inet_client_addr() IS NULL")
+    assert tuple(cur.fetchone()) == (
+        "trad_bot_runner_152_it_pg_test",
+        "trad_bot_runner_152_it",
+        True,
+    )
+    conn.rollback()
     try:
         require_isolated_schema(conn)
+
+        # ISSUE152: never reuse an existing finalized test source.
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT current_database(), current_user"
+        )
+        db_name, db_user = cur.fetchone()
+
+        if (
+            db_name != "trad_bot_runner_152_it_pg_test"
+            or db_user != "trad_bot_runner_152_it"
+        ):
+            raise RuntimeError(
+                "ISSUE152_E2E_DATABASE_IDENTITY_MISMATCH"
+            )
+
+        cur.execute(
+            f"SELECT source_event_id, source_status "
+            f"FROM {SCHEMA}.source_event "
+            f"WHERE source_setup_id = %s",
+            ("ISSUE152-FINAL",),
+        )
+        existing = cur.fetchone()
+        conn.rollback()
+
+        if existing is not None:
+            raise RuntimeError(
+                f"ISSUE152_E2E_DIRTY_DATABASE:"
+                f"source_id={existing[0]},status={existing[1]}"
+            )
+
         repo = repository.MeEarlyMaeV3Repository(conn)
         actual = protocol.calculate_protocol_fingerprint(protocol.protocol_payload(FROZEN, ACTIVATION))
         with patch.object(repository, "FROZEN_AT", FROZEN), patch.object(
