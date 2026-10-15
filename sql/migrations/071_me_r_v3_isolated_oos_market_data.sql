@@ -3,7 +3,7 @@
 BEGIN;
 DO $$
 BEGIN
- IF current_database() <> 'trad_bot_me_r_v3_oos' THEN
+ IF current_database() NOT IN ('trad_bot_me_r_v3_oos', 'trad_bot_me_r_v3_oos_pg_test') THEN
   RAISE EXCEPTION 'ISOLATED_OOS_DATABASE_REQUIRED';
  END IF;
 END $$;
