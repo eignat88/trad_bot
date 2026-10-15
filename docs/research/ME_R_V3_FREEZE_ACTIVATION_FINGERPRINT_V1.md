@@ -137,3 +137,30 @@ Verdict:
 REPOSITORY_INTEGRATION_PASS
 CONCURRENT_REPOSITORY_SMOKE_PASS
 PRODUCTION_ACTIVATION_NO_GO
+
+## Candidate freeze boundaries — independently verified
+
+Verification date: 2026-10-15
+Verification source: VPS Python protocol_payload() and SHA-256
+
+FROZEN_AT: 2026-10-16T12:00:00Z
+ACTIVATION_AT: 2026-10-19T12:00:00Z
+
+Interval: 72 hours
+Ordering: PASS
+
+Candidate runtime protocol SHA-256:
+ed1cd8e48d3617fec66b5eac220ec8f7dab3b963e53a4ea51874f12ceddf131a
+
+Independent runtime calculation: MATCH
+Canonical protocol version: 3.0.0
+
+Status:
+- FINGERPRINT_VERIFIED
+- BOUNDARIES_PROPOSED
+- OPERATOR_APPROVAL_PENDING
+- PRODUCTION_ACTIVATION_NO_GO
+
+These are candidate boundaries only.
+No production environment variables have been configured.
+Historical observations must not be backfilled or counted.
