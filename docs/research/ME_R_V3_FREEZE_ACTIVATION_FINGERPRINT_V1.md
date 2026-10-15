@@ -106,3 +106,34 @@ Limitations:
 - Operator UTC boundaries and runtime fingerprint: PENDING.
 
 Verdict: SQL_RACE_PASS / FULL_REPOSITORY_PENDING / ACTIVATION_NO_GO.
+
+## Full PostgreSQL repository integration checkpoint
+
+Database: me_r151_race_test (isolated PostgreSQL 17.11)
+Driver: pg8000
+Migration: 068 applied successfully
+Transaction isolation: READ COMMITTED
+
+Validated:
+- register_protocol(): PASS
+- Protocol fingerprint match: PASS
+- Registered variants: exactly 7
+- Source insert and seven outcomes: PASS
+- Identical source replay: same source_event_id
+- Second UNIQUE candle collision: correctly rejected
+- Database CHECK violation: rollback without partial rows
+- Two concurrent Python repository calls: PASS
+- Both workers returned source_event_id = 4
+- Database verified one source and exactly seven variants
+- Previous SQL concurrent COMMIT and ROLLBACK tests: PASS
+
+Limitations:
+- Python worker synchronization occurred before repository calls,
+  not precisely at the competing SQL INSERT.
+- Natural scanner-to-capture provenance is not yet verified.
+- Operator freeze and activation boundaries are not approved.
+
+Verdict:
+REPOSITORY_INTEGRATION_PASS
+CONCURRENT_REPOSITORY_SMOKE_PASS
+PRODUCTION_ACTIVATION_NO_GO
