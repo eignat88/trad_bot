@@ -1,8 +1,9 @@
 """Issue #152 — TEST_ONLY real PostgreSQL lifecycle integration test.
 
-Only the dedicated database ``trad_bot_runner_152_it`` is used through the exact
-runner connection path. Temporary instrument/candle fixtures are removed by
-exact IDs in ``finally``; no production database or service is touched.
+Uses only trad_bot_runner_152_it_pg_test via explicit local peer connection.
+Requires an empty disposable V3 database. Committed/finalized rows are
+intentionally not deleted: database teardown is an external TEST_ONLY
+administrative operation.
 """
 from __future__ import annotations
 
@@ -15,7 +16,6 @@ import pytest
 from app.research.me_r_long_early_mae_v3 import protocol, repository
 from app.research.me_r_long_early_mae_v3.evaluator import MeEarlyMaeV3Evaluator
 from app.research.me_r_long_early_mae_v3.runner import (
-    connect_isolated_database,
     require_isolated_os_user,
     require_isolated_schema,
 )
@@ -137,6 +137,27 @@ def test_isolated_postgres_real_lifecycle():
                 f"source_id={existing[0]},status={existing[1]}"
             )
 
+        # Fail closed: never run against previously used test datasets.
+        cur = conn.cursor()
+        cur.execute(
+            f"""SELECT
+                (SELECT count(*) FROM {SCHEMA}.protocol),
+                (SELECT count(*) FROM {SCHEMA}.variant),
+                (SELECT count(*) FROM {SCHEMA}.source_event),
+                (SELECT count(*) FROM {SCHEMA}.variant_outcome),
+                (SELECT count(*) FROM {SCHEMA}.pipeline_run),
+                (SELECT count(*) FROM dds.instrument WHERE instrument_id = %s),
+                (SELECT count(*) FROM market.candle WHERE source = %s)
+            """,
+            (INSTRUMENT_ID, "ISSUE152_TEST_ONLY"),
+        )
+        counts = tuple(cur.fetchone())
+        conn.rollback()
+        if counts != (0, 0, 0, 0, 0, 0, 0):
+            raise RuntimeError(
+                f"ISSUE152_E2E_DISPOSABLE_DATABASE_NOT_EMPTY:{counts}"
+            )
+
         repo = repository.MeEarlyMaeV3Repository(conn)
         actual = protocol.calculate_protocol_fingerprint(protocol.protocol_payload(FROZEN, ACTIVATION))
         with patch.object(repository, "FROZEN_AT", FROZEN), patch.object(
@@ -209,48 +230,6 @@ def test_isolated_postgres_real_lifecycle():
             )
             assert tuple(cur.fetchone()) == ("FINALIZED", "COMPLETE")
     finally:
-        # Disposable cleanup is guarded by exact TEST_ONLY identity. No
-        # arbitrary schemas or production rows are deleted. Finalized rows
-        # are not force-mutated; immutable triggers remain authoritative.
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                f"DELETE FROM {SCHEMA}.variant_outcome "
-                f"WHERE source_event_id IN ("
-                f"  SELECT source_event_id FROM {SCHEMA}.source_event "
-                f"  WHERE protocol_version=%s AND source_setup_id LIKE %s"
-                f")",
-                (protocol.PROTOCOL_VERSION, "ISSUE152-%"),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                f"DELETE FROM {SCHEMA}.source_event "
-                f"WHERE protocol_version=%s AND source_setup_id LIKE %s",
-                (protocol.PROTOCOL_VERSION, "ISSUE152-%"),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                "DELETE FROM market.candle WHERE source = %s",
-                ("ISSUE152_TEST_ONLY",),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                "DELETE FROM dds.instrument WHERE symbol = %s",
-                ("ISSUE152TEST",),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
+        # Never delete immutable or shared rows by wildcard.
+        # TEST_ONLY disposable database teardown occurs outside this test.
         conn.close()

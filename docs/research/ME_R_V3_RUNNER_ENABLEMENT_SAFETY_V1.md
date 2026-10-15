@@ -36,17 +36,14 @@ paper/live routing, systemd and production configuration were not changed.
     UID and evaluator error/success paths.
 
 - `tests/test_me_r_early_mae_v3_pg_integration_issue152.py`
-  - Real `pg8000` integration test remains explicit opt-in via
-    `ME_EARLY_MAE_V3_PG_INTEGRATION=true`.
-  - Uses only the dedicated `trad_bot_runner_152_it` contour and disposable
-    fixture rows with cleanup in `finally`.
-  - TEST_ONLY synthetic baseline now uses exactly 48 sequential 5-minute
-    candles: `open_at = entry + 5*i minutes`,
-    `close_at = open_at + 5 minutes`.
-  - Cleanup deletes only exact TEST_ONLY rows identified by
-    `source_setup_id LIKE 'ISSUE152-%'` through the source FK,
-    `source='ISSUE152_TEST_ONLY'`, and `symbol='ISSUE152TEST'`.
-    Immutable triggers remain authoritative and are not bypassed.
+  - Real PostgreSQL integration test requires explicit opt-in.
+  - Connects only to `trad_bot_runner_152_it_pg_test`.
+  - Verifies the expected PostgreSQL role and Unix socket.
+  - Requires empty disposable V3 tables and TEST_ONLY fixtures.
+  - Uses 48 sequential five-minute candles for the 240-minute baseline.
+  - Preserves immutable FINALIZED records.
+  - Does not perform wildcard DELETE cleanup.
+  - Disposable database teardown is a separate administrative operation.
 
 ## Test evidence
 
@@ -72,34 +69,38 @@ schemas: dds, market, research_me_early_mae_v3
 
 ## PostgreSQL E2E verdict: PASS
 
-A real PostgreSQL integration test passed against the dedicated
-disposable database `trad_bot_runner_152_it_pg_test`.
-
-Evidence:
+The real PostgreSQL E2E passed in the isolated disposable database
+`trad_bot_runner_152_it_pg_test`.
 
 ```text
-PostgreSQL 17.11
+PostgreSQL: 17.11
 Database: trad_bot_runner_152_it_pg_test
 DB role: trad_bot_runner_152_it
 Connection: Unix socket / peer authentication
 Pre-test: protocols=0, sources=0, outcomes=0
-Post-fix E2E: 1 passed in 0.26s
+E2E: 1 passed in 0.26s
 Full V3 regression: 198 passed, 1 skipped
 git diff --check: PASS
-The test validates its implemented registration, source capture,
-evaluation, finalization and repeated evaluation assertions.
-The previous FINALIZED_SOURCE_IMMUTABLE blocker was caused by
-the E2E harness connecting to trad_bot_runner_152_it, which
-already contained a finalized ISSUE152-FINAL source.
-The test harness now connects explicitly to the disposable database,
-validates DB identity, and rejects reuse of ISSUE152-FINAL.
-The TEST_ONLY instrument INSERT was aligned with the actual
-disposable database schema: instrument_id and symbol.
-The 240-minute baseline fixture uses 48 contiguous five-minute candles.
-The passing test does not independently establish exhaustive
-crash recovery, concurrency or continuous-runner readiness.
-No approved runtime semantics, immutable triggers or
-freeze/activation guards were changed to obtain PASS.
+The earlier FINALIZED_SOURCE_IMMUTABLE failure was caused by
+the test connecting to trad_bot_runner_152_it, which already
+contained a finalized ISSUE152-FINAL source.
+The corrected test connects to the disposable database and validates
+its identity. Its PostgreSQL fixture also uses the actual
+dds.instrument columns and 48 contiguous five-minute candles.
+The current E2E test validates registration, source insertion,
+entry update, baseline evaluation, finalization and repeated evaluation.
+It does not prove exhaustive concurrency, crash recovery or
+continuous runner operation.
+The disposable database must be empty before the test.
+Finalized rows are never removed through wildcard DELETE operations.
+Database teardown must be performed separately by an authorized
+operator, exclusively for trad_bot_runner_152_it_pg_test.
+The temporary HBA permission used for the earlier successful
+integration run was removed after testing.
+No approved runtime semantics, freeze/activation guards,
+migrations or immutable triggers were changed.
+```
+
 ## Safety confirmation
 
 - `/opt/trad_bot` was not modified; its HEAD remains
