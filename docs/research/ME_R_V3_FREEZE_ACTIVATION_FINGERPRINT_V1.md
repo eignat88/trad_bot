@@ -28,7 +28,7 @@ Verification: PASS.
 
 ## Regression evidence
 
-181 passed, 0 failed.
+185 passed, 0 failed.
 Python: /opt/trad_bot/.venv/bin/python
 Production database integration: NOT VERIFIED.
 Natural runtime fetch provenance: NOT VERIFIED.
@@ -78,3 +78,31 @@ FREEZE_APPROVAL_PENDING
 PRODUCTION_ACTIVATION_NO_GO
 
 This document does not authorize deployment or OOS activation.
+
+## PostgreSQL race hardening checkpoint
+
+Environment: PostgreSQL 17.11, isolated database me_r151_race_test.
+Isolation: READ COMMITTED.
+Production trad_bot database: NOT MODIFIED.
+
+Code changes:
+- Source INSERT uses ON CONFLICT DO NOTHING RETURNING.
+- Conflict fallback re-reads source_setup_id with FOR UPDATE.
+- Missing fallback row rejects conflicting candle identity.
+- Registration advisory lock corrected to bigint.
+- Four additional SQL-contract regression tests.
+
+Evidence:
+- 185 V3 regression tests passed.
+- Concurrent COMMIT: PASS; one persistent source.
+- Second UNIQUE constraint: PASS; conflicting source rejected by SQL fallback conditions.
+- Concurrent ROLLBACK: PASS; surviving transaction committed exactly one source.
+- bigint advisory lock: PASS.
+
+Limitations:
+- SQL concurrency tests used a simplified race_source table.
+- Full Python repository plus seven variants integration: NOT VERIFIED.
+- Natural runtime source provenance: NOT VERIFIED.
+- Operator UTC boundaries and runtime fingerprint: PENDING.
+
+Verdict: SQL_RACE_PASS / FULL_REPOSITORY_PENDING / ACTIVATION_NO_GO.

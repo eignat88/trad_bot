@@ -48,7 +48,7 @@ class MeEarlyMaeV3Repository:
         payload = protocol_payload(FROZEN_AT, ACTIVATION_AT)
         cursor = self._cursor()
         try:
-            cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (PROTOCOL_LOCK_KEY,))
+            cursor.execute("SELECT pg_advisory_xact_lock(%s::bigint)", (PROTOCOL_LOCK_KEY,))
             cursor.execute(
                 f"""INSERT INTO {SOURCE_SCHEMA}.protocol (
                     protocol_version, experiment_id, scanner_name, scanner_version,
@@ -172,7 +172,8 @@ class MeEarlyMaeV3Repository:
                     ) VALUES (
                         %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                         %s::jsonb,%s,%s,%s,%s
-                    ) RETURNING source_event_id""",
+                    ) ON CONFLICT DO NOTHING
+                    RETURNING source_event_id""",
                     (
                         PROTOCOL_VERSION, str(source["source_setup_id"]),
                         int(source["instrument_id"]), source["symbol"],
@@ -189,8 +190,25 @@ class MeEarlyMaeV3Repository:
                 )
                 row = cursor.fetchone()
                 if row is None:
-                    raise RuntimeError("SOURCE_INSERT_RETURNED_NO_ID")
-                source_id = int(row[0])
+                    # New statement, new READ COMMITTED snapshot:
+                    # a concurrent winner may have committed this source.
+                    cursor.execute(
+                        f"""SELECT source_event_id
+                            FROM {SOURCE_SCHEMA}.source_event
+                            WHERE protocol_version=%s AND source_setup_id=%s
+                            FOR UPDATE""",
+                        (PROTOCOL_VERSION, str(source["source_setup_id"])),
+                    )
+                    existing = cursor.fetchone()
+                    if existing is None:
+                        # Conflict on the other UNIQUE identity.
+                        raise ValueError("SOURCE_CANDLE_IDENTITY_COLLISION")
+                    source_id = int(existing[0])
+                    self._verify_existing_source(
+                        cursor, source, source_id, fingerprint
+                    )
+                else:
+                    source_id = int(row[0])
 
             cursor.execute(
                 f"""SELECT variant_id, variant_status, horizon_minutes, threshold_mae_r,
