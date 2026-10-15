@@ -40,17 +40,13 @@ paper/live routing, systemd and production configuration were not changed.
     `ME_EARLY_MAE_V3_PG_INTEGRATION=true`.
   - Uses only the dedicated `trad_bot_runner_152_it` contour and disposable
     fixture rows with cleanup in `finally`.
-  - TEST_ONLY synthetic baseline now uses exactly 48 consecutive 5-minute
+  - TEST_ONLY synthetic baseline now uses exactly 48 sequential 5-minute
     candles: `open_at = entry + 5*i minutes`,
     `close_at = open_at + 5 minutes`.
   - Cleanup deletes only exact TEST_ONLY rows identified by
     `source_setup_id LIKE 'ISSUE152-%'` through the source FK,
     `source='ISSUE152_TEST_ONLY'`, and `symbol='ISSUE152TEST'`.
     Immutable triggers remain authoritative and are not bypassed.
-  - Covers protocol idempotency, seven approved variants, pre-activation
-    rejection, missing measured provenance rejection, source capture,
-    entry-fill persistence, evaluator lifecycle, seven-outcome finalization
-    and restart retry behavior.
 
 ## Test evidence
 
@@ -66,31 +62,42 @@ Targeted regression:
 Integration without explicit opt-in:
 1 skipped
 
-Integration with explicit opt-in, as trad_bot_runner_152_it:
-1 passed
+git diff --check:
+PASS
 
 PostgreSQL 17.11 isolated database:
 trad_bot_runner_152_it, Unix socket peer authentication
 schemas: dds, market, research_me_early_mae_v3
-
-Post-E2E disposable DB identity counts:
-protocols=0, variants=0, sources=0, outcomes=0,
-candles=0, instruments=0
 ```
 
-The skipped integration test is intentional fail-closed behavior without
-`ME_EARLY_MAE_V3_PG_INTEGRATION=true`.
+## PostgreSQL E2E verdict: FAIL / BLOCKED
 
-## PostgreSQL E2E status: PASS
+The final reproducible E2E run used a strictly identity-checked disposable
+database:
 
-The previous deterministic blocker was in the TEST_ONLY fixture only: the
-fixture generated 244 one-minute-spaced candles instead of the approved
-240-minute baseline represented by 48 sequential 5-minute candles. The fixture
-was corrected without changing runtime protocol, evaluator, repository or
-freeze guards.
+```text
+identity=trad_bot_runner_152_it_pg_test|1|0|0
+rc_identity=0
+```
 
-The real PostgreSQL lifecycle test passed under the dedicated role and then
-cleaned all disposable rows.
+The disposable database was rebuilt from migrations 068-070. The E2E failed
+immediately after protocol registration:
+
+```text
+PROTOCOL_COUNT_BEFORE [1]
+SOURCES_BEFORE ([39, 'ISSUE152-FINAL', 'FINALIZED'],)
+ValueError: FINALIZED_SOURCE_IMMUTABLE
+```
+
+This is not the previously documented synthetic-candle mismatch. The repository
+`register_protocol()` path leaves an already-finalized `ISSUE152-FINAL` source
+in a clean isolated database before the test calls `update_source_entry()`.
+The immutable trigger/repository lifecycle therefore prevents the intended
+`DETECTED -> ENTRY_FILLED` path in the current implementation.
+
+No approved protocol/runtime semantics, migrations, freeze guards or
+immutable triggers were changed to force a PASS. The minimal failing evidence
+is preserved by the committed integration test and final E2E output.
 
 ## Safety confirmation
 
@@ -105,5 +112,6 @@ cleaned all disposable rows.
 
 ## Verdict
 
-`READY_FOR_REVIEW`. Regression, `git diff --check` and PostgreSQL E2E are
-`PASS`. Production remains `NO_GO`.
+`READY_FOR_REVIEW` is allowed only with the open PostgreSQL E2E blocker.
+PostgreSQL E2E verdict: `FAIL / BLOCKED`. Regression and diff checks are
+`PASS`. This is not a production-ready status.
