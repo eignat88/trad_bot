@@ -86,7 +86,7 @@ def collect_context(client, symbol: str):
     return context, completed
 
 
-def store_latest_5m(connection, symbol: str, candle, observed_at: datetime) -> bool:
+def store_latest_5m(connection, symbol: str, candle, observed_at: datetime) -> tuple[bool, int | None]:
     """Write only a *newly available* completed candle; never backfill a gap."""
     opened_ms = int(candle.timestamp)
     if opened_ms < 10_000_000_000:
@@ -96,7 +96,7 @@ def store_latest_5m(connection, symbol: str, candle, observed_at: datetime) -> b
     activation = parse_utc(ACTIVATION_AT)
     lag = (observed_at - closed).total_seconds()
     if closed <= activation or lag < 0 or lag > 300:
-        return False
+        return False, None
     cursor = connection.cursor()
     try:
         cursor.execute(
@@ -120,8 +120,8 @@ def store_latest_5m(connection, symbol: str, candle, observed_at: datetime) -> b
             ),
         )
         inserted = cursor.rowcount == 1
-        connection.commit()
-        return inserted
+        # Transaction committed by caller (capture atomically, if signalled).
+        return inserted, int(instrument_id)
     except BaseException:
         connection.rollback()
         raise
@@ -144,24 +144,41 @@ def once(client=None):
         pipeline.initialize()
         stats = {"symbols": 0, "signals": 0, "new_candles": 0, "rejected": 0}
         for symbol in symbols:
-            # Fail closed for this symbol; no synthesized or late signals.
-            context, completed = collect_context(client, symbol)
-            latest = context.candles_5m[-1] if context.candles_5m else None
-            if latest is None:
-                stats["rejected"] += 1
-                continue
-            inserted = store_latest_5m(connection, symbol, latest, completed)
-            stats["new_candles"] += int(inserted)
-            # Capture only on a newly observed, naturally closed 5m candle.
-            if not inserted:
-                continue
-            detection = detect_v1_closed(context, completed, completed)
-            if detection.status == "REJECTED":
-                stats["rejected"] += 1
-            elif detection.status == "SIGNAL":
-                pipeline.capture_source(detection.source)
-                stats["signals"] += 1
-            stats["symbols"] += 1
+            # Each symbol is a separate transaction. Do not mark a candle seen
+            # until the validated no-signal state or capture is committed.
+            try:
+                context, completed = collect_context(client, symbol)
+                latest = context.candles_5m[-1] if context.candles_5m else None
+                if latest is None:
+                    stats["rejected"] += 1
+                    continue
+                # Detector validates contiguous closed timeframes before storage.
+                detection = detect_v1_closed(context, completed, completed)
+                if detection.status == "REJECTED":
+                    stats["rejected"] += 1
+                    continue
+                inserted, instrument_id = store_latest_5m(
+                    connection, symbol, latest, completed
+                )
+                if not inserted:
+                    connection.rollback()
+                    continue
+                if detection.status == "SIGNAL":
+                    if detection.source is None:
+                        raise RuntimeError("ME_R_V3_SIGNAL_WITHOUT_SOURCE")
+                    # The repository must not rollback the transaction merely
+                    # to look up an instrument. Supply the known local ID.
+                    pipeline.capture_source({
+                        **detection.source, "instrument_id": instrument_id
+                    })
+                    stats["signals"] += 1
+                else:
+                    connection.commit()
+                stats["new_candles"] += 1
+                stats["symbols"] += 1
+            except BaseException:
+                connection.rollback()
+                raise
         evaluation = pipeline.evaluate_cycle()
         if evaluation.get("errors", 0):
             raise RuntimeError("ME_R_V3_EVALUATOR_CYCLE_ERRORS")
