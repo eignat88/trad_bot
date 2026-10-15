@@ -113,12 +113,15 @@ the separate statistical protocol, not by this specification freeze.
 
 ## 9. Approval boundary
 
-Status: FREEZE_CANDIDATE_PENDING_FINAL_VALIDATION.
+Status: APPROVED_SPECIFICATION_FROZEN.
 
-Protocol specification may be marked APPROVED only after:
-- immutable hash and constant consistency checks PASS;
-- broader relevant regression tests PASS;
-- operator reviews and approves the final artifact.
+Approval: operator explicitly accepted the final protocol parameters on 2026-10-15.
+Acceptance evidence:
+- immutable hash and constant consistency checks: PASS;
+- broader relevant regression tests: 159 PASS;
+- operator review and approval: CONFIRMED.
+
+This approval applies to the immutable research specification only. It does not authorize runtime activation, deployment, database migrations, paper/live execution or retrospective rewriting.
 
 Activation approval: NOT GRANTED.
 No V3 OOS accumulation may be claimed by this issue.
