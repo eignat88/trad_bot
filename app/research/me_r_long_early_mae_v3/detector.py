@@ -69,7 +69,7 @@ def _detect_original_v1(context: DetectionContext) -> SetupCandidate | None:
     if len(candles_15m) < 30 or len(candles_5m) < 15:
         return None
 
-    swing_highs = find_swing_highs(candles_15m, 5)
+    swing_highs = find_swing_highs(to_frozen_v1_candles(context.candles_15m), 5)
     if len(swing_highs) < 2:
         return None
     prev_high = swing_highs[-2].price
