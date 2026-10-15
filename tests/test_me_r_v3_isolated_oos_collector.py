@@ -45,7 +45,7 @@ def test_no_pre_activation_backfill(monkeypatch):
     assert module.store_latest_5m(
         NoCallConnection(), "BTCUSDT", candle(opened),
         activation + timedelta(seconds=20),
-    ) is False
+    ) == (False, None)
 
 
 def test_no_late_retroactive_candle(monkeypatch):
@@ -73,3 +73,21 @@ def test_no_paper_live_route():
     assert "create_order(" not in source
     assert "paper_engine" not in source
     assert "trad_bot_runner_152_it" not in source
+
+def test_duplicate_candle_cannot_replay_capture():
+    from pathlib import Path
+    source = Path(module.__file__).read_text()
+    assert "if not inserted:" in source
+    assert "connection.rollback()" in source
+    assert "pipeline.capture_source({" in source
+    assert "connection.commit()" in source
+
+
+def test_systemd_disabled_by_default():
+    from pathlib import Path
+    service = Path("deploy/systemd/trad-bot-me-r-v3-oos.service").read_text()
+    timer = Path("deploy/systemd/trad-bot-me-r-v3-oos.timer").read_text()
+    assert "ME_EARLY_MAE_V3_CAPTURE_ENABLED=false" in service
+    assert "User=trad_bot_me_r_v3_oos" in service
+    assert "Persistent=false" in timer
+    assert "WantedBy=timers.target" in timer
