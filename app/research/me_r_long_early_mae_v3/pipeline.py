@@ -15,8 +15,8 @@ class MeEarlyMaeV3Pipeline:
     def initialize(self) -> None:
         self.repository.register_protocol()
 
-    def capture_source(self, source: dict) -> int | None:
-        return self.source_adapter.capture(source)
+    def capture_source(self, source: dict, *, commit: bool = True) -> int | None:
+        return self.source_adapter.capture(source, commit=commit)
 
     def evaluate_cycle(self, now=None) -> dict[str, int]:
         return self.evaluator.run_cycle(now)
