@@ -7,7 +7,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
+from pathlib import Path
 from datetime import datetime, timezone
+
+# Permit direct execution from tools/research without external PYTHONPATH.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.config import Settings
 from app.exchange.bybit_client import BybitClient
