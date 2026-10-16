@@ -111,3 +111,64 @@ def test_collector_owns_commit_only_after_source_capture():
     assert "}, commit=False)" in source
     capture = source.index("}, commit=False)")
     assert "connection.commit()" in source[capture:capture + 100]
+
+
+def test_market_preflight_is_read_only_and_uses_closed_context(monkeypatch):
+    from types import SimpleNamespace
+    checked = []
+    fake_closed = SimpleNamespace(
+        signal_candle=SimpleNamespace(
+            close_at=datetime(2026, 10, 15, 16, 5, tzinfo=timezone.utc)
+        ),
+        candles_5m=tuple(range(30)),
+        candles_15m=tuple(range(40)),
+        candles_1h=tuple(range(24)),
+    )
+    monkeypatch.setattr(module, "validate_identity", lambda: None)
+    monkeypatch.setattr(module, "configured_symbols", lambda: ("BTCUSDT",))
+    monkeypatch.setattr(module, "collect_context", lambda client, symbol: (
+        SimpleNamespace(symbol=symbol),
+        datetime(2026, 10, 15, 16, 5, 30, tzinfo=timezone.utc),
+    ))
+    monkeypatch.setattr(module, "build_closed_context",
+                        lambda context, asof, completed: checked.append(context.symbol) or fake_closed)
+    monkeypatch.setattr(module, "connect",
+                        lambda: (_ for _ in ()).throw(AssertionError("DB must not be accessed")))
+    result = module.market_preflight(client=object())
+    assert checked == ["BTCUSDT"]
+    assert result["BTCUSDT"]["delay_seconds"] == 30.0
+    assert result["BTCUSDT"]["closed_5m"] == 30
+
+
+def test_market_preflight_rejects_stale_source_without_db(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(module, "validate_identity", lambda: None)
+    monkeypatch.setattr(module, "configured_symbols", lambda: ("BTCUSDT",))
+    monkeypatch.setattr(module, "collect_context", lambda client, symbol: (
+        SimpleNamespace(symbol=symbol),
+        datetime(2026, 10, 15, 16, 11, tzinfo=timezone.utc),
+    ))
+    monkeypatch.setattr(module, "build_closed_context",
+                        lambda context, asof, completed: SimpleNamespace(
+                            signal_candle=SimpleNamespace(
+                                close_at=datetime(2026, 10, 15, 16, 5, tzinfo=timezone.utc)
+                            )
+                        ))
+    monkeypatch.setattr(module, "connect",
+                        lambda: (_ for _ in ()).throw(AssertionError("DB must not be accessed")))
+    with pytest.raises(RuntimeError, match="SOURCE_DELAY_INVALID"):
+        module.market_preflight(client=object())
+
+
+def test_service_and_timer_contract():
+    from pathlib import Path
+    service = Path("deploy/systemd/trad-bot-me-r-v3-oos.service").read_text()
+    timer = Path("deploy/systemd/trad-bot-me-r-v3-oos.timer").read_text()
+    assert "Type=oneshot" in service
+    assert "User=trad_bot_me_r_v3_oos" in service
+    assert "WorkingDirectory=/opt/trad_bot" in service
+    assert "ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.me_r_long_early_mae_v3.isolated_oos --once" in service
+    assert "ME_EARLY_MAE_V3_CAPTURE_ENABLED=false" in service
+    assert "EnvironmentFile=-/etc/trad-bot/me-r-v3-oos.env" in service
+    assert "OnCalendar=*-*-* *:0/5:30 UTC" in timer
+    assert "Persistent=false" in timer
