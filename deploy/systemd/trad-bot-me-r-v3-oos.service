@@ -1,19 +1,21 @@
 [Unit]
-Description=ME_R V3 isolated research-only OOS cycle (Issue 154)
+Description=ME_R V3 isolated research-only OOS cycle (Issue 154; disabled by default)
 After=network-online.target postgresql.service
 Wants=network-online.target
-ConditionPathExists=/opt/trad_bot/app/research/me_r_long_early_mae_v3/isolated_oos.py
+ConditionPathExists=/opt/trad_bot_me_r_v3_release/app/research/me_r_long_early_mae_v3/isolated_oos.py
 
 [Service]
 Type=oneshot
 User=trad_bot_me_r_v3_oos
 Group=trad_bot_me_r_v3_oos
-WorkingDirectory=/opt/trad_bot
+WorkingDirectory=/opt/trad_bot_me_r_v3_release
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=ME_EARLY_MAE_V3_CAPTURE_ENABLED=false
-# Operator must provide a separately approved environment file; never commit its values.
-EnvironmentFile=-/etc/trad-bot/me-r-v3-oos.env
-ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.me_r_long_early_mae_v3.isolated_oos --once
+# Mandatory reviewed operator configuration; absence fails closed.
+EnvironmentFile=/etc/trad-bot/me-r-v3-oos.env
+ExecStart=/opt/trad_bot_me_r_v3_release/.venv/bin/python -m app.research.me_r_long_early_mae_v3.isolated_oos --once
+UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
