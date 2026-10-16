@@ -61,7 +61,8 @@ def test_no_late_retroactive_candle(monkeypatch):
 def test_sql_migration_requires_exact_database():
     from pathlib import Path
     sql = Path("sql/migrations/071_me_r_v3_isolated_oos_market_data.sql").read_text()
-    assert "current_database() <> 'trad_bot_me_r_v3_oos'" in sql
+    assert "'trad_bot_me_r_v3_oos_pg_test'" in sql
+    assert "'trad_bot_me_r_v3_oos'" in sql
     assert "PRIMARY KEY (exchange, market_type, instrument_id, timeframe, open_time)" in sql
     assert "ON DELETE CASCADE" not in sql
 
@@ -91,3 +92,22 @@ def test_systemd_disabled_by_default():
     assert "User=trad_bot_me_r_v3_oos" in service
     assert "Persistent=false" in timer
     assert "WantedBy=timers.target" in timer
+
+
+def test_capture_facade_preserves_default_commit_contract():
+    from app.research.me_r_long_early_mae_v3.pipeline import MeEarlyMaeV3Pipeline
+    class Adapter:
+        def capture(self, source, *, commit=True):
+            return source["id"], commit
+    pipeline = object.__new__(MeEarlyMaeV3Pipeline)
+    pipeline.source_adapter = Adapter()
+    assert pipeline.capture_source({"id": 7}) == (7, True)
+    assert pipeline.capture_source({"id": 7}, commit=False) == (7, False)
+
+
+def test_collector_owns_commit_only_after_source_capture():
+    from pathlib import Path
+    source = Path(module.__file__).read_text()
+    assert "}, commit=False)" in source
+    capture = source.index("}, commit=False)")
+    assert "connection.commit()" in source[capture:capture + 100]
