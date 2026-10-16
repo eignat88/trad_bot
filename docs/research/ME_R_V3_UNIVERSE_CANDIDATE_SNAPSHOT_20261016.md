@@ -22,3 +22,24 @@ BTCUSDT,ETHUSDT,SOLUSDT,ZECUSDT,SOXLUSDT,NEARUSDT,XRPUSDT,HYPEUSDT,STRKUSDT,KORU
 4. Approve exact ordered symbol list and hash explicitly; configure runtime only after separate deployment/activation authorizations.
 
 Original state remains `CANDIDATE_NOT_APPROVED`. Freeze timestamp 2026-10-16T12:00:00Z and activation cutoff 2026-10-19T12:00:00Z do **not** authorize a service start.
+
+## Full 50-symbol natural market preflight — 2026-10-16
+
+Operator-provided VPS stdout after checking out commit `6e6eeafc`.
+Command: `--market-preflight` on all 50 symbols from this snapshot, running
+as dedicated OS user `trad_bot_me_r_v3_oos`, no DB connection or capture.
+
+- Results returned for **all 50/50** symbols; zero reported failures.
+- All source-close timestamps: `2026-10-16T05:05:00Z`.
+- All: 199 validated closed 5m, 199 closed 15m, 199 closed 1h candles.
+- Earliest fetch completion BTCUSDT: `05:07:37.543720Z`, 157.544s lag.
+- Latest fetch completion XAUTUSDT: `05:08:08.580044Z`, 188.580s lag.
+- Observed first-to-last API completion span: 31.036324s.
+- Max 300s lag gate: PASS for this single observed sampling cycle.
+
+**Scope limitation:** this is one read-only observed sequence. It does not
+measure 50-symbol live evaluator completion, tail retry/backoff latency,
+API failures or repeated-cycle reliability. Market/underlying eligibility
+has not been independently approved. The snapshot remains
+`CANDIDATE_NOT_APPROVED`; no merger, migration to the clean OOS database,
+service start, timer activation or historical ingestion is authorized.
