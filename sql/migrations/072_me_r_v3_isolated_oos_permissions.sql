@@ -18,7 +18,10 @@ BEGIN
     END IF;
 END $$;
 
-GRANT CONNECT ON DATABASE trad_bot_me_r_v3_oos_pg_test TO trad_bot_me_r_v3_oos;
+DO $
+BEGIN
+    EXECUTE format('GRANT CONNECT ON DATABASE %I TO trad_bot_me_r_v3_oos', current_database());
+END $;
 GRANT USAGE ON SCHEMA research_me_early_mae_v3 TO trad_bot_me_r_v3_oos;
 GRANT SELECT, INSERT, UPDATE ON
     research_me_early_mae_v3.protocol,
