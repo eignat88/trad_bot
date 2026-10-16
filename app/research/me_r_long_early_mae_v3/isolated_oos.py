@@ -7,6 +7,7 @@ The existing #152 isolated test runner is deliberately untouched.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import pwd
 import re
@@ -22,6 +23,8 @@ from .protocol import ACTIVATION_AT, parse_utc, require_protocol_fingerprint
 DATABASE = "trad_bot_me_r_v3_oos"
 ROLE = "trad_bot_me_r_v3_oos"
 SOCKET = "/var/run/postgresql/.s.PGSQL.5432"
+FROZEN_CRYPTO_UNIVERSE = "BTCUSDT,ETHUSDT,SOLUSDT,ZECUSDT,NEARUSDT,XRPUSDT,HYPEUSDT,STRKUSDT,ENAUSDT,ZEREBROUSDT,DOGEUSDT,SUIUSDT,AKEUSDT,ADAUSDT,PUMPFUNUSDT,1000PEPEUSDT,WLDUSDT,ZROUSDT,ONDOUSDT,INJUSDT,UNIUSDT,WALUSDT,AVAXUSDT,LINKUSDT,ARBUSDT,TIAUSDT,PYTHUSDT,TAOUSDT,PUFFERUSDT,SIRENUSDT,AAVEUSDT,ZKUSDT,QNTUSDT,CRVUSDT"
+FROZEN_CRYPTO_UNIVERSE_SHA256 = "19c5807e510e75ff1e19bdca8bdad469e05a9c2198266ab27821570425a28bf8"
 INTERVALS = (("candles_5m", "5", 300), ("candles_15m", "15", 900), ("candles_1h", "60", 3600))
 
 
@@ -58,6 +61,10 @@ def configured_symbols() -> tuple[str, ...]:
         raise RuntimeError("ME_R_V3_EXPLICIT_SYMBOL_UNIVERSE_REQUIRED")
     if any(re.fullmatch(r"[A-Z0-9]{3,32}", symbol) is None for symbol in symbols):
         raise RuntimeError("ME_R_V3_INVALID_SYMBOL")
+    csv = ",".join(symbols)
+    digest = hashlib.sha256(csv.encode("utf-8")).hexdigest()
+    if csv != FROZEN_CRYPTO_UNIVERSE or digest != FROZEN_CRYPTO_UNIVERSE_SHA256:
+        raise RuntimeError("ME_R_V3_FROZEN_UNIVERSE_MISMATCH")
     return symbols
 
 
