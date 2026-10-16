@@ -14,9 +14,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 EXPERIMENT_ID = "ME_R_LONG_EARLY_MAE_EXIT_OOS_V3"
-PROTOCOL_VERSION = "3.0.0-DRAFT"
+PROTOCOL_VERSION = "3.0.0"
 SCANNER_NAME = "ME_R_LONG_CLOSED_V1"
-SCANNER_VERSION = "1.0.0-DRAFT"
+SCANNER_VERSION = "1.0.0"
 SOURCE_DIRECTION = "LONG"
 SOURCE_SCHEMA = "research_me_early_mae_v3"
 SOURCE_CANDLE_VERSION = "MARKET_CANDLE_CLOSED_5M_V1"
@@ -69,10 +69,12 @@ def _read_utc_boundary(name: str) -> datetime | None:
     raw = os.environ.get(name, "").strip()
     if not raw:
         return None
-    value = parse_utc(datetime.fromisoformat(raw.replace("Z", "+00:00")))
+    value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise RuntimeError(f"ME_R_EARLY_MAE_V3_NON_UTC_BOUNDARY:{name}")
     if value.utcoffset().total_seconds() != 0:
         raise RuntimeError(f"ME_R_EARLY_MAE_V3_NON_UTC_BOUNDARY:{name}")
-    return value
+    return parse_utc(value)
 
 
 FROZEN_AT = _read_utc_boundary("ME_EARLY_MAE_V3_FROZEN_AT")

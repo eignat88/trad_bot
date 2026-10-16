@@ -1,0 +1,75 @@
+name: ME R V3 Isolated OOS PR Safety
+
+on:
+  pull_request:
+    paths:
+      - "app/research/me_r_long_early_mae_v3/**"
+      - "tests/test_me_r_early_mae_v3_*.py"
+      - "tests/test_me_r_v3_*.py"
+      - "sql/migrations/071_me_r_v3_isolated_oos_market_data.sql"
+      - "sql/migrations/072_me_r_v3_isolated_oos_permissions.sql"
+      - "deploy/systemd/trad-bot-me-r-v3-oos.*"
+      - "docs/research/ME_R_V3_CRYPTO_ONLY_UNIVERSE_ISSUE154.md"
+      - ".github/workflows/me-r-v3-isolated-oos-pr.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-safety:
+    name: Offline V3 tests and frozen universe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      ME_R_V3_PG_INTEGRATION: "false"
+      ME_R_V3_ATOMIC_E2E: "false"
+      ME_EARLY_MAE_V3_CAPTURE_ENABLED: "false"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Configure Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install offline dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+
+      - name: Verify frozen universe equals reviewed manifest
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import re
+          from pathlib import Path
+          from app.research.me_r_long_early_mae_v3.isolated_oos import (
+              FROZEN_CRYPTO_UNIVERSE,
+              FROZEN_CRYPTO_UNIVERSE_SHA256,
+          )
+          text = Path("docs/research/ME_R_V3_CRYPTO_ONLY_UNIVERSE_ISSUE154.md").read_text()
+          found = re.findall(r"(?m)^BTCUSDT,[A-Z0-9,]+$", text)
+          assert len(found) == 1, "manifest CSV missing or ambiguous"
+          assert found[0] == FROZEN_CRYPTO_UNIVERSE
+          symbols = found[0].split(",")
+          assert len(symbols) == len(set(symbols)) == 34
+          actual = hashlib.sha256(found[0].encode("utf-8")).hexdigest()
+          assert actual == FROZEN_CRYPTO_UNIVERSE_SHA256
+          print("FROZEN_CRYPTO_UNIVERSE_MANIFEST_PASS", len(symbols), actual)
+          PY
+
+      - name: Run isolated offline V3 regression (DB/E2E strictly disabled)
+        shell: bash
+        run: |
+          python -m pytest -q -p no:cacheprovider \
+            tests/test_me_r_early_mae_v3_*.py \
+            tests/test_me_r_v3_isolated_oos_collector.py \
+            tests/test_me_r_v3_isolated_pg_collector_issue154.py \
+            tests/test_me_r_v3_atomic_pg_e2e_issue154.py \
+            --tb=short
