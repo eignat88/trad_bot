@@ -1,0 +1,48 @@
+name: VPS Deploy Preflight
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vps-deploy-preflight
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: VPS read-only preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify SSH secret is configured
+        env:
+          SSH_KEY: ${{ secrets.VPS_PREFLIGHT_SSH_KEY }}
+        run: |
+          if [ -z "$SSH_KEY" ]; then
+            echo "::error::Repository secret VPS_PREFLIGHT_SSH_KEY is missing"
+            exit 1
+          fi
+
+      - name: Run forced-command preflight over pinned SSH
+        env:
+          SSH_KEY: ${{ secrets.VPS_PREFLIGHT_SSH_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/tradbot-ssh"
+          KEY="$RUNNER_TEMP/tradbot-ssh/id_ed25519"
+          KNOWN="$RUNNER_TEMP/tradbot-ssh/known_hosts"
+          printf '%s\n' "$SSH_KEY" > "$KEY"
+          chmod 600 "$KEY"
+          printf '%s\n' '91.99.60.150 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIQjakOj/XwjoH+GIgzQzFvgez9xTepLlJLz0GQH3obk' > "$KNOWN"
+          ssh -T -i "$KEY" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$KNOWN" \
+            -o ConnectTimeout=15 \
+            tradbot-deploy@91.99.60.150
+          rm -f "$KEY"
