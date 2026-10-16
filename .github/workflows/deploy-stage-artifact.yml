@@ -55,8 +55,11 @@ jobs:
             | tar -xf - -C "$RUNNER_TEMP/stage-package"
           printf '%s\n' "$GITHUB_SHA" > "$RUNNER_TEMP/stage-package/RELEASE_COMMIT"
           tar -C "$RUNNER_TEMP/stage-package" -czf "$RUNNER_TEMP/tradbot-stage-$GITHUB_SHA.tar.gz" .
-          sha256sum "$RUNNER_TEMP/tradbot-stage-$GITHUB_SHA.tar.gz" \
-            | tee "$RUNNER_TEMP/tradbot-stage-$GITHUB_SHA.sha256"
+          ( cd "$RUNNER_TEMP" && \
+            sha256sum "tradbot-stage-$GITHUB_SHA.tar.gz" \
+              | tee "tradbot-stage-$GITHUB_SHA.sha256" )
+          ( cd "$RUNNER_TEMP" && \
+            sha256sum --check "tradbot-stage-$GITHUB_SHA.sha256" )
           echo "STAGE_ARTIFACT_ONLY=true" >> "$GITHUB_STEP_SUMMARY"
           echo "COMMIT=$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
           echo "NO_VPS_OR_PRODUCTION_CHANGES=true" >> "$GITHUB_STEP_SUMMARY"
