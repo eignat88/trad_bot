@@ -170,7 +170,8 @@ def once(client=None):
                     # to look up an instrument. Supply the known local ID.
                     pipeline.capture_source({
                         **detection.source, "instrument_id": instrument_id
-                    })
+                    }, commit=False)
+                    connection.commit()
                     stats["signals"] += 1
                 else:
                     connection.commit()
