@@ -79,4 +79,6 @@ class MeEarlyMaeV3SourceAdapter:
             "target_price": target_price,
             "risk_distance": entry_price - stop_price,
         }
-        return self.repository.insert_source_with_variants(payload, commit=commit)
+        if commit:
+            return self.repository.insert_source_with_variants(payload)
+        return self.repository.insert_source_with_variants(payload, commit=False)
