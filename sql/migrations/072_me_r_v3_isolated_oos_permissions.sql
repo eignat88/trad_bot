@@ -18,10 +18,10 @@ BEGIN
     END IF;
 END $$;
 
-DO $
+DO $grant$
 BEGIN
     EXECUTE format('GRANT CONNECT ON DATABASE %I TO trad_bot_me_r_v3_oos', current_database());
-END $;
+END $grant$;
 GRANT USAGE ON SCHEMA research_me_early_mae_v3 TO trad_bot_me_r_v3_oos;
 GRANT SELECT, INSERT, UPDATE ON
     research_me_early_mae_v3.protocol,
