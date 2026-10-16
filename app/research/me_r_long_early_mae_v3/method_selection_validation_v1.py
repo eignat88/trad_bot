@@ -36,7 +36,7 @@ def run_screen(*, mode: str, datasets: int, reps: int) -> dict:
         raise ValueError("UNKNOWN_MODE")
     if type(datasets) is not int or datasets < 1:
         raise ValueError("INVALID_DATASETS")
-    if type(reps) is not int or reps < 1:
+    if type(reps) is not int or reps < 100:
         raise ValueError("INVALID_REPS")
     if mode == "holdout" and (datasets < MIN_HOLDOUT_DATASETS or reps < MIN_HOLDOUT_REPS):
         raise ValueError("UNDERPOWERED_HOLDOUT")
