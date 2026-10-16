@@ -166,10 +166,12 @@ def test_service_and_timer_contract():
     timer = Path("deploy/systemd/trad-bot-me-r-v3-oos.timer").read_text()
     assert "Type=oneshot" in service
     assert "User=trad_bot_me_r_v3_oos" in service
-    assert "WorkingDirectory=/opt/trad_bot" in service
-    assert "ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.me_r_long_early_mae_v3.isolated_oos --once" in service
+    assert "WorkingDirectory=/opt/trad_bot_me_r_v3_release" in service
+    assert "ExecStart=/opt/trad_bot_me_r_v3_release/.venv/bin/python -m app.research.me_r_long_early_mae_v3.isolated_oos --once" in service
+    assert "/opt/trad_bot/.venv/bin/python" not in service
     assert "ME_EARLY_MAE_V3_CAPTURE_ENABLED=false" in service
-    assert "EnvironmentFile=-/etc/trad-bot/me-r-v3-oos.env" in service
+    assert "EnvironmentFile=/etc/trad-bot/me-r-v3-oos.env" in service
+    assert "EnvironmentFile=-" not in service
     assert "OnCalendar=*-*-* *:0/5:30 UTC" in timer
     assert "Persistent=false" in timer
 
