@@ -47,3 +47,45 @@ been run as part of this PR. Prove that deduplication and SQL conflict
 semantics preserve immutable candle provenance; check partial API failure,
 rate-limit, missed intervals, reboots, multi-symbol cycle latency and
 no unapproved activation. Do not interpret this draft as OOS approval.
+
+
+## PR #159 final preflight checkpoint (2026-10-16)
+
+Validation evidence from disposable `trad_bot_me_r_v3_oos_pg_test`:
+SQL 068--072, five research tables, local market tables and least-privilege
+grants PASS; regression 210 passed / 3 skipped; PG integration 2 passed;
+one-shot real atomic PostgreSQL E2E 1 passed (one committed source and
+seven variants, subsequent uncommitted candle + source tuple rolled back).
+The disposable database is now deliberately non-empty; never rerun the
+one-shot integration or delete immutable rows to make it pass.
+
+**Authoritative offline protocol approval (#151):**
+`FROZEN_AT=2026-10-16T12:00:00Z`;
+`ACTIVATION_AT=2026-10-19T12:00:00Z`;
+runtime SHA-256
+`ed1cd8e48d3617fec66b5eac220ec8f7dab3b963e53a4ea51874f12ceddf131a`.
+These approve boundaries/fingerprint only, **not** systemd activation.
+Activation timestamp is an inclusion cutoff, not an auto-launch schedule.
+No retrospective signals or backfill, including delayed deployment.
+
+For natural Bybit data preflight only, use the isolated Linux OS account,
+an explicitly frozen `ME_R_V3_OOS_SYMBOLS` universe and a PR checkout.
+Run `python -m app.research.me_r_long_early_mae_v3.isolated_oos
+--market-preflight` immediately after a 5-minute boundary. The command
+fetches public 5m/15m/1h market data, checks closed/gapless source
+contexts and source delay <=300s, and **does not connect to PostgreSQL**.
+A synthetic/unit test PASS does not substitute for a natural API PASS.
+Keep service/timer disabled during this test.
+
+Systemd preflight: `systemd-analyze verify <absolute service path>
+<absolute timer path>` and `systemd-analyze calendar
+'*-*-* *:0/5:30 UTC'`. Service runs as
+`trad_bot_me_r_v3_oos`, requires a future reviewed merge of PR #159
+into the deployed checkout and an independently approved environment file.
+Never install the production units from the detached PR worktree or
+start the timer before separate operator authorization.
+
+Current status: DB_ATOMICITY_PASS /
+NATURAL_BYBIT_PREFLIGHT_PENDING /
+SYSTEMD_VPS_SYNTAX_PENDING /
+PRODUCTION_ACTIVATION_NO_GO.
