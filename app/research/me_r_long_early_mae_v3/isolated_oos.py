@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
 import os
 import pwd
 import re
@@ -19,12 +20,14 @@ from .detector import detect_v1_closed
 from .guards import require_runtime_configuration
 from .pipeline import MeEarlyMaeV3Pipeline
 from .protocol import ACTIVATION_AT, parse_utc, require_protocol_fingerprint
+from .runner import require_isolated_schema
 
 DATABASE = "trad_bot_me_r_v3_oos"
 ROLE = "trad_bot_me_r_v3_oos"
 SOCKET = "/var/run/postgresql/.s.PGSQL.5432"
 FROZEN_CRYPTO_UNIVERSE = "BTCUSDT,ETHUSDT,SOLUSDT,ZECUSDT,NEARUSDT,XRPUSDT,HYPEUSDT,STRKUSDT,ENAUSDT,ZEREBROUSDT,DOGEUSDT,SUIUSDT,AKEUSDT,ADAUSDT,PUMPFUNUSDT,1000PEPEUSDT,WLDUSDT,ZROUSDT,ONDOUSDT,INJUSDT,UNIUSDT,WALUSDT,AVAXUSDT,LINKUSDT,ARBUSDT,TIAUSDT,PYTHUSDT,TAOUSDT,PUFFERUSDT,SIRENUSDT,AAVEUSDT,ZKUSDT,QNTUSDT,CRVUSDT"
 FROZEN_CRYPTO_UNIVERSE_SHA256 = "19c5807e510e75ff1e19bdca8bdad469e05a9c2198266ab27821570425a28bf8"
+LOGGER = logging.getLogger(__name__)
 INTERVALS = (("candles_5m", "5", 300), ("candles_15m", "15", 900), ("candles_1h", "60", 3600))
 
 
@@ -48,6 +51,9 @@ def connect():
         if any(item is None for item in cursor.fetchone()):
             raise RuntimeError("ME_R_V3_LOCAL_MARKET_SCHEMA_MISSING")
         connection.rollback()
+        # Same V3 integrity contract as the isolated #152 runner, without
+        # connecting to its DB: tables, constraints, and immutable triggers.
+        require_isolated_schema(connection)
         return connection
     except BaseException:
         connection.close()
@@ -150,7 +156,7 @@ def once(client=None):
     try:
         pipeline = MeEarlyMaeV3Pipeline(connection)
         pipeline.initialize()
-        stats = {"symbols": 0, "signals": 0, "new_candles": 0, "rejected": 0}
+        stats = {"symbols": 0, "signals": 0, "new_candles": 0, "rejected": 0, "failed_symbols": 0}
         for symbol in symbols:
             # Each symbol is a separate transaction. Do not mark a candle seen
             # until the validated no-signal state or capture is committed.
@@ -187,9 +193,15 @@ def once(client=None):
                     connection.commit()
                 stats["new_candles"] += 1
                 stats["symbols"] += 1
-            except BaseException:
+            except Exception as exc:
+                # A single delisted/unavailable instrument must not stall the
+                # remaining frozen universe or previously pending outcomes.
+                # Rollback must succeed; a broken DB connection is fatal.
                 connection.rollback()
-                raise
+                stats["failed_symbols"] += 1
+                LOGGER.error("ME_R_V3_SYMBOL_FAILED symbol=%s error_type=%s message=%s",
+                             symbol, type(exc).__name__, exc)
+                continue
         evaluation = pipeline.evaluate_cycle()
         if evaluation.get("errors", 0):
             raise RuntimeError("ME_R_V3_EVALUATOR_CYCLE_ERRORS")
