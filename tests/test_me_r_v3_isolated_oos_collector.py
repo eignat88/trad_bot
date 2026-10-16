@@ -172,3 +172,25 @@ def test_service_and_timer_contract():
     assert "EnvironmentFile=-/etc/trad-bot/me-r-v3-oos.env" in service
     assert "OnCalendar=*-*-* *:0/5:30 UTC" in timer
     assert "Persistent=false" in timer
+
+
+def test_frozen_crypto_universe_exact_match(monkeypatch):
+    import hashlib
+    csv = module.FROZEN_CRYPTO_UNIVERSE
+    assert len(csv.split(",")) == 34
+    assert len(set(csv.split(","))) == 34
+    assert hashlib.sha256(csv.encode("utf-8")).hexdigest() == module.FROZEN_CRYPTO_UNIVERSE_SHA256
+    monkeypatch.setenv("ME_R_V3_OOS_SYMBOLS", csv)
+    assert module.configured_symbols() == tuple(csv.split(","))
+
+
+def test_frozen_crypto_universe_fails_closed_on_membership_or_order(monkeypatch):
+    csv = module.FROZEN_CRYPTO_UNIVERSE
+    monkeypatch.setenv("ME_R_V3_OOS_SYMBOLS", csv.replace("BTCUSDT,", "", 1))
+    with pytest.raises(RuntimeError, match="FROZEN_UNIVERSE_MISMATCH"):
+        module.configured_symbols()
+    parts = csv.split(",")
+    parts[0], parts[1] = parts[1], parts[0]
+    monkeypatch.setenv("ME_R_V3_OOS_SYMBOLS", ",".join(parts))
+    with pytest.raises(RuntimeError, match="FROZEN_UNIVERSE_MISMATCH"):
+        module.configured_symbols()
