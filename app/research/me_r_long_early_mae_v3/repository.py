@@ -136,7 +136,7 @@ class MeEarlyMaeV3Repository:
             self.connection.rollback()
             raise
 
-    def insert_source_with_variants(self, source: dict[str, Any]) -> int:
+    def insert_source_with_variants(self, source: dict[str, Any], *, commit: bool = True) -> int:
         validate_freeze_activation(FROZEN_AT, ACTIVATION_AT, datetime.now(timezone.utc))
         fingerprint = require_protocol_fingerprint(FROZEN_AT, ACTIVATION_AT)
         detected = parse_utc(source["detected_at"])
@@ -248,7 +248,8 @@ class MeEarlyMaeV3Repository:
                             variant.role, variant.is_primary, SOURCE_CANDLE_VERSION,
                         ),
                     )
-            self.connection.commit()
+            if commit:
+                self.connection.commit()
             return source_id
         except Exception:
             self.connection.rollback()

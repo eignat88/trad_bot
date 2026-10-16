@@ -1,0 +1,253 @@
+"""Issue #154: strictly isolated, opt-in prospective market-data + V3 cycle.
+
+Never imports a trade execution engine and never connects to the production DB.
+Does not backfill missing OOS candles after downtime: incompleteness remains visible.
+The existing #152 isolated test runner is deliberately untouched.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import logging
+import os
+import pwd
+import re
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+from .closed_context import build_closed_context
+from .detector import detect_v1_closed
+from .guards import require_runtime_configuration
+from .pipeline import MeEarlyMaeV3Pipeline
+from .protocol import ACTIVATION_AT, parse_utc, require_protocol_fingerprint
+from .runner import require_isolated_schema
+
+DATABASE = "trad_bot_me_r_v3_oos"
+ROLE = "trad_bot_me_r_v3_oos"
+SOCKET = "/var/run/postgresql/.s.PGSQL.5432"
+FROZEN_CRYPTO_UNIVERSE = "BTCUSDT,ETHUSDT,SOLUSDT,ZECUSDT,NEARUSDT,XRPUSDT,HYPEUSDT,STRKUSDT,ENAUSDT,ZEREBROUSDT,DOGEUSDT,SUIUSDT,AKEUSDT,ADAUSDT,PUMPFUNUSDT,1000PEPEUSDT,WLDUSDT,ZROUSDT,ONDOUSDT,INJUSDT,UNIUSDT,WALUSDT,AVAXUSDT,LINKUSDT,ARBUSDT,TIAUSDT,PYTHUSDT,TAOUSDT,PUFFERUSDT,SIRENUSDT,AAVEUSDT,ZKUSDT,QNTUSDT,CRVUSDT"
+FROZEN_CRYPTO_UNIVERSE_SHA256 = "19c5807e510e75ff1e19bdca8bdad469e05a9c2198266ab27821570425a28bf8"
+LOGGER = logging.getLogger(__name__)
+INTERVALS = (("candles_5m", "5", 300), ("candles_15m", "15", 900), ("candles_1h", "60", 3600))
+
+
+def validate_identity() -> None:
+    """Refuse execution as root, tradbot, or the #152 integration user."""
+    expected = pwd.getpwnam(ROLE).pw_uid
+    if os.getuid() != expected or os.geteuid() != expected:
+        raise RuntimeError("ME_R_V3_ISOLATED_OS_USER_REQUIRED")
+
+
+def connect():
+    import pg8000.dbapi
+
+    connection = pg8000.dbapi.connect(user=ROLE, database=DATABASE, unix_sock=SOCKET)
+    try:
+        cursor = connection.cursor()
+        cursor.execute("SELECT current_database(), current_user, session_user, inet_client_addr() IS NULL")
+        if tuple(cursor.fetchone()) != (DATABASE, ROLE, ROLE, True):
+            raise RuntimeError("ME_R_V3_ISOLATED_DB_IDENTITY_MISMATCH")
+        cursor.execute("SELECT to_regclass('market.candle'), to_regclass('dds.instrument')")
+        if any(item is None for item in cursor.fetchone()):
+            raise RuntimeError("ME_R_V3_LOCAL_MARKET_SCHEMA_MISSING")
+        connection.rollback()
+        # Same V3 integrity contract as the isolated #152 runner, without
+        # connecting to its DB: tables, constraints, and immutable triggers.
+        require_isolated_schema(connection)
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+def configured_symbols() -> tuple[str, ...]:
+    raw = os.environ.get("ME_R_V3_OOS_SYMBOLS", "")
+    symbols = tuple(part.strip() for part in raw.split(",") if part.strip())
+    if not symbols or len(symbols) > 50 or len(set(symbols)) != len(symbols):
+        raise RuntimeError("ME_R_V3_EXPLICIT_SYMBOL_UNIVERSE_REQUIRED")
+    if any(re.fullmatch(r"[A-Z0-9]{3,32}", symbol) is None for symbol in symbols):
+        raise RuntimeError("ME_R_V3_INVALID_SYMBOL")
+    csv = ",".join(symbols)
+    digest = hashlib.sha256(csv.encode("utf-8")).hexdigest()
+    if csv != FROZEN_CRYPTO_UNIVERSE or digest != FROZEN_CRYPTO_UNIVERSE_SHA256:
+        raise RuntimeError("ME_R_V3_FROZEN_UNIVERSE_MISMATCH")
+    return symbols
+
+
+def completed_only(candles, seconds: int, asof: datetime):
+    """Exclude exchange-reported forming candles before detector validation."""
+    selected = []
+    for candle in candles:
+        timestamp_ms = int(candle.timestamp)
+        if timestamp_ms < 10_000_000_000:
+            timestamp_ms *= 1000
+        opened = datetime.fromtimestamp(timestamp_ms / 1000, timezone.utc)
+        if opened + timedelta(seconds=seconds) <= asof:
+            selected.append(candle)
+    return tuple(selected)
+
+
+def collect_context(client, symbol: str):
+    """Timestamp the complete API fetch, including all three timeframes."""
+    started = datetime.now(timezone.utc)
+    data = {}
+    for name, interval, seconds in INTERVALS:
+        raw = client.get_klines(symbol, interval, 200)
+        fetched = datetime.now(timezone.utc)
+        data[name] = completed_only(raw, seconds, fetched)
+    completed = datetime.now(timezone.utc)
+    context = SimpleNamespace(symbol=symbol, source_fetch_started_at=started, **data)
+    return context, completed
+
+
+def store_latest_5m(connection, symbol: str, candle, observed_at: datetime) -> tuple[bool, int | None]:
+    """Write only a *newly available* completed candle; never backfill a gap."""
+    opened_ms = int(candle.timestamp)
+    if opened_ms < 10_000_000_000:
+        opened_ms *= 1000
+    opened = datetime.fromtimestamp(opened_ms / 1000, timezone.utc)
+    closed = opened + timedelta(minutes=5)
+    activation = parse_utc(ACTIVATION_AT)
+    lag = (observed_at - closed).total_seconds()
+    if closed <= activation or lag < 0 or lag > 300:
+        return False, None
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO dds.instrument(symbol) VALUES (%s) "
+            "ON CONFLICT (symbol) DO NOTHING",
+            (symbol,),
+        )
+        cursor.execute("SELECT instrument_id FROM dds.instrument WHERE symbol=%s", (symbol,))
+        instrument_id = cursor.fetchone()[0]
+        cursor.execute(
+            """INSERT INTO market.candle (
+               instrument_id, timeframe, open_time, close_time, open, high, low,
+               close, volume, source_received_at
+            ) VALUES (%s,'5',%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (exchange, market_type, instrument_id, timeframe, open_time)
+            DO NOTHING""",
+            (
+                instrument_id, opened, closed, candle.open, candle.high,
+                candle.low, candle.close, getattr(candle, "volume", 0.0),
+                observed_at,
+            ),
+        )
+        inserted = cursor.rowcount == 1
+        # Transaction committed by caller (capture atomically, if signalled).
+        return inserted, int(instrument_id)
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def once(client=None):
+    validate_identity()
+    require_runtime_configuration(datetime.now(timezone.utc))
+    require_protocol_fingerprint()
+    symbols = configured_symbols()
+
+    if client is None:
+        from app.config import Settings
+        from app.exchange.bybit_client import BybitClient
+        client = BybitClient(Settings())
+
+    connection = connect()
+    try:
+        pipeline = MeEarlyMaeV3Pipeline(connection)
+        pipeline.initialize()
+        stats = {"symbols": 0, "signals": 0, "new_candles": 0, "rejected": 0, "failed_symbols": 0}
+        for symbol in symbols:
+            # Each symbol is a separate transaction. Do not mark a candle seen
+            # until the validated no-signal state or capture is committed.
+            try:
+                context, completed = collect_context(client, symbol)
+                latest = context.candles_5m[-1] if context.candles_5m else None
+                if latest is None:
+                    stats["rejected"] += 1
+                    continue
+                # Detector validates contiguous closed timeframes before storage.
+                detection = detect_v1_closed(context, completed, completed)
+                if detection.status == "REJECTED":
+                    stats["rejected"] += 1
+                    continue
+                inserted, instrument_id = store_latest_5m(
+                    connection, symbol, latest, completed
+                )
+                if not inserted:
+                    connection.rollback()
+                    continue
+                if detection.status not in ("SIGNAL", "NO_SIGNAL"):
+                    raise RuntimeError("ME_R_V3_UNEXPECTED_DETECTOR_STATUS")
+                if detection.status == "SIGNAL":
+                    if detection.source is None:
+                        raise RuntimeError("ME_R_V3_SIGNAL_WITHOUT_SOURCE")
+                    # The repository must not rollback the transaction merely
+                    # to look up an instrument. Supply the known local ID.
+                    pipeline.capture_source({
+                        **detection.source, "instrument_id": instrument_id
+                    }, commit=False)
+                    connection.commit()
+                    stats["signals"] += 1
+                else:
+                    connection.commit()
+                stats["new_candles"] += 1
+                stats["symbols"] += 1
+            except Exception as exc:
+                # A single delisted/unavailable instrument must not stall the
+                # remaining frozen universe or previously pending outcomes.
+                # Rollback must succeed; a broken DB connection is fatal.
+                connection.rollback()
+                stats["failed_symbols"] += 1
+                LOGGER.error("ME_R_V3_SYMBOL_FAILED symbol=%s error_type=%s message=%s",
+                             symbol, type(exc).__name__, exc)
+                continue
+        evaluation = pipeline.evaluate_cycle()
+        if evaluation.get("errors", 0):
+            raise RuntimeError("ME_R_V3_EVALUATOR_CYCLE_ERRORS")
+        return {**stats, **{f"eval_{k}": v for k, v in evaluation.items()}}
+    finally:
+        connection.close()
+
+
+def market_preflight(client=None):
+    """Read-only natural candle preflight; never connects to the DB or captures."""
+    validate_identity()
+    symbols = configured_symbols()
+    if client is None:
+        from app.config import Settings
+        from app.exchange.bybit_client import BybitClient
+        client = BybitClient(Settings())
+    results = {}
+    for symbol in symbols:
+        context, completed = collect_context(client, symbol)
+        closed = build_closed_context(context, completed, completed)
+        signal = closed.signal_candle
+        delay = (completed - signal.close_at).total_seconds()
+        if delay < 0 or delay > 300:
+            raise RuntimeError(f"ME_R_V3_SOURCE_DELAY_INVALID:{symbol}:{delay}")
+        results[symbol] = {
+            "source_close": signal.close_at.isoformat(),
+            "fetch_completed": completed.isoformat(),
+            "delay_seconds": round(delay, 3),
+            "closed_5m": len(closed.candles_5m),
+            "closed_15m": len(closed.candles_15m),
+            "closed_1h": len(closed.candles_1h),
+        }
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Isolated ME_R V3 OOS collector")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--once", action="store_true")
+    mode.add_argument("--market-preflight", action="store_true")
+    args = parser.parse_args()
+    if args.market_preflight:
+        print(market_preflight())
+        return
+    print(once())
+
+
+if __name__ == "__main__":
+    main()
