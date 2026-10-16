@@ -21,13 +21,18 @@ def test_holdout_minimum_is_predeclared():
         run_screen(mode="holdout", datasets=1000, reps=299)
 
 
+def test_pilot_rejects_unsupported_bootstrap_reps():
+    with pytest.raises(ValueError, match="INVALID_REPS"):
+        run_screen(mode="pilot", datasets=2, reps=10)
+
+
 def test_unknown_mode_rejected():
     with pytest.raises(ValueError, match="UNKNOWN_MODE"):
         run_screen(mode="confirmatory", datasets=1, reps=1)
 
 
 def test_small_pilot_is_diagnostic_and_never_approves_method():
-    out = run_screen(mode="pilot", datasets=2, reps=10)
+    out = run_screen(mode="pilot", datasets=2, reps=100)
     assert out["screening_pass"] is None
     assert out["confirmatory_disposition"] == "NO_METHOD_APPROVED"
     assert out["requires_operator_method_approval"] is True
