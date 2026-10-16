@@ -138,6 +138,12 @@ def test_isolated_fingerprint_matches_operator_approved_values(monkeypatch):
 
 
 def test_isolated_os_user_rejects_wrong_uid(monkeypatch):
+    # CI runners do not have the VPS-only service account. Mock identity
+    # resolution to test the UID rejection path independently of host users.
+    import pwd
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda _name: SimpleNamespace(pw_uid=12345))
     monkeypatch.setattr(runner.os, "getuid", lambda: 0)
     monkeypatch.setattr(runner.os, "geteuid", lambda: 0)
     with pytest.raises(RuntimeError, match="ISOLATED_OS_USER_REQUIRED"):
