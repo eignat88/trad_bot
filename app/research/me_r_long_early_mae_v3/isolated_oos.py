@@ -13,6 +13,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from .closed_context import build_closed_context
 from .detector import detect_v1_closed
 from .guards import require_runtime_configuration
 from .pipeline import MeEarlyMaeV3Pipeline
@@ -163,6 +164,8 @@ def once(client=None):
                 if not inserted:
                     connection.rollback()
                     continue
+                if detection.status not in ("SIGNAL", "NO_SIGNAL"):
+                    raise RuntimeError("ME_R_V3_UNEXPECTED_DETECTOR_STATUS")
                 if detection.status == "SIGNAL":
                     if detection.source is None:
                         raise RuntimeError("ME_R_V3_SIGNAL_WITHOUT_SOURCE")
@@ -188,12 +191,42 @@ def once(client=None):
         connection.close()
 
 
+def market_preflight(client=None):
+    """Read-only natural candle preflight; never connects to the DB or captures."""
+    validate_identity()
+    symbols = configured_symbols()
+    if client is None:
+        from app.config import Settings
+        from app.exchange.bybit_client import BybitClient
+        client = BybitClient(Settings())
+    results = {}
+    for symbol in symbols:
+        context, completed = collect_context(client, symbol)
+        closed = build_closed_context(context, completed, completed)
+        signal = closed.signal_candle
+        delay = (completed - signal.close_at).total_seconds()
+        if delay < 0 or delay > 300:
+            raise RuntimeError(f"ME_R_V3_SOURCE_DELAY_INVALID:{symbol}:{delay}")
+        results[symbol] = {
+            "source_close": signal.close_at.isoformat(),
+            "fetch_completed": completed.isoformat(),
+            "delay_seconds": round(delay, 3),
+            "closed_5m": len(closed.candles_5m),
+            "closed_15m": len(closed.candles_15m),
+            "closed_1h": len(closed.candles_1h),
+        }
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Isolated ME_R V3 OOS collector")
-    parser.add_argument("--once", action="store_true")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--once", action="store_true")
+    mode.add_argument("--market-preflight", action="store_true")
     args = parser.parse_args()
-    if not args.once:
-        parser.error("explicit --once required; deployment and activation are separate")
+    if args.market_preflight:
+        print(market_preflight())
+        return
     print(once())
 
 
