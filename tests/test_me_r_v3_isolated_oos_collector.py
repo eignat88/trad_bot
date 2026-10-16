@@ -194,3 +194,80 @@ def test_frozen_crypto_universe_fails_closed_on_membership_or_order(monkeypatch)
     monkeypatch.setenv("ME_R_V3_OOS_SYMBOLS", ",".join(parts))
     with pytest.raises(RuntimeError, match="FROZEN_UNIVERSE_MISMATCH"):
         module.configured_symbols()
+
+
+def test_once_continues_after_symbol_api_failure_and_evaluates_pending(monkeypatch):
+    from unittest.mock import MagicMock
+    connection = MagicMock()
+    pipeline = MagicMock()
+    pipeline.evaluate_cycle.return_value = {"errors": 0, "finalized": 2}
+    monkeypatch.setattr(module, "validate_identity", lambda: None)
+    monkeypatch.setattr(module, "require_runtime_configuration", lambda now: None)
+    monkeypatch.setattr(module, "require_protocol_fingerprint", lambda: None)
+    monkeypatch.setattr(module, "configured_symbols", lambda: ("BTCUSDT", "ETHUSDT"))
+    monkeypatch.setattr(module, "connect", lambda: connection)
+    monkeypatch.setattr(module, "MeEarlyMaeV3Pipeline", lambda conn: pipeline)
+    def fetch(client, symbol):
+        if symbol == "BTCUSDT":
+            raise TimeoutError("injected_bybit_timeout")
+        return (SimpleNamespace(candles_5m=(candle(
+            datetime(2026, 10, 19, 12, 5, tzinfo=timezone.utc)),)),
+            datetime(2026, 10, 19, 12, 10, 25, tzinfo=timezone.utc))
+    monkeypatch.setattr(module, "collect_context", fetch)
+    monkeypatch.setattr(module, "detect_v1_closed",
+                        lambda *args: SimpleNamespace(status="NO_SIGNAL"))
+    monkeypatch.setattr(module, "store_latest_5m",
+                        lambda *args: (True, 10))
+    stats = module.once(client=object())
+    assert stats["failed_symbols"] == 1
+    assert stats["new_candles"] == 1
+    assert stats["eval_finalized"] == 2
+    assert connection.rollback.call_count >= 1
+    pipeline.evaluate_cycle.assert_called_once()
+    connection.close.assert_called_once()
+
+
+def test_connect_rejects_incomplete_v3_schema_before_capture(monkeypatch):
+    import sys
+    from unittest.mock import MagicMock
+    from types import ModuleType
+    connection = MagicMock()
+    connection.cursor.return_value.fetchone.side_effect = [
+        (module.DATABASE, module.ROLE, module.ROLE, True),
+        ("market.candle", "dds.instrument"),
+    ]
+    pg = ModuleType("pg8000")
+    dbapi = ModuleType("pg8000.dbapi")
+    dbapi.connect = lambda **kwargs: connection
+    pg.dbapi = dbapi
+    monkeypatch.setitem(sys.modules, "pg8000", pg)
+    monkeypatch.setitem(sys.modules, "pg8000.dbapi", dbapi)
+    def incomplete(conn):
+        assert conn is connection
+        raise RuntimeError("ME_R_EARLY_MAE_V3_TRIGGERS_INCOMPLETE:missing")
+    monkeypatch.setattr(module, "require_isolated_schema", incomplete)
+    with pytest.raises(RuntimeError, match="TRIGGERS_INCOMPLETE"):
+        module.connect()
+    connection.close.assert_called_once()
+
+
+def test_connect_calls_full_v3_schema_validation(monkeypatch):
+    import sys
+    from unittest.mock import MagicMock
+    from types import ModuleType
+    connection = MagicMock()
+    connection.cursor.return_value.fetchone.side_effect = [
+        (module.DATABASE, module.ROLE, module.ROLE, True),
+        ("market.candle", "dds.instrument"),
+    ]
+    pg = ModuleType("pg8000")
+    dbapi = ModuleType("pg8000.dbapi")
+    dbapi.connect = lambda **kwargs: connection
+    pg.dbapi = dbapi
+    monkeypatch.setitem(sys.modules, "pg8000", pg)
+    monkeypatch.setitem(sys.modules, "pg8000.dbapi", dbapi)
+    called = []
+    monkeypatch.setattr(module, "require_isolated_schema",
+                        lambda conn: called.append(conn))
+    assert module.connect() is connection
+    assert called == [connection]
