@@ -13,6 +13,7 @@ concurrency:
 jobs:
   preflight:
     name: VPS read-only preflight
+    environment: vps-preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -21,7 +22,7 @@ jobs:
           SSH_KEY: ${{ secrets.VPS_PREFLIGHT_SSH_KEY }}
         run: |
           if [ -z "$SSH_KEY" ]; then
-            echo "::error::Repository secret VPS_PREFLIGHT_SSH_KEY is missing"
+            echo "::error::Environment secret VPS_PREFLIGHT_SSH_KEY is missing"
             exit 1
           fi
 
