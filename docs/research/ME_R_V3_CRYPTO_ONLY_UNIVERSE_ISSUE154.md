@@ -13,3 +13,10 @@ Excluded 16 candidate contracts (subject to manual category verification):
 SOXLUSDT,KORUUSDT,SKHYNIXUSDT,XAUUSDT,SNDKUSDT,CLUSDT,SPCXUSDT,SKHYUSDT,MUUSDT,SOXSUSDT,MSTRUSDT,BTWUSDT,XAGUSDT,XPLUSDT,NVDAUSDT,XAUTUSDT
 
 Not a direct Bybit instrument-metadata classification: ticker-based selection is provisional, especially ambiguous token names. No deployment/capture until exact list explicitly approved and instrument underlying classification verified.
+
+## Validation checkpoint — 2026-10-16 05:12 UTC
+
+VPS detached checkout `b38f100a`: regression `215 passed, 3 skipped`.
+Operator natural Bybit read-only `--market-preflight` on exact manifest via `ME_R_V3_OOS_SYMBOLS`: 34/34 symbols PASS, no errors. All source closes `2026-10-16T05:10:00Z`; 199 completed 5m, 199 completed 15m and 199 completed 1h per symbol. BTCUSDT fetch completion `05:12:09.049091Z` (129.049s from close); CRVUSDT completion `05:12:31.664265Z` (151.664s from close). Sequential API completion span 22.615174s, max delay below 300s. One natural sampling cycle only; network retries, long-run continuity, and full evaluator runtime remain separate gates.
+
+Crypto-only scope approved, exact ticker membership classification has not been verified from exchange underlying metadata for ambiguous names. No merge, deployment or activation authorization implied.
