@@ -65,6 +65,7 @@ def diagnostic_funnel_stage(execution: list[Candle], htf: list[Candle], asof_ms:
     if level is None or ranges is None or level.level_type != "resistance":
         return "NO_HTF_LEVEL"
     touched = False
+    historical_reaction = False
     for index, candle in enumerate(execution[:-1]):
         if candle.timestamp < level.available_timestamp or atr[index] <= 0:
             continue
@@ -82,7 +83,9 @@ def diagnostic_funnel_stage(execution: list[Candle], htf: list[Candle], asof_ms:
         if reaction is not None and reaction[0] == len(execution)-1:
             return "REACTION_FRESH"
         if reaction is not None:
-            return "REACTION_HISTORICAL"
+            historical_reaction = True
+    if historical_reaction:
+        return "REACTION_HISTORICAL"
     return "TOUCH_NO_FRESH_REACTION" if touched else "NO_TOUCH"
 
 def replay(symbol: str, candles: list[Candle], *, warmup_5m: int = 400) -> dict:
