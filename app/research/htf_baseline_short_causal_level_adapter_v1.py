@@ -27,10 +27,10 @@ def causal_resistance_snapshot(
 ) -> LevelSnapshot | None:
     if not exec_closed or len(htf_closed) < 26:
         return None
-    if int(exec_closed[-1].timestamp) + FIVE != asof_ms:
-        raise ValueError("execution prefix must end at closed decision bar")
     if any(int(c.timestamp) + FIVE > asof_ms for c in exec_closed):
         raise ValueError("future 5m input")
+    if int(exec_closed[-1].timestamp) + FIVE != asof_ms:
+        raise ValueError("execution prefix must end at closed decision bar")
     times = [int(c.timestamp) for c in htf_closed]
     if any(t % HOUR or t + HOUR > asof_ms for t in times):
         raise ValueError("future or unclosed 1h input")
@@ -47,6 +47,10 @@ def causal_resistance_snapshot(
         if not all(htf_closed[i-j].high <= price for j in range(1, SWING_RIGHT+1)):
             continue
         if not all(htf_closed[i+j].high <= price for j in range(1, SWING_RIGHT+1)):
+            continue
+        if not any(htf_closed[i-j].high < price for j in range(1, SWING_RIGHT+1)):
+            continue
+        if not any(htf_closed[i+j].high < price for j in range(1, SWING_RIGHT+1)):
             continue
         available = int(htf_closed[i+SWING_RIGHT].timestamp) + HOUR
         if available > asof_ms or price <= reference:
