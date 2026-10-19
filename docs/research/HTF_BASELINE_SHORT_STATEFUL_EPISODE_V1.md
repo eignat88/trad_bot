@@ -118,3 +118,17 @@ PYTHONDONTWRITEBYTECODE=1 /opt/trad_bot/.venv/bin/python -m tools.research.htf_b
 ```
 
 Gate stays **PHASE_2_NO_GO**, Draft PR only, no deployment.
+
+## FIRST_SEEN_CLUSTER_BRIDGE_RESOLUTION_V1 — diagnostic audit
+
+`tools/research/htf_baseline_short_bridge_parity_v1.py` compares exact emitted `event_id` sets across selected-once and full-universe modes and captures each fail-closed ambiguous first-seen bridge with complete causally observed confirmation and both competing anchor metadata. CLI: `tools/research/htf_baseline_short_bridge_parity_cli_v1.py`.
+
+No ambiguity resolution is automatically applied. Two ETH historical ambiguous bridges remain to be investigated on VPS. Counts alone (20/20 BTC, 17/17 ETH) do not prove equality of event sets. Clustering remains provisional, not an execution filter or proven independence.
+
+```bash
+cd /tmp/trad_bot_issue176
+git fetch origin research/htf-baseline-short-stateful-episode-v1
+git checkout --detach origin/research/htf-baseline-short-stateful-episode-v1
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/trad_bot/.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_htf_baseline_short_bridge_parity_v1.py tests/test_htf_baseline_short_full_universe_first_seen_v1.py --tb=short
+PYTHONDONTWRITEBYTECODE=1 /opt/trad_bot/.venv/bin/python -m tools.research.htf_baseline_short_bridge_parity_cli_v1 --data-dir /tmp/htf_coverage_174 --symbols BTCUSDT ETHUSDT --start 2026-10-14T00:00:00Z --end 2026-10-17T00:00:00Z --out /tmp/htf_176_bridge_parity.json
+```
