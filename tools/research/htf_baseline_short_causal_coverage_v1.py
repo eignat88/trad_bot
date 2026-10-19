@@ -22,6 +22,7 @@ from typing import Sequence
 
 from app.models import Candle
 from app.research import htf_keylevel_baseline_short_causal_observer_v1 as observer
+from tools.research.htf_baseline_short_episode_ledger_v1 import event_episode
 
 BAR_MS = 300_000
 HOUR_MS = 3_600_000
@@ -105,17 +106,28 @@ def diagnose(symbol: str, candles: Sequence[Candle], start_ms: int,
                 funnel["causal_time_violation"] += 1
                 continue
             if signal.event_id not in first_seen:
+                episode = event_episode(symbol, prefix, htf, signal.touch_open_ms)
                 first_seen[signal.event_id] = {
-                    "symbol": symbol, "known_at_ms": signal.known_at_ms,
+                    "symbol": symbol, "event_id": signal.event_id,
+                    "known_at_ms": signal.known_at_ms,
                     "first_seen_ms": asof, "touch_open_ms": signal.touch_open_ms,
-                    "reaction_open_ms": signal.reaction_open_ms,
+                    "reaction_open_ms": signal.reaction_open_ms, **episode,
                 }
             else:
                 funnel["repeat_emission"] += 1
+        events = list(first_seen.values())
+        episode_groups: dict[str, list[str]] = {}
+        for event in events:
+            episode_groups.setdefault(event["episode_id"], []).append(event["event_id"])
         results[str(window)] = {
             "decision_funnel": dict(sorted(funnel.items())),
             "unique_events": len(first_seen),
-            "first_seen": list(first_seen.values()),
+            "unique_htf_levels": len({e["level_id"] for e in events}),
+            "unique_touch_episodes": len(episode_groups),
+            "episodes_with_multiple_signals": sum(len(v) > 1 for v in episode_groups.values()),
+            "same_episode_excess_signals": sum(len(v)-1 for v in episode_groups.values()),
+            "episode_groups": episode_groups,
+            "first_seen": events,
         }
     return {"symbol": symbol, "windows": results, "verdict": "DIAGNOSTIC_ONLY_NOT_OOS"}
 
