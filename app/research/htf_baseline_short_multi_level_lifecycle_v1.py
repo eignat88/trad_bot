@@ -50,8 +50,10 @@ class MultiLevelEpisodes:
                     sequence = self.sequence.get(level_id, 0) + 1
                     self.sequence[level_id] = sequence
                     episode_id = sha256(
-                        f"{self.symbol}|SHORT|{level_id}|{sequence}|{open_ms}".encode()
+                        f"{self.symbol}|SHORT|{level_id}|{open_ms}".encode()
                     ).hexdigest()
+                    if episode_id in self.episodes:
+                        raise ValueError("duplicate causal episode identity")
                     self.episodes[episode_id] = {
                         "episode_id": episode_id, "level_id": level_id,
                         "first_touch_open_ms": open_ms,
