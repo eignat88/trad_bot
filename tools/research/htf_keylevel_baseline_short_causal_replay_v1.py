@@ -18,6 +18,10 @@ from app.exchange.bybit_client import BybitClient
 from app.research.htf_keylevel_baseline_short_causal_observer_v1 import (
     BAR_MS, HTF_MS, detect_causal_baseline_short,
 )
+from app.research.htf_keylevel_point_b import (
+    _causal_atr_series, _find_htf_key_levels, _find_reaction_end,
+    KEY_LEVEL_TOUCH_TOLERANCE_ATR, LOCAL_STRUCTURE_LOOKBACK,
+)
 from app.research.srr_short_execution_r_expansion_prospective_evaluator import (
     BybitHistoricalCandleSource, SOURCE_VALIDATED,
 )
@@ -44,6 +48,43 @@ def assemble_complete_1h(candles: list[Candle], asof_ms: int) -> list[Candle]:
     return result
 
 
+
+def diagnostic_funnel_stage(execution: list[Candle], htf: list[Candle], asof_ms: int) -> str:
+    """Mirror the frozen detector's stage gates, without changing its result.
+
+    Decision counters are NOT trade counts. Identifies the deepest gate met
+    for each as-of 5m prefix. It uses the same level/touch/reaction helpers.
+    """
+    if len(execution) < 20 or len(htf) < LOCAL_STRUCTURE_LOOKBACK * 2 + 2:
+        return "HTF_HISTORY_INSUFFICIENT"
+    if (any(c.timestamp + BAR_MS > asof_ms for c in execution)
+            or any(c.timestamp + HTF_MS > asof_ms for c in htf)):
+        return "FUTURE_CANDLE_REJECTED"
+    atr = _causal_atr_series(execution)
+    level, ranges = _find_htf_key_levels(htf, execution, atr[0], "SHORT")
+    if level is None or ranges is None or level.level_type != "resistance":
+        return "NO_HTF_LEVEL"
+    touched = False
+    for index, candle in enumerate(execution[:-1]):
+        if candle.timestamp < level.available_timestamp or atr[index] <= 0:
+            continue
+        near = min(
+            abs((float(candle.low) - level.price) / atr[index]),
+            abs((level.price - float(candle.high)) / atr[index]),
+        ) <= KEY_LEVEL_TOUCH_TOLERANCE_ATR
+        if not (near and float(candle.high) >= level.price):
+            continue
+        touched = True
+        reaction = _find_reaction_end(
+            closed=execution, touch_index=index, level=level,
+            direction="SHORT", atr_by_index=atr,
+        )
+        if reaction is not None and reaction[0] == len(execution)-1:
+            return "REACTION_FRESH"
+        if reaction is not None:
+            return "REACTION_HISTORICAL"
+    return "TOUCH_NO_FRESH_REACTION" if touched else "NO_TOUCH"
+
 def replay(symbol: str, candles: list[Candle], *, warmup_5m: int = 400) -> dict:
     if len(candles) < warmup_5m + 1:
         raise ValueError("INSUFFICIENT_HISTORY")
@@ -62,6 +103,7 @@ def replay(symbol: str, candles: list[Candle], *, warmup_5m: int = 400) -> dict:
         prefix = candles[max(0, idx-199):idx+1]
         htf = assemble_complete_1h(candles[:idx+1], asof)[-199:]
         stats["evaluated_prefixes"] += 1
+        stats["stage_" + diagnostic_funnel_stage(prefix, htf, asof)] += 1
         signal = detect_causal_baseline_short(
             symbol=symbol, execution_candles=prefix, htf_candles=htf,
             evaluation_asof=datetime.fromtimestamp(asof / 1000, timezone.utc),
@@ -76,10 +118,23 @@ def replay(symbol: str, candles: list[Candle], *, warmup_5m: int = 400) -> dict:
         seen.add(signal.event_id)
         stats["unique_events"] += 1
         events.append(vars(signal))
+    # Funnel totals represent evaluated decisions (non-exclusive stages).
+    stages = {
+        "HTF_HISTORY_READY": stats["evaluated_prefixes"] - stats["stage_HTF_HISTORY_INSUFFICIENT"],
+        "HTF_LEVEL_FOUND": sum(stats["stage_"+x] for x in (
+            "NO_TOUCH", "TOUCH_NO_FRESH_REACTION", "REACTION_HISTORICAL", "REACTION_FRESH"
+        )),
+        "TOUCH_FOUND": sum(stats["stage_"+x] for x in (
+            "TOUCH_NO_FRESH_REACTION", "REACTION_HISTORICAL", "REACTION_FRESH"
+        )),
+        "REACTION_CONFIRMED_FRESH": stats["stage_REACTION_FRESH"],
+        "REACTION_CONFIRMED_HISTORICAL": stats["stage_REACTION_HISTORICAL"],
+        "SIGNAL_EMITTED_UNIQUE": stats["unique_events"],
+    }
     return {"mode": "HISTORICAL_DIAGNOSTIC_NOT_OOS",
             "symbol": symbol, "first_open_ms": candles[0].timestamp,
             "last_open_ms": candles[-1].timestamp,
-            "candles": len(candles), "stats": dict(stats), "events": events}
+            "candles": len(candles), "stats": dict(stats), "funnel": stages, "events": events}
 
 
 def main() -> None:
@@ -111,7 +166,7 @@ def main() -> None:
         p.error("Research output must reside under /tmp/")
     path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps({"result": "DIAGNOSTIC_COMPLETE", "path": str(path),
-                      "candles": report["candles"], "stats": report["stats"]}, indent=2))
+                      "candles": report["candles"], "stats": report["stats"], "funnel": report["funnel"]}, indent=2))
 
 
 if __name__ == "__main__":
