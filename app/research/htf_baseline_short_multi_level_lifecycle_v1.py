@@ -67,18 +67,31 @@ class MultiLevelEpisodes:
                     if previous and previous != episode_id:
                         self.episodes[previous]["state"] = "UNRESOLVED"
                         self.episodes[previous]["terminal_reason"] = "RECONTACT_SUPERSEDED_PENDING"
+                        self.episodes[previous]["terminal_at_ms"] = open_ms + STEP
+                        self.pending.pop(level_id, None)
                     self.pending[level_id] = episode_id
             else:
                 self.active.pop(level_id, None)
         for level_id in list(self.active):
             if level_id not in valid:
                 self.active.pop(level_id)
+        for level_id in unavailable:
+            eid = self.pending.pop(level_id, None)
+            if eid:
+                self.episodes[eid]["state"] = "UNRESOLVED"
+                self.episodes[eid]["terminal_reason"] = "SOURCE_WINDOW_EVICTED"
+                self.episodes[eid]["terminal_at_ms"] = open_ms + STEP
+                self.active.pop(level_id, None)
         emitted = []
         for level_id in confirmations:
             eid = self.pending.get(level_id)
             if not eid:
                 raise ValueError("confirmation without pending episode")
             episode = self.episodes[eid]
+            if episode["state"] == "UNRESOLVED":
+                raise ValueError("cannot confirm unresolved episode")
+            if not (episode["level_available_ms"] <= episode["first_touch_open_ms"] < open_ms + STEP):
+                raise ValueError("noncausal level/touch/confirmation order")
             if episode["first_confirmation_ms"] is not None:
                 raise ValueError("duplicate confirmation")
             episode["first_confirmation_ms"] = open_ms + STEP
@@ -88,14 +101,11 @@ class MultiLevelEpisodes:
                 "event_id": eid, "episode_id": eid, "level_id": level_id,
                 "known_at_ms": open_ms + STEP,
                 "observed_at_ms": open_ms + STEP,
+                "first_touch_open_ms": episode["first_touch_open_ms"],
+                "level_available_ms": episode["level_available_ms"],
             }
             emitted.append(event)
             self.events.append(event)
             self.pending.pop(level_id, None)
-        for level_id in unavailable:
-            eid = self.pending.get(level_id)
-            if eid:
-                self.episodes[eid]["state"] = "UNRESOLVED"
-                self.episodes[eid]["terminal_reason"] = "SOURCE_WINDOW_EVICTED"
         self.last_close_ms = open_ms + STEP
         return emitted
