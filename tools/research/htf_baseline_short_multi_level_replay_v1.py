@@ -18,14 +18,20 @@ from app.research.htf_baseline_short_causal_level_adapter_v1 import causal_resis
 # It is NOT a complete multi-level HTF source-discovery algorithm.
 
 
-def replay(symbol, candles, start_ms, end_ms):
+def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None):
     state = MultiLevelEpisodes(symbol)
     known_levels = {}
     counters = Counter()
+    restart_done = False
     for index, bar in enumerate(candles):
         asof = int(bar.timestamp) + BAR_MS
         if asof >= end_ms:
             break
+        if restart_at_ms is not None and not restart_done and asof >= restart_at_ms:
+            state = MultiLevelEpisodes.restore(json.loads(json.dumps(state.checkpoint())))
+            known_levels = {k: type(v)(**json.loads(json.dumps(vars(v)))) for k, v in known_levels.items()}
+            counters = Counter(json.loads(json.dumps(dict(counters))))
+            restart_done = True
         prefix = candles[max(0, index-199):index+1]
         htf = closed_htf(candles[:index+1], asof)[-200:]
         if len(prefix) >= 20 and len(htf) >= 26:
@@ -86,6 +92,7 @@ def replay(symbol, candles, start_ms, end_ms):
         raise ValueError(f"event integrity failed: {integrity_errors[:5]}")
     return {
         "symbol": symbol, "counters": dict(counters),
+        "restart_performed": restart_done,
         "unique_emission_ids": len({e["event_id"] for e in scope}),
         "emissions": scope,
         "total_episodes_including_warmup": len(state.episodes),
