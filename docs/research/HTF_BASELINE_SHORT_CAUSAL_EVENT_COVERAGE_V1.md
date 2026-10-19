@@ -34,3 +34,15 @@ PYTHONDONTWRITEBYTECODE=1 /opt/trad_bot/.venv/bin/python -m tools.research.htf_b
 
 ## GO/NO-GO
 Pending reproducible BTC/ETH source verification and runner execution. **Not deployable.** No threshold changes, main merge, freeze, systemd, config, evaluator, scanner or paper modifications.
+
+## Window divergence found (2026-10-19)
+
+BTCUSDT at 2026-10-14 12:35 UTC: 200-bar window chose HTF resistance 83260.1, touch 2026-10-14 10:10; 400-bar window chose resistance 82910.8, touch 2026-10-13 03:20. Both contained many eligible touch candidates. Root cause is source-window dependence of initial close, ATR initialization, level eligibility and first-touch ordering. In the initial run BTC events 10 vs 1; ETH 7 vs 7 with mostly differing timestamps/touches.
+
+### Diagnostic normalization patch (not Phase-2 implementation)
+
+The research-only causal observer now restricts inputs to the **last 200 closed 5m candles**, irrespective of an upstream 200/400 supply. Tests check that extending the earlier prefix does not change the observer's output. This freezes comparison semantics for the same rolling 200 context; it does NOT make HTF levels immutable across later live scans, and it does NOT establish globally stable setup identity. The touch-level canonicalization, event lifecycle and independent prospective detection/persistence remain unimplemented. No change was made to the original frozen Point-B detector.
+
+**Expected:** comparing runner windows 200 and 400 will now match because both evaluate the same trailing execution window. This is a deliberate normalization, **not** evidence that window sensitivity is scientifically resolved or that an execution edge exists. Do not merge or deploy based only on equal counts.
+
+Existing historical replay results and 25-record timestamp audit remain archived as pre-patch observations, not validated prospective OOS. Run the new tests and BTC/ETH replay again, and record complete results before Phase-1 GO/NO-GO.
