@@ -14,6 +14,18 @@ class AtomicAsofClusters:
         self.assignments={}
         self.last_asof=None
 
+    def checkpoint(self):
+        return {"symbol":self.symbol,"clusters":self.clusters,
+                "assignments":self.assignments,"last_asof":self.last_asof}
+
+    @classmethod
+    def restore(cls, data):
+        state=cls(data["symbol"])
+        state.clusters=data["clusters"]
+        state.assignments=data["assignments"]
+        state.last_asof=data["last_asof"]
+        return state
+
     def observe_batch(self, events, *, proximity_ms=300000, price_bps=20):
         if not events:return []
         times={e["known_at_ms"] for e in events}
