@@ -97,7 +97,7 @@ class EpisodeState:
         if reaction_confirmed:
             eid = self.pending.get(key)
             if eid is None:
-                raise ValueError("confirmation outside contiguous contact episode")
+                raise ValueError("confirmation without previously observed contact")
             record = self.episodes[eid]
             if record["first_confirmation_ms"] is None:
                 record["first_confirmation_ms"] = close_ms
