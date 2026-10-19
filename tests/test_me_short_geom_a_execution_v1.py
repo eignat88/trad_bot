@@ -105,14 +105,14 @@ def test_me_short_a_execution_persists_complete_frozen_tuple():
     assert params[6] == 100.0
     assert params[7] == 100.2
     assert params[8] == 95.0
-    assert params[12] == "me_short_geom_a_execution_frozen"
+    assert params[11] == "me_short_geom_a_execution_frozen"
 
     # Atomic execution tuple.
-    assert params[13] == 100.0
-    assert params[14] == 100.2
-    assert params[15] == 95.0
+    assert params[12] == 100.0
+    assert params[13] == 100.2
+    assert params[14] == 95.0
 
-    frozen = json.loads(params[16])
+    frozen = json.loads(params[15])
     assert frozen["_frozen_entry"] == "reference_price"
     assert frozen["_frozen_stop"] == "invalidation_price"
     assert frozen["_frozen_target"] == "target_1"
