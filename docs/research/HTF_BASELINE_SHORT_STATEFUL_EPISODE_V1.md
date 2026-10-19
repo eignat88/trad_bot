@@ -64,3 +64,19 @@ git checkout --detach origin/research/htf-baseline-short-stateful-episode-v1
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/trad_bot/.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_htf_baseline_short_multi_level_lifecycle_v1.py tests/test_htf_baseline_short_stateful_episode_v1.py tests/test_htf_baseline_short_stateful_replay_v1.py --tb=short
 PYTHONDONTWRITEBYTECODE=1 /opt/trad_bot/.venv/bin/python -m tools.research.htf_baseline_short_multi_level_replay_v1 --data-dir /tmp/htf_coverage_174 --symbols BTCUSDT ETHUSDT --start 2026-10-14T00:00:00Z --end 2026-10-17T00:00:00Z --out /tmp/htf_176_multi_level_replay.json
 ```
+
+## MULTI_LEVEL_EVENT_CLUSTER_AND_RESTART_AUDIT_V1
+
+Additional research-only script `tools/research/htf_baseline_short_event_cluster_restart_audit_v1.py` compares uninterrupted historical replay with a JSON checkpoint/restore **in the same process** at midpoint. Comparison covers emissions, counters, episode-status totals, pending totals and integrity checks. This is an initial deterministic restart equivalence audit, **not** independent process failure or transactional persistence testing.
+
+Event records now carry `level_price_at_touch`; candidate near-collision pairs are detected if confirmation time differs by at most 5m and resistance prices are within 20 bps. These are **exploratory diagnostic thresholds, not a dedup/trade protocol**. Do not claim clustered pairs are duplicate market reactions or that events outside clusters are independent.
+
+```bash
+cd /tmp/trad_bot_issue176
+git fetch origin research/htf-baseline-short-stateful-episode-v1
+git checkout --detach origin/research/htf-baseline-short-stateful-episode-v1
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/trad_bot/.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_htf_baseline_short_multi_level_lifecycle_v1.py tests/test_htf_baseline_short_multi_level_terminal_policy_v1.py tests/test_htf_baseline_short_stateful_episode_v1.py tests/test_htf_baseline_short_stateful_replay_v1.py tests/test_htf_baseline_short_event_cluster_restart_audit_v1.py --tb=short
+PYTHONDONTWRITEBYTECODE=1 /opt/trad_bot/.venv/bin/python -m tools.research.htf_baseline_short_event_cluster_restart_audit_v1 --data-dir /tmp/htf_coverage_174 --symbols BTCUSDT ETHUSDT --start 2026-10-14T00:00:00Z --end 2026-10-17T00:00:00Z --out /tmp/htf_176_event_cluster_restart.json
+```
+
+Phase-2 remains NO-GO until all simultaneously eligible levels and independent external restart / prefix audits are verified.
