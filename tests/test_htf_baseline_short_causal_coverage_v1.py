@@ -59,7 +59,7 @@ def test_diagnostic_does_not_count_repeated_prefixes_as_trades(monkeypatch):
         event.observed_at_ms = t
         return event
     monkeypatch.setattr(mod.observer, "detect_causal_baseline_short", fake_detector)
-    monkeypatch.setattr(mod, "event_episode", lambda *args: {"level_id": "level", "episode_id": "episode"})
+    monkeypatch.setattr(mod, "event_episode", lambda *args: {"level_id": "level", "episode_id": "episode", "episode_start_ms": src[0].timestamp, "episode_left_censored": False})
     start = src[320].timestamp+BAR_MS
     end = src[330].timestamp+BAR_MS
     r = diagnose("BTCUSDT", src, start, end, windows=(200,))
