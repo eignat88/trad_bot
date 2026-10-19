@@ -150,3 +150,20 @@ git checkout --detach origin/research/htf-baseline-short-stateful-episode-v1
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/trad_bot/.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_htf_baseline_short_episode_id_parity_asof_batch_v1.py tests/test_htf_baseline_short_bridge_parity_v1.py tests/test_htf_baseline_short_full_universe_first_seen_v1.py --tb=short
 PYTHONDONTWRITEBYTECODE=1 /opt/trad_bot/.venv/bin/python -m tools.research.htf_baseline_short_parity_batch_cli_v1 --data-dir /tmp/htf_coverage_174 --symbols BTCUSDT ETHUSDT --start 2026-10-14T00:00:00Z --end 2026-10-17T00:00:00Z --out /tmp/htf_176_parity_batch.json
 ```
+
+## ASOF_ATOMIC_CLUSTER_ASSIGNMENT_AND_EPISODE_ID_STABILITY_V1
+
+Research-only changes: `MultiLevelEpisodes` episode digest now uses `symbol|SHORT|level_id|first_touch_open_ms`, not the local `sequence`; retains sequence for compatibility with earlier checkpoint reports but it no longer determines an event ID. An identical causal first-touch identity is rejected rather than silently overwritten. **Historic hashed IDs deliberately change; do not mix old and new identity namespaces.** No stored production outcomes changed.
+
+`AtomicAsofClusters` first groups all events at a closed 5m ASOF by a *provisional* 20bps connected-component relation. Only clusters committed at a STRICTLY EARLIER ASOF may act as prior anchors. Same-ASOF groups cannot influence each other. Multiple earlier anchors matching a component cause `AMBIGUOUS_PRIOR_ANCHORS` with no reassignment or anchor merger. Anchored IDs are still research proposals, not validated independent reactions or execution keys.
+
+Historical full vs selected-once parity and new atomic grouping CLI:
+```bash
+cd /tmp/trad_bot_issue176
+git fetch origin research/htf-baseline-short-stateful-episode-v1
+git checkout --detach origin/research/htf-baseline-short-stateful-episode-v1
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/trad_bot/.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_htf_baseline_short_atomic_asof_identity_v1.py tests/test_htf_baseline_short_multi_level_lifecycle_v1.py tests/test_htf_baseline_short_multi_level_terminal_policy_v1.py tests/test_htf_baseline_short_reaction_identity_disk_restart_v1.py --tb=short
+PYTHONDONTWRITEBYTECODE=1 /opt/trad_bot/.venv/bin/python -m tools.research.htf_baseline_short_atomic_asof_parity_cli_v1 --data-dir /tmp/htf_coverage_174 --symbols BTCUSDT ETHUSDT --start 2026-10-14T00:00:00Z --end 2026-10-17T00:00:00Z --out /tmp/htf_176_atomic_asof_parity.json
+```
+
+No OOS, production, frozen detector, scanner, paper or main changes. **PHASE_2_NO_GO** until VPS validation, full-universe lifecycle retirement and proposed batch dedup protocol review.
