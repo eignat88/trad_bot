@@ -103,6 +103,7 @@ class MultiLevelEpisodes:
                 "observed_at_ms": open_ms + STEP,
                 "first_touch_open_ms": episode["first_touch_open_ms"],
                 "level_available_ms": episode["level_available_ms"],
+                "level_price_at_touch": episode["level_price_at_touch"],
             }
             emitted.append(event)
             self.events.append(event)
