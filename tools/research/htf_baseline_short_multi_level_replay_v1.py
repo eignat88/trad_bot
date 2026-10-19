@@ -20,7 +20,7 @@ from app.research.htf_baseline_short_causal_level_adapter_v1 import causal_resis
 
 def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
            resume_checkpoint=None, save_checkpoint=None, stop_at_ms=None,
-           full_universe=False):
+           full_universe=False, pending_impact=False):
     state = MultiLevelEpisodes(symbol)
     known_levels = {}
     counters = Counter()
@@ -32,6 +32,13 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
         from app.research.htf_baseline_short_stateful_episode_v1 import LevelSnapshot
         known_levels = {key: LevelSnapshot(**v) for key,v in checkpoint["known_levels"].items()}
         counters = Counter(checkpoint["counters"])
+    impact = {"eligibility_loss_with_pending": [], "confirmations_after_eligibility_loss": [], "eligibility_changes": 0}
+    previously_eligible = set()
+    lost_pending = {}
+    if resume_checkpoint is not None and pending_impact:
+        impact = checkpoint.get("pending_impact", impact)
+        previously_eligible = set(checkpoint.get("previously_eligible", []))
+        lost_pending = checkpoint.get("lost_pending", {})
     restart_done = False
     for index, bar in enumerate(candles):
         asof = int(bar.timestamp) + BAR_MS
@@ -58,6 +65,16 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
         else:
             selected = None
             atr = None
+        if pending_impact and full_universe:
+            eligible_ids = {x.level_id for x in discovered} if len(prefix) >= 20 and len(htf) >= 26 else set()
+            disappeared = previously_eligible - eligible_ids
+            for lid in sorted(disappeared):
+                impact["eligibility_changes"] += 1
+                if lid in state.pending:
+                    eid = state.pending[lid]
+                    lost_pending[eid] = {"level_id":lid, "lost_at_ms":asof}
+                    impact["eligibility_loss_with_pending"].append({"asof_ms":asof,"level_id":lid,"episode_id":eid})
+            previously_eligible = eligible_ids
         contacts = {}
         confirmations = []
         unavailable = []
@@ -86,6 +103,10 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
             open_ms=int(bar.timestamp), level_contacts=contacts,
             confirmations=confirmations, unavailable=unavailable,
         )
+        if pending_impact:
+            for e in emitted:
+                if e["episode_id"] in lost_pending:
+                    impact["confirmations_after_eligibility_loss"].append({"event_id":e["event_id"], **lost_pending[e["episode_id"]]})
         if start_ms <= asof < end_ms:
             counters["decisions"] += 1
             counters["levels_known"] = max(counters["levels_known"], len(known_levels))
@@ -98,6 +119,9 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
             "full_universe": full_universe,
             "state": state.checkpoint(), "known_levels": {k: vars(v) for k,v in known_levels.items()},
             "counters": dict(counters),
+            "pending_impact": impact if pending_impact else None,
+            "previously_eligible": sorted(previously_eligible),
+            "lost_pending": lost_pending,
         }
         Path(save_checkpoint).write_text(json.dumps(payload, sort_keys=True))
     scope = [e for e in state.events if start_ms <= e["known_at_ms"] < end_ms]
@@ -117,6 +141,7 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
     return {
         "symbol": symbol, "counters": dict(counters),
         "full_universe": full_universe,
+        "pending_impact": impact if pending_impact else None,
         "restart_performed": restart_done,
         "unique_emission_ids": len({e["event_id"] for e in scope}),
         "emissions": scope,
