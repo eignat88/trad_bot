@@ -97,3 +97,24 @@ git checkout --detach origin/research/htf-baseline-short-stateful-episode-v1
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/trad_bot/.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_htf_baseline_short_multi_level_lifecycle_v1.py tests/test_htf_baseline_short_multi_level_terminal_policy_v1.py tests/test_htf_baseline_short_stateful_episode_v1.py tests/test_htf_baseline_short_stateful_replay_v1.py tests/test_htf_baseline_short_event_cluster_restart_audit_v1.py tests/test_htf_baseline_short_reaction_identity_disk_restart_v1.py --tb=short
 PYTHONDONTWRITEBYTECODE=1 /opt/trad_bot/.venv/bin/python -m tools.research.htf_baseline_short_event_cluster_restart_audit_v1 --data-dir /tmp/htf_coverage_174 --symbols BTCUSDT ETHUSDT --start 2026-10-14T00:00:00Z --end 2026-10-17T00:00:00Z --out /tmp/htf_176_cluster_identity.json
 ```
+
+## FULL_CAUSAL_LEVEL_UNIVERSE_AND_FIRST_SEEN_CLUSTER_V1 (VPS pending)
+
+New as-of function `causal_resistance_universe` lists all resistance candidates satisfying the *proposed* causal swing, touch-count, price-above-last-close and available-at-ASOF rules. Existing nearest-level method delegates to this list. `full_universe=True` in the **research-only** replay retains every candidate seen at any past ASOF, not just the selected one; original default mode remains available for direct comparison.
+
+**Not yet full production-level lifecycle:** levels remain in the known registry after they cease satisfying the current reference-price eligibility. A complete causal level retirement/invalidation policy has NOT been proven. Expanding the observable universe also changes touch counts and may increase unresolved episodes. Historical Point-B remains frozen and untouched.
+
+`FirstSeenReactionClusters` creates immutable cluster IDs anchored to the **first received event** and attaches subsequent confirmations using only already-known anchors and a provisional (5m/20bps) threshold. Bridges matching two existing anchors are left `AMBIGUOUS_BRIDGE` rather than merging/rekeying old clusters. This is a *proposal*, not validated independence or approved OOS event dedup. Retrospective connected-component cluster IDs must not be substituted as first-seen IDs.
+
+Audit script: `tools/research/htf_baseline_short_full_universe_cluster_audit_v1.py`, produces JSON comparing selected-once and full-universe counts and provisional anchors. Tests: `tests/test_htf_baseline_short_full_universe_first_seen_v1.py`.
+
+VPS:
+```bash
+cd /tmp/trad_bot_issue176
+git fetch origin research/htf-baseline-short-stateful-episode-v1
+git checkout --detach origin/research/htf-baseline-short-stateful-episode-v1
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/trad_bot/.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_htf_baseline_short_full_universe_first_seen_v1.py tests/test_htf_baseline_short_multi_level_lifecycle_v1.py tests/test_htf_baseline_short_multi_level_terminal_policy_v1.py tests/test_htf_baseline_short_stateful_episode_v1.py tests/test_htf_baseline_short_stateful_replay_v1.py tests/test_htf_baseline_short_event_cluster_restart_audit_v1.py tests/test_htf_baseline_short_reaction_identity_disk_restart_v1.py --tb=short
+PYTHONDONTWRITEBYTECODE=1 /opt/trad_bot/.venv/bin/python -m tools.research.htf_baseline_short_full_universe_cluster_audit_v1 --data-dir /tmp/htf_coverage_174 --symbols BTCUSDT ETHUSDT --start 2026-10-14T00:00:00Z --end 2026-10-17T00:00:00Z --out /tmp/htf_176_full_universe_first_seen.json
+```
+
+Gate stays **PHASE_2_NO_GO**, Draft PR only, no deployment.
