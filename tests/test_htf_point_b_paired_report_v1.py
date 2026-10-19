@@ -15,7 +15,8 @@ def calc(direction="SHORT",entry=100,stop=110,target=80,ret=1,tp=False,sl=False,
 
 def test_short_timeout_raw_price_return_has_negative_sign():
     value,path=calc(ret=1)
-    assert value == pytest.approx(-0.1)\n    assert path == "TIMEOUT"
+    assert value == pytest.approx(-0.1)
+    assert path == "TIMEOUT"
 
 def test_short_takeprofit_stop_and_collision():
     assert calc(tp=True)==(2.0,"TP_FIRST")
