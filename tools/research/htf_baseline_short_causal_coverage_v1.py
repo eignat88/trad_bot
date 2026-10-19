@@ -23,6 +23,7 @@ from typing import Sequence
 from app.models import Candle
 from app.research import htf_keylevel_baseline_short_causal_observer_v1 as observer
 from tools.research.htf_baseline_short_episode_ledger_v1 import event_episode
+from tools.research.htf_baseline_short_episode_identity_hardening_v1 import audit_episode_identity, sliding_window_audit
 
 BAR_MS = 300_000
 HOUR_MS = 3_600_000
@@ -119,7 +120,11 @@ def diagnose(symbol: str, candles: Sequence[Candle], start_ms: int,
         episode_groups: dict[str, list[str]] = {}
         for event in events:
             episode_groups.setdefault(event["episode_id"], []).append(event["event_id"])
+        hardening = audit_episode_identity(events)
+        eviction = [sliding_window_audit(candles, e, window=200) for e in events]
         results[str(window)] = {
+            "identity_hardening": hardening,
+            "rolling_visibility": eviction,
             "decision_funnel": dict(sorted(funnel.items())),
             "unique_events": len(first_seen),
             "unique_htf_levels": len({e["level_id"] for e in events}),
