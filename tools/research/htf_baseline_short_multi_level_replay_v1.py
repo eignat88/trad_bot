@@ -18,15 +18,26 @@ from app.research.htf_baseline_short_causal_level_adapter_v1 import causal_resis
 # It is NOT a complete multi-level HTF source-discovery algorithm.
 
 
-def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None):
+def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
+           resume_checkpoint=None, save_checkpoint=None, stop_at_ms=None):
     state = MultiLevelEpisodes(symbol)
     known_levels = {}
     counters = Counter()
+    if resume_checkpoint is not None:
+        checkpoint = json.loads(Path(resume_checkpoint).read_text())
+        if checkpoint["symbol"] != symbol or checkpoint["end_ms"] != end_ms or checkpoint["start_ms"] != start_ms:
+            raise ValueError("checkpoint identity mismatch")
+        state = MultiLevelEpisodes.restore(checkpoint["state"])
+        from app.research.htf_baseline_short_stateful_episode_v1 import LevelSnapshot
+        known_levels = {key: LevelSnapshot(**v) for key,v in checkpoint["known_levels"].items()}
+        counters = Counter(checkpoint["counters"])
     restart_done = False
     for index, bar in enumerate(candles):
         asof = int(bar.timestamp) + BAR_MS
-        if asof >= end_ms:
+        if asof >= end_ms or (stop_at_ms is not None and asof >= stop_at_ms):
             break
+        if state.last_close_ms is not None and asof <= state.last_close_ms:
+            continue
         if restart_at_ms is not None and not restart_done and asof >= restart_at_ms:
             state = MultiLevelEpisodes.restore(json.loads(json.dumps(state.checkpoint())))
             known_levels = {k: type(v)(**json.loads(json.dumps(vars(v)))) for k, v in known_levels.items()}
@@ -76,6 +87,13 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None):
             counters["contacts"] += sum(x[2] for x in contacts.values())
             counters["confirmations"] += len(emitted)
             counters["unavailable_pending_prefixes"] += len(unavailable)
+    if save_checkpoint is not None:
+        payload = {
+            "symbol": symbol, "start_ms": start_ms, "end_ms": end_ms,
+            "state": state.checkpoint(), "known_levels": {k: vars(v) for k,v in known_levels.items()},
+            "counters": dict(counters),
+        }
+        Path(save_checkpoint).write_text(json.dumps(payload, sort_keys=True))
     scope = [e for e in state.events if start_ms <= e["known_at_ms"] < end_ms]
     statuses = Counter(x["state"] for x in state.episodes.values())
     integrity_errors = []
