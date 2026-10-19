@@ -132,3 +132,21 @@ git checkout --detach origin/research/htf-baseline-short-stateful-episode-v1
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/trad_bot/.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_htf_baseline_short_bridge_parity_v1.py tests/test_htf_baseline_short_full_universe_first_seen_v1.py --tb=short
 PYTHONDONTWRITEBYTECODE=1 /opt/trad_bot/.venv/bin/python -m tools.research.htf_baseline_short_bridge_parity_cli_v1 --data-dir /tmp/htf_coverage_174 --symbols BTCUSDT ETHUSDT --start 2026-10-14T00:00:00Z --end 2026-10-17T00:00:00Z --out /tmp/htf_176_bridge_parity.json
 ```
+
+## EPISODE_ID_PARITY_ROOT_CAUSE_AND_ASOF_BATCH_CLUSTER_V1 — VPS pending
+
+Research-only evidence tools:
+- `htf_baseline_short_episode_id_parity_root_cause_v1.py` matches mismatched IDs by level_id + confirmation ASOF + level_price; compares first_touch timestamp. This is an attribution diagnostic: matching geometry does NOT prove trade independence or full episode semantic equivalence.
+- `htf_baseline_short_asof_batch_cluster_audit_v1.py` groups confirmations by identical ASOF, calculates within-batch candidate edges before processing and checks matches to anchors existing **before** that batch. It DOES NOT change production cluster allocation, automatically merge bridges or resolve sequence-dependence.
+- `htf_baseline_short_parity_batch_cli_v1.py` generates a bounded read-only report for BTC/ETH.
+- `tests/test_htf_baseline_short_episode_id_parity_asof_batch_v1.py` includes synthetic parity and batch cases.
+
+Research only, no changes to frozen Point-B, production, OOS registry or scanners. Full-universe level retirement and prospective batch allocation remain **NOT IMPLEMENTED**. Phase 2 NO-GO.
+
+```bash
+cd /tmp/trad_bot_issue176
+git fetch origin research/htf-baseline-short-stateful-episode-v1
+git checkout --detach origin/research/htf-baseline-short-stateful-episode-v1
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/trad_bot/.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_htf_baseline_short_episode_id_parity_asof_batch_v1.py tests/test_htf_baseline_short_bridge_parity_v1.py tests/test_htf_baseline_short_full_universe_first_seen_v1.py --tb=short
+PYTHONDONTWRITEBYTECODE=1 /opt/trad_bot/.venv/bin/python -m tools.research.htf_baseline_short_parity_batch_cli_v1 --data-dir /tmp/htf_coverage_174 --symbols BTCUSDT ETHUSDT --start 2026-10-14T00:00:00Z --end 2026-10-17T00:00:00Z --out /tmp/htf_176_parity_batch.json
+```
