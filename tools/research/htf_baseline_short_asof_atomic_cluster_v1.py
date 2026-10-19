@@ -40,11 +40,12 @@ class AtomicAsofClusters:
         groups=defaultdict(list)
         for e in batch:groups[root(e["event_id"])].append(e)
         results=[]
+        prior_clusters = {cid: dict(c) for cid,c in self.clusters.items()}
         for members in groups.values():
             matches=set()
             for e in members:
                 p=e["level_price_at_touch"]
-                for cid,cluster in self.clusters.items():
+                for cid,cluster in prior_clusters.items():
                     if 0<=asof-cluster["anchor_time_ms"]<=proximity_ms and 10000*abs(p-cluster["anchor_price"])/min(p,cluster["anchor_price"])<=price_bps:
                         matches.add(cid)
             if len(matches)>1:
