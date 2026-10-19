@@ -9,6 +9,7 @@ from collections import defaultdict
 from pathlib import Path
 from tools.research.htf_baseline_short_causal_coverage_v1 import load_bars, utc_ms
 from tools.research.htf_baseline_short_multi_level_replay_v1 import replay
+from tools.research.htf_baseline_short_reaction_cluster_identity_v1 import reaction_clusters
 
 
 def cluster_events(events, episodes=None, *, proximity_ms=300000, price_bps=20):
@@ -59,9 +60,11 @@ def analyze(symbol, candles, start_ms, end_ms):
     if mismatches:
         raise AssertionError(f"restart replay mismatch: {mismatches}")
     cluster = cluster_events(baseline["emissions"])
+    identity = reaction_clusters(baseline["emissions"])
     return {"symbol": symbol, "restart_equivalence": "PASS",
             "restart_at_ms": restart_at, "compared_fields": keys,
             "confirmed_events": len(baseline["emissions"]), "cluster": cluster,
+            "reaction_identity": identity,
             "verdict": "HISTORICAL_RESEARCH_ONLY_NOT_OOS"}
 
 
