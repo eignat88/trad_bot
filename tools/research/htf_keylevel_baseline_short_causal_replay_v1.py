@@ -22,6 +22,7 @@ from app.research.htf_keylevel_point_b import (
     _causal_atr_series, _find_htf_key_levels, _find_reaction_end,
     KEY_LEVEL_TOUCH_TOLERANCE_ATR, LOCAL_STRUCTURE_LOOKBACK,
 )
+from tools.research.htf_keylevel_baseline_short_reaction_mask_audit_v1 import (inspect_reaction_masking, masking_summary)
 from app.research.srr_short_execution_r_expansion_prospective_evaluator import (
     BybitHistoricalCandleSource, SOURCE_VALIDATED,
 )
@@ -101,12 +102,16 @@ def replay(symbol: str, candles: list[Candle], *, warmup_5m: int = 400) -> dict:
     seen = set()
     stats = Counter()
     events = []
+    masking_records = []
     for idx in range(warmup_5m, len(candles)):
         asof = candles[idx].timestamp + BAR_MS
         prefix = candles[max(0, idx-199):idx+1]
         htf = assemble_complete_1h(candles[:idx+1], asof)[-199:]
         stats["evaluated_prefixes"] += 1
         stats["stage_" + diagnostic_funnel_stage(prefix, htf, asof)] += 1
+        masking = inspect_reaction_masking(prefix, htf)
+        masking["asof_ms"] = asof
+        masking_records.append(masking)
         signal = detect_causal_baseline_short(
             symbol=symbol, execution_candles=prefix, htf_candles=htf,
             evaluation_asof=datetime.fromtimestamp(asof / 1000, timezone.utc),
@@ -137,7 +142,7 @@ def replay(symbol: str, candles: list[Candle], *, warmup_5m: int = 400) -> dict:
     return {"mode": "HISTORICAL_DIAGNOSTIC_NOT_OOS",
             "symbol": symbol, "first_open_ms": candles[0].timestamp,
             "last_open_ms": candles[-1].timestamp,
-            "candles": len(candles), "stats": dict(stats), "funnel": stages, "events": events}
+            "candles": len(candles), "stats": dict(stats), "funnel": stages, "masking_audit": masking_summary(masking_records), "events": events}
 
 
 def main() -> None:
@@ -169,7 +174,7 @@ def main() -> None:
         p.error("Research output must reside under /tmp/")
     path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps({"result": "DIAGNOSTIC_COMPLETE", "path": str(path),
-                      "candles": report["candles"], "stats": report["stats"], "funnel": report["funnel"]}, indent=2))
+                      "candles": report["candles"], "stats": report["stats"], "funnel": report["funnel"], "masking_audit": report["masking_audit"]}, indent=2))
 
 
 if __name__ == "__main__":
