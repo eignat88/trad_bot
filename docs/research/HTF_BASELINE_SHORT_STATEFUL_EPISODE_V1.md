@@ -80,3 +80,20 @@ PYTHONDONTWRITEBYTECODE=1 /opt/trad_bot/.venv/bin/python -m tools.research.htf_b
 ```
 
 Phase-2 remains NO-GO until all simultaneously eligible levels and independent external restart / prefix audits are verified.
+
+## Reaction-cluster identity + separate-invocation disk restart (pending VPS verification)
+
+`tools/research/htf_baseline_short_reaction_cluster_identity_v1.py` builds a deterministic connected-component identity for candidate pairs (≤5m, ≤20bps), preserving **all** event IDs, episode IDs, level IDs, first confirmed timestamp and first event. This cluster ID depends on all members and is therefore *retrospective, diagnostic only*; it MUST NOT be used as a prospective first-seen or trading dedup key. Transitive edges can combine events further than direct time/price tolerance.
+
+`tools/research/htf_baseline_short_multi_level_replay_v1.py` now accepts `stop_at_ms`, `save_checkpoint` and `resume_checkpoint`; checkpoint stores episode state, known levels and counters. The CLI `tools/research/htf_baseline_short_disk_restart_audit_v1.py` supports baseline, stage1, stage2 and compare in **separate Python invocations** with local JSON. This is a synthetic process restart test, not transactional crash safety or concurrency verification.
+
+The original 37 events remain a bounded historical diagnostic count, **not an OOS or independent trade sample**. Level universe is still only levels selected at least once. Frozen Point-B detector unchanged.
+
+Validation:
+```bash
+cd /tmp/trad_bot_issue176
+git fetch origin research/htf-baseline-short-stateful-episode-v1
+git checkout --detach origin/research/htf-baseline-short-stateful-episode-v1
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/trad_bot/.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_htf_baseline_short_multi_level_lifecycle_v1.py tests/test_htf_baseline_short_multi_level_terminal_policy_v1.py tests/test_htf_baseline_short_stateful_episode_v1.py tests/test_htf_baseline_short_stateful_replay_v1.py tests/test_htf_baseline_short_event_cluster_restart_audit_v1.py tests/test_htf_baseline_short_reaction_identity_disk_restart_v1.py --tb=short
+PYTHONDONTWRITEBYTECODE=1 /opt/trad_bot/.venv/bin/python -m tools.research.htf_baseline_short_event_cluster_restart_audit_v1 --data-dir /tmp/htf_coverage_174 --symbols BTCUSDT ETHUSDT --start 2026-10-14T00:00:00Z --end 2026-10-17T00:00:00Z --out /tmp/htf_176_cluster_identity.json
+```
