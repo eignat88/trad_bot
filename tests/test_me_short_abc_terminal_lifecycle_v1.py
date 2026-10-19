@@ -37,7 +37,9 @@ def test_migration_contains_db_fuse_and_execution_guard():
     for key in OLD:
         assert key in sql
     assert "CREATE TRIGGER trg_guard_retired_me_short_abc_v1" in sql
-    assert "BEFORE INSERT OR UPDATE" in sql
+    assert "BEFORE UPDATE" in sql
+    assert "AFTER INSERT" in sql
+    assert "READY_TO_START" in sql
     assert "RAISE EXCEPTION" in sql
     assert "status='CANCELLED'" in sql
     assert "ME_SHORT_GEOM_A_EXECUTION_V1" in sql
