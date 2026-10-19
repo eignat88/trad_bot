@@ -175,3 +175,25 @@ No OOS, production, frozen detector, scanner, paper or main changes. **PHASE_2_N
 `AtomicAsofClusters.checkpoint/restore` stores symbol, existing clusters, assignments, and last ASOF. `htf_baseline_short_combined_restart_v1.py` tests full-universe episode replay state plus cluster state through **separate Python invocations** (baseline/stage1/stage2/compare) with JSON on local disk. The stage2 process continues episodes from their checkpoint and only delivers event IDs not already assigned by the cluster checkpoint. This is not atomic cross-file transaction or crash-safe recovery. Historical IDs use the new first-touch hash namespace. Do not reuse checkpoints from earlier commits.
 
 VPS tests and replay must pass before any conclusion. Do not deploy or merge. Phase 2 remains NO-GO.
+
+## HTF_PENDING_LIFECYCLE_AND_CRASH_SAFE_RECOVERY_V1 — combined research gate
+
+This version introduces `pending_impact=True` in the full-universe historical replay: the loss of present ASOF eligibility is cross-referenced with real `MultiLevelEpisodes.pending` **before** advancing the candle. It records pending episode IDs at eligibility loss and subsequent confirmations for those same episodes. No level is retired, invalidated, or deleted automatically. This is read-only historical evidence; missing a confirmation later is not proof a retirement rule is safe. The impact structure lives inside the replay checkpoint for deterministic continuity.
+
+`htf_baseline_short_atomic_checkpoint_v1.py` writes a single schema-versioned JSON envelope containing episode state, HTF levels, cursor/counters and atomic cluster state. It hashes canonical JSON with SHA-256, writes/flushed/fsyncs a temporary file, atomically `os.replace`s it, and fsyncs parent directory. It can fail before replace for fault injection. Validation rejects a changed hash or schema. **No claim of universal hardware durability, dual-generation fallback, safe concurrent writer lease, nor atomic linkage to any external execution side effects.** An already corrupt *committed* checkpoint intentionally raises instead of silently recovering, pending a verified backup generation policy.
+
+`htf_baseline_short_pending_atomic_gate_v1.py` supports baseline, stage1, fault (attempt interrupted replace), stage2 and compare across separate Python processes in the detached research worktree. Tests and historical VPS replay pending. No production modification / OOS.
+
+```bash
+cd /tmp/trad_bot_issue176
+git fetch origin research/htf-baseline-short-stateful-episode-v1
+git checkout --detach origin/research/htf-baseline-short-stateful-episode-v1
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/trad_bot/.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_htf_baseline_short_pending_atomic_gate_v1.py tests/test_htf_baseline_short_level_eligibility_combined_restart_v1.py tests/test_htf_baseline_short_atomic_asof_identity_v1.py --tb=short
+for symbol in BTCUSDT ETHUSDT; do
+  for phase in baseline stage1 fault stage2 compare; do
+    PYTHONDONTWRITEBYTECODE=1 /opt/trad_bot/.venv/bin/python -m tools.research.htf_baseline_short_pending_atomic_gate_v1 --phase "$phase" --data-dir /tmp/htf_coverage_174 --symbol "$symbol" --start 2026-10-14T00:00:00Z --end 2026-10-17T00:00:00Z --prefix "/tmp/htf_176_atomic_pending_${symbol}" || break
+  done
+done
+```
+
+**Phase 2 NO-GO**, pending combined VPS gate, independently reviewed retirement semantics, and final protocol readiness audit.
