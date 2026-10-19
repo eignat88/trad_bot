@@ -26,7 +26,8 @@ class EpisodeState:
     direction: str = "SHORT"
     last_close_ms: int | None = None
     sequence: dict[str, int] = field(default_factory=dict)
-    active: dict[str, dict] = field(default_factory=dict)
+    active: dict[str, str] = field(default_factory=dict)
+    pending: dict[str, str] = field(default_factory=dict)
     episodes: dict[str, dict] = field(default_factory=dict)
     emitted: list[dict] = field(default_factory=list)
 
@@ -35,6 +36,7 @@ class EpisodeState:
             "symbol": self.symbol, "direction": self.direction,
             "last_close_ms": self.last_close_ms,
             "sequence": self.sequence, "active": self.active,
+            "pending": self.pending,
             "episodes": self.episodes, "emitted": self.emitted,
         }
 
@@ -91,8 +93,9 @@ class EpisodeState:
                 }
                 self.episodes[eid] = record
                 self.active[key] = eid
+                self.pending[key] = eid
         if reaction_confirmed:
-            eid = self.active.get(key)
+            eid = self.pending.get(key)
             if eid is None:
                 raise ValueError("confirmation outside contiguous contact episode")
             record = self.episodes[eid]
@@ -104,5 +107,6 @@ class EpisodeState:
                     "known_at_ms": close_ms, "observed_at_ms": close_ms,
                 })
                 self.emitted.extend(emitted)
+                self.pending.pop(key, None)
         self.last_close_ms = close_ms
         return emitted
