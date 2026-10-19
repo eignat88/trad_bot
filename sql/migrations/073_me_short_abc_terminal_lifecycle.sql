@@ -10,7 +10,7 @@ BEGIN
  SELECT count(*) INTO invalid_count
  FROM research.prospective_experiment
  WHERE experiment_id IN ('ME_SHORT_GEOM_A_V1','ME_SHORT_GEOM_B_V1','ME_SHORT_GEOM_C_V1')
-   AND status NOT IN ('RUNNING','CANCELLED','COMPLETED','CLOSED_NEGATIVE');
+   AND status NOT IN ('RUNNING','READY_TO_START','CANCELLED','COMPLETED','CLOSED_NEGATIVE');
  IF invalid_count <> 0 THEN
    RAISE EXCEPTION 'ME SHORT ABC closure blocked: unexpected existing statuses (%)',invalid_count;
  END IF;
@@ -35,7 +35,7 @@ END $$;
 UPDATE research.prospective_experiment
 SET status='CANCELLED'
 WHERE experiment_id IN ('ME_SHORT_GEOM_A_V1','ME_SHORT_GEOM_B_V1','ME_SHORT_GEOM_C_V1')
-  AND status='RUNNING';
+  AND status IN ('RUNNING','READY_TO_START');
 
 -- A database-level fuse: later migrations, bootstrap code, and manual
 -- status changes cannot silently restart retired A/B/C IDs.
@@ -58,9 +58,18 @@ $$;
 
 DROP TRIGGER IF EXISTS trg_guard_retired_me_short_abc_v1
 ON research.prospective_experiment;
+DROP TRIGGER IF EXISTS trg_guard_retired_me_short_abc_v1_insert
+ON research.prospective_experiment;
 
+-- UPDATE must be prevented before changing the stored lifecycle state.
 CREATE TRIGGER trg_guard_retired_me_short_abc_v1
-BEFORE INSERT OR UPDATE ON research.prospective_experiment
+BEFORE UPDATE ON research.prospective_experiment
+FOR EACH ROW EXECUTE FUNCTION research.guard_retired_me_short_abc_v1();
+
+-- AFTER INSERT fires only for actual inserted rows; old seed migrations
+-- use ON CONFLICT DO NOTHING and must remain safely replayable.
+CREATE TRIGGER trg_guard_retired_me_short_abc_v1_insert
+AFTER INSERT ON research.prospective_experiment
 FOR EACH ROW EXECUTE FUNCTION research.guard_retired_me_short_abc_v1();
 
 DO $$
