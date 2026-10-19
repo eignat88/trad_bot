@@ -5,7 +5,7 @@ STEP=300000
 BASE=1800000000000 // 3600000 * 3600000
 
 def event(i, price, level):
-    return {"event_id":f"e{i}","episode_id":f"ep{i}","level_id":level,
+    return {"event_id":f"e{i}-{level}","episode_id":f"ep{i}-{level}","level_id":level,
             "known_at_ms":i*STEP,"level_price_at_touch":price}
 
 def test_nearby_levels_same_confirmation_flagged():
