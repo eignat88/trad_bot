@@ -11,7 +11,7 @@ from app.research.htf_keylevel_point_b import _causal_atr_series, _find_reaction
 from tools.research.htf_baseline_short_causal_coverage_v1 import (
     BAR_MS, closed_htf, load_bars, utc_ms,
 )
-from app.research.htf_baseline_short_causal_level_adapter_v1 import causal_resistance_snapshot
+from app.research.htf_baseline_short_causal_level_adapter_v1 import causal_resistance_snapshot, causal_resistance_universe
 
 # Research-only level universe. Legacy selector returns one nearest level;
 # this simulator independently retains level snapshots seen at earlier ASOFs.
@@ -19,13 +19,14 @@ from app.research.htf_baseline_short_causal_level_adapter_v1 import causal_resis
 
 
 def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
-           resume_checkpoint=None, save_checkpoint=None, stop_at_ms=None):
+           resume_checkpoint=None, save_checkpoint=None, stop_at_ms=None,
+           full_universe=False):
     state = MultiLevelEpisodes(symbol)
     known_levels = {}
     counters = Counter()
     if resume_checkpoint is not None:
         checkpoint = json.loads(Path(resume_checkpoint).read_text())
-        if checkpoint["symbol"] != symbol or checkpoint["end_ms"] != end_ms or checkpoint["start_ms"] != start_ms:
+        if checkpoint["symbol"] != symbol or checkpoint["end_ms"] != end_ms or checkpoint["start_ms"] != start_ms or checkpoint.get("full_universe", False) != full_universe:
             raise ValueError("checkpoint identity mismatch")
         state = MultiLevelEpisodes.restore(checkpoint["state"])
         from app.research.htf_baseline_short_stateful_episode_v1 import LevelSnapshot
@@ -47,7 +48,11 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
         htf = closed_htf(candles[:index+1], asof)[-200:]
         if len(prefix) >= 20 and len(htf) >= 26:
             selected = causal_resistance_snapshot(htf, prefix, asof)
-            if selected is not None:
+            if full_universe:
+                discovered = causal_resistance_universe(htf, prefix, asof)
+                for candidate in discovered:
+                    known_levels.setdefault(candidate.level_id, candidate)
+            elif selected is not None:
                 known_levels.setdefault(selected.level_id, selected)
             atr = _causal_atr_series(prefix)
         else:
@@ -90,6 +95,7 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
     if save_checkpoint is not None:
         payload = {
             "symbol": symbol, "start_ms": start_ms, "end_ms": end_ms,
+            "full_universe": full_universe,
             "state": state.checkpoint(), "known_levels": {k: vars(v) for k,v in known_levels.items()},
             "counters": dict(counters),
         }
@@ -110,6 +116,7 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
         raise ValueError(f"event integrity failed: {integrity_errors[:5]}")
     return {
         "symbol": symbol, "counters": dict(counters),
+        "full_universe": full_universe,
         "restart_performed": restart_done,
         "unique_emission_ids": len({e["event_id"] for e in scope}),
         "emissions": scope,
@@ -120,8 +127,8 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
         "unresolved_reason_counts": dict(Counter(x.get("terminal_reason") for x in state.episodes.values() if x["state"] == "UNRESOLVED")),
         "verdict": "DIAGNOSTIC_MULTI_LEVEL_NOT_OOS",
         "limitations": [
-            "level universe consists only of snapshots selected at least once",
-            "unselected eligible levels not discovered by current selector",
+            "level universe mode: all point-in-time eligible candidates" if full_universe else "level universe consists only of snapshots selected at least once",
+            "full universe applies proposed selection semantics; not frozen or production approved" if full_universe else "unselected eligible levels not discovered by current selector",
             "no proven invalidation/expiry/retirement geometry",
             "unresolved pending remain, no production-safe cleanup",
             "no independently verified restart + full prefix replay",
