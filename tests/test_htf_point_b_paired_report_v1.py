@@ -21,7 +21,8 @@ def test_short_timeout_raw_price_return_has_negative_sign():
 def test_short_takeprofit_stop_and_collision():
     assert calc(tp=True)==(2.0,"TP_FIRST")
     assert calc(sl=True)==(-1.0,"SL_FIRST")
-    assert calc(tp=False,sl=True,ambiguous=True)==(-1.0,"SL_FIRST")
+    assert calc(tp=False,sl=True,ambiguous=True)==(-1.0,"AMBIGUOUS_STOP_FIRST")
+    assert calc(tp=True,sl=True,ambiguous=True)==(-1.0,"AMBIGUOUS_STOP_FIRST")
 
 def test_long_timeout_and_directional_geometry():
     value,path=calc(direction="LONG",entry=100,stop=90,target=120,ret=2)
@@ -36,7 +37,8 @@ def test_frozen_policy_mismatch_fails_closed():
 def test_invalid_target_and_flags():
     assert calc(target=85)[1]=="target_not_2R"
     assert calc(tp=True,sl=True)[1]=="ambiguous_first_hit"
-    assert calc(ambiguous=True)[1]=="ambiguous_first_hit"
+    assert calc(tp=True,sl=True)[1]=="inconsistent_first_hit"
+    assert calc(ambiguous=True)==(-1.0,"AMBIGUOUS_STOP_FIRST")
 
 def test_day_clusters_reflect_unequal_day_sizes():
     data=[{"day":"a","symbol":"S1","delta_r":-1.0} for _ in range(10)]
@@ -55,3 +57,4 @@ def test_pairing_and_timestamp_gate_with_no_vps():
     assert details[0]["delta_r"]==pytest.approx(0.1)
     assert summary["directions"]["SHORT"]["n"]==1
     assert summary["directions"]["SHORT"]["verdict"]=="INCONCLUSIVE"
+    assert summary["directions"]["SHORT"]["leave_one_day_out"] == {"2026-10-07": None}
