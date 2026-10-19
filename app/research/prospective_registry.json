@@ -792,9 +792,9 @@
       ],
       "minimum_n": 100,
       "minimum_symbols": 10,
-      "freeze_ts": null,
-      "started_at": null,
-      "status": "INACTIVE"
+      "freeze_ts": "2026-10-13T12:37:03Z",
+      "started_at": "2026-10-13T12:37:03Z",
+      "status": "RUNNING"
     }
   ],
   "rules": {
