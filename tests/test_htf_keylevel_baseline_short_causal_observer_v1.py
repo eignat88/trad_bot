@@ -102,3 +102,41 @@ def test_no_database_and_no_order_calls(monkeypatch):
     result = run(bars, htf, now)
     assert result.experiment_id == mod.EXPERIMENT_ID
     assert "CAUSAL" in result.experiment_id
+
+
+def test_extra_old_history_cannot_change_level_or_event(monkeypatch):
+    bars, htf, now = fixtures()
+    seen = []
+    level = SimpleNamespace(price=100.0, level_type="resistance", available_timestamp=START)
+    monkeypatch.setattr(mod, "_causal_atr_series", lambda c: [1.0] * len(c))
+    def level_lookup(h, c, a, d):
+        seen.append((len(c), c[0].timestamp, c[0].close))
+        return level, (100.0, 100.0, 0.5)
+    monkeypatch.setattr(mod, "_find_htf_key_levels", level_lookup)
+    monkeypatch.setattr(mod, "_find_reaction_end",
+                        lambda **kw: (len(kw["closed"])-1, 100, 99, 101, 98, 2, 1, 1))
+    # Construct a valid 400-bar history with the same final 200 as comparison.
+    old = [
+        SimpleNamespace(timestamp=START-(200-i)*mod.BAR_MS, open=80.0,
+                        high=81.0, low=79.0, close=80.0, volume=10.0)
+        for i in range(200)
+    ]
+    short = run(bars, htf, now)
+    extended = run(old + bars, htf, now)
+    assert short is not None and extended is not None
+    assert short.event_id == extended.event_id
+    assert short.known_at_ms == extended.known_at_ms
+    assert seen[0] == seen[1]
+
+
+def test_200_and_400_canonical_prefix_equal(monkeypatch):
+    bars, htf, now = fixtures()
+    old = [
+        SimpleNamespace(timestamp=START-(380-i)*mod.BAR_MS, open=80.0,
+                        high=81.0, low=79.0, close=80.0, volume=10.0)
+        for i in range(380)
+    ]
+    install_stubs(monkeypatch)
+    a = run(old[-180:] + bars, htf, now)
+    b = run(old + bars, htf, now)
+    assert a == b
