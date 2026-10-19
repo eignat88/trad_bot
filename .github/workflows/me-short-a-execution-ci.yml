@@ -9,6 +9,8 @@ on:
       - 'sql/migrations/071_me_short_geom_a_execution_v1_registration.sql'
       - 'sql/migrations/072_me_short_geom_a_execution_v1_activation.sql'
       - 'tests/test_me_short_geom_a_execution_v1.py'
+      - 'tests/test_me_short_abc_terminal_lifecycle_v1.py'
+      - 'sql/migrations/073_me_short_abc_terminal_lifecycle.sql'
       - 'tests/test_prospective_evaluator_variant_tuple_hardening_v1.py'
       - 'tests/test_vc_short_execution_prospective_protocol.py'
       - '.github/workflows/me-short-a-execution-ci.yml'
@@ -42,7 +44,8 @@ jobs:
 
       - name: Compile touched Python
         run: |
-          python -m compileall -q             app/research/prospective_observer.py             app/research/prospective_evaluator.py             tests/test_me_short_geom_a_execution_v1.py
+          python -m compileall -q             app/research/prospective_observer.py             app/research/prospective_evaluator.py             tests/test_me_short_geom_a_execution_v1.py \
+            tests/test_me_short_abc_terminal_lifecycle_v1.py
 
       - name: Run execution protocol regressions
         env:
