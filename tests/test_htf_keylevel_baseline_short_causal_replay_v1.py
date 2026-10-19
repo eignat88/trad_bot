@@ -60,3 +60,35 @@ def test_gap_rejected():
     rows[9] = Candle(rows[9].timestamp+r.BAR_MS, 100, 101, 99, 100, 1)
     with pytest.raises(ValueError, match="NONCONTIGUOUS"):
         r.replay("BTCUSDT", rows)
+
+
+def test_diagnostic_funnel_no_level(monkeypatch):
+    rows = candles(400)
+    htf = r.assemble_complete_1h(rows, rows[-1].timestamp+r.BAR_MS)
+    monkeypatch.setattr(r, "_causal_atr_series", lambda c: [1.0]*len(c))
+    monkeypatch.setattr(r, "_find_htf_key_levels", lambda *args: (None, None))
+    assert r.diagnostic_funnel_stage(rows[-200:], htf, rows[-1].timestamp+r.BAR_MS) == "NO_HTF_LEVEL"
+
+
+def test_diagnostic_funnel_fresh_reaction(monkeypatch):
+    rows = candles(400)
+    asof = rows[-1].timestamp+r.BAR_MS
+    htf = r.assemble_complete_1h(rows, asof)
+    level = SimpleNamespace(price=100.0, level_type="resistance",
+                            available_timestamp=rows[-200].timestamp)
+    monkeypatch.setattr(r, "_causal_atr_series", lambda c: [1.0]*len(c))
+    monkeypatch.setattr(r, "_find_htf_key_levels", lambda *args: (level, (100.0, 100.0, .5)))
+    monkeypatch.setattr(r, "_find_reaction_end", lambda **kwargs: (len(kwargs["closed"])-1, 0, 0, 101, 99, 2, 1.0, 1.0))
+    assert r.diagnostic_funnel_stage(rows[-200:], htf, asof) == "REACTION_FRESH"
+
+
+def test_diagnostic_funnel_historical_not_fresh(monkeypatch):
+    rows = candles(400)
+    asof = rows[-1].timestamp+r.BAR_MS
+    htf = r.assemble_complete_1h(rows, asof)
+    level = SimpleNamespace(price=100.0, level_type="resistance",
+                            available_timestamp=rows[-200].timestamp)
+    monkeypatch.setattr(r, "_causal_atr_series", lambda c: [1.0]*len(c))
+    monkeypatch.setattr(r, "_find_htf_key_levels", lambda *args: (level, (100.0, 100.0, .5)))
+    monkeypatch.setattr(r, "_find_reaction_end", lambda **kwargs: (len(kwargs["closed"])-2, 0, 0, 101, 99, 2, 1.0, 1.0))
+    assert r.diagnostic_funnel_stage(rows[-200:], htf, asof) == "REACTION_HISTORICAL"
