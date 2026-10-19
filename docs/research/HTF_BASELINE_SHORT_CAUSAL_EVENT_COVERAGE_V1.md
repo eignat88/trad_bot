@@ -46,3 +46,11 @@ The research-only causal observer now restricts inputs to the **last 200 closed 
 **Expected:** comparing runner windows 200 and 400 will now match because both evaluate the same trailing execution window. This is a deliberate normalization, **not** evidence that window sensitivity is scientifically resolved or that an execution edge exists. Do not merge or deploy based only on equal counts.
 
 Existing historical replay results and 25-record timestamp audit remain archived as pre-patch observations, not validated prospective OOS. Run the new tests and BTC/ETH replay again, and record complete results before Phase-1 GO/NO-GO.
+
+## Phase-1 event ledger candidate (not a production dedup gate)
+
+The offline runner now enriches each emitted first-seen signal with `event_id`, `level_id` (symbol, direction, formation/availability timestamp and price), touch time, selected 5m level-contact episode, left-censor flag, reaction time and first-seen time. An episode is a **maximal contiguous run** of 5m candles meeting the same frozen proximity/touch predicate for the **same selected HTF level**. This is a narrow, falsifiable operational definition — not proof that separated episodes are statistically independent setups.
+
+Output includes `unique_htf_levels`, `unique_touch_episodes`, `same_episode_excess_signals` and `episode_groups`; raw `unique_events` remains the original number of emitted distinct signal IDs. An event linked to a touch episode whose start is outside the 200-bar window may be left-censored or misclassified. HTF level reselection between as-of decisions can fragment a true physical touch; levels with different IDs might be geometrically equivalent. **The ledger makes these differences visible but cannot fully repair them yet.**
+
+After VPS tests, replay the original October 14–17 BTC/ETH CSV input to `/tmp/htf_174_coverage_episode_ledger.json`, retaining the pre-patch file as baseline. Report the actual count of contact episodes and signals per episode separately for each symbol. Do not describe this count as proven independent events or OOS trades. No merge, no deploy, no edge verdict before reviewing replay and remaining event-identity sensitivity.
