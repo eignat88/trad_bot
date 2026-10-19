@@ -22,11 +22,11 @@ FIVE = 300_000
 SWING_RIGHT = 4
 
 
-def causal_resistance_snapshot(
+def causal_resistance_universe(
     htf_closed: Sequence[Candle], exec_closed: Sequence[Candle], asof_ms: int
-) -> LevelSnapshot | None:
+) -> tuple[LevelSnapshot, ...]:
     if not exec_closed or len(htf_closed) < 26:
-        return None
+        return ()
     if any(int(c.timestamp) + FIVE > asof_ms for c in exec_closed):
         raise ValueError("future 5m input")
     if int(exec_closed[-1].timestamp) + FIVE != asof_ms:
@@ -39,7 +39,7 @@ def causal_resistance_snapshot(
     reference = float(exec_closed[-1].close)
     atr = _causal_atr_series(exec_closed)[-1]
     if atr <= 0:
-        return None
+        return ()
     eligible = []
     for i in range(SWING_RIGHT, len(htf_closed)-SWING_RIGHT):
         c = htf_closed[i]
@@ -68,7 +68,13 @@ def causal_resistance_snapshot(
             price, formation,
             LevelSnapshot(sha256(raw.encode()).hexdigest(), price, available)
         ))
-    return min(eligible, key=lambda x: (x[0], x[1]))[2] if eligible else None
+    return tuple(x[2] for x in sorted(eligible, key=lambda x: (x[0], x[1], x[2].level_id)))
+
+
+def causal_resistance_snapshot(htf_closed, exec_closed, asof_ms):
+    """Backward compatible nearest selected level; research-only."""
+    universe = causal_resistance_universe(htf_closed, exec_closed, asof_ms)
+    return universe[0] if universe else None
 
 
 def causal_contact(candle: Candle, level: LevelSnapshot | None, atr: float) -> bool:
