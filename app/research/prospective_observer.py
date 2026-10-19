@@ -89,6 +89,14 @@ class ProspectiveOOSObserver:
 
     def _is_db_active(self, exp_id: str) -> bool:
         """Check the experiment's DB lifecycle state before capture."""
+        # Retired research cohorts are immutable: even if lifecycle lookup fails,
+        # scanner restarts or stale registry files cannot reactivate these IDs.
+        if exp_id in {
+            "ME_SHORT_GEOM_A_V1",
+            "ME_SHORT_GEOM_B_V1",
+            "ME_SHORT_GEOM_C_V1",
+        }:
+            return False
         if self._conn is None:
             return True
         if exp_id in self._active_cache:
