@@ -44,8 +44,11 @@ def frozen_gross_r(direction, entry, stop, target, ret, tp, sl, ambiguous, featu
     rr=abs(target-entry)/risk
     if not math.isclose(rr,2.0,rel_tol=1e-5,abs_tol=1e-5):
         return None,"target_not_2R"
-    if tp is True and sl is True or ambiguous is True and sl is not True:
-        return None,"ambiguous_first_hit"
+    if ambiguous is True:
+        # Frozen STOP_FIRST resolves same-candle collision as an SL.
+        return -1.0,"AMBIGUOUS_STOP_FIRST"
+    if tp is True and sl is True:
+        return None,"inconsistent_first_hit"
     if sl is True: return -1.0,"SL_FIRST"
     if tp is True: return rr,"TP_FIRST"
     if ret is None or not math.isfinite(float(ret)): return None,"missing_timeout_return"
@@ -109,7 +112,8 @@ def analyze(rows,asof,reps=4000):
         days=sorted({r["day"] for r in data})
         day_ci=cluster_ci(data,"day",reps)
         sym_ci=cluster_ci(data,"symbol",reps)
-        leave_out={d:mean(r["delta_r"] for r in data if r["day"]!=d) for d in days}
+        leave_out={d:mean(rest) if rest else None for d in days
+                   for rest in [[r["delta_r"] for r in data if r["day"]!=d]]}
         # Strictly incremental research verdict: not a trading recommendation.
         verdict="INCONCLUSIVE"
         if elapsed and day_ci["ci95"] and sym_ci["ci95"] and day_ci["ci95"][1]<0 and sym_ci["ci95"][1]<0:
