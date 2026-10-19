@@ -86,7 +86,7 @@ def test_stale_snapshot_rejected(monkeypatch):
 def test_unclosed_htf_bar_rejected(monkeypatch):
     install_stubs(monkeypatch)
     bars, htf, now = fixtures()
-    htf[-1].timestamp = (START//mod.HTF_MS)*mod.HTF_MS
+    htf[-1].timestamp = ((int(now.timestamp() * 1000) // mod.HTF_MS) * mod.HTF_MS)
     assert run(bars, htf, now) is None
 
 
