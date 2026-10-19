@@ -390,6 +390,13 @@ class ProspectiveOOSObserver:
                         reference_price, invalidation_price, target_1, target_2,
                         score, features, parameters, market_regime,
                     )
+                elif exp_id == "ME_SHORT_GEOM_A_EXECUTION_V1":
+                    obs_id = self._observe_me_short_a_execution(
+                        cursor, exp_id, exp_spec,
+                        source_key, symbol, direction, signal_time,
+                        reference_price, invalidation_price, target_1, target_2,
+                        score, features, parameters, market_regime,
+                    )
                 elif exp_id.startswith("ME_SHORT_GEOM_"):
                     obs_id = self._observe_me_geometry(
                         cursor, exp_id, exp_spec,
@@ -814,6 +821,136 @@ class ProspectiveOOSObserver:
             ),
         )
 
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+    def _is_exact_db_activation_ready(
+        self, exp_id: str, expected_freeze_ts: str | None,
+    ) -> bool:
+        """Fail closed unless DB lifecycle exactly matches the frozen boundary."""
+        if self._conn is None or not expected_freeze_ts:
+            return False
+
+        cursor = None
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                "SELECT status, started_at "
+                "FROM research.prospective_experiment "
+                "WHERE experiment_id = %s",
+                (exp_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return False
+
+            db_status, db_started_at = row
+            if str(db_status) != "RUNNING" or db_started_at is None:
+                return False
+
+            expected_dt = datetime.fromisoformat(
+                str(expected_freeze_ts).replace("Z", "+00:00")
+            )
+            actual_dt = (
+                db_started_at
+                if isinstance(db_started_at, datetime)
+                else datetime.fromisoformat(str(db_started_at).replace("Z", "+00:00"))
+            )
+            if expected_dt.tzinfo is None:
+                expected_dt = expected_dt.replace(tzinfo=timezone.utc)
+            else:
+                expected_dt = expected_dt.astimezone(timezone.utc)
+            if actual_dt.tzinfo is None:
+                actual_dt = actual_dt.replace(tzinfo=timezone.utc)
+            else:
+                actual_dt = actual_dt.astimezone(timezone.utc)
+            return actual_dt == expected_dt
+        except Exception:
+            logger.exception(
+                "prospective activation lookup failed for %s", exp_id,
+            )
+            return False
+        finally:
+            if cursor is not None:
+                cursor.close()
+
+    def _observe_me_short_a_execution(
+        self, cursor, exp_id: str, exp_spec: dict,
+        source_key: int, symbol: str, direction: str, signal_time: Any,
+        reference_price: float, invalidation_price: float | None,
+        target_1: float | None, target_2: float | None, score: float,
+        features: dict, parameters: dict, market_regime: str | None,
+    ) -> int | None:
+        """Capture frozen ME SHORT A execution geometry, strictly post-freeze."""
+        freeze_ts = exp_spec.get("freeze_ts")
+        if not freeze_ts or not self._is_exact_db_activation_ready(exp_id, freeze_ts):
+            return None
+
+        freeze_dt = datetime.fromisoformat(str(freeze_ts).replace("Z", "+00:00"))
+        signal_dt = (
+            signal_time
+            if isinstance(signal_time, datetime)
+            else datetime.fromisoformat(str(signal_time).replace("Z", "+00:00"))
+        )
+        if freeze_dt.tzinfo is None:
+            freeze_dt = freeze_dt.replace(tzinfo=timezone.utc)
+        else:
+            freeze_dt = freeze_dt.astimezone(timezone.utc)
+        if signal_dt.tzinfo is None:
+            signal_dt = signal_dt.replace(tzinfo=timezone.utc)
+        else:
+            signal_dt = signal_dt.astimezone(timezone.utc)
+
+        # Strict prospective boundary. Exact freeze timestamp is ineligible.
+        if signal_dt <= freeze_dt:
+            return None
+        if direction != "SHORT" or reference_price <= 0:
+            return None
+        if invalidation_price is None or invalidation_price <= reference_price:
+            return None
+        if target_1 is None or target_1 >= reference_price:
+            return None
+
+        structural_r = invalidation_price - reference_price
+        if structural_r <= 0:
+            return None
+
+        frozen_features = dict(features)
+        frozen_features.update({
+            "_frozen_entry": "reference_price",
+            "_frozen_stop": "invalidation_price",
+            "_frozen_target": "target_1",
+            "_frozen_structural_r": structural_r,
+            "_frozen_structural_r_pct": structural_r / reference_price,
+            "_frozen_max_hold": int(exp_spec["max_hold_minutes"]),
+            "_frozen_intrabar_policy": str(exp_spec["intrabar_policy"]),
+            "_frozen_freeze_ts": str(freeze_ts),
+            "_frozen_cost_model": exp_spec.get("cost_model"),
+            "_frozen_protocol_version": int(exp_spec.get("version", 1)),
+        })
+
+        cursor.execute(
+            """
+            INSERT INTO research.prospective_observation (
+                experiment_id, source_signal_id, source_observation_id,
+                symbol, direction, signal_time,
+                reference_price, invalidation_price, target_1, target_2,
+                score, rule_passed, filter_reason,
+                variant_entry, variant_stop, variant_target,
+                features, parameters, market_regime
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (experiment_id, source_signal_id) DO NOTHING
+            RETURNING observation_id
+            """,
+            (
+                exp_id, source_key, None,
+                symbol, direction, signal_time,
+                reference_price, invalidation_price, target_1, target_2,
+                score, "me_short_geom_a_execution_frozen",
+                reference_price, invalidation_price, target_1,
+                json.dumps(frozen_features), json.dumps(parameters), market_regime,
+            ),
+        )
         row = cursor.fetchone()
         return row[0] if row else None
 
