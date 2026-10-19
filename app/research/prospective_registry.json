@@ -136,7 +136,9 @@
       "minimum_symbols": 10,
       "source_signal_required": true,
       "started_at": null,
-      "status": "READY_TO_START"
+      "status": "CANCELLED",
+      "lifecycle_verdict": "CONTROL_RETAINED_FOR_SEPARATE_EXECUTION_VALIDATION",
+      "lifecycle_reason": "Completed paired geometry validation; superseded by ME_SHORT_GEOM_A_EXECUTION_V1. No further A/B/C collection."
     },
     {
       "experiment_id": "ME_SHORT_GEOM_A_EXECUTION_V1",
@@ -249,7 +251,9 @@
       "source_signal_required": true,
       "paired_with": "ME_SHORT_GEOM_A_V1",
       "started_at": null,
-      "status": "READY_TO_START"
+      "status": "CANCELLED",
+      "lifecycle_verdict": "REJECTED_NO_INCREMENTAL_EDGE",
+      "lifecycle_reason": "Completed paired geometry validation; superseded by ME_SHORT_GEOM_A_EXECUTION_V1. No further A/B/C collection."
     },
     {
       "experiment_id": "ME_SHORT_GEOM_C_V1",
@@ -289,7 +293,9 @@
       "source_signal_required": true,
       "paired_with": "ME_SHORT_GEOM_A_V1",
       "started_at": null,
-      "status": "READY_TO_START"
+      "status": "CANCELLED",
+      "lifecycle_verdict": "REJECTED_NO_INCREMENTAL_EDGE",
+      "lifecycle_reason": "Completed paired geometry validation; superseded by ME_SHORT_GEOM_A_EXECUTION_V1. No further A/B/C collection."
     },
     {
       "experiment_id": "VC_SHORT_EXECUTION_V1",
