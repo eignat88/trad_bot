@@ -48,3 +48,19 @@ git checkout --detach origin/research/htf-baseline-short-stateful-episode-v1
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/trad_bot/.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_htf_baseline_short_stateful_episode_v1.py tests/test_htf_baseline_short_stateful_replay_v1.py --tb=short
 PYTHONDONTWRITEBYTECODE=1 /opt/trad_bot/.venv/bin/python -m tools.research.htf_baseline_short_stateful_replay_v1 --data-dir /tmp/htf_coverage_174 --symbols BTCUSDT ETHUSDT --start 2026-10-14T00:00:00Z --end 2026-10-17T00:00:00Z --out /tmp/htf_176_stateful_replay.json
 ```
+
+## Pending-level lifecycle repair prototype — unverified on VPS
+
+Added research-only parallel implementation `app/research/htf_baseline_short_multi_level_lifecycle_v1.py`, driver `tools/research/htf_baseline_short_multi_level_replay_v1.py` and regression tests. Existing single-level runner left in place as baseline. Multi-level replay tracks **all levels historically selected at least once** and independently checks their pending reactions on each closed 5m bar. This directly addresses the prior per-ASOF selected-level-only blind spot.
+
+Termination policy is intentionally conservative: CONFIRMED is emitted once; SOURCE_WINDOW_EVICTED and RECONTACT_SUPERSEDED_PENDING are explicit UNRESOLVED reasons. No arbitrary timeouts or unproven INVALIDATED, EXPIRED, LEVEL_RETIRED judgments. Such terminal semantics remain future work and pending states can accumulate.
+
+**Important**: selected-once level universe is not proof of complete simultaneous HTF eligibility. Causal 1h level creation for all available levels, alternate-level selection, invalidation and lifecycle retirement remain unfrozen. This replay is diagnostic, NOT OOS or evidence of executable edge. Run only in /tmp isolated worktree.
+
+```bash
+cd /tmp/trad_bot_issue176
+git fetch origin research/htf-baseline-short-stateful-episode-v1
+git checkout --detach origin/research/htf-baseline-short-stateful-episode-v1
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/trad_bot/.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_htf_baseline_short_multi_level_lifecycle_v1.py tests/test_htf_baseline_short_stateful_episode_v1.py tests/test_htf_baseline_short_stateful_replay_v1.py --tb=short
+PYTHONDONTWRITEBYTECODE=1 /opt/trad_bot/.venv/bin/python -m tools.research.htf_baseline_short_multi_level_replay_v1 --data-dir /tmp/htf_coverage_174 --symbols BTCUSDT ETHUSDT --start 2026-10-14T00:00:00Z --end 2026-10-17T00:00:00Z --out /tmp/htf_176_multi_level_replay.json
+```
