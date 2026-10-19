@@ -167,3 +167,11 @@ PYTHONDONTWRITEBYTECODE=1 /opt/trad_bot/.venv/bin/python -m tools.research.htf_b
 ```
 
 No OOS, production, frozen detector, scanner, paper or main changes. **PHASE_2_NO_GO** until VPS validation, full-universe lifecycle retirement and proposed batch dedup protocol review.
+
+## HTF_LEVEL_RETIREMENT_AND_ATOMIC_RESTART_VALIDATION_V1 (research-only; VPS pending)
+
+`LevelEligibilityAudit` tracks `DISCOVERED`, `NOT_CURRENTLY_ELIGIBLE` (reason `BELOW_OR_AT_REFERENCE` or `NOT_IN_CURRENT_ELIGIBLE_SET`), and `RE_ELIGIBLE` across consecutive closed 5m ASOFs. Eligibility loss is **NOT** proven `LEVEL_RETIRED`/`LEVEL_INVALIDATED`; the audit does not change episode pending or known-level registry. The bounded historical CLI currently audits only the requested time window, so discovery at the window boundary is not full-warmup history. Pending indicators in this standalone eligibility audit are not wired to replay pending and should not be used as evidence of safe retirement.
+
+`AtomicAsofClusters.checkpoint/restore` stores symbol, existing clusters, assignments, and last ASOF. `htf_baseline_short_combined_restart_v1.py` tests full-universe episode replay state plus cluster state through **separate Python invocations** (baseline/stage1/stage2/compare) with JSON on local disk. The stage2 process continues episodes from their checkpoint and only delivers event IDs not already assigned by the cluster checkpoint. This is not atomic cross-file transaction or crash-safe recovery. Historical IDs use the new first-touch hash namespace. Do not reuse checkpoints from earlier commits.
+
+VPS tests and replay must pass before any conclusion. Do not deploy or merge. Phase 2 remains NO-GO.
