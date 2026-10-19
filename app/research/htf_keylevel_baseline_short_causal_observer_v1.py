@@ -21,6 +21,9 @@ from app.research.htf_keylevel_point_b import (
 BAR_MS = 5 * 60_000
 HTF_MS = 60 * 60_000
 EXPERIMENT_ID = "HTF_KEYLEVEL_BASELINE_SHORT_CAUSAL_OBSERVER_V1"
+# Diagnostic canonical window: the same last 200 closed 5m candles are used
+# whether the caller offers 200 or 400. This does not freeze a trading protocol.
+CANONICAL_EXECUTION_BARS = 200
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,10 @@ def detect_causal_baseline_short(
         return None
     if any(b.timestamp <= a.timestamp for a, b in zip(htf_candles, htf_candles[1:])):
         return None
+    # Prevent the source-history length from changing level selection, ATR warmup,
+    # or the first eligible touch. This is deliberately a diagnostic normalization;
+    # independently fixing touch-time HTF anchoring remains Phase-2 work.
+    execution_candles = execution_candles[-CANONICAL_EXECUTION_BARS:]
     atr = _causal_atr_series(execution_candles)
     level, range_data = _find_htf_key_levels(htf_candles, execution_candles, atr[0], "SHORT")
     if level is None or range_data is None or level.level_type != "resistance":
