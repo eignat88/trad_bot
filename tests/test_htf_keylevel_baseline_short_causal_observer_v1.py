@@ -121,8 +121,15 @@ def test_extra_old_history_cannot_change_level_or_event(monkeypatch):
                         high=81.0, low=79.0, close=80.0, volume=10.0)
         for i in range(200)
     ]
-    short = run(bars, htf, now)
-    extended = run(old + bars, htf, now)
+    # Both inputs must have the same trailing 200 bars; older bars differ.
+    common = old + bars
+    earliest = [
+        SimpleNamespace(timestamp=START-(400-i)*mod.BAR_MS, open=120.0,
+                        high=121.0, low=119.0, close=120.0, volume=10.0)
+        for i in range(200)
+    ]
+    short = run(common, htf, now)
+    extended = run(earliest + common, htf, now)
     assert short is not None and extended is not None
     assert short.event_id == extended.event_id
     assert short.known_at_ms == extended.known_at_ms
