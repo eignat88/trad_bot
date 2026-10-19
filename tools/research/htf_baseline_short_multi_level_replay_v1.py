@@ -72,6 +72,18 @@ def replay(symbol, candles, start_ms, end_ms):
             counters["unavailable_pending_prefixes"] += len(unavailable)
     scope = [e for e in state.events if start_ms <= e["known_at_ms"] < end_ms]
     statuses = Counter(x["state"] for x in state.episodes.values())
+    integrity_errors = []
+    seen = set()
+    for e in scope:
+        if e["episode_id"] in seen:
+            integrity_errors.append("duplicate episode")
+        seen.add(e["episode_id"])
+        if not (e["level_available_ms"] <= e["first_touch_open_ms"] < e["known_at_ms"] <= e["observed_at_ms"]):
+            integrity_errors.append("causality ordering")
+        if state.episodes[e["episode_id"]]["state"] != "CONFIRMED":
+            integrity_errors.append("terminal inconsistency")
+    if integrity_errors:
+        raise ValueError(f"event integrity failed: {integrity_errors[:5]}")
     return {
         "symbol": symbol, "counters": dict(counters),
         "unique_emission_ids": len({e["event_id"] for e in scope}),
@@ -79,6 +91,8 @@ def replay(symbol, candles, start_ms, end_ms):
         "total_episodes_including_warmup": len(state.episodes),
         "episode_state_counts_including_warmup": dict(statuses),
         "pending_at_end": len(state.pending),
+        "integrity": {"checked": len(scope), "violations": len(integrity_errors), "result": "PASS"},
+        "unresolved_reason_counts": dict(Counter(x.get("terminal_reason") for x in state.episodes.values() if x["state"] == "UNRESOLVED")),
         "verdict": "DIAGNOSTIC_MULTI_LEVEL_NOT_OOS",
         "limitations": [
             "level universe consists only of snapshots selected at least once",
