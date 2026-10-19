@@ -117,6 +117,7 @@ def audit_rows(rows: list[tuple[Any, ...]]) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project-root", type=Path, default=None, help="Directory containing config.yaml and .env; defaults to script repository root")
     parser.add_argument("--output", help="Local JSON output path (default: stdout)")
     args = parser.parse_args(argv)
 
@@ -124,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     from app.config.settings import load_settings
     from app.db.repository import ScannerRepository
 
-    root = Path(__file__).resolve().parents[2]
+    root = args.project_root.resolve() if args.project_root else Path(__file__).resolve().parents[2]
     s = load_settings(path=root / "config.yaml", env_file=root / ".env")
     repo = ScannerRepository(
         s.db_host, s.db_port, s.db_name, s.db_user, s.db_password,
