@@ -36,7 +36,6 @@ def test_frozen_policy_mismatch_fails_closed():
 
 def test_invalid_target_and_flags():
     assert calc(target=85)[1]=="target_not_2R"
-    assert calc(tp=True,sl=True)[1]=="ambiguous_first_hit"
     assert calc(tp=True,sl=True)[1]=="inconsistent_first_hit"
     assert calc(ambiguous=True)==(-1.0,"AMBIGUOUS_STOP_FIRST")
 
