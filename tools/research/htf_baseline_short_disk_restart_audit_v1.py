@@ -7,7 +7,7 @@ from tools.research.htf_baseline_short_multi_level_replay_v1 import replay
 
 FIELDS = ("emissions", "counters", "total_episodes_including_warmup",
           "episode_state_counts_including_warmup", "pending_at_end",
-          "unresolved_reason_counts", "integrity")
+          "unresolved_reason_counts", "integrity", "eligibility_loss_records")
 
 
 def main():

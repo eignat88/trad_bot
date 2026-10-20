@@ -30,6 +30,7 @@ def inspect_pair(symbol, resumed):
         "unique_impacted_episode_ids":len({x["episode_id"] for x in loss}),
         "post_loss_confirmation_records":len(after),
         "post_loss_unique_event_ids":len({x["event_id"] for x in after}),
+        "eligibility_loss_records":len(episodes.get("eligibility_loss_records",[])),
         "pending_at_end":episodes["pending_at_end"],
         "historical_integrity":"PASS"}
 
@@ -39,13 +40,18 @@ def report(paths):
         results.append(inspect_pair(symbol,json.loads(Path(path).read_text())))
     return {"issue":176,"read_only":True,"results":results,
         "gates":{
+            "local_regression":"PENDING_POST_REPAIR_RUN",
             "historical_episode_id_parity":"PASS_PREVIOUS_VPS_37_OF_37",
             "historical_combined_restart":"PASS_PREVIOUS_VPS_BTC_ETH",
             "historical_atomic_interrupted_write":"PASS_PREVIOUS_VPS_BTC_ETH",
             "level_retirement_authorization":"BLOCKED_NO_PROVEN_SAFE_RULE",
             "producer_consumer_atomic_outbox":"NOT_IMPLEMENTED",
             "multi_generation_corrupt_checkpoint_recovery":"NOT_IMPLEMENTED",
+            "provenance_replay_recovery":"RESEARCH_SINGLE_FILE_NOT_MULTI_GENERATION",
+            "checkpoint_writer_exclusivity":"RESEARCH_FILE_LOCK_EXCLUSIVE_WITH_OPERATOR_STALE_RECOVERY_ONLY",
             "prospective_level_selector_freeze":"NOT_APPROVED",
+            "prospective_protocol_checklist":"PROPOSED_NOT_APPROVED",
+            "unavailable_semantics_repair":"PENDING_VPS_AB",
             "independent_execution_edge":"NOT_PROVEN",
             "deployment_readiness":"NO_GO"},
         "decision":"PHASE_2_NO_GO",

@@ -20,7 +20,7 @@ def main():
     if a.phase=="compare":
         old=json.loads(base.read_text()); new=json.loads(completed.read_text())
         fields=("emissions","counters","integrity","episode_state_counts_including_warmup",
-                "pending_at_end","unresolved_reason_counts")
+                "pending_at_end","unresolved_reason_counts","eligibility_loss_records")
         if any(old["episodes"][key]!=new["episodes"][key] for key in fields):
             raise AssertionError("episode restart mismatch")
         if old["clusters"]!=new["clusters"]:

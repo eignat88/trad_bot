@@ -34,11 +34,15 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
         counters = Counter(checkpoint["counters"])
     impact = {"eligibility_loss_with_pending": [], "confirmations_after_eligibility_loss": [], "eligibility_changes": 0}
     previously_eligible = set()
+    disappeared = set()
     lost_pending = {}
+    prior_eligibility_losses = []
     if resume_checkpoint is not None and pending_impact:
         impact = checkpoint.get("pending_impact", impact)
         previously_eligible = set(checkpoint.get("previously_eligible", []))
+        disappeared = set(checkpoint.get("disappeared", []))
         lost_pending = checkpoint.get("lost_pending", {})
+        prior_eligibility_losses = list(state.eligibility_loss_records)
     restart_done = False
     for index, bar in enumerate(candles):
         asof = int(bar.timestamp) + BAR_MS
@@ -64,10 +68,13 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
             atr = _causal_atr_series(prefix)
         else:
             selected = None
+            discovered = ()
             atr = None
         if pending_impact and full_universe:
             eligible_ids = {x.level_id for x in discovered} if len(prefix) >= 20 and len(htf) >= 26 else set()
             disappeared = previously_eligible - eligible_ids
+            for candidate in discovered:
+                state.known_level_ids.add(candidate.level_id)
             for lid in sorted(disappeared):
                 impact["eligibility_changes"] += 1
                 if lid in state.pending:
@@ -78,6 +85,7 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
         contacts = {}
         confirmations = []
         unavailable = []
+        disappeared_pending = disappeared & set(state.pending) if pending_impact and full_universe else set()
         for key, level in sorted(known_levels.items()):
             if level.available_ms > int(bar.timestamp):
                 continue
@@ -102,6 +110,7 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
         emitted = state.advance(
             open_ms=int(bar.timestamp), level_contacts=contacts,
             confirmations=confirmations, unavailable=unavailable,
+            eligibility_loss=disappeared_pending,
         )
         if pending_impact:
             for e in emitted:
@@ -121,6 +130,7 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
             "counters": dict(counters),
             "pending_impact": impact if pending_impact else None,
             "previously_eligible": sorted(previously_eligible),
+            "disappeared": sorted(disappeared),
             "lost_pending": lost_pending,
         }
         Path(save_checkpoint).write_text(json.dumps(payload, sort_keys=True))
@@ -136,6 +146,8 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
             integrity_errors.append("causality ordering")
         if state.episodes[e["episode_id"]]["state"] != "CONFIRMED":
             integrity_errors.append("terminal inconsistency")
+    if state.eligibility_loss_records[:len(prior_eligibility_losses)] != prior_eligibility_losses:
+        integrity_errors.append("eligibility loss replay mismatch")
     if integrity_errors:
         raise ValueError(f"event integrity failed: {integrity_errors[:5]}")
     return {
@@ -150,6 +162,11 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
         "pending_at_end": len(state.pending),
         "integrity": {"checked": len(scope), "violations": len(integrity_errors), "result": "PASS"},
         "unresolved_reason_counts": dict(Counter(x.get("terminal_reason") for x in state.episodes.values() if x["state"] == "UNRESOLVED")),
+        "semantic_change_pending_vps_ab": {
+            "unavailable_condition": "level.available_ms > asof for missing pending-prefix evidence",
+            "status": "SEMANTIC_CHANGE_PENDING_VPS_AB",
+        },
+        "eligibility_loss_records": list(state.eligibility_loss_records),
         "verdict": "DIAGNOSTIC_MULTI_LEVEL_NOT_OOS",
         "limitations": [
             "level universe mode: all point-in-time eligible candidates" if full_universe else "level universe consists only of snapshots selected at least once",
@@ -157,6 +174,7 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
             "no proven invalidation/expiry/retirement geometry",
             "unresolved pending remain, no production-safe cleanup",
             "no independently verified restart + full prefix replay",
+            "unavailable semantics is a proposed repair and requires VPS A/B validation",
         ],
     }
 

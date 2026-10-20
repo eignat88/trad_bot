@@ -45,4 +45,5 @@ def test_pending_impact_replay_checkpoint_equivalence(tmp_path):
     resumed=replay("BTCUSDT",candles,start,end,full_universe=True,pending_impact=True,
         resume_checkpoint=checkpoint)
     assert baseline["pending_impact"]==resumed["pending_impact"]
+    assert baseline["eligibility_loss_records"]==resumed["eligibility_loss_records"]
     assert baseline["emissions"]==resumed["emissions"]

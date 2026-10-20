@@ -12,21 +12,25 @@ class AtomicAsofClusters:
         self.symbol=symbol
         self.clusters={}
         self.assignments={}
+        self.events={}
         self.last_asof=None
 
     def checkpoint(self):
         return {"symbol":self.symbol,"clusters":self.clusters,
-                "assignments":self.assignments,"last_asof":self.last_asof}
+                "assignments":self.assignments,"events":self.events,
+                "last_asof":self.last_asof}
 
     @classmethod
     def restore(cls, data):
         state=cls(data["symbol"])
         state.clusters=data["clusters"]
         state.assignments=data["assignments"]
+        state.events=data.get("events",{})
         state.last_asof=data["last_asof"]
         return state
 
-    def observe_batch(self, events, *, proximity_ms=300000, price_bps=20):
+    def observe_batch(self, events, *, proximity_ms=300000, price_bps=20,
+                      include_same_asof_prior=False):
         if not events:return []
         times={e["known_at_ms"] for e in events}
         if len(times)!=1:raise ValueError("mixed ASOF batch")
@@ -34,7 +38,7 @@ class AtomicAsofClusters:
         if self.last_asof is not None and asof<=self.last_asof:
             raise ValueError("nonmonotonic ASOF")
         ids=[e["event_id"] for e in events]
-        if len(ids)!=len(set(ids)) or set(ids)&self.assignments.keys():
+        if len(ids)!=len(set(ids)) or any(event_id in self.assignments for event_id in ids):
             raise ValueError("duplicate event")
         batch=sorted(events,key=lambda e:e["event_id"])
         for e in batch:
@@ -52,7 +56,8 @@ class AtomicAsofClusters:
         groups=defaultdict(list)
         for e in batch:groups[root(e["event_id"])].append(e)
         results=[]
-        prior_clusters = {cid: dict(c) for cid,c in self.clusters.items()}
+        prior_clusters = {cid: dict(c) for cid,c in self.clusters.items()
+                          if include_same_asof_prior or c["anchor_time_ms"]<asof}
         for members in groups.values():
             matches=set()
             for e in members:
@@ -75,12 +80,13 @@ class AtomicAsofClusters:
                     "member_event_ids":[e["event_id"] for e in members]}
             for e in members:
                 self.assignments[e["event_id"]]=cid
+                self.events[e["event_id"]]=dict(e)
                 results.append({"event_id":e["event_id"],"reaction_cluster_id":cid,
                     "status":status,"candidate_prior_cluster_ids":sorted(matches)})
         self.last_asof=asof
         return sorted(results,key=lambda e:e["event_id"])
 
-    def observe(self,events):
+    def observe(self,events, **kwargs):
         grouped=defaultdict(list)
         for e in events:grouped[e["known_at_ms"]].append(e)
-        return [item for k in sorted(grouped) for item in self.observe_batch(grouped[k])]
+        return [item for k in sorted(grouped) for item in self.observe_batch(grouped[k], **kwargs)]

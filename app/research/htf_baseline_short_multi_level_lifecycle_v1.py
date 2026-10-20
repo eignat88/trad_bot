@@ -5,6 +5,7 @@ contact ends. No arbitrary timeout: unconfirmable pending remains UNRESOLVED.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+from copy import deepcopy
 from hashlib import sha256
 
 STEP = 300000
@@ -18,21 +19,51 @@ class MultiLevelEpisodes:
     pending: dict = field(default_factory=dict)
     events: list = field(default_factory=list)
     sequence: dict = field(default_factory=dict)
+    eligibility_loss_records: list = field(default_factory=list)
+    known_level_ids: set = field(default_factory=set)
 
     def checkpoint(self):
-        return {key: getattr(self, key) for key in
-                ("symbol", "last_close_ms", "episodes", "active", "pending",
-                 "events", "sequence")}
+        return {
+            "symbol": self.symbol,
+            "last_close_ms": self.last_close_ms,
+            "episodes": self.episodes,
+            "active": self.active,
+            "pending": self.pending,
+            "events": self.events,
+            "sequence": self.sequence,
+            "eligibility_loss_records": self.eligibility_loss_records,
+            "known_level_ids": list(self.known_level_ids),
+        }
 
     @classmethod
     def restore(cls, data):
+        data = dict(data)
+        data["active"] = dict(data.get("active", {}))
+        data["pending"] = dict(data.get("pending", {}))
+        data["known_level_ids"] = set(data.get("known_level_ids", ()))
         return cls(**data)
 
     def advance(self, *, open_ms, level_contacts, confirmations=(),
-                unavailable=()):
+                unavailable=(), eligibility_loss=()):
+        working = deepcopy(self)
+        emitted = working._advance_mutating(
+            open_ms=open_ms,
+            level_contacts=level_contacts,
+            confirmations=confirmations,
+            unavailable=unavailable,
+            eligibility_loss=eligibility_loss,
+        )
+        self.__dict__.update(working.__dict__)
+        return emitted
+
+    def _advance_mutating(self, *, open_ms, level_contacts, confirmations=(),
+                          unavailable=(), eligibility_loss=()):
         """level_contacts: mapping level_id -> (price, available_ms, touched).
         confirmations: level IDs already proven by a strictly causal detector.
         unavailable: pending IDs whose original touch left the evidence window.
+        eligibility_loss: optional non-empty collection of level IDs whose current
+        eligibility was lost. It is diagnostic only: it never deletes pending or
+        retires a level.
         """
         if open_ms % STEP:
             raise ValueError("unaligned 5m candle")
@@ -41,7 +72,18 @@ class MultiLevelEpisodes:
                 raise ValueError("overlapping 5m bar")
             if open_ms > self.last_close_ms:
                 raise ValueError("5m gap")
+        lost_levels = set(eligibility_loss)
+        if any(not isinstance(level_id,str) or not level_id for level_id in lost_levels):
+            raise ValueError("invalid eligibility loss level ID")
+        for level_id in sorted(lost_levels):
+            if level_id not in self.known_level_ids:
+                raise ValueError("eligibility loss without known level")
+            self.eligibility_loss_records.append({
+                "level_id": level_id, "asof_ms": open_ms + STEP,
+                "pending": self.pending.get(level_id),
+            })
         valid = set(level_contacts)
+        self.known_level_ids.update(valid)
         for level_id, (price, available_ms, touched) in level_contacts.items():
             if not level_id or price <= 0 or available_ms > open_ms:
                 raise ValueError("level not available at candle open")
