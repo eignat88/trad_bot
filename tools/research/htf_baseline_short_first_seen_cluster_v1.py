@@ -7,6 +7,8 @@ A bridge between two pre-existing anchors is flagged as ambiguous, not merged.
 from __future__ import annotations
 from hashlib import sha256
 
+from tools.research.htf_baseline_short_asof_atomic_cluster_v1 import within_price_bps
+
 
 class FirstSeenReactionClusters:
     def __init__(self, symbol):
@@ -28,8 +30,7 @@ class FirstSeenReactionClusters:
             candidates = [
                 cid for cid, cluster in self.clusters.items()
                 if 0 <= time - cluster["anchor_time_ms"] <= proximity_ms
-                and 10000 * abs(price-cluster["anchor_price"]) /
-                    min(price, cluster["anchor_price"]) <= price_bps
+                and within_price_bps(price, cluster["anchor_price"], price_bps)
             ]
             if len(candidates) > 1:
                 self.ambiguous_bridges.append({"event_id":eid, "candidate_cluster_ids":sorted(candidates)})

@@ -84,3 +84,50 @@ def test_level_replacement_ends_old_contact():
     advance(s, 1, level=next_level, touch=True)
     assert len(s.episodes) == 2
     assert len(s.active) == 1
+
+
+def test_invalid_confirmation_is_atomic_and_correct_retry_succeeds():
+    s = EpisodeState("BTCUSDT")
+    advance(s, 0, touch=True)
+    before = json.loads(json.dumps(s.snapshot()))
+    other_level = LevelSnapshot("wrong-resistance", 105.0, 0)
+
+    with pytest.raises(ValueError, match="previously observed"):
+        advance(s, 1, level=other_level, touch=True, confirm=True)
+
+    assert s.snapshot() == before
+    events = advance(s, 1, touch=True, confirm=True)
+    assert len(events) == 1
+    assert s.sequence[LEVEL.level_id] == 1
+    assert len(s.episodes) == 1
+    assert s.active == {LEVEL.level_id: events[0]["episode_id"]}
+    assert s.pending == {}
+    assert len(s.emitted) == 1
+    assert s.last_close_ms == 2 * STEP_MS
+
+
+def test_invalid_confirmation_does_not_create_and_confirm_same_episode():
+    s = EpisodeState("BTCUSDT")
+    before = json.loads(json.dumps(s.snapshot()))
+    wrong_level = LevelSnapshot("new-level", 105.0, 0)
+
+    with pytest.raises(ValueError, match="previously observed"):
+        advance(s, 0, level=wrong_level, touch=True, confirm=True)
+
+    assert s.snapshot() == before
+    events = advance(s, 0, level=wrong_level, touch=True)
+    assert events == []
+    assert s.pending[wrong_level.level_id] in s.episodes
+    assert s.episodes[s.pending[wrong_level.level_id]]["state"] == "CONTACT"
+
+
+def test_duplicate_bar_rejection_does_not_mutate_confirmed_state():
+    s = EpisodeState("BTCUSDT")
+    advance(s, 0, touch=True)
+    assert len(advance(s, 1, touch=False, confirm=True)) == 1
+    before = json.loads(json.dumps(s.snapshot()))
+
+    with pytest.raises(ValueError, match="overlapping"):
+        advance(s, 1, touch=False, confirm=True)
+
+    assert s.snapshot() == before

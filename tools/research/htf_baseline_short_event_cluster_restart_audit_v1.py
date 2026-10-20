@@ -10,6 +10,7 @@ from pathlib import Path
 from tools.research.htf_baseline_short_causal_coverage_v1 import load_bars, utc_ms
 from tools.research.htf_baseline_short_multi_level_replay_v1 import replay
 from tools.research.htf_baseline_short_reaction_cluster_identity_v1 import reaction_clusters
+from tools.research.htf_baseline_short_asof_atomic_cluster_v1 import within_price_bps
 
 
 def cluster_events(events, episodes=None, *, proximity_ms=300000, price_bps=20):
@@ -32,8 +33,8 @@ def cluster_events(events, episodes=None, *, proximity_ms=300000, price_bps=20):
                 pb = episodes.get(b["episode_id"], {}).get("level_price_at_touch")
             if pa is None or pb is None or min(pa, pb) <= 0:
                 continue
-            gap_bps = 10000 * abs(pa-pb)/min(pa,pb)
-            if gap_bps <= price_bps:
+            if within_price_bps(pa,pb,price_bps):
+                gap_bps = 10000 * abs(pa-pb)/min(pa,pb)
                 pairs.append({
                     "first_event_id": a["event_id"],
                     "second_event_id": b["event_id"],

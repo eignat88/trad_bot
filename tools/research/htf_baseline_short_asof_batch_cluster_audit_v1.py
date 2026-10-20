@@ -1,6 +1,7 @@
 """#176 ASOF-batch ambiguity diagnostics, no prospective dedup decisions."""
 from collections import defaultdict
 from tools.research.htf_baseline_short_first_seen_cluster_v1 import FirstSeenReactionClusters
+from tools.research.htf_baseline_short_asof_atomic_cluster_v1 import within_price_bps
 
 def audit_batches(symbol, events, *, price_bps=20):
     batches=defaultdict(list)
@@ -17,7 +18,7 @@ def audit_batches(symbol, events, *, price_bps=20):
             for b in batch[i+1:]:
                 pa,pb=a["level_price_at_touch"],b["level_price_at_touch"]
                 if pa<=0 or pb<=0:raise ValueError("invalid resistance price")
-                if 10000*abs(pa-pb)/min(pa,pb)<=price_bps:
+                if within_price_bps(pa,pb,price_bps):
                     edges.append([a["event_id"],b["event_id"]])
         # For existing anchors, evaluate candidate sets against PRE-BATCH state.
         candidate_sets={}
@@ -26,7 +27,7 @@ def audit_batches(symbol, events, *, price_bps=20):
             candidate_sets[e["event_id"]]=sorted(
                 cid for cid,c in state.clusters.items()
                 if 0<=when-c["anchor_time_ms"]<=300000
-                and 10000*abs(p-c["anchor_price"])/min(p,c["anchor_price"])<=price_bps)
+                and within_price_bps(p,c["anchor_price"],price_bps))
         cases.append({"asof_ms":when,"event_ids":[e["event_id"] for e in batch],
             "same_asof_candidate_edges":edges,
             "pre_batch_anchor_matches":candidate_sets,

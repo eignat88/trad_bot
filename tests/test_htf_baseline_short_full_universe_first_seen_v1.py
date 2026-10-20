@@ -58,6 +58,26 @@ def test_fail_closed_bridge_does_not_merge_old_anchor_ids():
     assert len(s.clusters)==2
 
 
+def test_first_seen_bps_geometry_is_scale_independent():
+    scale_cases = ((100.0, 100.2), (1000.0, 1002.0), (2500.0, 2505.0))
+    for scale, (anchor, attached) in enumerate(scale_cases, start=1):
+        s = FirstSeenReactionClusters(f"SCALE{scale}USDT")
+        anchor_id = s.observe([event("A", FIVE, anchor)])[0]["reaction_cluster_id"]
+        attached_id = s.observe([event("B", 2 * FIVE, attached)])[0]["reaction_cluster_id"]
+        assert attached_id == anchor_id
+        assert s.result()["cluster_count"] == 1
+        assert s.result()["assigned_events"] == 2
+
+
+def test_first_seen_bps_geometry_rejects_values_outside_boundary():
+    s = FirstSeenReactionClusters("BTCUSDT")
+    anchor_id = s.observe([event("A", FIVE, 100.0)])[0]["reaction_cluster_id"]
+    outside_id = s.observe([event("B", 2 * FIVE, 100.201)])[0]["reaction_cluster_id"]
+    assert outside_id != anchor_id
+    assert s.result()["cluster_count"] == 2
+    assert s.result()["ambiguous_bridges"] == []
+
+
 def test_repeated_delivery_is_rejected():
     s=FirstSeenReactionClusters("BTCUSDT")
     s.observe([event("A", FIVE, 100)])

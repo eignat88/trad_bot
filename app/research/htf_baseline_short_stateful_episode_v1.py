@@ -70,6 +70,8 @@ class EpisodeState:
         if reaction_confirmed and not level:
             raise ValueError("confirmation without level")
         key = level.level_id if level else None
+        if reaction_confirmed and self.pending.get(key) is None:
+            raise ValueError("confirmation without previously observed contact")
         emitted: list[dict] = []
         # End active contact runs on first non-contact bar. This is a structural
         # event, not a timer-based cooldown; terminated episodes remain retained.
@@ -95,9 +97,7 @@ class EpisodeState:
                 self.active[key] = eid
                 self.pending[key] = eid
         if reaction_confirmed:
-            eid = self.pending.get(key)
-            if eid is None:
-                raise ValueError("confirmation without previously observed contact")
+            eid = self.pending[key]
             record = self.episodes[eid]
             if record["first_confirmation_ms"] is None:
                 record["first_confirmation_ms"] = close_ms
