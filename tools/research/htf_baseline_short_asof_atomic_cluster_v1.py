@@ -5,7 +5,19 @@ New same-ASOF connected components produce one new immutable anchor each,
 unless component could attach to multiple old anchors (fail closed).
 """
 from collections import defaultdict
+from decimal import Decimal
 from hashlib import sha256
+
+def within_price_bps(a, b, price_bps):
+    """Exact decimal boundary using the existing min-price denominator."""
+    pa, pb = Decimal(str(a)), Decimal(str(b))
+    threshold = Decimal(str(price_bps))
+    if not pa.is_finite() or not pb.is_finite() or not threshold.is_finite():
+        raise ValueError("non-finite price geometry")
+    if pa <= 0 or pb <= 0 or threshold < 0:
+        raise ValueError("invalid price geometry")
+    return Decimal(10000) * abs(pa - pb) <= threshold * min(pa, pb)
+
 
 class AtomicAsofClusters:
     def __init__(self,symbol):
@@ -50,7 +62,7 @@ class AtomicAsofClusters:
         for i,a in enumerate(batch):
             for b in batch[i+1:]:
                 pa,pb=a["level_price_at_touch"],b["level_price_at_touch"]
-                if 10000*abs(pa-pb)/min(pa,pb)<=price_bps:
+                if within_price_bps(pa,pb,price_bps):
                     x,y=root(a["event_id"]),root(b["event_id"])
                     if x!=y:parent[max(x,y)]=min(x,y)
         groups=defaultdict(list)
@@ -63,7 +75,7 @@ class AtomicAsofClusters:
             for e in members:
                 p=e["level_price_at_touch"]
                 for cid,cluster in prior_clusters.items():
-                    if 0<=asof-cluster["anchor_time_ms"]<=proximity_ms and 10000*abs(p-cluster["anchor_price"])/min(p,cluster["anchor_price"])<=price_bps:
+                    if 0<=asof-cluster["anchor_time_ms"]<=proximity_ms and within_price_bps(p,cluster["anchor_price"],price_bps):
                         matches.add(cid)
             if len(matches)>1:
                 cid=None; status="AMBIGUOUS_PRIOR_ANCHORS"

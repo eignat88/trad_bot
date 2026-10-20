@@ -69,18 +69,22 @@ def test_same_asof_groups_are_not_prior_anchors_by_default():
     r=c.observe_batch([event("a",STEP,100),event("b",STEP,103)])
     assert len({x["reaction_cluster_id"] for x in r})==2
 
-def test_exact_geometry_boundaries_are_not_clustered():
+def test_exact_geometry_boundaries_are_clustered_inclusively():
     c=AtomicAsofClusters("BTCUSDT")
     batch=[event("a",STEP,100.0),event("b",STEP,100.2)]
     left=c.observe_batch(batch)
     right=AtomicAsofClusters("BTCUSDT").observe_batch(list(reversed(batch)))
     assert left==right
-    assert len({r["reaction_cluster_id"] for r in left})==2
-    c.observe_batch([event("c",2*STEP,100.0)])
-    assert len(c.clusters)==2
+    assert len({r["reaction_cluster_id"] for r in left})==1
+    assert len(c.clusters)==1
+
+    result=c.observe_batch([event("c",2*STEP,100.0)])
+    assert result[0]["status"]=="PROVISIONAL_ATTACH"
+    assert len(c.clusters)==1
+
     result=c.observe_batch([event("d",3*STEP,100.2)])
     assert result[0]["status"]=="PROVISIONAL_NEW"
-    assert len(c.clusters)==3
+    assert len(c.clusters)==2
 
 
 def test_checkpoint_preserves_events_for_sensitivity_reanalysis():
