@@ -1,4 +1,5 @@
 """#176 candidate reaction groups and disk resume tests."""
+import hashlib
 import json
 from pathlib import Path
 from app.models import Candle
@@ -26,6 +27,32 @@ def test_transitive_cluster_preserves_three_original_events():
 def test_cluster_is_order_invariant():
     e=[event(10,100,"A"),event(10,100.1,"B"),event(20,105,"C")]
     assert reaction_clusters(e)==reaction_clusters(list(reversed(e)))
+
+
+def test_exact_boundary_is_scale_invariant():
+    for scale in (1.0, 10.0, 25.0):
+        result = reaction_clusters([
+            event(10, 100.0 * scale, "A"),
+            event(10, 100.2 * scale, "B"),
+        ])
+        assert result["cluster_count"] == 1
+        assert result["candidate_edges"] == 1
+
+
+def test_just_outside_exact_boundary_stays_separate():
+    result = reaction_clusters([
+        event(10, 100.0, "A"),
+        event(10, 100.201, "B"),
+    ])
+    assert result["cluster_count"] == 2
+    assert result["candidate_edges"] == 0
+
+
+def test_cluster_ids_follow_fixed_member_identity_at_boundary():
+    e=[event(10,100.0,"A"),event(10,100.2,"B")]
+    result=reaction_clusters(e)
+    expected=hashlib.sha256(b"event-A|event-B").hexdigest()
+    assert result["clusters"][0]["reaction_cluster_id"]==expected
 
 
 def test_disk_checkpoint_resume_matches_uninterrupted(tmp_path):

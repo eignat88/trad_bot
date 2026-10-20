@@ -6,6 +6,8 @@ setups. First confirmation and all member IDs retained for audit.
 from __future__ import annotations
 from hashlib import sha256
 
+from tools.research.htf_baseline_short_asof_atomic_cluster_v1 import within_price_bps
+
 
 def reaction_clusters(events, *, proximity_ms=300000, price_bps=20):
     ordered = sorted(events, key=lambda e: (e["known_at_ms"], e["event_id"]))
@@ -27,10 +29,9 @@ def reaction_clusters(events, *, proximity_ms=300000, price_bps=20):
                 break
             pa = a.get("level_price_at_touch")
             pb = b.get("level_price_at_touch")
-            if pa is None or pb is None or min(pa, pb) <= 0:
+            if pa is None or pb is None:
                 raise ValueError("missing/invalid level price")
-            gap = 10000 * abs(pa-pb) / min(pa, pb)
-            if gap <= price_bps:
+            if within_price_bps(pa, pb, price_bps):
                 edges.append((a["event_id"], b["event_id"]))
                 x, y = root(a["event_id"]), root(b["event_id"])
                 if x != y:
