@@ -396,3 +396,26 @@ def test_point_b_tables_untouched_by_migration(db):
         )
         (count,) = cur.fetchone()
     assert count == 2  # exactly the two new Phase-2 tables
+
+
+def test_registration_gate_fail_closed_then_admits_after_activation(db):
+    from app.research.htf_baseline_short_phase2_freeze_v1 import parse_ts_ms
+    from app.research.htf_baseline_short_phase2_observer_runner_v1 import (
+        NotRunnableError,
+        RunnerConfig,
+        require_runnable,
+    )
+
+    config = RunnerConfig(protocol_fingerprint=FINGERPRINT)
+    # PENDING + fingerprint mismatch -> refuse startup (fail-closed)
+    with pytest.raises(NotRunnableError):
+        require_runnable(db, config)
+    _activate(db)
+    # runtime fingerprint must match the registration exactly
+    bad_config = RunnerConfig(protocol_fingerprint="1" * 64)
+    with pytest.raises(NotRunnableError):
+        require_runnable(db, bad_config)
+    # matching fingerprint + freeze -> boundary admitted
+    boundary = require_runnable(db, config)
+    assert boundary.freeze_ts_ms == parse_ts_ms(FREEZE)
+    assert boundary.protocol_fingerprint == FINGERPRINT

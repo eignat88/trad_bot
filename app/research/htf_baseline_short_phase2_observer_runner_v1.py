@@ -449,6 +449,27 @@ def require_runnable(db_conn, config: RunnerConfig) -> Phase2FreezeBoundary:
     )
 
 
+def connect_db_from_env():
+    """Open the application database connection from HTF_P2_DB_* environment
+    variables (psycopg2 preferred, pg8000 fallback). Never called implicitly."""
+    host = os.environ.get("HTF_P2_DB_HOST", "127.0.0.1")
+    port = int(os.environ.get("HTF_P2_DB_PORT", "5432"))
+    user = os.environ.get("HTF_P2_DB_USER", "postgres")
+    name = os.environ.get("HTF_P2_DB_NAME", "trad_bot")
+    try:
+        import psycopg2
+
+        return psycopg2.connect(
+            host=host, port=port, user=user, database=name, connect_timeout=5
+        )
+    except ImportError:
+        import pg8000.dbapi
+
+        return pg8000.dbapi.connect(
+            host=host, port=port, user=user, database=name, timeout=5
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="HTF Phase-2 observe-only observer (disabled by default)")
     parser.add_argument("--data-dir", required=True, help="CSV candle source directory")
@@ -459,7 +480,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--max-cycles", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true", default=True)
-    parser.add_argument("--freeze-ts", default=None, help="explicit test-only freeze (ISO); requires --dry-run")
+    parser.add_argument(
+        "--use-registration",
+        action="store_true",
+        help="production path: gate startup on the DB registration + freeze sources",
+    )
+    parser.add_argument(
+        "--freeze-ts",
+        default=None,
+        help="explicit test-only freeze (ISO); dry-run only; never used in production",
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -474,29 +504,47 @@ def main(argv: list[str] | None = None) -> int:
         poll_seconds=args.poll_seconds,
         once=args.once,
         max_cycles=args.max_cycles,
-        dry_run=True,
+        dry_run=not args.use_registration,
     )
-    if not args.freeze_ts:
-        log.error("no freeze boundary supplied: fail closed (PHASE_2_NOT_ACTIVATED)")
-        return EXIT_NOT_RUNNABLE
-    fingerprint = config.protocol_fingerprint
-    try:
-        boundary = build_boundary(
-            experiment_id=config.experiment_id,
-            protocol_freeze_ts=args.freeze_ts,
-            registry_freeze_ts=args.freeze_ts,
-            database_freeze_ts=args.freeze_ts,
-            protocol_fingerprint_hex=fingerprint,
+    writer = InMemoryWriter()
+    db_conn = None
+    if args.use_registration:
+        # production path: registration + freeze sources must all agree,
+        # otherwise exit fail-closed BEFORE any observation is created
+        try:
+            db_conn = connect_db_from_env()
+            boundary = require_runnable(db_conn, config)
+        except Exception as exc:
+            log.error("registration gate refused startup: %s", exc)
+            return EXIT_NOT_RUNNABLE
+        from app.research.htf_baseline_short_phase2_persistence_v1 import (
+            Phase2ObservationWriter,
         )
-    except NotRunnableError as exc:
-        log.error("%s", exc)
+
+        writer = Phase2ObservationWriter(db_conn)
+    elif args.freeze_ts:
+        fingerprint = config.protocol_fingerprint
+        try:
+            boundary = build_boundary(
+                experiment_id=config.experiment_id,
+                protocol_freeze_ts=args.freeze_ts,
+                registry_freeze_ts=args.freeze_ts,
+                database_freeze_ts=args.freeze_ts,
+                protocol_fingerprint_hex=fingerprint,
+            )
+        except NotRunnableError as exc:
+            log.error("%s", exc)
+            return EXIT_NOT_RUNNABLE
+    else:
+        log.error("no freeze boundary supplied: fail closed (PHASE_2_NOT_ACTIVATED)")
         return EXIT_NOT_RUNNABLE
 
     runner = Phase2ObserverRunner(
         config,
         boundary=boundary,
         source=FileCandleSource(args.data_dir),
-        writer=InMemoryWriter(),
+        writer=writer,
+        db_conn=db_conn,
     )
     runner.install_signal_handlers()
     return runner.run_loop()

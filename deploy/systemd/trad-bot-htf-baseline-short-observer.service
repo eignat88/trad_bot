@@ -17,10 +17,11 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/trad_bot
 EnvironmentFile=/opt/trad_bot/.env
-# --once is intentionally absent: the runner loops. Activation gating (freeze
-# boundary, registration state, protocol fingerprint) is enforced inside the
-# runner and fails closed before any observation is created.
-ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.htf_baseline_short_phase2_observer_runner_v1 --data-dir /opt/trad_bot/var/htf_phase2/candles --checkpoint /opt/trad_bot/var/htf_phase2/state.json --poll-seconds 300 --log-level INFO
+# --once is intentionally absent: the runner loops. --use-registration gates
+# startup on the DB registration state (RUNNING + freeze + matching protocol
+# fingerprint) and fails closed before any observation is created. Nothing here
+# activates the experiment.
+ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.htf_baseline_short_phase2_observer_runner_v1 --data-dir /opt/trad_bot/var/htf_phase2/candles --checkpoint /opt/trad_bot/var/htf_phase2/state.json --poll-seconds 300 --use-registration --log-level INFO
 
 Restart=on-failure
 RestartSec=60
