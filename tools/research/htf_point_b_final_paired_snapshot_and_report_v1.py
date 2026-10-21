@@ -15,8 +15,10 @@ Modes
 ``report``
     Fully offline: consumes the frozen snapshot files and writes the canonical
     MD/JSON/CSV artifacts. Deterministic for a given snapshot, seed and
-    bootstrap iteration count. Refuses to overwrite existing artifacts unless
-    ``--allow-artifact-overwrite`` is passed explicitly.
+    bootstrap iteration count. Verifies ``snapshot_rows.csv`` against the
+    SHA-256 recorded in ``snapshot_meta.json`` (fail-closed on mismatch or a
+    missing record) before analysing anything. Refuses to overwrite existing
+    artifacts unless ``--allow-artifact-overwrite`` is passed explicitly.
 
 Output schema (fixed artifact set, written into ``--out``)
 ----------------------------------------------------------
@@ -208,6 +210,17 @@ def _round(x, nd=10):
     return None if x is None else round(float(x), nd)
 
 
+def _iso_or_none(dt) -> str | None:
+    return dt.isoformat() if isinstance(dt, datetime) else None
+
+
+def eligible_extrema(eligible: list[dict]) -> tuple[str | None, str | None]:
+    """Earliest/latest eligible signal_time as ISO strings; both None if empty."""
+    earliest = min((_parse_ts(x["signal_time"]) for x in eligible), default=None)
+    latest = max((_parse_ts(x["signal_time"]) for x in eligible), default=None)
+    return _iso_or_none(earliest), _iso_or_none(latest)
+
+
 # ----------------------- frozen outcome semantics -----------------------
 
 def frozen_gross_r(direction, entry, stop, target, ret,
@@ -393,7 +406,10 @@ def run_capture(worktree: Path, config_root: Path, outdir: Path,
         norm.append(rec)
 
     rows_path = outdir / SNAPSHOT_ROWS_FILE
-    with rows_path.open("w", newline="", encoding="utf-8") as fh:
+    # Snapshot files are staged under temporary names and renamed only at the
+    # end so a failed capture cannot leave a half-written snapshot behind.
+    rows_tmp = outdir / (SNAPSHOT_ROWS_FILE + ".tmp")
+    with rows_tmp.open("w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=ROW_FIELDS, lineterminator="\n")
         w.writeheader()
         for rec in norm:
@@ -425,6 +441,8 @@ def run_capture(worktree: Path, config_root: Path, outdir: Path,
             "calendar_dates": sorted({_parse_ts(x["signal_time"]).date().isoformat() for x in sub}),
         }
 
+    earliest_eligible, latest_eligible = eligible_extrema(eligible)
+
     meta.update({
         "SNAPSHOT_ASOF_UTC": asof.isoformat(),
         "POST_FREEZE_ELIGIBLE_N": len(eligible),
@@ -434,8 +452,8 @@ def run_capture(worktree: Path, config_root: Path, outdir: Path,
         "SYMBOLS_N": len(symbols),
         "OOS_ELAPSED_HOURS": round((asof - FREEZE).total_seconds() / 3600.0, 6),
         "OOS_CALENDAR_DATES": days,
-        "EARLIEST_ELIGIBLE": min((_parse_ts(x["signal_time"]) for x in eligible), default=None).isoformat(),
-        "LATEST_ELIGIBLE": max((_parse_ts(x["signal_time"]) for x in eligible), default=None).isoformat(),
+        "EARLIEST_ELIGIBLE": earliest_eligible,
+        "LATEST_ELIGIBLE": latest_eligible,
         "LATEST_FINALIZED_AT": latest_finalized.isoformat() if latest_finalized else None,
         "SOURCE_COMPLETENESS": per_cohort,
         "source_row_counts": {
@@ -444,12 +462,15 @@ def run_capture(worktree: Path, config_root: Path, outdir: Path,
             **{f"{exp}": v["rows_post_freeze"] for exp, v in per_cohort.items()},
         },
         "snapshot_rows_file": SNAPSHOT_ROWS_FILE,
-        "snapshot_rows_sha256": _sha256_file(rows_path),
+        "snapshot_rows_sha256": _sha256_file(rows_tmp),
     })
 
     meta_path = outdir / SNAPSHOT_META_FILE
-    with meta_path.open("w", encoding="utf-8", newline="\n") as fh:
+    meta_tmp = outdir / (SNAPSHOT_META_FILE + ".tmp")
+    with meta_tmp.open("w", encoding="utf-8", newline="\n") as fh:
         fh.write(json.dumps(meta, indent=2, ensure_ascii=False, default=str) + "\n")
+    rows_tmp.replace(rows_path)
+    meta_tmp.replace(meta_path)
     return meta
 
 
@@ -897,6 +918,26 @@ def _validate_meta(meta: dict) -> datetime:
     except (TypeError, ValueError) as exc:
         raise ValueError(
             f"malformed snapshot_meta.json: bad SNAPSHOT_ASOF_UTC: {exc}") from exc
+
+
+def verify_snapshot_checksum(outdir: Path, meta: dict) -> None:
+    """Fail closed unless snapshot_rows.csv matches the hash recorded at capture."""
+    recorded = meta.get("snapshot_rows_sha256")
+    if not recorded:
+        raise ValueError("malformed snapshot_meta.json: missing snapshot_rows_sha256")
+    actual = _sha256_file(outdir / SNAPSHOT_ROWS_FILE)
+    if actual != recorded:
+        raise ValueError(
+            f"snapshot checksum mismatch: {SNAPSHOT_ROWS_FILE} is {actual} but "
+            f"{SNAPSHOT_META_FILE} records {recorded}")
+
+
+def load_snapshot(outdir: Path) -> tuple[list[dict], dict]:
+    """Offline load: validated metadata + checksum-verified snapshot rows."""
+    meta = json.loads((outdir / SNAPSHOT_META_FILE).read_text(encoding="utf-8"))
+    _validate_meta(meta)
+    verify_snapshot_checksum(outdir, meta)
+    return load_rows(outdir), meta
 
 
 def analyze(rows: list[dict], meta: dict, reps: int, seed: int) -> tuple[dict, dict]:
@@ -1355,8 +1396,7 @@ def main(argv=None) -> int:
             "SYMBOLS_N", "OOS_ELAPSED_HOURS")}, indent=2, default=str))
         return 0
 
-    rows = load_rows(opts.out)
-    meta = json.loads((opts.out / SNAPSHOT_META_FILE).read_text(encoding="utf-8"))
+    rows, meta = load_snapshot(opts.out)
     if opts.reps < 100:
         ap.error("--reps must be >= 100")
     summary, details = analyze(rows, meta, opts.reps, opts.seed)

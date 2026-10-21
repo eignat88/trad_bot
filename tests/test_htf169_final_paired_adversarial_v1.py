@@ -436,6 +436,39 @@ def test_capture_refuses_nonempty_output_dir(tmp_path):
                          allow_nonempty=True)
 
 
+def test_snapshot_checksum_mismatch_fails_closed(tmp_path):
+    _write_snapshot_csv(tmp_path / tool.SNAPSHOT_ROWS_FILE, [make_row(POINT_B, obs=1)])
+    (tmp_path / tool.SNAPSHOT_META_FILE).write_text(json.dumps({
+        "SNAPSHOT_ASOF_UTC": "2026-10-21T13:40:50+00:00",
+        "snapshot_rows_sha256": tool._sha256_file(tmp_path / tool.SNAPSHOT_ROWS_FILE),
+    }), encoding="utf-8")
+    rows, meta = tool.load_snapshot(tmp_path)  # consistent snapshot loads fine
+    assert len(rows) == 1
+    # rows edited/truncated after capture: report must fail closed, not re-attribute
+    _write_snapshot_csv(tmp_path / tool.SNAPSHOT_ROWS_FILE, [])
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        tool.load_snapshot(tmp_path)
+
+
+def test_snapshot_missing_recorded_checksum_fails_closed(tmp_path):
+    _write_snapshot_csv(tmp_path / tool.SNAPSHOT_ROWS_FILE, [make_row(POINT_B, obs=1)])
+    (tmp_path / tool.SNAPSHOT_META_FILE).write_text(
+        json.dumps({"SNAPSHOT_ASOF_UTC": "2026-10-21T13:40:50+00:00"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="missing snapshot_rows_sha256"):
+        tool.load_snapshot(tmp_path)
+
+
+def test_empty_eligible_cohort_extrema_are_null():
+    # capture with zero post-freeze observations must serialize null, not crash
+    assert tool.eligible_extrema([]) == (None, None)
+    earliest, latest = tool.eligible_extrema([
+        {"signal_time": "2026-10-07T09:00:00+00:00"},
+        {"signal_time": "2026-10-08T09:00:00+00:00"},
+    ])
+    assert earliest == "2026-10-07T09:00:00+00:00"
+    assert latest == "2026-10-08T09:00:00+00:00"
+
+
 # ── parity with the frozen branch implementation (when available) ───
 
 def test_parity_with_branch_frozen_gross_r():
