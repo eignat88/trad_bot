@@ -168,6 +168,32 @@ def test_password_file_symlink_rejected(monkeypatch, tmp_path):
         load_db_credentials()
 
 
+@POSIX_ONLY
+def test_password_file_fifo_rejected_without_blocking(monkeypatch, tmp_path):
+    """NEW-2: a FIFO in place of the password file must fail fast, not hang."""
+    import threading
+
+    fifo = tmp_path / "pw"
+    os.mkfifo(fifo)
+    _set_env(monkeypatch, HTF_P2_DB_USER="trad_bot_htf_p2_observer",
+             HTF_P2_DB_NAME="trad_bot", HTF_P2_DB_PASSWORD_FILE=str(fifo))
+    result = {}
+
+    def target():
+        try:
+            result["value"] = load_db_credentials()
+        except DbCredentialsError as exc:
+            result["error"] = exc
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    assert not worker.is_alive(), "FIFO open must not block"
+    assert "error" in result, "FIFO must be rejected"
+    assert "regular file" in str(result["error"])
+    assert "good-secret" not in str(result["error"])
+
+
 def test_password_never_logged(monkeypatch, caplog):
     _set_env(monkeypatch, HTF_P2_DB_USER="trad_bot_htf_p2_observer",
              HTF_P2_DB_NAME="trad_bot", HTF_P2_DB_PASSWORD="super-secret-pw")

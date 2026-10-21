@@ -620,7 +620,14 @@ def _read_password_file(path: str) -> str:
             raise DbCredentialsError(f"password file unreadable: {exc}") from exc
         if stat_module.S_ISLNK(pre.st_mode):
             raise DbCredentialsError("password file must not be a symlink")
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        # NEW-2: reject non-regular files (FIFO/sockets/devices) BEFORE open —
+        # opening a FIFO would block waiting for a writer.
+        if not stat_module.S_ISREG(pre.st_mode):
+            raise DbCredentialsError("password file must be a regular file (not a symlink or device)")
+        # O_NOFOLLOW: block symlink swaps; O_NONBLOCK: never block if a regular
+        # file is swapped for a FIFO between lstat and open (the fstat check
+        # below then rejects the opened object).
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
             fd = os.open(path, flags)
         except OSError as exc:

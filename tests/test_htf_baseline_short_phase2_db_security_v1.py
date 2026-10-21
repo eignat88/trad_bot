@@ -217,6 +217,61 @@ def test_075_scoped_to_phase2_surface_static():
         assert obj.startswith("htf_baseline_short_phase2"), f"out-of-scope object: {obj}"
 
 
+RUNBOOK = ROOT / "docs" / "research" / "HTF_BASELINE_SHORT_PHASE2_MIGRATION_074_075_RUNBOOK_V1.md"
+
+
+def _runbook_verification_sql() -> list[str]:
+    """Extract the marked verification statements from the migration runbook."""
+    doc = RUNBOOK.read_text(encoding="utf-8")
+    assert "-- VERIFICATION_SQL_BEGIN" in doc and "-- VERIFICATION_SQL_END" in doc
+    block = doc.split("-- VERIFICATION_SQL_BEGIN", 1)[1].split("-- VERIFICATION_SQL_END", 1)[0]
+    statements = []
+    for raw in block.split(";"):
+        lines = [ln for ln in raw.splitlines() if ln.strip() and not ln.strip().startswith("--")]
+        if lines:
+            statements.append("\n".join(lines))
+    assert statements, "no verification SQL extracted from runbook"
+    return statements
+
+
+def _run_verification(db) -> list[tuple]:
+    mismatches = []
+    for stmt in _runbook_verification_sql():
+        with db.cursor() as cur:
+            cur.execute(stmt)
+            for check, expected, actual in cur.fetchall():
+                if expected != actual:
+                    mismatches.append((check, expected, actual))
+    db.rollback()
+    return mismatches
+
+
+def test_runbook_verification_sql_passes_after_075(db):
+    """The runbook's own SQL must execute and PASS after a correct 074 -> 075."""
+    apply_075(db)
+    mismatches = _run_verification(db)
+    assert not mismatches, mismatches
+
+
+def test_runbook_verification_sql_flags_bad_grants(db):
+    """Negative: artificially granted PUBLIC rights MUST be detected (NEW-1)."""
+    apply_075(db)
+    with db.cursor() as cur:
+        cur.execute(
+            "GRANT INSERT ON research.htf_baseline_short_phase2_observation TO PUBLIC"
+        )
+        cur.execute(
+            "GRANT EXECUTE ON FUNCTION research.htf_baseline_short_phase2_activate("
+            "text,timestamp with time zone,text) TO PUBLIC"
+        )
+    db.commit()
+    mismatches = _run_verification(db)
+    flagged = {check for check, _, _ in mismatches}
+    assert "pub_tbl" in flagged
+    assert "pub_fn" in flagged
+    assert "leftover_dml" in flagged
+
+
 def test_systemd_unit_matches_exit_code_contract():
     """F5: EXIT_NOT_RUNNABLE=3 must not restart-loop; unit keeps its guards."""
     import app.research.htf_baseline_short_phase2_observer_runner_v1 as mod

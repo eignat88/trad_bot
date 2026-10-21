@@ -45,48 +45,106 @@ sudo -u postgres psql -d trad_bot -v ON_ERROR_STOP=1 --single-transaction \
 
 These checks are NOT optional: PostgreSQL `GRANT`/`REVOKE` issued by a role
 without the required rights can silently no-op, so the only proof is the
-EFFECTIVE privilege state. Run every query below and compare against the
-expected column. **On ANY mismatch: STOP — do not provision secrets, do not
-enable the unit, do not proceed to activation.** Record the output in the
-change log.
+EFFECTIVE privilege state. Every statement below returns rows of the shape
+`check | expected | actual` — **for EVERY row `actual` must equal `expected`**.
+On ANY mismatch or error: STOP — do not provision secrets, do not enable the
+unit, do not proceed to activation. Record the output in the change log.
+
+Notes:
+* PUBLIC is a pseudo-role, not a role: `has_*_privilege('PUBLIC', ...)` raises
+  an error and must never be used. PUBLIC grants are counted via
+  `aclexplode()` with `grantee = 0`, over `COALESCE(acl, acldefault(...))` so
+  default privileges (e.g. function EXECUTE for PUBLIC) are counted too.
+* `trad_bot` rows are guarded with `CASE WHEN EXISTS(pg_roles ...)`: a missing
+  role yields `false` (no privileges) and never an SQL error.
+* Function checks match by `proname`, covering ALL overloads.
+* This block is executed automatically by
+  `tests/test_htf_baseline_short_phase2_db_security_v1.py`; keep the
+  `VERIFICATION_SQL_*` markers and the `check|expected|actual` shape intact.
 
 ```sql
--- (a) effective table privileges (has_*_privilege is authoritative)
-SELECT
-  has_table_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_observation', 'INSERT')      AS obs_ins,   -- false
-  has_table_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_observation', 'SELECT')      AS obs_sel,   -- true
-  has_table_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_experiment',   'UPDATE')     AS obs_upd,   -- false
-  has_table_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_freeze_registry', 'INSERT')  AS obs_reg,   -- false
-  has_table_privilege('trad_bot_htf_p2_admin',    'research.htf_baseline_short_phase2_observation', 'SELECT')      AS adm_sel,   -- true
-  has_table_privilege('trad_bot_htf_p2_admin',    'research.htf_baseline_short_phase2_experiment',   'INSERT')     AS adm_ins,   -- false
-  has_table_privilege('PUBLIC',                   'research.htf_baseline_short_phase2_observation', 'SELECT')      AS pub_sel;   -- false
--- and, when the application roles exist in this cluster:
-SELECT
-  has_table_privilege('trad_bot', 'research.htf_baseline_short_phase2_observation', 'INSERT') AS tb_ins,   -- false
-  has_table_privilege('trad_bot', 'research.htf_baseline_short_phase2_observation', 'SELECT') AS tb_sel;   -- false
-
--- (b) effective function privileges
-SELECT
-  has_function_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_insert_observation(text,text,text,text,text,timestamp with time zone,timestamp with time zone,timestamp with time zone,numeric,numeric,boolean,boolean,jsonb)', 'EXECUTE') AS obs_fn_ins,  -- true
-  has_function_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_activate(text,timestamp with time zone,text)', 'EXECUTE') AS obs_fn_act,  -- false
-  has_function_privilege('trad_bot_htf_p2_admin',    'research.htf_baseline_short_phase2_activate(text,timestamp with time zone,text)', 'EXECUTE') AS adm_fn_act,  -- true
-  has_function_privilege('PUBLIC',                   'research.htf_baseline_short_phase2_activate(text,timestamp with time zone,text)', 'EXECUTE') AS pub_fn_act;  -- false
-
--- (c) SECURITY DEFINER + pinned search_path on both write functions
-SELECT proname, prosecdef, proconfig FROM pg_proc
- WHERE proname IN ('htf_baseline_short_phase2_insert_observation',
-                   'htf_baseline_short_phase2_activate');
--- expected: prosecdef = true for both, proconfig contains search_path=pg_catalog, research
-
--- (d) no leftover direct DML grants anywhere on the Phase-2 tables
-SELECT grantee, table_name, privilege_type
-  FROM information_schema.table_privileges
- WHERE table_schema = 'research'
-   AND table_name LIKE 'htf_baseline_short_phase2%'
-   AND privilege_type IN ('INSERT','UPDATE','DELETE')
-   AND grantee <> 'postgres'
- ORDER BY 1,2,3;
--- expected: 0 rows
+-- VERIFICATION_SQL_BEGIN
+SELECT 'obs_sel' AS check, true AS expected,
+       has_table_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_observation', 'SELECT') AS actual;
+SELECT 'obs_ins' AS check, false AS expected,
+       has_table_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_observation', 'INSERT') AS actual;
+SELECT 'obs_upd_exp' AS check, false AS expected,
+       has_table_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_experiment', 'UPDATE') AS actual;
+SELECT 'obs_reg_ins' AS check, false AS expected,
+       has_table_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_freeze_registry', 'INSERT') AS actual;
+SELECT 'obs_fn_ins' AS check, true AS expected,
+       (SELECT count(*) > 0 AND COALESCE(bool_and(has_function_privilege('trad_bot_htf_p2_observer', p.oid, 'EXECUTE')), false)
+          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = 'research' AND p.proname = 'htf_baseline_short_phase2_insert_observation') AS actual;
+SELECT 'obs_fn_act' AS check, false AS expected,
+       (SELECT count(*) > 0 AND COALESCE(bool_and(has_function_privilege('trad_bot_htf_p2_observer', p.oid, 'EXECUTE')), false)
+          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = 'research' AND p.proname = 'htf_baseline_short_phase2_activate') AS actual;
+SELECT 'adm_sel' AS check, true AS expected,
+       has_table_privilege('trad_bot_htf_p2_admin', 'research.htf_baseline_short_phase2_experiment', 'SELECT') AS actual;
+SELECT 'adm_ins' AS check, false AS expected,
+       has_table_privilege('trad_bot_htf_p2_admin', 'research.htf_baseline_short_phase2_observation', 'INSERT') AS actual;
+SELECT 'adm_fn_act' AS check, true AS expected,
+       (SELECT count(*) > 0 AND COALESCE(bool_and(has_function_privilege('trad_bot_htf_p2_admin', p.oid, 'EXECUTE')), false)
+          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = 'research' AND p.proname = 'htf_baseline_short_phase2_activate') AS actual;
+SELECT 'adm_fn_ins' AS check, false AS expected,
+       (SELECT count(*) > 0 AND COALESCE(bool_and(has_function_privilege('trad_bot_htf_p2_admin', p.oid, 'EXECUTE')), false)
+          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = 'research' AND p.proname = 'htf_baseline_short_phase2_insert_observation') AS actual;
+SELECT 'tb_ins' AS check, false AS expected,
+       CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trad_bot')
+            THEN has_table_privilege('trad_bot', 'research.htf_baseline_short_phase2_observation', 'INSERT')
+            ELSE false END AS actual;
+SELECT 'tb_sel' AS check, false AS expected,
+       CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trad_bot')
+            THEN has_table_privilege('trad_bot', 'research.htf_baseline_short_phase2_observation', 'SELECT')
+            ELSE false END AS actual;
+SELECT 'pub_tbl' AS check, 0 AS expected,
+       (SELECT count(*)
+          FROM pg_class c,
+               aclexplode(COALESCE(c.relacl, acldefault('r', c.relowner))) a
+         WHERE c.relnamespace = 'research'::regnamespace
+           AND c.relname IN ('htf_baseline_short_phase2_experiment',
+                             'htf_baseline_short_phase2_observation',
+                             'htf_baseline_short_phase2_freeze_registry')
+           AND a.grantee = 0) AS actual;
+SELECT 'pub_fn' AS check, 0 AS expected,
+       (SELECT count(*)
+          FROM pg_proc p
+          JOIN pg_namespace n ON n.oid = p.pronamespace,
+               aclexplode(COALESCE(p.proacl, acldefault('f', p.proowner))) a
+         WHERE n.nspname = 'research'
+           AND p.proname IN ('htf_baseline_short_phase2_insert_observation',
+                             'htf_baseline_short_phase2_activate',
+                             'htf_baseline_short_phase2_experiment_guard',
+                             'htf_baseline_short_phase2_observation_guard',
+                             'htf_baseline_short_phase2_freeze_registry_guard')
+           AND a.grantee = 0) AS actual;
+SELECT 'definer_fn' AS check, true AS expected,
+       (SELECT count(DISTINCT p.proname) = 2 AND COALESCE(bool_and(p.prosecdef), false)
+          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = 'research'
+           AND p.proname IN ('htf_baseline_short_phase2_insert_observation',
+                             'htf_baseline_short_phase2_activate')) AS actual;
+SELECT 'pinned_search_path' AS check, true AS expected,
+       (SELECT count(DISTINCT p.proname) = 2
+          AND COALESCE(bool_and('search_path=pg_catalog, research' = ANY (p.proconfig)), false)
+          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = 'research'
+           AND p.proname IN ('htf_baseline_short_phase2_insert_observation',
+                             'htf_baseline_short_phase2_activate')) AS actual;
+SELECT 'leftover_dml' AS check, 0 AS expected,
+       (SELECT count(*)
+          FROM pg_class c,
+               aclexplode(COALESCE(c.relacl, acldefault('r', c.relowner))) a
+         WHERE c.relnamespace = 'research'::regnamespace
+           AND c.relname IN ('htf_baseline_short_phase2_experiment',
+                             'htf_baseline_short_phase2_observation',
+                             'htf_baseline_short_phase2_freeze_registry')
+           AND a.grantee <> c.relowner
+           AND a.privilege_type IN ('INSERT', 'UPDATE', 'DELETE')) AS actual;
+-- VERIFICATION_SQL_END
 ```
 
 **STOP contract:** any value differing from the expected comment above means
