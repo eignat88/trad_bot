@@ -41,7 +41,61 @@ sudo -u postgres psql -d trad_bot -v ON_ERROR_STOP=1 --single-transaction \
   A failed 075 leaves the database exactly as it was.
 * 075 is re-runnable: grants/revokes are idempotent.
 
-## 2. Post-apply verification (read-only)
+## 2. Post-apply verification (read-only) — MANDATORY, STOP ON MISMATCH
+
+These checks are NOT optional: PostgreSQL `GRANT`/`REVOKE` issued by a role
+without the required rights can silently no-op, so the only proof is the
+EFFECTIVE privilege state. Run every query below and compare against the
+expected column. **On ANY mismatch: STOP — do not provision secrets, do not
+enable the unit, do not proceed to activation.** Record the output in the
+change log.
+
+```sql
+-- (a) effective table privileges (has_*_privilege is authoritative)
+SELECT
+  has_table_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_observation', 'INSERT')      AS obs_ins,   -- false
+  has_table_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_observation', 'SELECT')      AS obs_sel,   -- true
+  has_table_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_experiment',   'UPDATE')     AS obs_upd,   -- false
+  has_table_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_freeze_registry', 'INSERT')  AS obs_reg,   -- false
+  has_table_privilege('trad_bot_htf_p2_admin',    'research.htf_baseline_short_phase2_observation', 'SELECT')      AS adm_sel,   -- true
+  has_table_privilege('trad_bot_htf_p2_admin',    'research.htf_baseline_short_phase2_experiment',   'INSERT')     AS adm_ins,   -- false
+  has_table_privilege('PUBLIC',                   'research.htf_baseline_short_phase2_observation', 'SELECT')      AS pub_sel;   -- false
+-- and, when the application roles exist in this cluster:
+SELECT
+  has_table_privilege('trad_bot', 'research.htf_baseline_short_phase2_observation', 'INSERT') AS tb_ins,   -- false
+  has_table_privilege('trad_bot', 'research.htf_baseline_short_phase2_observation', 'SELECT') AS tb_sel;   -- false
+
+-- (b) effective function privileges
+SELECT
+  has_function_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_insert_observation(text,text,text,text,text,timestamp with time zone,timestamp with time zone,timestamp with time zone,numeric,numeric,boolean,boolean,jsonb)', 'EXECUTE') AS obs_fn_ins,  -- true
+  has_function_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_activate(text,timestamp with time zone,text)', 'EXECUTE') AS obs_fn_act,  -- false
+  has_function_privilege('trad_bot_htf_p2_admin',    'research.htf_baseline_short_phase2_activate(text,timestamp with time zone,text)', 'EXECUTE') AS adm_fn_act,  -- true
+  has_function_privilege('PUBLIC',                   'research.htf_baseline_short_phase2_activate(text,timestamp with time zone,text)', 'EXECUTE') AS pub_fn_act;  -- false
+
+-- (c) SECURITY DEFINER + pinned search_path on both write functions
+SELECT proname, prosecdef, proconfig FROM pg_proc
+ WHERE proname IN ('htf_baseline_short_phase2_insert_observation',
+                   'htf_baseline_short_phase2_activate');
+-- expected: prosecdef = true for both, proconfig contains search_path=pg_catalog, research
+
+-- (d) no leftover direct DML grants anywhere on the Phase-2 tables
+SELECT grantee, table_name, privilege_type
+  FROM information_schema.table_privileges
+ WHERE table_schema = 'research'
+   AND table_name LIKE 'htf_baseline_short_phase2%'
+   AND privilege_type IN ('INSERT','UPDATE','DELETE')
+   AND grantee <> 'postgres'
+ ORDER BY 1,2,3;
+-- expected: 0 rows
+```
+
+**STOP contract:** any value differing from the expected comment above means
+the migration did not take effect as intended (wrong applying role is the
+most likely cause). Re-apply 075 as the table owner (`postgres`) and re-run
+this section; never fall back to manual GRANT/REVOKE surgery in production.
+
+Earlier structural checks (object list, role attributes, ACL diff of
+pre-existing research objects) remain useful and stay as written below.
 
 ```sql
 -- 1. objects
@@ -51,20 +105,6 @@ SELECT table_name FROM information_schema.tables
 -- 2. roles
 SELECT rolname, rolcanlogin, rolsuper, rolcreatedb, rolcreaterole
   FROM pg_roles WHERE rolname LIKE 'trad_bot_htf_p2%';
-
--- 3. no direct DML left for application roles on Phase-2 tables
-SELECT grantee, table_name, privilege_type
-  FROM information_schema.table_privileges
- WHERE table_schema = 'research'
-   AND table_name LIKE 'htf_baseline_short_phase2%'
-   AND privilege_type IN ('INSERT','UPDATE','DELETE')
- ORDER BY 1,2,3;
--- expected: only the owner (postgres)
-
--- 4. activation function is not PUBLIC
-SELECT proacl FROM pg_proc
- WHERE proname = 'htf_baseline_short_phase2_activate';
--- expected: no PUBLIC EXECUTE entry
 ```
 
 Then provision credentials per

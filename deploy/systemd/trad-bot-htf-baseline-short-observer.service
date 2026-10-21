@@ -31,6 +31,11 @@ ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.htf_baseline_short_phas
 
 Restart=on-failure
 RestartSec=60
+# Exit-code contract (runner constants): 0 = OK/stop requested, 3 =
+# EXIT_NOT_RUNNABLE (registration gate refusal / missing credentials — the
+# EXPECTED fail-closed outcome), 4 = EXIT_STATE_ERROR, 5 = EXIT_WRITER_ERROR.
+# Exit 3 must NOT trigger a restart loop: it needs operator action, not retry.
+RestartPreventExitStatus=3
 
 # Explicit shutdown: SIGTERM finishes the current 5m bar, persists the
 # checkpoint, releases the writer lease and exits.

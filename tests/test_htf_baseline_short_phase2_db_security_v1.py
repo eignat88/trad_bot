@@ -217,6 +217,29 @@ def test_075_scoped_to_phase2_surface_static():
         assert obj.startswith("htf_baseline_short_phase2"), f"out-of-scope object: {obj}"
 
 
+def test_systemd_unit_matches_exit_code_contract():
+    """F5: EXIT_NOT_RUNNABLE=3 must not restart-loop; unit keeps its guards."""
+    import app.research.htf_baseline_short_phase2_observer_runner_v1 as mod
+
+    assert mod.EXIT_NOT_RUNNABLE == 3
+    assert mod.EXIT_STATE_ERROR == 4
+    assert mod.EXIT_WRITER_ERROR == 5
+    assert mod.EXIT_OK == 0
+    unit = (ROOT / "deploy" / "systemd" / "trad-bot-htf-baseline-short-observer.service").read_text(
+        encoding="utf-8"
+    )
+    assert "RestartPreventExitStatus=3" in unit
+    assert "Restart=on-failure" in unit
+    assert "TimeoutStopSec=60" in unit
+    assert "MemoryMax=512M" in unit  # resource limits preserved
+    assert "TasksMax=64" in unit
+    assert "LimitNOFILE=4096" in unit
+    assert "ConditionPathExists=" in unit  # disabled by default preserved
+    assert "UMask=0077" in unit
+    assert "--activation-config" in unit
+    assert "EnvironmentFile=/opt/trad_bot/etc/htf_phase2_observer.env" in unit
+
+
 def test_075_requires_074_fail_closed(db):
     with db.cursor() as cur:
         cur.execute("DROP TABLE research.htf_baseline_short_phase2_freeze_registry")
