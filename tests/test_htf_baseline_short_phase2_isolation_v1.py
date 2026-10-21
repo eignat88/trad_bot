@@ -30,6 +30,7 @@ ALLOWED_NEW_PREFIXES = (
     "docs/research/HTF_BASELINE_SHORT_PHASE2_",
     "deploy/systemd/trad-bot-htf-baseline-short-observer.service",
     "sql/migrations/074_htf_baseline_short_phase2_registration.sql",
+    "sql/migrations/075_htf_baseline_short_phase2_privilege_hardening.sql",
     "tools/research/htf_baseline_short_phase2_",
 )
 

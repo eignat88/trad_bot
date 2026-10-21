@@ -8,7 +8,8 @@ Documentation=file:///opt/trad_bot/docs/research/HTF_BASELINE_SHORT_PHASE2_PROTO
 # file. Without it the service does not start at all. Creating the flag file is
 # part of the operator authorization sequence in
 # docs/research/HTF_BASELINE_SHORT_PHASE2_ACTIVATION_RUNBOOK_V1.md and must
-# never be automated.
+# never be automated. This unit is NOT enabled at install time and has no
+# dependency that would start it automatically.
 ConditionPathExists=/opt/trad_bot/etc/htf_phase2_observer_enabled
 After=network-online.target postgresql.service
 Wants=network-online.target
@@ -16,12 +17,17 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/trad_bot
-EnvironmentFile=/opt/trad_bot/.env
+# Dedicated secrets file for the observer only (chmod 0600, owner tradbot).
+# It must contain HTF_P2_DB_HOST/PORT/NAME/USER and HTF_P2_DB_PASSWORD (or
+# HTF_P2_DB_PASSWORD_FILE). The shared application .env is intentionally NOT
+# loaded: the observer must never reuse scanner credentials.
+# See docs/research/HTF_BASELINE_SHORT_PHASE2_DB_SECRETS_V1.md.
+EnvironmentFile=/opt/trad_bot/etc/htf_phase2_observer.env
 # --once is intentionally absent: the runner loops. --use-registration gates
-# startup on the DB registration state (RUNNING + freeze + matching protocol
-# fingerprint) and fails closed before any observation is created. Nothing here
-# activates the experiment.
-ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.htf_baseline_short_phase2_observer_runner_v1 --data-dir /opt/trad_bot/var/htf_phase2/candles --checkpoint /opt/trad_bot/var/htf_phase2/state.json --poll-seconds 300 --use-registration --log-level INFO
+# startup on the THREE independently maintained freeze authorities (protocol /
+# DB registration / --activation-config) and fails closed before any
+# observation is created. Nothing here activates the experiment.
+ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.htf_baseline_short_phase2_observer_runner_v1 --data-dir /opt/trad_bot/var/htf_phase2/candles --checkpoint /opt/trad_bot/var/htf_phase2/state.json --poll-seconds 300 --use-registration --activation-config /opt/trad_bot/etc/htf_phase2_activation.json --log-level INFO
 
 Restart=on-failure
 RestartSec=60
@@ -30,6 +36,10 @@ RestartSec=60
 # checkpoint, releases the writer lease and exits.
 TimeoutStopSec=60
 KillSignal=SIGTERM
+
+# Checkpoint/lease/secrets are private to the service user. Directory contract:
+# /opt/trad_bot/var/htf_phase2 owned by tradbot:tradbot, mode 0700 (see runbook).
+UMask=0077
 
 # Resource limits (documented requirement).
 MemoryMax=512M

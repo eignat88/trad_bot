@@ -576,25 +576,109 @@ def require_runnable(
     )
 
 
-def connect_db_from_env():
-    """Open the application database connection from HTF_P2_DB_* environment
-    variables (psycopg2 preferred, pg8000 fallback). Never called implicitly."""
-    host = os.environ.get("HTF_P2_DB_HOST", "127.0.0.1")
-    port = int(os.environ.get("HTF_P2_DB_PORT", "5432"))
-    user = os.environ.get("HTF_P2_DB_USER", "postgres")
-    name = os.environ.get("HTF_P2_DB_NAME", "trad_bot")
-    try:
-        import psycopg2
+DB_CONNECT_TIMEOUT_S = 5
+#: shared/admin roles the observer must never authenticate as
+_FORBIDDEN_DB_USERS = frozenset({"postgres", "trad_bot", "analytics_runner", "analytics_agent"})
 
-        return psycopg2.connect(
-            host=host, port=port, user=user, database=name, connect_timeout=5
+
+class DbCredentialsError(RuntimeError):
+    """Missing or unsafe database credentials (fail closed; never guess)."""
+
+
+def load_db_credentials() -> dict:
+    """Load dedicated-role credentials from HTF_P2_DB_* (CP2 hardening).
+
+    Fail-closed contract:
+      * ``HTF_P2_DB_USER`` is REQUIRED and must be the dedicated observer role —
+        there is no default user and shared/admin roles are rejected;
+      * ``HTF_P2_DB_NAME`` is REQUIRED (no implicit database);
+      * the password comes from ``HTF_P2_DB_PASSWORD`` or, preferably, from the
+        file named by ``HTF_P2_DB_PASSWORD_FILE`` (first non-empty line). No
+        password -> refuse to connect (never trust/peer fallback);
+      * scanner/.env credentials are never read — only HTF_P2_DB_* is consulted.
+    """
+    user = os.environ.get("HTF_P2_DB_USER", "").strip()
+    if not user:
+        raise DbCredentialsError(
+            "HTF_P2_DB_USER must explicitly name the dedicated observer role "
+            "(no default user)"
         )
-    except ImportError:
+    if user in _FORBIDDEN_DB_USERS:
+        raise DbCredentialsError(
+            "HTF_P2_DB_USER must be the dedicated observer role, not a shared "
+            "or administrative role (refusing)"
+        )
+    name = os.environ.get("HTF_P2_DB_NAME", "").strip()
+    if not name:
+        raise DbCredentialsError("HTF_P2_DB_NAME is required (no implicit database)")
+    password = os.environ.get("HTF_P2_DB_PASSWORD")
+    if password is None or password == "":
+        pw_file = os.environ.get("HTF_P2_DB_PASSWORD_FILE", "").strip()
+        if not pw_file:
+            raise DbCredentialsError(
+                "HTF_P2_DB_PASSWORD or HTF_P2_DB_PASSWORD_FILE is required "
+                "(refusing password-less connection)"
+            )
+        try:
+            lines = Path(pw_file).read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            raise DbCredentialsError(f"password file unreadable: {exc}") from exc
+        password = next((line.strip() for line in lines if line.strip()), "")
+        if not password:
+            raise DbCredentialsError("password file contains no password")
+    return {
+        "host": os.environ.get("HTF_P2_DB_HOST", "127.0.0.1"),
+        "port": int(os.environ.get("HTF_P2_DB_PORT", "5432")),
+        "user": user,
+        "database": name,
+        "password": password,
+    }
+
+
+def connect_db_from_env():
+    """Open the observer database connection from HTF_P2_DB_* (CP2 hardening).
+
+    SCRAM-SHA-256 is supported natively by pg8000, which is the preferred
+    driver; psycopg2 (libpq) is the fallback. The password is passed only to
+    the driver and is NEVER logged. Never called implicitly.
+    """
+    creds = load_db_credentials()
+    log.info(
+        "observer db connect host=%s port=%s db=%s user=%s (password redacted)",
+        creds["host"], creds["port"], creds["database"], creds["user"],
+    )
+    try:
         import pg8000.dbapi
 
         return pg8000.dbapi.connect(
-            host=host, port=port, user=user, database=name, timeout=5
+            host=creds["host"],
+            port=creds["port"],
+            user=creds["user"],
+            database=creds["database"],
+            password=creds["password"],
+            timeout=DB_CONNECT_TIMEOUT_S,
         )
+    except ImportError:
+        import psycopg2
+
+        return psycopg2.connect(
+            host=creds["host"],
+            port=creds["port"],
+            user=creds["user"],
+            database=creds["database"],
+            password=creds["password"],
+            connect_timeout=DB_CONNECT_TIMEOUT_S,
+        )
+
+
+def close_db_connection(conn) -> None:
+    """Close a database connection defensively (explicit resource cleanup)."""
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except Exception as exc:  # pragma: no cover - best effort
+        log.warning("db connection close failed: %s", exc)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -683,7 +767,11 @@ def main(argv: list[str] | None = None) -> int:
         db_conn=db_conn,
     )
     runner.install_signal_handlers()
-    return runner.run_loop()
+    try:
+        return runner.run_loop()
+    finally:
+        if db_conn is not None:
+            close_db_connection(db_conn)
 
 
 if __name__ == "__main__":  # pragma: no cover
