@@ -92,7 +92,14 @@ def replay(symbol, candles, start_ms, end_ms, *, restart_at_ms=None,
             touch = causal_contact(bar, level, atr[-1]) if atr else False
             contacts[key] = (level.price, level.available_ms, touch)
             eid = state.pending.get(key)
-            if eid and not touch and atr:
+            # P2-06: a reaction confirmation must NOT be suppressed merely
+            # because the confirming candle also touches the level. A rejection
+            # wick can pierce the level (touch) and still close away from it
+            # (reaction end) on the same bar. Confirmation is allowed on a
+            # touching bar only when the level's contact run is still active
+            # (continuation). A re-contact after the run broke is a supersession
+            # (see MultiLevelEpisodes._advance_mutating) and must not confirm.
+            if eid and (not touch or key in state.active) and atr:
                 record = state.episodes[eid]
                 first = record["first_touch_open_ms"]
                 matching = [i for i, c in enumerate(prefix)

@@ -41,9 +41,12 @@ def causal_resistance_universe(
     if atr <= 0:
         return ()
     eligible = []
+    seen_prices = set()
     for i in range(SWING_RIGHT, len(htf_closed)-SWING_RIGHT):
         c = htf_closed[i]
         price = float(c.high)
+        if price in seen_prices:
+            continue
         if not all(htf_closed[i-j].high <= price for j in range(1, SWING_RIGHT+1)):
             continue
         if not all(htf_closed[i+j].high <= price for j in range(1, SWING_RIGHT+1)):
@@ -52,6 +55,7 @@ def causal_resistance_universe(
             continue
         if not any(htf_closed[i+j].high < price for j in range(1, SWING_RIGHT+1)):
             continue
+        seen_prices.add(price)
         available = int(htf_closed[i+SWING_RIGHT].timestamp) + HOUR
         if available > asof_ms or price <= reference:
             continue

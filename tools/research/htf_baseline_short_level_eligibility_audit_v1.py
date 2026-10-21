@@ -17,6 +17,8 @@ class LevelEligibilityAudit:
                 self.ever_seen[lid]=level
                 if self.record_transitions:
                     self.counts["DISCOVERED"]+=1
+                    self.transitions.append({"asof_ms":asof_ms,"level_id":lid,"state":"DISCOVERED",
+                                             "pending":lid in pending})
             elif lid not in self.last_eligible:
                 if self.record_transitions:
                     self.counts["RE_ELIGIBLE"]+=1
