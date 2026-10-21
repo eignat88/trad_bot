@@ -35,6 +35,8 @@ from app.research.htf_keylevel_point_b import (
 )
 from app.research.htf_baseline_short_phase2_contracts_v1 import (
     HTF_MS,
+    REASON_INCOMPLETE_1H_COVERAGE,
+    ContractViolation,
     HtfCoverage,
     aggregate_closed_htf,
     htf_coverage_from_htf_series,
@@ -107,22 +109,36 @@ def build_resistance_universe(
     *,
     symbol: str,
     direction: str = "SHORT",
+    require_clean_coverage: bool = True,
+    htf_source_label: str | None = None,
 ) -> tuple[tuple[LevelRecord, ...], UniverseDiagnostics]:
     """Build the causal resistance universe for one decision time.
 
     Fail-closed on any 5m contract violation (D1). 1H coverage is accounted for
     explicitly and surfaced in the diagnostics (D2); hours that are partial or
     missing are never used to form levels and never silently ignored.
+
+    ``require_clean_coverage`` (default True) makes any partial/missing hour in
+    the decision window a hard ``ContractViolation(REASON_INCOMPLETE_1H_COVERAGE)``
+    — swing geometry must never silently stretch across a gap. Callers that
+    intentionally evaluate gap diagnostics pass False and handle coverage
+    themselves.
     """
     if direction != "SHORT":
         raise ValueError("phase-2 universe is SHORT-only")
     validate_execution_series(exec_closed, asof_ms)
-    htf_source = "AGGREGATED_5M"
+    htf_source = htf_source_label or "AGGREGATED_5M"
     coverage = HtfCoverage()
     if htf_closed:
         validate_htf_series(htf_closed, asof_ms)
-        htf_source = "PROVIDER_1H"
+        if htf_source_label is None:
+            htf_source = "PROVIDER_1H"
         coverage = htf_coverage_from_htf_series(htf_closed, asof_ms)
+    if require_clean_coverage and (coverage.partial_hours or coverage.missing_hours):
+        raise ContractViolation(
+            REASON_INCOMPLETE_1H_COVERAGE,
+            f"partial={len(coverage.partial_hours)} missing={len(coverage.missing_hours)}",
+        )
     if not htf_closed or len(htf_closed) < SWING_LEFT + SWING_RIGHT + 1:
         raise ValueError("insufficient closed 1h history")
 

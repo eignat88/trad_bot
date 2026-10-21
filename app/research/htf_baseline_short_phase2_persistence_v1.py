@@ -87,11 +87,17 @@ def load_experiment_state(conn, experiment_id: str = EXPERIMENT_ID) -> Experimen
 
 
 def freeze_sources(conn, experiment_id: str = EXPERIMENT_ID) -> dict:
-    """The three freeze sources required to agree (registry here = experiment row)."""
+    """Database-side freeze authority values (one of THREE independent sources).
+
+    This function reports ONLY what the database says. The protocol authority
+    (``protocol_v1.approved_freeze_ts``) and the runtime activation config are
+    maintained elsewhere and independently; agreement between all three is
+    enforced by the runner, which must fail closed on any mismatch or missing
+    source. Nothing here mirrors one source into another.
+    """
     state = load_experiment_state(conn, experiment_id)
     return {
         "database": state.freeze_ts,
-        "registry": state.freeze_ts,
         "status": state.status,
         "observer_enabled": state.observer_enabled,
         "database_fingerprint": state.protocol_fingerprint,
@@ -111,16 +117,23 @@ def insert_observation_raw(
     known_at,
     level_price,
     entry_reference_price,
+    warmup_origin: bool = False,
+    resumed_pre_freeze: bool = False,
     features: dict | None = None,
 ) -> int | None:
-    """Call the DB-level enforcing insert. Returns the id, or None on duplicate."""
+    """Call the DB-level enforcing insert. Returns the id, or None on duplicate.
+
+    ``warmup_origin``/``resumed_pre_freeze`` are authoritative eligibility
+    flags: the SQL function rejects any non-FALSE value, so direct callers
+    cannot smuggle ineligible episodes past the persistence boundary.
+    """
     import json
 
     cur = conn.cursor()
     try:
         cur.execute(
             "SELECT research.htf_baseline_short_phase2_insert_observation("
-            "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
+            "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
             (
                 experiment_id,
                 source_event_id,
@@ -132,6 +145,8 @@ def insert_observation_raw(
                 known_at,
                 level_price,
                 entry_reference_price,
+                bool(warmup_origin),
+                bool(resumed_pre_freeze),
                 json.dumps(features or {}, sort_keys=True),
             ),
         )
@@ -142,29 +157,34 @@ def insert_observation_raw(
 
 
 class Phase2ObservationWriter:
-    """Idempotent observation writer with application-level freeze gating."""
+    """Idempotent observation writer with mandatory freeze-boundary gating."""
 
     def __init__(self, conn, *, experiment_id: str = EXPERIMENT_ID):
         self.conn = conn
         self.experiment_id = experiment_id
 
-    def emit(self, events: list[dict], boundary: Phase2FreezeBoundary | None) -> EmitResult:
+    def emit(self, events: list[dict], boundary: Phase2FreezeBoundary) -> EmitResult:
         """Emit one atomic batch. Raises on any failure; caller must NOT advance
-        its cursor before this returns (at-least-once + idempotent writes)."""
+        its cursor before this returns (at-least-once + idempotent writes).
+
+        ``boundary`` is MANDATORY: eligibility filtering must never be silently
+        bypassed. A missing boundary is a programming error and raises.
+        """
+        if boundary is None:
+            raise ValueError(
+                "Phase2ObservationWriter.emit requires a freeze boundary; "
+                "eligibility filtering must never be bypassed"
+            )
         result = EmitResult()
         try:
             for event in events:
-                decision = (
-                    boundary.check_event(
-                        signal_time=event["known_at_ms"],
-                        first_touch_time=event["first_touch_open_ms"],
-                        warmup_origin=bool(event.get("warmup_origin")),
-                        resumed_pre_freeze=bool(event.get("resumed_pre_freeze", False)),
-                    )
-                    if boundary is not None
-                    else None
+                decision = boundary.check_event(
+                    signal_time=event["known_at_ms"],
+                    first_touch_time=event["first_touch_open_ms"],
+                    warmup_origin=bool(event.get("warmup_origin")),
+                    resumed_pre_freeze=bool(event.get("resumed_pre_freeze", False)),
                 )
-                if decision is not None and not decision:
+                if not decision:
                     result.rejected += 1
                     continue
                 row_id = insert_observation_raw(
@@ -179,11 +199,13 @@ class Phase2ObservationWriter:
                     known_at=_ms_to_iso(event["known_at_ms"]),
                     level_price=event.get("level_price_at_touch"),
                     entry_reference_price=event.get("entry_reference_price"),
+                    warmup_origin=bool(event.get("warmup_origin")),
+                    resumed_pre_freeze=bool(event.get("resumed_pre_freeze", False)),
                     features={
                         "level_available_ms": event.get("level_available_ms"),
-                        "warmup_origin": event.get("warmup_origin", False),
                         "direction": event.get("direction", "SHORT"),
                         "protocol": "HTF_BASELINE_SHORT_PHASE2_PROTOCOL_V1",
+                        "provenance": event.get("provenance", {}),
                     },
                 )
                 if row_id is None:
@@ -191,12 +213,14 @@ class Phase2ObservationWriter:
                 else:
                     result.inserted += 1
             self.conn.commit()
-        except Exception:
+        except Exception as exc:
             try:
                 self.conn.rollback()
             except Exception:
                 pass
-            raise
+            if isinstance(exc, (P2PersistenceError, ValueError)):
+                raise
+            raise P2PersistenceError(f"observation batch failed: {exc}") from exc
         return result
 
 

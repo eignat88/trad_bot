@@ -73,6 +73,7 @@ EXIT_OK = 0
 EXIT_STOP_REQUESTED = 0
 EXIT_NOT_RUNNABLE = 3
 EXIT_STATE_ERROR = 4
+EXIT_WRITER_ERROR = 5
 
 CANONICAL_WINDOW = 200
 MIN_EXEC_BARS = 20
@@ -113,6 +114,8 @@ class Metrics:
     coverage_gap_bars: int = 0
     checkpoint_writes: int = 0
     writer_errors: int = 0
+    writer_rejected: int = 0
+    quarantine_bars: int = 0
 
     def as_dict(self) -> dict:
         return dict(self.__dict__)
@@ -214,6 +217,11 @@ class Phase2ObserverRunner:
         self._emitted: set[str] = set()
         self._known_levels: dict[str, dict] = {}
         self._warmup_done: dict[str, int] = {}
+        self._coverage_reports: list[dict] = []
+        self._provenance: dict = {
+            "candle_source": type(source).__name__,
+            "htf_source": "AGGREGATED_5M",
+        }
 
     # ------------------------------------------------------------- lifecycle
     def request_stop(self, *_args) -> None:
@@ -234,6 +242,8 @@ class Phase2ObserverRunner:
             "boundary_freeze_ts_ms": self.boundary.freeze_ts_ms,
             "protocol_fingerprint": self.boundary.protocol_fingerprint,
             "created_at_ms": int(time.time() * 1000),
+            "provenance": dict(self._provenance),
+            "coverage_reports": list(self._coverage_reports),
             "emitted": sorted(self._emitted),
             "known_levels": self._known_levels,
             "cursors": dict(self._cursors),
@@ -263,6 +273,9 @@ class Phase2ObserverRunner:
         self._known_levels = dict(payload.get("known_levels", {}))
         self._cursors = dict(payload.get("cursors", {}))
         self._warmup_done = dict(payload.get("warmup_done", {}))
+        self._coverage_reports = list(payload.get("coverage_reports", []))
+        if payload.get("provenance"):
+            self._provenance = dict(payload["provenance"])
         self._state = {
             symbol: Phase2Episodes.restore(data)
             for symbol, data in payload.get("symbols", {}).items()
@@ -289,10 +302,6 @@ class Phase2ObserverRunner:
             bar = candles[index]
             open_ms = int(bar.timestamp)
             asof = open_ms + BAR_MS
-            warmup = warmup_budget > 0
-            if warmup:
-                warmup_budget -= 1
-                self._warmup_done[symbol] = self._warmup_done.get(symbol, 0) + 1
 
             prefix = candles[max(0, index - CANONICAL_WINDOW + 1): index + 1]
             try:
@@ -301,52 +310,88 @@ class Phase2ObserverRunner:
                 self.metrics.coverage_gap_bars += 1
                 self._cursors[symbol] = index + 1
                 continue
+            # CP4 gap policy: an incomplete/missing 1H hour must never silently
+            # change level selection. Quarantine the symbol at the first dirty
+            # bar (cursor frozen) and wait for the source data to be completed;
+            # identity stays stable across quarantine/repair.
+            if not coverage.clean:
+                self.metrics.quarantine_bars += 1
+                self._coverage_reports.append(
+                    {
+                        "symbol": symbol,
+                        "asof_ms": asof,
+                        "action": "QUARANTINED",
+                        "partial_hours": list(coverage.partial_hours),
+                        "missing_hours": list(coverage.missing_hours),
+                    }
+                )
+                break
             htf = htf[-DEFAULT_HTF_HISTORY_HOURS:]
+            # warmup accounting happens ONLY for bars the machine actually
+            # advances over; quarantined bars never consume warmup budget
+            warmup = warmup_budget > 0
+            if warmup:
+                warmup_budget -= 1
+                self._warmup_done[symbol] = self._warmup_done.get(symbol, 0) + 1
             known = self._known_levels.setdefault(symbol, {})
             contacts: dict[str, tuple[float, int, bool]] = {}
             confirmations: list[str] = []
             unavailable: list[str] = []
-            if len(prefix) >= MIN_EXEC_BARS and len(htf) >= MIN_HTF_BARS:
-                universe, _diag = build_resistance_universe(
-                    htf, prefix, asof, symbol=symbol
+            try:
+                if len(prefix) >= MIN_EXEC_BARS and len(htf) >= MIN_HTF_BARS:
+                    universe, _diag = build_resistance_universe(
+                        htf, prefix, asof, symbol=symbol
+                    )
+                    for record in universe:
+                        known.setdefault(
+                            record.level_id,
+                            {
+                                "level_id": record.level_id,
+                                "price": record.price,
+                                "available_ms": record.available_ms,
+                            },
+                        )
+                    atr = _causal_atr_series(prefix)
+                    for key in sorted(known):
+                        level = known[key]
+                        if int(level["available_ms"]) > open_ms:
+                            continue
+                        touch = is_touch(
+                            bar, float(level["price"]), int(level["available_ms"]), atr[-1]
+                        )
+                        contacts[key] = (float(level["price"]), int(level["available_ms"]), touch)
+                        eid = state.pending.get(key)
+                        # P2-06/P2-09: confirmation allowed on a touching bar only
+                        # while the contact run is active (continuation).
+                        if eid and (not touch or key in state.active):
+                            record = state.episodes[eid]
+                            first = record["first_touch_open_ms"]
+                            matching = [i for i, c in enumerate(prefix) if int(c.timestamp) == first]
+                            if matching:
+                                candidate = _find_reaction_end(
+                                    closed=prefix,
+                                    touch_index=matching[0],
+                                    level=SimpleNamespace(price=record["level_price_at_touch"]),
+                                    direction="SHORT",
+                                    atr_by_index=atr,
+                                )
+                                if candidate is not None and candidate[0] == len(prefix) - 1:
+                                    confirmations.append(key)
+                            else:
+                                unavailable.append(key)
+            except ContractViolation as exc:
+                # 5m contract violation (gap/duplicate/conflict...) or universe
+                # coverage refusal: quarantine instead of silently re-selecting
+                self.metrics.coverage_gap_bars += 1
+                self._coverage_reports.append(
+                    {
+                        "symbol": symbol,
+                        "asof_ms": asof,
+                        "action": "QUARANTINED",
+                        "reason": str(exc),
+                    }
                 )
-                for record in universe:
-                    known.setdefault(
-                        record.level_id,
-                        {
-                            "level_id": record.level_id,
-                            "price": record.price,
-                            "available_ms": record.available_ms,
-                        },
-                    )
-                atr = _causal_atr_series(prefix)
-                for key in sorted(known):
-                    level = known[key]
-                    if int(level["available_ms"]) > open_ms:
-                        continue
-                    touch = is_touch(
-                        bar, float(level["price"]), int(level["available_ms"]), atr[-1]
-                    )
-                    contacts[key] = (float(level["price"]), int(level["available_ms"]), touch)
-                    eid = state.pending.get(key)
-                    # P2-06/P2-09: confirmation allowed on a touching bar only
-                    # while the contact run is active (continuation).
-                    if eid and (not touch or key in state.active):
-                        record = state.episodes[eid]
-                        first = record["first_touch_open_ms"]
-                        matching = [i for i, c in enumerate(prefix) if int(c.timestamp) == first]
-                        if matching:
-                            candidate = _find_reaction_end(
-                                closed=prefix,
-                                touch_index=matching[0],
-                                level=SimpleNamespace(price=record["level_price_at_touch"]),
-                                direction="SHORT",
-                                atr_by_index=atr,
-                            )
-                            if candidate is not None and candidate[0] == len(prefix) - 1:
-                                confirmations.append(key)
-                        else:
-                            unavailable.append(key)
+                break
             emitted = state.advance(
                 open_ms=open_ms,
                 level_contacts=contacts,
@@ -355,6 +400,11 @@ class Phase2ObserverRunner:
                 warmup=warmup,
             )
             for event in emitted:
+                event["provenance"] = {
+                    "candle_source": self._provenance.get("candle_source"),
+                    "htf_source": self._provenance.get("htf_source", "AGGREGATED_5M"),
+                    "coverage_clean": True,
+                }
                 decision = self.boundary.check_event(
                     signal_time=event["known_at_ms"],
                     first_touch_time=event["first_touch_open_ms"],
@@ -374,7 +424,10 @@ class Phase2ObserverRunner:
             result = self.writer.emit(emitted_events, self.boundary)
             self.metrics.emissions_eligible += getattr(result, "inserted", 0)
             self.metrics.duplicate_suppressions += getattr(result, "deduplicated", 0)
-            self.metrics.emissions_rejected += getattr(result, "rejected", 0)
+            # writer-side rejections are counted separately: events reaching the
+            # writer were already boundary-filtered above, so any writer-level
+            # rejection is drift, never a second count of the same rejection
+            self.metrics.writer_rejected += getattr(result, "rejected", 0)
             for event in emitted_events:
                 self._emitted.add(event["source_event_id"])
         elif emitted_events:
@@ -407,6 +460,18 @@ class Phase2ObserverRunner:
             self.metrics.writer_errors += 1
             log.error("state store failure: %s", exc)
             return EXIT_STATE_ERROR
+        except Exception as exc:
+            # persistence-specific and unexpected errors map to a deterministic
+            # exit code; the checkpoint was not advanced, so restart replays
+            from app.research.htf_baseline_short_phase2_persistence_v1 import (
+                P2PersistenceError,
+            )
+
+            if isinstance(exc, P2PersistenceError):
+                self.metrics.writer_errors += 1
+                log.error("persistence failure: %s", exc)
+                return EXIT_WRITER_ERROR
+            raise
         finally:
             lease.release()
         return EXIT_OK
@@ -426,24 +491,86 @@ class Phase2ObserverRunner:
         return EXIT_OK
 
 
-def require_runnable(db_conn, config: RunnerConfig) -> Phase2FreezeBoundary:
-    """Fail-closed gate: registration + freeze + fingerprint must all agree."""
+def load_activation_config(path: str | os.PathLike) -> dict:
+    """Load the operator-maintained runtime activation config (authority 3).
+
+    Expected JSON: {"experiment_id": ..., "freeze_ts": <ISO8601>,
+    "protocol_fingerprint": <64-hex>}. This file is deployed by the operator at
+    activation time and is maintained independently of both the protocol
+    constant and the database activation record.
+    """
+    try:
+        data = json.loads(Path(str(path)).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise NotRunnableError(f"activation config unreadable: {exc}") from exc
+    if not isinstance(data, dict):
+        raise NotRunnableError("activation config must be a JSON object")
+    for key in ("experiment_id", "freeze_ts", "protocol_fingerprint"):
+        if not data.get(key):
+            raise NotRunnableError(f"activation config missing {key}")
+    return data
+
+
+def require_runnable(
+    db_conn,
+    config: RunnerConfig,
+    *,
+    activation: dict | None = None,
+    protocol_freeze_ts: str | None = None,
+) -> Phase2FreezeBoundary:
+    """Fail-closed gate over THREE independently maintained freeze authorities.
+
+    1. Approved frozen protocol — ``protocol_v1.approved_freeze_ts()`` (or an
+       explicitly injected value in tests). None means the protocol is not
+       frozen yet -> refuse to run.
+    2. Durable experiment registration — the database activation record
+       (freeze_ts + protocol_fingerprint written once by ``activate()``).
+    3. Runtime activation configuration — the operator-deployed activation
+       file (``activation`` mapping from :func:`load_activation_config`).
+
+    No source is derived from another, so a stale or missing source can never
+    be masked by copying. Every missing source or pairwise disagreement
+    rejects startup; fingerprints must additionally match the fingerprint of
+    the code actually running (``config.protocol_fingerprint``).
+    """
     from app.research.htf_baseline_short_phase2_persistence_v1 import (
         freeze_sources,
         load_experiment_state,
     )
+    from app.research.htf_baseline_short_phase2_protocol_v1 import approved_freeze_ts
 
     state = load_experiment_state(db_conn, config.experiment_id)
+    sources = freeze_sources(db_conn, config.experiment_id)
+
     if state.protocol_fingerprint != config.protocol_fingerprint:
         raise NotRunnableError(
-            "protocol fingerprint mismatch between runtime and registration "
+            "protocol fingerprint mismatch between runtime code and registration "
             "(fail closed; no observations)"
         )
-    sources = freeze_sources(db_conn, config.experiment_id)
+    if protocol_freeze_ts is None:
+        protocol_freeze_ts = approved_freeze_ts()
+    if not protocol_freeze_ts:
+        raise NotRunnableError(
+            "protocol freeze authority is empty: the protocol is not frozen "
+            "(fail closed; no observations)"
+        )
+    if activation is None:
+        raise NotRunnableError(
+            "runtime activation configuration is missing (fail closed; no observations)"
+        )
+    if activation.get("experiment_id") != config.experiment_id:
+        raise NotRunnableError("activation config experiment_id mismatch")
+    if activation.get("protocol_fingerprint") != config.protocol_fingerprint:
+        raise NotRunnableError(
+            "activation config fingerprint mismatch (outdated activation "
+            "configuration; fail closed)"
+        )
+    if sources.get("database") is None:
+        raise NotRunnableError("database freeze authority is empty")
     return build_boundary(
         experiment_id=config.experiment_id,
-        protocol_freeze_ts=sources["registry"],
-        registry_freeze_ts=sources["registry"],
+        protocol_freeze_ts=protocol_freeze_ts,
+        registry_freeze_ts=activation.get("freeze_ts"),
         database_freeze_ts=sources["database"],
         protocol_fingerprint_hex=config.protocol_fingerprint,
     )
@@ -486,6 +613,11 @@ def main(argv: list[str] | None = None) -> int:
         help="production path: gate startup on the DB registration + freeze sources",
     )
     parser.add_argument(
+        "--activation-config",
+        default=None,
+        help="operator-maintained runtime activation config (JSON); REQUIRED with --use-registration",
+    )
+    parser.add_argument(
         "--freeze-ts",
         default=None,
         help="explicit test-only freeze (ISO); dry-run only; never used in production",
@@ -509,11 +641,15 @@ def main(argv: list[str] | None = None) -> int:
     writer = InMemoryWriter()
     db_conn = None
     if args.use_registration:
-        # production path: registration + freeze sources must all agree,
-        # otherwise exit fail-closed BEFORE any observation is created
+        # production path: the THREE independent freeze authorities must all
+        # agree, otherwise exit fail-closed BEFORE any observation is created
+        if not args.activation_config:
+            log.error("registration gate: --activation-config is required")
+            return EXIT_NOT_RUNNABLE
         try:
+            activation = load_activation_config(args.activation_config)
             db_conn = connect_db_from_env()
-            boundary = require_runnable(db_conn, config)
+            boundary = require_runnable(db_conn, config, activation=activation)
         except Exception as exc:
             log.error("registration gate refused startup: %s", exc)
             return EXIT_NOT_RUNNABLE

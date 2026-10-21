@@ -108,12 +108,19 @@ CREATE TABLE IF NOT EXISTS research.htf_baseline_short_phase2_observation (
     known_at             TIMESTAMPTZ NOT NULL,
     level_price          NUMERIC,
     entry_reference_price NUMERIC,
+    -- eligibility is decided by authoritative columns, NEVER by caller JSONB
+    warmup_origin        BOOLEAN NOT NULL DEFAULT FALSE,
+    resumed_pre_freeze   BOOLEAN NOT NULL DEFAULT FALSE,
     features             JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (experiment_id, source_event_id),
     CHECK (signal_time > first_touch_time),
     CHECK (known_at = signal_time),
-    CHECK (source_event_id <> '')
+    CHECK (source_event_id <> ''),
+    CHECK (source_event_id = episode_id || ':FIRST_CONFIRM'),
+    -- warmup-origin episodes can NEVER become prospective observations
+    CHECK (warmup_origin = FALSE),
+    CHECK (resumed_pre_freeze = FALSE)
 );
 
 CREATE INDEX IF NOT EXISTS idx_htf_p2_obs_experiment_time
@@ -123,7 +130,35 @@ CREATE INDEX IF NOT EXISTS idx_htf_p2_obs_episode
 
 CREATE OR REPLACE FUNCTION research.htf_baseline_short_phase2_observation_guard()
 RETURNS TRIGGER AS $$
+DECLARE
+    _exp research.htf_baseline_short_phase2_experiment%ROWTYPE;
 BEGIN
+    IF TG_OP = 'INSERT' THEN
+        -- direct SQL callers cannot bypass eligibility either
+        IF NEW.warmup_origin IS DISTINCT FROM FALSE THEN
+            RAISE EXCEPTION 'P2_WARMUP_EVENT_REJECTED';
+        END IF;
+        IF NEW.resumed_pre_freeze IS DISTINCT FROM FALSE THEN
+            RAISE EXCEPTION 'P2_RESUMED_PRE_FREEZE_REJECTED';
+        END IF;
+        SELECT * INTO _exp
+          FROM research.htf_baseline_short_phase2_experiment
+         WHERE experiment_id = NEW.experiment_id
+           FOR SHARE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'P2_EXPERIMENT_NOT_REGISTERED';
+        END IF;
+        IF _exp.freeze_ts IS NULL OR _exp.status <> 'RUNNING' OR NOT _exp.observer_enabled THEN
+            RAISE EXCEPTION 'P2_OBSERVER_NOT_ENABLED';
+        END IF;
+        IF NEW.signal_time <= _exp.freeze_ts THEN
+            RAISE EXCEPTION 'P2_SIGNAL_NOT_AFTER_FREEZE';
+        END IF;
+        IF NEW.first_touch_time <= _exp.freeze_ts THEN
+            RAISE EXCEPTION 'P2_FIRST_TOUCH_NOT_AFTER_FREEZE';
+        END IF;
+        RETURN NEW;
+    END IF;
     IF TG_OP IN ('UPDATE', 'DELETE') THEN
         RAISE EXCEPTION 'P2_OBSERVATIONS_ARE_IMMUTABLE';
     END IF;
@@ -134,10 +169,46 @@ $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS trg_htf_baseline_short_phase2_observation_guard
     ON research.htf_baseline_short_phase2_observation;
 CREATE TRIGGER trg_htf_baseline_short_phase2_observation_guard
-    BEFORE UPDATE OR DELETE ON research.htf_baseline_short_phase2_observation
+    BEFORE INSERT OR UPDATE OR DELETE ON research.htf_baseline_short_phase2_observation
     FOR EACH ROW EXECUTE FUNCTION research.htf_baseline_short_phase2_observation_guard();
 
+-- ------------------------------------------------------- freeze registry (CP1)
+-- Canonical, globally-unique claim of every approved freeze timestamp.
+-- The PRIMARY KEY on freeze_ts makes REUSE of any claimed timestamp
+-- (including timestamps already claimed by other experiment families when
+-- they are registered here) structurally impossible. Rows are append-only.
+CREATE TABLE IF NOT EXISTS research.htf_baseline_short_phase2_freeze_registry (
+    freeze_ts            TIMESTAMPTZ PRIMARY KEY,
+    experiment_id        TEXT NOT NULL,
+    protocol_fingerprint TEXT NOT NULL CHECK (length(protocol_fingerprint) = 64),
+    activated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    activated_by         TEXT NOT NULL DEFAULT current_user,
+    note                 TEXT
+);
+
+CREATE OR REPLACE FUNCTION research.htf_baseline_short_phase2_freeze_registry_guard()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP IN ('UPDATE', 'DELETE') THEN
+        RAISE EXCEPTION 'P2_FREEZE_REGISTRY_IS_IMMUTABLE';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_htf_baseline_short_phase2_freeze_registry_guard
+    ON research.htf_baseline_short_phase2_freeze_registry;
+CREATE TRIGGER trg_htf_baseline_short_phase2_freeze_registry_guard
+    BEFORE UPDATE OR DELETE ON research.htf_baseline_short_phase2_freeze_registry
+    FOR EACH ROW EXECUTE FUNCTION research.htf_baseline_short_phase2_freeze_registry_guard();
+
 -- --------------------------------------------------------------- insert path
+-- Eligibility is enforced HERE for every caller, including direct SQL:
+--   * explicit warmup/resumed-pre-freeze flags are REJECTED (never stored);
+--   * strict > freeze on BOTH signal_time and first_touch_time;
+--   * source_event_id must match the FIRST_CONFIRM identity shape;
+--   * authoritative flags are written by this function, caller JSONB cannot
+--     spoof them (it is nested under "caller" and never inspected for eligibility).
 CREATE OR REPLACE FUNCTION research.htf_baseline_short_phase2_insert_observation(
     _experiment_id         TEXT,
     _source_event_id       TEXT,
@@ -149,12 +220,23 @@ CREATE OR REPLACE FUNCTION research.htf_baseline_short_phase2_insert_observation
     _known_at              TIMESTAMPTZ,
     _level_price           NUMERIC,
     _entry_reference_price NUMERIC,
+    _warmup_origin         BOOLEAN DEFAULT FALSE,
+    _resumed_pre_freeze    BOOLEAN DEFAULT FALSE,
     _features              JSONB DEFAULT '{}'::jsonb
 ) RETURNS BIGINT AS $$
 DECLARE
     _exp research.htf_baseline_short_phase2_experiment%ROWTYPE;
     _id  BIGINT;
 BEGIN
+    IF _warmup_origin IS DISTINCT FROM FALSE THEN
+        RAISE EXCEPTION 'P2_WARMUP_EVENT_REJECTED';
+    END IF;
+    IF _resumed_pre_freeze IS DISTINCT FROM FALSE THEN
+        RAISE EXCEPTION 'P2_RESUMED_PRE_FREEZE_REJECTED';
+    END IF;
+    IF _source_event_id IS DISTINCT FROM _episode_id || ':FIRST_CONFIRM' THEN
+        RAISE EXCEPTION 'P2_SOURCE_EVENT_ID_SHAPE';
+    END IF;
     SELECT * INTO _exp
       FROM research.htf_baseline_short_phase2_experiment
      WHERE experiment_id = _experiment_id
@@ -183,11 +265,16 @@ BEGIN
     INSERT INTO research.htf_baseline_short_phase2_observation (
         experiment_id, source_event_id, episode_id, level_id, symbol, direction,
         signal_time, first_touch_time, known_at, level_price,
-        entry_reference_price, features
+        entry_reference_price, warmup_origin, resumed_pre_freeze, features
     ) VALUES (
         _experiment_id, _source_event_id, _episode_id, _level_id, _symbol, 'SHORT',
         _signal_time, _first_touch_time, _known_at, _level_price,
-        _entry_reference_price, COALESCE(_features, '{}'::jsonb)
+        _entry_reference_price, FALSE, FALSE,
+        jsonb_build_object(
+            'warmup_origin', FALSE,
+            'resumed_pre_freeze', FALSE,
+            'caller', COALESCE(_features, '{}'::jsonb)
+        )
     )
     ON CONFLICT (experiment_id, source_event_id) DO NOTHING
     RETURNING observation_id INTO _id;
@@ -196,6 +283,19 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- --------------------------------------------------------------- activation
+-- Timestamp policy (documented skew tolerance):
+--   * freeze_ts MUST NOT be in the past beyond a 60-second clock-skew window
+--     (retroactive activation is rejected: P2_FREEZE_TS_IN_PAST);
+--   * freeze_ts MUST NOT be more than 5 minutes in the future
+--     (P2_FREEZE_TS_MUST_NOT_BE_FAR_FUTURE);
+--   * freeze_ts MUST NOT equal any previously claimed timestamp
+--     (P2_FREEZE_TS_ALREADY_CLAIMED) — this structurally forbids reusing
+--     timestamps already claimed by other experiment families once their
+--     claims are recorded in the canonical registry;
+--   * activation atomically writes the immutable activation record
+--     (freeze_ts, experiment_id, protocol_fingerprint, activated_at/by);
+--   * concurrent activation is serialized by FOR UPDATE on the experiment
+--     row; the loser fails cleanly and can never mutate the recorded freeze.
 CREATE OR REPLACE FUNCTION research.htf_baseline_short_phase2_activate(
     _experiment_id TEXT,
     _freeze_ts     TIMESTAMPTZ,
@@ -209,6 +309,9 @@ BEGIN
     END IF;
     IF _freeze_ts IS NULL THEN
         RAISE EXCEPTION 'P2_FREEZE_TS_REQUIRED';
+    END IF;
+    IF _freeze_ts < now() - interval '60 seconds' THEN
+        RAISE EXCEPTION 'P2_FREEZE_TS_IN_PAST';
     END IF;
     IF _freeze_ts > now() + interval '5 minutes' THEN
         RAISE EXCEPTION 'P2_FREEZE_TS_MUST_NOT_BE_FAR_FUTURE';
@@ -226,6 +329,13 @@ BEGIN
     IF _exp.freeze_ts IS NOT NULL THEN
         RAISE EXCEPTION 'P2_FREEZE_TS_SET_ONCE';
     END IF;
+    BEGIN
+        INSERT INTO research.htf_baseline_short_phase2_freeze_registry (
+            freeze_ts, experiment_id, protocol_fingerprint
+        ) VALUES (_freeze_ts, _experiment_id, _fingerprint);
+    EXCEPTION WHEN unique_violation THEN
+        RAISE EXCEPTION 'P2_FREEZE_TS_ALREADY_CLAIMED';
+    END;
     UPDATE research.htf_baseline_short_phase2_experiment
        SET status = 'RUNNING',
            freeze_ts = _freeze_ts,

@@ -168,20 +168,39 @@ def _pid_alive(pid: int) -> bool:
 
 
 class WriterLease:
-    """Single-writer lease with heartbeat and explicit stale takeover."""
+    """Single-writer lease with heartbeat, fencing token and explicit stale takeover.
+
+    Concurrency contract (remediation CP5):
+
+    * takeover is only possible with the explicit ``allow_stale_takeover``
+      flag AND proof that the previous owner is gone: a lock whose owner PID
+      is verifiably dead is stale; a lock whose owner PID is ALIVE is never
+      stale, no matter how old its heartbeat is (a slow writer must never be
+      stolen from);
+    * every acquisition mints a unique ``generation`` fencing token; heartbeat
+      and release verify ownership by generation, so a writer that lost its
+      lease to a takeover detects ``LEASE_LOST`` at its next heartbeat and
+      must stop writing — two writers cannot both believe they hold the lease
+      for more than one heartbeat interval;
+    * unreadable lock metadata (crash during lock creation) is recoverable
+      only through the same explicit takeover path.
+    """
 
     def __init__(self, path: str | os.PathLike, *, instance_id: str, stale_after_s: float = 600.0):
         self.lock_path = Path(str(path) + LEASE_SUFFIX)
         self.instance_id = instance_id
         self.stale_after_s = float(stale_after_s)
         self._owned = False
+        self._generation = None
 
     def acquire(self, *, allow_stale_takeover: bool = False) -> dict:
         import time
+        import uuid
 
         metadata = {
             "pid": os.getpid(),
             "instance_id": self.instance_id,
+            "generation": uuid.uuid4().hex,
             "acquired_at_ms": int(time.time() * 1000),
             "heartbeat_at_ms": int(time.time() * 1000),
         }
@@ -191,6 +210,7 @@ class WriterLease:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
                     json.dump(metadata, handle)
                 self._owned = True
+                self._generation = metadata["generation"]
                 return metadata
             except FileExistsError:
                 existing = self._read_lock()
@@ -218,13 +238,16 @@ class WriterLease:
         import time
 
         pid = existing.get("pid")
-        if isinstance(pid, int) and not _pid_alive(pid):
-            return True
+        if isinstance(pid, int):
+            if _pid_alive(pid):
+                return False  # a live owner is NEVER stale
+            return True  # verifiably dead owner -> recoverable
+        # no readable owner pid: only an explicit takeover may recover this
         heartbeat = existing.get("heartbeat_at_ms")
         if isinstance(heartbeat, (int, float)):
             age_s = (time.time() * 1000 - heartbeat) / 1000.0
             return age_s > self.stale_after_s
-        return True  # unreadable lock metadata → treat as stale
+        return True  # unreadable lock metadata -> recoverable via explicit takeover
 
     def heartbeat(self) -> None:
         import time
@@ -232,8 +255,16 @@ class WriterLease:
         if not self._owned:
             raise WriterLeaseError("heartbeat without ownership")
         existing = self._read_lock()
+        if (
+            existing.get("instance_id") != self.instance_id
+            or existing.get("generation") != self._generation
+        ):
+            self._owned = False
+            raise WriterLeaseError(
+                "LEASE_LOST: lock was taken over by another writer; "
+                "this instance must stop writing"
+            )
         existing["heartbeat_at_ms"] = int(time.time() * 1000)
-        existing["instance_id"] = self.instance_id
         temp = self.lock_path.with_suffix(".tmp")
         temp.write_text(json.dumps(existing), encoding="utf-8")
         os.replace(temp, self.lock_path)
@@ -242,7 +273,10 @@ class WriterLease:
         if not self._owned:
             return
         existing = self._read_lock()
-        if existing.get("instance_id") == self.instance_id:
+        if (
+            existing.get("instance_id") == self.instance_id
+            and existing.get("generation") == self._generation
+        ):
             try:
                 self.lock_path.unlink()
             except OSError:

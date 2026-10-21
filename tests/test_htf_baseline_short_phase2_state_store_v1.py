@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -174,3 +175,88 @@ def test_heartbeat_without_ownership_rejected(tmp_path):
     lease = WriterLease(tmp_path / "state.json", instance_id="run-1")
     with pytest.raises(WriterLeaseError):
         lease.heartbeat()
+
+
+# ------------------------------------------- remediation CP5/CP6 lease safety
+
+
+def test_live_owner_never_stolen_even_with_stale_heartbeat(tmp_path):
+    lease1 = WriterLease(tmp_path / "state.json", instance_id="slow-writer", stale_after_s=0.001)
+    lease1.acquire()
+    time.sleep(0.02)  # heartbeat is now far older than stale_after_s
+    lease2 = WriterLease(tmp_path / "state.json", instance_id="thief", stale_after_s=0.001)
+    with pytest.raises(WriterLeaseError):
+        lease2.acquire(allow_stale_takeover=True)  # PID alive -> never stale
+    lease1.heartbeat()  # original owner still in control
+    lease1.release()
+
+
+def test_takeover_fences_the_original_owner(tmp_path):
+    lease1 = WriterLease(tmp_path / "state.json", instance_id="run-1")
+    lease1.acquire()
+    # simulate run-1 having died: its owner PID is gone
+    lock_path = tmp_path / f"state.json{LEASE_SUFFIX}"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock["pid"] = 999_999_999
+    lock["heartbeat_at_ms"] = 0
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    lease2 = WriterLease(tmp_path / "state.json", instance_id="run-2")
+    lease2.acquire(allow_stale_takeover=True)
+    # the fenced owner detects the takeover at its next heartbeat
+    with pytest.raises(WriterLeaseError) as excinfo:
+        lease1.heartbeat()
+    assert "LEASE_LOST" in str(excinfo.value)
+    # a fenced owner must never unlink the new owner's lock
+    lease1.release()
+    assert lock_path.exists()
+    lease2.heartbeat()  # new owner still in control
+    lease2.release()
+
+
+def test_real_process_kill_lease_recovery(tmp_path):
+    """CP6: actual subprocess kill, not metadata simulation."""
+    import subprocess
+    import sys
+    import textwrap
+
+    repo_root = Path(__file__).resolve().parent.parent
+    state_path = tmp_path / "state.json"
+    ready_flag = tmp_path / "child-ready"
+    child_code = textwrap.dedent(
+        f"""
+        import sys, time
+        sys.path.insert(0, {str(repo_root)!r})
+        from app.research.htf_baseline_short_phase2_state_store_v1 import WriterLease
+        lease = WriterLease({str(state_path)!r}, instance_id="child")
+        lease.acquire()
+        open({str(ready_flag)!r}, "w").write("1")
+        time.sleep(120)
+        """
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child_code],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    try:
+        deadline = time.time() + 30
+        while time.time() < deadline and not ready_flag.exists():
+            time.sleep(0.05)
+        assert ready_flag.exists(), "child did not acquire the lease in time"
+        # while the child lives, even explicit takeover must be refused
+        intruder = WriterLease(state_path, instance_id="intruder", stale_after_s=0.001)
+        with pytest.raises(WriterLeaseError):
+            intruder.acquire(allow_stale_takeover=True)
+        proc.kill()  # the real thing: process termination
+        proc.wait(timeout=30)
+        # dead owner -> explicit takeover recovers the lease
+        recovered = WriterLease(state_path, instance_id="recovered", stale_after_s=0.001)
+        metadata = recovered.acquire(allow_stale_takeover=True)
+        assert metadata["instance_id"] == "recovered"
+        recovered.release()
+    finally:
+        if proc.poll() is None:  # pragma: no cover
+            proc.kill()
+            proc.wait(timeout=30)

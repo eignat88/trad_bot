@@ -82,11 +82,12 @@ def test_migration_touches_only_new_phase2_tables():
     sql = (
         ROOT / "sql" / "migrations" / "074_htf_baseline_short_phase2_registration.sql"
     ).read_text(encoding="utf-8")
-    # only CREATE on the two new tables; no ALTER/DROP/TRUNCATE anywhere
+    # only CREATE on the new Phase-2 tables; no ALTER/DROP/TRUNCATE anywhere
     creates = re.findall(r"CREATE TABLE (?:IF NOT EXISTS )?([\w.]+)", sql)
     assert set(creates) == {
         "research.htf_baseline_short_phase2_experiment",
         "research.htf_baseline_short_phase2_observation",
+        "research.htf_baseline_short_phase2_freeze_registry",
     }
     upper = sql.upper()
     for forbidden in ("ALTER TABLE", "DROP TABLE", "TRUNCATE", "DELETE FROM", "UPDATE RESEARCH.PROSPECTIVE"):

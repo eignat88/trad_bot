@@ -246,3 +246,95 @@ def test_memory_writer_is_idempotent_and_freeze_gated():
     result3 = writer.emit([pre_freeze], boundary)
     assert result3.rejected == 1
     assert len(writer.rows) == 1
+
+
+# ------------------------------------------- remediation CP4: coverage gaps
+
+
+def _write_candles(data_dir, candles):
+    with (data_dir / "BTCUSDT_5m.csv").open("w", encoding="utf-8", newline="") as handle:
+        handle.write("timestamp,open,high,low,close,volume\n")
+        for c in candles:
+            handle.write(f"{c.timestamp},{c.open},{c.high},{c.low},{c.close},{c.volume}\n")
+
+
+def test_missing_hour_quarantines_and_recovers_with_stable_identity(env):
+    tmp_path, config, boundary, source, writer, candles = env
+    data_dir = tmp_path / "candles"
+    # gap after the fixture's contact/confirmation hours (25..28)
+    gap_start = HOUR0 + 29 * HOUR
+    gapped = [c for c in candles if not (gap_start <= c.timestamp < gap_start + HOUR)]
+    _write_candles(data_dir, gapped)
+
+    quarantined = Phase2ObserverRunner(config, boundary=boundary, source=source, writer=writer)
+    assert quarantined.run_once() == EXIT_OK
+    assert quarantined.metrics.quarantine_bars >= 1  # gap policy engaged
+    ids_before_gap = {row["source_event_id"] for row in writer.rows}
+    state = read_checkpoint(tmp_path / "state.json")
+    assert state["coverage_reports"], "coverage diagnostics must be recorded"
+    assert any(r.get("action") == "QUARANTINED" for r in state["coverage_reports"])
+
+    # data completion -> automatic recovery, cursor resumes where it stopped
+    _write_candles(data_dir, candles)
+    recovered = Phase2ObserverRunner(config, boundary=boundary, source=source, writer=writer)
+    assert recovered.run_once() == EXIT_OK
+    assert recovered.metrics.bars_processed >= 1  # quarantine released
+    ids_recovered = {row["source_event_id"] for row in writer.rows}
+
+    # reference: the same data processed in one clean pass from scratch
+    ref_config = RunnerConfig(
+        symbols=("BTCUSDT",),
+        checkpoint_path=str(tmp_path / "ref-state.json"),
+        warmup_bars=config.warmup_bars,
+    )
+    ref_writer = InMemoryWriter()
+    reference = Phase2ObserverRunner(ref_config, boundary=boundary, source=source, writer=ref_writer)
+    assert reference.run_once() == EXIT_OK
+    ids_reference = {row["source_event_id"] for row in ref_writer.rows}
+
+    # identity is stable: gap quarantine + repair equals one clean pass
+    assert ids_before_gap | ids_recovered == ids_reference
+
+
+def test_coverage_clean_events_carry_provenance(env):
+    tmp_path, config, boundary, source, writer, candles = env
+    runner = Phase2ObserverRunner(config, boundary=boundary, source=source, writer=writer)
+    assert runner.run_once() == EXIT_OK
+    assert writer.rows, "expected at least one eligible event in the fixture"
+    for row in writer.rows:
+        prov = row["provenance"]
+        assert prov["candle_source"] == "FileCandleSource"
+        assert prov["htf_source"] == "AGGREGATED_5M"
+        assert prov["coverage_clean"] is True
+    state = read_checkpoint(tmp_path / "state.json")
+    assert state["provenance"]["candle_source"] == "FileCandleSource"
+
+
+# --------------------------------------- remediation CP5: writer failures
+
+
+def test_writer_persistence_error_maps_to_deterministic_exit_code(env):
+    from app.research.htf_baseline_short_phase2_observer_runner_v1 import EXIT_WRITER_ERROR
+    from app.research.htf_baseline_short_phase2_persistence_v1 import P2PersistenceError
+
+    tmp_path, config, boundary, source, writer, candles = env
+    config.warmup_bars = 0  # ensure eligible events reach the writer
+
+    class FailingWriter:
+        def emit(self, events, boundary):
+            raise P2PersistenceError("simulated db outage")
+
+    runner = Phase2ObserverRunner(config, boundary=boundary, source=source, writer=FailingWriter())
+    code = runner.run_once()
+    assert code == EXIT_WRITER_ERROR
+    assert runner.metrics.writer_errors == 1
+    assert not (tmp_path / "state.json").exists()  # checkpoint not advanced -> replay safe
+
+
+def test_writer_rejections_not_double_counted(env):
+    tmp_path, config, boundary, source, writer, candles = env
+    config.warmup_bars = 10_000  # every event warmup -> rejected before the writer
+    runner = Phase2ObserverRunner(config, boundary=boundary, source=source, writer=writer)
+    runner.run_once()
+    assert runner.metrics.emissions_rejected >= 1
+    assert runner.metrics.writer_rejected == 0  # single counting, no drift

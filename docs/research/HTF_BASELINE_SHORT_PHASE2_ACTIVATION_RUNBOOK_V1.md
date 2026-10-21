@@ -142,3 +142,94 @@ Freeze timestamp selection rules:
 * no historical events as OOS observations;
 * no retrospective PnL tuning; no parameter changes after freeze without a new
   version; no execution/expectancy metrics in this study.
+
+## 7. Freeze authorities (remediation CP2) and the activation config
+
+Startup is gated on THREE independently maintained freeze values plus two
+fingerprints. Any missing source or pairwise disagreement refuses startup
+(fail closed, zero observations):
+
+1. **Approved frozen protocol** — `APPROVED_FREEZE_TS` in
+   `app/research/htf_baseline_short_phase2_protocol_v1.py`, set in the commit
+   that freezes the protocol (operator action).
+2. **Durable experiment registration** — `freeze_ts` / `protocol_fingerprint`
+   in `research.htf_baseline_short_phase2_experiment`, written once by
+   `research.htf_baseline_short_phase2_activate(...)` (§3).
+3. **Runtime activation configuration** — an operator-deployed JSON file, e.g.
+   `/opt/trad_bot/etc/htf_phase2_activation.json`:
+
+   ```json
+   {
+     "experiment_id": "HTF_KEYLEVEL_BASELINE_SHORT_CAUSAL_OBSERVER_V1",
+     "freeze_ts": "<the same approved ISO timestamp>",
+     "protocol_fingerprint": "<64-hex fingerprint of the frozen protocol>"
+   }
+   ```
+
+   passed as `--activation-config` to the observer (required together with
+   `--use-registration`).
+
+The three values are maintained by different people/artifacts; nothing copies
+one into another automatically, so a stale or divergent source is always
+detectable.
+
+## 8. Timestamp skew tolerance (remediation CP1)
+
+`research.htf_baseline_short_phase2_activate` enforces:
+
+* `freeze_ts >= now() - 60 seconds` — retroactive activation is rejected
+  (`P2_FREEZE_TS_IN_PAST`); the 60-second window exists solely to absorb
+  clock skew between the operator console and the database server;
+* `freeze_ts <= now() + 5 minutes` — far-future freezes are rejected
+  (`P2_FREEZE_TS_MUST_NOT_BE_FAR_FUTURE`);
+* `freeze_ts` must be unclaimed in
+  `research.htf_baseline_short_phase2_freeze_registry` (PRIMARY KEY on
+  `freeze_ts`) — reusing any previously claimed timestamp, including
+  timestamps claimed by other experiment families registered there, fails
+  with `P2_FREEZE_TS_ALREADY_CLAIMED`. Timestamps claimed by other families
+  must be recorded in this registry at their own activation so the prohibition
+  is enforced structurally, not by convention.
+
+## 9. Corrupt checkpoint recovery
+
+`read_checkpoint` is fail-closed: a corrupted, truncated or legacy-schema
+checkpoint raises and the runner exits with `EXIT_STATE_ERROR` (4) without
+writing anything. Recovery procedure:
+
+1. Verify no observer process is running (`systemctl status`, `ps`).
+2. Move the checkpoint file aside (do NOT edit it in place):
+
+   ```bash
+   mv /opt/trad_bot/var/htf_phase2/state.json \
+      /opt/trad_bot/var/htf_phase2/state.json.broken-$(date +%Y%m%d%H%M%S)
+   ```
+
+3. Restart the observer. It replays from the beginning of the available
+   source; the durable guarantee makes this safe — already-persisted events
+   are suppressed by `UNIQUE (experiment_id, source_event_id)` + `ON CONFLICT
+   DO NOTHING` (at-least-once with idempotent writes; exactly-once is NOT
+   claimed).
+4. If the writer lease file is left over from a crash, takeover happens
+   automatically only when the recorded owner PID is verifiably dead; a live
+   owner is never stolen from. For unreadable lock metadata, verify manually
+   that no writer process exists and delete the `*.lease` file.
+
+## 10. Runtime limitations (remediation CP5) — CSV-only source
+
+The observer currently reads candles from CSV files (`SYMBOL_5m.csv`) via
+`FileCandleSource`. It proves the pipeline but is **not** a live-streaming
+production observer. Missing before live operation:
+
+* a live Bybit kline source (pagination, backfill, rate limits, forming-bar
+  filtering, exchange-clock skew handling);
+* gap policy for live streams (the runner QUARANTINES on any partial/missing
+  1H hour and resumes automatically when the source is completed);
+* native 1H provenance (current HTF bars are aggregated from 5m;
+  `provenance` records this per event);
+* dynamic symbol universe management;
+* `HTF_P2_DB_*` environment mapping for the deployed `.env` (the unit's
+  `EnvironmentFile` must provide `HTF_P2_DB_HOST/PORT/USER/NAME`);
+* monitoring/alerting wiring and log rotation.
+
+Do NOT claim production live-streaming readiness without those integrations
+and their tests.

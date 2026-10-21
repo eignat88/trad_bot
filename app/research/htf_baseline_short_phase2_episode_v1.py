@@ -132,6 +132,17 @@ class Phase2Episodes:
                 raise LegacyCheckpointError(f"pending episode {eid} is not CONTACT")
             if record["level_id"] != level_id:
                 raise LegacyCheckpointError(f"pending level mismatch for {eid}")
+        # the active map is an authoritative P2-09 gate: a forged entry would
+        # wrongly suppress re-contact episodes, so every entry must resolve to
+        # a real, matching, non-terminal-UNRESOLVED episode
+        for level_id, eid in self.active.items():
+            record = self.episodes.get(eid)
+            if record is None:
+                raise LegacyCheckpointError(f"active references unknown episode {eid}")
+            if record["level_id"] != level_id:
+                raise LegacyCheckpointError(f"active level mismatch for {eid}")
+            if record["state"] not in (STATE_CONTACT, STATE_CONFIRMED):
+                raise LegacyCheckpointError(f"active episode {eid} is {record['state']}")
         for eid, record in self.episodes.items():
             expected = episode_id_for(
                 self.experiment_id, self.symbol, self.direction,

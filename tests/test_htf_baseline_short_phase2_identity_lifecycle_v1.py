@@ -250,6 +250,29 @@ def test_tampered_identity_rejected_on_restore():
         Phase2Episodes.restore(payload)
 
 
+def test_tampered_active_map_rejected_on_restore():
+    m = machine()
+    m.advance(open_ms=T0, level_contacts={"lvl-1": contact()})
+    # forged active entry pointing at a non-existent episode
+    payload = m.checkpoint()
+    payload["active"]["lvl-1"] = "f" * 64
+    with pytest.raises(LegacyCheckpointError):
+        Phase2Episodes.restore(payload)
+    # forged active entry for an unknown level
+    payload = m.checkpoint()
+    payload["active"]["ghost-level"] = next(iter(payload["episodes"]))
+    with pytest.raises(LegacyCheckpointError):
+        Phase2Episodes.restore(payload)
+    # forged active entry pointing at an UNRESOLVED (terminal) episode
+    payload = m.checkpoint()
+    eid = next(iter(payload["episodes"]))
+    payload["episodes"][eid]["state"] = "UNRESOLVED"
+    payload["episodes"][eid]["terminal_reason"] = "X"
+    payload["episodes"][eid]["terminal_at_ms"] = T0 + STEP
+    with pytest.raises(LegacyCheckpointError):
+        Phase2Episodes.restore(payload)
+
+
 # ------------------------------------------- differential parity with audited
 def _projection(state_like) -> dict:
     episodes = {

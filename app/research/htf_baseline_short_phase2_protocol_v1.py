@@ -38,6 +38,19 @@ DIRECTION = "SHORT"
 #: Historical research base commit this protocol was drafted against.
 BASE_COMMIT = "4ef60d1e6bb7d2fbbd7fe2b4e3de0591995dc5ba"
 
+#: Authority 1 of 3 for the freeze boundary: the APPROVED FROZEN PROTOCOL.
+#: Set here ONLY by the operator at protocol-freeze time, together with the
+#: fingerprint approval. Remains None while the protocol is a candidate —
+#: the runtime must then fail closed. This value is maintained independently
+#: of the database activation record and of the runtime activation config;
+#: any disagreement between the three authorities rejects startup.
+APPROVED_FREEZE_TS: str | None = None
+
+
+def approved_freeze_ts() -> str | None:
+    """Return the operator-approved protocol freeze timestamp (or None)."""
+    return APPROVED_FREEZE_TS
+
 PROTOCOL_V1: dict = {
     "schema": PROTOCOL_SCHEMA,
     "status": PROTOCOL_STATUS,

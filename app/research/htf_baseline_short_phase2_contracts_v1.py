@@ -30,6 +30,7 @@ REASON_STALE_PREFIX = "STALE_PREFIX"
 REASON_INVALID_OHLC = "INVALID_OHLC"
 REASON_UNALIGNED_1H = "UNALIGNED_1H"
 REASON_UNCLOSED_1H = "UNCLOSED_1H"
+REASON_INCOMPLETE_1H_COVERAGE = "INCOMPLETE_1H_COVERAGE"
 
 
 class ContractViolation(ValueError):
@@ -42,11 +43,19 @@ class ContractViolation(ValueError):
 
 @dataclass(frozen=True)
 class HtfCoverage:
-    """Explicit 1H coverage accounting. Never silently drop an hour."""
+    """Explicit 1H coverage accounting. Never silently drop an hour.
+
+    ``leading_partial_hours`` covers the history-start edge only: the very
+    first bucket of the series may legitimately be incomplete because the
+    source history begins mid-hour. It is excluded and reported, like every
+    other unusable hour, but it is not a mid-series gap — the gap policies
+    (quarantine) key off ``partial_hours`` and ``missing_hours``.
+    """
 
     complete_hours: tuple[int, ...] = ()
     partial_hours: tuple[int, ...] = ()
     missing_hours: tuple[int, ...] = ()
+    leading_partial_hours: tuple[int, ...] = ()
 
     @property
     def clean(self) -> bool:
@@ -174,6 +183,7 @@ def aggregate_closed_htf(
     last_hour = max(buckets)
     complete: list[int] = []
     partial: list[int] = []
+    leading_partial: list[int] = []
     missing: list[int] = []
     out: list[Candle] = []
     hour = first_hour
@@ -199,7 +209,10 @@ def aggregate_closed_htf(
                 )
             )
         elif group:
-            partial.append(hour)
+            if hour == first_hour:
+                leading_partial.append(hour)  # history-start edge, not a gap
+            else:
+                partial.append(hour)
         else:
             missing.append(hour)
         hour += HTF_MS
@@ -207,6 +220,7 @@ def aggregate_closed_htf(
         complete_hours=tuple(complete),
         partial_hours=tuple(partial),
         missing_hours=tuple(missing),
+        leading_partial_hours=tuple(leading_partial),
     )
 
 
