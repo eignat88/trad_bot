@@ -52,7 +52,11 @@ def _htf(highs):
 def test_tied_htf_swing_highs_form_one_resistance_level():
     # A contiguous tied plateau must be represented once, not once per tied
     # swing candidate.
-    highs = [100, 90, 100, 90, 100, 90, 91, 92, 93, 100, 100, 93, 92, 91, 90,
+    # Leading 100s at indices 0..2 sit OUTSIDE the SWING_RIGHT=4 swing window,
+    # so they build touch-count but never mint a level; the ONLY in-range 100
+    # swing is the contiguous tied plateau at indices 9,10. (P2-11 forbids
+    # counting the unrelated index-4 oscillation swing into the plateau's dedup.)
+    highs = [100, 100, 100, 95, 90, 90, 91, 92, 93, 100, 100, 93, 92, 91, 90,
              90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90]
     htf = _htf(highs)
     closed_htf = htf[:-1]
@@ -255,7 +259,9 @@ def test_tied_plateau_mints_single_id_even_after_original_swing_eviction():
     from app.research.htf_baseline_short_causal_level_adapter_v1 import (
         causal_resistance_universe,
     )
-    highs = [100, 90, 100, 90, 100, 90, 91, 92, 93, 100, 100, 93, 92, 91, 90,
+    # Leading 100s at indices 0..2 sit OUTSIDE the swing window (touch-count
+    # builders only); the ONLY in-range 100 swing is the tied plateau 9,10.
+    highs = [100, 100, 100, 95, 90, 90, 91, 92, 93, 100, 100, 93, 92, 91, 90,
              90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90]
     full = _htf_series(highs, BASE)
     closed = full[:-1]
@@ -264,7 +270,7 @@ def test_tied_plateau_mints_single_id_even_after_original_swing_eviction():
     uni = causal_resistance_universe(closed, execp, asof)
     at_100 = [l.level_id for l in uni if l.price == 100.0]
     assert len(at_100) == 1
-    # Evict the original leading swing-high (index 0) from the window: the
+    # Evict the original leading 100 (index 0) from the window: the
     # plateau must still collapse to a single id, never two.
     trimmed = closed[1:]
     execp2 = _exec_prefix(trimmed[-1].timestamp)

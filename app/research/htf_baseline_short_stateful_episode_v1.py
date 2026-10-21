@@ -6,6 +6,7 @@ this module never rewrites a prior event. JSON snapshot supports offline restart
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Any
@@ -53,7 +54,19 @@ class EpisodeState:
 
         touch and reaction_confirmed MUST come from a causal external detector.
         A confirmation is permitted only for an already-observed active episode.
+        The step is atomic (P2-10): it is applied to a copy and committed only
+        on success, so a rejected/invalid step never corrupts recoverable state.
         """
+        working = deepcopy(self)
+        emitted = working._advance_mutating(
+            open_ms=open_ms, high=high, low=low, level=level, touch=touch,
+            reaction_confirmed=reaction_confirmed,
+        )
+        self.__dict__.update(working.__dict__)
+        return emitted
+
+    def _advance_mutating(self, *, open_ms, high, low, level, touch,
+                          reaction_confirmed):
         if open_ms % STEP_MS:
             raise ValueError("unaligned 5m candle")
         close_ms = open_ms + STEP_MS
@@ -73,6 +86,13 @@ class EpisodeState:
         if reaction_confirmed and self.pending.get(key) is None:
             raise ValueError("confirmation without previously observed contact")
         emitted: list[dict] = []
+        # P2-10: a same-step re-contact (a touch that begins a NEW run because
+        # the prior run ended) must not hijack the pending identity before the
+        # reaction confirmation is validated. Reject that combination: the
+        # confirmation is neither emitted nor attributed to the re-contact.
+        is_recontact = bool(touch) and key not in self.active
+        if reaction_confirmed and is_recontact:
+            reaction_confirmed = False
         # End active contact runs on first non-contact bar. This is a structural
         # event, not a timer-based cooldown; terminated episodes remain retained.
         for active_key in list(self.active):
@@ -95,6 +115,13 @@ class EpisodeState:
                 }
                 self.episodes[eid] = record
                 self.active[key] = eid
+                # P2-10: supersede the prior pending episode rather than
+                # orphaning it in CONTACT. It is terminal and never re-attributed.
+                previous = self.pending.get(key)
+                if previous and previous != eid:
+                    self.episodes[previous]["state"] = "UNRESOLVED"
+                    self.episodes[previous]["terminal_reason"] = "RECONTACT_SUPERSEDED_PENDING"
+                    self.episodes[previous]["terminal_at_ms"] = close_ms
                 self.pending[key] = eid
         if reaction_confirmed:
             eid = self.pending[key]

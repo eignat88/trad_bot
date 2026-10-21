@@ -41,12 +41,19 @@ def causal_resistance_universe(
     if atr <= 0:
         return ()
     eligible = []
-    seen_prices = set()
+    cur_run_price = None
+    run_repped = False
     for i in range(SWING_RIGHT, len(htf_closed)-SWING_RIGHT):
         c = htf_closed[i]
         price = float(c.high)
-        if price in seen_prices:
-            continue
+        # P2-11: only a genuine tied swing-high plateau (a maximal run of equal
+        # highs) collapses to one representative level. Independent same-price
+        # swings are separate formations and must never be suppressed merely for
+        # sharing a price; an ineligible candidate no longer blocks a later
+        # eligible one within its own run either.
+        if price != cur_run_price:
+            cur_run_price = price
+            run_repped = False
         if not all(htf_closed[i-j].high <= price for j in range(1, SWING_RIGHT+1)):
             continue
         if not all(htf_closed[i+j].high <= price for j in range(1, SWING_RIGHT+1)):
@@ -55,7 +62,8 @@ def causal_resistance_universe(
             continue
         if not any(htf_closed[i+j].high < price for j in range(1, SWING_RIGHT+1)):
             continue
-        seen_prices.add(price)
+        if run_repped:
+            continue
         available = int(htf_closed[i+SWING_RIGHT].timestamp) + HOUR
         if available > asof_ms or price <= reference:
             continue
@@ -66,6 +74,7 @@ def causal_resistance_universe(
         )
         if count < KEY_LEVEL_MIN_TOUCHES:
             continue
+        run_repped = True
         formation = int(c.timestamp)
         raw = f"SHORT|{formation}|{available}|{price:.12g}"
         eligible.append((

@@ -44,7 +44,12 @@ def replay(symbol, candles, start_ms: int, end_ms: int):
             atr = _causal_atr_series(prefix)
             touch = causal_contact(bar, level, atr[-1])
             confirm = False
-            if level is not None and not touch:
+            # P2-09: mirror the multi-level active-vs-recontact distinction. A
+            # reaction confirmation may be evaluated on a bar that still touches
+            # the level when it continues an active contact run; a re-contact
+            # (touch after the run broke) is handled by the state machine as a
+            # supersession and must not confirm the superseded pending episode.
+            if level is not None and (not touch or level.level_id in state.active):
                 pending_id = state.pending.get(level.level_id)
                 if pending_id:
                     record = state.episodes[pending_id]

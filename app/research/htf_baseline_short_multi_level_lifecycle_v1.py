@@ -84,11 +84,15 @@ class MultiLevelEpisodes:
             })
         valid = set(level_contacts)
         self.known_level_ids.update(valid)
+        # P2-10: levels whose touch this step begins a NEW run (a re-contact or a
+        # first contact) must not absorb a same-step reaction confirmation.
+        recontacted = set()
         for level_id, (price, available_ms, touched) in level_contacts.items():
             if not level_id or price <= 0 or available_ms > open_ms:
                 raise ValueError("level not available at candle open")
             if touched:
                 if level_id not in self.active:
+                    recontacted.add(level_id)
                     sequence = self.sequence.get(level_id, 0) + 1
                     self.sequence[level_id] = sequence
                     episode_id = sha256(
@@ -128,6 +132,11 @@ class MultiLevelEpisodes:
                 self.active.pop(level_id, None)
         emitted = []
         for level_id in confirmations:
+            # P2-10: reject a same-step confirmation for a level whose touch this
+            # step began a new run. It must not be attributed to the re-contact
+            # episode; the prior pending is already superseded above.
+            if level_id in recontacted:
+                continue
             eid = self.pending.get(level_id)
             if not eid:
                 raise ValueError("confirmation without pending episode")
