@@ -1,0 +1,47 @@
+[Unit]
+Description=trad_bot HTF baseline SHORT Phase-2 observe-only observer (DISABLED BY DEFAULT)
+Documentation=file:///opt/trad_bot/docs/research/HTF_BASELINE_SHORT_PHASE2_PROTOCOL_V1.md
+# Issue #176 Phase 2 — observe-only research. It NEVER routes signals to
+# paper/live trading and NEVER modifies the frozen Point-B OOS stack.
+#
+# Disabled by default: the unit is gated on an explicit operator-created flag
+# file. Without it the service does not start at all. Creating the flag file is
+# part of the operator authorization sequence in
+# docs/research/HTF_BASELINE_SHORT_PHASE2_ACTIVATION_RUNBOOK_V1.md and must
+# never be automated.
+ConditionPathExists=/opt/trad_bot/etc/htf_phase2_observer_enabled
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trad_bot
+EnvironmentFile=/opt/trad_bot/.env
+# --once is intentionally absent: the runner loops. --use-registration gates
+# startup on the DB registration state (RUNNING + freeze + matching protocol
+# fingerprint) and fails closed before any observation is created. Nothing here
+# activates the experiment.
+ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.htf_baseline_short_phase2_observer_runner_v1 --data-dir /opt/trad_bot/var/htf_phase2/candles --checkpoint /opt/trad_bot/var/htf_phase2/state.json --poll-seconds 300 --use-registration --log-level INFO
+
+Restart=on-failure
+RestartSec=60
+
+# Explicit shutdown: SIGTERM finishes the current 5m bar, persists the
+# checkpoint, releases the writer lease and exits.
+TimeoutStopSec=60
+KillSignal=SIGTERM
+
+# Resource limits (documented requirement).
+MemoryMax=512M
+TasksMax=64
+LimitNOFILE=4096
+
+User=tradbot
+Group=tradbot
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trad-bot-htf-baseline-short-observer
+
+[Install]
+WantedBy=multi-user.target
