@@ -27,7 +27,16 @@ EnvironmentFile=/opt/trad_bot/etc/htf_phase2_observer.env
 # startup on the THREE independently maintained freeze authorities (protocol /
 # DB registration / --activation-config) and fails closed before any
 # observation is created. Nothing here activates the experiment.
-ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.htf_baseline_short_phase2_observer_runner_v1 --data-dir /opt/trad_bot/var/htf_phase2/candles --checkpoint /opt/trad_bot/var/htf_phase2/state.json --poll-seconds 300 --use-registration --activation-config /opt/trad_bot/etc/htf_phase2_activation.json --log-level INFO
+#
+# --candle-source bybit (issue #184): explicit RESEARCH_ONLY source of CLOSED
+# 5m Bybit candles (server-time ASOF verification, bounded pagination,
+# fail-closed quarantine). The CSV source remains the Python default for
+# offline replay and deterministic tests only. --data-dir is intentionally
+# absent: it is a CSV-only parameter, and without it any accidental removal of
+# --candle-source bybit makes the CSV fallback fail closed
+# ("--data-dir is required for --candle-source csv") instead of silently
+# replaying stale CSV files.
+ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.htf_baseline_short_phase2_observer_runner_v1 --candle-source bybit --checkpoint /opt/trad_bot/var/htf_phase2/state.json --poll-seconds 300 --use-registration --activation-config /opt/trad_bot/etc/htf_phase2_activation.json --log-level INFO
 
 Restart=on-failure
 RestartSec=60
