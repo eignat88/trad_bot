@@ -78,6 +78,10 @@ def test_no_tracked_file_modified_against_base():
         # synthetic history before its gap-resume point (causal lookback
         # contract); still strictly inside the Phase-2 test surface
         "tests/test_htf_baseline_short_phase2_runtime_v1.py",
+        # issue #184: Bybit wiring — the activation runbook is updated to the
+        # explicit `--candle-source bybit` ExecStart and the effective-unit /
+        # fail-closed verification procedure (docs-only, Phase-2 surface)
+        "docs/research/HTF_BASELINE_SHORT_PHASE2_ACTIVATION_RUNBOOK_V1.md",
     )
 
     unexpected = []
