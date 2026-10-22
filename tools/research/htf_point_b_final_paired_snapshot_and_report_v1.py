@@ -274,6 +274,152 @@ def frozen_gross_r(direction, entry, stop, target, ret,
     return r, "TIMEOUT"
 
 
+# ----------------- P2 repair v2: first-exit chronology and variant gates -----------------
+#
+# Rationale (Codex review 5604710893 of 6de58c7ac1):
+#   P2-1 ``ProspectiveOOSEvaluator._check_tp_sl`` sets ``ambiguous_intrabar=True``
+#        for ANY candle spanning both levels - including candles AFTER the first
+#        exit was already established - and then applies the intrabar policy to
+#        that candle. A later ambiguous candle therefore must not overwrite the
+#        reconstructed first-exit chronology (captured first-hit times).
+#   P2-2 ``ProspectiveOOSEvaluator.evaluate_observation`` evaluates outcome flags
+#        and the percentage return on the complete variant tuple
+#        (variant_entry/variant_stop/variant_target) when it is present, while
+#        this analyzer normalises R on the reference geometry. Rows evaluated on
+#        a different geometry must be excluded fail-closed, never silently
+#        rescored on the reference geometry.
+#
+# Classification priority (research-only; frozen evaluator is never modified):
+#   1. confirmed first-exit chronology from captured first-hit times
+#      (``time_to_tp``/``time_to_sl`` are MINUTES from signal_time, both rounded
+#      to 0.1 by the evaluator - directly comparable);
+#   2. frozen STOP_FIRST for a true same-candle first-exit collision;
+#   3. fail-closed UNRESOLVED_FIRST_EXIT_ORDER for irreconcilable evidence.
+
+REPAIR_VERSION = "HTF_POINT_B_P2_REPAIR_V2"
+CLASSIFICATION_FIRST_EXIT_V2 = "first_exit_v2"
+CLASSIFICATION_FROZEN_FLAGS_V1 = "frozen_flags_v1"
+
+# Variant geometry dispositions (documented frozen eligibility policy):
+#   none / complete_equal  -> allowed (evaluator geometry == analysed geometry)
+#   complete_different     -> EXCLUDE (Case C: outcome on a different geometry)
+#   partial                -> EXCLUDE (Case D: INVALID_VARIANT_GEOMETRY)
+#   provenance_unknown     -> EXCLUDE (Case E: UNVERIFIED_OUTCOME_GEOMETRY)
+VARIANT_ALLOWED = ("none", "complete_equal")
+
+
+def variant_geometry_status(row: dict) -> tuple[str, str]:
+    """Classify captured variant tuple vs reference geometry (fail-closed).
+
+    Returns (status, detail). Equality is exact float equality of the captured
+    values - no arbitrary tolerance is introduced.
+    """
+    ve, vs, vt = row.get("variant_entry"), row.get("variant_stop"), row.get("variant_target")
+    present = [x is not None for x in (ve, vs, vt)]
+    n = sum(present)
+    ref = (row.get("reference_price"), row.get("invalidation_price"), row.get("target_1"))
+    if n == 0:
+        return "none", "reference_geometry"
+    if n < 3:
+        return "partial", f"variant_values_present={n}"
+    if any(x is None for x in ref):
+        return "provenance_unknown", "variant_complete_reference_missing"
+    if (ve, vs, vt) == ref:
+        return "complete_equal", "variant_equals_reference_exact"
+    return "complete_different", "variant_differs_from_reference"
+
+
+def first_exit_outcome(row: dict) -> tuple[float | None, str, str]:
+    """P2-repair-v2 frozen gross R from reconstructed first-exit chronology.
+
+    Returns (gross_r | None, label, reason). Fail-closed: any evidence that
+    cannot be reconciled yields UNRESOLVED_FIRST_EXIT_ORDER (row excluded from
+    the paired result and fully accounted), never a guessed outcome.
+    """
+    vstatus, vdetail = variant_geometry_status(row)
+    if vstatus not in VARIANT_ALLOWED:
+        return None, f"EXCLUDED_VARIANT_{vstatus.upper()}", vdetail
+
+    direction = row["direction"]
+    entry, stop, target = row["reference_price"], row["invalidation_price"], row["target_1"]
+    policy, max_hold = row["frozen_intrabar_policy"], row["frozen_max_hold"]
+    if policy != FROZEN_INTRABAR_POLICY or int(max_hold or 0) != FROZEN_MAX_HOLD:
+        return None, "NON_FROZEN_POLICY", "policy"
+    if direction not in ("LONG", "SHORT"):
+        return None, "INVALID_DIRECTION", "direction"
+    if None in (entry, stop, target):
+        return None, "UNVERIFIED_OUTCOME_GEOMETRY", "missing_geometry"
+    entry, stop, target = float(entry), float(stop), float(target)
+    if not all(map(math.isfinite, (entry, stop, target))) or entry <= 0:
+        return None, "UNVERIFIED_OUTCOME_GEOMETRY", "bad_geometry"
+    sign = 1 if direction == "LONG" else -1
+    if sign * (entry - stop) <= 0 or sign * (target - entry) <= 0:
+        return None, "UNVERIFIED_OUTCOME_GEOMETRY", "bad_directional_geometry"
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None, "UNVERIFIED_OUTCOME_GEOMETRY", "bad_directional_geometry"
+    rr = abs(target - entry) / risk
+    if not math.isclose(rr, FROZEN_TP_R, rel_tol=RR_TOL, abs_tol=RR_TOL):
+        return None, "UNVERIFIED_OUTCOME_GEOMETRY", "target_not_2R"
+
+    ttp, tsl = row["time_to_tp"], row["time_to_sl"]
+    tp_hit, sl_hit = row["tp_hit"], row["sl_hit"]
+    amb = row["ambiguous_intrabar"]
+    tp_flag, sl_flag = row["tp_before_sl"], row["sl_before_tp"]
+
+    def _unresolved(reason: str):
+        return None, "UNRESOLVED_FIRST_EXIT_ORDER", reason
+
+    # Frozen evaluation window: the evaluator scans candles strictly inside
+    # (signal_time, signal_time + max_hold) and rounds first-hit times to 0.1 min,
+    # so valid evidence satisfies 0 < t < max_hold. Any other value is not
+    # comparable frozen first-exit evidence.
+    for name, t in (("time_to_tp", ttp), ("time_to_sl", tsl)):
+        if t is not None and not (0.0 < float(t) < float(FROZEN_MAX_HOLD)):
+            return _unresolved(f"{name}_out_of_window:{t}")
+
+    # The evaluator always records a first-hit time together with its hit flag.
+    if bool(tp_hit) != (ttp is not None) or bool(sl_hit) != (tsl is not None):
+        return _unresolved("hit_flag_timestamp_inconsistent")
+    if amb is True and not (tp_hit and sl_hit):
+        return _unresolved("ambiguous_without_both_first_hits")
+
+    if not tp_hit and not sl_hit:
+        if amb is True or tp_flag is True or sl_flag is True:
+            return _unresolved("flags_without_any_first_hit")
+        # TIMEOUT: no level was touched inside the frozen window.
+        ret = row["return_at_240m"]
+        if ret is None:
+            return None, "MISSING_TIMEOUT_RETURN", "timeout_without_return"
+        r = sign * float(ret) * entry / (100.0 * risk)
+        if not math.isfinite(r):
+            return None, "MISSING_TIMEOUT_RETURN", "timeout_without_return"
+        return r, "TIMEOUT", "timeout_no_first_exit"
+
+    if tp_hit and not sl_hit:
+        return FROZEN_TP_R, "TP_FIRST", "tp_only_first_hit"
+    if sl_hit and not tp_hit:
+        return FROZEN_SL_R, "SL_FIRST", "sl_only_first_hit"
+
+    # Both levels touched: reconstructed first-exit chronology from comparable
+    # first-hit times. A later ambiguous candle does not change the first exit.
+    ttp, tsl = float(ttp), float(tsl)
+    if ttp == tsl:
+        if amb is not True:
+            return _unresolved("same_time_without_intrabar_collision")
+        # True same-candle first-exit collision -> frozen STOP_FIRST.
+        return FROZEN_SL_R, "SAME_CANDLE_STOP_FIRST", "simultaneous_first_hit"
+    if ttp < tsl:
+        if sl_flag is True and tp_flag is not True:
+            return _unresolved("flag_time_conflict:sl_before_tp_vs_time_to_tp_first")
+        return FROZEN_TP_R, "TP_FIRST", (
+            "late_ambiguity_after_tp" if amb is True else "tp_first_hit")
+    if tp_flag is True and sl_flag is not True:
+        return _unresolved("flag_time_conflict:tp_before_sl_vs_time_to_sl_first")
+    return FROZEN_SL_R, "SL_FIRST", (
+        "late_ambiguity_after_sl" if amb is True else "sl_first_hit")
+
+
 # --------------------------- snapshot phase ---------------------------
 
 def _assert_read_only(sql: str) -> None:
@@ -516,20 +662,26 @@ def _row_outcome(row: dict) -> tuple[float | None, str]:
         row["ambiguous_intrabar"], row["frozen_intrabar_policy"], row["frozen_max_hold"])
 
 
-def match_and_classify(rows: list[dict], asof: datetime):
+def match_and_classify(rows: list[dict], asof: datetime,
+                       mode: str = CLASSIFICATION_FIRST_EXIT_V2):
     """Identity matching + full unmatched/funnel lineage classification.
 
-    Returns (pairs, unmatched, funnel, outcome_audit).
+    Returns (pairs, unmatched, funnel, outcome_audit, collision_detail,
+             changed_rows, variant_audit_rows).
     Fail-closed rules (mirroring tools/research/htf_point_b_final_paired_oos_verdict_v1):
       duplicates, identity mismatches, baseline-after-Point-B, pre-freeze rows.
     Additional distinctions preserved here:
       immature vs mature-but-unfinalized vs invalid frozen geometry/R.
+    Both classifications (frozen_flags_v1 and first_exit_v2) are computed for
+    every row on every call; ``mode`` only selects which one feeds the pairs.
     """
     rejects = Counter()
     outcome_audit = Counter()
     prefreeze_rows = 0
     invalid_identity_rows = 0
     eligible_rows = []
+    changed_rows: list[dict] = []
+    variant_audit_rows: list[dict] = []
 
     for row in rows:
         if row["experiment_id"] not in (POINT_B, BASELINE):
@@ -541,12 +693,80 @@ def match_and_classify(rows: list[dict], asof: datetime):
         if row["signal_time"] <= FREEZE:
             prefreeze_rows += 1
             continue
-        # Per-row frozen outcome audit.
-        if row["variant_entry"] is not None or row["variant_stop"] is not None or row["variant_target"] is not None:
-            outcome_audit["variant_geometry_present"] += 1
-        r_val, path = _row_outcome(row)
+        # Per-row frozen outcome audit: both classifications, always.
+        vstatus, vdetail = variant_geometry_status(row)
+        row["_variant_status"], row["_variant_detail"] = vstatus, vdetail
+        outcome_audit[f"variant_geometry:{vstatus}"] += 1
+        if vstatus not in VARIANT_ALLOWED:
+            outcome_audit["variant_geometry_excluded"] += 1
+            if vstatus == "complete_different":
+                outcome_audit["variant_geometry_different"] += 1
+            elif vstatus == "partial":
+                outcome_audit["variant_geometry_invalid_partial"] += 1
+            else:
+                outcome_audit["variant_geometry_provenance_unknown"] += 1
+        variant_audit_rows.append({
+            "observation_id": row["observation_id"], "experiment_id": row["experiment_id"],
+            "direction": row["direction"], "setup_event_id": row["setup_event_id"],
+            "variant_geometry_status": vstatus, "detail": vdetail,
+            "reference_entry": _fmt(row["reference_price"]),
+            "reference_stop": _fmt(row["invalidation_price"]),
+            "reference_target": _fmt(row["target_1"]),
+            "variant_entry": _fmt(row["variant_entry"]),
+            "variant_stop": _fmt(row["variant_stop"]),
+            "variant_target": _fmt(row["variant_target"]),
+            "effective_geometry_source": "reference" if vstatus in VARIANT_ALLOWED else "unusable_excluded",
+        })
+
+        old_r, old_label = _row_outcome(row)
+        new_r, new_label, new_reason = first_exit_outcome(row)
+        row["_gross_r_v1"], row["_path_v1"] = old_r, old_label
+        row["_gross_r_v2"], row["_path_v2"], row["_reason_v2"] = new_r, new_label, new_reason
+        if mode == CLASSIFICATION_FIRST_EXIT_V2:
+            r_val, path = new_r, new_label
+        else:
+            r_val, path = old_r, old_label
+
+        if row["is_final"]:
+            # First-exit chronology accounting (classification-independent).
+            if row["ambiguous_intrabar"] is True:
+                ttp, tsl = row["time_to_tp"], row["time_to_sl"]
+                if ttp is not None and tsl is not None and ttp != tsl:
+                    outcome_audit["late_ambiguity_affected"] += 1
+                    outcome_audit["late_ambiguity_affected:" + ("tp_first" if ttp < tsl else "sl_first")] += 1
+                elif ttp is not None and tsl is not None:
+                    outcome_audit["same_candle_ambiguity"] += 1
+            if new_label == "UNRESOLVED_FIRST_EXIT_ORDER":
+                outcome_audit["unresolved_first_exit_order"] += 1
+                outcome_audit[f"unresolved_first_exit_order:{new_reason.split(':')[0]}"] += 1
+            # Changed-row audit record (deterministic, mode-independent).
+            changed = (old_r is None) != (new_r is None) or (
+                old_r is not None and new_r is not None and old_r != new_r)
+            if changed:
+                outcome_audit[f"reclassified:{old_label}->{new_label}"] += 1
+                changed_rows.append({
+                    "observation_id": row["observation_id"],
+                    "setup_event_id": row["setup_event_id"], "direction": row["direction"],
+                    "experiment": row["experiment_id"],
+                    "old_classification": old_label, "new_classification": new_label,
+                    "old_gross_r": _fmt(old_r), "new_gross_r": _fmt(new_r),
+                    "change_reason": new_reason,
+                    "source_time_to_tp": "" if row["time_to_tp"] is None else _fmt(row["time_to_tp"]),
+                    "source_time_to_sl": "" if row["time_to_sl"] is None else _fmt(row["time_to_sl"]),
+                    "ambiguous_intrabar": row["ambiguous_intrabar"],
+                    "reference_geometry": (
+                        f"entry={_fmt(row['reference_price'])};"
+                        f"stop={_fmt(row['invalidation_price'])};target={_fmt(row['target_1'])}"),
+                    "variant_geometry_status": vstatus,
+                })
+
         if row["is_final"] and r_val is None:
-            outcome_audit[f"finalized_r_reject:{path}"] += 1
+            if path == "UNRESOLVED_FIRST_EXIT_ORDER" or path.startswith("EXCLUDED_VARIANT_"):
+                # Documented eligibility exclusions (fail-closed), not integrity
+                # failures: the row is blocked from the paired result and counted.
+                outcome_audit[f"policy_exclusion:{path}"] += 1
+            else:
+                outcome_audit[f"finalized_r_reject:{path}"] += 1
         if row["is_final"]:
             if row["evaluated_240m_at"] is not None and \
                     row["evaluated_240m_at"] < row["signal_time"] + timedelta(minutes=FROZEN_MAX_HOLD):
@@ -689,7 +909,7 @@ def match_and_classify(rows: list[dict], asof: datetime):
     return pairs, unmatched, funnel, dict(sorted(outcome_audit.items())), {
         "cross_symbol_event_ids": cross_symbol[:50],
         "cross_direction_event_ids": cross_direction[:50],
-    }
+    }, changed_rows, variant_audit_rows
 
 
 def _pf(values: list[float]) -> float | None:
@@ -940,9 +1160,17 @@ def load_snapshot(outdir: Path) -> tuple[list[dict], dict]:
     return load_rows(outdir), meta
 
 
-def analyze(rows: list[dict], meta: dict, reps: int, seed: int) -> tuple[dict, dict]:
+def analyze(rows: list[dict], meta: dict, reps: int, seed: int,
+            mode: str = CLASSIFICATION_FIRST_EXIT_V2) -> tuple[dict, dict]:
     asof = _validate_meta(meta)
-    pairs, unmatched, funnel, outcome_audit, collision_detail = match_and_classify(rows, asof)
+    if mode not in (CLASSIFICATION_FIRST_EXIT_V2, CLASSIFICATION_FROZEN_FLAGS_V1):
+        raise ValueError(f"unknown classification mode: {mode!r}")
+    (pairs, unmatched, funnel, outcome_audit, collision_detail,
+     changed_rows, variant_audit_rows) = match_and_classify(rows, asof, mode=mode)
+    other_mode = (CLASSIFICATION_FROZEN_FLAGS_V1 if mode == CLASSIFICATION_FIRST_EXIT_V2
+                  else CLASSIFICATION_FIRST_EXIT_V2)
+    (o_pairs, o_unmatched, o_funnel, o_outcome_audit, _o_coll,
+     _o_changed, _o_variant) = match_and_classify(rows, asof, mode=other_mode)
 
     per_dir_funnel = {}
     dir_identities = {}
@@ -976,6 +1204,24 @@ def analyze(rows: list[dict], meta: dict, reps: int, seed: int) -> tuple[dict, d
             st.get("matched_finalized_n", 0) / dir_identities[d], 6) if dir_identities[d] else None
         stats_by_dir[d] = st
 
+    # Comparison-mode results (the other classification) for impact accounting.
+    other_stats_by_dir = {}
+    for d in ("LONG", "SHORT"):
+        other_sub = [p for p in o_pairs if p["direction"] == d]
+        other_st = directional_stats(other_sub, reps, seed)
+        # Same enrichment as the primary loop: maturity_gates reads "symbols".
+        other_st["symbols"] = sorted({p["symbol"] for p in other_sub})
+        other_stats_by_dir[d] = other_st
+    other_gates = maturity_gates(other_stats_by_dir, asof)
+    other_integrity = bool(o_funnel.get("conservation_ok")) and \
+        not any(k.startswith("finalized_r_reject") or k in
+                ("premature_finalization", "ambiguous_without_stop_first", "timeout_missing_return")
+                for k in o_outcome_audit)
+    other_verdicts = {}
+    for d in ("LONG", "SHORT"):
+        v, why = decide_verdict(other_stats_by_dir.get(d), other_gates["all_pass"], other_integrity)
+        other_verdicts[d] = {"verdict": v, "rationale": why}
+
     gates = maturity_gates(stats_by_dir, asof)
     integrity_pass = bool(funnel.get("conservation_ok")) and \
         not any(k.startswith("finalized_r_reject") or k in
@@ -1002,9 +1248,143 @@ def analyze(rows: list[dict], meta: dict, reps: int, seed: int) -> tuple[dict, d
     else:
         overall = overall_words.get(key, "MIXED")
 
+    # ---- P2 repair v2 impact accounting (deterministic, mode-independent) ----
+    if mode == CLASSIFICATION_FIRST_EXIT_V2:
+        before_stats, before_verdicts = other_stats_by_dir, other_verdicts
+        before_pairs, before_funnel = o_pairs, o_funnel
+        before_audit = o_outcome_audit
+        before_gates = other_gates
+        after_stats, after_verdicts = stats_by_dir, verdicts
+        after_pairs, after_funnel = pairs, funnel
+        after_gates = gates
+    else:
+        before_stats, before_verdicts = stats_by_dir, verdicts
+        before_pairs, before_funnel = pairs, funnel
+        before_audit = outcome_audit
+        before_gates = gates
+        after_stats, after_verdicts = other_stats_by_dir, other_verdicts
+        after_pairs, after_funnel = o_pairs, o_funnel
+        after_gates = other_gates
+
+    def _overall_of(vd: dict) -> str:
+        k2 = (vd["LONG"]["verdict"], vd["SHORT"]["verdict"])
+        if "BLOCKED" in k2:
+            return "BLOCKED"
+        if k2 == ("PROMISING", "PROMISING"):
+            return "SUPPORTED_BOTH_DIRECTIONS"
+        if "PROMISING" in k2:
+            return ("PROMISING_LONG__NOT_ROBUST_SHORT" if vd["SHORT"]["verdict"] != "PROMISING"
+                    else "PROMISING_SHORT__NOT_ROBUST_LONG")
+        return overall_words.get(k2, "MIXED")
+
+    def _cmp_dir(stats: dict, verdict: dict, gates_pass: bool) -> dict:
+        return {
+            "matched_finalized_n": stats.get("matched_finalized_n"),
+            "symbols_n": len(stats.get("symbols", [])),
+            "maturity_gates_pass": gates_pass,
+            "point_b_mean_r": stats.get("point_b_mean_r"),
+            "baseline_mean_r": stats.get("baseline_mean_r"),
+            "paired_delta_mean_r": stats.get("paired_delta_mean_r"),
+            "paired_delta_median_r": stats.get("paired_delta_median_r"),
+            "day_cluster_ci95": (stats.get("day_cluster") or {}).get("ci95"),
+            "symbol_cluster_ci95": (stats.get("symbol_cluster") or {}).get("ci95"),
+            "verdict": verdict["verdict"],
+        }
+
+    tp_first_reclassified = sum(
+        1 for c in changed_rows
+        if c["new_classification"] == "TP_FIRST" and c["old_classification"] != "TP_FIRST")
+    sl_first_reclassified = sum(
+        1 for c in changed_rows
+        if c["new_classification"] == "SL_FIRST" and c["old_classification"] != "SL_FIRST")
+
+    before_idx = {(p["event_id"], p["direction"]): p for p in before_pairs}
+    after_idx = {(p["event_id"], p["direction"]): p for p in after_pairs}
+    pairs_excluded = sorted(set(before_idx) - set(after_idx))
+    pairs_reclassified = 0
+    delta_changed = {"LONG": 0, "SHORT": 0}
+    for k in sorted(set(before_idx) & set(after_idx)):
+        op, ap = before_idx[k], after_idx[k]
+        if op["point_b_r"] != ap["point_b_r"] or op["baseline_r"] != ap["baseline_r"]:
+            pairs_reclassified += 1
+            if op["delta_r"] != ap["delta_r"]:
+                delta_changed[op["direction"]] += 1
+
+    variant_counters = Counter(r["variant_geometry_status"] for r in variant_audit_rows)
+    blocked_variant = [r for r in variant_audit_rows
+                       if r["variant_geometry_status"] not in VARIANT_ALLOWED]
+
+    repair_v2 = {
+        "repair_version": REPAIR_VERSION,
+        "primary_mode": mode,
+        "before_after_convention": "before=frozen_flags_v1, after=first_exit_v2",
+        "first_exit_semantics": (
+            "first-exit chronology from captured first-hit minutes (time_to_tp/time_to_sl, "
+            "comparable units); frozen STOP_FIRST only for a true same-candle first-exit "
+            "collision (equal first-hit times with ambiguous_intrabar); a later ambiguous "
+            "candle never overrides an established earlier exit; irreconcilable evidence "
+            "-> UNRESOLVED_FIRST_EXIT_ORDER (fail-closed, counted, excluded)"),
+        "variant_semantics": (
+            "complete variant tuple -> the evaluator evaluated on variant geometry: "
+            "exact-equal to reference is allowed, differing tuples, partial tuples and "
+            "unknown provenance are excluded fail-closed and counted"),
+        "frozen_evaluator_discrepancy": (
+            "frozen_flags_v1 mirrors ProspectiveOOSEvaluator flag semantics exactly "
+            "(AMBIGUOUS_STOP_FIRST on any ambiguous candle); first_exit_v2 diverges only "
+            "where captured first-hit times prove a different first exit; historical "
+            "outcomes are never modified"),
+        "counters": {
+            "SOURCE_SNAPSHOT_ROWS": len(rows),
+            "MATCHED_FINALIZED_BEFORE": len(before_pairs),
+            "MATCHED_FINALIZED_AFTER": len(after_pairs),
+            "TP_FIRST_RECLASSIFIED_N": tp_first_reclassified,
+            "SL_FIRST_RECLASSIFIED_N": sl_first_reclassified,
+            "LATE_AMBIGUITY_AFFECTED_N": outcome_audit.get("late_ambiguity_affected", 0),
+            "SAME_CANDLE_AMBIGUITY_N": outcome_audit.get("same_candle_ambiguity", 0),
+            "UNRESOLVED_ORDER_N": (outcome_audit.get("unresolved_first_exit_order", 0)
+                                   if mode == CLASSIFICATION_FIRST_EXIT_V2
+                                   else o_outcome_audit.get("unresolved_first_exit_order", 0)),
+            "VARIANT_GEOMETRY_PRESENT_N": sum(variant_counters[k] for k in (
+                "complete_equal", "complete_different", "partial", "provenance_unknown")),
+            "VARIANT_GEOMETRY_DIFFERENT_N": variant_counters.get("complete_different", 0),
+            "VARIANT_GEOMETRY_INVALID_N": (variant_counters.get("partial", 0)
+                                           + variant_counters.get("provenance_unknown", 0)),
+            "PAIRS_EXCLUDED_NEW_N": len(pairs_excluded),
+            "PAIRS_RECLASSIFIED_N": pairs_reclassified,
+            "LONG_DELTA_CHANGED_N": delta_changed["LONG"],
+            "SHORT_DELTA_CHANGED_N": delta_changed["SHORT"],
+            "variant_none_n": variant_counters.get("none", 0),
+            "variant_complete_equal_n": variant_counters.get("complete_equal", 0),
+            "variant_complete_different_n": variant_counters.get("complete_different", 0),
+            "variant_partial_n": variant_counters.get("partial", 0),
+            "variant_provenance_unknown_n": variant_counters.get("provenance_unknown", 0),
+            "affected_point_b_n": sum(1 for r in blocked_variant if r["experiment_id"] == POINT_B),
+            "affected_baseline_n": sum(1 for r in blocked_variant if r["experiment_id"] == BASELINE),
+            "affected_long_n": sum(1 for r in blocked_variant if r["direction"] == "LONG"),
+            "affected_short_n": sum(1 for r in blocked_variant if r["direction"] == "SHORT"),
+        },
+        "changed_rows_n": len(changed_rows),
+        "pairs_excluded_identity_samples": [
+            {"event_id": k[0], "direction": k[1]} for k in pairs_excluded[:50]],
+        "comparison": {
+            d: {
+                "before": _cmp_dir(before_stats[d], before_verdicts[d],
+                                   before_gates.get("all_pass", False)),
+                "after": _cmp_dir(after_stats[d], after_verdicts[d],
+                                  after_gates.get("all_pass", False)),
+            } for d in ("LONG", "SHORT")
+        },
+        "before_overall": _overall_of(before_verdicts),
+        "after_overall": _overall_of(after_verdicts),
+        "before_funnel": dict(sorted(before_funnel.items())),
+        "before_outcome_audit": before_audit,
+    }
+
     summary = {
         "schema_version": SCHEMA_VERSION,
         "issue": ISSUE,
+        "repair_version": REPAIR_VERSION,
+        "classification_mode": mode,
         "asof_utc": meta["SNAPSHOT_ASOF_UTC"],
         "db_snapshot_asof": meta.get("db_now"),
         "snapshot_identifier": meta.get("snapshot_identifier"),
@@ -1019,6 +1399,7 @@ def analyze(rows: list[dict], meta: dict, reps: int, seed: int) -> tuple[dict, d
         "funnel": dict(sorted(funnel.items())),
         "funnel_by_direction": per_dir_funnel,
         "outcome_audit": outcome_audit,
+        "repair_v2": repair_v2,
         "collision_diagnostics": {k: len(v) for k, v in collision_detail.items()},
         "collision_event_id_samples": collision_detail,
         "directions": stats_by_dir,
@@ -1050,7 +1431,11 @@ def analyze(rows: list[dict], meta: dict, reps: int, seed: int) -> tuple[dict, d
             "entry times, entry prices and risk geometry differ between cohorts; R is normalized, not identical trades",
         ],
     }
-    return summary, {"pairs": pairs, "unmatched": unmatched}
+    return summary, {
+        "pairs": pairs, "unmatched": unmatched,
+        "changed_rows": changed_rows, "variant_audit_rows": variant_audit_rows,
+        "other_mode": other_mode, "other_pairs": o_pairs, "other_unmatched": o_unmatched,
+    }
 
 
 def write_artifacts(outdir: Path, summary: dict, details: dict, meta: dict,
@@ -1064,6 +1449,10 @@ def write_artifacts(outdir: Path, summary: dict, details: dict, meta: dict,
         "HTF_POINT_B_FINAL_PAIRED_OOS_VERDICT_V1.json",
         "HTF_POINT_B_FINAL_PAIRED_OOS_VERDICT_V1.md",
         "HTF_POINT_B_FINAL_PAIRED_SOURCE_MANIFEST_V1.json",
+        "HTF_POINT_B_P2_REPAIR_IMPACT_V2.json",
+        "HTF_POINT_B_P2_REPAIR_IMPACT_V2.md",
+        "HTF_POINT_B_P2_REPAIR_CHANGED_ROWS_V2.csv",
+        "HTF_POINT_B_P2_REPAIR_VARIANT_AUDIT_V2.csv",
         "SHA256SUMS.txt",
     ]
     conflicts = [n for n in _CANONICAL_FILES if (outdir / n).exists()]
@@ -1173,9 +1562,59 @@ def write_artifacts(outdir: Path, summary: dict, details: dict, meta: dict,
     _w("HTF_POINT_B_FINAL_PAIRED_OOS_VERDICT_V1.md",
        render_markdown(summary, artifacts, git_meta))
 
+    # 6a. P2 repair v2 impact artifacts (classification-change accounting).
+    ch_rows = sorted(details.get("changed_rows", []),
+                     key=lambda r: (r["direction"], r["experiment"], r["observation_id"]))
+    ch_fields = ["observation_id", "setup_event_id", "direction", "experiment",
+                 "old_classification", "new_classification", "old_gross_r", "new_gross_r",
+                 "change_reason", "source_time_to_tp", "source_time_to_sl",
+                 "ambiguous_intrabar", "reference_geometry", "variant_geometry_status"]
+    ch_path = outdir / "HTF_POINT_B_P2_REPAIR_CHANGED_ROWS_V2.csv"
+    with ch_path.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=ch_fields, lineterminator="\n")
+        w.writeheader()
+        for r in ch_rows:
+            w.writerow({k: r.get(k, "") for k in ch_fields})
+    artifacts[ch_path.name] = _sha256_file(ch_path)
+
+    va_rows = sorted(details.get("variant_audit_rows", []), key=lambda r: r["observation_id"])
+    va_fields = ["observation_id", "experiment_id", "direction", "setup_event_id",
+                 "variant_geometry_status", "detail", "effective_geometry_source",
+                 "reference_entry", "reference_stop", "reference_target",
+                 "variant_entry", "variant_stop", "variant_target"]
+    va_path = outdir / "HTF_POINT_B_P2_REPAIR_VARIANT_AUDIT_V2.csv"
+    with va_path.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=va_fields, lineterminator="\n")
+        w.writeheader()
+        for r in va_rows:
+            w.writerow({k: r.get(k, "") for k in va_fields})
+    artifacts[va_path.name] = _sha256_file(va_path)
+
+    impact = {
+        "schema_version": "HTF_POINT_B_P2_REPAIR_IMPACT_V2",
+        "repair_version": summary.get("repair_version"),
+        "classification_mode": summary.get("classification_mode"),
+        "generated_from": {
+            "snapshot_asof_utc": summary.get("asof_utc"),
+            "snapshot_rows_sha256": meta.get("snapshot_rows_sha256"),
+            "snapshot_identifier": meta.get("snapshot_identifier"),
+            "git_sha": git_meta,
+            "random_seed": summary["bootstrap"]["random_seed"],
+            "bootstrap_iterations": summary["bootstrap"]["bootstrap_iterations"],
+            "frozen_freeze_ts": summary.get("freeze_ts"),
+        },
+        "impact": summary["repair_v2"],
+    }
+    _w("HTF_POINT_B_P2_REPAIR_IMPACT_V2.json",
+       json.dumps(impact, indent=2, ensure_ascii=False, allow_nan=False, default=str) + "\n")
+    _w("HTF_POINT_B_P2_REPAIR_IMPACT_V2.md",
+       render_repair_markdown(summary, meta, git_meta))
+
     # 7. manifest (hashes of every other artifact)
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
+        "repair_version": summary.get("repair_version"),
+        "classification_mode": summary.get("classification_mode"),
         "audit_timestamp_utc": summary["asof_utc"],
         "db_snapshot_asof": summary.get("db_snapshot_asof"),
         "freeze_ts": summary["freeze_ts"],
@@ -1208,6 +1647,74 @@ def write_artifacts(outdir: Path, summary: dict, details: dict, meta: dict,
         fh.write("\n".join(lines) + "\n")
     artifacts["SHA256SUMS.txt"] = _sha256_file(sums)
     return artifacts
+
+
+def render_repair_markdown(summary: dict, meta: dict, git_meta: dict) -> str:
+    """Human-readable P2 repair v2 impact report (deterministic)."""
+    rv = summary["repair_v2"]
+    ctr = rv["counters"]
+    a = []
+    a.append("# HTF_POINT_B_P2_REPAIR_IMPACT_V2 - first-exit chronology and variant geometry")
+    a.append("")
+    a.append(f"- Repair version: `{rv['repair_version']}`")
+    a.append(f"- Classification mode (this report): `{summary['classification_mode']}`")
+    a.append(f"- Frozen snapshot as-of: `{summary['asof_utc']}`")
+    a.append(f"- Frozen snapshot rows SHA-256: `{meta.get('snapshot_rows_sha256')}`")
+    a.append(f"- Research HEAD: `{git_meta.get('research_head')}` / "
+             f"production HEAD: `{git_meta.get('production_head')}`")
+    a.append(f"- Freeze: `{summary['freeze_ts']}` (eligibility `signal_time > freeze_ts`)")
+    a.append(f"- Bootstrap: seed `{summary['bootstrap']['random_seed']}`, "
+             f"`{summary['bootstrap']['bootstrap_iterations']}` iterations")
+    a.append("")
+    a.append("## Semantics")
+    a.append(f"- First-exit: {rv['first_exit_semantics']}")
+    a.append(f"- Variant geometry: {rv['variant_semantics']}")
+    a.append(f"- Frozen evaluator discrepancy: {rv['frozen_evaluator_discrepancy']}")
+    a.append("")
+    a.append("## Impact counters")
+    a.append("")
+    a.append("| Counter | Value |")
+    a.append("| --- | ---: |")
+    for k in sorted(ctr):
+        a.append(f"| {k} | {ctr[k]} |")
+    a.append("")
+    a.append("## Before / after paired results (before = frozen_flags_v1, after = first_exit_v2)")
+    a.append("")
+    a.append("| Metric | LONG before | LONG after | SHORT before | SHORT after |")
+    a.append("| --- | ---: | ---: | ---: | ---: |")
+    rows = [
+        ("Matched N", "matched_finalized_n"),
+        ("Point-B mean gross R", "point_b_mean_r"),
+        ("Baseline mean gross R", "baseline_mean_r"),
+        ("Mean paired delta R", "paired_delta_mean_r"),
+        ("Median paired delta R", "paired_delta_median_r"),
+        ("Day-cluster 95% CI", "day_cluster_ci95"),
+        ("Symbol-cluster 95% CI", "symbol_cluster_ci95"),
+        ("Verdict", "verdict"),
+    ]
+    for label, k in rows:
+        vals = [rv["comparison"][d][side].get(k) for d in ("LONG", "SHORT")
+                for side in ("before", "after")]
+        a.append(f"| {label} | " + " | ".join(str(v) for v in
+                 (vals[0], vals[1], vals[2], vals[3])) + " |")
+    a.append("")
+    a.append(f"- Overall before: `{rv['before_overall']}`")
+    a.append(f"- Overall after: `{rv['after_overall']}`")
+    a.append(f"- Changed rows: `{rv['changed_rows_n']}` "
+             f"(TP-first reclassified `{ctr['TP_FIRST_RECLASSIFIED_N']}`, "
+             f"SL-first reclassified `{ctr['SL_FIRST_RECLASSIFIED_N']}`)")
+    a.append(f"- Pairs excluded by repair: `{ctr['PAIRS_EXCLUDED_NEW_N']}`, "
+             f"pairs reclassified: `{ctr['PAIRS_RECLASSIFIED_N']}` "
+             f"(LONG delta changed `{ctr['LONG_DELTA_CHANGED_N']}`, "
+             f"SHORT delta changed `{ctr['SHORT_DELTA_CHANGED_N']}`)")
+    a.append("")
+    a.append("## Scope")
+    a.append("- Research-only classification repair; historical frozen outcomes are not modified.")
+    a.append("- Gross frozen research geometry only; no net/executable claim.")
+    a.append("- Per-row records: `HTF_POINT_B_P2_REPAIR_CHANGED_ROWS_V2.csv`, "
+             "`HTF_POINT_B_P2_REPAIR_VARIANT_AUDIT_V2.csv`.")
+    a.append("")
+    return "\n".join(a)
 
 
 def render_markdown(summary: dict, artifacts: dict, git_meta: dict) -> str:
@@ -1384,6 +1891,10 @@ def main(argv=None) -> int:
     rp.add_argument("--seed", type=int, default=DEFAULT_SEED)
     rp.add_argument("--git-research-head", default="")
     rp.add_argument("--git-production-head", default="")
+    rp.add_argument("--classification", default=CLASSIFICATION_FIRST_EXIT_V2,
+                    choices=[CLASSIFICATION_FIRST_EXIT_V2, CLASSIFICATION_FROZEN_FLAGS_V1],
+                    help="gross-R classification: repaired first-exit chronology (default) "
+                         "or the legacy frozen-flag semantics kept for before/after impact")
     rp.add_argument("--allow-artifact-overwrite", action="store_true",
                     help="explicit approval to overwrite existing canonical artifacts")
 
@@ -1399,7 +1910,8 @@ def main(argv=None) -> int:
     rows, meta = load_snapshot(opts.out)
     if opts.reps < 100:
         ap.error("--reps must be >= 100")
-    summary, details = analyze(rows, meta, opts.reps, opts.seed)
+    summary, details = analyze(rows, meta, opts.reps, opts.seed,
+                               mode=opts.classification)
     git_meta = {"research_head": opts.git_research_head, "production_head": opts.git_production_head}
     artifacts = write_artifacts(opts.out, summary, details, meta, git_meta,
                                 allow_overwrite=opts.allow_artifact_overwrite)
