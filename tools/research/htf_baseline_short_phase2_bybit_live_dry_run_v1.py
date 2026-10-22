@@ -53,8 +53,10 @@ from app.research.htf_baseline_short_phase2_bybit_candle_source_v1 import (
     DEFAULT_MAX_PAGES,
     DEFAULT_PAGE_LIMIT,
     DEFAULT_RETRY_BACKOFF_S,
+    SERVER_TIME_ENDPOINT,
     BybitPhase2CandleSource,
     CandleSourceError,
+    _extract_server_time_ms,
 )
 from app.research.htf_baseline_short_phase2_contracts_v1 import BAR_MS
 from app.research.htf_baseline_short_phase2_observer_runner_v1 import (
@@ -425,9 +427,19 @@ def main(argv: list[str] | None = None, *, client_factory=None) -> int:
             once=True,
             dry_run=True,
         )
+        client = client_factory()
+        asof_pin = args.evaluation_asof_ms
+        if asof_pin is None:
+            # Pin ONE causal ASOF for the whole dry-run (review 5615772746):
+            # without it every load resolves its own server-time ASOF, so a bar
+            # closing between two loads (other symbol / restart cycle) is later
+            # counted as "reprocessed" by the restart-equivalence audit, whose
+            # PASS criterion is defined against a pinned ASOF. Probing uses the
+            # documented read-only client contract.
+            asof_pin = _extract_server_time_ms(client._public_get(SERVER_TIME_ENDPOINT))
         source = BybitPhase2CandleSource(
-            client_factory(),
-            evaluation_asof_ms=args.evaluation_asof_ms,
+            client,
+            evaluation_asof_ms=asof_pin,
             page_limit=int(args.page_limit),
             max_pages=int(args.max_pages),
             min_history_bars=int(args.min_history_bars),

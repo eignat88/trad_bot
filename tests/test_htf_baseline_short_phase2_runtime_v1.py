@@ -58,6 +58,23 @@ def make_csv_candles() -> list[Candle]:
     return candles
 
 
+def make_lead_candles(hours=16) -> list[Candle]:
+    """Flat lead history BEFORE HOUR0 (FIX-1 review 5615772746).
+
+    Continues the base period-3 pattern, so it forms no strict 4/4 swings and
+    no touches — it only deepens the causal lookback before a resume point, in
+    particular before the gap-resume of the coverage-gap test (the fixture's
+    own history there is just 29h < MIN_RESUME_LOOKBACK_BARS 5m-bars).
+    """
+    candles: list[Candle] = []
+    for hour_index in range(-hours, 0):
+        high = 100.0 + (hour_index % 3) * 0.1
+        for bar_index in range(12):
+            ts = HOUR0 + hour_index * HOUR + bar_index * BAR
+            candles.append(Candle(ts, 100.0, high, 99.0, 100.0, 1.0))
+    return candles
+
+
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
     data_dir = tmp_path / "candles"
@@ -261,6 +278,11 @@ def _write_candles(data_dir, candles):
 def test_missing_hour_quarantines_and_recovers_with_stable_identity(env):
     tmp_path, config, boundary, source, writer, candles = env
     data_dir = tmp_path / "candles"
+    # FIX-1 review 5615772746: deepen the causal history before the gap-resume
+    # (resume lands at hour 29; the bare fixture carries only 29h = 348 bars of
+    # lookback there < MIN_RESUME_LOOKBACK_BARS). The lead hours are flat and
+    # form no swings/touches, so event semantics are unchanged.
+    candles = make_lead_candles() + candles
     # gap after the fixture's contact/confirmation hours (25..28)
     gap_start = HOUR0 + 29 * HOUR
     gapped = [c for c in candles if not (gap_start <= c.timestamp < gap_start + HOUR)]

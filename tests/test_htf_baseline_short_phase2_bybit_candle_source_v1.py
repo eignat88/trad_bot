@@ -68,6 +68,8 @@ class FakeKlineClient:
         *,
         server_time_ms: int,
         drop_opens_once=(),
+        drop_opens_twice=(),
+        conflict_on_second_serving=(),
         drop_opens_forever=(),
         duplicate_rows=(),
         conflicting_rows=(),
@@ -83,6 +85,8 @@ class FakeKlineClient:
         self.rows = {int(c.timestamp): row_of(c) for c in candles}
         self.server_time_ms = int(server_time_ms)
         self.drop_opens_once = set(drop_opens_once)
+        self.drop_opens_twice = set(drop_opens_twice)
+        self.conflict_on_second_serving = set(conflict_on_second_serving)
         self.drop_opens_forever = set(drop_opens_forever)
         self.duplicate_rows = set(duplicate_rows)
         self.conflicting_rows = set(conflicting_rows)
@@ -97,6 +101,8 @@ class FakeKlineClient:
         self.calls: list[dict] = []
         self.kline_calls: list[tuple[int, int]] = []
         self._served_once: set[int] = set()
+        self._offer_counts: dict[int, int] = {}
+        self._served_counts: dict[int, int] = {}
 
     def _public_get(self, endpoint: str, **params):
         self.calls.append({"endpoint": endpoint, **params})
@@ -130,12 +136,21 @@ class FakeKlineClient:
                 )
                 if not (in_window or live_tail):
                     continue
+                offer = self._offer_counts.get(open_ms, 0)
+                self._offer_counts[open_ms] = offer + 1
                 if open_ms in self.drop_opens_forever:
+                    continue
+                if open_ms in self.drop_opens_twice and offer < 2:
                     continue
                 if open_ms in self.drop_opens_once and open_ms not in self._served_once:
                     self._served_once.add(open_ms)
                     continue
                 row = list(self.rows[open_ms])
+                served = self._served_counts.get(open_ms, 0)
+                self._served_counts[open_ms] = served + 1
+                if open_ms in self.conflict_on_second_serving and served >= 1:
+                    row[2] = str(float(row[2]) + 1.0)  # coherent, but different
+                    row[4] = str(float(row[4]) + 1.0)
                 if open_ms in self.duplicate_rows:
                     rows.append(list(row))
                 if open_ms in self.conflicting_rows:
@@ -309,6 +324,54 @@ def test_ohlc_conflict_fails_closed():
         include_live_tail=False,
     )
     source = build_source(client, min_history_bars=50)
+    with pytest.raises(BybitCandleSourceError) as excinfo:
+        source.load("BTCUSDT")
+    assert excinfo.value.reason == REASON_CONFLICTING
+
+
+def test_gap_recovery_retry_overlap_is_idempotent_not_a_false_duplicate():
+    """Review 5615772746 FIX-2: recovery attempt 1 returns only a PART of the
+    missing candles, attempt 2 re-fetches the FULL range including the already
+    recovered bar. The identical overlap must be accepted (idempotent retry),
+    never reported as ``DUPLICATE_CANDLE``."""
+    history = make_candles(700)
+    server_time_ms = history[-1].timestamp + BAR
+    gap = [history[-120].timestamp, history[-119].timestamp, history[-118].timestamp]
+    client = FakeKlineClient(
+        history,
+        server_time_ms=server_time_ms,
+        drop_opens_once={gap[0]},  # served again from recovery attempt 1
+        drop_opens_twice={gap[1], gap[2]},  # served only from attempt 2
+        include_live_tail=False,
+    )
+    source = build_source(client, page_limit=200, max_pages=3, min_history_bars=450)
+
+    candles = source.load("BTCUSDT")
+
+    opens = {int(c.timestamp) for c in candles}
+    assert set(gap) <= opens  # every missing bar recovered
+    assert len(candles) == 450  # complete, no dropped history
+    assert source.last_load_metrics["gap_recovery_requests"] >= 2
+    assert source.last_load_metrics["bars_returned"] == 450
+
+
+def test_gap_recovery_retry_overlap_conflict_still_fails_closed():
+    """An identical cross-attempt overlap is accepted, but a CONFLICTING candle
+    returned by a later recovery attempt stays fail-closed."""
+    history = make_candles(700)
+    server_time_ms = history[-1].timestamp + BAR
+    recovered = history[-120].timestamp
+    still_missing = history[-119].timestamp
+    client = FakeKlineClient(
+        history,
+        server_time_ms=server_time_ms,
+        drop_opens_once={recovered},
+        drop_opens_twice={still_missing},
+        conflict_on_second_serving={recovered},  # attempt 2 contradicts attempt 1
+        include_live_tail=False,
+    )
+    source = build_source(client, page_limit=200, max_pages=3, min_history_bars=450)
+
     with pytest.raises(BybitCandleSourceError) as excinfo:
         source.load("BTCUSDT")
     assert excinfo.value.reason == REASON_CONFLICTING

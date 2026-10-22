@@ -220,31 +220,37 @@ class BybitPhase2CandleSource:
     ) -> tuple[int, int, bool, int]:
         """Plan the bounded delivery window around the durable timestamp cursor.
 
-        Steady state: the last ``min_history_bars`` closed bars. When the durable
-        resume point falls OUTSIDE that window (observer downtime longer than
-        the window) a bounded catch-up batch is planned instead: the window
-        starts ``min_history_bars`` before the resume point (the full causal
-        lookback for 1H resistance and the ATR window) and ends at most
-        ``batch_bars`` past it, so the observer advances sequentially from the
-        old cursor toward the current ASOF over several bounded cycles. The
-        cursor is never silently moved and nothing is ever skipped.
+        Cold start (no resume point): the steady window ``[end_open −
+        (min_history_bars−1) .. end_open]``.
+
+        Resume-aware (review 5615772746 FIX-1): EVERY load carries the FULL
+        causal lookback — ``min_history_bars`` bars before the resume point —
+        for the 1H resistance touch history and the ATR window, plus at most
+        ``batch_bars`` of new bars after it. A replay whose window starts later
+        (a shifted window) would silently rebuild a different level universe
+        than uninterrupted processing, so the lookback is part of the source
+        contract and is verified again fail-closed by the runner. Recovery of a
+        long downtime proceeds in bounded sequential batches from the old
+        cursor toward the current ASOF; the cursor is never silently moved and
+        nothing is ever skipped.
         """
         steady_start = end_open - (self.min_history_bars - 1) * BAR_MS
-        if resume_open_ms is None or resume_open_ms >= steady_start:
+        if resume_open_ms is None:
             return steady_start, end_open, False, self.min_history_bars
-        # bounded catch-up: window = causal lookback + a capped batch of new bars
+        # bounded batch: full causal lookback + a capped amount of new bars
         capacity = self.max_pages * self.page_limit - self.min_history_bars
         batch_bars = min(self.max_backfill_bars, capacity)
         if batch_bars < 1:
             raise BybitCandleSourceError(
                 REASON_REQUEST_WINDOW_INVALID,
-                "no backfill capacity within the page budget "
+                "no recovery capacity within the page budget "
                 f"(max_pages={self.max_pages} page_limit={self.page_limit} "
                 f"min_history_bars={self.min_history_bars})",
             )
-        start_open = resume_open_ms - (self.min_history_bars - 1) * BAR_MS
+        lookback_start = resume_open_ms - (self.min_history_bars - 1) * BAR_MS
+        start_open = min(lookback_start, steady_start)
         window_end = min(end_open, resume_open_ms + (batch_bars - 1) * BAR_MS)
-        return start_open, window_end, True, batch_bars
+        return start_open, window_end, window_end < end_open, batch_bars
 
     def load(self, symbol: str, *, resume_open_ms: int | None = None) -> list[Candle]:
         """Return the verified closed 5m history for ``symbol`` (ascending).
@@ -492,8 +498,17 @@ class BybitPhase2CandleSource:
         by_open: dict[int, Candle],
         unclosed_opens: set[int],
     ) -> int:
-        """Validate and merge one page; returns the number of unclosed bars excluded."""
+        """Validate and merge one page; returns the number of unclosed bars excluded.
+
+        Duplicate policy (review 5615772746 FIX-2): a repeated open inside ONE
+        API response is always ``DUPLICATE_CANDLE`` (or ``CONFLICTING_CANDLE``
+        when the OHLC differs), while an IDENTICAL candle seen again across
+        requests — e.g. a gap-recovery retry re-fetching a range that is already
+        partially recovered — is an idempotent overlap and is accepted. A
+        CONFLICTING candle across requests remains fail-closed.
+        """
         excluded = 0
+        seen_in_response: dict[int, tuple[float, float, float, float, float]] = {}
         for row in rows:
             if not isinstance(row, (list, tuple)) or len(row) < 6:
                 raise BybitCandleSourceError(REASON_INVALID_ROW, f"malformed row in {symbol}")
@@ -527,6 +542,16 @@ class BybitPhase2CandleSource:
                     f"bar {open_ms} outside requested window {page_start}..{page_end}",
                 )
 
+            values = (open_, high, low, close, volume)
+            repeated = seen_in_response.get(open_ms)
+            if repeated is not None:
+                # duplicates within ONE API response are always a protocol error
+                raise BybitCandleSourceError(
+                    REASON_DUPLICATE if repeated == values else REASON_CONFLICTING,
+                    f"repeated open {open_ms} in one response for {symbol}",
+                )
+            seen_in_response[open_ms] = values
+
             candle = Candle(open_ms, open_, high, low, close, volume)
             previous = by_open.get(open_ms)
             if previous is not None:
@@ -537,10 +562,14 @@ class BybitPhase2CandleSource:
                     and float(previous.close) == close
                     and float(previous.volume) == volume
                 )
-                raise BybitCandleSourceError(
-                    REASON_DUPLICATE if identical else REASON_CONFLICTING,
-                    f"repeated open {open_ms} in {symbol}",
-                )
+                if not identical:
+                    raise BybitCandleSourceError(
+                        REASON_CONFLICTING,
+                        f"conflicting candle {open_ms} in {symbol}",
+                    )
+                # identical overlap between requests (gap-recovery retries):
+                # idempotent, accepted without a second bookkeeping entry
+                continue
             by_open[open_ms] = candle
         return excluded
 

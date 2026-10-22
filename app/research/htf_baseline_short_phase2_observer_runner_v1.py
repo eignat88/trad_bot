@@ -90,6 +90,12 @@ CANONICAL_WINDOW = 200
 MIN_EXEC_BARS = 20
 MIN_HTF_BARS = 26
 DEFAULT_HTF_HISTORY_HOURS = 200
+BARS_PER_HOUR = 3_600_000 // BAR_MS  # 12
+# full causal lookback required before a resumed bar: the 1H resistance gate
+# (MIN_HTF_BARS closed hours) plus the canonical execution/ATR window (review
+# 5615772746 FIX-1). A replay carrying less than this cannot rebuild the same
+# level universe / ATR context as uninterrupted processing -> fail closed.
+MIN_RESUME_LOOKBACK_BARS = MIN_HTF_BARS * BARS_PER_HOUR + CANONICAL_WINDOW  # 512
 
 #: Checkpoint cursor schema V2: the cursor is the stable OPEN TIMESTAMP of the
 #: last visited bar, never an index into a variable-length list (issue #181).
@@ -121,6 +127,7 @@ class RunnerConfig:
     max_cycles: int | None = None
     stale_lease_after_s: float = 600.0
     allow_stale_takeover: bool = False
+    min_resume_lookback_bars: int = MIN_RESUME_LOOKBACK_BARS
     protocol_fingerprint: str = field(default_factory=protocol_fingerprint)
 
 
@@ -504,6 +511,34 @@ class Phase2ObserverRunner:
                     "%s: source window misses resume bar %d (first available %d); "
                     "symbol blocked until coverage is complete",
                     symbol, resume_open, open_ms,
+                )
+                return len(candles)
+            if index < int(self.config.min_resume_lookback_bars):
+                # review 5615772746 FIX-1: the resume bar is present but the
+                # window carries too little history BEFORE it to rebuild the
+                # causal lookback (1H resistance touch history + ATR window).
+                # Processing it would silently drop episodes vs an
+                # uninterrupted replay -> fail closed, cursor and episode
+                # identity preserved, nothing partially processed.
+                self.metrics.quarantine_bars += 1
+                self._coverage_reports.append(
+                    {
+                        "symbol": symbol,
+                        "action": "QUARANTINED",
+                        "reason": "RESUME_LOOKBACK_INCOMPLETE",
+                        "resume_open_ms": resume_open,
+                        "lookback_bars": index,
+                        "required_lookback_bars": int(self.config.min_resume_lookback_bars),
+                    }
+                )
+                log.warning(
+                    "%s: window carries %d lookback bars before resume %d "
+                    "(need %d); symbol blocked until the full causal lookback "
+                    "is delivered",
+                    symbol,
+                    index,
+                    resume_open,
+                    int(self.config.min_resume_lookback_bars),
                 )
                 return len(candles)
             return index

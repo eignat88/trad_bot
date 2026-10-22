@@ -74,6 +74,10 @@ def test_no_tracked_file_modified_against_base():
         "app/research/htf_baseline_short_phase2_observer_runner_v1.py",
         "deploy/systemd/trad-bot-htf-baseline-short-observer.service",
         "tests/test_htf_baseline_short_phase2_isolation_v1.py",
+        # FIX-1 review 5615772746: the CP4 coverage-gap fixture needed more
+        # synthetic history before its gap-resume point (causal lookback
+        # contract); still strictly inside the Phase-2 test surface
+        "tests/test_htf_baseline_short_phase2_runtime_v1.py",
     )
 
     unexpected = []

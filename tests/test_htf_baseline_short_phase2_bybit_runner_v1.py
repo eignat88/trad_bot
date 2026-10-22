@@ -26,6 +26,7 @@ from app.research.htf_baseline_short_phase2_observer_runner_v1 import (
     CheckpointCursorError,
     FileCandleSource,
     InMemoryWriter,
+    MIN_RESUME_LOOKBACK_BARS,
     Phase2ObserverRunner,
     RunnerConfig,
     build_boundary,
@@ -270,24 +271,36 @@ def test_rolling_window_eviction_preserves_episode_identity(env):
     ref_runner.run_once()
     assert ref_writer.rows  # the reference really observed something
 
-    # eviction: cycle 1 sees only the first 240 bars, cycle 2 sees the window
-    # SHIFTED forward by 120 bars (the 120 leading bars are gone)
+    # eviction: cycle 1 sees the first 640 bars (all pre-event history; the
+    # two episodes start at bar 732), cycle 2 sees the window SHIFTED forward
+    # by 120 bars (the 120 leading bars are gone). The cut sits at bar 640 so
+    # the shifted dataset still carries MIN_RESUME_LOOKBACK_BARS bars of real
+    # synthetic history before the resume point (640 - 120 = 520 >= 512).
     evict_writer = InMemoryWriter()
     config = make_config(tmp_path, "evict_state.json")
     runner = Phase2ObserverRunner(
         config, boundary=boundary, source=FileCandleSource(data_dir), writer=evict_writer
     )
-    runner.process_symbol_bars("BTCUSDT", candles[:240])
+    runner.process_symbol_bars("BTCUSDT", candles[:640])
     runner.save_checkpoint()
 
-    shifted_source = make_bybit_source(candles[120:])
+    shifted_source = make_bybit_source(
+        candles[120:],
+        min_history_bars=MIN_RESUME_LOOKBACK_BARS + 1,
+    )
     runner2 = Phase2ObserverRunner(
         config, boundary=boundary, source=shifted_source, writer=evict_writer
     )
     assert runner2.run_once() == EXIT_OK  # loads the checkpoint, resumes by timestamp
 
-    assert len(shifted_source.load("BTCUSDT")) == 696  # window really did shift
-    assert runner2.metrics.bars_processed == 816 - 240  # only unseen bars were visited
+    metrics = shifted_source.last_load_metrics
+    # resume-aware window: full causal lookback before the resume bar ...
+    assert metrics["window_start_open_ms"] == candles[640 - MIN_RESUME_LOOKBACK_BARS].timestamp
+    assert metrics["window_end_open_ms"] == candles[-1].timestamp
+    # ... entirely inside the shifted dataset (the 120 evicted bars are gone)
+    assert metrics["window_start_open_ms"] >= candles[120].timestamp
+    assert runner2.metrics.quarantine_bars == 0  # lookback satisfied, no fail-closed
+    assert runner2.metrics.bars_processed == 816 - 640  # only unseen bars were visited
 
     ref_ids = sorted(r["source_event_id"] for r in ref_writer.rows)
     evict_ids = sorted(r["source_event_id"] for r in evict_writer.rows)
@@ -527,22 +540,29 @@ def test_checkpoint_restart_equivalence(env):
     assert clean.run_once() == EXIT_OK
     assert clean_writer.rows
 
-    # interrupted cycle: process half, persist the checkpoint, then restart
+    # interrupted cycle: process the pre-event half (cut at bar 640, the two
+    # episodes start at bar 732), persist the checkpoint, then restart from a
+    # different overlapping source whose dataset still carries the full causal
+    # lookback (640 - 60 = 580 >= MIN_RESUME_LOOKBACK_BARS) before the resume
     crash_writer = InMemoryWriter()
     config = make_config(tmp_path, "crash_state.json")
     crashed = Phase2ObserverRunner(
         config, boundary=boundary, source=FileCandleSource(data_dir), writer=crash_writer
     )
-    crashed.process_symbol_bars("BTCUSDT", candles[:240])
+    crashed.process_symbol_bars("BTCUSDT", candles[:640])
     crashed.save_checkpoint()
 
     restarted = Phase2ObserverRunner(
         config,
         boundary=boundary,
-        source=make_bybit_source(candles[60:]),  # different source, overlapping window
+        source=make_bybit_source(
+            candles[60:],  # different source, overlapping window
+            min_history_bars=MIN_RESUME_LOOKBACK_BARS + 1,
+        ),
         writer=crash_writer,
     )
     assert restarted.run_once() == EXIT_OK
+    assert restarted.metrics.quarantine_bars == 0  # lookback satisfied, no fail-closed
 
     clean_ids = sorted(r["source_event_id"] for r in clean_writer.rows)
     crash_ids = sorted(r["source_event_id"] for r in crash_writer.rows)

@@ -28,6 +28,7 @@ from app.research.htf_baseline_short_phase2_bybit_candle_source_v1 import (
 )
 from app.research.htf_baseline_short_phase2_observer_runner_v1 import (
     EXIT_OK,
+    MIN_RESUME_LOOKBACK_BARS,
     InMemoryWriter,
     Phase2ObserverRunner,
     RunnerConfig,
@@ -146,12 +147,16 @@ def env(monkeypatch):
     return make_candles()
 
 
-def make_config(tmp_path, name="state.json", warmup_bars=300):
+def make_config(tmp_path, name="state.json", warmup_bars=300, min_resume_lookback_bars=300):
     return RunnerConfig(
         experiment_id=EXPERIMENT_ID,
         symbols=("BTCUSDT",),
         checkpoint_path=str(tmp_path / name),
         warmup_bars=warmup_bars,
+        # fixture-sized lookback requirement (the runner default is the full
+        # canonical MIN_RESUME_LOOKBACK_BARS, asserted explicitly in the FIX-1
+        # review tests below)
+        min_resume_lookback_bars=min_resume_lookback_bars,
     )
 
 
@@ -242,13 +247,18 @@ def test_downtime_shorter_than_window_resumes_normally(env, tmp_path):
     candles = env
     boundary = make_boundary()
     split = 1100  # resume inside the steady window [1040..1439]
-    writer, runners = run_recovery(tmp_path, candles, boundary, split=split)
+    # one load covers the whole remaining catch-up (340 bars <= batch 400)
+    writer, runners = run_recovery(tmp_path, candles, boundary, split=split, max_backfill_bars=400)
 
     runner = runners[1]  # the first catch-up cycle
     assert runner.metrics.backfill_batches == 0
     assert runner.metrics.quarantine_bars == 0
     assert runner.source.last_load_metrics["backfill"] is False
     assert runner.metrics.bars_processed == len(candles) - split
+    # FIX-1: the delivered window carries the full causal lookback before resume
+    metrics = runner.source.last_load_metrics
+    assert metrics["window_start_open_ms"] == candles[split - 399].timestamp
+    assert metrics["window_end_open_ms"] == candles[-1].timestamp
     assert [event_key(r) for r in writer.rows] == [
         event_key(r) for r in reference_events(candles, boundary)
     ]
@@ -284,7 +294,10 @@ def test_downtime_far_beyond_one_batch_recovers_sequentially(env, tmp_path):
     )
 
     total_backfill = sum(r.metrics.backfill_batches for r in runners)
-    assert total_backfill == 2  # [840..939] then [940..1039], then steady state
+    # bounded sequential catch-up from the durable cursor:
+    # [840..939] [940..1039] [1040..1139] [1140..1239] [1240..1339] (bounded,
+    # backfill=True) then [1340..1439] (window_end == ASOF, backfill=False)
+    assert total_backfill == 5
     assert sum(r.metrics.bars_processed for r in runners[1:]) == len(candles) - SPLIT
     assert all(r.metrics.quarantine_bars == 0 for r in runners)
     assert [event_key(r) for r in writer.rows] == [
@@ -503,3 +516,175 @@ def test_insufficient_htf_atr_lookback_fails_closed(env, tmp_path):
     assert writer.rows == []  # no partial processing with a broken lookback
     state = read_checkpoint(str(tmp_path / "state.json"))
     assert state["cursors"]["BTCUSDT"]["last_processed_open_ms"] == candles[SPLIT - 1].timestamp
+
+
+# ===================== FIX-1 review 5615772746: shifted-window causal lookback
+
+
+@pytest.fixture()
+def shifted_env(monkeypatch):
+    monkeypatch.setattr(
+        point_b, "_find_reaction_end",
+        lambda **kwargs: (len(kwargs["closed"]) - 1, 0),
+    )
+    return make_shifted_candles()
+
+
+def make_shifted_candles() -> list[Candle]:
+    """120 hours: 3 uninterrupted episodes; a shifted window keeps only 1.
+
+    * hours 20, 28 -> 109.9 count-touches; hour 32 -> 110.0 swing (level X,
+      available hour 37) — X needs history before hour 48;
+    * hours 52, 58 -> 117.9 count-touches; hour 64 -> 118.0 swing (level Y,
+      available hour 69);
+    * hours 78 and 82 -> two X contact runs (2 episodes, first touches at
+      bars 936 and 984);
+    * hour 88 -> one Y contact run (1 episode, first touch at bar 1056).
+
+    The 117.9/118.0 hours trade in a 115..118 band so they stay outside the
+    frozen touch tolerance of level X (distance/ATR > 1.0), and the 110.0
+    contact hours never reach level Y (high < price). Replaying from
+    ``candles[576:]`` (hour 48) can no longer derive level X, so it silently
+    keeps only the Y episode — the review's Codex scenario.
+    """
+    specs = {
+        20: (109.4, 109.9, 109.0, 109.4),
+        28: (109.4, 109.9, 109.0, 109.4),
+        32: (109.5, 110.0, 109.0, 109.5),
+        52: (117.4, 117.9, 115.0, 117.4),
+        58: (117.4, 117.9, 115.0, 117.4),
+        64: (117.5, 118.0, 115.0, 117.5),
+        78: (109.5, 110.0, 108.0, 109.5),
+        82: (109.5, 110.0, 108.0, 109.5),
+        88: (117.5, 118.0, 115.0, 117.5),
+    }
+    candles: list[Candle] = []
+    for hour_index in range(120):
+        ohlc = specs.get(hour_index, (100.0, 100.0, 99.0, 100.0))
+        for bar_index in range(12):
+            ts = HOUR0 + hour_index * HOUR + bar_index * BAR
+            candles.append(Candle(ts, *ohlc, 1.0))
+    return candles
+
+
+SHIFTED_RESUME = 744  # replay 1 covers candles[:744]; replay 2 resumes here
+SHIFTED_START = 576  # shifted window: only 168 bars of lookback before resume
+FULL_LOOKBACK_START = 232  # >= MIN_RESUME_LOOKBACK_BARS before the resume bar
+
+
+def test_shifted_window_replay_reproduces_missed_episodes(shifted_env, tmp_path):
+    """Codex reproduction (review 5615772746 FIX-1): the uninterrupted replay
+    forms 3 events, the shifted replay only 1 — the shifted window loses the
+    level-derivation history, so level X (formed from hours before the window)
+    silently never exists and its two episodes vanish without any error."""
+    candles = shifted_env
+    boundary = make_boundary()
+    asof = candles[-1].timestamp + BAR
+
+    ref_writer = InMemoryWriter()
+    ref_runner = Phase2ObserverRunner(
+        make_config(tmp_path, "ref.json", warmup_bars=300, min_resume_lookback_bars=0),
+        boundary=boundary,
+        source=make_source(candles),
+        writer=ref_writer,
+    )
+    ref_runner.process_symbol_bars("BTCUSDT", candles, evaluation_asof_ms=asof)
+    assert [r["first_touch_open_ms"] for r in ref_writer.rows] == [
+        candles[936].timestamp,
+        candles[984].timestamp,
+        candles[1056].timestamp,
+    ]  # uninterrupted replay: 3 episodes
+
+    writer = InMemoryWriter()
+    runner = Phase2ObserverRunner(
+        make_config(tmp_path, "repro.json", warmup_bars=300, min_resume_lookback_bars=0),
+        boundary=boundary,
+        source=make_source(candles),
+        writer=writer,
+    )
+    # shifted replay: only the window [576:] is delivered — the shape a window
+    # planner without resume-aware lookback produces when resuming at bar 744
+    # (just 168 bars of history before the resume point)
+    runner.process_symbol_bars("BTCUSDT", candles[SHIFTED_START:], evaluation_asof_ms=asof)
+    assert [r["first_touch_open_ms"] for r in writer.rows] == [candles[1056].timestamp]
+    # silent divergence: only the Y episode survives in the shifted replay
+    assert len(writer.rows) == 1
+
+
+def test_shifted_window_without_full_lookback_is_quarantined(shifted_env, tmp_path):
+    """Fail-closed: a resume without the full causal lookback quarantines the
+    symbol with an explicit reason instead of silently dropping episodes."""
+    candles = shifted_env
+    boundary = make_boundary()
+    writer = InMemoryWriter()
+    config = make_config(
+        tmp_path,
+        "guard.json",
+        warmup_bars=300,
+        min_resume_lookback_bars=MIN_RESUME_LOOKBACK_BARS,
+    )
+    runner = Phase2ObserverRunner(
+        config, boundary=boundary, source=make_source(candles), writer=writer
+    )
+    runner.process_symbol_bars(
+        "BTCUSDT", candles[:SHIFTED_RESUME], evaluation_asof_ms=candles[-1].timestamp + BAR
+    )
+    assert writer.rows == []
+
+    emitted = runner.process_symbol_bars(
+        "BTCUSDT", candles[SHIFTED_START:], evaluation_asof_ms=candles[-1].timestamp + BAR
+    )
+
+    assert emitted == []  # nothing partially processed
+    assert writer.rows == []
+    assert runner.metrics.quarantine_bars == 1
+    report = runner._coverage_reports[-1]
+    assert report["reason"] == "RESUME_LOOKBACK_INCOMPLETE"
+    assert report["lookback_bars"] == SHIFTED_RESUME - SHIFTED_START
+    assert report["required_lookback_bars"] == MIN_RESUME_LOOKBACK_BARS
+    # cursor and episode identity preserved for a later full-lookback replay
+    assert runner._cursors["BTCUSDT"]["last_processed_open_ms"] == candles[SHIFTED_RESUME - 1].timestamp
+    assert runner._state["BTCUSDT"].last_close_ms == candles[SHIFTED_RESUME].timestamp
+
+
+def test_full_lookback_restart_matches_uninterrupted_replay(shifted_env, tmp_path):
+    """With the full causal lookback the restart replay is exactly equivalent
+    to uninterrupted processing: identical source_event_id / episode_id /
+    first_touch_open_ms / known_at_ms, no repeated FIRST_CONFIRM."""
+    candles = shifted_env
+    boundary = make_boundary()
+    ref = reference_events(candles, boundary)
+    assert [r["first_touch_open_ms"] for r in ref] == [
+        candles[936].timestamp,
+        candles[984].timestamp,
+        candles[1056].timestamp,
+    ]
+
+    writer = InMemoryWriter()
+    config = make_config(
+        tmp_path,
+        "restart.json",
+        warmup_bars=300,
+        min_resume_lookback_bars=MIN_RESUME_LOOKBACK_BARS,
+    )
+    runner = Phase2ObserverRunner(
+        config, boundary=boundary, source=make_source(candles), writer=writer
+    )
+    runner.process_symbol_bars(
+        "BTCUSDT", candles[:SHIFTED_RESUME], evaluation_asof_ms=candles[-1].timestamp + BAR
+    )
+    runner.save_checkpoint()
+
+    restarted = Phase2ObserverRunner(
+        config, boundary=boundary, source=make_source(candles), writer=writer
+    )
+    assert restarted.load_checkpoint()
+    restarted.process_symbol_bars(
+        "BTCUSDT", candles[FULL_LOOKBACK_START:], evaluation_asof_ms=candles[-1].timestamp + BAR
+    )
+
+    assert restarted.metrics.quarantine_bars == 0
+    assert [event_key(r) for r in writer.rows] == [event_key(r) for r in ref]
+    assert [r["episode_id"] for r in writer.rows] == [r["episode_id"] for r in ref]
+    ids = [r["source_event_id"] for r in writer.rows]
+    assert len(ids) == len(set(ids))  # no repeated FIRST_CONFIRM

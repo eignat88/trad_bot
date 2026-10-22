@@ -54,13 +54,13 @@ resistance (200 закрытых часов) и 200-барного ATR. При �
 `load(symbol, *, resume_open_ms=None)` принимает безопасную resume-точку из
 durable timestamp-курсора (**никогда** не из индекса списка):
 
-* **steady-режим** (`resume_open_ms is None` или курсор внутри steady-окна):
-  выдаётся последнее `min_history_bars` закрытых баров — без изменений;
-* **backfill-режим** (курсор левее `steady_start` — простой наблюдателя дольше окна
-  источника): планируется **ограниченная партия**
-  `[resume − (min_history_bars−1) .. min(resume + batch_bars−1, end_open)]` —
-  полный причинный lookback для 1H resistance и ATR плюс не более `batch_bars`
-  новых баров, где `batch_bars = min(max_backfill_bars, max_pages×page_limit −
+* **cold start** (`resume_open_ms is None`): выдаётся последнее `min_history_bars`
+  закрытых баров — без изменений;
+* **resume-aware load** (есть durable курсор): **каждая** выдача несёт полный
+  причинный lookback `min_history_bars` перед resume-точкой плюс не более
+  `batch_bars` новых баров после неё:
+  `[resume − (min_history_bars−1) .. min(resume + batch_bars−1, end_open)]`,
+  где `batch_bars = min(max_backfill_bars, max_pages×page_limit −
   min_history_bars)`; при `batch_bars < 1` → `REQUEST_WINDOW_INVALID`
   (lookback никогда не сжимается молча);
 * восстановление идёт **последовательно партиями** от старого курсора к новому
@@ -88,6 +88,47 @@ durable timestamp-курсора (**никогда** не из индекса с
 lookback; доказательство эквивалентности «без перерыва vs checkpoint/restart/
 backfill» действительно, когда структура уровней целиком лежит в доставленном
 lookback (симуляция гарантирует это одинаковой последовательностью окон).
+
+## Полный причинный lookback при resume (FIX-1, review 5615772746)
+
+Сдвинутое окно (меньше истории перед resume-точкой, чем нужно 1H resistance и
+ATR) молча пересоздаёт другую вселенную уровней: реплей `candles[:744]` →
+`candles[576:]` без гарантии lookback даёт 1 эпизод против 3 при непрерывном
+проходе — без единой ошибки. Защита двухуровневая:
+
+* **источник** (см. выше): resume-aware выдача обязана нести полный lookback
+  `min_history_bars` перед resume-точкой (top-up истории);
+* **раннер** (`_resume_index`, fail-closed сертификация): если найденный
+  resume-бар имеет меньше `RunnerConfig.min_resume_lookback_bars` баров
+  истории перед собой — символ **карантинится** с причиной
+  `RESUME_LOOKBACK_INCOMPLETE` (метрика `quarantine_bars`, coverage-отчёт
+  содержит `resume_open_ms`/`lookback_bars`/`required_lookback_bars`), ничего
+  не обрабатывается, курсор и идентичность эпизодов сохраняются. Продолжение
+  возможно только когда источник доставит полный lookback.
+
+Константа `MIN_RESUME_LOOKBACK_BARS = MIN_HTF_BARS × 12 + CANONICAL_WINDOW = 512`
+(26 закрытых 1H-часов touch-истории + каноническое 200-барное окно ATR) —
+дефолт конфига; холодный старт не затронут (нечего резюмировать), существующий
+предохранитель `RESUME_GAP_SOURCE_WINDOW` сохранён. При достаточном lookback
+рестарт/сдвиг/eviction-окна дают точную эквивалентность непрерывному проходу:
+идентичные `source_event_id`/`episode_id`/`first_touch_open_ms`/`known_at_ms`,
+без повторных FIRST_CONFIRM.
+
+## Идемпотентный retry-overlap gap-recovery (FIX-2, review 5615772746)
+
+Повторный запрос диапазона gap-recovery, частично восстановленного предыдущей
+попыткой, не должен создавать ложный `DUPLICATE_CANDLE`. Политика `_merge_rows`:
+
+* **повтор внутри одного API-ответа** — всегда протокольная ошибка:
+  идентичная строка → `DUPLICATE_CANDLE`, разная → `CONFLICTING_CANDLE`;
+* **идентичная свеча между запросами** (retry перекрывает уже восстановленный
+  диапазон) — идемпотентный overlap, принимается молча, без второй записи;
+* **конфликтующая OHLC между запросами** (retry противоречит прошлой попытке) —
+  по-прежнему fail-closed `CONFLICTING_CANDLE`.
+
+Частичное восстановление честно продолжается со следующей попытки (бюджет
+`gap_recovery_attempts × max_gap_windows` неизменен); диапазоны восстановления
+по-прежнему строго ограничены, ничего не подмешивается из будущего.
 
 ## Выбор источника (opt-in)
 
@@ -154,7 +195,9 @@ PASS. Успех одного символа никогда не маскиру�
 
 * `tests/test_htf_baseline_short_phase2_bybit_candle_source_v1.py` — юнит-матрица
   источника (forming-candle, boundary-after-close, пагинация 200+, пропуски/дубликаты/
-  OHLC-конфликты, ошибки API, rate limit, локальные часы никогда не решают).
+  OHLC-конфликты, ошибки API, rate limit, локальные часы никогда не решают;
+  FIX-2 review 5615772746: частичное→полное восстановление без ложного
+  `DUPLICATE_CANDLE`, конфликт между попытками → fail-closed).
 * `tests/test_htf_baseline_short_phase2_bybit_runner_v1.py` — интеграционная матрица
   (CSV-parity, rolling-window eviction, restart+overlap без дубликатов FIRST_CONFIRM,
   warmup/pre-freeze не становятся чистым OOS, блокировка символа, миграция курсора,
@@ -165,7 +208,11 @@ PASS. Успех одного символа никогда не маскиру�
   restart посреди backfill без потерь/дубликатов, overlap диапазонов без повторного
   FIRST_CONFIRM, стабильность episode identity при вытеснении окна, pre-freeze
   события не становятся чистым OOS, first-touch до freeze при подтверждении после —
-  не eligible, недостаточный HTF/ATR lookback → fail-closed).
+  не eligible, недостаточный HTF/ATR lookback → fail-closed; FIX-1 review
+  5615772746: репродукция «3 vs 1» на сдвинутом окне, карантин
+  `RESUME_LOOKBACK_INCOMPLETE` без обработки, эквивалентность
+  «без перерыва vs restart с полным lookback» по
+  `source_event_id`/`episode_id`/`first_touch_open_ms`/`known_at_ms`).
 * `tests/test_htf_baseline_short_phase2_bybit_dry_run_v1.py` — FIX-2 матрица
   (все символы валидны → PASS; `SOURCE_BLOCKED`/`QUARANTINED`/неполное покрытие →
   FAIL; `run_once()==EXIT_OK` при `source_errors > 0` → FAIL; сломанная
