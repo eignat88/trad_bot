@@ -61,6 +61,9 @@ DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_GAP_RECOVERY_ATTEMPTS = 2
 DEFAULT_MAX_GAP_WINDOWS = 8
 DEFAULT_RETRY_BACKOFF_S = 0.5
+#: Maximum NEW closed bars delivered per catch-up batch when the durable
+#: cursor falls outside the steady window (bounded historical backfill).
+DEFAULT_MAX_BACKFILL_BARS = 800
 
 # --------------------------------------------------------------- reason codes
 REASON_API_ERROR = "BYBIT_API_ERROR"
@@ -159,6 +162,7 @@ class BybitPhase2CandleSource:
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         gap_recovery_attempts: int = DEFAULT_GAP_RECOVERY_ATTEMPTS,
         max_gap_windows: int = DEFAULT_MAX_GAP_WINDOWS,
+        max_backfill_bars: int = DEFAULT_MAX_BACKFILL_BARS,
         retry_backoff_s: float = DEFAULT_RETRY_BACKOFF_S,
         category: str = "linear",
         interval: str = "5",
@@ -173,6 +177,7 @@ class BybitPhase2CandleSource:
             ("max_attempts", max_attempts),
             ("gap_recovery_attempts", gap_recovery_attempts),
             ("max_gap_windows", max_gap_windows),
+            ("max_backfill_bars", max_backfill_bars),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer, got {value!r}")
@@ -197,6 +202,7 @@ class BybitPhase2CandleSource:
         self.max_attempts = int(max_attempts)
         self.gap_recovery_attempts = int(gap_recovery_attempts)
         self.max_gap_windows = int(max_gap_windows)
+        self.max_backfill_bars = int(max_backfill_bars)
         self.retry_backoff_s = float(retry_backoff_s)
         self.category = str(category)
         self.interval = str(interval)
@@ -209,11 +215,59 @@ class BybitPhase2CandleSource:
         self.request_log: list[dict] = []
 
     # ------------------------------------------------------------------ load
-    def load(self, symbol: str) -> list[Candle]:
-        """Return the verified closed 5m history for ``symbol`` (ascending)."""
+    def _plan_window(
+        self, end_open: int, resume_open_ms: int | None
+    ) -> tuple[int, int, bool, int]:
+        """Plan the bounded delivery window around the durable timestamp cursor.
+
+        Steady state: the last ``min_history_bars`` closed bars. When the durable
+        resume point falls OUTSIDE that window (observer downtime longer than
+        the window) a bounded catch-up batch is planned instead: the window
+        starts ``min_history_bars`` before the resume point (the full causal
+        lookback for 1H resistance and the ATR window) and ends at most
+        ``batch_bars`` past it, so the observer advances sequentially from the
+        old cursor toward the current ASOF over several bounded cycles. The
+        cursor is never silently moved and nothing is ever skipped.
+        """
+        steady_start = end_open - (self.min_history_bars - 1) * BAR_MS
+        if resume_open_ms is None or resume_open_ms >= steady_start:
+            return steady_start, end_open, False, self.min_history_bars
+        # bounded catch-up: window = causal lookback + a capped batch of new bars
+        capacity = self.max_pages * self.page_limit - self.min_history_bars
+        batch_bars = min(self.max_backfill_bars, capacity)
+        if batch_bars < 1:
+            raise BybitCandleSourceError(
+                REASON_REQUEST_WINDOW_INVALID,
+                "no backfill capacity within the page budget "
+                f"(max_pages={self.max_pages} page_limit={self.page_limit} "
+                f"min_history_bars={self.min_history_bars})",
+            )
+        start_open = resume_open_ms - (self.min_history_bars - 1) * BAR_MS
+        window_end = min(end_open, resume_open_ms + (batch_bars - 1) * BAR_MS)
+        return start_open, window_end, True, batch_bars
+
+    def load(self, symbol: str, *, resume_open_ms: int | None = None) -> list[Candle]:
+        """Return the verified closed 5m history for ``symbol`` (ascending).
+
+        ``resume_open_ms`` is the durable timestamp-cursor resume point (the
+        open time of the first not-yet-processed bar). When it lies outside the
+        steady window, a bounded historical backfill batch covering it is
+        returned instead of the latest window, so a long observer downtime can
+        be recovered without skipping history or moving the cursor.
+        """
         symbol = str(symbol or "").strip()
         if not symbol:
             raise BybitCandleSourceError(REASON_REQUEST_WINDOW_INVALID, "empty symbol")
+        if resume_open_ms is not None and (
+            isinstance(resume_open_ms, bool)
+            or not isinstance(resume_open_ms, int)
+            or resume_open_ms <= 0
+            or resume_open_ms % BAR_MS
+        ):
+            raise BybitCandleSourceError(
+                REASON_REQUEST_WINDOW_INVALID,
+                f"resume_open_ms must be a positive aligned timestamp, got {resume_open_ms!r}",
+            )
         self.request_log = []
         metrics: dict[str, Any] = {
             "symbol": symbol,
@@ -223,27 +277,39 @@ class BybitPhase2CandleSource:
             "retries": 0,
             "unclosed_candles_excluded": 0,
             "bars_returned": 0,
+            "backfill": False,
+            "resume_open_ms": resume_open_ms,
         }
         self.last_load_metrics = metrics
 
         server_time_ms = self._fetch_server_time_ms()
         asof_ms = self._resolve_asof(server_time_ms)
         end_open = (asof_ms - BAR_MS) // BAR_MS * BAR_MS
-        start_open = end_open - (self.min_history_bars - 1) * BAR_MS
+        start_open, window_end, backfill, batch_bars = self._plan_window(
+            end_open, resume_open_ms
+        )
+        metrics.update(
+            {
+                "backfill": backfill,
+                "batch_bars": batch_bars,
+                "window_start_open_ms": start_open,
+                "window_end_open_ms": window_end,
+            }
+        )
 
         by_open: dict[int, Candle] = {}
         unclosed_opens: set[int] = set()
         cursor = start_open
         pages = 0
-        while cursor <= end_open:
+        while cursor <= window_end:
             pages += 1
             if pages > self.max_pages:
                 raise BybitCandleSourceError(
                     REASON_MAX_PAGES, f"page budget {self.max_pages} exhausted"
                 )
-            page_end = min(end_open, cursor + (self.page_limit - 1) * BAR_MS)
+            page_end = min(window_end, cursor + (self.page_limit - 1) * BAR_MS)
             rows, page_time_ms = self._fetch_page(
-                symbol, cursor, page_end, window_end=end_open, attempts=self.max_attempts
+                symbol, cursor, page_end, window_end=window_end, attempts=self.max_attempts
             )
             metrics["pages_fetched"] += 1
             server_time_ms = min(server_time_ms, page_time_ms)
@@ -267,7 +333,7 @@ class BybitPhase2CandleSource:
         # or a dropped bar -> bounded recovery -> fail closed.
         expected = [
             open_ms
-            for open_ms in range(start_open, end_open + BAR_MS, BAR_MS)
+            for open_ms in range(start_open, window_end + BAR_MS, BAR_MS)
             if open_ms not in unclosed_opens
         ]
         missing = [open_ms for open_ms in expected if open_ms not in by_open]

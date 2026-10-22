@@ -1,13 +1,15 @@
 {
   "audits": {
     "bounded_requests": {
-      "budget": 72,
+      "budget": 316,
+      "loads": 4,
       "pass": true,
+      "per_load_budget": 79,
       "request_count": 32
     },
     "causal_asof": {
-      "checked_events": 181,
-      "evaluation_asof_ms": 1792668221027,
+      "checked_events": 180,
+      "evaluation_asof_ms": 1792672653180,
       "failures": [],
       "pass": true
     },
@@ -31,15 +33,26 @@
     ],
     "warmup_bars": 400
   },
+  "coverage_status": {
+    "blocked": [],
+    "complete": [
+      "BTCUSDT",
+      "ETHUSDT"
+    ],
+    "incomplete": [],
+    "quarantined": []
+  },
   "cycle1_exit_code": 0,
   "cycle1_metrics": {
+    "backfill_bars": 0,
+    "backfill_batches": 0,
     "bars_processed": 6000,
     "checkpoint_writes": 1,
     "coverage_gap_bars": 0,
     "cursor_migrations": 0,
     "cycles": 1,
     "duplicate_suppressions": 0,
-    "emissions_eligible": 181,
+    "emissions_eligible": 180,
     "emissions_rejected": 0,
     "quarantine_bars": 0,
     "source_errors": 0,
@@ -48,19 +61,24 @@
     "writer_errors": 0,
     "writer_rejected": 0
   },
-  "evaluation_asof_ms": 1792668221027,
-  "generated_at": "2026-10-22T11:23:07Z",
+  "evaluation_asof_ms": 1792672653180,
+  "generated_at": "2026-10-22T12:36:59Z",
   "issue": 181,
   "load_metrics": {
+    "backfill": false,
     "bars_returned": 3000,
-    "evaluation_asof_ms": 1792668221027,
+    "batch_bars": 3000,
+    "evaluation_asof_ms": 1792672653180,
     "gap_recovery_requests": 0,
     "page_requests": 0,
     "pages_fetched": 15,
+    "resume_open_ms": null,
     "retries": 0,
-    "server_time_ms": 1792668221027,
+    "server_time_ms": 1792672653180,
     "symbol": "ETHUSDT",
-    "unclosed_candles_excluded": 0
+    "unclosed_candles_excluded": 0,
+    "window_end_open_ms": 1792672200000,
+    "window_start_open_ms": 1791772500000
   },
   "mode": "RESEARCH_ONLY/OBSERVE_ONLY",
   "observed_events": [
@@ -290,12 +308,74 @@
       "warmup_origin": false
     }
   ],
-  "observed_events_total": 181,
+  "observed_events_total": 180,
   "oos_activation": "BLOCKED (gate #181)",
+  "overall_verdict": "PASS",
   "production_db_writes": 0,
+  "quarantine_bars": 0,
+  "readiness_blockers": [],
+  "recovery_status": {
+    "downtime_bars": 3000,
+    "equivalence": {
+      "duplicate_first_confirm": 0,
+      "extra_events": [],
+      "identical_episode_ids": true,
+      "identical_first_touch_open_ms": true,
+      "identical_known_at_ms": true,
+      "identical_source_event_ids": true,
+      "interrupted_events": 212,
+      "missed_events": [],
+      "pass": true,
+      "uninterrupted_events": 212
+    },
+    "failures": [],
+    "history_bars": 5400,
+    "pass": true,
+    "scenarios": {
+      "interrupted": {
+        "backfill_bars": 1600,
+        "backfill_batches": 2,
+        "bars_processed": 2200,
+        "batches_before_crash": 1,
+        "cycles": 5,
+        "duplicate_suppressions": 0,
+        "emissions_rejected": 0,
+        "events": 212
+      },
+      "uninterrupted": {
+        "backfill_bars": 2400,
+        "backfill_batches": 3,
+        "bars_processed": 5400,
+        "cycles": 5,
+        "duplicate_suppressions": 0,
+        "emissions_rejected": 0,
+        "events": 212
+      }
+    },
+    "split_index": 2400,
+    "window_bars": 1200
+  },
   "request_count": 32,
-  "server_time_ms": 1792668221027,
+  "server_time_ms": 1792672653180,
   "source_error": null,
+  "source_errors": 0,
+  "symbol_status": {
+    "BTCUSDT": {
+      "coverage": "COMPLETE",
+      "cursor_last_processed_open_ms": 1792672200000,
+      "processed": true,
+      "reason": null,
+      "status": "OK"
+    },
+    "ETHUSDT": {
+      "coverage": "COMPLETE",
+      "cursor_last_processed_open_ms": 1792672200000,
+      "processed": true,
+      "reason": null,
+      "status": "OK"
+    }
+  },
+  "symbols_blocked": 0,
   "tool": "HTF_BASELINE_SHORT_PHASE2_BYBIT_LIVE_DRY_RUN_V1",
   "verdict": "PASS"
 }

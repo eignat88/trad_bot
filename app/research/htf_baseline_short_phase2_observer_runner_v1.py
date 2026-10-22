@@ -24,6 +24,7 @@ emitted-event set in the checkpoint). Exactly-once is NOT claimed.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
 import os
@@ -139,6 +140,8 @@ class Metrics:
     symbols_blocked: int = 0
     unclosed_candles_excluded: int = 0
     cursor_migrations: int = 0
+    backfill_batches: int = 0
+    backfill_bars: int = 0
 
     def as_dict(self) -> dict:
         return dict(self.__dict__)
@@ -178,7 +181,10 @@ class FileCandleSource:
     def __init__(self, data_dir: str | os.PathLike):
         self.data_dir = Path(data_dir)
 
-    def load(self, symbol: str) -> list[Candle]:
+    def load(self, symbol: str, *, resume_open_ms: int | None = None) -> list[Candle]:
+        # CSV replay is complete by construction: the whole file is delivered
+        # and the runner resumes from the durable timestamp cursor. The resume
+        # point is accepted for source-contract parity with the live source.
         path = self.data_dir / f"{symbol}_5m.csv"
         rows: list[Candle] = []
         try:
@@ -435,6 +441,36 @@ class Phase2ObserverRunner:
             candles = candles[:kept]
         return candles
 
+    def _durable_resume_open(
+        self, symbol: str, state: Phase2Episodes | None
+    ) -> int | None:
+        """Safe resume point from the durable timestamp cursor (never a list index).
+
+        The earlier of the episode-machine close and the checkpoint cursor wins,
+        so a bar skipped by a transient failure is re-visited instead of silently
+        jumping the episode machine over a ``5m gap``.
+        """
+        resume_open: int | None = None
+        if state is not None and state.last_close_ms is not None:
+            resume_open = int(state.last_close_ms)
+        cursor = self._cursors.get(symbol)
+        if cursor is not None:
+            cursor_resume = int(cursor["last_processed_open_ms"]) + BAR_MS
+            resume_open = cursor_resume if resume_open is None else min(resume_open, cursor_resume)
+        return resume_open
+
+    def _load_symbol(self, symbol: str, resume_open_ms: int | None) -> list[Candle]:
+        """Load one symbol, passing the durable timestamp cursor to the source.
+
+        Sources implementing the v2 contract receive ``resume_open_ms`` so a
+        long observer downtime can be recovered with bounded historical
+        backfill instead of quarantining the symbol forever.
+        """
+        loader = self.source.load
+        if "resume_open_ms" in inspect.signature(loader).parameters:
+            return loader(symbol, resume_open_ms=resume_open_ms)
+        return loader(symbol)
+
     def _resume_index(self, symbol: str, state: Phase2Episodes, candles: list[Candle]) -> int:
         """Resume position as a stable TIMESTAMP cursor, never a list index.
 
@@ -443,13 +479,7 @@ class Phase2ObserverRunner:
         bar skipped by a transient contract failure is re-visited instead of
         silently jumping the episode machine over a ``5m gap``.
         """
-        resume_open: int | None = None
-        if state.last_close_ms is not None:
-            resume_open = int(state.last_close_ms)
-        cursor = self._cursors.get(symbol)
-        if cursor is not None:
-            cursor_resume = int(cursor["last_processed_open_ms"]) + BAR_MS
-            resume_open = cursor_resume if resume_open is None else min(resume_open, cursor_resume)
+        resume_open = self._durable_resume_open(symbol, state)
         if resume_open is None:
             return 0
         for index, bar in enumerate(candles):
@@ -652,8 +682,9 @@ class Phase2ObserverRunner:
             lease.acquire(allow_stale_takeover=self.config.allow_stale_takeover)
             self.load_checkpoint()
             for symbol in self.config.symbols:
+                resume_open = self._durable_resume_open(symbol, self._state.get(symbol))
                 try:
-                    candles = self.source.load(symbol)
+                    candles = self._load_symbol(symbol, resume_open)
                 except CandleSourceError as exc:
                     # fail-closed source contract (API error / rate limit /
                     # incomplete pagination): BLOCK the symbol, advance nothing,
@@ -668,6 +699,11 @@ class Phase2ObserverRunner:
                         symbol, exc,
                     )
                     continue
+                load_metrics = getattr(self.source, "last_load_metrics", None) or {}
+                if load_metrics.get("backfill"):
+                    # bounded cursor-aware catch-up batch (review FIX-1)
+                    self.metrics.backfill_batches += 1
+                    self.metrics.backfill_bars += int(load_metrics.get("batch_bars", 0))
                 evaluation_asof_ms = getattr(self.source, "last_evaluation_asof_ms", None)
                 self.process_symbol_bars(
                     symbol, candles, evaluation_asof_ms=evaluation_asof_ms
