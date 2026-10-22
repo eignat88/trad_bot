@@ -181,7 +181,18 @@ def _provisioned_db(fail_at: str | None = None, name: str | None = None):
     name = name or f"trad_bot_p2_it_{uuid.uuid4().hex[:8]}"
     _assert_safe_database(name)
     admin = _admin_connect()
-    preexisting = _existing_roles(admin)
+    try:
+        preexisting = _existing_roles(admin)
+        conflicting = {OBSERVER_ROLE, ADMIN_ROLE} & preexisting
+        if conflicting:
+            raise RuntimeError(
+                "REFUSE_PREEXISTING_PHASE2_ROLES: "
+                + ", ".join(sorted(conflicting))
+            )
+    except BaseException:
+        admin.close()
+        raise
+
     conn = None
     try:
         with admin.cursor() as cur:
@@ -208,6 +219,112 @@ def db():
     """Disposable database with 074 applied; roles tracked for teardown."""
     with _provisioned_db() as prov:
         yield prov.conn
+
+
+
+@pytest.mark.parametrize(
+    "existing_role",
+    [OBSERVER_ROLE, ADMIN_ROLE],
+)
+def test_preexisting_phase2_roles_are_rejected(existing_role, monkeypatch):
+    """Existing cluster-wide Phase-2 roles must never be modified."""
+    class FakeAdmin:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    admin = FakeAdmin()
+    operations = []
+
+    monkeypatch.setattr(
+        __import__(__name__, fromlist=["_admin_connect"]),
+        "_admin_connect",
+        lambda: admin,
+    )
+    monkeypatch.setattr(
+        __import__(__name__, fromlist=["_existing_roles"]),
+        "_existing_roles",
+        lambda conn: {existing_role},
+    )
+    monkeypatch.setattr(
+        __import__(__name__, fromlist=["_cleanup"]),
+        "_cleanup",
+        lambda *args, **kwargs: operations.append("cleanup"),
+    )
+
+    with pytest.raises(RuntimeError, match="REFUSE_PREEXISTING_PHASE2_ROLES"):
+        with _provisioned_db():
+            pytest.fail("provisioning must not proceed")
+
+    assert operations == [], "cleanup must not run on preexisting roles"
+    assert admin.closed
+
+
+
+@pytest.mark.parametrize("existing_role", [OBSERVER_ROLE, ADMIN_ROLE])
+def test_preexisting_role_password_unchanged_real_pg(existing_role):
+    """Pre-existing role credentials must survive provisioning refusal."""
+    admin = _admin_connect()
+    marker = f"trad_bot_p2_it_{uuid.uuid4().hex[:8]}"
+    secret = _new_test_credential()
+
+    try:
+        with admin.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM pg_roles WHERE rolname = %s",
+                (existing_role,),
+            )
+            assert cur.fetchone() is None, (
+                "test requires a clean isolated cluster"
+            )
+
+            cur.execute(
+                pgsql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
+                    pgsql.Identifier(existing_role),
+                    pgsql.Literal(secret.reveal()),
+                )
+            )
+
+            cur.execute(
+                "SELECT rolpassword FROM pg_authid WHERE rolname = %s",
+                (existing_role,),
+            )
+            before = cur.fetchone()[0]
+
+        assert before.startswith("SCRAM-SHA-256$")
+
+        with pytest.raises(
+            RuntimeError,
+            match="REFUSE_PREEXISTING_PHASE2_ROLES",
+        ):
+            with _provisioned_db(name=marker):
+                pytest.fail("provisioning must be refused")
+
+        with admin.cursor() as cur:
+            cur.execute(
+                "SELECT rolpassword FROM pg_authid WHERE rolname = %s",
+                (existing_role,),
+            )
+            after = cur.fetchone()[0]
+
+            cur.execute(
+                "SELECT 1 FROM pg_database WHERE datname = %s",
+                (marker,),
+            )
+            database_exists = cur.fetchone()
+
+        assert before == after, "existing role password was modified"
+        assert database_exists is None, "test database was created"
+
+    finally:
+        with admin.cursor() as cur:
+            cur.execute(
+                pgsql.SQL("DROP ROLE IF EXISTS {}").format(
+                    pgsql.Identifier(existing_role)
+                )
+            )
+        admin.close()
 
 
 def _existing_roles(conn) -> set:
