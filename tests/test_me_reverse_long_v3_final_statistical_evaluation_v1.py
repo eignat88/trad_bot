@@ -178,6 +178,7 @@ def test_verify_manifest_before_regeneration_is_read_only(mod):
     assert report["ok"] is True, report
     assert report["mismatched"] == []
     assert report["missing_required"] == []
+    assert report["mismatched_local_only"] == []
     assert report["checked_required"] == report["matched_required"]
     assert report["checked_required"] == len(_committed_manifest()["files"])
     # verification must never overwrite the manifest under test
@@ -240,6 +241,36 @@ def test_negative_tampered_cohort_snapshot_detected(mod, tmp_path):
     assert COHORT_LOGICAL in report["mismatched"]
     assert MANIFEST_PATH.read_bytes() == manifest_before
     assert _sha256(tampered) != _committed_manifest()["files"][COHORT_LOGICAL]
+
+
+def test_negative_drifted_local_only_evidence_fails_verification(mod, tmp_path):
+    """A PRESENT local-only evidence file with a drifted hash must fail.
+
+    Absence is informational (local-only evidence is not committed), but if
+    the file exists and differs from its recorded hash, verification must not
+    report success (Codex re-review finding 4351709010).
+    """
+    tree = _materialize_tree(tmp_path)
+    manifest = _committed_manifest()
+    local_rel = (
+        "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/"
+        "extract/me_v3_eval_20261022.tgz"
+    )
+    assert local_rel in manifest["local_only_files"]["files"]
+
+    drifted = tree / local_rel
+    drifted.parent.mkdir(parents=True, exist_ok=True)
+    drifted.write_bytes(b"corrupted local-only evidence")
+
+    manifest_before = MANIFEST_PATH.read_bytes()
+    report = mod.verify_manifest(MANIFEST_PATH, tree)
+
+    assert report["ok"] is False
+    assert report["mismatched_local_only"] == [local_rel]
+    assert MANIFEST_PATH.read_bytes() == manifest_before
+    # absence stays informational: remove it and verification passes again
+    drifted.unlink()
+    assert mod.verify_manifest(MANIFEST_PATH, tree)["ok"] is True
 
 
 def test_regression_reproduces_original_defect_and_confirms_fix(mod, tmp_path):

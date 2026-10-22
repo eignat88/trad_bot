@@ -1350,6 +1350,12 @@ def verify_manifest(
     the manifest and hashes the referenced files.  ``root`` is the directory
     the manifest's logical names are resolved against (the repository root for
     the committed evidence; a temporary copy root in negative tests).
+
+    Failure semantics: any hash mismatch or missing file in ``files`` fails
+    verification, and so does a *present* local-only evidence file whose hash
+    drifted (``mismatched_local_only``).  Local-only files that are absent are
+    reported as informational only, because they are intentionally not
+    committed.
     """
     manifest_path = Path(manifest_path) if manifest_path else OUT_DIR / f"{BASENAME}_manifest.json"
     root = Path(root) if root else REPO_ROOT
@@ -1378,11 +1384,17 @@ def verify_manifest(
     for rel, digest in sorted(manifest.get("local_only_files", {}).get("files", {}).items()):
         path = root / rel
         if not path.exists():
+            # legitimately absent (local-only evidence is not committed);
+            # absence is informational, presence-with-drift is a failure
             report["absent_local_only"].append(rel)
         elif sha256_file(path) != digest:
             report["mismatched_local_only"].append(rel)
 
-    report["ok"] = not report["mismatched"] and not report["missing_required"]
+    report["ok"] = (
+        not report["mismatched"]
+        and not report["missing_required"]
+        and not report["mismatched_local_only"]
+    )
     return report
 
 
