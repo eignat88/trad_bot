@@ -24,6 +24,7 @@ emitted-event set in the checkpoint). Exactly-once is NOT claimed.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
 import os
@@ -37,6 +38,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.models import Candle
+from app.research.htf_baseline_short_phase2_bybit_candle_source_v1 import (
+    BybitPhase2CandleSource,
+    CandleSourceError,
+    DEFAULT_MAX_ATTEMPTS as BYBIT_DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MAX_PAGES as BYBIT_DEFAULT_MAX_PAGES,
+    DEFAULT_MIN_HISTORY_BARS as BYBIT_DEFAULT_MIN_HISTORY_BARS,
+    DEFAULT_PAGE_LIMIT as BYBIT_DEFAULT_PAGE_LIMIT,
+    DEFAULT_RETRY_BACKOFF_S as BYBIT_DEFAULT_RETRY_BACKOFF_S,
+)
 from app.research.htf_baseline_short_phase2_contracts_v1 import (
     BAR_MS,
     ContractViolation,
@@ -80,6 +90,17 @@ CANONICAL_WINDOW = 200
 MIN_EXEC_BARS = 20
 MIN_HTF_BARS = 26
 DEFAULT_HTF_HISTORY_HOURS = 200
+BARS_PER_HOUR = 3_600_000 // BAR_MS  # 12
+# full causal lookback required before a resumed bar: the 1H resistance gate
+# (MIN_HTF_BARS closed hours) plus the canonical execution/ATR window (review
+# 5615772746 FIX-1). A replay carrying less than this cannot rebuild the same
+# level universe / ATR context as uninterrupted processing -> fail closed.
+MIN_RESUME_LOOKBACK_BARS = MIN_HTF_BARS * BARS_PER_HOUR + CANONICAL_WINDOW  # 512
+
+#: Checkpoint cursor schema V2: the cursor is the stable OPEN TIMESTAMP of the
+#: last visited bar, never an index into a variable-length list (issue #181).
+CURSOR_SCHEMA_V2 = "HTF_P2_CURSOR_V2_TIMESTAMP"
+CURSOR_SCHEMA_V1_INDEX = "HTF_P2_CURSOR_V1_INDEX"
 
 
 class NotRunnableError(RuntimeError):
@@ -88,6 +109,10 @@ class NotRunnableError(RuntimeError):
 
 class CheckpointBoundaryError(StateStoreError):
     """Checkpoint belongs to a different freeze boundary; reject, never reuse."""
+
+
+class CheckpointCursorError(StateStoreError):
+    """Checkpoint cursor is unusable and cannot be migrated; reject, never guess."""
 
 
 @dataclass
@@ -102,6 +127,7 @@ class RunnerConfig:
     max_cycles: int | None = None
     stale_lease_after_s: float = 600.0
     allow_stale_takeover: bool = False
+    min_resume_lookback_bars: int = MIN_RESUME_LOOKBACK_BARS
     protocol_fingerprint: str = field(default_factory=protocol_fingerprint)
 
 
@@ -117,6 +143,12 @@ class Metrics:
     writer_errors: int = 0
     writer_rejected: int = 0
     quarantine_bars: int = 0
+    source_errors: int = 0
+    symbols_blocked: int = 0
+    unclosed_candles_excluded: int = 0
+    cursor_migrations: int = 0
+    backfill_batches: int = 0
+    backfill_bars: int = 0
 
     def as_dict(self) -> dict:
         return dict(self.__dict__)
@@ -156,24 +188,104 @@ class FileCandleSource:
     def __init__(self, data_dir: str | os.PathLike):
         self.data_dir = Path(data_dir)
 
-    def load(self, symbol: str) -> list[Candle]:
+    def load(self, symbol: str, *, resume_open_ms: int | None = None) -> list[Candle]:
+        # CSV replay is complete by construction: the whole file is delivered
+        # and the runner resumes from the durable timestamp cursor. The resume
+        # point is accepted for source-contract parity with the live source.
         path = self.data_dir / f"{symbol}_5m.csv"
         rows: list[Candle] = []
-        with path.open(newline="", encoding="utf-8") as handle:
-            import csv as _csv
+        try:
+            with path.open(newline="", encoding="utf-8") as handle:
+                import csv as _csv
 
-            for row in _csv.DictReader(handle):
-                rows.append(
-                    Candle(
-                        int(row["timestamp"]),
-                        float(row["open"]),
-                        float(row["high"]),
-                        float(row["low"]),
-                        float(row["close"]),
-                        float(row["volume"]),
+                for row in _csv.DictReader(handle):
+                    rows.append(
+                        Candle(
+                            int(row["timestamp"]),
+                            float(row["open"]),
+                            float(row["high"]),
+                            float(row["low"]),
+                            float(row["close"]),
+                            float(row["volume"]),
+                        )
                     )
-                )
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            # fail-closed source failure: the symbol is blocked, never partially
+            # processed with silently dropped rows
+            raise CandleSourceError("CSV_SOURCE_ERROR", f"{path.name}: {exc}") from exc
         return rows
+
+
+# ------------------------------------------------------- checkpoint cursors
+def parse_timestamp_cursors(raw_cursors: dict) -> dict[str, dict]:
+    """Validate the V2 timestamp cursor map ({symbol: {last_processed_open_ms}})."""
+    cursors: dict[str, dict] = {}
+    if not isinstance(raw_cursors, dict):
+        raise CheckpointCursorError("cursors must be a mapping")
+    for symbol, value in raw_cursors.items():
+        if not isinstance(value, dict):
+            raise CheckpointCursorError(f"cursor for {symbol} is not a timestamp cursor")
+        open_ms = value.get("last_processed_open_ms")
+        if (
+            isinstance(open_ms, bool)
+            or not isinstance(open_ms, int)
+            or open_ms < 0
+            or open_ms % BAR_MS
+        ):
+            raise CheckpointCursorError(
+                f"cursor for {symbol} has invalid last_processed_open_ms {open_ms!r}"
+            )
+        cursors[str(symbol)] = {"last_processed_open_ms": open_ms}
+    return cursors
+
+
+def migrate_legacy_index_cursors(
+    raw_cursors: dict, symbols_state: dict
+) -> tuple[dict[str, dict], list[dict]]:
+    """Controlled migration of V1 index cursors to stable timestamp cursors.
+
+    The legacy cursor was an INDEX into that run's candle list and is therefore
+    meaningless for any other list. It is mapped through the authoritative
+    per-symbol episode state (``last_close_ms``), which is a timestamp: the next
+    bar to visit opens exactly at ``last_close_ms``. A legacy cursor that cannot
+    be mapped this way is REJECTED (fail-closed), and every mapping is recorded
+    in the checkpoint audit trail.
+    """
+    cursors: dict[str, dict] = {}
+    migrations: list[dict] = []
+    if not isinstance(raw_cursors, dict):
+        raise CheckpointCursorError("cursors must be a mapping")
+    for symbol, value in sorted(raw_cursors.items()):
+        symbol = str(symbol)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise CheckpointCursorError(
+                f"legacy cursor for {symbol} has invalid shape {value!r}"
+            )
+        if value == 0:
+            continue  # nothing visited yet: no cursor to migrate
+        state = symbols_state.get(symbol) if isinstance(symbols_state, dict) else None
+        last_close_ms = state.get("last_close_ms") if isinstance(state, dict) else None
+        if (
+            isinstance(last_close_ms, bool)
+            or not isinstance(last_close_ms, int)
+            or last_close_ms < BAR_MS
+            or (last_close_ms - BAR_MS) % BAR_MS
+        ):
+            raise CheckpointCursorError(
+                f"legacy index cursor for {symbol} cannot be mapped to a timestamp "
+                "(no authoritative last_close_ms); refusing to guess"
+            )
+        cursors[symbol] = {"last_processed_open_ms": last_close_ms - BAR_MS}
+        migrations.append(
+            {
+                "symbol": symbol,
+                "from_schema": CURSOR_SCHEMA_V1_INDEX,
+                "to_schema": CURSOR_SCHEMA_V2,
+                "legacy_index": value,
+                "last_processed_open_ms": last_close_ms - BAR_MS,
+            }
+        )
+    return cursors, migrations
 
 
 def build_boundary(
@@ -214,7 +326,8 @@ class Phase2ObserverRunner:
         self.metrics = Metrics()
         self._stop = False
         self._state: dict[str, Phase2Episodes] = {}
-        self._cursors: dict[str, int] = {}
+        self._cursors: dict[str, dict] = {}
+        self._cursor_migrations: list[dict] = []
         self._emitted: set[str] = set()
         self._known_levels: dict[str, dict] = {}
         self._warmup_done: dict[str, int] = {}
@@ -243,11 +356,13 @@ class Phase2ObserverRunner:
             "boundary_freeze_ts_ms": self.boundary.freeze_ts_ms,
             "protocol_fingerprint": self.boundary.protocol_fingerprint,
             "created_at_ms": int(time.time() * 1000),
+            "cursor_schema": CURSOR_SCHEMA_V2,
+            "cursor_migrations": list(self._cursor_migrations),
             "provenance": dict(self._provenance),
             "coverage_reports": list(self._coverage_reports),
             "emitted": sorted(self._emitted),
             "known_levels": self._known_levels,
-            "cursors": dict(self._cursors),
+            "cursors": {symbol: dict(cursor) for symbol, cursor in self._cursors.items()},
             "warmup_done": dict(self._warmup_done),
             "symbols": {
                 symbol: state.checkpoint() for symbol, state in self._state.items()
@@ -272,19 +387,173 @@ class Phase2ObserverRunner:
             raise CheckpointBoundaryError("checkpoint protocol fingerprint mismatch")
         self._emitted = set(payload.get("emitted", []))
         self._known_levels = dict(payload.get("known_levels", {}))
-        self._cursors = dict(payload.get("cursors", {}))
         self._warmup_done = dict(payload.get("warmup_done", {}))
         self._coverage_reports = list(payload.get("coverage_reports", []))
+        raw_cursors = payload.get("cursors", {})
+        cursor_schema = payload.get("cursor_schema")
+        symbols_state = payload.get("symbols", {})
+        if cursor_schema is None:
+            # legacy checkpoint (V1 index cursors): controlled migration to the
+            # stable timestamp cursor; recorded in the durable audit trail
+            self._cursors, migrations = migrate_legacy_index_cursors(
+                raw_cursors, symbols_state
+            )
+            self._cursor_migrations = list(payload.get("cursor_migrations", [])) + migrations
+            self.metrics.cursor_migrations += len(migrations)
+        elif cursor_schema == CURSOR_SCHEMA_V2:
+            self._cursors = parse_timestamp_cursors(raw_cursors)
+            self._cursor_migrations = list(payload.get("cursor_migrations", []))
+        else:
+            raise CheckpointCursorError(
+                f"unknown checkpoint cursor schema {cursor_schema!r}; "
+                f"expected {CURSOR_SCHEMA_V2!r} (or a migratable legacy checkpoint)"
+            )
         if payload.get("provenance"):
             self._provenance = dict(payload["provenance"])
         self._state = {
             symbol: Phase2Episodes.restore(data)
-            for symbol, data in payload.get("symbols", {}).items()
+            for symbol, data in symbols_state.items()
         }
         return True
 
     # ------------------------------------------------------------- processing
-    def process_symbol_bars(self, symbol: str, candles: list[Candle]) -> list[dict]:
+    def _apply_evaluation_asof(
+        self, symbol: str, candles: list[Candle], evaluation_asof_ms: int | None
+    ) -> list[Candle]:
+        """Exclude candles not provably closed at the verified evaluation ASOF.
+
+        Defense in depth on top of the source contract: a forming 5m candle is
+        NEVER consumed, and no decision may look past ``evaluation_asof_ms``.
+        Sources that are inherently closed-history (frozen CSV replay) expose no
+        ASOF and keep their exact historical behavior.
+        """
+        if evaluation_asof_ms is None:
+            return candles
+        if isinstance(evaluation_asof_ms, bool) or not isinstance(evaluation_asof_ms, int):
+            raise CheckpointCursorError(
+                f"evaluation_asof_ms must be an int, got {evaluation_asof_ms!r}"
+            )
+        cutoff = int(evaluation_asof_ms)
+        kept = len(candles)
+        for index, bar in enumerate(candles):
+            if int(bar.timestamp) + BAR_MS > cutoff:
+                kept = index
+                break
+        if kept < len(candles):
+            self.metrics.unclosed_candles_excluded += len(candles) - kept
+            log.info(
+                "%s: excluded %d candle(s) not closed at evaluation_asof_ms=%d",
+                symbol, len(candles) - kept, cutoff,
+            )
+            candles = candles[:kept]
+        return candles
+
+    def _durable_resume_open(
+        self, symbol: str, state: Phase2Episodes | None
+    ) -> int | None:
+        """Safe resume point from the durable timestamp cursor (never a list index).
+
+        The earlier of the episode-machine close and the checkpoint cursor wins,
+        so a bar skipped by a transient failure is re-visited instead of silently
+        jumping the episode machine over a ``5m gap``.
+        """
+        resume_open: int | None = None
+        if state is not None and state.last_close_ms is not None:
+            resume_open = int(state.last_close_ms)
+        cursor = self._cursors.get(symbol)
+        if cursor is not None:
+            cursor_resume = int(cursor["last_processed_open_ms"]) + BAR_MS
+            resume_open = cursor_resume if resume_open is None else min(resume_open, cursor_resume)
+        return resume_open
+
+    def _load_symbol(self, symbol: str, resume_open_ms: int | None) -> list[Candle]:
+        """Load one symbol, passing the durable timestamp cursor to the source.
+
+        Sources implementing the v2 contract receive ``resume_open_ms`` so a
+        long observer downtime can be recovered with bounded historical
+        backfill instead of quarantining the symbol forever.
+        """
+        loader = self.source.load
+        if "resume_open_ms" in inspect.signature(loader).parameters:
+            return loader(symbol, resume_open_ms=resume_open_ms)
+        return loader(symbol)
+
+    def _resume_index(self, symbol: str, state: Phase2Episodes, candles: list[Candle]) -> int:
+        """Resume position as a stable TIMESTAMP cursor, never a list index.
+
+        The durable state (``last_close_ms``) and the timestamp cursor both name
+        the next bar to visit by its open time; the earlier of the two wins so a
+        bar skipped by a transient contract failure is re-visited instead of
+        silently jumping the episode machine over a ``5m gap``.
+        """
+        resume_open = self._durable_resume_open(symbol, state)
+        if resume_open is None:
+            return 0
+        for index, bar in enumerate(candles):
+            open_ms = int(bar.timestamp)
+            if open_ms < resume_open:
+                continue
+            if open_ms > resume_open:
+                # the loaded window starts after the durable resume point: the
+                # intervening bars are unavailable -> block the symbol (CP4 gap
+                # policy) instead of silently re-basing the causal history
+                self.metrics.quarantine_bars += 1
+                self._coverage_reports.append(
+                    {
+                        "symbol": symbol,
+                        "action": "QUARANTINED",
+                        "reason": "RESUME_GAP_SOURCE_WINDOW",
+                        "resume_open_ms": resume_open,
+                        "first_available_open_ms": open_ms,
+                    }
+                )
+                log.warning(
+                    "%s: source window misses resume bar %d (first available %d); "
+                    "symbol blocked until coverage is complete",
+                    symbol, resume_open, open_ms,
+                )
+                return len(candles)
+            if index < int(self.config.min_resume_lookback_bars):
+                # review 5615772746 FIX-1: the resume bar is present but the
+                # window carries too little history BEFORE it to rebuild the
+                # causal lookback (1H resistance touch history + ATR window).
+                # Processing it would silently drop episodes vs an
+                # uninterrupted replay -> fail closed, cursor and episode
+                # identity preserved, nothing partially processed.
+                self.metrics.quarantine_bars += 1
+                self._coverage_reports.append(
+                    {
+                        "symbol": symbol,
+                        "action": "QUARANTINED",
+                        "reason": "RESUME_LOOKBACK_INCOMPLETE",
+                        "resume_open_ms": resume_open,
+                        "lookback_bars": index,
+                        "required_lookback_bars": int(self.config.min_resume_lookback_bars),
+                    }
+                )
+                log.warning(
+                    "%s: window carries %d lookback bars before resume %d "
+                    "(need %d); symbol blocked until the full causal lookback "
+                    "is delivered",
+                    symbol,
+                    index,
+                    resume_open,
+                    int(self.config.min_resume_lookback_bars),
+                )
+                return len(candles)
+            return index
+        return len(candles)
+
+    def _advance_cursor(self, symbol: str, open_ms: int) -> None:
+        self._cursors[symbol] = {"last_processed_open_ms": int(open_ms)}
+
+    def process_symbol_bars(
+        self,
+        symbol: str,
+        candles: list[Candle],
+        *,
+        evaluation_asof_ms: int | None = None,
+    ) -> list[dict]:
         """Advance one symbol over its closed 5m series; returns emitted events."""
         from app.research.htf_keylevel_point_b import _causal_atr_series, _find_reaction_end
 
@@ -294,7 +563,8 @@ class Phase2ObserverRunner:
             )
         state = self._state[symbol]
         emitted_events: list[dict] = []
-        start_index = self._cursors.get(symbol, 0)
+        candles = self._apply_evaluation_asof(symbol, candles, evaluation_asof_ms)
+        start_index = self._resume_index(symbol, state, candles)
         warmup_budget = max(0, self.config.warmup_bars - self._warmup_done.get(symbol, 0))
 
         for index in range(start_index, len(candles)):
@@ -309,7 +579,7 @@ class Phase2ObserverRunner:
                 htf, coverage = aggregate_closed_htf(candles[: index + 1], asof)
             except ContractViolation:
                 self.metrics.coverage_gap_bars += 1
-                self._cursors[symbol] = index + 1
+                self._advance_cursor(symbol, open_ms)
                 continue
             # CP4 gap policy: an incomplete/missing 1H hour must never silently
             # change level selection. Quarantine the symbol at the first dirty
@@ -418,7 +688,7 @@ class Phase2ObserverRunner:
                     self.metrics.duplicate_suppressions += 1
                     continue
                 emitted_events.append(event)
-            self._cursors[symbol] = index + 1
+            self._advance_cursor(symbol, open_ms)
             self.metrics.bars_processed += 1
 
         if emitted_events and self.writer is not None:
@@ -447,8 +717,32 @@ class Phase2ObserverRunner:
             lease.acquire(allow_stale_takeover=self.config.allow_stale_takeover)
             self.load_checkpoint()
             for symbol in self.config.symbols:
-                candles = self.source.load(symbol)
-                self.process_symbol_bars(symbol, candles)
+                resume_open = self._durable_resume_open(symbol, self._state.get(symbol))
+                try:
+                    candles = self._load_symbol(symbol, resume_open)
+                except CandleSourceError as exc:
+                    # fail-closed source contract (API error / rate limit /
+                    # incomplete pagination): BLOCK the symbol, advance nothing,
+                    # emit nothing; other symbols continue
+                    self.metrics.source_errors += 1
+                    self.metrics.symbols_blocked += 1
+                    self._coverage_reports.append(
+                        {"symbol": symbol, "action": "SOURCE_BLOCKED", "reason": exc.reason}
+                    )
+                    log.error(
+                        "candle source failed for %s (%s); symbol blocked, no bars processed",
+                        symbol, exc,
+                    )
+                    continue
+                load_metrics = getattr(self.source, "last_load_metrics", None) or {}
+                if load_metrics.get("backfill"):
+                    # bounded cursor-aware catch-up batch (review FIX-1)
+                    self.metrics.backfill_batches += 1
+                    self.metrics.backfill_bars += int(load_metrics.get("batch_bars", 0))
+                evaluation_asof_ms = getattr(self.source, "last_evaluation_asof_ms", None)
+                self.process_symbol_bars(
+                    symbol, candles, evaluation_asof_ms=evaluation_asof_ms
+                )
                 lease.heartbeat()
             self.save_checkpoint()
             self.metrics.cycles += 1
@@ -741,9 +1035,74 @@ def close_db_connection(conn) -> None:
         log.warning("db connection close failed: %s", exc)
 
 
+def build_candle_source(args, config: RunnerConfig):
+    """Opt-in candle source selection (issue #181): ``csv`` (default) | ``bybit``.
+
+    ``csv`` keeps the frozen deterministic replay path byte-for-byte.
+    ``bybit`` is the RESEARCH_ONLY live source: public read-only market data,
+    bounded pagination, verified evaluation ASOF. It never activates OOS, never
+    connects to paper/live and never writes to a database by itself.
+    """
+    source_kind = str(getattr(args, "candle_source", "csv")).strip().lower()
+    if source_kind == "csv":
+        if not getattr(args, "data_dir", None):
+            raise NotRunnableError("--data-dir is required for --candle-source csv")
+        return FileCandleSource(args.data_dir)
+    if source_kind == "bybit":
+        from app.config import Settings
+        from app.exchange.bybit_client import BybitClient
+
+        explicit_history = getattr(args, "bybit_min_history_bars", None)
+        min_history_bars = int(explicit_history) if explicit_history else max(
+            BYBIT_DEFAULT_MIN_HISTORY_BARS,
+            # enough history for the 200 closed 1H hours + the 200-bar ATR
+            # window + this run's warmup, so level identity never depends on a
+            # rolling window edge (issue #181 requirement 6)
+            config.warmup_bars + DEFAULT_HTF_HISTORY_HOURS * 12 + CANONICAL_WINDOW,
+        )
+        return BybitPhase2CandleSource(
+            BybitClient(Settings()),
+            evaluation_asof_ms=getattr(args, "evaluation_asof_ms", None),
+            page_limit=int(getattr(args, "bybit_page_limit", BYBIT_DEFAULT_PAGE_LIMIT)),
+            max_pages=int(getattr(args, "bybit_max_pages", BYBIT_DEFAULT_MAX_PAGES)),
+            min_history_bars=min_history_bars,
+            max_attempts=int(getattr(args, "bybit_max_attempts", BYBIT_DEFAULT_MAX_ATTEMPTS)),
+            retry_backoff_s=float(
+                getattr(args, "bybit_retry_backoff_s", BYBIT_DEFAULT_RETRY_BACKOFF_S)
+            ),
+        )
+    raise NotRunnableError(f"unknown --candle-source {source_kind!r} (csv|bybit)")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="HTF Phase-2 observe-only observer (disabled by default)")
-    parser.add_argument("--data-dir", required=True, help="CSV candle source directory")
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="CSV candle source directory (required for --candle-source csv)",
+    )
+    parser.add_argument(
+        "--candle-source",
+        default="csv",
+        choices=("csv", "bybit"),
+        help="opt-in candle source: csv (default, deterministic replay) or bybit (RESEARCH_ONLY live)",
+    )
+    parser.add_argument(
+        "--evaluation-asof-ms",
+        type=int,
+        default=None,
+        help="explicit evaluation ASOF (epoch ms) for the bybit source; default = verified exchange time",
+    )
+    parser.add_argument("--bybit-page-limit", type=int, default=BYBIT_DEFAULT_PAGE_LIMIT)
+    parser.add_argument("--bybit-max-pages", type=int, default=BYBIT_DEFAULT_MAX_PAGES)
+    parser.add_argument(
+        "--bybit-min-history-bars",
+        type=int,
+        default=None,
+        help="override the closed-bar history floor (default: warmup + 200h + ATR window)",
+    )
+    parser.add_argument("--bybit-max-attempts", type=int, default=BYBIT_DEFAULT_MAX_ATTEMPTS)
+    parser.add_argument("--bybit-retry-backoff-s", type=float, default=BYBIT_DEFAULT_RETRY_BACKOFF_S)
     parser.add_argument("--symbols", default="BTCUSDT,ETHUSDT")
     parser.add_argument("--checkpoint", default="var/htf_phase2/state.json")
     parser.add_argument("--warmup-bars", type=int, default=400)
@@ -782,6 +1141,12 @@ def main(argv: list[str] | None = None) -> int:
         max_cycles=args.max_cycles,
         dry_run=not args.use_registration,
     )
+    try:
+        source = build_candle_source(args, config)
+    except Exception as exc:
+        # fail-closed source selection: no boundary, no writer, no observations
+        log.error("candle source unavailable: %s", exc)
+        return EXIT_NOT_RUNNABLE
     writer = InMemoryWriter()
     db_conn = None
     try:
@@ -823,7 +1188,7 @@ def main(argv: list[str] | None = None) -> int:
         runner = Phase2ObserverRunner(
             config,
             boundary=boundary,
-            source=FileCandleSource(args.data_dir),
+            source=source,
             writer=writer,
             db_conn=db_conn,
         )
