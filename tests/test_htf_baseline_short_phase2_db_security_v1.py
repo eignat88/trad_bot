@@ -3,7 +3,10 @@ migration 074 -> 075 on DISPOSABLE PostgreSQL databases only.
 
 SAFETY: connects to the local test server (P2_TEST_DB_*), creates/drops only
 ``trad_bot_p2_it_*`` databases and ephemeral roles; production ``trad_bot`` is
-blocked by name. The module skips when no local test server is reachable.
+blocked by name. Connection targets are fail-closed: the server must be
+loopback (or explicitly confirmed isolated via P2_TEST_DB_ISOLATION_ACK=yes)
+and every test database name must match ``trad_bot_p2_it_*``. The module
+skips when no local test server is reachable.
 
 Covers: least-privilege observer role, SECURITY DEFINER insert wall, denied
 direct DML, admin-only activation, freeze-registry isolation, unchanged grants
@@ -12,8 +15,10 @@ driver path (SCRAM-capable) and transaction rollback.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import re
+import secrets
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -23,6 +28,7 @@ import pytest
 
 pytest.importorskip("psycopg2")
 import psycopg2  # noqa: E402
+from psycopg2 import sql as pgsql  # noqa: E402
 
 from app.research.htf_baseline_short_phase2_persistence_v1 import (
     insert_observation_raw,
@@ -34,6 +40,33 @@ DB_USER = os.environ.get("P2_TEST_DB_USER", "postgres")
 
 _DB_PATTERN = re.compile(r"\Atrad_bot_p2_it_[a-z0-9_]+\Z")
 _BLOCKED = frozenset({"trad_bot", "postgres", "template0", "template1", "srr", "test"})
+_LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _assert_isolation_confirmed() -> None:
+    """Fail-closed connection guard: never run DB-creating tests against a
+    server that is not confirmed as an isolated test cluster."""
+    if DB_HOST not in _LOOPBACK and os.environ.get("P2_TEST_DB_ISOLATION_ACK") != "yes":
+        raise RuntimeError(
+            "P2_TEST_DB_HOST is not loopback and isolation is not confirmed; "
+            "refusing to run database-creating tests. Point P2_TEST_DB_* at an "
+            "isolated test cluster (e.g. 127.0.0.1:55432) or explicitly set "
+            "P2_TEST_DB_ISOLATION_ACK=yes for a known-isolated cluster."
+        )
+
+
+def _assert_safe_database(name: str, *, maintenance: bool = False) -> None:
+    """Fail-closed database-name guard: production names are always refused."""
+    if maintenance:
+        if name != "postgres":
+            raise RuntimeError(f"refusing non-maintenance database target: {name}")
+        return
+    if name in _BLOCKED or not _DB_PATTERN.match(name):
+        raise RuntimeError(f"refusing unsafe test database name: {name}")
+
+
+# Fail closed at import time on an unconfirmed, non-loopback target.
+_assert_isolation_confirmed()
 
 ROOT = Path(__file__).resolve().parent.parent
 MIGRATION_074 = ROOT / "sql" / "migrations" / "074_htf_baseline_short_phase2_registration.sql"
@@ -58,6 +91,8 @@ def _first_touch_time() -> str:
 
 
 def _admin_connect():
+    _assert_isolation_confirmed()
+    _assert_safe_database("postgres", maintenance=True)
     conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database="postgres", user=DB_USER, connect_timeout=5)
     conn.autocommit = True
     return conn
@@ -78,37 +113,101 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+class _Provisioned:
+    """Bundle exposed by ``_provisioned_db`` (internal, test-injectable)."""
+
+    def __init__(self, conn, name: str, admin, preexisting: set):
+        self.conn = conn
+        self.name = name
+        self.admin = admin
+        self.preexisting = preexisting
+
+
+def _maybe_fail(fail_at: str | None, point: str) -> None:
+    if fail_at == point:
+        raise RuntimeError(f"injected failure at {point}")
+
+
+def _drop_test_roles(admin, preexisting: set) -> None:
+    """Drop only roles this run created; never touch pre-existing roles."""
+    for role in (OBSERVER_ROLE, ADMIN_ROLE):
+        if role in preexisting:
+            continue
+        with admin.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
+            if cur.fetchone() is None:
+                continue
+            try:
+                cur.execute(f"DROP OWNED BY {role}")  # clear residual ACL deps
+            except Exception:  # pragma: no cover - best effort
+                pass
+            cur.execute(f"DROP ROLE {role}")
+
+
+def _cleanup(admin, name: str, preexisting: set, conn=None) -> None:
+    """Guaranteed teardown: drop the disposable database and created roles."""
+    if conn is not None:
+        try:
+            conn.rollback()
+            with conn.cursor() as cur:
+                for role in (OBSERVER_ROLE, ADMIN_ROLE):
+                    if role not in preexisting:
+                        try:
+                            cur.execute(f"DROP OWNED BY {role}")
+                        except Exception:  # pragma: no cover - role may not exist
+                            pass
+            conn.commit()
+        except Exception:  # pragma: no cover - broken connection is fine
+            pass
+    with admin.cursor() as cur:
+        cur.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
+            (name,),
+        )
+        cur.execute(f"DROP DATABASE IF EXISTS {name}")
+    _drop_test_roles(admin, preexisting)
+
+
+@contextlib.contextmanager
+def _provisioned_db(fail_at: str | None = None, name: str | None = None):
+    """Core of the ``db`` fixture: disposable database with 074 applied.
+
+    Cleanup is guaranteed via try/finally for every failure stage:
+    after CREATE DATABASE, at first connect, during migration 074, during the
+    test body and during/after migration 075. ``fail_at`` injects a failure at
+    a named point so the cleanup regression test can exercise each stage.
+    """
+    _assert_isolation_confirmed()
+    name = name or f"trad_bot_p2_it_{uuid.uuid4().hex[:8]}"
+    _assert_safe_database(name)
+    admin = _admin_connect()
+    preexisting = _existing_roles(admin)
+    conn = None
+    try:
+        with admin.cursor() as cur:
+            cur.execute(f"CREATE DATABASE {name}")
+        _maybe_fail(fail_at, "after_create_database")
+        conn = psycopg2.connect(
+            host=DB_HOST, port=DB_PORT, database=name, user=DB_USER, connect_timeout=5
+        )
+        _maybe_fail(fail_at, "at_connect")
+        with conn.cursor() as cur:
+            cur.execute(MIGRATION_074.read_text(encoding="utf-8"))
+        conn.commit()
+        _maybe_fail(fail_at, "during_m74")
+        yield _Provisioned(conn, name, admin, preexisting)
+    finally:
+        try:
+            _cleanup(admin, name, preexisting, conn)
+        finally:
+            admin.close()
+
+
 @pytest.fixture()
 def db():
     """Disposable database with 074 applied; roles tracked for teardown."""
-    name = f"trad_bot_p2_it_{uuid.uuid4().hex[:8]}"
-    if not _DB_PATTERN.match(name) or name in _BLOCKED:
-        raise AssertionError(f"refusing unsafe test database name: {name}")
-    admin = _admin_connect()
-    preexisting = _existing_roles(admin)
-    with admin.cursor() as cur:
-        cur.execute(f"CREATE DATABASE {name}")
-    conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=name, user=DB_USER, connect_timeout=5)
-    with conn.cursor() as cur:
-        cur.execute(MIGRATION_074.read_text(encoding="utf-8"))
-    conn.commit()
-    yield conn
-    conn.rollback()
-    conn.close()
-    with admin.cursor() as cur:
-        cur.execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s", (name,)
-        )
-        cur.execute(f"DROP DATABASE IF EXISTS {name}")
-    # drop roles the migration created during this test (never pre-existing ones)
-    for role in (OBSERVER_ROLE, ADMIN_ROLE):
-        if role not in preexisting:
-            with admin.cursor() as cur:
-                try:
-                    cur.execute(f"DROP ROLE IF EXISTS {role}")
-                except Exception:  # pragma: no cover - role may own grants elsewhere
-                    pass
-    admin.close()
+    with _provisioned_db() as prov:
+        yield prov.conn
 
 
 def _existing_roles(conn) -> set:
@@ -121,6 +220,39 @@ def apply_075(conn) -> None:
     with conn.cursor() as cur:
         cur.execute(MIGRATION_075.read_text(encoding="utf-8"))
     conn.commit()
+
+
+class _RedactedSecret(str):
+    """String whose str/repr never reveal the value (traceback/log safety)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<redacted>"
+
+    def __str__(self) -> str:
+        return "<redacted>"
+
+
+def _new_test_credential() -> str:
+    """A REAL random password for the test observer role (never logged)."""
+    return _RedactedSecret(secrets.token_urlsafe(32))
+
+
+def _install_observer_login(admin, password: str) -> None:
+    """Set a real password on the TEST cluster's observer role.
+
+    Test-cluster only (P2_TEST_DB_* fail-closed guard); production role
+    passwords are never touched. The value is quoted via psycopg2.sql.Literal
+    and never echoed. Works for trust (ignored), md5 and SCRAM-SHA-256
+    servers, so the integration tests are real under every allowed config.
+    """
+    with admin.cursor() as cur:
+        cur.execute(
+            pgsql.SQL("ALTER ROLE {} PASSWORD {}").format(
+                pgsql.Identifier(OBSERVER_ROLE), pgsql.Literal(password)
+            )
+        )
 
 
 def _activate(conn, freeze=None, fingerprint=FINGERPRINT):
@@ -294,6 +426,53 @@ def test_runbook_verification_sql_flags_sequence_grants(db):
         cur.execute(f"REVOKE UPDATE ON SEQUENCE {seq} FROM trad_bot_htf_p2_observer")
     db.commit()
     assert not _run_verification(db)  # restored -> every check PASS again
+
+
+_FAILURE_STAGES = (
+    "after_create_database",
+    "at_connect",
+    "during_m74",
+    "during_test",
+    "during_m75",
+)
+
+
+@pytest.mark.parametrize("stage", _FAILURE_STAGES)
+def test_fixture_cleanup_guaranteed_on_early_failure(stage):
+    """A failure at ANY provisioning stage must leave zero leftover objects.
+
+    Models errors after CREATE DATABASE but before the first connect, at
+    connect time, during migration 074, during the test body and during
+    migration 075 (with roles created); the disposable database and every
+    fixture-created role must be gone afterwards, while pre-existing roles
+    are never dropped.
+    """
+    snapshot = _admin_connect()
+    try:
+        preexisting = _existing_roles(snapshot)
+    finally:
+        snapshot.close()
+    name = f"trad_bot_p2_it_{uuid.uuid4().hex[:8]}"
+    with pytest.raises(RuntimeError):
+        with _provisioned_db(name=name, fail_at=stage) as prov:
+            if stage == "during_test":
+                raise RuntimeError("injected failure at during_test")
+            if stage == "during_m75":
+                apply_075(prov.conn)  # roles exist when the failure hits
+                raise RuntimeError("injected failure at during_m75")
+    check = _admin_connect()
+    try:
+        with check.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (name,))
+            assert cur.fetchone() is None, "disposable database leaked"
+            cur.execute(
+                "SELECT rolname FROM pg_roles WHERE rolname = ANY(%s)",
+                ([OBSERVER_ROLE, ADMIN_ROLE],),
+            )
+            leaked = {r[0] for r in cur.fetchall()} - preexisting
+            assert not leaked, f"roles leaked: {sorted(leaked)}"
+    finally:
+        check.close()
 
 
 def test_systemd_unit_matches_exit_code_contract():
@@ -575,6 +754,12 @@ def test_concurrent_observer_inserts_single_row(db):
     apply_075(db)
     _activate(db)
     _enable_observer(db)
+    admin = _admin_connect()
+    try:
+        password = _new_test_credential()
+        _install_observer_login(admin, password)
+    finally:
+        admin.close()
     dbname = db.get_dsn_parameters()["dbname"]
     errors: list[str] = []
     results: list[object] = []
@@ -582,7 +767,10 @@ def test_concurrent_observer_inserts_single_row(db):
 
     def worker():
         try:
-            conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=dbname, user=OBSERVER_ROLE)
+            conn = psycopg2.connect(
+                host=DB_HOST, port=DB_PORT, database=dbname,
+                user=OBSERVER_ROLE, password=password, connect_timeout=5,
+            )
             row = insert_observation_raw(conn, experiment_id=EXP, **_event_kwargs())
             conn.commit()
             conn.close()
@@ -590,7 +778,7 @@ def test_concurrent_observer_inserts_single_row(db):
                 results.append(row)
         except Exception as exc:  # pragma: no cover
             with lock:
-                errors.append(str(exc))
+                errors.append(str(exc).replace(password, "<redacted>"))
 
     threads = [threading.Thread(target=worker) for _ in range(4)]
     for t in threads:
@@ -624,20 +812,69 @@ def test_transaction_rollback_leaves_no_rows(db):
     assert count == 0
 
 
-def test_pg8000_scram_capable_driver_path_as_observer(db):
-    pg8000 = pytest.importorskip("pg8000.dbapi")
+def test_pg8000_scram_capable_driver_path_as_observer(db, tmp_path, monkeypatch):
+    """Real integration: production credential plumbing + pg8000 SCRAM path.
+
+    A REAL random password is installed on the test observer role (test
+    cluster only) and delivered through a closed 0600 temporary file,
+    exercising ``load_db_credentials``/``connect_db_from_env`` exactly as
+    production does. Works against trust, md5 and SCRAM-SHA-256 servers; the
+    observer must connect with minimal privileges: direct DML refused
+    (SQLSTATE 42501), the SECURITY DEFINER boundary usable.
+    """
+    pytest.importorskip("pg8000.dbapi")
     apply_075(db)
     _activate(db)
     _enable_observer(db)
     dbname = db.get_dsn_parameters()["dbname"]
-    # pg8000 speaks SCRAM-SHA-256 natively; the local trust server ignores the
-    # password, so this proves the driver path and credential plumbing. A true
-    # SCRAM handshake needs a scram-secured server (staging verification).
-    conn = pg8000.connect(
-        host=DB_HOST, port=DB_PORT, user=OBSERVER_ROLE, database=dbname,
-        password="probe-not-logged", timeout=5,
-    )
+    admin = _admin_connect()
     try:
+        password = _new_test_credential()
+        _install_observer_login(admin, password)
+    finally:
+        admin.close()
+    pw_file = tmp_path / "observer.pw"
+    fd = os.open(str(pw_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(password + "\n")
+    monkeypatch.setenv("HTF_P2_DB_HOST", DB_HOST)
+    monkeypatch.setenv("HTF_P2_DB_PORT", str(DB_PORT))
+    monkeypatch.setenv("HTF_P2_DB_USER", OBSERVER_ROLE)
+    monkeypatch.setenv("HTF_P2_DB_NAME", dbname)
+    monkeypatch.setenv("HTF_P2_DB_PASSWORD_FILE", str(pw_file))
+    monkeypatch.delenv("HTF_P2_DB_PASSWORD", raising=False)
+    from app.research.htf_baseline_short_phase2_observer_runner_v1 import (
+        connect_db_from_env,
+        load_db_credentials,
+    )
+    creds = load_db_credentials()
+    assert creds["user"] == OBSERVER_ROLE
+    assert creds["database"] == dbname
+    conn = connect_db_from_env()  # pg8000-first: native SCRAM-SHA-256
+    try:
+        cur = conn.cursor()  # pg8000 cursors have no context-manager protocol
+        try:
+            cur.execute("SELECT current_user")
+            (who,) = cur.fetchone()
+        finally:
+            cur.close()
+        assert who == OBSERVER_ROLE
+        # minimal privileges: direct DML must be refused with SQLSTATE 42501
+        denied = None
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "INSERT INTO research.htf_baseline_short_phase2_observation "
+                "DEFAULT VALUES"
+            )
+        except Exception as exc:
+            denied = exc
+        finally:
+            cur.close()
+        assert denied is not None, "direct INSERT must be denied for observer"
+        _assert_insufficient_privilege(denied)
+        conn.rollback()
+        # and the SECURITY DEFINER boundary must work for the same connection
         row_id = insert_observation_raw(conn, experiment_id=EXP, **_event_kwargs())
         conn.commit()
         assert row_id is not None
