@@ -1,0 +1,14 @@
+table_name,conname,constraint_def
+research.me_reverse_long_v3_execution_outcome,me_reverse_long_v3_execution_outcome_experiment_id_check,CHECK ((experiment_id = 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V3_OOS'::text))
+research.me_reverse_long_v3_execution_outcome,me_reverse_long_v3_execution_outcome_filter_group_check,"CHECK ((filter_group = ANY (ARRAY['PASS'::text, 'REJECT'::text, 'MISSING_FEATURE'::text])))"
+research.me_reverse_long_v3_execution_outcome,me_reverse_long_v3_execution_outcome_observation_id_fkey,FOREIGN KEY (observation_id) REFERENCES research.prospective_observation(observation_id)
+research.me_reverse_long_v3_execution_outcome,me_reverse_long_v3_execution_outcome_pkey,PRIMARY KEY (observation_id)
+research.me_reverse_long_v3_execution_outcome,me_reverse_long_v3_execution_outcome_status_check,"CHECK ((status = ANY (ARRAY['PENDING'::text, 'FINALIZED'::text, 'COVERAGE_INVALID'::text, 'TEMPORAL_UNVERIFIED'::text, 'INVALID_GEOMETRY'::text])))"
+research.me_reverse_long_v3_execution_outcome,me_v3_finalized_integrity,CHECK (((status <> 'FINALIZED'::text) OR ((execution_entry_at IS NOT NULL) AND (execution_entry_price > (0)::numeric) AND (execution_stop_price > (0)::numeric) AND (execution_target_price > execution_entry_price) AND (execution_stop_price < execution_entry_price) AND (exit_at IS NOT NULL) AND (exit_price IS NOT NULL) AND (exit_reason IS NOT NULL) AND (gross_r IS NOT NULL) AND (net_r_normal IS NOT NULL) AND (net_r_elevated IS NOT NULL) AND (ambiguous IS NOT NULL) AND (coverage_reason IS NULL) AND (candle_count = 48))))
+research.me_reverse_long_v3_execution_outcome,me_v3_nonfinal_no_economics,CHECK (((status = 'FINALIZED'::text) OR ((execution_entry_price IS NULL) AND (execution_stop_price IS NULL) AND (execution_target_price IS NULL) AND (exit_at IS NULL) AND (exit_price IS NULL) AND (exit_reason IS NULL) AND (gross_r IS NULL) AND (net_r_normal IS NULL) AND (net_r_elevated IS NULL))))
+research.prospective_experiment,prospective_experiment_direction_check,"CHECK ((direction = ANY (ARRAY['LONG'::text, 'SHORT'::text])))"
+research.prospective_experiment,prospective_experiment_pkey,PRIMARY KEY (experiment_id)
+research.prospective_experiment,prospective_experiment_status_check,"CHECK ((status = ANY (ARRAY['READY_TO_START'::text, 'RUNNING'::text, 'PAUSED'::text, 'COMPLETED'::text, 'CANCELLED'::text])))"
+research.prospective_observation,prospective_observation_experiment_id_fkey,FOREIGN KEY (experiment_id) REFERENCES research.prospective_experiment(experiment_id)
+research.prospective_observation,prospective_observation_experiment_id_source_signal_id_key,"UNIQUE (experiment_id, source_signal_id)"
+research.prospective_observation,prospective_observation_pkey,PRIMARY KEY (observation_id)

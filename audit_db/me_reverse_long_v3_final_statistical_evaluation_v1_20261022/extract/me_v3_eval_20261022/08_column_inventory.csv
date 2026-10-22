@@ -1,0 +1,126 @@
+table_name,ordinal_position,column_name,data_type,is_nullable
+me_reverse_long_v3_execution_outcome,1,observation_id,bigint,NO
+me_reverse_long_v3_execution_outcome,2,experiment_id,text,NO
+me_reverse_long_v3_execution_outcome,3,status,text,NO
+me_reverse_long_v3_execution_outcome,4,filter_group,text,NO
+me_reverse_long_v3_execution_outcome,5,execution_entry_at,timestamp with time zone,YES
+me_reverse_long_v3_execution_outcome,6,execution_entry_price,numeric,YES
+me_reverse_long_v3_execution_outcome,7,execution_stop_price,numeric,YES
+me_reverse_long_v3_execution_outcome,8,execution_target_price,numeric,YES
+me_reverse_long_v3_execution_outcome,9,exit_at,timestamp with time zone,YES
+me_reverse_long_v3_execution_outcome,10,exit_price,numeric,YES
+me_reverse_long_v3_execution_outcome,11,exit_reason,text,YES
+me_reverse_long_v3_execution_outcome,12,gross_r,numeric,YES
+me_reverse_long_v3_execution_outcome,13,net_r_normal,numeric,YES
+me_reverse_long_v3_execution_outcome,14,net_r_elevated,numeric,YES
+me_reverse_long_v3_execution_outcome,15,ambiguous,boolean,YES
+me_reverse_long_v3_execution_outcome,16,coverage_reason,text,YES
+me_reverse_long_v3_execution_outcome,17,candle_count,integer,YES
+me_reverse_long_v3_execution_outcome,18,evaluated_at,timestamp with time zone,NO
+me_reverse_long_v3_execution_outcome,19,created_at,timestamp with time zone,NO
+me_reverse_long_v3_execution_outcome,20,updated_at,timestamp with time zone,NO
+prospective_completed_event,1,experiment_id,text,NO
+prospective_completed_event,2,setup_event_id,text,NO
+prospective_completed_event,3,symbol,text,NO
+prospective_completed_event,4,direction,text,NO
+prospective_completed_event,5,status,text,NO
+prospective_completed_event,6,snapshot,jsonb,NO
+prospective_completed_event,7,frozen_at,timestamp with time zone,NO
+prospective_completed_event,8,created_at,timestamp with time zone,NO
+prospective_experiment,1,experiment_id,text,NO
+prospective_experiment,2,version,integer,NO
+prospective_experiment,3,scanner_name,text,NO
+prospective_experiment,4,direction,text,NO
+prospective_experiment,5,experiment_type,text,NO
+prospective_experiment,6,hypothesis,text,NO
+prospective_experiment,7,primary_metric,text,NO
+prospective_experiment,8,secondary_metrics,jsonb,NO
+prospective_experiment,9,filter_rule,text,NO
+prospective_experiment,10,threshold,numeric,YES
+prospective_experiment,11,entry_rule,text,NO
+prospective_experiment,12,stop_rule,text,NO
+prospective_experiment,13,target_rule,text,NO
+prospective_experiment,14,position_sizing,text,NO
+prospective_experiment,15,fee_assumption,text,NO
+prospective_experiment,16,horizons,jsonb,NO
+prospective_experiment,17,minimum_n,integer,NO
+prospective_experiment,18,minimum_symbols,integer,NO
+prospective_experiment,19,discovery_source,text,NO
+prospective_experiment,20,paired_with,text,YES
+prospective_experiment,21,started_at,timestamp with time zone,YES
+prospective_experiment,22,status,text,NO
+prospective_experiment,23,created_at,timestamp with time zone,NO
+prospective_experiment,24,updated_at,timestamp with time zone,NO
+prospective_experiment_direction_state,1,experiment_id,text,NO
+prospective_experiment_direction_state,2,direction,text,NO
+prospective_experiment_direction_state,3,status,text,NO
+prospective_experiment_direction_state,4,closed_at,timestamp with time zone,YES
+prospective_experiment_direction_state,5,closure_reason,text,YES
+prospective_experiment_direction_state,6,closure_source,text,YES
+prospective_experiment_direction_state,7,closure_artifact,text,YES
+prospective_experiment_direction_state,8,created_at,timestamp with time zone,NO
+prospective_experiment_direction_state,9,updated_at,timestamp with time zone,NO
+prospective_observation,1,observation_id,bigint,NO
+prospective_observation,2,experiment_id,text,NO
+prospective_observation,3,source_signal_id,bigint,NO
+prospective_observation,4,source_observation_id,bigint,YES
+prospective_observation,5,symbol,text,NO
+prospective_observation,6,direction,text,NO
+prospective_observation,7,signal_time,timestamp with time zone,NO
+prospective_observation,8,reference_price,numeric,NO
+prospective_observation,9,invalidation_price,numeric,YES
+prospective_observation,10,target_1,numeric,YES
+prospective_observation,11,target_2,numeric,YES
+prospective_observation,12,score,numeric,NO
+prospective_observation,13,variant_entry,numeric,YES
+prospective_observation,14,variant_stop,numeric,YES
+prospective_observation,15,variant_target,numeric,YES
+prospective_observation,16,rule_passed,boolean,NO
+prospective_observation,17,filter_reason,text,YES
+prospective_observation,18,gate_result,text,YES
+prospective_observation,19,features,jsonb,NO
+prospective_observation,20,parameters,jsonb,NO
+prospective_observation,21,market_regime,text,YES
+prospective_observation,22,created_at,timestamp with time zone,NO
+prospective_outcome,1,observation_id,bigint,NO
+prospective_outcome,2,experiment_id,text,NO
+prospective_outcome,3,mfe_15m,numeric,YES
+prospective_outcome,4,mae_15m,numeric,YES
+prospective_outcome,5,mfe_30m,numeric,YES
+prospective_outcome,6,mae_30m,numeric,YES
+prospective_outcome,7,mfe_60m,numeric,YES
+prospective_outcome,8,mae_60m,numeric,YES
+prospective_outcome,9,mfe_120m,numeric,YES
+prospective_outcome,10,mae_120m,numeric,YES
+prospective_outcome,11,mfe_240m,numeric,YES
+prospective_outcome,12,mae_240m,numeric,YES
+prospective_outcome,13,mfe_r_15m,numeric,YES
+prospective_outcome,14,mae_r_15m,numeric,YES
+prospective_outcome,15,mfe_r_30m,numeric,YES
+prospective_outcome,16,mae_r_30m,numeric,YES
+prospective_outcome,17,mfe_r_60m,numeric,YES
+prospective_outcome,18,mae_r_60m,numeric,YES
+prospective_outcome,19,mfe_r_120m,numeric,YES
+prospective_outcome,20,mae_r_120m,numeric,YES
+prospective_outcome,21,mfe_r_240m,numeric,YES
+prospective_outcome,22,mae_r_240m,numeric,YES
+prospective_outcome,23,return_at_15m,numeric,YES
+prospective_outcome,24,return_at_30m,numeric,YES
+prospective_outcome,25,return_at_60m,numeric,YES
+prospective_outcome,26,return_at_120m,numeric,YES
+prospective_outcome,27,return_at_240m,numeric,YES
+prospective_outcome,28,tp_hit,boolean,NO
+prospective_outcome,29,sl_hit,boolean,NO
+prospective_outcome,30,tp_before_sl,boolean,NO
+prospective_outcome,31,sl_before_tp,boolean,NO
+prospective_outcome,32,ambiguous_intrabar,boolean,NO
+prospective_outcome,33,time_to_tp,numeric,YES
+prospective_outcome,34,time_to_sl,numeric,YES
+prospective_outcome,35,evaluated_15m_at,timestamp with time zone,YES
+prospective_outcome,36,evaluated_30m_at,timestamp with time zone,YES
+prospective_outcome,37,evaluated_60m_at,timestamp with time zone,YES
+prospective_outcome,38,evaluated_120m_at,timestamp with time zone,YES
+prospective_outcome,39,evaluated_240m_at,timestamp with time zone,YES
+prospective_outcome,40,is_final,boolean,NO
+prospective_outcome,41,created_at,timestamp with time zone,NO
+prospective_outcome,42,updated_at,timestamp with time zone,NO
