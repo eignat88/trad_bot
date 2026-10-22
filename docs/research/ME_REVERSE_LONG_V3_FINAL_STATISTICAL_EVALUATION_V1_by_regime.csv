@@ -1,0 +1,3 @@
+market_regime,n_total,n_PASS,net_normal_mean_PASS,total_net_r_PASS,n_REJECT,net_normal_mean_REJECT,total_net_r_REJECT,net_normal_mean_all,total_net_r_all,symbols_in_group
+HIGH_VOLATILITY,77,52,-0.2913065704,-15.14794166,25,0.0873223632,2.18305908,-0.1683750984,-12.96488258,26
+RANGE,59,55,-0.2725695513,-14.99132532,4,0.0194665,0.077866,-0.2527704969,-14.91345932,20
