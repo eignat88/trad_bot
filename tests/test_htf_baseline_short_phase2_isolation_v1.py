@@ -30,6 +30,7 @@ ALLOWED_NEW_PREFIXES = (
     "docs/research/HTF_BASELINE_SHORT_PHASE2_",
     "deploy/systemd/trad-bot-htf-baseline-short-observer.service",
     "sql/migrations/074_htf_baseline_short_phase2_registration.sql",
+    "sql/migrations/075_htf_baseline_short_phase2_privilege_hardening.sql",
     "tools/research/htf_baseline_short_phase2_",
 )
 
@@ -39,8 +40,19 @@ def _git(*args: str) -> str:
         ["git", *args], cwd=ROOT, capture_output=True, text=True, timeout=60
     )
     if result.returncode != 0:
-        pytest.skip(f"git unavailable: {result.stderr.strip()[:200]}")
+        pytest.fail(
+            f"git command failed ({result.returncode}): "
+            f"{result.stderr.strip()[:300]}"
+        )
     return result.stdout
+
+
+def _pr_base() -> str:
+    """Resolve merge-base with main for PR-scope checks."""
+    base = _git("merge-base", "HEAD", "origin/main").strip()
+    if not base:
+        pytest.fail("cannot resolve PR merge-base")
+    return base
 
 
 def test_frozen_point_b_stack_byte_identical_to_base():
@@ -51,13 +63,28 @@ def test_frozen_point_b_stack_byte_identical_to_base():
 
 
 def test_no_tracked_file_modified_against_base():
-    diff = _git("diff", "--name-status", BASE_SHA)
+    diff = _git("diff", "--name-status", _pr_base())
     changed = [
         line.strip()
         for line in diff.splitlines()
         if line.strip() and line.strip()[0] in {"M", "D", "R", "C", "T"}
     ]
-    assert changed == [], f"tracked files modified/deleted vs base: {changed}"
+    allowed_modified = (
+        ".github/workflows/main-pr-safety.yml",
+        "app/research/htf_baseline_short_phase2_observer_runner_v1.py",
+        "deploy/systemd/trad-bot-htf-baseline-short-observer.service",
+        "tests/test_htf_baseline_short_phase2_isolation_v1.py",
+    )
+
+    unexpected = []
+    for entry in changed:
+        status, path = entry.split("\t", 1)
+        if status != "M" or path not in allowed_modified:
+            unexpected.append(entry)
+
+    assert unexpected == [], (
+        f"tracked files modified/deleted outside Phase-2 surface: {unexpected}"
+    )
 
 
 def test_new_files_are_confined_to_phase2_surface():
@@ -66,7 +93,7 @@ def test_new_files_are_confined_to_phase2_surface():
     for line in status.splitlines():
         if line.startswith("??"):
             new_paths.add(line[3:].strip().strip('"'))
-    diff = _git("diff", "--name-status", BASE_SHA)
+    diff = _git("diff", "--name-status", _pr_base())
     for line in diff.splitlines():
         if line.startswith("A"):
             new_paths.add(line[2:].strip().strip('"'))

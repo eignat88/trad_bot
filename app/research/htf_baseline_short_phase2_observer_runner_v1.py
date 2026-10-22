@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import signal
+import stat as stat_module
 import sys
 import time
 from dataclasses import dataclass, field
@@ -576,25 +577,168 @@ def require_runnable(
     )
 
 
-def connect_db_from_env():
-    """Open the application database connection from HTF_P2_DB_* environment
-    variables (psycopg2 preferred, pg8000 fallback). Never called implicitly."""
-    host = os.environ.get("HTF_P2_DB_HOST", "127.0.0.1")
-    port = int(os.environ.get("HTF_P2_DB_PORT", "5432"))
-    user = os.environ.get("HTF_P2_DB_USER", "postgres")
-    name = os.environ.get("HTF_P2_DB_NAME", "trad_bot")
-    try:
-        import psycopg2
+DB_CONNECT_TIMEOUT_S = 5
+#: shared/admin roles the observer must never authenticate as
+_FORBIDDEN_DB_USERS = frozenset({"postgres", "trad_bot", "analytics_runner", "analytics_agent"})
 
-        return psycopg2.connect(
-            host=host, port=port, user=user, database=name, connect_timeout=5
+
+class DbCredentialsError(RuntimeError):
+    """Missing or unsafe database credentials (fail closed; never guess)."""
+
+
+def check_password_file_stat(st_mode: int, st_uid: int, euid: int | None = None) -> None:
+    """Validate password-file metadata (F1 hardening); raises DbCredentialsError.
+
+    Pure logic (usable on any platform): the file must be a regular file, must
+    not be group/world accessible (``mode & 0o077`` must be 0; 0600/0400 pass)
+    and must be owned by the service user or root. ``euid`` defaults to the
+    current effective uid.
+    """
+    if not stat_module.S_ISREG(st_mode):
+        raise DbCredentialsError("password file must be a regular file (not a symlink or device)")
+    if stat_module.S_IMODE(st_mode) & 0o077:
+        raise DbCredentialsError(
+            "password file must not be group/world accessible (require 0600 or stricter)"
         )
-    except ImportError:
+    if os.name == "posix":
+        owner = os.geteuid() if euid is None else euid
+        if st_uid not in (owner, 0):
+            raise DbCredentialsError(
+                "password file must be owned by the service user or root"
+            )
+
+
+def _read_password_file(path: str) -> str:
+    """Read the password file defensively (F1): symlink/TOCTOU resistant on POSIX.
+
+    The password value never appears in exceptions or logs.
+    """
+    if os.name == "posix":
+        try:
+            pre = os.lstat(path)
+        except OSError as exc:
+            raise DbCredentialsError(f"password file unreadable: {exc}") from exc
+        if stat_module.S_ISLNK(pre.st_mode):
+            raise DbCredentialsError("password file must not be a symlink")
+        # NEW-2: reject non-regular files (FIFO/sockets/devices) BEFORE open —
+        # opening a FIFO would block waiting for a writer.
+        if not stat_module.S_ISREG(pre.st_mode):
+            raise DbCredentialsError("password file must be a regular file (not a symlink or device)")
+        # O_NOFOLLOW: block symlink swaps; O_NONBLOCK: never block if a regular
+        # file is swapped for a FIFO between lstat and open (the fstat check
+        # below then rejects the opened object).
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            raise DbCredentialsError(f"password file unreadable: {exc}") from exc
+        try:
+            fst = os.fstat(fd)  # stat the opened object: TOCTOU-safe
+            check_password_file_stat(fst.st_mode, fst.st_uid)
+            data = os.read(fd, 65536)
+        finally:
+            os.close(fd)
+    else:
+        # Windows: POSIX mode/uid semantics do not apply; content checks below
+        try:
+            data = Path(path).read_bytes()[:65536]
+        except OSError as exc:
+            raise DbCredentialsError(f"password file unreadable: {exc}") from exc
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    password = next((line.strip() for line in lines if line.strip()), "")
+    if not password:
+        raise DbCredentialsError("password file contains no password")
+    return password
+
+
+def load_db_credentials() -> dict:
+    """Load dedicated-role credentials from HTF_P2_DB_* (CP2 hardening).
+
+    Fail-closed contract:
+      * ``HTF_P2_DB_USER`` is REQUIRED and must be the dedicated observer role —
+        there is no default user and shared/admin roles are rejected;
+      * ``HTF_P2_DB_NAME`` is REQUIRED (no implicit database);
+      * the password comes from ``HTF_P2_DB_PASSWORD`` or, preferably, from the
+        file named by ``HTF_P2_DB_PASSWORD_FILE`` (first non-empty line). No
+        password -> refuse to connect (never trust/peer fallback);
+      * scanner/.env credentials are never read — only HTF_P2_DB_* is consulted.
+    """
+    user = os.environ.get("HTF_P2_DB_USER", "").strip()
+    if not user:
+        raise DbCredentialsError(
+            "HTF_P2_DB_USER must explicitly name the dedicated observer role "
+            "(no default user)"
+        )
+    if user in _FORBIDDEN_DB_USERS:
+        raise DbCredentialsError(
+            "HTF_P2_DB_USER must be the dedicated observer role, not a shared "
+            "or administrative role (refusing)"
+        )
+    name = os.environ.get("HTF_P2_DB_NAME", "").strip()
+    if not name:
+        raise DbCredentialsError("HTF_P2_DB_NAME is required (no implicit database)")
+    password = os.environ.get("HTF_P2_DB_PASSWORD")
+    if password is None or password == "":
+        pw_file = os.environ.get("HTF_P2_DB_PASSWORD_FILE", "").strip()
+        if not pw_file:
+            raise DbCredentialsError(
+                "HTF_P2_DB_PASSWORD or HTF_P2_DB_PASSWORD_FILE is required "
+                "(refusing password-less connection)"
+            )
+        password = _read_password_file(pw_file)
+    return {
+        "host": os.environ.get("HTF_P2_DB_HOST", "127.0.0.1"),
+        "port": int(os.environ.get("HTF_P2_DB_PORT", "5432")),
+        "user": user,
+        "database": name,
+        "password": password,
+    }
+
+
+def connect_db_from_env():
+    """Open the observer database connection from HTF_P2_DB_* (CP2 hardening).
+
+    SCRAM-SHA-256 is supported natively by pg8000, which is the preferred
+    driver; psycopg2 (libpq) is the fallback. The password is passed only to
+    the driver and is NEVER logged. Never called implicitly.
+    """
+    creds = load_db_credentials()
+    log.info(
+        "observer db connect host=%s port=%s db=%s user=%s (password redacted)",
+        creds["host"], creds["port"], creds["database"], creds["user"],
+    )
+    try:
         import pg8000.dbapi
 
         return pg8000.dbapi.connect(
-            host=host, port=port, user=user, database=name, timeout=5
+            host=creds["host"],
+            port=creds["port"],
+            user=creds["user"],
+            database=creds["database"],
+            password=creds["password"],
+            timeout=DB_CONNECT_TIMEOUT_S,
         )
+    except ImportError:
+        import psycopg2
+
+        return psycopg2.connect(
+            host=creds["host"],
+            port=creds["port"],
+            user=creds["user"],
+            database=creds["database"],
+            password=creds["password"],
+            connect_timeout=DB_CONNECT_TIMEOUT_S,
+        )
+
+
+def close_db_connection(conn) -> None:
+    """Close a database connection defensively (explicit resource cleanup)."""
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except Exception as exc:  # pragma: no cover - best effort
+        log.warning("db connection close failed: %s", exc)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -640,50 +784,56 @@ def main(argv: list[str] | None = None) -> int:
     )
     writer = InMemoryWriter()
     db_conn = None
-    if args.use_registration:
-        # production path: the THREE independent freeze authorities must all
-        # agree, otherwise exit fail-closed BEFORE any observation is created
-        if not args.activation_config:
-            log.error("registration gate: --activation-config is required")
-            return EXIT_NOT_RUNNABLE
-        try:
-            activation = load_activation_config(args.activation_config)
-            db_conn = connect_db_from_env()
-            boundary = require_runnable(db_conn, config, activation=activation)
-        except Exception as exc:
-            log.error("registration gate refused startup: %s", exc)
-            return EXIT_NOT_RUNNABLE
-        from app.research.htf_baseline_short_phase2_persistence_v1 import (
-            Phase2ObservationWriter,
-        )
-
-        writer = Phase2ObservationWriter(db_conn)
-    elif args.freeze_ts:
-        fingerprint = config.protocol_fingerprint
-        try:
-            boundary = build_boundary(
-                experiment_id=config.experiment_id,
-                protocol_freeze_ts=args.freeze_ts,
-                registry_freeze_ts=args.freeze_ts,
-                database_freeze_ts=args.freeze_ts,
-                protocol_fingerprint_hex=fingerprint,
+    try:
+        if args.use_registration:
+            # production path: the THREE independent freeze authorities must all
+            # agree, otherwise exit fail-closed BEFORE any observation is created
+            if not args.activation_config:
+                log.error("registration gate: --activation-config is required")
+                return EXIT_NOT_RUNNABLE
+            try:
+                activation = load_activation_config(args.activation_config)
+                db_conn = connect_db_from_env()
+                boundary = require_runnable(db_conn, config, activation=activation)
+            except Exception as exc:
+                log.error("registration gate refused startup: %s", exc)
+                return EXIT_NOT_RUNNABLE
+            from app.research.htf_baseline_short_phase2_persistence_v1 import (
+                Phase2ObservationWriter,
             )
-        except NotRunnableError as exc:
-            log.error("%s", exc)
-            return EXIT_NOT_RUNNABLE
-    else:
-        log.error("no freeze boundary supplied: fail closed (PHASE_2_NOT_ACTIVATED)")
-        return EXIT_NOT_RUNNABLE
 
-    runner = Phase2ObserverRunner(
-        config,
-        boundary=boundary,
-        source=FileCandleSource(args.data_dir),
-        writer=writer,
-        db_conn=db_conn,
-    )
-    runner.install_signal_handlers()
-    return runner.run_loop()
+            writer = Phase2ObservationWriter(db_conn)
+        elif args.freeze_ts:
+            fingerprint = config.protocol_fingerprint
+            try:
+                boundary = build_boundary(
+                    experiment_id=config.experiment_id,
+                    protocol_freeze_ts=args.freeze_ts,
+                    registry_freeze_ts=args.freeze_ts,
+                    database_freeze_ts=args.freeze_ts,
+                    protocol_fingerprint_hex=fingerprint,
+                )
+            except NotRunnableError as exc:
+                log.error("%s", exc)
+                return EXIT_NOT_RUNNABLE
+        else:
+            log.error("no freeze boundary supplied: fail closed (PHASE_2_NOT_ACTIVATED)")
+            return EXIT_NOT_RUNNABLE
+
+        runner = Phase2ObserverRunner(
+            config,
+            boundary=boundary,
+            source=FileCandleSource(args.data_dir),
+            writer=writer,
+            db_conn=db_conn,
+        )
+        runner.install_signal_handlers()
+        return runner.run_loop()
+    finally:
+        # F2: close exactly once on EVERY post-connect path (accepted gate,
+        # refused gate, exception, early return); never leaks to process exit.
+        if db_conn is not None:
+            close_db_connection(db_conn)
 
 
 if __name__ == "__main__":  # pragma: no cover
