@@ -272,6 +272,30 @@ def test_runbook_verification_sql_flags_bad_grants(db):
     assert "leftover_dml" in flagged
 
 
+def test_runbook_verification_sql_flags_sequence_grants(db):
+    """Negative: sequence grants to PUBLIC/observer MUST be detected (P3-VF1).
+
+    Also proves the full block runs without SQL errors whether or not the
+    `trad_bot` role exists (CASE-guarded rows) and that revoking the bad
+    grants restores a clean PASS.
+    """
+    apply_075(db)
+    seq = "research.htf_baseline_short_phase2_observation_observation_id_seq"
+    with db.cursor() as cur:
+        cur.execute(f"GRANT USAGE ON SEQUENCE {seq} TO PUBLIC")
+        cur.execute(f"GRANT UPDATE ON SEQUENCE {seq} TO trad_bot_htf_p2_observer")
+    db.commit()
+    mismatches = _run_verification(db)
+    flagged = {check for check, _, _ in mismatches}
+    assert "seq_pub" in flagged
+    assert "seq_observer" in flagged
+    with db.cursor() as cur:
+        cur.execute(f"REVOKE USAGE ON SEQUENCE {seq} FROM PUBLIC")
+        cur.execute(f"REVOKE UPDATE ON SEQUENCE {seq} FROM trad_bot_htf_p2_observer")
+    db.commit()
+    assert not _run_verification(db)  # restored -> every check PASS again
+
+
 def test_systemd_unit_matches_exit_code_contract():
     """F5: EXIT_NOT_RUNNABLE=3 must not restart-loop; unit keeps its guards."""
     import app.research.htf_baseline_short_phase2_observer_runner_v1 as mod

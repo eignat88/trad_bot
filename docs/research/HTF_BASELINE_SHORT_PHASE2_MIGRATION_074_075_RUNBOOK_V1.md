@@ -144,6 +144,41 @@ SELECT 'leftover_dml' AS check, 0 AS expected,
                              'htf_baseline_short_phase2_freeze_registry')
            AND a.grantee <> c.relowner
            AND a.privilege_type IN ('INSERT', 'UPDATE', 'DELETE')) AS actual;
+SELECT 'seq_observer' AS check, false AS expected, x.actual AS actual FROM (
+  SELECT has_sequence_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_observation_observation_id_seq', 'USAGE') AS actual
+  UNION ALL
+  SELECT has_sequence_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_observation_observation_id_seq', 'SELECT')
+  UNION ALL
+  SELECT has_sequence_privilege('trad_bot_htf_p2_observer', 'research.htf_baseline_short_phase2_observation_observation_id_seq', 'UPDATE')
+) x;
+SELECT 'seq_admin' AS check, false AS expected, x.actual AS actual FROM (
+  SELECT has_sequence_privilege('trad_bot_htf_p2_admin', 'research.htf_baseline_short_phase2_observation_observation_id_seq', 'USAGE') AS actual
+  UNION ALL
+  SELECT has_sequence_privilege('trad_bot_htf_p2_admin', 'research.htf_baseline_short_phase2_observation_observation_id_seq', 'SELECT')
+  UNION ALL
+  SELECT has_sequence_privilege('trad_bot_htf_p2_admin', 'research.htf_baseline_short_phase2_observation_observation_id_seq', 'UPDATE')
+) x;
+SELECT 'seq_trad_bot' AS check, false AS expected, x.actual AS actual FROM (
+  SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trad_bot')
+              THEN has_sequence_privilege('trad_bot', 'research.htf_baseline_short_phase2_observation_observation_id_seq', 'USAGE')
+              ELSE false END AS actual
+  UNION ALL
+  SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trad_bot')
+              THEN has_sequence_privilege('trad_bot', 'research.htf_baseline_short_phase2_observation_observation_id_seq', 'SELECT')
+              ELSE false END
+  UNION ALL
+  SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trad_bot')
+              THEN has_sequence_privilege('trad_bot', 'research.htf_baseline_short_phase2_observation_observation_id_seq', 'UPDATE')
+              ELSE false END
+) x;
+SELECT 'seq_pub' AS check, 0 AS expected,
+       (SELECT count(*)
+          FROM pg_class c,
+               aclexplode(COALESCE(c.relacl, acldefault('S', c.relowner))) a
+         WHERE c.relnamespace = 'research'::regnamespace
+           AND c.relkind = 'S'
+           AND c.relname = 'htf_baseline_short_phase2_observation_observation_id_seq'
+           AND a.grantee = 0) AS actual;
 -- VERIFICATION_SQL_END
 ```
 
