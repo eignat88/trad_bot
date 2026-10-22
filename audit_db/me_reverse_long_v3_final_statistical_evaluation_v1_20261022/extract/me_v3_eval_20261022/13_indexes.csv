@@ -1,0 +1,9 @@
+table_name,index_name,is_unique,index_def
+me_reverse_long_v3_execution_outcome,idx_me_v3_exec_status,f,"CREATE INDEX idx_me_v3_exec_status ON research.me_reverse_long_v3_execution_outcome USING btree (status, evaluated_at)"
+me_reverse_long_v3_execution_outcome,me_reverse_long_v3_execution_outcome_pkey,t,CREATE UNIQUE INDEX me_reverse_long_v3_execution_outcome_pkey ON research.me_reverse_long_v3_execution_outcome USING btree (observation_id)
+prospective_experiment,prospective_experiment_pkey,t,CREATE UNIQUE INDEX prospective_experiment_pkey ON research.prospective_experiment USING btree (experiment_id)
+prospective_observation,idx_pobs_experiment,f,CREATE INDEX idx_pobs_experiment ON research.prospective_observation USING btree (experiment_id)
+prospective_observation,idx_pobs_source_signal,f,CREATE INDEX idx_pobs_source_signal ON research.prospective_observation USING btree (source_signal_id)
+prospective_observation,idx_pobs_symbol_time,f,"CREATE INDEX idx_pobs_symbol_time ON research.prospective_observation USING btree (symbol, signal_time DESC)"
+prospective_observation,prospective_observation_experiment_id_source_signal_id_key,t,"CREATE UNIQUE INDEX prospective_observation_experiment_id_source_signal_id_key ON research.prospective_observation USING btree (experiment_id, source_signal_id)"
+prospective_observation,prospective_observation_pkey,t,CREATE UNIQUE INDEX prospective_observation_pkey ON research.prospective_observation USING btree (observation_id)

@@ -1,0 +1,64 @@
+{
+  "artifact_set": "ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1",
+  "files": {
+    "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/01_extract_frozen_cohort.sql": "b7763fc5b6e5a32f25d252cf7d75f650b449912871ecf3fe3b6fbb6f8d0d97fd",
+    "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/02_extract_supplemental.sql": "c9cad5c3d2dbf536e72981791b5b09dafab7987f1eaa7aab61ee6120eb2cbef5",
+    "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/03_extract_constraints.sql": "d3bbc7b69c2808423301feeb1dbf60ef6b84f8f13d19e414bec0f6a17d937abc",
+    "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022/01_db_meta.csv": "d5636843ed1dc15adee53a08b48980b523ffc123d534b6e1d93ac81a8bda5d76",
+    "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022/02_prospective_experiment_all.csv": "0c3fac42339fb114b33e467cc1471ae4eff81a87cda9a9d33faa6b77937ffc60",
+    "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022/03_direction_state.csv": "82ff38a3b22165bab298956d12c4ee92a8d5fd4b604a9ec6a7366af5082f7895",
+    "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022/04_cohort_full.csv": "04090564a6f1f173dbabc371e9fec62b466813a9e4cbc162bb6e1307b5571ff1",
+    "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022/05_outcome_orphans.csv": "bcb1c5197501b65ed3f06c78a4c9e57019386cc059b1accb3fa1e98ddac329fd",
+    "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022/08_column_inventory.csv": "b771f7a15154861b6bc916a0c8796194ebb249ec5a13721ebe13ff954cd8fa30",
+    "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022/09_row_counts.csv": "8ee38cfd428594cc0b30990d1aacd873eca4392084373635dc2bcbd6eadce37f",
+    "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022/10_prospective_outcome_v3.csv": "6fa019297e590616e1319aacf3543d8da1930d9a5f24c992ceff5e0fd56db339",
+    "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022/11_completed_events_v3.csv": "674faa476691f84617939c8904ab4230af090a5ae81c3501f474de4160f3d604",
+    "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022/12_constraints.csv": "d5226ca2ca7866f0edbf2389beb79f66ce6c7a44585fd0d1b6bc6d05a5eb1095",
+    "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022/13_indexes.csv": "c481cd704a047a8cfc44f91203afa7b60d7332f42751ef700eec833f1ab256ec",
+    "docs/research/ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1.csv": "11e38e2268613ae1c0cb46506824719cd24ff9eb379f46d161b6f31c3f42f3a1",
+    "docs/research/ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1.json": "42e5697b95fb48ef592afd7f92c215dec70f9fcda303af76f348c17ce6471a79",
+    "docs/research/ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1.md": "1cc6007cb1a6b18df2ccc399477a4176625a9cb04952d23967ab6878833f693f",
+    "docs/research/ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1_by_day.csv": "2dac96087beef3827c52c96db63c75de704c3a736ac7fcda5fdac0b280ef7bbb",
+    "docs/research/ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1_by_regime.csv": "233ba5c6da918a8ad923afb2487e41ffaf308224a3d66df51d8adc5812addbd0",
+    "docs/research/ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1_by_symbol.csv": "1ae9790acdd40270ec12c3de428a3dfe25dbeeafa4935470e6e8d6b0d84b7f0c",
+    "docs/research/ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1_robustness.csv": "9eecaf646d3792a35f692816dd1d0002b76072b9616c4954f7707c24f90c89f0",
+    "tools/research/me_reverse_long_v3_final_statistical_evaluation_v1.py": "1fbcd42b9b9f949a5d3c33721092e9832474084566d5907664660fa17377f457"
+  },
+  "generated_from_snapshot_as_of_utc": "2026-10-22T17:11:24Z",
+  "git": {
+    "note": "git diff of app/research/me_reverse_long_v3/**, prospective_observer.py, prospective_registry.json, migration 067 and the V3 tests is empty between production HEAD 362c217 and both origin/main snapshots 5a3d29c and 224f1d0.",
+    "origin_main": "224f1d038751e8e8a2dfba6705964c1aff6966fa",
+    "origin_main_verified_snapshot": "5a3d29c800d54988bad6d7cbeca7b1322890c679",
+    "production_vps_head": "362c217b90e5e72006f8f10006f201cd8fb5c4db",
+    "v3_files_identical_between_heads": true
+  },
+  "local_only_files": {
+    "files": {
+      "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022.tgz": "1a7fb38cdf5e21a9149aba9dcd705895d4c1ff8b31a7ca41ca42f91527c0b59e",
+      "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022/06_prospective_outcome_all.csv": "70f4bee27647f9772d4b639ce16b169c3041b594a68e593c8fc45b6eed0540df",
+      "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022/07_completed_events.csv": "657860425f9cb19a8f351bbc0b50f3c59a02b7b552142ebdc149207302e91b71"
+    },
+    "note": "Full-table raw extracts kept locally for evidence only; NOT committed to git to avoid repository bloat. Reproduction needs only the committed extraction SQL plus the committed cohort snapshot. Hashes are recorded for immutability."
+  },
+  "protocol_fingerprint": {
+    "canonical_payload": {
+      "direction": "LONG",
+      "entry_rule": "NEXT_OPEN_5M: opening price of the first strictly later 5m execution candle",
+      "experiment_id": "MOMENTUM_EXHAUSTION_REVERSE_LONG_V3_OOS",
+      "fee_assumption": "taker 0.055%/side; normal slippage 0.05%/side; elevated 0.10%/side",
+      "freeze_ts": "2026-10-13T12:37:03Z",
+      "max_hold_minutes": 240,
+      "minimum_n": 100,
+      "minimum_symbols": 10,
+      "primary_metric": "net_r_normal",
+      "source_scanner": "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2",
+      "stop_rule": "2.5% below reference entry",
+      "target_rule": "3.0% above reference entry",
+      "threshold": 0.4,
+      "version": 1
+    },
+    "derived_sha256": "67565f04f5cd0801e615b91aa81826b3761d24e63482e0aecc669ff6b9dbf565",
+    "note": "MOMENTUM_EXHAUSTION_REVERSE_LONG_V3_OOS has NO stored protocol_fingerprint column (unlike ME_R_LONG_EARLY_MAE_EXIT_OOS_V2); the fingerprint above is derived in this evaluation from the canonical frozen payload and is NOT a frozen production value.",
+    "status": "DERIVED_NOT_STORED"
+  }
+}
