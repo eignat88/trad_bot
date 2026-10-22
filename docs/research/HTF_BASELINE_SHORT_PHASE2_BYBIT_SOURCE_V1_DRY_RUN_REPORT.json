@@ -1,0 +1,301 @@
+{
+  "audits": {
+    "bounded_requests": {
+      "budget": 72,
+      "pass": true,
+      "request_count": 32
+    },
+    "causal_asof": {
+      "checked_events": 181,
+      "evaluation_asof_ms": 1792668221027,
+      "failures": [],
+      "pass": true
+    },
+    "checkpoint_restart_equivalence": {
+      "bars_reprocessed": 0,
+      "emissions_on_restart": 0,
+      "pass": true,
+      "restart_exit_code": 0,
+      "state_unchanged": true
+    }
+  },
+  "bounds": {
+    "max_attempts": 3,
+    "max_pages": 20,
+    "min_history_bars": 3000,
+    "page_limit": 200,
+    "retry_backoff_s": 0.5,
+    "symbols": [
+      "BTCUSDT",
+      "ETHUSDT"
+    ],
+    "warmup_bars": 400
+  },
+  "cycle1_exit_code": 0,
+  "cycle1_metrics": {
+    "bars_processed": 6000,
+    "checkpoint_writes": 1,
+    "coverage_gap_bars": 0,
+    "cursor_migrations": 0,
+    "cycles": 1,
+    "duplicate_suppressions": 0,
+    "emissions_eligible": 181,
+    "emissions_rejected": 0,
+    "quarantine_bars": 0,
+    "source_errors": 0,
+    "symbols_blocked": 0,
+    "unclosed_candles_excluded": 0,
+    "writer_errors": 0,
+    "writer_rejected": 0
+  },
+  "evaluation_asof_ms": 1792668221027,
+  "generated_at": "2026-10-22T11:23:07Z",
+  "issue": 181,
+  "load_metrics": {
+    "bars_returned": 3000,
+    "evaluation_asof_ms": 1792668221027,
+    "gap_recovery_requests": 0,
+    "page_requests": 0,
+    "pages_fetched": 15,
+    "retries": 0,
+    "server_time_ms": 1792668221027,
+    "symbol": "ETHUSDT",
+    "unclosed_candles_excluded": 0
+  },
+  "mode": "RESEARCH_ONLY/OBSERVE_ONLY",
+  "observed_events": [
+    {
+      "episode_id": "f42e2577e8778a897d02050a48e0352fe672a04fb6bf0fa6dd5c9c35a0690119",
+      "first_touch_open_ms": 1791913500000,
+      "known_at_ms": 1791914400000,
+      "level_id": "85bd3fc98f1293589e0a6602a2611c94390201632c79e0ec619dbe43029cdbbe",
+      "source_event_id": "f42e2577e8778a897d02050a48e0352fe672a04fb6bf0fa6dd5c9c35a0690119:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "95962c481626b5ccac91e83237148175b3b616a5f5d6cc11bd813ead4c72ab69",
+      "first_touch_open_ms": 1791948600000,
+      "known_at_ms": 1791949500000,
+      "level_id": "74895e7fb23cf321b16cb9d8b7165f08e81e41121046d0715d5b9a81de17ee7f",
+      "source_event_id": "95962c481626b5ccac91e83237148175b3b616a5f5d6cc11bd813ead4c72ab69:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "3ebf96332f25a83dbf7a11d7009ce941aa18dee145ba86ddd4753f3e01258238",
+      "first_touch_open_ms": 1791952200000,
+      "known_at_ms": 1791954300000,
+      "level_id": "74895e7fb23cf321b16cb9d8b7165f08e81e41121046d0715d5b9a81de17ee7f",
+      "source_event_id": "3ebf96332f25a83dbf7a11d7009ce941aa18dee145ba86ddd4753f3e01258238:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "57e3d0ebaf0c4e17b8d5be72bb5c68bcfea4746859ced41632220d48ac6512b7",
+      "first_touch_open_ms": 1791965100000,
+      "known_at_ms": 1791966300000,
+      "level_id": "74895e7fb23cf321b16cb9d8b7165f08e81e41121046d0715d5b9a81de17ee7f",
+      "source_event_id": "57e3d0ebaf0c4e17b8d5be72bb5c68bcfea4746859ced41632220d48ac6512b7:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "5ffefae7920fc75560b2f9b1591f8a52d3f35d5a92b79f7d551d949987eea8fc",
+      "first_touch_open_ms": 1791965400000,
+      "known_at_ms": 1791966300000,
+      "level_id": "a3335d1e1e2ad4f5ffae7d5a7bcfe07ecee5d0b36a8ce2b054171f1061057127",
+      "source_event_id": "5ffefae7920fc75560b2f9b1591f8a52d3f35d5a92b79f7d551d949987eea8fc:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "31f72eafce35db36fead098db38f5c9b72008965e99b015a9bd4b91aafc3c602",
+      "first_touch_open_ms": 1791966600000,
+      "known_at_ms": 1791967500000,
+      "level_id": "74895e7fb23cf321b16cb9d8b7165f08e81e41121046d0715d5b9a81de17ee7f",
+      "source_event_id": "31f72eafce35db36fead098db38f5c9b72008965e99b015a9bd4b91aafc3c602:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "e636a68301f84c342faa594f0b58658250fd394c96f4945dec1704ac5fd822a8",
+      "first_touch_open_ms": 1791969600000,
+      "known_at_ms": 1791972600000,
+      "level_id": "85bd3fc98f1293589e0a6602a2611c94390201632c79e0ec619dbe43029cdbbe",
+      "source_event_id": "e636a68301f84c342faa594f0b58658250fd394c96f4945dec1704ac5fd822a8:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "af44e0500023c965904000ff2d11038de74d45d784c9281d8f7ffff79bed7182",
+      "first_touch_open_ms": 1791979800000,
+      "known_at_ms": 1791980700000,
+      "level_id": "74895e7fb23cf321b16cb9d8b7165f08e81e41121046d0715d5b9a81de17ee7f",
+      "source_event_id": "af44e0500023c965904000ff2d11038de74d45d784c9281d8f7ffff79bed7182:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "7e37daa1132fffe175324361d67e08ffc828b8015039260cc5d1dc9b7111ba2c",
+      "first_touch_open_ms": 1791980700000,
+      "known_at_ms": 1791981600000,
+      "level_id": "74895e7fb23cf321b16cb9d8b7165f08e81e41121046d0715d5b9a81de17ee7f",
+      "source_event_id": "7e37daa1132fffe175324361d67e08ffc828b8015039260cc5d1dc9b7111ba2c:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "60efd2120e2bfb3e0cbcddeaca8c4efe48a0c0163b9b822078fc0607f49be071",
+      "first_touch_open_ms": 1792149000000,
+      "known_at_ms": 1792149900000,
+      "level_id": "f4edab39abb2708d8b58fd3dbef01dd09b6f3e4159703fc3344065989fc453ce",
+      "source_event_id": "60efd2120e2bfb3e0cbcddeaca8c4efe48a0c0163b9b822078fc0607f49be071:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "fee983b88bef2c90ac34c7558bc9d6d3f20e50c89b4b654f19978ffd0aa5a369",
+      "first_touch_open_ms": 1792150200000,
+      "known_at_ms": 1792152300000,
+      "level_id": "f4edab39abb2708d8b58fd3dbef01dd09b6f3e4159703fc3344065989fc453ce",
+      "source_event_id": "fee983b88bef2c90ac34c7558bc9d6d3f20e50c89b4b654f19978ffd0aa5a369:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "d6d8b158dab7cad6c7552ca45332dacd6d795e01c29f8236dddb6cb2b1117773",
+      "first_touch_open_ms": 1792287600000,
+      "known_at_ms": 1792288500000,
+      "level_id": "14d8c0da9fa5d1c0a58711cdcb4e09ebb8c62f807ba9387ffb6c2049be81cbe8",
+      "source_event_id": "d6d8b158dab7cad6c7552ca45332dacd6d795e01c29f8236dddb6cb2b1117773:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "bd95a3ea745bba10e5055f9eed0ca1bd54b1926e830e104266c50e807449ef30",
+      "first_touch_open_ms": 1792287600000,
+      "known_at_ms": 1792288800000,
+      "level_id": "9ca99ac9ae39565534b43c2579a774241b843c5adc8ffe19aaa737d98089c97b",
+      "source_event_id": "bd95a3ea745bba10e5055f9eed0ca1bd54b1926e830e104266c50e807449ef30:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "1fd88bcff30c066c6d11ab2ab6aaf47eb7b881832e060b47ccc13730347a8cda",
+      "first_touch_open_ms": 1792292400000,
+      "known_at_ms": 1792295100000,
+      "level_id": "14d8c0da9fa5d1c0a58711cdcb4e09ebb8c62f807ba9387ffb6c2049be81cbe8",
+      "source_event_id": "1fd88bcff30c066c6d11ab2ab6aaf47eb7b881832e060b47ccc13730347a8cda:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "ba7c41886b51d66f8cabc4ab29c99b5604be9f22fc000a0fe815ed0d38b23c12",
+      "first_touch_open_ms": 1792300200000,
+      "known_at_ms": 1792302300000,
+      "level_id": "14d8c0da9fa5d1c0a58711cdcb4e09ebb8c62f807ba9387ffb6c2049be81cbe8",
+      "source_event_id": "ba7c41886b51d66f8cabc4ab29c99b5604be9f22fc000a0fe815ed0d38b23c12:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "c2adbe93a18b0323417dacc15770974c30104bfe76298c61708a9580b46a991c",
+      "first_touch_open_ms": 1792300800000,
+      "known_at_ms": 1792302300000,
+      "level_id": "9ca99ac9ae39565534b43c2579a774241b843c5adc8ffe19aaa737d98089c97b",
+      "source_event_id": "c2adbe93a18b0323417dacc15770974c30104bfe76298c61708a9580b46a991c:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "5b6296079740c42ef2ab0ebe340f38349ba9ddccaa40bee14c085933bef4418a",
+      "first_touch_open_ms": 1792306800000,
+      "known_at_ms": 1792308600000,
+      "level_id": "9ca99ac9ae39565534b43c2579a774241b843c5adc8ffe19aaa737d98089c97b",
+      "source_event_id": "5b6296079740c42ef2ab0ebe340f38349ba9ddccaa40bee14c085933bef4418a:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "6f51b045d3705c7099ca216df34886b413860fd83252e06e938fd9e468f2bbe6",
+      "first_touch_open_ms": 1792320300000,
+      "known_at_ms": 1792321500000,
+      "level_id": "c2d67eb8a346f3b0b1c7df5097aaf8189e60dc22bfe862526b2f1c057c8681cd",
+      "source_event_id": "6f51b045d3705c7099ca216df34886b413860fd83252e06e938fd9e468f2bbe6:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "7772a0c3f20b4466303ca5534c4a26cb034ed1cd16497553928db6397a3161e8",
+      "first_touch_open_ms": 1792324800000,
+      "known_at_ms": 1792326900000,
+      "level_id": "c2d67eb8a346f3b0b1c7df5097aaf8189e60dc22bfe862526b2f1c057c8681cd",
+      "source_event_id": "7772a0c3f20b4466303ca5534c4a26cb034ed1cd16497553928db6397a3161e8:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "e9faffa0abec779975eceb2d23b8b8c7e8805c5f63a6d7427ca36d3216ca199d",
+      "first_touch_open_ms": 1792329300000,
+      "known_at_ms": 1792330200000,
+      "level_id": "14d8c0da9fa5d1c0a58711cdcb4e09ebb8c62f807ba9387ffb6c2049be81cbe8",
+      "source_event_id": "e9faffa0abec779975eceb2d23b8b8c7e8805c5f63a6d7427ca36d3216ca199d:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "22d7b479512acb8e36c4be47cebbdbfc4395881f52841c544c2cc994abbb459a",
+      "first_touch_open_ms": 1792329600000,
+      "known_at_ms": 1792330500000,
+      "level_id": "9ca99ac9ae39565534b43c2579a774241b843c5adc8ffe19aaa737d98089c97b",
+      "source_event_id": "22d7b479512acb8e36c4be47cebbdbfc4395881f52841c544c2cc994abbb459a:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "9850c839d031b1299b61ad8ae3f7f2e9ebbaff1ff1d79144c6516d30a7d3de68",
+      "first_touch_open_ms": 1792363200000,
+      "known_at_ms": 1792365900000,
+      "level_id": "9ca99ac9ae39565534b43c2579a774241b843c5adc8ffe19aaa737d98089c97b",
+      "source_event_id": "9850c839d031b1299b61ad8ae3f7f2e9ebbaff1ff1d79144c6516d30a7d3de68:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "5b2d7c610aa023209ea5e6a3c8739c4826b5188413a7a319a2509d40142633fb",
+      "first_touch_open_ms": 1792367700000,
+      "known_at_ms": 1792381500000,
+      "level_id": "c2d67eb8a346f3b0b1c7df5097aaf8189e60dc22bfe862526b2f1c057c8681cd",
+      "source_event_id": "5b2d7c610aa023209ea5e6a3c8739c4826b5188413a7a319a2509d40142633fb:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "13f5eb3366ec0047e979e4dab3492119b21fb165a1976689cc2059c52dcd71ec",
+      "first_touch_open_ms": 1792377900000,
+      "known_at_ms": 1792381500000,
+      "level_id": "f4edab39abb2708d8b58fd3dbef01dd09b6f3e4159703fc3344065989fc453ce",
+      "source_event_id": "13f5eb3366ec0047e979e4dab3492119b21fb165a1976689cc2059c52dcd71ec:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    },
+    {
+      "episode_id": "77ce4b2f0b66548c79a12a91a279f2ff6065eb09c87fbebd7d333a04e9ab2b9c",
+      "first_touch_open_ms": 1792384200000,
+      "known_at_ms": 1792386300000,
+      "level_id": "f4edab39abb2708d8b58fd3dbef01dd09b6f3e4159703fc3344065989fc453ce",
+      "source_event_id": "77ce4b2f0b66548c79a12a91a279f2ff6065eb09c87fbebd7d333a04e9ab2b9c:FIRST_CONFIRM",
+      "symbol": "BTCUSDT",
+      "warmup_origin": false
+    }
+  ],
+  "observed_events_total": 181,
+  "oos_activation": "BLOCKED (gate #181)",
+  "production_db_writes": 0,
+  "request_count": 32,
+  "server_time_ms": 1792668221027,
+  "source_error": null,
+  "tool": "HTF_BASELINE_SHORT_PHASE2_BYBIT_LIVE_DRY_RUN_V1",
+  "verdict": "PASS"
+}
