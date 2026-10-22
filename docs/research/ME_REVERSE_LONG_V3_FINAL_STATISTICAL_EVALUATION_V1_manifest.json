@@ -17,12 +17,12 @@
     "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022/13_indexes.csv": "c481cd704a047a8cfc44f91203afa7b60d7332f42751ef700eec833f1ab256ec",
     "docs/research/ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1.csv": "11e38e2268613ae1c0cb46506824719cd24ff9eb379f46d161b6f31c3f42f3a1",
     "docs/research/ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1.json": "42e5697b95fb48ef592afd7f92c215dec70f9fcda303af76f348c17ce6471a79",
-    "docs/research/ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1.md": "4e4b0cd2df83450bf6f042aa4cca8f31db0a3a0cf4f4cf038e3824bec866df0d",
+    "docs/research/ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1.md": "87b0f698532f8849103154688e07b9f339210dcf0d444dc3b02c88dd16233bbd",
     "docs/research/ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1_by_day.csv": "2dac96087beef3827c52c96db63c75de704c3a736ac7fcda5fdac0b280ef7bbb",
     "docs/research/ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1_by_regime.csv": "233ba5c6da918a8ad923afb2487e41ffaf308224a3d66df51d8adc5812addbd0",
     "docs/research/ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1_by_symbol.csv": "1ae9790acdd40270ec12c3de428a3dfe25dbeeafa4935470e6e8d6b0d84b7f0c",
     "docs/research/ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1_robustness.csv": "9eecaf646d3792a35f692816dd1d0002b76072b9616c4954f7707c24f90c89f0",
-    "tools/research/me_reverse_long_v3_final_statistical_evaluation_v1.py": "afc785d1705452a203982997c3d80aac67fffed895caa6313c1da55a2111331f"
+    "tools/research/me_reverse_long_v3_final_statistical_evaluation_v1.py": "cfc572bf8f67c47ffe8d3e189c1da5fe4a460883731f385aabcbc0b3a93a0353"
   },
   "generated_from_snapshot_as_of_utc": "2026-10-22T17:11:24Z",
   "git": {
@@ -33,7 +33,11 @@
     "v3_files_identical_between_heads": true
   },
   "local_only_files": {
-    "files": {},
+    "files": {
+      "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022.tgz": "1a7fb38cdf5e21a9149aba9dcd705895d4c1ff8b31a7ca41ca42f91527c0b59e",
+      "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022/06_prospective_outcome_all.csv": "70f4bee27647f9772d4b639ce16b169c3041b594a68e593c8fc45b6eed0540df",
+      "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/me_v3_eval_20261022/07_completed_events.csv": "657860425f9cb19a8f351bbc0b50f3c59a02b7b552142ebdc149207302e91b71"
+    },
     "note": "Full-table raw extracts kept locally for evidence only; NOT committed to git to avoid repository bloat. Reproduction needs only the committed extraction SQL plus the committed cohort snapshot. Hashes are recorded for immutability."
   },
   "protocol_fingerprint": {

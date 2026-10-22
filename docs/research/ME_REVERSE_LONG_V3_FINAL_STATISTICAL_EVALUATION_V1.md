@@ -282,11 +282,13 @@ Basis:
 
 ## 7. Deterministic tests / reproducibility
 
-* `tests/test_me_reverse_long_v3_final_statistical_evaluation_v1.py` — **12 passed**: join cardinality 1:1, maturity split 136/1, zero missingness on FINALIZED, no pre-freeze contamination, classification = frozen threshold, integrity audit CLEAN, all operator values MATCH, CONTROL = aggregate unfiltered baseline (contains both groups), fixed-seed intervals byte-stable, **outputs byte-identical on re-run**, manifest hashes verified.
-* Script rerun determinism: `ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1.json` = `0d2e19b4…e6d05f` before/after re-run (identical).
+* `tests/test_me_reverse_long_v3_final_statistical_evaluation_v1.py` — **15 passed**: join cardinality 1:1, maturity split 136/1, zero missingness on FINALIZED, no pre-freeze contamination, classification = frozen threshold, integrity audit CLEAN, all operator values MATCH, CONTROL = aggregate unfiltered baseline (contains both groups), fixed-seed intervals byte-stable, **manifest verified before any regeneration (strictly read-only)**, regeneration into a temporary directory byte-identical to committed artifacts, and **negative regression tests**: tampering the frozen extraction SQL or the cohort snapshot under an unchanged manifest is detected as FAIL, reproducing the original P2 defect (in-place regeneration re-hashed drifted inputs and masked them) and confirming the fix.
+* **Integrity order (Codex P2 fix, PR #188):** (1) verify the committed SHA-256 manifest against the files on disk — `python tools/research/me_reverse_long_v3_final_statistical_evaluation_v1.py --verify` is strictly read-only and never rewrites the manifest; (2) only then regenerate artifacts, and only into a separate directory (`--out DIR`), so verification can never be satisfied by freshly generated hashes.
+* Script rerun determinism: `ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1.json` = `42e5697b…e6471a79` before/after re-run (identical); N, Net E[R], PF, CIs and the final research verdict are unchanged by the manifest fix (research results are byte-identical).
 * Commands:
   * extraction (VPS, READ-ONLY): `sudo -u postgres psql -d trad_bot -P pager=off -f 01_extract_frozen_cohort.sql` (and `02_…`, `03_…`)
-  * analysis: `python tools/research/me_reverse_long_v3_final_statistical_evaluation_v1.py`
+  * verify committed evidence (read-only): `python tools/research/me_reverse_long_v3_final_statistical_evaluation_v1.py --verify`
+  * analysis: `python tools/research/me_reverse_long_v3_final_statistical_evaluation_v1.py` (generation; `--out DIR` to write elsewhere)
   * tests: `python -m pytest tests/test_me_reverse_long_v3_final_statistical_evaluation_v1.py -q`
 
 ## 8. Artifacts

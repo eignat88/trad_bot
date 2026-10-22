@@ -61,6 +61,38 @@ BASENAME = "ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1"
 COHORT_CSV = SNAPSHOT_DIR / "04_cohort_full.csv"
 EXPERIMENT_CSV = SNAPSHOT_DIR / "02_prospective_experiment_all.csv"
 
+# Logical (repository-relative) names used in the manifest, independent of the
+# physical directory the artifacts are generated into.  This lets a rerun into
+# a temporary directory produce a manifest that is directly comparable with the
+# committed one.
+LOGICAL_SNAPSHOT_PREFIX = (
+    "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/"
+    "extract/me_v3_eval_20261022/"
+)
+LOGICAL_EXTRACT_PREFIX = (
+    "audit_db/me_reverse_long_v3_final_statistical_evaluation_v1_20261022/extract/"
+)
+LOGICAL_OUTPUT_PREFIX = "docs/research/"
+LOGICAL_SCRIPT = "tools/research/me_reverse_long_v3_final_statistical_evaluation_v1.py"
+LOGICAL_REPORT_MD = LOGICAL_OUTPUT_PREFIX + f"{BASENAME}.md"
+LOCAL_ONLY_NAMES = {
+    "06_prospective_outcome_all.csv",
+    "07_completed_events.csv",
+}
+OUTPUT_NAMES = [
+    f"{BASENAME}.json",
+    f"{BASENAME}.csv",
+    f"{BASENAME}_by_day.csv",
+    f"{BASENAME}_by_symbol.csv",
+    f"{BASENAME}_by_regime.csv",
+    f"{BASENAME}_robustness.csv",
+]
+EXTRACT_SQL_NAMES = [
+    "01_extract_frozen_cohort.sql",
+    "02_extract_supplemental.sql",
+    "03_extract_constraints.sql",
+]
+
 # ---------------------------------------------------------------------------
 # Frozen protocol constants (app/research/me_reverse_long_v3/protocol.py @
 # origin/main 5a3d29c; identical on production HEAD 362c217)
@@ -337,8 +369,9 @@ def cluster_robust_se(rows: list[dict], key: str, field: str = "net_r_normal") -
 # ---------------------------------------------------------------------------
 # Load + derive
 # ---------------------------------------------------------------------------
-def load_rows() -> list[dict]:
-    with COHORT_CSV.open(newline="", encoding="utf-8") as fh:
+def load_rows(snapshot_dir: Path | None = None) -> list[dict]:
+    snapshot_dir = Path(snapshot_dir) if snapshot_dir else SNAPSHOT_DIR
+    with (snapshot_dir / "04_cohort_full.csv").open(newline="", encoding="utf-8") as fh:
         raw = list(csv.DictReader(fh))
     rows = []
     for rec in raw:
@@ -1167,8 +1200,8 @@ SNAPSHOT_FIELDS = [
 ]
 
 
-def write_snapshot_csv(rows: list[dict]) -> Path:
-    path = OUT_DIR / f"{BASENAME}.csv"
+def write_snapshot_csv(rows: list[dict], out_dir: Path) -> Path:
+    path = Path(out_dir) / f"{BASENAME}.csv"
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=SNAPSHOT_FIELDS, lineterminator="\n")
         writer.writeheader()
@@ -1208,10 +1241,166 @@ def sha256_file(path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Manifest: generation and verification
+#
+# Integrity order is mandatory:
+#   1. verify the COMMITTED manifest against the files on disk
+#      (verify_manifest() is strictly read-only);
+#   2. only then may artifacts be re-generated, and always into a separate
+#      directory (temporary for tests) that never overwrites the committed
+#      manifest.
+# ---------------------------------------------------------------------------
+def manifest_entries(
+    out_dir: Path, snapshot_dir: Path
+) -> tuple[list[tuple[str, Path]], list[tuple[str, Path]]]:
+    """Return (required, local_only) (logical_name, actual_path) pairs."""
+    out_dir = Path(out_dir)
+    snapshot_dir = Path(snapshot_dir)
+    extract_dir = snapshot_dir.parent
+
+    required: list[tuple[str, Path]] = []
+    local_only: list[tuple[str, Path]] = []
+    for p in sorted(snapshot_dir.glob("*.csv")):
+        target = local_only if p.name in LOCAL_ONLY_NAMES else required
+        target.append((LOGICAL_SNAPSHOT_PREFIX + p.name, p))
+    tarball = extract_dir / "me_v3_eval_20261022.tgz"
+    if tarball.exists():
+        local_only.append((LOGICAL_EXTRACT_PREFIX + tarball.name, tarball))
+
+    for name in EXTRACT_SQL_NAMES:
+        required.append((LOGICAL_EXTRACT_PREFIX + name, extract_dir / name))
+    required.append((LOGICAL_SCRIPT, Path(__file__).resolve()))
+    for name in OUTPUT_NAMES:
+        required.append((LOGICAL_OUTPUT_PREFIX + name, out_dir / name))
+
+    md_path = OUT_DIR / f"{BASENAME}.md"
+    if md_path.exists():
+        required.append((LOGICAL_REPORT_MD, md_path))
+    return required, local_only
+
+
+def build_manifest(out_dir: Path, snapshot_dir: Path) -> dict:
+    """Build the manifest object from freshly generated artifacts."""
+    required, local_only = manifest_entries(out_dir, snapshot_dir)
+    canonical_payload = {
+        "entry_rule": "NEXT_OPEN_5M: opening price of the first strictly later 5m execution candle",
+        "experiment_id": EXPERIMENT_ID,
+        "fee_assumption": "taker 0.055%/side; normal slippage 0.05%/side; elevated 0.10%/side",
+        "freeze_ts": FREEZE_TS.isoformat().replace("+00:00", "Z"),
+        "max_hold_minutes": MAX_HOLD_MINUTES,
+        "minimum_n": MINIMUM_N,
+        "minimum_symbols": MINIMUM_SYMBOLS,
+        "primary_metric": "net_r_normal",
+        "source_scanner": SOURCE_SCANNER,
+        "direction": "LONG",
+        "stop_rule": "2.5% below reference entry",
+        "target_rule": "3.0% above reference entry",
+        "threshold": FROZEN_THRESHOLD,
+        "version": 1,
+    }
+    payload_bytes = json.dumps(
+        canonical_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return {
+        "artifact_set": BASENAME,
+        "generated_from_snapshot_as_of_utc": "2026-10-22T17:11:24Z",
+        "git": {
+            "origin_main": "224f1d038751e8e8a2dfba6705964c1aff6966fa",
+            "origin_main_verified_snapshot": "5a3d29c800d54988bad6d7cbeca7b1322890c679",
+            "production_vps_head": "362c217b90e5e72006f8f10006f201cd8fb5c4db",
+            "v3_files_identical_between_heads": True,
+            "note": (
+                "git diff of app/research/me_reverse_long_v3/**, "
+                "prospective_observer.py, prospective_registry.json, migration "
+                "067 and the V3 tests is empty between production HEAD 362c217 "
+                "and both origin/main snapshots 5a3d29c and 224f1d0."
+            ),
+        },
+        "protocol_fingerprint": {
+            "status": "DERIVED_NOT_STORED",
+            "derived_sha256": hashlib.sha256(payload_bytes).hexdigest(),
+            "canonical_payload": canonical_payload,
+            "note": (
+                "MOMENTUM_EXHAUSTION_REVERSE_LONG_V3_OOS has NO stored "
+                "protocol_fingerprint column (unlike ME_R_LONG_EARLY_MAE_EXIT_OOS_V2); "
+                "the fingerprint above is derived in this evaluation from the "
+                "canonical frozen payload and is NOT a frozen production value."
+            ),
+        },
+        "files": {rel: sha256_file(path) for rel, path in sorted(required)},
+        "local_only_files": {
+            "note": (
+                "Full-table raw extracts kept locally for evidence only; NOT "
+                "committed to git to avoid repository bloat. Reproduction needs "
+                "only the committed extraction SQL plus the committed cohort "
+                "snapshot. Hashes are recorded for immutability."
+            ),
+            "files": {rel: sha256_file(path) for rel, path in sorted(local_only)},
+        },
+    }
+
+
+def verify_manifest(
+    manifest_path: Path | None = None,
+    root: Path | None = None,
+) -> dict:
+    """Verify a manifest against the files on disk. STRICTLY READ-ONLY.
+
+    This function never writes and never regenerates anything: it only reads
+    the manifest and hashes the referenced files.  ``root`` is the directory
+    the manifest's logical names are resolved against (the repository root for
+    the committed evidence; a temporary copy root in negative tests).
+    """
+    manifest_path = Path(manifest_path) if manifest_path else OUT_DIR / f"{BASENAME}_manifest.json"
+    root = Path(root) if root else REPO_ROOT
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    report = {
+        "manifest": manifest_path.name,
+        "root": str(root),
+        "ok": True,
+        "checked_required": 0,
+        "matched_required": 0,
+        "mismatched": [],
+        "missing_required": [],
+        "absent_local_only": [],
+        "mismatched_local_only": [],
+    }
+    for rel, digest in sorted(manifest.get("files", {}).items()):
+        report["checked_required"] += 1
+        path = root / rel
+        if not path.exists():
+            report["missing_required"].append(rel)
+        elif sha256_file(path) != digest:
+            report["mismatched"].append(rel)
+        else:
+            report["matched_required"] += 1
+    for rel, digest in sorted(manifest.get("local_only_files", {}).get("files", {}).items()):
+        path = root / rel
+        if not path.exists():
+            report["absent_local_only"].append(rel)
+        elif sha256_file(path) != digest:
+            report["mismatched_local_only"].append(rel)
+
+    report["ok"] = not report["mismatched"] and not report["missing_required"]
+    return report
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main() -> dict:
-    rows = load_rows()
+def main(out_dir: Path | None = None, snapshot_dir: Path | None = None) -> dict:
+    """Generate artifacts.
+
+    Generation is a WRITE operation and is strictly separated from
+    verification: callers that must not touch committed evidence pass a
+    separate ``out_dir`` (tests use a temporary directory).  Nothing outside
+    ``out_dir`` is written.
+    """
+    out_dir = Path(out_dir) if out_dir else OUT_DIR
+    snapshot_dir = Path(snapshot_dir) if snapshot_dir else SNAPSHOT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = load_rows(snapshot_dir)
     integrity = integrity_audit(rows)
     stats = group_stats(rows)
     reconciliation = reconcile_operator(stats)
@@ -1223,13 +1412,13 @@ def main() -> dict:
     unc = uncertainty(rows)
     rob = robustness(rows)
 
-    snapshot_csv = write_snapshot_csv(rows)
-    by_day_csv = write_table_csv(OUT_DIR / f"{BASENAME}_by_day.csv", by_day)
-    by_symbol_csv = write_table_csv(OUT_DIR / f"{BASENAME}_by_symbol.csv", by_symbol)
-    by_regime_csv = write_table_csv(OUT_DIR / f"{BASENAME}_by_regime.csv", by_regime)
-    rob_csv = write_table_csv(OUT_DIR / f"{BASENAME}_robustness.csv", rob)
+    snapshot_csv = write_snapshot_csv(rows, out_dir)
+    by_day_csv = write_table_csv(out_dir / f"{BASENAME}_by_day.csv", by_day)
+    by_symbol_csv = write_table_csv(out_dir / f"{BASENAME}_by_symbol.csv", by_symbol)
+    by_regime_csv = write_table_csv(out_dir / f"{BASENAME}_by_regime.csv", by_regime)
+    rob_csv = write_table_csv(out_dir / f"{BASENAME}_robustness.csv", rob)
 
-    with EXPERIMENT_CSV.open(newline="", encoding="utf-8") as fh:
+    with (snapshot_dir / "02_prospective_experiment_all.csv").open(newline="", encoding="utf-8") as fh:
         exp_rows = [r for r in csv.DictReader(fh) if r["experiment_id"] == EXPERIMENT_ID]
     exp_row = json.loads(exp_rows[0]["row_json"]) if exp_rows else {}
 
@@ -1359,97 +1548,13 @@ def main() -> dict:
         ],
     }
 
-    json_path = OUT_DIR / f"{BASENAME}.json"
+    json_path = out_dir / f"{BASENAME}.json"
     with json_path.open("w", encoding="utf-8", newline="\n") as fh:
         json.dump(results, fh, indent=2, sort_keys=True, ensure_ascii=False)
         fh.write("\n")
 
-    canonical_payload = {
-        "entry_rule": "NEXT_OPEN_5M: opening price of the first strictly later 5m execution candle",
-        "experiment_id": EXPERIMENT_ID,
-        "fee_assumption": "taker 0.055%/side; normal slippage 0.05%/side; elevated 0.10%/side",
-        "freeze_ts": FREEZE_TS.isoformat().replace("+00:00", "Z"),
-        "max_hold_minutes": MAX_HOLD_MINUTES,
-        "minimum_n": MINIMUM_N,
-        "minimum_symbols": MINIMUM_SYMBOLS,
-        "primary_metric": "net_r_normal",
-        "source_scanner": SOURCE_SCANNER,
-        "direction": "LONG",
-        "stop_rule": "2.5% below reference entry",
-        "target_rule": "3.0% above reference entry",
-        "threshold": FROZEN_THRESHOLD,
-        "version": 1,
-    }
-    payload_bytes = json.dumps(
-        canonical_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
-    manifest = {
-        "artifact_set": BASENAME,
-        "generated_from_snapshot_as_of_utc": "2026-10-22T17:11:24Z",
-        "git": {
-            "origin_main": "224f1d038751e8e8a2dfba6705964c1aff6966fa",
-            "origin_main_verified_snapshot": "5a3d29c800d54988bad6d7cbeca7b1322890c679",
-            "production_vps_head": "362c217b90e5e72006f8f10006f201cd8fb5c4db",
-            "v3_files_identical_between_heads": True,
-            "note": (
-                "git diff of app/research/me_reverse_long_v3/**, "
-                "prospective_observer.py, prospective_registry.json, migration "
-                "067 and the V3 tests is empty between production HEAD 362c217 "
-                "and both origin/main snapshots 5a3d29c and 224f1d0."
-            ),
-        },
-        "protocol_fingerprint": {
-            "status": "DERIVED_NOT_STORED",
-            "derived_sha256": hashlib.sha256(payload_bytes).hexdigest(),
-            "canonical_payload": canonical_payload,
-            "note": (
-                "MOMENTUM_EXHAUSTION_REVERSE_LONG_V3_OOS has NO stored "
-                "protocol_fingerprint column (unlike ME_R_LONG_EARLY_MAE_EXIT_OOS_V2); "
-                "the fingerprint above is derived in this evaluation from the "
-                "canonical frozen payload and is NOT a frozen production value."
-            ),
-        },
-        "files": {},
-    }
-    local_only_names = {
-        "06_prospective_outcome_all.csv",
-        "07_completed_events.csv",
-    }
-    tracked = [p for p in sorted(SNAPSHOT_DIR.glob("*.csv")) if p.name not in local_only_names]
-    local_only = [p for p in sorted(SNAPSHOT_DIR.glob("*.csv")) if p.name in local_only_names]
-    tarball = SNAPSHOT_DIR.parent / "me_v3_eval_20261022.tgz"
-    if tarball.exists():
-        local_only.append(tarball)
-    tracked += [
-        Path(__file__).resolve(),
-        SNAPSHOT_DIR.parent / "01_extract_frozen_cohort.sql",
-        SNAPSHOT_DIR.parent / "02_extract_supplemental.sql",
-        SNAPSHOT_DIR.parent / "03_extract_constraints.sql",
-        json_path,
-        snapshot_csv,
-        by_day_csv,
-        by_symbol_csv,
-        by_regime_csv,
-        rob_csv,
-    ]
-    md_path = OUT_DIR / f"{BASENAME}.md"
-    if md_path.exists():
-        tracked.append(md_path)
-    for p in tracked:
-        manifest["files"][str(p.relative_to(REPO_ROOT)).replace("\\", "/")] = sha256_file(p)
-    manifest["local_only_files"] = {
-        "note": (
-            "Full-table raw extracts kept locally for evidence only; NOT "
-            "committed to git to avoid repository bloat. Reproduction needs "
-            "only the committed extraction SQL plus the committed cohort "
-            "snapshot. Hashes are recorded for immutability."
-        ),
-        "files": {
-            str(p.relative_to(REPO_ROOT)).replace("\\", "/"): sha256_file(p)
-            for p in local_only
-        },
-    }
-    manifest_path = OUT_DIR / f"{BASENAME}_manifest.json"
+    manifest = build_manifest(out_dir, snapshot_dir)
+    manifest_path = out_dir / f"{BASENAME}_manifest.json"
     with manifest_path.open("w", encoding="utf-8", newline="\n") as fh:
         json.dump(manifest, fh, indent=2, sort_keys=True, ensure_ascii=False)
         fh.write("\n")
@@ -1458,7 +1563,40 @@ def main() -> dict:
 
 
 if __name__ == "__main__":
-    res = main()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "ME_REVERSE_LONG_V3_FINAL_STATISTICAL_EVALUATION_V1: "
+            "verify the committed manifest (read-only) or regenerate artifacts."
+        )
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help=(
+            "verify the committed manifest against files on disk and exit; "
+            "strictly read-only, never regenerates or rewrites anything"
+        ),
+    )
+    parser.add_argument("--manifest", default=None, help="manifest path to verify")
+    parser.add_argument("--root", default=None, help="root directory logical names resolve against")
+    parser.add_argument("--out", default=None, help="output directory for regeneration (default: docs/research)")
+    parser.add_argument("--snapshot-dir", default=None, help="extraction snapshot directory (default: committed snapshot)")
+    args = parser.parse_args()
+
+    if args.verify:
+        report = verify_manifest(
+            Path(args.manifest) if args.manifest else None,
+            Path(args.root) if args.root else None,
+        )
+        print(json.dumps(report, indent=2, sort_keys=True))
+        raise SystemExit(0 if report["ok"] else 1)
+
+    res = main(
+        out_dir=Path(args.out) if args.out else None,
+        snapshot_dir=Path(args.snapshot_dir) if args.snapshot_dir else None,
+    )
     print(json.dumps({
         "integrity_verdict": res["integrity"]["integrity_verdict"],
         "checks_failed": res["integrity"]["checks_failed"],
