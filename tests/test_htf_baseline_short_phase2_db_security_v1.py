@@ -223,7 +223,14 @@ def apply_075(conn) -> None:
 
 
 class _RedactedSecret(str):
-    """String whose str/repr never reveal the value (traceback/log safety)."""
+    """String whose str/repr never reveal the value (traceback/log safety).
+
+    NOTE: psycopg2's connection-info builder converts non-exact ``str``
+    values through ``str()``, so passing this object directly to
+    ``psycopg2.connect(password=...)`` sends ``<redacted>`` and breaks
+    SCRAM authentication. Always cross driver boundaries with ``reveal()``
+    (a plain ``str`` carrying the real value; drivers never log it).
+    """
 
     __slots__ = ()
 
@@ -233,24 +240,61 @@ class _RedactedSecret(str):
     def __str__(self) -> str:
         return "<redacted>"
 
+    def reveal(self) -> str:
+        """Plain ``str`` with the real value — for driver boundaries only."""
+        return self + ""
+
 
 def _new_test_credential() -> str:
     """A REAL random password for the test observer role (never logged)."""
     return _RedactedSecret(secrets.token_urlsafe(32))
 
 
+def _scram_verifier_matches(verifier: str, password: str) -> bool:
+    """Check a pg_authid SCRAM-SHA-256 verifier against a password (RFC 5802).
+
+    Verifies that the password actually stored on the role equals the test
+    credential, without ever printing either value. SASLprep is identity for
+    the ASCII random credentials used here.
+    """
+    try:
+        import base64
+        import hashlib
+        import hmac
+
+        scheme, iter_salt, stored_server = verifier.split("$")
+        if scheme != "SCRAM-SHA-256":
+            return False
+        iterations_s, salt_b64 = iter_salt.split(":")
+        stored_b64, server_b64 = stored_server.split(":")
+        salt = base64.b64decode(salt_b64)
+        salted = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, int(iterations_s)
+        )
+        client_key = hmac.new(salted, b"Client Key", hashlib.sha256).digest()
+        stored_key = hashlib.sha256(client_key).digest()
+        server_key = hmac.new(salted, b"Server Key", hashlib.sha256).digest()
+        return (
+            base64.b64encode(stored_key).decode() == stored_b64
+            and base64.b64encode(server_key).decode() == server_b64
+        )
+    except Exception:
+        return False
+
+
 def _install_observer_login(admin, password: str) -> None:
     """Set a real password on the TEST cluster's observer role.
 
     Test-cluster only (P2_TEST_DB_* fail-closed guard); production role
-    passwords are never touched. The value is quoted via psycopg2.sql.Literal
-    and never echoed. Works for trust (ignored), md5 and SCRAM-SHA-256
-    servers, so the integration tests are real under every allowed config.
+    passwords are never touched. The plain value (``reveal()``) is quoted via
+    psycopg2.sql.Literal and never echoed. Works for trust (ignored), md5 and
+    SCRAM-SHA-256 servers, so the integration tests are real under every
+    allowed config.
     """
     with admin.cursor() as cur:
         cur.execute(
             pgsql.SQL("ALTER ROLE {} PASSWORD {}").format(
-                pgsql.Identifier(OBSERVER_ROLE), pgsql.Literal(password)
+                pgsql.Identifier(OBSERVER_ROLE), pgsql.Literal(password.reveal())
             )
         )
 
@@ -750,6 +794,60 @@ def test_warmup_and_prefreeze_rejected_for_observer(db):
         cur.execute("RESET ROLE")
 
 
+def test_psycopg2_password_adaptation_preserves_real_secret():
+    """Regression: the real password must reach psycopg2; masking kept.
+
+    Hypothesis confirmation (VPS SCRAM failure): psycopg2's connection-info
+    builder converts the _RedactedSecret subclass through ``str()``, so the
+    driver would send '<redacted>' and SCRAM auth would fail. The driver
+    boundary must receive a plain ``str`` with the real value (``reveal()``),
+    while str/repr of the secret container stay redacted. No secret is ever
+    placed in an assertion expression (only precomputed booleans).
+    """
+    secret = _new_test_credential()
+    real = secret.reveal()
+    # masking preserved wherever the secret could be displayed
+    assert str(secret) == "<redacted>"
+    assert repr(secret) == "<redacted>"
+    assert str(secret) != real
+    # hypothesis: psycopg2 stringifies the subclass -> wrong password in DSN
+    dsn_bad = psycopg2.extensions.make_dsn(password=secret)
+    hypothesis_confirmed = ("<redacted>" in dsn_bad) and (real not in dsn_bad)
+    assert hypothesis_confirmed is True
+    # fix contract: the plain-str boundary carries the real value
+    assert type(real) is str
+    dsn_good = psycopg2.extensions.make_dsn(password=real)
+    real_reached = (real in dsn_good) and ("<redacted>" not in dsn_good)
+    assert real_reached is True
+
+
+def test_observer_password_verifier_matches_credential(db):
+    """Regression: ALTER ROLE must store the REAL password (SCRAM verifier).
+
+    Reads pg_authid (superuser test admin on the isolated test cluster) and
+    checks the stored SCRAM-SHA-256 verifier against the credential via
+    RFC 5802 math — proof that the password survives adaptation on the SQL
+    side as well. Neither the verifier nor the password is ever printed.
+    """
+    apply_075(db)
+    password = _new_test_credential()
+    admin = _admin_connect()
+    try:
+        _install_observer_login(admin, password)
+        with admin.cursor() as cur:
+            cur.execute(
+                "SELECT rolpassword FROM pg_authid WHERE rolname = %s",
+                (OBSERVER_ROLE,),
+            )
+            row = cur.fetchone()
+    finally:
+        admin.close()
+    assert row is not None
+    (verifier,) = row
+    matched = _scram_verifier_matches(verifier, password.reveal())
+    assert matched is True
+
+
 def test_concurrent_observer_inserts_single_row(db):
     apply_075(db)
     _activate(db)
@@ -760,6 +858,7 @@ def test_concurrent_observer_inserts_single_row(db):
         _install_observer_login(admin, password)
     finally:
         admin.close()
+    plain_password = password.reveal()  # plain str for the driver boundary
     dbname = db.get_dsn_parameters()["dbname"]
     errors: list[str] = []
     results: list[object] = []
@@ -769,7 +868,7 @@ def test_concurrent_observer_inserts_single_row(db):
         try:
             conn = psycopg2.connect(
                 host=DB_HOST, port=DB_PORT, database=dbname,
-                user=OBSERVER_ROLE, password=password, connect_timeout=5,
+                user=OBSERVER_ROLE, password=plain_password, connect_timeout=5,
             )
             row = insert_observation_raw(conn, experiment_id=EXP, **_event_kwargs())
             conn.commit()
@@ -778,7 +877,7 @@ def test_concurrent_observer_inserts_single_row(db):
                 results.append(row)
         except Exception as exc:  # pragma: no cover
             with lock:
-                errors.append(str(exc).replace(password, "<redacted>"))
+                errors.append(str(exc).replace(plain_password, "<redacted>"))
 
     threads = [threading.Thread(target=worker) for _ in range(4)]
     for t in threads:
@@ -836,7 +935,7 @@ def test_pg8000_scram_capable_driver_path_as_observer(db, tmp_path, monkeypatch)
     pw_file = tmp_path / "observer.pw"
     fd = os.open(str(pw_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(password + "\n")
+        fh.write(password.reveal() + "\n")
     monkeypatch.setenv("HTF_P2_DB_HOST", DB_HOST)
     monkeypatch.setenv("HTF_P2_DB_PORT", str(DB_PORT))
     monkeypatch.setenv("HTF_P2_DB_USER", OBSERVER_ROLE)
