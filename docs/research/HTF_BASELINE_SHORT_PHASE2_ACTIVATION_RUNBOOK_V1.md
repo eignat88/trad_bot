@@ -135,7 +135,10 @@ Freeze timestamp selection rules (enforced, not advisory):
      --out /opt/trad_bot/etc/htf_phase2_freeze_record.json
    ```
 
-   Record the printed `record_sha256` + canonical JSON in the change log.
+   Record the printed `record_sha256` + canonical JSON in the change log
+   (independent verification recipe and its limits — tamper evidence only,
+   NOT a signature — in
+   `HTF_BASELINE_SHORT_PHASE2_ISSUE197_FROZEN_TIMESTAMP_AUTHORITY_V1.md` §4.2).
    `mint` refuses on pinned-fingerprint drift, non-canonical timestamps,
    out-of-window values and legacy boundary timestamps.
 3. **Claim** (same GO, immediately after) — this is the ONE sanctioned
@@ -152,6 +155,12 @@ Freeze timestamp selection rules (enforced, not advisory):
    Expected terminal line: `THREE_AUTHORITY_AGREEMENT=OK`. On any `REFUSED` /
    `PARTIAL ACTIVATION` output: STOP — never mint a new timestamp; follow the
    recovery matrix in `HTF_BASELINE_SHORT_PHASE2_ISSUE197_FROZEN_TIMESTAMP_AUTHORITY_V1.md` §4.1.
+   If the database commit succeeded but the activation JSON is missing, the
+   recovery is `claim --repair-activation-json` with the SAME record — this
+   **delayed repair** also works after the acceptance window has expired
+   (PR #200 FIX-1): it requires the unchanged DB record and its matching
+   immutable `freeze_registry` row, performs no activation and fails closed
+   before any write on the slightest mismatch.
 4. Read-only confirmation (`... verify --record ... --activation ...`) plus the
    §4 SQL checks; keep the output in the change log.
 5. **Issue #198 only — observe-only startup** (a separate

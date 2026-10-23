@@ -20,6 +20,7 @@ P2_TEST_DB_PORT (default 5432), P2_TEST_DB_USER (default postgres).
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -583,3 +584,144 @@ def test_startup_gate_refuses_any_authority_drift_after_claim(tool_db, tmp_path)
     # and the happy path still holds
     boundary = require_runnable(tool_db, config, activation=good, freeze_record=record)
     assert boundary.protocol_fingerprint == FP
+
+
+# ============================================ FIX-1: delayed repair after window
+def _claim_late(record_path: Path, activation_path: Path, monkeypatch, hours: float = 2.0):
+    """Run claim as if ``hours`` have elapsed since mint (P1: delayed repair)."""
+    real_db_now = tool._db_now
+    monkeypatch.setattr(
+        tool,
+        "_db_now",
+        lambda conn: real_db_now(conn) + timedelta(hours=hours),
+    )
+    return _claim(record_path, activation_path, repair_activation_json=True)
+
+
+def test_delayed_repair_after_window_end_to_end(tool_db, tmp_path, monkeypatch):
+    record_path = tmp_path / "freeze_record.json"
+    activation_path = tmp_path / "activation.json"
+    assert _mint(record_path) == tool.EXIT_OK
+    assert _claim(record_path, activation_path) == tool.EXIT_OK
+    activation_path.unlink()  # interrupted second half -> activation JSON missing
+
+    # the acceptance window has long expired; the committed claim stands
+    assert _claim_late(record_path, activation_path, monkeypatch, hours=2) == tool.EXIT_OK
+    assert activation_path.exists()
+    record = load_freeze_record(record_path)
+    activation = json.loads(activation_path.read_text(encoding="utf-8"))
+    assert activation["freeze_ts"] == record["freeze_ts"]
+    assert activation["protocol_fingerprint"] == record["protocol_fingerprint"]
+
+    from app.research.htf_baseline_short_phase2_observer_runner_v1 import (
+        RunnerConfig,
+        require_runnable,
+    )
+
+    config = RunnerConfig(protocol_fingerprint=FP)
+    boundary = require_runnable(
+        tool_db,
+        config,
+        activation=activation,
+        freeze_record=record,
+        require_pinned_fingerprint=True,
+    )
+    assert boundary.freeze_ts_ms == parse_ts_ms(record["freeze_ts"])
+
+
+def test_delayed_repair_refuses_mismatched_record(tool_db, tmp_path, monkeypatch):
+    record_path = tmp_path / "freeze_record.json"
+    activation_path = tmp_path / "activation.json"
+    assert _mint(record_path) == tool.EXIT_OK
+    assert _claim(record_path, activation_path) == tool.EXIT_OK
+    first = load_freeze_record(record_path)
+
+    second_path = tmp_path / "freeze_record_2.json"
+    assert _mint(second_path) == tool.EXIT_OK  # a different, newer boundary
+    activation_path.unlink()
+    assert (
+        _claim_late(second_path, activation_path, monkeypatch, hours=2)
+        == tool.EXIT_REFUSED
+    )
+    assert not activation_path.exists()
+    tool_db.rollback()
+
+    # the database boundary is unchanged
+    with tool_db.cursor() as cur:
+        cur.execute(
+            "SELECT freeze_ts, protocol_fingerprint FROM "
+            "research.htf_baseline_short_phase2_experiment WHERE experiment_id = %s",
+            (EXPERIMENT_ID,),
+        )
+        freeze_ts, fingerprint = cur.fetchone()
+    assert parse_ts_ms(freeze_ts) == parse_ts_ms(first["freeze_ts"])
+    assert fingerprint == FP
+
+
+def test_delayed_repair_refuses_tampered_record(tool_db, tmp_path, monkeypatch):
+    record_path = tmp_path / "freeze_record.json"
+    activation_path = tmp_path / "activation.json"
+    assert _mint(record_path) == tool.EXIT_OK
+    assert _claim(record_path, activation_path) == tool.EXIT_OK
+    activation_path.unlink()
+
+    record = load_freeze_record(record_path)
+    record["issued_by"] = "someone-else"  # tamper WITHOUT re-sealing
+    record_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    assert (
+        _claim_late(record_path, activation_path, monkeypatch, hours=2)
+        == tool.EXIT_REFUSED
+    )
+    assert not activation_path.exists()
+
+
+def test_delayed_repair_refuses_without_registry_evidence(tool_db, tmp_path, monkeypatch):
+    record_path = tmp_path / "freeze_record.json"
+    activation_path = tmp_path / "activation.json"
+    assert _mint(record_path) == tool.EXIT_OK
+    assert _claim(record_path, activation_path) == tool.EXIT_OK
+    activation_path.unlink()
+
+    # the registry itself is immutable (this is what makes it trustworthy
+    # evidence in the first place): rows can never be deleted or rewritten
+    with pytest.raises(Exception) as excinfo:
+        with tool_db.cursor() as cur:
+            cur.execute("DELETE FROM research.htf_baseline_short_phase2_freeze_registry")
+    assert "P2_FREEZE_REGISTRY_IS_IMMUTABLE" in str(excinfo.value)
+    tool_db.rollback()
+
+    # ... and if the evidence is nevertheless unreadable/absent at claim time,
+    # the repair fails closed before any activation JSON is written
+    monkeypatch.setattr(tool, "_registry_row", lambda conn, freeze_ts: None)
+    assert (
+        _claim_late(record_path, activation_path, monkeypatch, hours=2)
+        == tool.EXIT_REFUSED
+    )
+    assert not activation_path.exists()
+
+
+def test_reactivation_with_new_timestamp_never_happens(tool_db, tmp_path):
+    record_path = tmp_path / "freeze_record.json"
+    activation_path = tmp_path / "activation.json"
+    assert _mint(record_path) == tool.EXIT_OK
+    assert _claim(record_path, activation_path) == tool.EXIT_OK
+    first = load_freeze_record(record_path)
+
+    second_path = tmp_path / "freeze_record_2.json"
+    assert _mint(second_path) == tool.EXIT_OK
+    assert _claim(second_path, tmp_path / "activation_2.json") == tool.EXIT_REFUSED
+    assert not (tmp_path / "activation_2.json").exists()
+    tool_db.rollback()
+
+    with tool_db.cursor() as cur:
+        cur.execute("SELECT count(*) FROM research.htf_baseline_short_phase2_freeze_registry")
+        (registry_n,) = cur.fetchone()
+        cur.execute(
+            "SELECT freeze_ts FROM research.htf_baseline_short_phase2_experiment "
+            "WHERE experiment_id = %s",
+            (EXPERIMENT_ID,),
+        )
+        (freeze_ts,) = cur.fetchone()
+    assert registry_n == 1
+    assert parse_ts_ms(freeze_ts) == parse_ts_ms(first["freeze_ts"])

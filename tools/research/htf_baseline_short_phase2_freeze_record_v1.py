@@ -13,14 +13,27 @@ mint   (operator GO)  Create the immutable, self-hashed FREEZE RECORD that
                       claimed_at, approval ref). Validates the timestamp
                       against the PostgreSQL acceptance window using the DB
                       server clock. Writes NOTHING to the database.
-claim  (operator GO)  Atomically claim the timestamp in PostgreSQL via
-                      research.htf_baseline_short_phase2_activate() (the ONLY
-                      sanctioned activation entry point), then write the
-                      private runtime activation JSON and verify exact
-                      agreement of all three freeze authorities. Refuses to
-                      overwrite an existing activation JSON unless
-                      --repair-activation-json is given for the documented
-                      interrupted-activation recovery.
+claim  (operator GO)  Two explicit paths (FIX-1):
+                      * INITIAL ACTIVATION — the database is still PENDING:
+                        validates the record against the PostgreSQL acceptance
+                        window ``now()-60s .. now()+5min`` (tool side AND
+                        inside the function), claims the timestamp via
+                        research.htf_baseline_short_phase2_activate() (the ONLY
+                        sanctioned activation entry point), then writes the
+                        private runtime activation JSON and verifies exact
+                        agreement of all three freeze authorities.
+                      * DELAYED REPAIR ``--repair-activation-json`` — the
+                        database ALREADY carries a committed claim: re-derives
+                        the activation JSON from a freeze record that matches
+                        the unchanged DB record and its immutable
+                        freeze_registry evidence EXACTLY (experiment id,
+                        freeze timestamp, protocol fingerprint). The freshness
+                        window is not re-applied (the original claim passed it
+                        transactionally); no activation is performed and a NEW
+                        timestamp can never be introduced. Any mismatch fails
+                        closed BEFORE the activation JSON is written.
+                      Without --repair-activation-json an existing activation
+                      JSON is never overwritten.
 verify (read-only)    Re-check the three authorities end to end.
 
 Hard rules (any violation aborts with a non-zero exit and STOP guidance):
@@ -134,18 +147,56 @@ def _load_state(conn, experiment_id: str):
 
 
 def _atomic_write_json(path: str | Path, payload: dict, *, overwrite: bool) -> None:
+    """Atomic, symlink-safe JSON write with explicit permissions (FIX-2).
+
+    Security properties:
+      * never writes through a symlink — the target and its parent directory
+        must not be symlinks (prevents swapping a link into place of an
+        artifact);
+      * never clobbers an existing file unless ``overwrite=True`` — that flag
+        is used ONLY for the activation-JSON repair path; the immutable freeze
+        record is always written with ``overwrite=False`` and can therefore
+        never be replaced;
+      * the temp file is created with ``O_EXCL`` so a pre-existing or
+        symlinked temp file is refused instead of clobbered;
+      * the temp file is fsynced before the atomic ``os.replace`` and carries
+        mode 0600 on POSIX.
+    """
     target = Path(str(path))
+    if target.is_symlink():
+        raise ToolRefused(f"{target} is a symlink; refusing to write through it")
+    if target.parent.is_symlink():
+        raise ToolRefused(f"{target.parent} is a symlink; refusing to write into it")
+    if not target.parent.is_dir():
+        raise ToolRefused(f"{target.parent} is not a directory; refusing to write")
     if target.exists() and not overwrite:
         raise ToolRefused(
             f"{target} already exists; refusing to overwrite an activation "
             "artifact (use --repair-activation-json only for the documented "
             "interrupted-activation recovery)"
         )
-    tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp = target.with_name(f".{target.name}.tmp.{os.getpid()}")
+    if tmp.exists() or tmp.is_symlink():
+        raise ToolRefused(
+            f"{tmp} already exists; refusing to clobber a pre-existing temp "
+            "file (possible squatting)"
+        )
+    payload_text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload_text)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        try:
+            os.unlink(str(tmp))
+        except OSError:
+            pass
+        raise
     if os.name == "posix":
-        os.chmod(tmp, 0o600)
-    os.replace(tmp, target)
+        os.chmod(str(tmp), 0o600)
+    os.replace(str(tmp), str(target))
 
 
 def _require_pinned_protocol() -> str:
@@ -221,6 +272,16 @@ def cmd_mint(args) -> int:
 
 # -------------------------------------------------------------------- claim
 def _load_and_validate_record(args, now_ms: int | None) -> dict:
+    """Structural record validation; freshness only when ``now_ms`` is given.
+
+    ``now_ms=None`` validates integrity only (self-hash, canonical form,
+    forbidden legacy timestamps, pinned fingerprint, experiment id). The
+    PostgreSQL ``now()-60s .. now()+5min`` window is enforced ONLY for the
+    initial activation (FIX-1): a repair after an already-committed claim must
+    keep working once that window has expired, because the immutable database
+    record is the evidence that the original claim passed the window when it
+    mattered.
+    """
     record = load_freeze_record(args.record)
     validate_freeze_record(
         record,
@@ -233,6 +294,139 @@ def _load_and_validate_record(args, now_ms: int | None) -> dict:
     return record
 
 
+def _registry_row(conn, freeze_ts: str):
+    """Durable, immutable evidence of the committed claim (freeze_registry).
+
+    ``research.htf_baseline_short_phase2_freeze_registry`` is append-only and
+    keyed by ``freeze_ts``; its row proves that the boundary was claimed once
+    and binds it to an experiment id and protocol fingerprint.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT experiment_id, protocol_fingerprint FROM "
+            "research.htf_baseline_short_phase2_freeze_registry "
+            "WHERE freeze_ts = %s",
+            (freeze_ts,),
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+    if row is None:
+        return None
+    return {"experiment_id": row[0], "protocol_fingerprint": row[1]}
+
+
+def _require_activation_path_distinct_from_record(args) -> None:
+    """FIX-2: the immutable freeze record is never overwritten, even by a
+    mis-pointed ``--activation-out``."""
+    if Path(str(args.activation_out)).resolve() == Path(str(args.record)).resolve():
+        raise ToolRefused(
+            "--activation-out must not point at the freeze record itself: the "
+            "freeze record is immutable and is never overwritten"
+        )
+
+
+def _committed_claim_matches(state, record) -> bool:
+    return (
+        state.status == "RUNNING"
+        and state.freeze_ts is not None
+        and parse_ts_ms(state.freeze_ts) == parse_ts_ms(record["freeze_ts"])
+        and state.protocol_fingerprint == record["protocol_fingerprint"]
+    )
+
+
+def _write_activation_and_verify(args, conn, record, *, overwrite: bool) -> int:
+    """Authoritative re-read, write runtime authority 3, verify agreement."""
+    state = _load_state(conn, record["experiment_id"])
+    if not _committed_claim_matches(state, record):
+        raise ToolRefused(
+            "PARTIAL ACTIVATION: database state does not match the freeze "
+            "record after the claim. Do NOT retry with another timestamp. "
+            "Keep the observer stopped and escalate with this output."
+        )
+    if not args.activation_out:
+        raise ToolRefused(
+            "--activation-out is required: the runtime activation JSON is "
+            "freeze authority 3 and must be deployed at the same GO"
+        )
+    _require_activation_path_distinct_from_record(args)
+    activation = {
+        "experiment_id": record["experiment_id"],
+        "freeze_ts": record["freeze_ts"],
+        "protocol_fingerprint": record["protocol_fingerprint"],
+    }
+    _atomic_write_json(args.activation_out, activation, overwrite=overwrite)
+    print(f"ACTIVATION_CONFIG_WRITTEN={args.activation_out}")
+    activation = json.loads(Path(str(args.activation_out)).read_text(encoding="utf-8"))
+    verify_authority_agreement(
+        record=record,
+        database_freeze_ts=state.freeze_ts,
+        database_fingerprint=state.protocol_fingerprint,
+        activation=activation,
+        expected_experiment_id=record["experiment_id"],
+        expected_protocol_fingerprint=record["protocol_fingerprint"],
+    )
+    print("THREE_AUTHORITY_AGREEMENT=OK")
+    print(f"record_sha256={record['record_sha256']}")
+    print(
+        "STOP NOTE: activation complete. Do NOT set observer_enabled=true, "
+        "create /opt/trad_bot/etc/htf_phase2_observer_enabled or start the "
+        "systemd unit here — observe-only startup is a separate GO (issue #198)."
+    )
+    return EXIT_OK
+
+
+def _repair_after_committed_claim(args, conn, record) -> int:
+    """FIX-1 recovery path: repair AFTER a successfully committed claim.
+
+    Preconditions (each checked fail-closed BEFORE any write):
+      * the database registration carries exactly this record's experiment id,
+        freeze timestamp and protocol fingerprint (the DB record must be the
+        unchanged, originally claimed one);
+      * the immutable ``freeze_registry`` row evidences the SAME claim;
+      * the record itself passed structural validation (self-hash intact).
+
+    The ``now()-60s .. now()+5min`` freshness window is deliberately NOT
+    re-applied here: it gated the original activation (``activate()`` enforces
+    it transactionally, and this path performs no activation at all), and the
+    repair only re-derives runtime authority 3 from an already-validated
+    agreement. Re-activation with a NEW timestamp is structurally impossible
+    on this path — there is no ``activate()`` call, and the status/registry
+    guards would reject any other timestamp anyway.
+    """
+    state = _load_state(conn, record["experiment_id"])
+    if not _committed_claim_matches(state, record):
+        raise ToolRefused(
+            "database does not carry the committed claim recorded in this "
+            "freeze record (state="
+            f"status={state.status!r}, freeze_ts={state.freeze_ts!r}, "
+            f"protocol_fingerprint={state.protocol_fingerprint!r}); refusing "
+            "repair — STOP and escalate, never re-mint a timestamp"
+        )
+    row = _registry_row(conn, record["freeze_ts"])
+    if (
+        row is None
+        or row["experiment_id"] != record["experiment_id"]
+        or row["protocol_fingerprint"] != record["protocol_fingerprint"]
+    ):
+        raise ToolRefused(
+            f"freeze_registry does not evidence this exact claim (row={row}); "
+            "refusing repair — the database record cannot be corroborated. "
+            "STOP and escalate"
+        )
+    print(
+        "REPAIR_MODE: database already carries the committed claim "
+        f"freeze_ts={record['freeze_ts']} fingerprint={record['protocol_fingerprint']}; "
+        "re-deriving activation JSON from the identical freeze record "
+        "(no activation is performed)"
+    )
+    if args.dry_run:
+        print("DRY_RUN: activation JSON NOT written")
+        return EXIT_OK
+    return _write_activation_and_verify(args, conn, record, overwrite=True)
+
+
 def cmd_claim(args) -> int:
     _require_pinned_protocol()
     conn = None
@@ -240,15 +434,14 @@ def cmd_claim(args) -> int:
         conn = _connect()
         db_now = _db_now(conn)
         now_ms = parse_ts_ms(db_now)
-        record = _load_and_validate_record(args, now_ms)
+        # Structural record validation FIRST (integrity only, no freshness):
+        # whether the window applies depends on which path is taken, and that
+        # is decided by the authoritative database state below (FIX-1).
+        record = _load_and_validate_record(args, now_ms=None)
         state = _load_state(conn, record["experiment_id"])
-        already = (
-            state.status == "RUNNING"
-            and state.freeze_ts is not None
-            and parse_ts_ms(state.freeze_ts) == parse_ts_ms(record["freeze_ts"])
-            and state.protocol_fingerprint == record["protocol_fingerprint"]
-        )
-        if already:
+
+        if _committed_claim_matches(state, record):
+            # Path B: recovery after an already-committed identical claim.
             if not args.repair_activation_json:
                 raise ToolRefused(
                     "database is ALREADY activated with exactly this freeze "
@@ -256,88 +449,53 @@ def cmd_claim(args) -> int:
                     "missing (interrupted activation), re-run with "
                     "--repair-activation-json — never with a NEW timestamp"
                 )
-        else:
-            if state.status not in ("PENDING", "READY_TO_START"):
-                raise ToolRefused(
-                    f"experiment registration is {state.status!r}: activation "
-                    "refused. If a concurrent/earlier attempt already claimed a "
-                    "freeze, STOP and escalate — never mint a new timestamp to "
-                    "'fix' a half-finished activation"
-                )
-            if state.freeze_ts is not None or state.protocol_fingerprint:
-                raise ToolRefused(
-                    "registration already carries freeze/fingerprint values "
-                    "that do not match this record; STOP and escalate"
-                )
-            if args.dry_run:
-                print(
-                    f"DRY_RUN: would activate freeze_ts={record['freeze_ts']} "
-                    f"fingerprint={record['protocol_fingerprint']}"
-                )
-                return EXIT_OK
-            cur = conn.cursor()
-            try:
-                cur.execute(
-                    "SELECT research.htf_baseline_short_phase2_activate(%s, %s, %s)",
-                    (
-                        record["experiment_id"],
-                        record["freeze_ts"],
-                        record["protocol_fingerprint"],
-                    ),
-                )
-                cur.fetchone()
-            finally:
-                cur.close()
-            conn.commit()
-            print(f"DB_ACTIVATED freeze_ts={record['freeze_ts']}")
+            return _repair_after_committed_claim(args, conn, record)
+        if args.repair_activation_json:
+            raise ToolRefused(
+                "--repair-activation-json requires an already-committed, "
+                "identical database claim; this database carries none. Repair "
+                "is never combined with the initial activation — run a plain "
+                "claim while the record is inside the acceptance window"
+            )
 
-        # post-claim authoritative read (the DB is now the durable claim)
-        state = _load_state(conn, record["experiment_id"])
-        if (
-            state.status != "RUNNING"
-            or state.freeze_ts is None
-            or parse_ts_ms(state.freeze_ts) != parse_ts_ms(record["freeze_ts"])
-            or state.protocol_fingerprint != record["protocol_fingerprint"]
-        ):
+        # Path A: initial claim — the strict PostgreSQL acceptance window
+        # now()-60s .. now()+5min applies in full (tool-side AND inside
+        # research.htf_baseline_short_phase2_activate()).
+        record = _load_and_validate_record(args, now_ms=now_ms)
+        if state.status not in ("PENDING", "READY_TO_START"):
             raise ToolRefused(
-                "PARTIAL ACTIVATION: database state does not match the freeze "
-                "record after the claim. Do NOT retry with another timestamp. "
-                "Keep the observer stopped and escalate with this output."
+                f"experiment registration is {state.status!r}: activation "
+                "refused. If a concurrent/earlier attempt already claimed a "
+                "freeze, STOP and escalate — never mint a new timestamp to "
+                "'fix' a half-finished activation"
             )
-        if args.activation_out:
-            activation = {
-                "experiment_id": record["experiment_id"],
-                "freeze_ts": record["freeze_ts"],
-                "protocol_fingerprint": record["protocol_fingerprint"],
-            }
-            _atomic_write_json(
-                args.activation_out,
-                activation,
-                overwrite=bool(already and args.repair_activation_json),
-            )
-            print(f"ACTIVATION_CONFIG_WRITTEN={args.activation_out}")
-        else:
+        if state.freeze_ts is not None or state.protocol_fingerprint:
             raise ToolRefused(
-                "--activation-out is required: the runtime activation JSON is "
-                "freeze authority 3 and must be deployed at the same GO"
+                "registration already carries freeze/fingerprint values "
+                "that do not match this record; STOP and escalate"
             )
-        activation = json.loads(Path(str(args.activation_out)).read_text(encoding="utf-8"))
-        verify_authority_agreement(
-            record=record,
-            database_freeze_ts=state.freeze_ts,
-            database_fingerprint=state.protocol_fingerprint,
-            activation=activation,
-            expected_experiment_id=record["experiment_id"],
-            expected_protocol_fingerprint=record["protocol_fingerprint"],
-        )
-        print("THREE_AUTHORITY_AGREEMENT=OK")
-        print(f"record_sha256={record['record_sha256']}")
-        print(
-            "STOP NOTE: activation complete. Do NOT set observer_enabled=true, "
-            "create /opt/trad_bot/etc/htf_phase2_observer_enabled or start the "
-            "systemd unit here — observe-only startup is a separate GO (issue #198)."
-        )
-        return EXIT_OK
+        if args.dry_run:
+            print(
+                f"DRY_RUN: would activate freeze_ts={record['freeze_ts']} "
+                f"fingerprint={record['protocol_fingerprint']}"
+            )
+            return EXIT_OK
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT research.htf_baseline_short_phase2_activate(%s, %s, %s)",
+                (
+                    record["experiment_id"],
+                    record["freeze_ts"],
+                    record["protocol_fingerprint"],
+                ),
+            )
+            cur.fetchone()
+        finally:
+            cur.close()
+        conn.commit()
+        print(f"DB_ACTIVATED freeze_ts={record['freeze_ts']}")
+        return _write_activation_and_verify(args, conn, record, overwrite=False)
     except FreezeRecordError as exc:
         raise ToolRefused(str(exc)) from exc
     finally:

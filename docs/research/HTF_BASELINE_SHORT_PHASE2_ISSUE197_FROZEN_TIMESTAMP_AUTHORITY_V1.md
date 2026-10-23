@@ -223,6 +223,15 @@ the freeze timestamp never enters Git.
    This performs the ONE `research.htf_baseline_short_phase2_activate(...)`
    call, then deploys the runtime activation JSON and prints
    `THREE_AUTHORITY_AGREEMENT=OK`. STOP on `REFUSED` / `PARTIAL ACTIVATION`.
+
+   The initial claim enforces the PostgreSQL acceptance window
+   `now()-60s .. now()+5min` in full (tool side and inside `activate()`).
+   The one exception is the documented **delayed repair** (PR #200 FIX-1):
+   `claim --repair-activation-json` against a database that ALREADY carries a
+   committed, exactly-matching, registry-evidenced claim — that path performs
+   no activation, only re-derives the runtime activation JSON from the
+   identical freeze record, and it is the only path where the freshness
+   window is not re-applied.
 4. **Verify (read-only)** — `... verify --record ... --activation ...` plus
    the §4 post-activation SQL checks; keep the output.
 5. **Issue #198 only** — separate `GO_FOR_OBSERVE_ONLY_STARTUP`: set
@@ -242,10 +251,57 @@ the observation table.
 |---|---|---|
 | before mint | nothing changed | normal PR/review flow |
 | mint done, claim not run | inert record only | claim later **only if** still inside the acceptance window; otherwise discard record and re-mint under the same GO decision (old record cannot be claimed — freshness rules) |
-| claim: DB committed, activation JSON write failed | DB `RUNNING`, no runtime config → observer cannot start (fail-closed) | `claim --repair-activation-json` with the SAME record; never a new `freeze_ts`; if the record is lost, STOP and escalate |
+| claim: DB committed, activation JSON write failed | DB `RUNNING`, no runtime config → observer cannot start (fail-closed) | `claim --repair-activation-json` with the SAME record; never a new `freeze_ts`; if the record is lost, STOP and escalate. This **delayed repair** also works after the `now()-60s .. now()+5min` window has expired (PR #200 FIX-1): it requires the unchanged DB record (same experiment id, `freeze_ts`, protocol fingerprint) **and** the matching immutable `freeze_registry` row; any mismatch fails closed before the activation JSON is written |
 | claim refused (concurrent attempt won) | exactly one freeze claimed | STOP; inspect registry + record; never mint a new timestamp to "fix" it |
 | disagreement found at verify/startup | mixed artifacts | hard NO_GO; keep observer stopped; preserve evidence; operators decide: recover the exact same boundary or `CANCEL` and version a new experiment |
 | after issue #198 startup error | observer running/partial | stop ONLY the observer unit, remove ONLY its gate file, set `observer_enabled=false` (always allowed); never rewind the freeze, never edit observations |
+
+### 4.2 Freeze-record SHA-256 evidence model (PR #200 FIX-3)
+
+**What the hash is — and what it is not.** `record_sha256` is the SHA-256 of
+the record's canonical JSON payload (all fields except `record_sha256` itself,
+`sort_keys=True`, separators `(",", ":")`, `ensure_ascii=True`). It is
+**tamper evidence only**: it detects any later edit of the file. It is NOT a
+digital signature, NOT a proof of who created the record, and NOT independent
+proof of authenticity — anyone who can rewrite the file can also recompute the
+hash. Authenticity comes from the out-of-band operator GO record
+(`operator_approval_ref`, `issued_by`, the human change log), never from the
+JSON self-hash.
+
+**How the operator records the evidence (at mint, in the same GO):**
+
+1. capture the mint output — the canonical JSON and the printed
+   `record_sha256=...` line;
+2. paste BOTH into the change log / issue GO comment, together with the
+   approving operator identity, the GO reference and a UTC timestamp;
+3. optionally GPG-sign that change-log entry (or the record file) — this is
+   the only step in the flow that adds actual cryptographic authenticity.
+
+**How an independent reviewer verifies it (without trusting the tool or the
+operator workstation):** copy ONLY the JSON file to any machine and recompute
+the digest with stock Python (no project code involved):
+
+```bash
+python -c "import json,hashlib,sys; r=json.load(open(sys.argv[1], encoding='utf-8')); r.pop('record_sha256', None); print(hashlib.sha256(json.dumps(r, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('utf-8')).hexdigest())" /opt/trad_bot/etc/htf_phase2_freeze_record.json
+```
+
+* the output must equal the `record_sha256` recorded in the change log at
+  mint time — compare them byte-for-byte;
+* cross-check with coreutils on a different host if desired:
+  `jq -cS 'del(.record_sha256)' htf_phase2_freeze_record.json | tr -d '\n' | sha256sum`
+  (equivalent for ASCII-only fields; the Python recipe above is
+  authoritative);
+* then confirm the semantic fields against the GO decision by eye:
+  `experiment_id`, `protocol_fingerprint` (= pinned
+  `FROZEN_PROTOCOL_FINGERPRINT`), `freeze_ts`, `claimed_at`,
+  `record_id`, `operator_approval_ref`, `issued_by`;
+* `verify --record ... --activation ...` re-checks the three runtime
+  authorities afterwards, but it is a convenience — the digest comparison
+  above is the independent artifact check and must be performed outside the
+  tool.
+
+Any mismatch at any step = the record cannot be trusted = **STOP** (no claim,
+no repair, no activation JSON).
 
 ## 5. Verification performed in this task (isolated, no production access)
 
