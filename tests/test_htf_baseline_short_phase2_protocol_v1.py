@@ -3,18 +3,25 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 
 import pytest
 
 from app.research.htf_baseline_short_phase2_protocol_v1 import (
+    APPROVED_FREEZE_TS,
     BASE_COMMIT,
+    CANDIDATE_PROTOCOL_FINGERPRINT,
+    CANDIDATE_PROTOCOL_STATUS,
     EXPERIMENT_ID,
+    FROZEN_PROTOCOL_FINGERPRINT,
     OPERATOR_APPROVED,
     PROTOCOL_STATUS,
     PROTOCOL_V1,
+    approved_freeze_ts,
     canonical_protocol_json,
     operator_decisions_pending,
     protocol_fingerprint,
+    verify_frozen_fingerprint,
 )
 
 POINT_B_FREEZE = "2026-10-06T14:00:00Z"
@@ -44,9 +51,34 @@ def test_fingerprint_changes_on_any_semantic_change():
     assert protocol_fingerprint(mutated) != protocol_fingerprint()
 
 
-def test_protocol_status_is_not_frozen_until_operator_approval():
-    assert PROTOCOL_STATUS == "PROTOCOL_NOT_FROZEN"
-    assert PROTOCOL_V1["status"] == "PROTOCOL_NOT_FROZEN"
+def test_protocol_status_is_frozen_but_authorizes_nothing():
+    # Issue #197: the SPECIFICATION is frozen; this is not an activation.
+    assert PROTOCOL_STATUS == "FROZEN"
+    assert PROTOCOL_V1["status"] == "FROZEN"
+
+
+def test_final_frozen_fingerprint_is_pinned_and_reproducible():
+    # deterministic across processes/runs and equal to the reviewed pin
+    assert protocol_fingerprint() == FROZEN_PROTOCOL_FINGERPRINT
+    assert verify_frozen_fingerprint() is True
+    assert len(FROZEN_PROTOCOL_FINGERPRINT) == 64
+
+
+def test_candidate_fingerprint_reproducible_by_status_field_alone():
+    # the ONLY semantic delta candidate -> frozen is the status field; this is
+    # the independent re-verification of both published fingerprints
+    restored = copy.deepcopy(PROTOCOL_V1)
+    restored["status"] = CANDIDATE_PROTOCOL_STATUS
+    assert protocol_fingerprint(restored) == CANDIDATE_PROTOCOL_FINGERPRINT
+    assert CANDIDATE_PROTOCOL_FINGERPRINT != FROZEN_PROTOCOL_FINGERPRINT
+
+
+def test_protocol_module_carries_no_freeze_timestamp():
+    # timestamp authority V1: the freeze timestamp must never live in Git —
+    # merge/CI/deploy latency cannot be allowed to decide it
+    assert APPROVED_FREEZE_TS is None
+    assert approved_freeze_ts() is None
+    assert not re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", canonical_protocol_json())
 
 
 def test_experiment_identity_is_distinct_from_point_b():

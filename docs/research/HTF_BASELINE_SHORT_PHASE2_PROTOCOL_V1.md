@@ -1,18 +1,19 @@
 # HTF_BASELINE_SHORT_PHASE2_PROTOCOL_V1
 
-**Status: `PROTOCOL_NOT_FROZEN` — six parameter values operator-approved on 2026-10-23 in #186; protocol fingerprint review, freeze timestamp and activation remain separate gates.**
+**Status: `FROZEN` (Issue #197) — six parameter values operator-approved on 2026-10-23 in #186 and unchanged by the freeze; the freeze timestamp, activation and observe-only startup remain separate gates. `FROZEN` authorizes nothing by itself.**
 
 | Field | Value |
 |---|---|
-| Issue | #176 (predecessor #174); operator approval #186 |
+| Issue | #176 (predecessor #174); operator approval #186; freeze mechanism #197 |
 | Approved parameter decisions | 6/6 on 2026-10-23; no additional conditions |
-| Freeze timestamp | `None` (NOT ACTIVATED) |
+| Freeze timestamp | `None` in Git — chosen at the operator GO as an operator-approved **freeze record** (timestamp authority V1, see `HTF_BASELINE_SHORT_PHASE2_ISSUE197_FROZEN_TIMESTAMP_AUTHORITY_V1.md`) |
 | Study family | `HTF_BASELINE_SHORT_CAUSAL_EPISODE_STATEFUL_OBSERVER_V1` |
 | Experiment id | `HTF_KEYLEVEL_BASELINE_SHORT_CAUSAL_OBSERVER_V1` |
 | Direction | `SHORT` (observe-only) |
 | Base commit | `4ef60d1e6bb7d2fbbd7fe2b4e3de0591995dc5ba` |
 | Machine-readable source | `app/research/htf_baseline_short_phase2_protocol_v1.py` |
-| Canonical fingerprint (SHA-256) | `39accac9ddddfd1495202cd708d7dc95b6c6b93ac79d819ff3d5a02beec60de1` (VPS-verified 2026-10-23, PR #192; reverify on final commit) |
+| Canonical fingerprint, FROZEN payload (SHA-256) | `22fa0c08eed92df7bb6e94576987305343a71083f3129f3ce4acd07c287cb3f0` — pinned in `FROZEN_PROTOCOL_FINGERPRINT`, regression-verified |
+| Canonical fingerprint, reviewed candidate (audit trail) | `39accac9ddddfd1495202cd708d7dc95b6c6b93ac79d819ff3d5a02beec60de1` — reproducible from the FROZEN payload by restoring `status = PROTOCOL_NOT_FROZEN` (the only delta) |
 | Delivery guarantee | **AT-LEAST-ONCE + IDEMPOTENT writes** (exactly-once NOT claimed) |
 
 The fingerprint is computed over the canonical JSON serialization

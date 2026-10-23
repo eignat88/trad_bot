@@ -812,12 +812,18 @@ def require_runnable(
     *,
     activation: dict | None = None,
     protocol_freeze_ts: str | None = None,
+    freeze_record: dict | None = None,
+    require_pinned_fingerprint: bool = False,
 ) -> Phase2FreezeBoundary:
     """Fail-closed gate over THREE independently maintained freeze authorities.
 
-    1. Approved frozen protocol — ``protocol_v1.approved_freeze_ts()`` (or an
-       explicitly injected value in tests). None means the protocol is not
-       frozen yet -> refuse to run.
+    1. Approved frozen protocol + operator freeze record — the FROZEN protocol
+       fingerprint pin plus the operator-approved freeze record
+       (timestamp authority V1, ``freeze_record``), which carries the fresh UTC
+       timestamp chosen at the separate operator GO. The legacy in-code
+       ``protocol_v1.approved_freeze_ts()`` (or an explicitly injected value in
+       tests) is accepted as this authority's timestamp too; nothing may run
+       while every form of it is empty.
     2. Durable experiment registration — the database activation record
        (freeze_ts + protocol_fingerprint written once by ``activate()``).
     3. Runtime activation configuration — the operator-deployed activation
@@ -826,13 +832,21 @@ def require_runnable(
     No source is derived from another, so a stale or missing source can never
     be masked by copying. Every missing source or pairwise disagreement
     rejects startup; fingerprints must additionally match the fingerprint of
-    the code actually running (``config.protocol_fingerprint``).
+    the code actually running (``config.protocol_fingerprint``). When a freeze
+    record is supplied it is verified in full (self-hash, canonical timestamps,
+    internal freshness window) and must agree with the database, the runtime
+    activation config and the running code before a boundary exists.
     """
     from app.research.htf_baseline_short_phase2_persistence_v1 import (
         freeze_sources,
         load_experiment_state,
     )
     from app.research.htf_baseline_short_phase2_protocol_v1 import approved_freeze_ts
+    from app.research.htf_baseline_short_phase2_timestamp_authority_v1 import (
+        FreezeRecordError,
+        validate_freeze_record,
+        verify_authority_agreement,
+    )
 
     state = load_experiment_state(db_conn, config.experiment_id)
     sources = freeze_sources(db_conn, config.experiment_id)
@@ -842,12 +856,40 @@ def require_runnable(
             "protocol fingerprint mismatch between runtime code and registration "
             "(fail closed; no observations)"
         )
+    if state.status != "RUNNING":
+        raise NotRunnableError(
+            f"experiment registration is {state.status!r}, not 'RUNNING' "
+            "(fail closed; no observations)"
+        )
+    if freeze_record is not None:
+        # authority 1 in its timestamp-bearing form: verify the record itself
+        # (tamper evidence + freshness window) BEFORE comparing sources.
+        try:
+            validate_freeze_record(
+                freeze_record,
+                expected_experiment_id=config.experiment_id,
+                expected_protocol_fingerprint=config.protocol_fingerprint,
+                require_pinned_fingerprint=require_pinned_fingerprint,
+            )
+        except FreezeRecordError as exc:
+            raise NotRunnableError(f"freeze record rejected: {exc}") from exc
+        record_freeze_ts = freeze_record.get("freeze_ts")
+        if protocol_freeze_ts is not None:
+            from app.research.htf_baseline_short_phase2_freeze_v1 import parse_ts_ms
+
+            if parse_ts_ms(protocol_freeze_ts) != parse_ts_ms(record_freeze_ts):
+                raise NotRunnableError(
+                    "explicit protocol freeze timestamp disagrees with the "
+                    "operator freeze record (fail closed; no observations)"
+                )
+        protocol_freeze_ts = record_freeze_ts
     if protocol_freeze_ts is None:
         protocol_freeze_ts = approved_freeze_ts()
     if not protocol_freeze_ts:
         raise NotRunnableError(
-            "protocol freeze authority is empty: the protocol is not frozen "
-            "(fail closed; no observations)"
+            "protocol freeze authority is empty: no operator freeze record and "
+            "the protocol carries no approved timestamp (fail closed; no "
+            "observations)"
         )
     if activation is None:
         raise NotRunnableError(
@@ -862,6 +904,20 @@ def require_runnable(
         )
     if sources.get("database") is None:
         raise NotRunnableError("database freeze authority is empty")
+    if freeze_record is not None:
+        # single agreement path over every applicable value (timestamps AND
+        # fingerprints across record / database / activation / running code)
+        try:
+            verify_authority_agreement(
+                record=freeze_record,
+                database_freeze_ts=sources.get("database"),
+                database_fingerprint=state.protocol_fingerprint,
+                activation=activation,
+                expected_experiment_id=config.experiment_id,
+                expected_protocol_fingerprint=config.protocol_fingerprint,
+            )
+        except FreezeRecordError as exc:
+            raise NotRunnableError(f"freeze authority disagreement: {exc}") from exc
     return build_boundary(
         experiment_id=config.experiment_id,
         protocol_freeze_ts=protocol_freeze_ts,
@@ -1121,6 +1177,15 @@ def main(argv: list[str] | None = None) -> int:
         help="operator-maintained runtime activation config (JSON); REQUIRED with --use-registration",
     )
     parser.add_argument(
+        "--freeze-record",
+        default=None,
+        help=(
+            "operator-approved immutable freeze record (JSON, timestamp "
+            "authority V1). Without it the registration gate refuses startup "
+            "(the protocol carries no timestamp in Git)."
+        ),
+    )
+    parser.add_argument(
         "--freeze-ts",
         default=None,
         help="explicit test-only freeze (ISO); dry-run only; never used in production",
@@ -1157,9 +1222,31 @@ def main(argv: list[str] | None = None) -> int:
                 log.error("registration gate: --activation-config is required")
                 return EXIT_NOT_RUNNABLE
             try:
+                from app.research.htf_baseline_short_phase2_timestamp_authority_v1 import (
+                    FreezeRecordError,
+                    load_freeze_record,
+                )
+
                 activation = load_activation_config(args.activation_config)
+                freeze_record = None
+                if args.freeze_record:
+                    try:
+                        freeze_record = load_freeze_record(args.freeze_record)
+                    except FreezeRecordError as exc:
+                        # degrade to "no record": require_runnable is the single
+                        # enforcement point and refuses startup without the
+                        # operator freeze record (fail closed, zero observations)
+                        log.error("freeze record unavailable: %s", exc)
+                gate_kwargs = {}
+                if freeze_record is not None:
+                    gate_kwargs = {
+                        "freeze_record": freeze_record,
+                        "require_pinned_fingerprint": True,
+                    }
                 db_conn = connect_db_from_env()
-                boundary = require_runnable(db_conn, config, activation=activation)
+                boundary = require_runnable(
+                    db_conn, config, activation=activation, **gate_kwargs
+                )
             except Exception as exc:
                 log.error("registration gate refused startup: %s", exc)
                 return EXIT_NOT_RUNNABLE

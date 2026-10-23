@@ -6,10 +6,19 @@ studies:
     HTF_KEYLEVEL_BASELINE_SHORT_CAUSAL_OBSERVER_V1
     HTF_BASELINE_SHORT_CAUSAL_EPISODE_STATEFUL_OBSERVER_V1
 
-Status: PROTOCOL_NOT_FROZEN. All six candidate parameter values received
-explicit operator approval on 2026-10-23 (Issue #186). The approved values
-are not an activation or timestamp freeze; that requires a separate change,
-fingerprint verification and production authorization.
+Status: FROZEN (Issue #197). All six candidate parameter values received
+explicit operator approval on 2026-10-23 (Issue #186) and are unchanged by
+this freeze. ``FROZEN`` is a statement about the protocol SPECIFICATION only:
+it does NOT authorize observer startup, does NOT carry any freeze timestamp,
+and does NOT activate anything. Activation still requires a separate operator
+GO, a fresh operator-approved freeze record (timestamp authority V1) and exact
+agreement of all three freeze authorities.
+
+The canonical fingerprint of the FROZEN protocol is pinned in
+``FROZEN_PROTOCOL_FINGERPRINT`` and covered by tests. The only semantic delta
+against the reviewed candidate is ``status: PROTOCOL_NOT_FROZEN -> FROZEN``;
+the candidate fingerprint is reproducible from the FROZEN payload by restoring
+that single field (regression-tested).
 
 Each of the six operator-decision fields is marked ``OPERATOR_APPROVED``;
 their values are unchanged from the reviewed candidate.
@@ -25,11 +34,22 @@ from hashlib import sha256
 import json
 
 PROTOCOL_SCHEMA = "HTF_PHASE2_PROTOCOL_V1"
-PROTOCOL_STATUS = "PROTOCOL_NOT_FROZEN"
+PROTOCOL_STATUS = "FROZEN"
+#: The reviewed candidate status; kept ONLY so tests can prove that the FROZEN
+#: payload differs from the candidate by this single field.
+CANDIDATE_PROTOCOL_STATUS = "PROTOCOL_NOT_FROZEN"
 OPERATOR_APPROVAL_REQUIRED = "OPERATOR_APPROVAL_REQUIRED"
 OPERATOR_APPROVED = "OPERATOR_APPROVED"
 OPERATOR_APPROVAL_ISSUE = 186
 OPERATOR_APPROVAL_DATE_UTC = "2026-10-23"
+
+#: Issue #197: canonical SHA-256 fingerprint of the FROZEN protocol payload.
+#: Pinned by review; recomputation is enforced by tests (any drift is a hard
+#: stop and requires a NEW experiment version and a NEW freeze).
+FROZEN_PROTOCOL_FINGERPRINT = "22fa0c08eed92df7bb6e94576987305343a71083f3129f3ce4acd07c287cb3f0"
+#: Reproducible fingerprint of the reviewed CANDIDATE payload (same payload with
+#: ``status`` restored to :data:`CANDIDATE_PROTOCOL_STATUS`). Test-only anchor.
+CANDIDATE_PROTOCOL_FINGERPRINT = "39accac9ddddfd1495202cd708d7dc95b6c6b93ac79d819ff3d5a02beec60de1"
 
 #: Fixed identity of the prospective experiment. Must never be reused from the
 #: Point-B experiments (HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE,
@@ -43,11 +63,21 @@ DIRECTION = "SHORT"
 BASE_COMMIT = "4ef60d1e6bb7d2fbbd7fe2b4e3de0591995dc5ba"
 
 #: Authority 1 of 3 for the freeze boundary: the APPROVED FROZEN PROTOCOL.
-#: Set here ONLY by the operator at protocol-freeze time, together with the
-#: fingerprint approval. Remains None while the protocol is a candidate —
-#: the runtime must then fail closed. This value is maintained independently
-#: of the database activation record and of the runtime activation config;
-#: any disagreement between the three authorities rejects startup.
+#:
+#: Issue #197 timestamp-authority V1: the freeze timestamp is intentionally
+#: NEVER stored in this Git-tracked module. A timestamp committed here would
+#: have to survive code review, merge, CI and deployment inside the PostgreSQL
+#: acceptance window (now() - 60s .. now() + 5m), which cannot be guaranteed;
+#: a stale or backdated timestamp is exactly what the freeze boundary forbids.
+#: Instead the operator-approved, immutable FREEZE RECORD
+#: (``htf_baseline_short_phase2_timestamp_authority_v1``) carries the fresh UTC
+#: timestamp chosen at the separate operator GO, bound to
+#: :data:`FROZEN_PROTOCOL_FINGERPRINT` and to the experiment identity.
+#:
+#: This constant therefore remains None and the runtime fails closed while it
+#: is None. The three authorities (freeze record + PostgreSQL registration +
+#: private runtime activation config) are maintained independently; any
+#: disagreement between them rejects startup.
 APPROVED_FREEZE_TS: str | None = None
 
 
@@ -226,3 +256,13 @@ def operator_decisions_pending(protocol: dict | None = None) -> list[str]:
 
     walk(data, "")
     return sorted(pending)
+
+
+def verify_frozen_fingerprint(protocol: dict | None = None) -> bool:
+    """True iff the payload's fingerprint equals the pinned FROZEN fingerprint.
+
+    Used by tests and by the operator claim tool as a hard stop: any drift
+    between the reviewed/deployed payload and the pinned hash must block
+    activation instead of silently re-basing the freeze.
+    """
+    return protocol_fingerprint(protocol) == FROZEN_PROTOCOL_FINGERPRINT
