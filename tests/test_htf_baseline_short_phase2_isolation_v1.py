@@ -71,6 +71,11 @@ def test_no_tracked_file_modified_against_base():
     ]
     allowed_modified = (
         ".github/workflows/main-pr-safety.yml",
+        # Issue #186: only these exact Phase-2 approval-record files may change;
+        # do not broaden the allowlist to directory prefixes.
+        "app/research/htf_baseline_short_phase2_protocol_v1.py",
+        "docs/research/HTF_BASELINE_SHORT_PHASE2_PROTOCOL_V1.md",
+        "tests/test_htf_baseline_short_phase2_protocol_v1.py",
         "app/research/htf_baseline_short_phase2_observer_runner_v1.py",
         "deploy/systemd/trad-bot-htf-baseline-short-observer.service",
         "tests/test_htf_baseline_short_phase2_isolation_v1.py",
