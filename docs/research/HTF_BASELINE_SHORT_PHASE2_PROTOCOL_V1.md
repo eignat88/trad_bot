@@ -1,16 +1,18 @@
 # HTF_BASELINE_SHORT_PHASE2_PROTOCOL_V1
 
-**Status: `PROTOCOL_NOT_FROZEN` — frozen-contract candidate, operator approval required.**
+**Status: `PROTOCOL_NOT_FROZEN` — six parameter values operator-approved on 2026-10-23 in #186; protocol fingerprint review, freeze timestamp and activation remain separate gates.**
 
 | Field | Value |
 |---|---|
-| Issue | #176 (predecessor #174) |
+| Issue | #176 (predecessor #174); operator approval #186 |
+| Approved parameter decisions | 6/6 on 2026-10-23; no additional conditions |
+| Freeze timestamp | `None` (NOT ACTIVATED) |
 | Study family | `HTF_BASELINE_SHORT_CAUSAL_EPISODE_STATEFUL_OBSERVER_V1` |
 | Experiment id | `HTF_KEYLEVEL_BASELINE_SHORT_CAUSAL_OBSERVER_V1` |
 | Direction | `SHORT` (observe-only) |
 | Base commit | `4ef60d1e6bb7d2fbbd7fe2b4e3de0591995dc5ba` |
 | Machine-readable source | `app/research/htf_baseline_short_phase2_protocol_v1.py` |
-| Canonical fingerprint (SHA-256) | `04f7c314bafb613f1a11ebb3d6868101be046468637d56284365d74477f5cf23` |
+| Canonical fingerprint (SHA-256) | Recompute from the merged protocol using `protocol_fingerprint()`; reverify at review before freeze |
 | Delivery guarantee | **AT-LEAST-ONCE + IDEMPOTENT writes** (exactly-once NOT claimed) |
 
 The fingerprint is computed over the canonical JSON serialization
@@ -81,7 +83,7 @@ Point-B OOS protocol.
 * Terminal episodes are never re-attributed; a post-terminal confirmation
   raises. Each 5m step is all-or-nothing.
 * **Terminal level-retirement policy:** eligibility loss is **non-terminal**
-  (diagnostic only) — marked `OPERATOR_APPROVAL_REQUIRED`; any alternative
+  (diagnostic only) — marked `OPERATOR_APPROVED`; any alternative
   requires a new protocol version.
 
 ## 5. Freeze boundary
@@ -137,11 +139,11 @@ Point-B OOS protocol.
 
 | Gate | PROPOSED value | Status |
 |---|---|---|
-| minimum confirmations | 30 | `OPERATOR_APPROVAL_REQUIRED` |
-| minimum symbols | 5 | `OPERATOR_APPROVAL_REQUIRED` |
-| minimum active days | 14 | `OPERATOR_APPROVAL_REQUIRED` |
-| geometry proximity | 300000 ms | `OPERATOR_APPROVAL_REQUIRED` |
-| geometry price band | 20 bps (0/10/20/30/40 sensitivity) | `OPERATOR_APPROVAL_REQUIRED` |
+| minimum confirmations | 30 | `OPERATOR_APPROVED` |
+| minimum symbols | 5 | `OPERATOR_APPROVED` |
+| minimum active days | 14 | `OPERATOR_APPROVED` |
+| geometry proximity | 300000 ms | `OPERATOR_APPROVED` |
+| geometry price band | 20 bps (0/10/20/30/40 sensitivity) | `OPERATOR_APPROVED` |
 
 ## 10. Authorization
 
