@@ -345,7 +345,7 @@ def _load_active_experiments(conn) -> list[str]:
 def _load_prospective_experiments(conn) -> list[str]:
     """Load prospective experiment IDs with status='RUNNING'.
 
-    Returns experiments with status='RUNNING' AND started_at IS NOT NULL.
+    Returns RUNNING experiments and only V3 in DRAINING, with started_at.
     Experiments with started_at=NULL or status != 'RUNNING' are NOT evaluated.
     Direction-level lifecycle does NOT affect experiment selection — a shared
     experiment remains in the active list even if some directions are closed,
@@ -357,7 +357,10 @@ def _load_prospective_experiments(conn) -> list[str]:
     try:
         cursor.execute(
             "SELECT experiment_id FROM research.prospective_experiment "
-            "WHERE status = 'RUNNING' AND started_at IS NOT NULL "
+            "WHERE started_at IS NOT NULL AND ("
+            "status = 'RUNNING' OR ("
+            "experiment_id = 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V3_OOS' "
+            "AND status = 'DRAINING')) "
             "ORDER BY experiment_id"
         )
         return [row[0] for row in cursor.fetchall()]

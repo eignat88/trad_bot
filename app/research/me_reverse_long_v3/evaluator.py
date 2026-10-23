@@ -69,7 +69,7 @@ class MEReverseLongV3ExecutionEvaluator:
                 LEFT JOIN research.me_reverse_long_v3_execution_outcome r
                   ON r.observation_id = o.observation_id
                 WHERE o.experiment_id = %s
-                  AND e.status = 'RUNNING'
+                  AND e.status IN ('RUNNING', 'DRAINING')
                   AND e.started_at IS NOT NULL
                   AND o.signal_time > e.started_at
                   AND o.direction = 'LONG'
