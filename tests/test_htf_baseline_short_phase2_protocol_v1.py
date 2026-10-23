@@ -9,7 +9,7 @@ import pytest
 from app.research.htf_baseline_short_phase2_protocol_v1 import (
     BASE_COMMIT,
     EXPERIMENT_ID,
-    OPERATOR_APPROVAL_REQUIRED,
+    OPERATOR_APPROVED,
     PROTOCOL_STATUS,
     PROTOCOL_V1,
     canonical_protocol_json,
@@ -70,19 +70,17 @@ def test_identity_rule_forbids_mutable_counters():
     assert identity["stable_across"] == ["restart", "warmup length", "rolling-window shift"]
 
 
-def test_terminal_retirement_policy_pending_operator_approval():
+def test_terminal_retirement_policy_approved_by_operator():
     retirement = PROTOCOL_V1["lifecycle"]["level_retirement_policy"]
-    assert retirement["status"] == OPERATOR_APPROVAL_REQUIRED
+    assert retirement["status"] == OPERATOR_APPROVED
     assert retirement["rule"] == "LEVEL_ELIGIBILITY_LOSS_IS_NON_TERMINAL"
 
 
 def test_operator_decisions_are_explicitly_tracked():
     pending = operator_decisions_pending()
-    assert "geometry.proximity_ms" in pending
-    assert "geometry.price_bps" in pending
-    assert "lifecycle.level_retirement_policy" in pending
-    assert "maturity_gates.minimum_confirmations" in pending
-    assert len(pending) == 6
+    assert pending == []
+    for group, key, expected in [("geometry", "proximity_ms", 300000), ("geometry", "price_bps", 20), ("maturity_gates", "minimum_confirmations", 30), ("maturity_gates", "minimum_symbols", 5), ("maturity_gates", "minimum_active_days", 14)]:
+        assert PROTOCOL_V1[group][key] == {"value": expected, "status": OPERATOR_APPROVED}
 
 
 def test_metrics_separation_declares_execution_out_of_scope():
