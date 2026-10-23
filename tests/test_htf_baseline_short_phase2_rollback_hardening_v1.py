@@ -541,6 +541,7 @@ def test_t12_phase2_data_preserved(tmp_path):
             )
             before_rows = cur.fetchone()
         assert before_rows[0] == 1, "the observation must have been written"
+        conn.commit()  # close the read transaction; run_rollback owns the next one
         report = rb.run_rollback(conn, snap_path)
         assert report["verdict"] == "RESTORED_AND_VERIFIED"
         with conn.cursor() as cur:
@@ -918,3 +919,209 @@ def test_adv_superuser_requirement_fails_closed(tmp_path):
             cur.execute("RESET ROLE")
         conn.commit()
         conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# Atomicity — the PR #191 review fix: run_rollback owns the transaction and
+# commits ONLY after every post-restore verification passed; every failure
+# (SQL execution, post-verification, ACL mismatch, function-config mismatch,
+# interruption before commit) must leave ZERO committed changes.
+# --------------------------------------------------------------------------- #
+class _ConnectionSpy:
+    """Delegating wrapper counting commit()/rollback() calls on a connection."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.commit_calls = 0
+        self.rollback_calls = 0
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def commit(self):
+        self.commit_calls += 1
+        return self._conn.commit()
+
+    def rollback(self):
+        self.rollback_calls += 1
+        return self._conn.rollback()
+
+    def cursor(self, *args, **kwargs):
+        return self._conn.cursor(*args, **kwargs)
+
+
+def _assert_075_state_intact(conn, state_075: dict) -> None:
+    """Nothing may be committed by a failed rollback: the FULL state — ACL
+    tuples, effective privileges, roles, memberships, function config — must
+    hash-identically to the committed 075 state."""
+    assert snap.payload_sha256(_capture(conn)) == snap.payload_sha256(state_075)
+
+
+def _assert_both_p2_roles_present(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT rolname FROM pg_roles WHERE rolname = ANY(%s)", (list(rb.P2_ROLES),)
+        )
+        present = {row[0] for row in cur.fetchall()}
+    assert present == set(rb.P2_ROLES)
+
+
+def _atomic_setup(tmp_path, tag: str):
+    """Provision 074 -> snapshot -> 075 and return the committed 075 state."""
+    resources = _tracked_resources()
+    res = resources.__enter__()
+    try:
+        conn, _ = _provision_db(res)
+        pre = _capture(conn)
+        snap_path = _snapshot_file(tmp_path, pre, f"{tag}_pre")
+        _apply_075(conn)
+        state_075 = _capture(conn)
+    except BaseException:
+        resources.__exit__(None, None, None)
+        raise
+    return resources, conn, pre, snap_path, state_075
+
+
+def test_atomic_sql_execution_failure_commits_nothing(tmp_path):
+    """Failure DURING SQL execution -> zero commits, no partial restore."""
+    resources, conn, pre, snap_path, state_075 = _atomic_setup(tmp_path, "atomic_sql")
+    try:
+        plan = rb.build_restore_plan(pre, state_075)
+        assert len(plan["statements"]) > 3
+        cut = len(plan["statements"]) // 2
+        spy = _ConnectionSpy(conn)
+        with pytest.raises(rb._InjectedFailure):
+            rb.run_rollback(spy, snap_path, fail_after=cut)
+        assert spy.commit_calls == 0
+        assert spy.rollback_calls >= 1
+        _assert_075_state_intact(conn, state_075)
+        _assert_both_p2_roles_present(conn)
+    finally:
+        conn.close()
+        resources.__exit__(None, None, None)
+
+
+def test_atomic_post_verification_failure_commits_nothing(tmp_path):
+    """Failure DURING post-restore verification -> zero commits."""
+    resources, conn, pre, snap_path, state_075 = _atomic_setup(tmp_path, "atomic_verify")
+    try:
+        spy = _ConnectionSpy(conn)
+        with pytest.raises(rb._InjectedFailure) as exc:
+            rb.run_rollback(spy, snap_path, fail_point="verify_exception")
+        assert "post-restore verification" in str(exc.value)
+        assert spy.commit_calls == 0
+        assert spy.rollback_calls >= 1
+        _assert_075_state_intact(conn, state_075)
+        _assert_both_p2_roles_present(conn)
+    finally:
+        conn.close()
+        resources.__exit__(None, None, None)
+
+
+def test_atomic_acl_mismatch_after_restoration_rolls_back(tmp_path):
+    """A restore whose re-grant half is missing must be REFUSED by the
+    post-restore verification and rolled back — the revoked privileges and
+    the roles the partial plan dropped are fully restored afterwards."""
+    resources, conn, pre, snap_path, state_075 = _atomic_setup(tmp_path, "atomic_acl")
+    try:
+        spy = _ConnectionSpy(conn)
+        with pytest.raises(rb.FailClosed) as exc:
+            rb.run_rollback(spy, snap_path, fail_point="skip_acl_grants")
+        assert "P2_RB_VERIFICATION_FAILED" in str(exc.value)
+        assert spy.commit_calls == 0
+        assert spy.rollback_calls >= 1
+        _assert_075_state_intact(conn, state_075)
+        _assert_both_p2_roles_present(conn)
+    finally:
+        conn.close()
+        resources.__exit__(None, None, None)
+
+
+def test_atomic_function_config_mismatch_rolls_back(tmp_path):
+    """A restore that misses the function-config statements must be REFUSED
+    (proconfig/prosecdef still differ) and rolled back."""
+    resources, conn, pre, snap_path, state_075 = _atomic_setup(tmp_path, "atomic_cfg")
+    try:
+        spy = _ConnectionSpy(conn)
+        with pytest.raises(rb.FailClosed) as exc:
+            rb.run_rollback(spy, snap_path, fail_point="skip_function_config_restore")
+        assert "P2_RB_VERIFICATION_FAILED" in str(exc.value)
+        assert spy.commit_calls == 0
+        assert spy.rollback_calls >= 1
+        _assert_075_state_intact(conn, state_075)
+        _assert_both_p2_roles_present(conn)
+    finally:
+        conn.close()
+        resources.__exit__(None, None, None)
+
+
+def test_atomic_success_commits_exactly_once_and_verifies(tmp_path):
+    """Success -> exactly ONE final commit and the verified restored state."""
+    resources, conn, pre, snap_path, state_075 = _atomic_setup(tmp_path, "atomic_ok")
+    try:
+        spy = _ConnectionSpy(conn)
+        report = rb.run_rollback(spy, snap_path)
+        assert report["verdict"] == "RESTORED_AND_VERIFIED"
+        assert report["full_state_equal"] is True
+        assert spy.commit_calls == 1
+        assert spy.rollback_calls == 0
+        _assert_exact_acl_equal(pre, _capture(conn))
+    finally:
+        conn.close()
+        resources.__exit__(None, None, None)
+
+
+def test_atomic_failure_before_commit_leaves_no_partial_state(tmp_path):
+    """Failure AFTER the full restore+verification but BEFORE the commit must
+    change nothing: neither privileges nor the roles the plan dropped."""
+    resources, conn, pre, snap_path, state_075 = _atomic_setup(tmp_path, "atomic_precommit")
+    try:
+        spy = _ConnectionSpy(conn)
+        with pytest.raises(rb._InjectedFailure) as exc:
+            rb.run_rollback(spy, snap_path, fail_point="before_commit")
+        assert "before the final commit" in str(exc.value)
+        assert spy.commit_calls == 0
+        assert spy.rollback_calls >= 1
+        _assert_075_state_intact(conn, state_075)
+        _assert_both_p2_roles_present(conn)
+    finally:
+        conn.close()
+        resources.__exit__(None, None, None)
+
+
+def test_atomic_autocommit_connection_is_refused(tmp_path):
+    """autocommit would bypass the transaction boundary -> fail closed."""
+    resources, conn, pre, snap_path, state_075 = _atomic_setup(tmp_path, "atomic_ac")
+    try:
+        auto = psycopg2.connect(
+            host=DB_HOST, port=DB_PORT, dbname=conn.get_dsn_parameters()["dbname"],
+            user=DB_USER,
+        )
+        auto.autocommit = True
+        try:
+            with pytest.raises(rb.FailClosed) as exc:
+                rb.run_rollback(auto, snap_path)
+            assert "P2_RB_CONNECTION_AUTOCOMMIT" in str(exc.value)
+        finally:
+            auto.close()
+        _assert_075_state_intact(conn, state_075)
+    finally:
+        conn.close()
+        resources.__exit__(None, None, None)
+
+
+def test_atomic_foreign_open_transaction_is_refused(tmp_path):
+    """A connection already inside a transaction the tool does not own must be
+    refused (its uncommitted work would otherwise be destroyed)."""
+    resources, conn, pre, snap_path, state_075 = _atomic_setup(tmp_path, "atomic_tx")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")  # leave an open transaction behind
+        with pytest.raises(rb.FailClosed) as exc:
+            rb.run_rollback(conn, snap_path)
+        assert "P2_RB_TRANSACTION_NOT_IDLE" in str(exc.value)
+        conn.rollback()
+        _assert_075_state_intact(conn, state_075)
+    finally:
+        conn.close()
+        resources.__exit__(None, None, None)

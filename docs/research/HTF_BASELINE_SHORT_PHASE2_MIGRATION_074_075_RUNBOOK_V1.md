@@ -407,10 +407,17 @@ sudo -u postgres python3 tools/research/htf_baseline_short_phase2_acl_snapshot_v
 
 ### 4.5 Partial-failure handling and idempotency
 
-* the restore runs in ONE transaction; an interruption or SQL error rolls the
-  whole transaction back — the database is never left partially changed
-  (tested: `test_t17_interrupted_rollback_leaves_no_partial_changes`). The CLI
-  exits with `ABORTED_NO_CHANGES` and a `P2_RB_*` code in this case;
+* the restore AND its post-restore verification run in ONE transaction owned
+  by the rollback tool: the single `COMMIT` happens only AFTER every ACL /
+  role / function verification passed. Any failure — interruption, SQL error,
+  verification mismatch, unexpected exception — rolls the whole transaction
+  back and the database is never left partially changed (tested:
+  `test_t17_interrupted_rollback_leaves_no_partial_changes` and the atomicity
+  cases A01–A08 of the rollback-hardening document). The CLI exits with
+  `ABORTED_NO_CHANGES` and a `P2_RB_*` code in this case;
+* the tool refuses a connection that would bypass that boundary:
+  `autocommit` connections (`P2_RB_CONNECTION_AUTOCOMMIT`) and connections
+  already inside another transaction (`P2_RB_TRANSACTION_NOT_IDLE`);
 * re-running the rollback after success is a safe refusal
   (`P2_RB_NOTHING_TO_ROLL_BACK`) and changes nothing (tested: T18);
 * `--dry-run` changes nothing and can be repeated freely;

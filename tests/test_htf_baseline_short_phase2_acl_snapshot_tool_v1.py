@@ -440,6 +440,55 @@ def test_rollback_tool_scope_statics():
     assert not re.search(r"(?i)(from|join)\s+pg_authid\b", source)
 
 
+def test_rollback_transaction_contract_statics():
+    """PR #191 atomicity contract, statically enforced: run_rollback owns the
+    transaction, the whole restore + verification share one uncommitted
+    transaction, exactly one commit exists and it runs AFTER verification."""
+    source = ROLLBACK_TOOL.read_text(encoding="utf-8")
+    code = _code_only(ROLLBACK_TOOL)
+
+    # _execute_plan must never commit/roll back — the caller owns the lifecycle
+    execute_plan = code.split("def _execute_plan", 1)[1].split("\ndef ", 1)[0]
+    assert not re.search(r"\.(commit|rollback)\(", execute_plan)
+
+    # exactly ONE commit statement in the module, inside run_rollback only
+    commits = re.findall(r"(?m)^\s*conn\.commit\(\)\s*$", source)
+    assert len(commits) == 1, f"expected exactly one commit, found {len(commits)}"
+    before_run, run_body = source.split("def run_rollback(", 1)
+    assert not re.search(r"(?m)^\s*conn\.commit\(\)\s*$", before_run)
+    commit_pos = re.search(r"(?m)^\s*conn\.commit\(\)\s*$", run_body).start()
+
+    # _restore_and_verify verifies BEFORE run_rollback commits:
+    # execute -> capture -> compare_states, all in the uncommitted transaction
+    verify_body = source.split("def _restore_and_verify", 1)[1].split("\ndef ", 1)[0]
+    assert not re.search(r"(?m)^\s*conn\.commit\(\)\s*$", verify_body)
+    assert "manage_transaction=False" in verify_body
+    assert verify_body.index("_execute_plan(") < verify_body.index("compare_states(")
+    assert run_body.index("_restore_and_verify(") < commit_pos
+
+    # every non-success exit rolls the transaction back
+    assert "except BaseException:" in run_body
+    assert run_body.index("except BaseException:") > commit_pos
+    assert "conn.rollback()" in run_body.split("except BaseException:", 1)[1]
+
+    # driver/transaction boundary guards
+    assert "P2_RB_CONNECTION_AUTOCOMMIT" in source
+    assert "P2_RB_TRANSACTION_NOT_IDLE" in source
+    assert "_assert_transaction_boundary" in source
+
+
+def test_docs_cover_transaction_atomicity_contract():
+    hardening = HARDENING_DOC.read_text(encoding="utf-8")
+    for needle in (
+        "Transaction atomicity",
+        "P2_RB_CONNECTION_AUTOCOMMIT",
+        "P2_RB_TRANSACTION_NOT_IDLE",
+        "autocommit",
+        "fail_point",
+    ):
+        assert needle in hardening, f"hardening doc must document: {needle}"
+
+
 def test_runbook_documents_corrected_procedure():
     doc = RUNBOOK.read_text(encoding="utf-8")
     # the destructive legacy claim is gone from every executable SQL block

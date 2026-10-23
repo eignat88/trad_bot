@@ -86,10 +86,12 @@ build the restore plan from the SNAPSHOT (never guessed):
     functions:  SECURITY INVOKER, RESET ALL, then SET each snapshot proconfig entry
     roles:      DROP only roles created by 075 (absent from the snapshot) and
                 dependency-free; pre-existing roles are preserved untouched
-execute the whole plan in ONE transaction (interrupt => full rollback)
-re-capture and verify: exact ACL tuples == snapshot, effective privileges ==
-    snapshot, roles dropped/preserved as planned      (P2_RB_VERIFICATION_FAILED)
-verdict: RESTORED_AND_VERIFIED
+execute the whole plan in ONE transaction owned by run_rollback
+re-capture and verify INSIDE that same still-uncommitted transaction:
+    exact ACL tuples == snapshot, effective privileges == snapshot,
+    roles dropped/preserved as planned      (P2_RB_VERIFICATION_FAILED)
+commit ONLY after every verification passed -> RESTORED_AND_VERIFIED
+(any failure at any point -> rollback: zero committed changes)
 ```
 
 Properties:
@@ -99,11 +101,48 @@ Properties:
 * **Scoped**: SQL never names objects outside the Phase-2 surface; the frozen
   Point-B `prospective_*` stack, other `research` objects, other roles and
   Phase-2 rows are untouched (asserted by T19/T20 and by static checks).
-* **Atomic**: single transaction; a `fail_after` test seam proves that
-  interruption leaves zero changes (T17).
+* **Atomic**: single transaction; `fail_after` and `fail_point` test seams
+  prove that interruption, verification failure, ACL/function-config mismatch
+  and failure before commit all leave zero committed changes (T17 + A01–A08).
 * **Idempotent**: a second run refuses safely (T18).
 * **Representation-aware**: NULL vs materialized ACLs are reported as
   `acl_representation` and never treated as an ACL difference.
+
+### Transaction atomicity contract (PR #191 review fix)
+
+`run_rollback()` owns the complete transaction lifecycle:
+
+1. the drift/dependency checks, every restore statement, the post-restore
+   capture (`capture_state(..., manage_transaction=False)`) and the full
+   ACL/role/function verification share **one uncommitted transaction**;
+2. the module contains exactly **one** `conn.commit()` and it executes
+   strictly **after** every post-restore verification check passed;
+3. every other exit — fail-closed refusal, `P2_RB_NOTHING_TO_ROLL_BACK`,
+   injected test failure, unexpected exception — ends in `conn.rollback()`
+   and preserves the original database state byte-for-byte.
+
+Connection settings cannot bypass the boundary: the tool refuses
+`autocommit` connections (`P2_RB_CONNECTION_AUTOCOMMIT`) and connections that
+are already inside a transaction it does not own
+(`P2_RB_TRANSACTION_NOT_IDLE`), both fail closed before anything runs. The
+deterministic failure-injection seams (`fail_after` = abort before statement
+N; `fail_point` ∈ `verify_exception` / `skip_acl_grants` /
+`skip_function_config_restore` / `before_commit`) exist purely for the
+atomicity tests and are rejected for any other value.
+
+PostgreSQL limitations to keep in mind (documented, not worked around):
+
+* `CREATE ROLE` / `DROP ROLE` are cluster-wide catalog changes: they are
+  transactional (they roll back with the transaction) but are visible to all
+  databases only at commit, and concurrent role DDL serializes on the
+  `pg_authid` locks — a long rollback window blocks other role DDL.
+* `DROP ROLE` fails while the role carries dependencies in **any** database;
+  the pre-check turns that into a fail-closed refusal
+  (`P2_RB_ROLE_DEPENDENCY_UNEXPECTED`) before any statement runs.
+* Concurrent DDL on the audited surface during the rollback window makes the
+  post-restore verification fail (`P2_RB_CONFLICTING_STATE` /
+  `P2_RB_VERIFICATION_FAILED`) and rolls everything back — the rollback must
+  run in a quiet window, as the runbook requires.
 
 ### Fail-closed codes
 
@@ -117,6 +156,8 @@ Properties:
 | `P2_RB_CONFLICTING_STATE` | state difference the audited 075 delta cannot explain, incl. object-identity drift (T15) |
 | `P2_RB_NOTHING_TO_ROLL_BACK` | safe refusal: nothing to do (T18) |
 | `P2_RB_VERIFICATION_FAILED` | post-restore verification mismatch |
+| `P2_RB_CONNECTION_AUTOCOMMIT` | connection runs with `autocommit` — no single-transaction restore possible |
+| `P2_RB_TRANSACTION_NOT_IDLE` | connection already inside a transaction the tool does not own |
 | `ABORTED_NO_CHANGES` (CLI) | interrupted/failed transaction — nothing committed (T17) |
 
 ## 5. Test matrix (T01–T20) — temporary isolated PostgreSQL 17 only
@@ -164,6 +205,19 @@ Exact ACL comparison requirement: satisfied as tuple-level comparison of
 `aclexplode()` output over `COALESCE(acl, acldefault(...))` for every captured
 object plus per-role `has_*_privilege()` — never substituted by
 SELECT/INSERT availability checks (asserted in T08 and in the unit tests).
+
+### Atomicity cases (A01–A08, same module)
+
+| ID | Scenario | Expected result | Test |
+|---|---|---|---|
+| A01 | Failure during SQL execution (`fail_after`) | 0 commits, rollback called, full 075 state hash-identical, both roles present | `test_atomic_sql_execution_failure_commits_nothing` |
+| A02 | Failure during post-verification (`fail_point=verify_exception`) | 0 commits, state unchanged | `test_atomic_post_verification_failure_commits_nothing` |
+| A03 | ACL mismatch after restoration (`fail_point=skip_acl_grants`) | `P2_RB_VERIFICATION_FAILED`, 0 commits, no partial privileges/dropped roles | `test_atomic_acl_mismatch_after_restoration_rolls_back` |
+| A04 | Function-config mismatch (`fail_point=skip_function_config_restore`) | `P2_RB_VERIFICATION_FAILED`, 0 commits, state unchanged | `test_atomic_function_config_mismatch_rolls_back` |
+| A05 | Successful restore | exactly ONE `commit()`, zero `rollback()`, verified `RESTORED_AND_VERIFIED` | `test_atomic_success_commits_exactly_once_and_verifies` |
+| A06 | Failure before commit (`fail_point=before_commit`) | 0 commits, nothing restored, roles still present | `test_atomic_failure_before_commit_leaves_no_partial_state` |
+| A07 | `autocommit` connection | refused `P2_RB_CONNECTION_AUTOCOMMIT`, nothing executed | `test_atomic_autocommit_connection_is_refused` |
+| A08 | foreign open transaction | refused `P2_RB_TRANSACTION_NOT_IDLE`, caller's state untouched | `test_atomic_foreign_open_transaction_is_refused` |
 
 ## 6. Test isolation and cleanup
 

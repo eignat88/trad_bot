@@ -641,11 +641,22 @@ def _capture_effective_privileges(cursor, state: dict, role_names: list[str]) ->
     return out
 
 
-def capture_state(conn) -> dict:
-    """Capture the full deterministic privilege state (READ-ONLY)."""
-    conn.rollback()
+def capture_state(conn, *, manage_transaction: bool = True) -> dict:
+    """Capture the full deterministic privilege state (READ-ONLY).
+
+    ``manage_transaction=True`` (the default) opens and closes its own clean
+    read-only transaction on ``conn``.  ``manage_transaction=False`` captures
+    INSIDE the caller's already-open transaction and NEVER touches its
+    lifecycle (no ``commit``/``rollback``): this is required when the caller
+    must verify uncommitted work before committing it — the rollback tool's
+    post-restore verification.  Both modes issue only SELECT/SHOW statements,
+    so the capture can never modify any state it observes.
+    """
+    if manage_transaction:
+        conn.rollback()
     with conn.cursor() as cursor:
-        cursor.execute("SET LOCAL default_transaction_read_only = on")
+        if manage_transaction:
+            cursor.execute("SET LOCAL default_transaction_read_only = on")
         cursor.execute("SELECT current_setting('server_version_num')")
         server_version_num = int(cursor.fetchone()[0])
         if server_version_num < 170000:
@@ -669,7 +680,8 @@ def capture_state(conn) -> dict:
         )
         cursor.execute("SHOW server_version")
         server_version = cursor.fetchone()[0]
-    conn.rollback()
+    if manage_transaction:
+        conn.rollback()
     state["capture_info"] = {
         "server_version": server_version,
         "server_version_num": server_version_num,

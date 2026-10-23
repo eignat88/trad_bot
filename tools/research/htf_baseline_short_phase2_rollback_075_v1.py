@@ -23,8 +23,11 @@ Guarantees
   memberships, grants outside the audited surface, dependencies in other
   databases), unexpected state changes not explained by the audited 075
   delta, missing grantees, insufficient applying role.
-* The whole restore runs in ONE transaction; an interruption (or the
-  ``--fail-after`` test seam) rolls every statement back — no partial state.
+* The whole restore runs in ONE transaction owned by ``run_rollback``: the
+  post-restore capture and verification run on that same uncommitted state,
+  the single ``commit`` happens ONLY after every verification passed, and any
+  failure (including the ``--fail-after``/``--fail-point`` test seams) ends in
+  ``rollback`` — no partial state is ever committed.
 * Roles created by 075 are dropped ONLY when the snapshot proves they did
   not exist before 075 and only when they carry no dependency anywhere.
   Roles that existed before 075 are NEVER dropped and never altered.
@@ -499,44 +502,99 @@ def build_restore_plan(before: dict, current: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # execution
 # --------------------------------------------------------------------------- #
-def _execute_plan(conn, plan: dict, fail_after: int | None = None) -> list[str]:
-    """Run the plan in ONE transaction; ``fail_after`` is a test seam.
+# TEST-ONLY fault-injection seams exercised by the atomicity integration
+# tests (see tests/test_htf_baseline_short_phase2_rollback_hardening_v1.py).
+_TEST_FAIL_POINTS = frozenset(
+    {
+        "verify_exception",
+        "skip_acl_grants",
+        "skip_function_config_restore",
+        "before_commit",
+    }
+)
 
-    The seam raises before executing statement ``fail_after`` (0-based), so
-    the interruption path (T17) is exercised exactly like a real abort: the
-    transaction rolls back and no statement of the plan persists.
+
+class _InjectedFailure(RuntimeError):
+    """Raised by the ``fail_point``/``fail_after`` test seams."""
+
+
+def _apply_fail_point(plan: dict, fail_point: str | None) -> dict:
+    """TEST-ONLY: reshape the plan so one specific failure is deterministic.
+
+    ``skip_acl_grants`` drops the re-grant half of the ACL restore (the
+    REVOKE half still runs), producing a REAL post-restore ACL mismatch that
+    the verification must refuse; ``skip_function_config_restore`` omits the
+    function-configuration restore, producing a REAL function-config
+    mismatch; ``verify_exception`` / ``before_commit`` are raised at the
+    corresponding points of ``_restore_and_verify``.  Every seam must end
+    with the transaction rolled back and the database exactly as it was
+    before the attempt.
+    """
+    if fail_point is None:
+        return plan
+    if fail_point not in _TEST_FAIL_POINTS:
+        raise ValueError(f"unknown fail_point {fail_point!r}")
+    if fail_point == "skip_acl_grants":
+        kept = [
+            item
+            for item in plan["statements"]
+            if not (
+                item["reason"].startswith("restore ACL")
+                and item["sql"].startswith("GRANT ")
+            )
+        ]
+    elif fail_point == "skip_function_config_restore":
+        kept = [
+            item
+            for item in plan["statements"]
+            if not item["reason"].startswith("restore function config")
+        ]
+    else:
+        return plan
+    return {**plan, "statements": kept}
+
+
+def _execute_plan(conn, plan: dict, fail_after: int | None = None) -> list[str]:
+    """Execute the plan's statements inside the CALLER'S transaction.
+
+    This function NEVER commits and NEVER rolls back: the transaction
+    lifecycle belongs exclusively to ``run_rollback``, so the post-restore
+    verification runs on the same uncommitted state and the single final
+    commit happens only after that verification passed.  ``fail_after`` is a
+    test seam that raises before executing statement ``fail_after``
+    (0-based), so the interruption path (T17) is exercised exactly like a
+    real abort.
     """
     executed: list[str] = []
-    try:
+    for index, item in enumerate(plan["statements"]):
+        if fail_after is not None and index == fail_after:
+            raise _InjectedFailure(f"injected failure before statement {index}")
         with conn.cursor() as cur:
-            for index, item in enumerate(plan["statements"]):
-                if fail_after is not None and index == fail_after:
-                    raise RuntimeError(f"injected failure before statement {index}")
-                cur.execute(item["sql"])
-                executed.append(item["sql"])
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
+            cur.execute(item["sql"])
+        executed.append(item["sql"])
     return executed
 
 
-def run_rollback(
+def _restore_and_verify(
     conn,
+    meta: dict,
+    before: dict,
     snapshot_path,
     *,
     dry_run: bool = False,
     fail_after: int | None = None,
+    fail_point: str | None = None,
 ) -> dict:
-    """Snapshot-driven rollback of migration 075.  Fail closed, atomic.
+    """Check, restore and VERIFY in ONE uncommitted transaction (no commit!).
 
-    Returns a report dict; raises ``FailClosed``/``NothingToRollBack``
-    without any committed change when the rollback cannot be proven safe.
+    Everything below — drift/dependency checks, every restore statement, the
+    post-restore state capture and the complete ACL/role/function
+    verification — runs in the transaction owned by ``run_rollback``.  The
+    returned report is produced only after every verification check passed;
+    ``run_rollback`` performs the single ``conn.commit()`` after this
+    function returns.  Any raise propagates to ``run_rollback``, which rolls
+    the transaction back, so a failed attempt can never leave partial state.
     """
-    if snapshot_path is None:
-        _fail("P2_RB_SNAPSHOT_REQUIRED", "a verified pre-075 snapshot is mandatory")
-    meta, before = snapmod.load_snapshot(snapshot_path)
-
     with conn.cursor() as cur:
         cur.execute("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
         is_super = bool(cur.fetchone()[0])
@@ -546,7 +604,7 @@ def run_rollback(
             "the rollback must run as a superuser (same requirement as applying 075)",
         )
 
-    current = snapmod.capture_state(conn)
+    current = snapmod.capture_state(conn, manage_transaction=False)
     if current["database"]["identity"]["name"] != before["database"]["identity"]["name"]:
         _fail(
             "P2_RB_DATABASE_MISMATCH",
@@ -583,6 +641,7 @@ def run_rollback(
         )
 
     plan = build_restore_plan(before, current)
+    plan = _apply_fail_point(plan, fail_point)
 
     report = {
         "verdict": "DRY_RUN" if dry_run else "RESTORE_PLANNED",
@@ -602,7 +661,12 @@ def run_rollback(
     executed = _execute_plan(conn, plan, fail_after=fail_after)
     report["executed_statements"] = executed
 
-    after = snapmod.capture_state(conn)
+    if fail_point == "verify_exception":
+        raise _InjectedFailure("injected failure during post-restore verification")
+
+    # verification runs on the SAME still-uncommitted transaction: it sees
+    # exactly the state that would become durable at the final commit
+    after = snapmod.capture_state(conn, manage_transaction=False)
     verification = snapmod.compare_states(before, after)
     report["verification"] = verification
     report["full_state_equal"] = verification["equal"]
@@ -639,8 +703,102 @@ def run_rollback(
             "P2_RB_VERIFICATION_FAILED",
             f"roles created by 075 are still present: {sorted(present & set(P2_ROLES))}",
         )
-    report["verdict"] = "RESTORED_AND_VERIFIED"
+    if fail_point == "before_commit":
+        raise _InjectedFailure("injected failure immediately before the final commit")
+    # every verification passed; ``run_rollback`` now performs the single,
+    # final commit of this transaction
     return report
+
+
+def _assert_transaction_boundary(conn) -> None:
+    """Fail closed unless the connection cannot bypass our transaction.
+
+    Autocommit would turn every statement into its own transaction (no atomic
+    restore possible); a connection already inside a transaction this tool
+    does not own would make the final rollback destroy the caller's
+    uncommitted work.  Both settings are refused before anything runs.
+    """
+    if getattr(conn, "autocommit", False):
+        _fail(
+            "P2_RB_CONNECTION_AUTOCOMMIT",
+            "the connection must run with autocommit disabled so the restore and "
+            "its verification share exactly one transaction",
+        )
+    status = None
+    info = getattr(conn, "info", None)
+    if info is not None:
+        status = getattr(info, "transaction_status", None)
+    if status is None:
+        getter = getattr(conn, "get_transaction_status", None)
+        if getter is not None:
+            status = getter()
+    if status is not None:
+        try:
+            idle = int(status) == 0  # 0 = TRANSACTION_STATUS_IDLE
+        except (TypeError, ValueError):
+            idle = False  # fail closed: an uninterpretable status is not IDLE
+        if not idle:
+            _fail(
+                "P2_RB_TRANSACTION_NOT_IDLE",
+                "the connection is already inside a transaction the rollback does "
+                "not own; commit or roll that transaction back first",
+            )
+
+
+def run_rollback(
+    conn,
+    snapshot_path,
+    *,
+    dry_run: bool = False,
+    fail_after: int | None = None,
+    fail_point: str | None = None,
+) -> dict:
+    """Snapshot-driven rollback of migration 075.  Fail closed, atomic.
+
+    Transaction contract (PR #191 review fix)
+    -----------------------------------------
+    ``run_rollback`` OWNS the complete transaction lifecycle:
+
+    * the drift/dependency checks, every restore statement, the post-restore
+      state capture and the full ACL/role/function verification all run in
+      ONE transaction;
+    * the ONLY ``conn.commit()`` of the whole module sits here, strictly
+      AFTER every post-restore verification passed;
+    * ANY other exit — fail-closed refusal, ``NothingToRollBack``, injected
+      test failure, unexpected exception — ends in ``conn.rollback()`` and
+      leaves the database byte-for-byte unchanged.
+
+    The connection must run with ``autocommit`` disabled and must not already
+    be inside a foreign transaction (checked up front, fail closed), so no
+    driver setting can bypass the transaction boundary.
+
+    Returns a report dict; raises ``FailClosed``/``NothingToRollBack``
+    without any committed change when the rollback cannot be proven safe.
+    """
+    if snapshot_path is None:
+        _fail("P2_RB_SNAPSHOT_REQUIRED", "a verified pre-075 snapshot is mandatory")
+    _assert_transaction_boundary(conn)
+    meta, before = snapmod.load_snapshot(snapshot_path)
+
+    try:
+        report = _restore_and_verify(
+            conn,
+            meta,
+            before,
+            snapshot_path,
+            dry_run=dry_run,
+            fail_after=fail_after,
+            fail_point=fail_point,
+        )
+        if report["verdict"] == "DRY_RUN":
+            conn.rollback()  # read-only probe: close our transaction, keep nothing
+            return report
+        conn.commit()
+        report["verdict"] = "RESTORED_AND_VERIFIED"
+        return report
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 # --------------------------------------------------------------------------- #
@@ -673,13 +831,23 @@ def main(argv=None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--fail-after", type=int, default=None,
                         help="test seam: abort before statement N (0-based)")
+    parser.add_argument(
+        "--fail-point",
+        default=None,
+        choices=sorted(_TEST_FAIL_POINTS),
+        help="test seam: inject a deterministic failure (see _TEST_FAIL_POINTS)",
+    )
     parser.add_argument("--output", default=None)
     args = parser.parse_args(argv)
 
     conn = _connect(args)
     try:
         report = run_rollback(
-            conn, args.snapshot, dry_run=args.dry_run, fail_after=args.fail_after
+            conn,
+            args.snapshot,
+            dry_run=args.dry_run,
+            fail_after=args.fail_after,
+            fail_point=args.fail_point,
         )
     except NothingToRollBack as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
