@@ -82,6 +82,12 @@ def test_no_tracked_file_modified_against_base():
         # explicit `--candle-source bybit` ExecStart and the effective-unit /
         # fail-closed verification procedure (docs-only, Phase-2 surface)
         "docs/research/HTF_BASELINE_SHORT_PHASE2_ACTIVATION_RUNBOOK_V1.md",
+        # Issue #185 FIX-4: the migration runbook's rollback section is being
+        # corrected in-place (the DROP OWNED BY claim was wrong and is replaced
+        # by the snapshot-driven, fail-closed rollback procedure). Only this
+        # Phase-2 runbook document is touched; its VERIFICATION_SQL contract
+        # block is preserved byte-for-byte.
+        "docs/research/HTF_BASELINE_SHORT_PHASE2_MIGRATION_074_075_RUNBOOK_V1.md",
     )
 
     unexpected = []
