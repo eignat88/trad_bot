@@ -12,7 +12,7 @@
 | Direction | `SHORT` (observe-only) |
 | Base commit | `4ef60d1e6bb7d2fbbd7fe2b4e3de0591995dc5ba` |
 | Machine-readable source | `app/research/htf_baseline_short_phase2_protocol_v1.py` |
-| Canonical fingerprint (SHA-256) | Recompute from the merged protocol using `protocol_fingerprint()`; reverify at review before freeze |
+| Canonical fingerprint (SHA-256) | `39accac9ddddfd1495202cd708d7dc95b6c6b93ac79d819ff3d5a02beec60de1` (VPS-verified 2026-10-23, PR #192; reverify on final commit) |
 | Delivery guarantee | **AT-LEAST-ONCE + IDEMPOTENT writes** (exactly-once NOT claimed) |
 
 The fingerprint is computed over the canonical JSON serialization
