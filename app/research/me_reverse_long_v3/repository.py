@@ -142,7 +142,7 @@ class MEReverseLongV3OutcomeRepository:
                   ON e.experiment_id = o.experiment_id
                 WHERE o.observation_id = %s
                   AND o.experiment_id = %s
-                  AND e.status = 'RUNNING'
+                  AND e.status IN ('RUNNING', 'DRAINING')
                   AND e.started_at IS NOT NULL
                   AND o.signal_time > e.started_at
                   AND o.direction = 'LONG'

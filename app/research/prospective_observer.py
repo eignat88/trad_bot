@@ -112,7 +112,7 @@ class ProspectiveOOSObserver:
             )
             row = cursor.fetchone()
             if row is not None and row[0] is not None:
-                active = self._active_status(str(row[0]))
+                active = (str(row[0]) == "RUNNING") if exp_id == "MOMENTUM_EXHAUSTION_REVERSE_LONG_V3_OOS" else self._active_status(str(row[0]))
                 self._active_cache[exp_id] = active
                 if not active:
                     logger.info(
