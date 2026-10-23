@@ -153,12 +153,67 @@ PostgreSQL limitations to keep in mind (documented, not worked around):
 | `P2_RB_APPLYING_ROLE_INSUFFICIENT` | applying role is not a superuser |
 | `P2_RB_DATABASE_MISMATCH` | snapshot taken on another database |
 | `P2_RB_ROLE_DEPENDENCY_UNEXPECTED` | role membership/ownership/cross-DB/out-of-surface dependency of a P2 role (T16) |
-| `P2_RB_CONFLICTING_STATE` | state difference the audited 075 delta cannot explain, incl. object-identity drift (T15) |
+| `P2_RB_CONFLICTING_STATE` | state difference the audited 075 delta cannot explain — incl. object-identity drift (T15), an effective-privilege flip the ACL delta does not imply, or an expected 075 grant missing from a post-075 state |
 | `P2_RB_NOTHING_TO_ROLL_BACK` | safe refusal: nothing to do (T18) |
 | `P2_RB_VERIFICATION_FAILED` | post-restore verification mismatch |
 | `P2_RB_CONNECTION_AUTOCOMMIT` | connection runs with `autocommit` — no single-transaction restore possible |
 | `P2_RB_TRANSACTION_NOT_IDLE` | connection already inside a transaction the tool does not own |
 | `ABORTED_NO_CHANGES` (CLI) | interrupted/failed transaction — nothing committed (T17) |
+
+### Effective-privilege delta classification (issue #181 fix)
+
+Problem observed on the isolated `issue181_it` cluster (PostgreSQL 17, port
+5544) with production-like application roles and ACL: after 074 -> pre-075
+snapshot -> 075, the rollback dry-run classified the 26 expected privilege
+revocations as opaque `changes_derived` instead of recognizing them as the
+audited 075 delta:
+
+* 15 x `EXECUTE` (5 Phase-2 functions x `trad_bot`/`analytics_runner`/
+  `analytics_agent`, granted through the PUBLIC function default),
+* 9 x `SELECT`/`INSERT`/`UPDATE` (3 Phase-2 tables x `trad_bot`, granted by
+  the 049/050 default privileges `trad_bot=arw` of schema `research`),
+* 2 x `USAGE`/`SELECT` (the Phase-2 sequence x `trad_bot`
+  (`trad_bot=rU` default privilege)).
+
+Root cause: `classify_changes` swept every `effective_privilege` difference
+into the `derived` bucket without validating it ("never decide the refusal"),
+so the expected delta was never recognized as acceptable — and, symmetrically,
+an arbitrary privilege flip would have been absorbed silently.
+
+Fix (FAIL CLOSED preserved and strengthened):
+
+1. **Confirmation by the exact ACL delta.** Every `effective_privilege` flip
+   must be implied by an already-classified 075 ACL entry change on the SAME
+   object and privilege, granted to the role itself, to `PUBLIC`, or to a role
+   the flip's role inherits from (`pg_auth_members` closure — the
+   `has_*_privilege()` semantics).  A removal can only explain `True->False`,
+   an addition only `False->True`; `TEMP`/`TEMPORARY` are matched as aliases.
+   Confirmed flips are classified as explained by 075 with their derivation
+   (`classification: confirmed_by_075_acl_delta`, `covered_by`); anything else
+   is `unexpected` and refuses the rollback (`P2_RB_CONFLICTING_STATE`).
+2. **Delta completeness.** 075 grants its surface unconditionally (CONNECT
+   for both P2 roles on the database, USAGE on `research`, SELECT on the
+   three tables, EXECUTE on the two callable functions).  Once the state
+   moved away from the snapshot, a missing one of those pairs proves a
+   post-075 foreign REVOKE of a 075 grant — a drift a before-vs-current diff
+   cannot see — and fails closed as well.  A state identical to the snapshot
+   still refuses as `P2_RB_NOTHING_TO_ROLL_BACK` (T18).
+3. **Machine-readable report.** dry-run/rollback reports now carry
+   `changes_unexplained: []` and
+   `classification: {explained_by_075, effective_privilege_confirmed,
+   derived_representation_only, unexplained: 0}` so the acceptance gate can
+   require `unexplained = 0` explicitly.  `changes_derived` is now strictly
+   `acl_representation` (stored-ACL NULL vs materialized form).
+
+Regression tests (`tests/test_htf_baseline_short_phase2_rollback_075_effective_privilege_delta_v1.py`):
+production-like roles + default ACL + PUBLIC EXECUTE confirmed end-to-end
+(dry-run = all 26 confirmed, `unexplained = 0`; execution =
+`RESTORED_AND_VERIFIED`, `full_state_equal`, `effective_privileges_equal`,
+`trad_bot`/`analytics_runner`/`analytics_agent` preserved), plus negative
+scenarios that must keep failing closed: foreign `GRANT`, foreign `REVOKE`
+(including a revoked 075 grant), role attribute drift, membership drift,
+unknown object, orphan effective-privilege flip, wrong-direction flip and a
+corrupted snapshot.
 
 ## 5. Test matrix (T01–T20) — temporary isolated PostgreSQL 17 only
 
