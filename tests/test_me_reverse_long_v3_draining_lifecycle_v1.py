@@ -52,6 +52,8 @@ def test_sql_is_install_only_and_blocks_premature_cancel_or_reactivation():
     sql = (Path(__file__).resolve().parents[1] /
            "sql/migrations/076_me_reverse_long_v3_draining_lifecycle.sql").read_text()
     assert "CREATE TRIGGER trg_guard_me_reverse_long_v3_drain" in sql
+    assert "ADD CONSTRAINT prospective_experiment_status_check" in sql
+    assert "experiment_id = 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V3_OOS'" in sql
     assert "OLD.status = 'RUNNING' AND NEW.status = 'CANCELLED'" in sql
     assert "OLD.status = 'DRAINING' AND NEW.status = 'CANCELLED'" in sql
     assert "r.status IS DISTINCT FROM 'FINALIZED'" in sql
