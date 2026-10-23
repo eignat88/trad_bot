@@ -657,16 +657,50 @@ def _admin_connect():
     )
 
 
+def _preexisting_p2_roles() -> set:
+    """Phase-2 roles that already exist on the configured test cluster.
+
+    These roles belong to whatever else uses the cluster: they are NEVER
+    deleted by this harness (Codex Review P1) and their presence makes the
+    clean-state production-like scenarios refuse to run, because those
+    scenarios assert the exact 075-creates-the-roles behaviour.
+    """
+    admin = _admin_connect()
+    try:
+        with admin.cursor() as cur:
+            cur.execute(
+                "SELECT rolname FROM pg_roles WHERE rolname IN (%s, %s)",
+                (rb.ADMIN_ROLE, rb.OBSERVER_ROLE),
+            )
+            return {row[0] for row in cur.fetchall()}
+    finally:
+        admin.close()
+
+
+def _require_clean_p2_roles() -> None:
+    """Refuse to run when Phase-2 roles pre-exist (fail-safe, never destructive)."""
+    preexisting = _preexisting_p2_roles()
+    if preexisting:
+        pytest.skip(
+            "Phase-2 roles already exist on the test cluster "
+            f"({', '.join(sorted(preexisting))}); refusing to run — "
+            "pre-existing cluster roles are never touched"
+        )
+
+
 @contextmanager
 def _tracked_resources():
     created_databases: list[str] = []
     created_roles: list[str] = []
     connections: list = []
+    # roles that predate this test belong to the cluster and must survive it
+    preexisting_p2 = _preexisting_p2_roles()
     try:
         yield {
             "databases": created_databases,
             "roles": created_roles,
             "connections": connections,
+            "preexisting_p2": preexisting_p2,
         }
     finally:
         for conn in connections:
@@ -691,7 +725,16 @@ def _tracked_resources():
                         except Exception:
                             admin.rollback()
                             time.sleep(0.75)
-                for role in list(created_roles) + [rb.ADMIN_ROLE, rb.OBSERVER_ROLE]:
+                # delete ONLY roles this test created: its own tracked roles
+                # plus Phase-2 roles that did NOT exist at teardown entry
+                # (Codex Review P1 — pre-existing cluster roles are never
+                # dropped)
+                droppable_p2 = [
+                    role
+                    for role in (rb.ADMIN_ROLE, rb.OBSERVER_ROLE)
+                    if role not in preexisting_p2
+                ]
+                for role in list(created_roles) + droppable_p2:
                     try:
                         cur.execute(f'DROP ROLE IF EXISTS "{role}"')
                     except Exception:
@@ -711,8 +754,16 @@ def _ensure_role(resources, conn, role: str, ddl: str) -> None:
         resources["roles"].append(role)
 
 
-def _provision_prodlike(resources):
-    """074 under production-like roles + default ACL (049/050 semantics)."""
+def _provision_prodlike(resources, *, require_clean_p2: bool = True):
+    """074 under production-like roles + default ACL (049/050 semantics).
+
+    With ``require_clean_p2`` (default) the scenario refuses to run when the
+    two Phase-2 roles already exist on the cluster — the clean-state
+    assertions expect migration 075 to create them, and pre-existing cluster
+    roles must never be touched by this harness.
+    """
+    if require_clean_p2:
+        _require_clean_p2_roles()
     name = f"trad_bot_p2_it_effdelta_{uuid.uuid4().hex[:8]}"
     _assert_safe_database(name)
     admin = _admin_connect()
@@ -1010,3 +1061,72 @@ def test_it_corrupted_snapshot_blocks_rollback(tmp_path):
         after = _capture(conn)
         assert snap.payload_sha256(after) == snap.payload_sha256(before)
         conn.close()
+
+
+@itmark
+def test_it_preexisting_p2_roles_are_never_deleted_by_teardown(tmp_path):
+    """Regression (Codex Review P1): Phase-2 roles that already exist on the
+    cluster belong to someone else.  The harness must (a) refuse to run its
+    clean-state scenarios while they exist, (b) never drop them at teardown,
+    and (c) still classify/restore correctly when 075 only grants to them."""
+    admin = _admin_connect()
+    admin.autocommit = True
+    created_here: list[str] = []
+    try:
+        with admin.cursor() as cur:
+            for role, ddl in (
+                (rb.OBSERVER_ROLE, f'CREATE ROLE "{rb.OBSERVER_ROLE}" WITH LOGIN NOINHERIT'),
+                (rb.ADMIN_ROLE, f'CREATE ROLE "{rb.ADMIN_ROLE}" WITH NOLOGIN NOINHERIT'),
+            ):
+                cur.execute(
+                    f"DO $r$ BEGIN IF NOT EXISTS "
+                    f"(SELECT 1 FROM pg_roles WHERE rolname = '{role}') "
+                    f"THEN {ddl}; END IF; END $r$"
+                )
+                created_here.append(role)
+
+        # (a) the clean-state scenarios REFUSE to run while the roles exist
+        assert _preexisting_p2_roles() == {rb.ADMIN_ROLE, rb.OBSERVER_ROLE}
+        with pytest.raises(pytest.skip.Exception):
+            _require_clean_p2_roles()
+
+        with _tracked_resources() as res:
+            # the harness knows the roles predate the test
+            assert res["preexisting_p2"] == {rb.ADMIN_ROLE, rb.OBSERVER_ROLE}
+            conn, _ = _provision_prodlike(res, require_clean_p2=False)
+            pre = _capture(conn)
+            snap_path = _snapshot_file(tmp_path, pre, "effdelta_preexist_pre")
+            _apply_075(conn)
+            report = rb.run_rollback(conn, snap_path, dry_run=True)
+
+            # pre-existing roles are preserved by design — never dropped
+            assert report["roles_to_drop"] == []
+            assert report["roles_preserved"] == [rb.ADMIN_ROLE, rb.OBSERVER_ROLE]
+            # the 26 expected application-role changes are still confirmed
+            # exactly by the 075 ACL delta (FAIL-CLOSED semantics intact)
+            breakdown = _app_effective_breakdown(report["changes_explained_by_075"])
+            assert sum(breakdown.values()) == N_EFFECTIVE
+            assert report["changes_unexplained"] == []
+            assert report["classification"]["unexplained"] == 0
+
+            report2 = rb.run_rollback(conn, snap_path)
+            assert report2["verdict"] == "RESTORED_AND_VERIFIED"
+            assert report2["roles_dropped_verified"] == []  # nothing dropped
+            post = _capture(conn)
+            for role in (rb.ADMIN_ROLE, rb.OBSERVER_ROLE):
+                assert role in post["roles"]
+                # pre-existing role attributes are untouched
+                assert post["roles"][role] == pre["roles"][role]
+            conn.close()
+
+        # (b) THE regression assertion: teardown preserved both roles
+        assert _preexisting_p2_roles() == {rb.ADMIN_ROLE, rb.OBSERVER_ROLE}
+    finally:
+        # this test created the roles as fixtures and cleans up ITS OWN roles
+        with admin.cursor() as cur:
+            for role in created_here:
+                try:
+                    cur.execute(f'DROP ROLE IF EXISTS "{role}"')
+                except Exception:
+                    admin.rollback()
+        admin.close()
