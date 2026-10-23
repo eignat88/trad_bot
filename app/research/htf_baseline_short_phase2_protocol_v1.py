@@ -6,12 +6,13 @@ studies:
     HTF_KEYLEVEL_BASELINE_SHORT_CAUSAL_OBSERVER_V1
     HTF_BASELINE_SHORT_CAUSAL_EPISODE_STATEFUL_OBSERVER_V1
 
-Status: PROTOCOL_NOT_FROZEN. This module is a *candidate* protocol. It becomes
-frozen only through explicit operator approval, after which the SHA-256
-fingerprint below is recorded immutably together with the approving commit.
+Status: PROTOCOL_NOT_FROZEN. All six candidate parameter values received
+explicit operator approval on 2026-10-23 (Issue #186). The approved values
+are not an activation or timestamp freeze; that requires a separate change,
+fingerprint verification and production authorization.
 
-Every field that requires an operator decision is marked
-``OPERATOR_APPROVAL_REQUIRED`` and carries a PROPOSED (unapproved) default.
+Each of the six operator-decision fields is marked ``OPERATOR_APPROVED``;
+their values are unchanged from the reviewed candidate.
 No value in this file was derived from retrospective PnL optimization; such
 optimization is explicitly prohibited by the protocol itself.
 
@@ -26,6 +27,9 @@ import json
 PROTOCOL_SCHEMA = "HTF_PHASE2_PROTOCOL_V1"
 PROTOCOL_STATUS = "PROTOCOL_NOT_FROZEN"
 OPERATOR_APPROVAL_REQUIRED = "OPERATOR_APPROVAL_REQUIRED"
+OPERATOR_APPROVED = "OPERATOR_APPROVED"
+OPERATOR_APPROVAL_ISSUE = 186
+OPERATOR_APPROVAL_DATE_UTC = "2026-10-23"
 
 #: Fixed identity of the prospective experiment. Must never be reused from the
 #: Point-B experiments (HTF_KEYLEVEL_SR_BREAK_POINT_B_V1_PROSPECTIVE,
@@ -137,7 +141,7 @@ PROTOCOL_V1: dict = {
         "level_retirement_policy": {
             "rule": "LEVEL_ELIGIBILITY_LOSS_IS_NON_TERMINAL",
             "detail": "eligibility loss never deletes pending and never retires a level; it is recorded diagnostically only",
-            "status": OPERATOR_APPROVAL_REQUIRED,
+            "status": OPERATOR_APPROVED,
             "alternative_requires_new_protocol_version": True,
         },
         "multi_level_same_bar": "each level advances independently; multiple same-bar emissions allowed; deterministic sorted level ordering",
@@ -159,15 +163,15 @@ PROTOCOL_V1: dict = {
         "historical_events_as_oos": "FORBIDDEN",
     },
     "geometry": {
-        "proximity_ms": {"value": 300000, "status": OPERATOR_APPROVAL_REQUIRED},
-        "price_bps": {"value": 20, "status": OPERATOR_APPROVAL_REQUIRED},
+        "proximity_ms": {"value": 300000, "status": OPERATOR_APPROVED},
+        "price_bps": {"value": 20, "status": OPERATOR_APPROVED},
         "boundaries": "inclusive provisional baseline; boundary sensitivity (0/10/20/30/40 bps) must be approved before freeze",
         "ambiguity": "multiple prior anchors fail closed without merge (AMBIGUOUS_PRIOR_ANCHORS)",
     },
     "maturity_gates": {
-        "minimum_confirmations": {"value": 30, "status": OPERATOR_APPROVAL_REQUIRED},
-        "minimum_symbols": {"value": 5, "status": OPERATOR_APPROVAL_REQUIRED},
-        "minimum_active_days": {"value": 14, "status": OPERATOR_APPROVAL_REQUIRED},
+        "minimum_confirmations": {"value": 30, "status": OPERATOR_APPROVED},
+        "minimum_symbols": {"value": 5, "status": OPERATOR_APPROVED},
+        "minimum_active_days": {"value": 14, "status": OPERATOR_APPROVED},
         "readout_before_maturity": "DIAGNOSTIC_ONLY",
     },
     "metrics": {
