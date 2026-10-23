@@ -117,6 +117,18 @@ def _tracked_resources():
     """Track every disposable database/role a test creates and clean up."""
     created_databases: list[str] = []
     created_roles: list[str] = []
+    # Phase-2 roles that predate this test belong to the cluster and must
+    # survive it — only roles created by the test are ever dropped
+    admin0 = _admin_connect()
+    try:
+        with admin0.cursor() as cur:
+            cur.execute(
+                "SELECT rolname FROM pg_roles WHERE rolname IN (%s, %s)",
+                (ADMIN_ROLE, OBSERVER_ROLE),
+            )
+            preexisting_p2 = {row[0] for row in cur.fetchall()}
+    finally:
+        admin0.close()
     try:
         yield {"databases": created_databases, "roles": created_roles}
     finally:
@@ -131,10 +143,17 @@ def _tracked_resources():
                         (dbname,),
                     )
                     cur.execute(f'DROP DATABASE IF EXISTS "{dbname}"')
-                # test-owned roles: 075 roles plus any role this test created;
+                # test-owned roles only: any role this test created plus the
+                # Phase-2 roles this test created (075) — never a Phase-2 role
+                # that already existed on the cluster (Codex Review P1);
                 # each statement is best-effort so a failing assertion in the
                 # test never hides the cleanup
-                for role in list(created_roles) + [ADMIN_ROLE, OBSERVER_ROLE]:
+                droppable_p2 = [
+                    role
+                    for role in (ADMIN_ROLE, OBSERVER_ROLE)
+                    if role not in preexisting_p2
+                ]
+                for role in list(created_roles) + droppable_p2:
                     try:
                         cur.execute(f'DROP ROLE IF EXISTS "{role}"')
                     except Exception:

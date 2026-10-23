@@ -23,6 +23,14 @@ Guarantees
   memberships, grants outside the audited surface, dependencies in other
   databases), unexpected state changes not explained by the audited 075
   delta, missing grantees, insufficient applying role.
+* Every effective-privilege difference is confirmed against the EXACT ACL
+  delta of migration 075 before it is accepted: the expected revocations
+  from ``PUBLIC``/``trad_bot``/``analytics_runner``/``analytics_agent`` and
+  the expected grants to the two Phase-2 roles (including consequences via
+  PUBLIC defaults, the ``trad_bot=arw``/``trad_bot=rU`` default-privilege
+  grants and role inheritance) are classified as the audited delta; any
+  effective-privilege flip the delta does not imply is unexplained state and
+  FAILS CLOSED.  No arbitrary ACL change is ever accepted.
 * The whole restore runs in ONE transaction owned by ``run_rollback``: the
   post-restore capture and verification run on that same uncommitted state,
   the single ``commit`` happens ONLY after every verification passed, and any
@@ -146,6 +154,143 @@ def _proconfig_change_explained(before: list, after: list) -> bool:
     return sp_after == {_SEARCH_PATH_TARGET}
 
 
+# privilege names used by aclexplode() vs has_*_privilege() differ for TEMP
+_PRIVILEGE_ALIASES = {
+    "TEMP": {"TEMP", "TEMPORARY"},
+    "TEMPORARY": {"TEMP", "TEMPORARY"},
+}
+
+
+def _privilege_source_roles(role: str, before: dict) -> frozenset:
+    """Roles whose ACL grants govern ``role``'s effective privileges.
+
+    ``has_*_privilege()`` resolves an ACL entry for ``grantee`` as a privilege
+    of ``role`` whenever ``role`` has the privileges of ``grantee``:
+    ``grantee == role`` itself, ``grantee == PUBLIC`` (implicit for every
+    role), or ``grantee`` reachable through ``pg_auth_members``
+    (``has_privs_of_role`` covers inheritance chains and SET ROLE chains).
+    Role memberships are an authoritative input of the classifier (any
+    membership change not explained by the snapshot is refused before this
+    runs), so the closure taken from the pre-075 snapshot is exact.
+    """
+    sources = {role, "PUBLIC"}
+    parents: dict = {}
+    for row in before.get("memberships", []):
+        granted, member = row[0], row[1]
+        parents.setdefault(member, set()).add(granted)
+    stack = [role]
+    while stack:
+        current = stack.pop()
+        for granted in parents.get(current, ()):
+            if granted not in sources:
+                sources.add(granted)
+                stack.append(granted)
+    return frozenset(sources)
+
+
+def _effective_change_explained(
+    change: dict, explained_acl_changes: list, before: dict
+) -> list:
+    """Return the 075 ACL delta entries that imply an effective-privilege flip.
+
+    An effective-privilege difference is a COMPUTED consequence of ACL entry
+    changes (plus role/membership/default-privilege inputs, each classified
+    separately).  It is accepted only when the exact audited 075 ACL delta
+    contains an entry on the SAME object and privilege, granted to the role
+    itself / PUBLIC / a role it inherits from, whose removal can only produce
+    a ``True -> False`` flip or whose addition can only produce a
+    ``False -> True`` flip.  Anything else — a flip with no covering 075
+    entry, a flip on an unknown object, or the wrong direction — is NOT an
+    acceptable delta and is returned as unexplained (FAIL CLOSED).
+    """
+    role = change["role"]
+    obj = change["object"]
+    priv = change["privilege"]
+    before_value, after_value = change["before"], change["after"]
+    if type(before_value) is not bool or type(after_value) is not bool:
+        return []
+    if before_value == after_value:
+        return []
+    accepted = _PRIVILEGE_ALIASES.get(priv, {priv})
+    sources = _privilege_source_roles(role, before)
+    covering = []
+    for entry in explained_acl_changes:
+        if entry.get("object") != obj:
+            continue
+        entry_priv = entry.get("entry", [None, None, None])[2]
+        if entry_priv not in accepted:
+            continue
+        grantee = entry.get("entry", [None, None])[1]
+        if grantee not in sources:
+            continue
+        if entry.get("action") == "removed" and before_value and not after_value:
+            covering.append(entry)
+        elif entry.get("action") == "added" and after_value and not before_value:
+            covering.append(entry)
+    return covering
+
+
+def _expected_075_grant_surface(current: dict) -> list:
+    """(object key, grantee, privilege) pairs migration 075 ALWAYS grants.
+
+    075 grants these unconditionally (an idempotent re-grant keeps the tuple
+    present), so a genuinely post-075 state must contain every one of them.
+    A missing pair proves a post-075 foreign REVOKE removed a 075 grant —
+    a drift that a pure before-vs-current diff cannot see, because the
+    missing addition simply looks like "less of the 075 delta".
+    """
+    db_key = current["database"]["key"]
+    research_key = f"schema:{snapmod.AFFECTED_SCHEMA}"
+    surface = [
+        (db_key, OBSERVER_ROLE, "CONNECT"),
+        (db_key, ADMIN_ROLE, "CONNECT"),
+        (research_key, OBSERVER_ROLE, "USAGE"),
+        (research_key, ADMIN_ROLE, "USAGE"),
+    ]
+    for key in sorted(P2_TABLE_KEYS):
+        surface.append((key, OBSERVER_ROLE, "SELECT"))
+        surface.append((key, ADMIN_ROLE, "SELECT"))
+    surface.append((INSERT_FN_KEY, OBSERVER_ROLE, "EXECUTE"))
+    surface.append((ACTIVATE_FN_KEY, ADMIN_ROLE, "EXECUTE"))
+    return surface
+
+
+def check_075_delta_complete(before: dict, current: dict, changes: list) -> list:
+    """FAIL CLOSED records for expected 075 grants missing from ``current``.
+
+    Only enforced when the state actually moved away from the snapshot (any
+    non-representation change): a state identical to the pre-075 snapshot has
+    nothing to roll back and is refused as ``NothingToRollBack`` instead.
+    """
+    if not any(c["kind"] != "acl_representation" for c in changes):
+        return []
+    objects = snapmod._objects_by_key(current)
+    missing = []
+    for key, grantee, privilege in _expected_075_grant_surface(current):
+        entry = objects.get(key)
+        if entry is None:
+            missing.append(
+                {
+                    "kind": "delta_completeness",
+                    "object": key,
+                    "action": "expected_object_missing",
+                    "expected": [grantee, privilege],
+                }
+            )
+            continue
+        present = {(e[1], e[2]) for e in entry.get("acl_effective", [])}
+        if (grantee, privilege) not in present:
+            missing.append(
+                {
+                    "kind": "delta_completeness",
+                    "object": key,
+                    "action": "missing_expected_acl_entry",
+                    "expected": [grantee, privilege],
+                }
+            )
+    return missing
+
+
 def _acl_change_explained(change: dict, before: dict, database_key: str, research_key: str) -> bool:
     """True only for ACL changes that migration 075 is known to produce."""
     obj = change["object"]
@@ -195,11 +340,25 @@ def _object_from_state(state: dict, key: str):
 def classify_changes(changes: list, before: dict, current: dict) -> tuple[list, list, list]:
     """Split state differences into (explained_by_075, derived, unexpected).
 
-    ``derived`` holds differences that are computed state (per-role effective
-    privileges and stored-ACL representation).  They can only change when an
-    authoritative input (ACL entry, role, membership, default privileges)
-    changes, and every such input is classified above; they are verified
-    exactly at the end of the rollback and never decide the refusal.
+    ``derived`` holds differences that are pure computed representation
+    (stored-ACL NULL vs materialized form with an identical effective tuple
+    set).  They can only change when an authoritative input changes, they are
+    verified exactly at the end of the rollback and never decide the refusal.
+
+    ``effective_privilege`` differences are NOT blindly derived: every one of
+    them is confirmed against the exact ACL delta of migration 075 (see
+    ``_effective_change_explained``).  A flip that the audited delta implies —
+    the expected revocations from ``PUBLIC``/application roles or the expected
+    grants to the two Phase-2 roles, including their effects through role
+    inheritance and the PUBLIC defaults — is classified as explained by 075
+    with its derivation recorded.  A flip the delta does NOT imply is
+    ``unexpected`` and FAILS CLOSED like any other unexplained change; no
+    arbitrary ACL/privilege change is ever accepted silently.
+
+    The classifier also enforces delta completeness
+    (``check_075_delta_complete``): once the state moved away from the
+    snapshot, every grant 075 unconditionally creates must still be present,
+    so a post-075 foreign REVOKE of a 075 grant fails closed as well.
     """
     database_key = current["database"]["key"]
     research_key = f"schema:{snapmod.AFFECTED_SCHEMA}"
@@ -214,10 +373,14 @@ def classify_changes(changes: list, before: dict, current: dict) -> tuple[list, 
             affected_oids.add(("pg_proc", fn["identity"]["oid"]))
 
     explained, derived, unexpected = [], [], []
+    effective_changes = []
     for change in changes:
         kind = change["kind"]
-        if kind in ("acl_representation", "effective_privilege"):
+        if kind == "acl_representation":
             derived.append(change)
+            continue
+        if kind == "effective_privilege":
+            effective_changes.append(change)
             continue
         ok = False
         if kind == "role" and change.get("action") == "added":
@@ -255,6 +418,28 @@ def classify_changes(changes: list, before: dict, current: dict) -> tuple[list, 
             # not explain; a removal can never be produced by 075
             ok = False
         (explained if ok else unexpected).append(change)
+
+    # second pass: every effective-privilege flip must be implied by the
+    # already-classified (explained) ACL delta of 075 — no exceptions
+    explained_acl_changes = [c for c in explained if c["kind"] == "acl_entry"]
+    for change in effective_changes:
+        covering = _effective_change_explained(change, explained_acl_changes, before)
+        if covering:
+            annotated = dict(change)
+            annotated["classification"] = "confirmed_by_075_acl_delta"
+            annotated["covered_by"] = sorted(
+                f"{e['action']} ({e['entry'][0]}, {e['entry'][1]}, "
+                f"{e['entry'][2]}) on {e['object']}"
+                for e in covering
+            )
+            explained.append(annotated)
+        else:
+            unexpected.append(change)
+
+    # completeness gate: when the state moved away from the snapshot, every
+    # grant 075 unconditionally creates must still be present — a missing one
+    # is a post-075 foreign REVOKE and must fail closed
+    unexpected.extend(check_075_delta_complete(before, current, changes))
     return explained, derived, unexpected
 
 
@@ -649,6 +834,18 @@ def _restore_and_verify(
         "snapshot_meta": meta,
         "changes_explained_by_075": explained,
         "changes_derived": derived,
+        # fail-closed contract: unexpected changes abort above, so a produced
+        # report always has exactly ZERO unexplained changes
+        "changes_unexplained": [],
+        "classification": {
+            "explained_by_075": len(explained),
+            "effective_privilege_confirmed": sum(
+                1 for c in explained
+                if c.get("classification") == "confirmed_by_075_acl_delta"
+            ),
+            "derived_representation_only": len(derived),
+            "unexplained": 0,
+        },
         "statements": [item["sql"] for item in plan["statements"]],
         "statement_reasons": [item["reason"] for item in plan["statements"]],
         "roles_to_drop": plan["roles_to_drop"],
