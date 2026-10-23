@@ -70,7 +70,7 @@ def test_successful_atomic_write():
     assert result == "INSERTED_OR_UPDATED"
     assert cursor.execute.call_count == 2
     assert "FOR UPDATE OF o" in cursor.execute.call_args_list[0].args[0]
-    assert "status = 'RUNNING'" in cursor.execute.call_args_list[0].args[0]
+    assert "status IN ('RUNNING', 'DRAINING')" in cursor.execute.call_args_list[0].args[0]
     assert "DO UPDATE SET" in cursor.execute.call_args_list[1].args[0]
     assert "<> 'FINALIZED'" in cursor.execute.call_args_list[1].args[0]
     conn.commit.assert_called_once()
