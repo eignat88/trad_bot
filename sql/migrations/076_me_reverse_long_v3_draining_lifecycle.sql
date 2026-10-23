@@ -2,6 +2,21 @@
 -- Deployment order: code + this migration -> controlled operator RUNNING->DRAINING
 -- -> 100% FINALIZED -> controlled operator DRAINING->CANCELLED.
 BEGIN;
+-- Migration 050's existing status CHECK rejects DRAINING. Replace it with
+-- the identical original statuses plus ONE scoped V3-only drain exception.
+-- This stays idempotent when migration 076 is reapplied.
+ALTER TABLE research.prospective_experiment
+DROP CONSTRAINT IF EXISTS prospective_experiment_status_check;
+ALTER TABLE research.prospective_experiment
+ADD CONSTRAINT prospective_experiment_status_check
+CHECK (
+    status IN ('READY_TO_START','RUNNING','PAUSED','COMPLETED','CANCELLED')
+    OR (
+        experiment_id = 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V3_OOS'
+        AND status = 'DRAINING'
+    )
+);
+
 CREATE OR REPLACE FUNCTION research.guard_me_reverse_long_v3_drain_lifecycle()
 RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE unfinished bigint;
