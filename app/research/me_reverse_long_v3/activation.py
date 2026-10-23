@@ -58,7 +58,7 @@ def is_v3_evaluator_activated(
         return False
     if registry_spec.get("status") != "RUNNING":
         return False
-    if db_status != "RUNNING" or db_started_at is None:
+    if db_status not in {"RUNNING", "DRAINING"} or db_started_at is None:
         return False
 
     try:
