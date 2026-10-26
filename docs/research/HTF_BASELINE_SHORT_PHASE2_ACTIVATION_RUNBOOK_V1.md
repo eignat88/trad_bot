@@ -7,6 +7,20 @@ activation is explicit, ordered and auditable.**
 Every step below requires explicit operator instruction. No step is automated,
 none is part of CI, merge or deployment.
 
+> **Issue #197 update (frozen protocol + timestamp authority V1).** The
+> protocol module is now `FROZEN` (fingerprint pinned
+> `22fa0c08eed92df7bb6e94576987305343a71083f3129f3ce4acd07c287cb3f0`) and the
+> freeze timestamp is NO LONGER stored in Git. It is chosen at the separate
+> operator GO and materialized as an operator-approved, immutable **freeze
+> record** claimed through
+> `tools/research/htf_baseline_short_phase2_freeze_record_v1.py`
+> (`mint` → `claim` → `verify`). The observer unit now passes
+> `--freeze-record /opt/trad_bot/etc/htf_phase2_freeze_record.json`; without a
+> valid, mutually consistent freeze record the registration gate refuses
+> startup (exit 3, zero observations). Design rationale and the partial-failure
+> matrix: `HTF_BASELINE_SHORT_PHASE2_ISSUE197_FROZEN_TIMESTAMP_AUTHORITY_V1.md`.
+> Nothing here authorizes activation — `PHASE_2_NO_GO` remains in force.
+
 > **Issue #184 update (systemd Bybit wiring).** The observer unit now selects
 > the Bybit closed-candle source **explicitly** via `--candle-source bybit` in
 > `ExecStart`. The former CSV runtime limitation is gone: CSV remains only the
@@ -37,18 +51,36 @@ none is part of CI, merge or deployment.
 
 ## 1. Protocol freeze (operator)
 
-1. Apply any approved parameter decisions to
-   `app/research/htf_baseline_short_phase2_protocol_v1.py` **locally**, run the
-   full test matrix, and commit.
-2. Compute and record the fingerprint:
+**Implemented by PR for issue #197 — the specification freeze is DONE; the
+timestamp/activation gates below are NOT.**
+
+1. The protocol module carries `PROTOCOL_STATUS = "FROZEN"` with the pinned
+   `FROZEN_PROTOCOL_FINGERPRINT`; the six approved values, causal contracts and
+   identity rules are unchanged (regression-tested). Any later parameter change
+   needs a NEW protocol version, a NEW experiment version and a NEW freeze.
+2. Verify on the deployed commit (read-only):
 
    ```bash
-   python -c "from app.research.htf_baseline_short_phase2_protocol_v1 import protocol_fingerprint; print(protocol_fingerprint())"
+   python - <<'PY'
+   from app.research.htf_baseline_short_phase2_protocol_v1 import (
+       PROTOCOL_STATUS, APPROVED_FREEZE_TS, approved_freeze_ts,
+       protocol_fingerprint, verify_frozen_fingerprint, operator_decisions_pending,
+   )
+   print("status", PROTOCOL_STATUS)
+   print("freeze_ts_in_git", APPROVED_FREEZE_TS, approved_freeze_ts())
+   print("pending", operator_decisions_pending())
+   print("fingerprint", protocol_fingerprint())
+   print("pin_ok", verify_frozen_fingerprint())
+   PY
    ```
 
+   Expected: `FROZEN`, `None`, `[]`, fingerprint
+   `22fa0c08eed92df7bb6e94576987305343a71083f3129f3ce4acd07c287cb3f0`,
+   `True`. ANY deviation is a hard STOP.
 3. Record `FROZEN + <commit sha> + <fingerprint> + <operator> + <date>` in the
-   change log. The protocol is now frozen; any later change needs a new
-   version, a new experiment version and a new freeze.
+   change log. The protocol carries NO timestamp on purpose: the freeze
+   timestamp is chosen at the activation GO (§3) so it can never go stale
+   during review/merge/CI/deployment.
 
 ## 2. Database migration (operator-approved, separate from merge)
 
@@ -76,33 +108,71 @@ none is part of CI, merge or deployment.
 ## 3. Activation (operator, one deliberate action)
 
 **None of the steps below may run until a separate `PHASE_2_GO` decision is
-issued.** The section records the future, ordered procedure.
+issued.** The section records the future, ordered procedure. Timestamp
+authority V1 (issue #197): the `FREEZE_TS` is chosen HERE — at the activation
+GO, as close to the database claim as possible — and never earlier.
 
-Freeze timestamp selection rules:
+Freeze timestamp selection rules (enforced, not advisory):
 
-* choose a **fresh** UTC timestamp at/after the moment activation readiness is
-  reached — **never** `2026-10-06T14:00:00Z` (Point-B), never a past timestamp;
+* chosen at the GO by the `mint` tool from the **PostgreSQL server clock**
+  (or passed explicitly and validated against it); never `2026-10-06T14:00:00Z`
+  (Point-B), never a past timestamp, never a re-used one;
+* claimable only inside the DB acceptance window `now()-60s .. now()+5m`
+  (checked in `mint`/`claim` AND inside `activate()`);
 * `signal_time > freeze_ts` and `first_touch_time > freeze_ts` are strict;
 * everything at or before the freeze is ineligible forever.
 
-1. Prepare the two operator-maintained configuration artifacts (§12) — the
+1. Prepare the operator-maintained configuration artifacts (§12) — the
    dedicated secrets file `htf_phase2_observer.env` and the runtime activation
-   config `htf_phase2_activation.json`. Neither is ever generated
-   automatically; neither may be committed to Git.
-2. Activate the experiment (sets status RUNNING, freeze, fingerprint — still
-   `observer_enabled = FALSE`):
+   config path `htf_phase2_activation.json` (written by `claim`, step 3).
+   None is ever generated automatically; none may be committed to Git.
+2. **Mint the freeze record** (operator GO; writes nothing to the database):
 
-   ```sql
-   SELECT research.htf_baseline_short_phase2_activate(
-       'HTF_KEYLEVEL_BASELINE_SHORT_CAUSAL_OBSERVER_V1',
-       '<FREEZE_TS>', '<FROZEN_FINGERPRINT>');
+   ```bash
+   python tools/research/htf_baseline_short_phase2_freeze_record_v1.py mint \
+     --operator-approval-ref "<GO reference + operator identity>" \
+     --issued-by "<operator>" --record-id "$(uuidgen)" \
+     --out /opt/trad_bot/etc/htf_phase2_freeze_record.json
    ```
 
-3. Copy the same `<FREEZE_TS>` and `<FROZEN_FINGERPRINT>` into the runtime
-   activation config used by the observer so all three freeze sources agree
-   (protocol constant / DB registration / activation config). Any mismatch
-   makes the runner fail closed (exit 3, no observations).
-4. Enable the observer (still a separate action):
+   Record the printed `record_sha256` + canonical JSON in the change log
+   (independent verification recipe and its limits — tamper evidence only,
+   NOT a signature — in
+   `HTF_BASELINE_SHORT_PHASE2_ISSUE197_FROZEN_TIMESTAMP_AUTHORITY_V1.md` §4.2).
+   `mint` refuses on pinned-fingerprint drift, non-canonical timestamps,
+   out-of-window values and legacy boundary timestamps.
+3. **Claim** (same GO, immediately after) — this is the ONE sanctioned
+   activation path (`research.htf_baseline_short_phase2_activate(...)`), then
+   the runtime activation config is written and all three authorities are
+   re-verified:
+
+   ```bash
+   python tools/research/htf_baseline_short_phase2_freeze_record_v1.py claim \
+     --record /opt/trad_bot/etc/htf_phase2_freeze_record.json \
+     --activation-out /opt/trad_bot/etc/htf_phase2_activation.json
+   ```
+
+   Expected terminal line: `THREE_AUTHORITY_AGREEMENT=OK`. On any `REFUSED` /
+   `PARTIAL ACTIVATION` output: STOP — never mint a new timestamp; follow the
+   recovery matrix in `HTF_BASELINE_SHORT_PHASE2_ISSUE197_FROZEN_TIMESTAMP_AUTHORITY_V1.md` §4.1.
+   The initial claim first seals the **claim receipt**
+   `htf_phase2_activation.json.claim_receipt.json` (printed as
+   `CLAIM_RECEIPT_SEALED=...`) — the trusted record-identity binding written
+   exactly once BEFORE the database commit (§7, and §4.3 of the design doc).
+   If the database commit succeeded but the activation JSON is missing, the
+   recovery is `claim --repair-activation-json` with the SAME record — this
+   **delayed repair** also works after the acceptance window has expired
+   (PR #200 FIX-1): it requires the unchanged DB record and its matching
+   immutable `freeze_registry` row **and** an exact `record_id` +
+   `record_sha256` match against the sealed claim receipt (PR #200 FIX-4) — a
+   record minted later, even with the identical `freeze_ts` and fingerprint,
+   is refused. It performs no activation and fails closed before any write on
+   the slightest mismatch, and also when the claim receipt is missing (the
+   original identity cannot be established — STOP and escalate).
+4. Read-only confirmation (`... verify --record ... --activation ...`) plus the
+   §4 SQL checks; keep the output in the change log.
+5. **Issue #198 only — observe-only startup** (a separate
+   `GO_FOR_OBSERVE_ONLY_STARTUP`, NOT part of this activation):
 
    ```sql
    UPDATE research.htf_baseline_short_phase2_experiment
@@ -110,16 +180,16 @@ Freeze timestamp selection rules:
     WHERE experiment_id = 'HTF_KEYLEVEL_BASELINE_SHORT_CAUSAL_OBSERVER_V1';
    ```
 
-5. Verify the effective systemd unit (§13) and run the fail-closed checks
+6. Verify the effective systemd unit (§13) and run the fail-closed checks
    (§14) **before** creating the flag file.
-6. Create the unit gate flag file (never automated; the LAST authorization
+7. Create the unit gate flag file (never automated; the LAST authorization
    step before start):
 
    ```bash
    install -d /opt/trad_bot/etc && touch /opt/trad_bot/etc/htf_phase2_observer_enabled
    ```
 
-7. Start the service **disabled-by-default unit** — and only this unit:
+8. Start the service **disabled-by-default unit** — and only this unit:
 
    ```bash
    systemctl daemon-reload
@@ -129,6 +199,12 @@ Freeze timestamp selection rules:
 
    Never `systemctl enable` this unit. It is started manually, per activation,
    and must remain start-on-demand only.
+
+**STOP conditions (hard):** pinned fingerprint drift; `operator_decisions_pending() != []`;
+any `REFUSED`/`PARTIAL ACTIVATION` from mint/claim/verify; DB registration not
+`PENDING` before the claim; freeze registry non-empty without a matching
+record; any three-authority disagreement; unit or flag file present before
+step 7; any pre-freeze row in the observation table.
 
 ## 4. Post-activation health check
 
@@ -181,16 +257,24 @@ Freeze timestamp selection rules:
 
 ## 7. Freeze authorities (remediation CP2) and the activation config
 
-Startup is gated on THREE independently maintained freeze values plus two
-fingerprints. Any missing source or pairwise disagreement refuses startup
-(fail closed, zero observations):
+Startup is gated on THREE independently maintained freeze values plus the
+protocol fingerprint, compared across FOUR applicable holders (record /
+database / activation config / running code). Any missing source or pairwise
+disagreement refuses startup (fail closed, zero observations):
 
-1. **Approved frozen protocol** — `APPROVED_FREEZE_TS` in
-   `app/research/htf_baseline_short_phase2_protocol_v1.py`, set in the commit
-   that freezes the protocol (operator action).
+1. **Approved frozen protocol + operator freeze record** — the FROZEN protocol
+   payload (`PROTOCOL_STATUS = "FROZEN"`, pinned `FROZEN_PROTOCOL_FINGERPRINT`)
+   carries NO timestamp in Git (issue #197: merge/CI/deploy latency must never
+   decide the freeze). The timestamp authority is the immutable, self-hashed
+   **freeze record** `/opt/trad_bot/etc/htf_phase2_freeze_record.json`
+   (schema `HTF_PHASE2_FREEZE_RECORD_V1`), minted at the GO by
+   `tools/research/htf_baseline_short_phase2_freeze_record_v1.py` and passed as
+   `--freeze-record` (required together with `--use-registration`; without it
+   the gate refuses).
 2. **Durable experiment registration** — `freeze_ts` / `protocol_fingerprint`
    in `research.htf_baseline_short_phase2_experiment`, written once by
-   `research.htf_baseline_short_phase2_activate(...)` (§3).
+   `research.htf_baseline_short_phase2_activate(...)` via the `claim` tool
+   (§3). `freeze_registry` additionally forbids re-used timestamps.
 3. **Runtime activation configuration** — an operator-deployed JSON file, e.g.
    `/opt/trad_bot/etc/htf_phase2_activation.json`:
 
@@ -202,12 +286,16 @@ fingerprints. Any missing source or pairwise disagreement refuses startup
    }
    ```
 
-   passed as `--activation-config` to the observer (required together with
-   `--use-registration`).
+   written by `claim` and passed as `--activation-config`.
 
 The three values are maintained by different people/artifacts; nothing copies
-one into another automatically, so a stale or divergent source is always
-detectable.
+one into another automatically at RUNTIME, so a stale or divergent source is
+always detectable. The `record_sha256` of the freeze record (recorded in the
+change log at mint time) makes any post-approval edit detectable as well.
+Record IDENTITY — which of several minted records the claim actually
+committed — is bound only by the claim receipt (PR #200 FIX-4): the
+`record_sha256` self-hash is tamper evidence and never proof that a record
+belongs to the original GO.
 
 ## 8. Timestamp skew tolerance (remediation CP1)
 
@@ -283,7 +371,7 @@ Effective `ExecStart` of
 `deploy/systemd/trad-bot-htf-baseline-short-observer.service`:
 
 ```text
-ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.htf_baseline_short_phase2_observer_runner_v1 --candle-source bybit --checkpoint /opt/trad_bot/var/htf_phase2/state.json --poll-seconds 300 --use-registration --activation-config /opt/trad_bot/etc/htf_phase2_activation.json --log-level INFO
+ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.htf_baseline_short_phase2_observer_runner_v1 --candle-source bybit --checkpoint /opt/trad_bot/var/htf_phase2/state.json --poll-seconds 300 --use-registration --activation-config /opt/trad_bot/etc/htf_phase2_activation.json --freeze-record /opt/trad_bot/etc/htf_phase2_freeze_record.json --log-level INFO
 ```
 
 * `--candle-source bybit` — explicit RESEARCH_ONLY source of closed 5m Bybit
@@ -296,7 +384,10 @@ ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.htf_baseline_short_phas
 * The CSV default inside Python is unchanged: offline replay and the
   deterministic test matrix keep working exactly as before.
 * `--once` is intentionally absent (the runner loops);
-  `--use-registration` keeps the THREE freeze authorities gate active.
+  `--use-registration` keeps the THREE freeze authorities gate active;
+  `--freeze-record` (issue #197) supplies the operator freeze record — the
+  timestamp carrier of authority 1. Without a valid record the gate refuses
+  startup (exit 3).
 * The runner exit-code contract: `0` OK/stop requested, `3` EXIT_NOT_RUNNABLE
   (fail-closed refusal), `4` EXIT_STATE_ERROR, `5` EXIT_WRITER_ERROR. The unit
   sets `RestartPreventExitStatus=3`, so a refusal never restart-loops.
@@ -310,6 +401,8 @@ All artifacts below are operator-created, never automated, never committed:
 | `/opt/trad_bot/etc/htf_phase2_observer_enabled` | `tradbot:tradbot` 0600 | empty flag file; exists = allowed to start |
 | `/opt/trad_bot/etc/htf_phase2_observer.env` | `tradbot:tradbot` 0600 | `HTF_P2_DB_HOST/PORT/NAME/USER` (dedicated observer role) + `HTF_P2_DB_PASSWORD` or preferably `HTF_P2_DB_PASSWORD_FILE` pointing to a 0600 password file |
 | `/opt/trad_bot/etc/htf_phase2_activation.json` | `tradbot:tradbot` 0600 | `experiment_id`, `freeze_ts`, `protocol_fingerprint` (§7) |
+| `/opt/trad_bot/etc/htf_phase2_activation.json.claim_receipt.json` | `tradbot:tradbot` 0600 | the claim receipt (schema `HTF_PHASE2_CLAIM_RECEIPT_V1`): binds `record_id` + `record_sha256` of the ONE freeze record the original claim committed; sealed exactly once BEFORE the DB commit and never overwritten (PR #200 FIX-4) |
+| `/opt/trad_bot/etc/htf_phase2_freeze_record.json` | `tradbot:tradbot` 0600 | the immutable freeze record (schema `HTF_PHASE2_FREEZE_RECORD_V1`), minted at the GO; its `record_sha256` is recorded in the change log at mint time (§3, §7) |
 | `/opt/trad_bot/var/htf_phase2/` (checkpoint, lease) | `tradbot:tradbot` 0700 | created by the operator; `UMask=0077` keeps runtime files private |
 
 Credentials rules (enforced in code, not only by convention):
@@ -356,6 +449,9 @@ Expected refusal behavior (deterministic, covered by
 
 * missing `/opt/trad_bot/etc/htf_phase2_activation.json` → exit `3`, **zero
   observations**, no database session opened;
+* missing/tampered `/opt/trad_bot/etc/htf_phase2_freeze_record.json` → exit
+  `3` (the registration gate refuses without the operator freeze record; a
+  tampered record is detected by its `record_sha256`);
 * any freeze/fingerprint disagreement between the three authorities → exit
   `3`, zero observations;
 * missing/unsafe observer credentials → exit `3`;
@@ -378,8 +474,9 @@ expected safe outcome and requires operator action, not retries.
    `systemctl enable`, then `systemctl daemon-reload`.
 4. VPS: `systemd-analyze verify` + `systemctl show` checks (§13); record
    `NOT_VERIFIED` honestly if any check cannot run.
-5. Operator prepares the env file, activation config and directory modes
-   (§12).
+5. Operator prepares the env file and directory modes (§12). The activation
+   config and the freeze record are produced by `mint`/`claim` at the GO (§3),
+   never in advance.
 6. Fail-closed checks (§14) with the flag file **absent** — the unit must not
    start.
 7. `PHASE_2_GO` decision, then — and only then — the activation sequence (§3).

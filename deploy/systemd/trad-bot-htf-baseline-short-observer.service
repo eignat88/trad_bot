@@ -24,9 +24,14 @@ WorkingDirectory=/opt/trad_bot
 # See docs/research/HTF_BASELINE_SHORT_PHASE2_DB_SECRETS_V1.md.
 EnvironmentFile=/opt/trad_bot/etc/htf_phase2_observer.env
 # --once is intentionally absent: the runner loops. --use-registration gates
-# startup on the THREE independently maintained freeze authorities (protocol /
-# DB registration / --activation-config) and fails closed before any
+# startup on the THREE independently maintained freeze authorities (freeze
+# record + DB registration / --activation-config) and fails closed before any
 # observation is created. Nothing here activates the experiment.
+#
+# --freeze-record (issue #197 timestamp authority V1): the operator-approved
+# immutable freeze record that binds the fresh UTC freeze timestamp to the
+# pinned FROZEN protocol fingerprint. The protocol module carries NO timestamp;
+# without a valid record the registration gate refuses startup (exit 3).
 #
 # --candle-source bybit (issue #184): explicit RESEARCH_ONLY source of CLOSED
 # 5m Bybit candles (server-time ASOF verification, bounded pagination,
@@ -36,7 +41,7 @@ EnvironmentFile=/opt/trad_bot/etc/htf_phase2_observer.env
 # --candle-source bybit makes the CSV fallback fail closed
 # ("--data-dir is required for --candle-source csv") instead of silently
 # replaying stale CSV files.
-ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.htf_baseline_short_phase2_observer_runner_v1 --candle-source bybit --checkpoint /opt/trad_bot/var/htf_phase2/state.json --poll-seconds 300 --use-registration --activation-config /opt/trad_bot/etc/htf_phase2_activation.json --log-level INFO
+ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.htf_baseline_short_phase2_observer_runner_v1 --candle-source bybit --checkpoint /opt/trad_bot/var/htf_phase2/state.json --poll-seconds 300 --use-registration --activation-config /opt/trad_bot/etc/htf_phase2_activation.json --freeze-record /opt/trad_bot/etc/htf_phase2_freeze_record.json --log-level INFO
 
 Restart=on-failure
 RestartSec=60
