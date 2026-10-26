@@ -85,8 +85,7 @@ class FakeCursor:
             self._rows = self.conn.route_select(head, params)
             self.rowcount = len(self._rows)
         else:
-            self.conn.inserts.append((sql, params))
-            self.rowcount = 0 if self.conn.conflict_skip else 1
+            self.rowcount = self.conn.note_write(sql, params)
 
     def fetchone(self):
         return self._rows.pop(0) if self._rows else None
@@ -107,10 +106,24 @@ class FakeConnection:
         self.conflict_skip = conflict_skip
         self.statements = []
         self.inserts = []
+        # Rows that actually landed. With ``conflict_skip`` the tables behave
+        # like INSERT ... ON CONFLICT DO NOTHING: the write is attempted and
+        # recorded in ``inserts``, but no row appears in the table.
+        self.persisted = []
         self.commits = 0
         self.rollbacks = 0
         self.phase1_rows = []
         self.pending_events = []
+        # Rows already present in the append-only source_signal table from a
+        # previous run (models partial recovery).
+        self.source_signal_rows: list = []
+        self._source_keys_cache: list | None = None
+        self._source_keys_stamp = -1
+        # SQL substring -> raise, to model a least-privilege role that lacks a
+        # SELECT on one of the confirmation queries.
+        self.fail_select: str | None = None
+        # event_key -> raise on the confirmation queries for that key only.
+        self.fail_select_keys: set = set()
 
     def cursor(self):
         return FakeCursor(self)
@@ -125,8 +138,19 @@ class FakeConnection:
         pass
 
     def route_select(self, head, params):
+        if self.fail_select and self.fail_select.upper() in head:
+            raise PermissionError(
+                f"permission denied for {self.fail_select}")
+        if (params and params[0] in self.fail_select_keys
+                and ("SOURCE_SIGNAL" in head or "FILL_FEASIBILITY" in head)):
+            raise PermissionError(
+                f"permission denied for event_key={params[0]}")
         if "ME_SHORT_A_LINEAGE_ACTIVATION_V1" in head and "STATUS,FREEZE_TS" in head:
             return [self.activation_row] if self.activation_row else []
+        if ("ME_SHORT_A_SOURCE_SIGNAL_V1" in head
+                and head.lstrip().startswith("SELECT")):
+            key = params[0] if params else None
+            return [(k,) for k in self._source_signal_keys() if k == key][:1]
         if "ME_SHORT_A_FILL_FEASIBILITY_V1" in head:
             key = params[0] if params else None
             return [r for r in self.phase1_rows if r[0] == key]
@@ -136,15 +160,30 @@ class FakeConnection:
             return self._pending()
         return []
 
+    def _source_signal_keys(self):
+        """The append-only source_signal table, derived from the rows that
+        actually landed — exactly the state a re-run or a partial recovery
+        sees. Cached per insert count so large pagination runs stay fast."""
+        if (self._source_keys_cache is not None
+                and self._source_keys_stamp == len(self.inserts)):
+            return self._source_keys_cache
+        out = [row[0] for row in self.source_signal_rows]
+        for sql, params in self.persisted_for(SOURCE_TABLE):
+            payload = dict(zip(_insert_columns(sql), params))
+            out.append(payload["event_key"])
+        self._source_keys_cache = out
+        self._source_keys_stamp = len(self.inserts)
+        return out
+
     def _pending(self):
         """Mimic the append-only tables: an event is pending until its outcome
         row exists. Seeded ``pending_events`` survive a simulated restart."""
         settled = set()
-        for sql, params in self.inserts_for(OUTCOME_TABLE):
+        for sql, params in self.persisted_for(OUTCOME_TABLE):
             payload = dict(zip(_insert_columns(sql), params))
             settled.add(payload["event_key"])
         out = []
-        for sql, params in self.inserts_for(LINEAGE_TABLE):
+        for sql, params in self.persisted_for(LINEAGE_TABLE):
             payload = dict(zip(_insert_columns(sql), params))
             if payload["event_key"] in settled:
                 continue
@@ -167,8 +206,39 @@ class FakeConnection:
                 out.append(match.group(1))
         return out
 
+    def note_write(self, sql, params):
+        """Model ``INSERT ... ON CONFLICT (event_key[, ...]) DO NOTHING``.
+
+        Returns the rowcount the real driver would report: 1 for a fresh row,
+        0 when the append-only table already holds that identity.
+        """
+        self.inserts.append((sql, params))
+        if self.conflict_skip:
+            return 0
+        payload = dict(zip(_insert_columns(sql), params))
+        identity = payload.get("event_key")
+        if identity is not None:
+            key = (identity, payload.get("candle_open_time"))
+            for existing_sql, existing_params in self.persisted_for(
+                    self._table_of(sql)):
+                prior = dict(zip(_insert_columns(existing_sql), existing_params))
+                if (prior.get("event_key"),
+                        prior.get("candle_open_time")) == key:
+                    return 0
+        self.persisted.append((sql, params))
+        return 1
+
+    @staticmethod
+    def _table_of(sql):
+        match = re.search(r"INSERT INTO ([a-z0-9_.]+)", sql, re.I)
+        return match.group(1) if match else ""
+
     def inserts_for(self, table):
         return [s for s in self.inserts if s[0].startswith(f"INSERT INTO {table}")]
+
+    def persisted_for(self, table):
+        return [s for s in self.persisted
+                if s[0].startswith(f"INSERT INTO {table}")]
 
 
 class FakeRawCandle:

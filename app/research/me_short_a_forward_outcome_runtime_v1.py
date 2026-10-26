@@ -45,7 +45,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, NamedTuple, Sequence
 
 try:  # pragma: no cover - psycopg is optional in unit tests
     import psycopg  # type: ignore
@@ -87,6 +87,16 @@ __all__ = [
     "RUNNER_STATE_FAILED",
     "Candle",
     "Candidate",
+    "CandidatePage",
+    "CandidateSource",
+    "ListCandidateSource",
+    "PAGE_SIZE_DEFAULT",
+    "HANDLED",
+    "HANDLED_SKIPPED",
+    "HANDLER_RETRY",
+    "HANDLER_OUTCOMES",
+    "DatabaseAccessError",
+    "Phase1Link",
     "CandleSource",
     "RuntimeConfig",
     "RuntimeMetrics",
@@ -140,6 +150,10 @@ RUNNER_STATES = (RUNNER_STATE_IDLE, RUNNER_STATE_RUNNING, RUNNER_STATE_STOPPING,
 
 # How many already-handled ids are remembered for idempotency.
 SEEN_IDS_LIMIT = 4096
+# Keyset page size for candidate intake. Pages are traversed to exhaustion
+# inside one cycle, so this is a batching parameter, never a limit on how many
+# candidates a cycle may observe.
+PAGE_SIZE_DEFAULT = 500
 
 # 5m candle granularity used everywhere in this protocol.
 CANDLE_MINUTES = 5
@@ -171,6 +185,61 @@ def canonical_price(value: Any) -> Decimal | None:
         return Decimal(str(float(value)))
     except (ArithmeticError, TypeError, ValueError):
         return None
+
+
+def _parse_source_ids(value: Any) -> list[int]:
+    """Normalize Phase 1 ``source_observation_ids`` whatever the driver gave.
+
+    ``jsonb`` columns are decoded to a list by psycopg and delivered as text
+    by pg8000 (the documented fallback in the runner), so both shapes — plus
+    a tuple and a bare scalar — must parse to the same list of ints.
+    Unparseable elements are dropped rather than guessed at.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8")
+        except Exception:
+            return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            value = json.loads(text)
+        except Exception:
+            value = [text]
+    if isinstance(value, Mapping):
+        return []
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        items = [value]
+    out: list[int] = []
+    for item in items:
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            out.append(int(item))
+            continue
+        if isinstance(item, float) and item.is_integer():
+            out.append(int(item))
+            continue
+        if isinstance(item, Mapping):
+            for field in ("observation_id", "id", "source_observation_id"):
+                if field in item:
+                    try:
+                        out.append(int(item[field]))
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            continue
+        try:
+            out.append(int(str(item).strip()))
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 # ── frozen identity of the runtime protocol ────────────────────────────
@@ -372,6 +441,107 @@ class Candidate:
         return self.invalidation_price - self.reference_price
 
 
+# ── candidate source (keyset-paginated) ───────────────────────────────
+
+@dataclass(frozen=True)
+class CandidatePage:
+    """One keyset page of candidate rows, plus everything needed to resume.
+
+    ``cursor`` is the composite keyset ``(detected_at, setup_id)`` of the LAST
+    row returned by this page — or ``None`` for an empty page. It is only ever
+    advanced by the caller after the whole page has been handled, so a failure
+    in the middle of a page can never lose the rows behind it.
+
+    ``rejected`` names the rows that could not be represented as a
+    :class:`Candidate` at all. They are counted and surfaced, never silently
+    dropped, because silently dropping a row is how candidates get lost.
+    """
+
+    candidates: tuple[Candidate, ...] = ()
+    rejected: tuple[str, ...] = ()
+    rows_read: int = 0
+    page_size: int = 0
+    cursor: tuple[datetime, Any] | None = None
+    exhausted: bool = True
+
+    @property
+    def next_cursor(self) -> tuple[datetime, Any] | None:
+        """Resume point: strictly AFTER this page's last row."""
+        return self.cursor
+
+
+class CandidateSource:
+    """Interface the runtime needs from a candidate provider.
+
+    Implementations MUST be keyset-paginated on ``(detected_at, setup_id)`` and
+    MUST apply the immutable ``freeze_ts`` as a strict lower bound in the
+    backend query, so a pre-freeze backlog can never be re-read, block the
+    selection, or push post-freeze rows out of a page.
+    """
+
+    def fetch_page(
+        self,
+        cursor: tuple[datetime, Any] | None,
+        *,
+        freeze_ts: datetime,
+        page_size: int,
+    ) -> CandidatePage:
+        raise NotImplementedError
+
+
+class ListCandidateSource(CandidateSource):
+    """In-memory keyset-paginated source (tests and simple providers).
+
+    Applies exactly the same ordering, freeze bound and cursor semantics as
+    :class:`DbScannerSetupCandidateSource`, so pagination tests written
+    against it describe the real contract.
+    """
+
+    def __init__(self, rows: Iterable[tuple[Any, Candidate]]) -> None:
+        self._rows = sorted(
+            list(rows), key=lambda item: (item[0], str(item[1])))
+
+    @classmethod
+    def from_candidates(
+        cls, candidates: Iterable[Candidate],
+    ) -> "ListCandidateSource":
+        return cls([(c.signal_time, c) for c in candidates])
+
+    def fetch_page(
+        self,
+        cursor: tuple[datetime, Any] | None,
+        *,
+        freeze_ts: datetime,
+        page_size: int,
+    ) -> CandidatePage:
+        if freeze_ts is None:
+            raise ValueError("fetch_page requires an immutable freeze_ts")
+        limit = max(1, int(page_size))
+        selected: list[Candidate] = []
+        rejected: list[str] = []
+        last: tuple[datetime, Any] | None = None
+        read = 0
+        for key, candidate in self._rows:
+            if key[0] is None or key[0] <= freeze_ts:
+                continue                      # pre-freeze never blocks a page
+            if cursor is not None and (key[0], str(key[1])) <= (
+                    cursor[0], str(cursor[1])):
+                continue
+            read += 1
+            selected.append(candidate)
+            last = (key[0], str(key[1]))
+            if read >= limit:
+                break
+        return CandidatePage(
+            candidates=tuple(selected),
+            rejected=tuple(rejected),
+            rows_read=read,
+            page_size=limit,
+            cursor=last,
+            exhausted=read < limit,
+        )
+
+
 # ── candle source (interface + default in-memory implementation) ──────
 
 class CandleSource:
@@ -449,6 +619,32 @@ class RuntimeConfig:
 
 class ActivationStateError(RuntimeError):
     """Raised when the runtime is not allowed to write."""
+
+
+class DatabaseAccessError(RuntimeError):
+    """A READ-ONLY confirmation query failed.
+
+    Raised instead of being silently converted into "the row is absent",
+    because the capture tables are append-only: a confirmation that is
+    mistaken for a negative is written once and can never be repaired.
+    """
+
+
+class Phase1Link(NamedTuple):
+    """Result of the READ-ONLY Phase 1 linkage lookup."""
+
+    event_key: str | None
+    observation_id: int | None
+    source_observation_ids: tuple[int, ...] = ()
+
+
+# Per-candidate handling outcomes. The first two let the keyset cursor move
+# on; the third keeps the cursor where it is so the candidate is retried and
+# is therefore never lost.
+HANDLED = "HANDLED"
+HANDLED_SKIPPED = "HANDLED_SKIPPED"
+HANDLER_RETRY = "HANDLER_RETRY"
+HANDLER_OUTCOMES = (HANDLED, HANDLED_SKIPPED, HANDLER_RETRY)
 
 
 # ── metrics / diagnostics ──────────────────────────────────────────────
@@ -560,17 +756,19 @@ class ForwardOutcomeRuntime:
         *,
         config: RuntimeConfig,
         candle_source: CandleSource,
-        candidate_source: Callable[[datetime | None], Iterable[Candidate]]
+        candidate_source: CandidateSource
+        | Callable[[datetime | None], Iterable[Candidate]]
         | None = None,
         clock: Callable[[], datetime] = utcnow,
         runner_id: str | None = None,
         generation: int = 0,
         sleep: Callable[[float], None] = time.sleep,
+        page_size: int = PAGE_SIZE_DEFAULT,
     ) -> None:
         self._conn = conn
         self._config = config
         self._candles = candle_source
-        self._candidates = candidate_source or (lambda _since: ())
+        self._candidates = self._normalize_source(candidate_source)
         self._clock = clock
         self._sleep = sleep
         self._runner_id = runner_id or f"me-short-a-forward-runtime-{os.getpid()}"
@@ -584,6 +782,47 @@ class ForwardOutcomeRuntime:
         self._seen_candidate_ids: set[str] = set()
         self._seen_order: list[str] = []
         self._cycle_id = 0
+        self._page_size = max(1, int(page_size))
+        # Keyset cursor over (detected_at, setup_id). It is advanced ONLY after
+        # a whole page has been handled, so a failure can never push the
+        # cursor past rows that were not written. On restart it resets to
+        # None, i.e. to the immutable freeze_ts bound, and every write below
+        # is INSERT ... ON CONFLICT DO NOTHING — so a restart neither loses
+        # nor duplicates a candidate.
+        self._candidate_cursor: tuple[datetime, Any] | None = None
+
+    @staticmethod
+    def _normalize_source(candidate_source):
+        """Accept either a keyset-paginated source or a plain callable.
+
+        A plain ``f(freeze) -> Iterable[Candidate]`` is wrapped into a single
+        page, which keeps simple providers (and tests) usable while the real
+        ``DbScannerSetupCandidateSource`` drives full keyset pagination.
+        """
+        if candidate_source is None:
+            return ListCandidateSource(())
+        if hasattr(candidate_source, "fetch_page"):
+            return candidate_source
+
+        class _CallableSource(CandidateSource):
+            def __init__(self, fn):
+                self._fn = fn
+
+            def fetch_page(self, cursor, *, freeze_ts, page_size):
+                if cursor is not None:
+                    return CandidatePage(
+                        rows_read=0, page_size=page_size,
+                        cursor=cursor, exhausted=True)
+                rows = list(self._fn(freeze_ts))
+                return CandidatePage(
+                    candidates=tuple(rows),
+                    rows_read=len(rows),
+                    page_size=max(len(rows), 1),
+                    cursor=None,
+                    exhausted=True,
+                )
+
+        return _CallableSource(candidate_source)
 
     # ── introspection ───────────────────────────────────────────────
     @property
@@ -609,6 +848,14 @@ class ForwardOutcomeRuntime:
     @property
     def generation(self) -> int:
         return self._generation
+
+    @property
+    def candidate_cursor(self) -> tuple[datetime, Any] | None:
+        """The keyset ``(detected_at, setup_id)`` already fully handled.
+
+        ``None`` means intake has not advanced past the immutable freeze yet.
+        """
+        return self._candidate_cursor
 
     def config_fingerprint(self) -> str:
         import hashlib
@@ -711,11 +958,28 @@ class ForwardOutcomeRuntime:
                 else freeze.astimezone(timezone.utc)
         return row[0], freeze
 
-    def _phase1_lookup(self, key: str) -> tuple[int | None, int | None]:
+    def _phase1_lookup(self, key: str) -> Phase1Link:
         """READ-ONLY check whether a Phase 1 snapshot shares this event_key.
 
         Never inserts, updates or retro-fits anything in
         ``research.me_short_a_fill_feasibility_v1``.
+
+        Correctness contract:
+
+        * no row  -> :class:`Phase1Link` with ``event_key=None`` (honest
+          "no Phase 1 evidence for this key");
+        * a row   -> the observed ``event_key`` plus the ACTUAL
+          ``source_observation_ids``, parsed whatever the driver returned
+          (``jsonb`` comes back as a list from psycopg and as text from
+          pg8000, which this runtime may fall back to);
+        * a DB error (for example the least-privilege role has no ``SELECT``
+          on this table) -> :class:`DatabaseAccessError`.
+
+        A database error must never be flattened into "no Phase 1 evidence":
+        the capture tables are append-only, so a false ``phase1_linked =
+        FALSE`` would be written once and could never be repaired — it is
+        exactly what turns a healthy event into a permanent
+        ``MISSING_LINEAGE``.
         """
         cursor = self._conn.cursor()
         try:
@@ -724,21 +988,50 @@ class ForwardOutcomeRuntime:
                 "research.me_short_a_fill_feasibility_v1 WHERE event_key=%s",
                 (key,))
             row = cursor.fetchone()
-        except Exception:
-            log.debug("ME SHORT A runtime Phase 1 lookup unavailable", exc_info=True)
-            return None, None
+        except Exception as exc:
+            raise DatabaseAccessError(
+                f"Phase 1 linkage lookup failed for event_key={key[:16]}…: "
+                f"{type(exc).__name__}: {exc}") from exc
         finally:
             cursor.close()
         if not row:
-            return None, None
-        source_ids = row[1] or []
-        observation_id = None
-        if isinstance(source_ids, (list, tuple)) and source_ids:
-            try:
-                observation_id = int(source_ids[0])
-            except (TypeError, ValueError):
-                observation_id = None
-        return key, observation_id
+            return Phase1Link(None, None, ())
+        source_ids = _parse_source_ids(row[1])
+        observation_id = source_ids[0] if source_ids else None
+        return Phase1Link(str(row[0]), observation_id, tuple(source_ids))
+
+    def _source_signal_present(self, key: str) -> bool:
+        """READ-ONLY confirmation that a source_signal row exists for ``key``.
+
+        Returns the TRUE state of the append-only
+        ``research.me_short_a_source_signal_v1`` table rather than the return
+        value of the current ``INSERT ... ON CONFLICT DO NOTHING``:
+
+        * a re-run inserts nothing and must still report the row as present;
+        * a partial recovery (source signal written, process died before the
+          lineage row) must not be recorded as ``source_signal_missing``;
+        * a failed insert reports the row as absent, which the caller turns
+          into a retry instead of a permanent false record.
+
+        Raises :class:`DatabaseAccessError` when the confirmation itself
+        cannot be read — the least-privilege runtime role holds ``SELECT`` on
+        this table, but a role that only has ``INSERT`` must fail loudly here
+        rather than let a permission error masquerade as "absent".
+        """
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT event_key FROM research.me_short_a_source_signal_v1 "
+                "WHERE event_key=%s",
+                (key,))
+            row = cursor.fetchone()
+        except Exception as exc:
+            raise DatabaseAccessError(
+                f"source_signal confirmation failed for event_key={key[:16]}…: "
+                f"{type(exc).__name__}: {exc}") from exc
+        finally:
+            cursor.close()
+        return row is not None
 
     def _count_open_events(self) -> int:
         try:
@@ -888,35 +1181,115 @@ class ForwardOutcomeRuntime:
         self.stop("RUN_COMPLETED" if self._state != RUNNER_STATE_FAILED else "FAILED")
         return self._metrics
 
-    # ── candidate intake ────────────────────────────────────────────
+    # ── candidate intake (keyset pagination) ──────────────────────
     def _observe_candidates(self, freeze: datetime) -> None:
-        for candidate in self._candidates(self._last_event_time):
-            self._metrics.add("candidates_seen")
+        """Consume every post-freeze candidate page, without losing any.
+
+        Contract:
+
+        * the immutable ``freeze_ts`` is the strict lower bound, applied by the
+          source itself, so a pre-freeze backlog is never re-read and can
+          never occupy a page or push a post-freeze row out of one;
+        * the keyset cursor advances only over pages that were handled in
+          full — a surfaced database error stops intake at that exact page and
+          leaves the cursor where it was, so the same rows are retried next
+          cycle and are never lost;
+        * pages are traversed to exhaustion inside one cycle, so a batch
+          larger than ``page_size`` is fully observed.
+        """
+        while True:
             try:
-                self._handle_candidate(candidate, freeze)
+                page = self._candidates.fetch_page(
+                    self._candidate_cursor,
+                    freeze_ts=freeze,
+                    page_size=self._page_size,
+                )
             except Exception as exc:
                 self._metrics.add("errors")
-                self._last_error = f"{type(exc).__name__}: {exc}"
-                log.exception("ME SHORT A candidate handling failed")
+                self._last_error = f"candidate page read failed: {type(exc).__name__}: {exc}"
+                log.exception("ME SHORT A candidate page read failed")
+                return
 
-    def _handle_candidate(self, candidate: Candidate, freeze: datetime) -> None:
+            for rejected_id in page.rejected:
+                self._metrics.add("skipped_invalid_candidate")
+                self._last_error = f"candidate row rejected: {rejected_id}"
+                log.warning(
+                    "ME SHORT A runtime rejected candidate row %s", rejected_id)
+
+            if page.rows_read <= 0:
+                return
+
+            stalled = False
+            for candidate in page.candidates:
+                self._metrics.add("candidates_seen")
+                try:
+                    outcome = self._handle_candidate(candidate, freeze)
+                except Exception as exc:
+                    self._metrics.add("errors")
+                    self._last_error = f"{type(exc).__name__}: {exc}"
+                    log.exception("ME SHORT A candidate handling failed")
+                    outcome = HANDLER_RETRY
+                if outcome not in HANDLER_OUTCOMES:
+                    self._metrics.add("errors")
+                    self._last_error = f"unknown handler outcome {outcome!r}"
+                    outcome = HANDLER_RETRY
+                if outcome == HANDLER_RETRY:
+                    stalled = True
+                    break
+
+            if stalled:
+                # Do NOT advance the keyset cursor: the rest of this page and
+                # everything behind it stays reachable and is retried. A page
+                # is never skipped, because skipping it would silently lose
+                # candidates.
+                self._last_error = (
+                    self._last_error or "candidate page stalled; retrying"
+                )
+                log.error(
+                    "ME SHORT A forward runtime stalled at cursor=%s; "
+                    "retrying the same page next cycle",
+                    self._candidate_cursor)
+                return
+
+            self._candidate_cursor = page.next_cursor
+            self._last_event_time = max(
+                filter(None, [
+                    self._last_event_time,
+                    *(c.signal_time for c in page.candidates),
+                ]), default=self._last_event_time)
+            if page.exhausted or page.rows_read < self._page_size:
+                return
+
+    def _handle_candidate(
+        self, candidate: Candidate, freeze: datetime,
+    ) -> str:
+        """Capture one candidate. Returns a HANDLER_* outcome.
+
+        ``HANDLER_RETRY`` means the evidence chain could NOT be confirmed and
+        the keyset cursor must not move past this candidate. It is returned
+        instead of writing a record that would be permanently wrong: the
+        capture tables are append-only, so a lineage row written with a false
+        ``source_signal_present`` or a false ``phase1_linked`` can never be
+        repaired and would show up as a bogus ``MISSING_LINEAGE`` /
+        ``QUARANTINED`` forever.
+        """
         token = candidate.event_id or (
             f"{candidate.symbol}|{candidate.signal_time.isoformat()}|"
             f"{candidate.reference_price}|{candidate.invalidation_price}|"
             f"{candidate.target_1}")
         if self._already_seen(token):
             self._metrics.add("skipped_idempotent")
-            return
+            return HANDLED_SKIPPED
 
         if candidate.signal_time <= freeze:
             self._metrics.add("skipped_pre_freeze")
             self._remember(token)
-            return
+            return HANDLED_SKIPPED
 
         if candidate.signal_time.utcoffset() != timedelta(0):
             self._metrics.add("skipped_invalid_candidate")
             self._remember(token)
-            return
+            return HANDLED_SKIPPED
 
         missing = [
             name for name, value in (
@@ -935,11 +1308,11 @@ class ForwardOutcomeRuntime:
             if candle.close_time > candidate.signal_time:
                 self._metrics.add("skipped_lookahead")
                 self._remember(token)
-                return
+                return HANDLED_SKIPPED
             if candle.retrieved_at > now:
                 self._metrics.add("skipped_lookahead")
                 self._remember(token)
-                return
+                return HANDLED_SKIPPED
         if window:
             no_lookahead_flags.append("recent_high_window_closed_before_signal")
         else:
@@ -954,6 +1327,7 @@ class ForwardOutcomeRuntime:
         if window:
             signal_candle_close = max(c.close_time for c in window)
 
+        key = event_key_for(candidate)
         captured = capture_source_signal(
             self._conn,
             symbol=candidate.symbol,
@@ -986,13 +1360,48 @@ class ForwardOutcomeRuntime:
                 [candidate.source_observation_id]
                 if candidate.source_observation_id is not None else None),
         )
+
+        # `captured` only tells us whether THIS INSERT created a row. On a
+        # re-run, on ON CONFLICT DO NOTHING and during partial recovery it is
+        # False even though the append-only row exists. The lineage record
+        # must report the table's real state, so confirm it (READ-ONLY).
+        try:
+            present = self._source_signal_present(key)
+        except DatabaseAccessError as exc:
+            self._metrics.add("errors")
+            self._last_error = str(exc)
+            log.error(
+                "ME SHORT A runtime cannot confirm the source signal; "
+                "retrying without writing lineage: %s", exc)
+            return HANDLER_RETRY
+        if not present:
+            # The source signal row genuinely does not exist: the capture did
+            # not land. Never write a lineage row claiming it did, and never
+            # write one claiming `source_signal_missing` either — both would
+            # be permanent, unrepairable lies on an append-only table.
+            self._metrics.add("errors")
+            self._last_error = (
+                f"source_signal row not confirmed for event_key={key[:16]}…")
+            log.error(
+                "ME SHORT A runtime source signal missing after capture; "
+                "retrying the same candidate")
+            return HANDLER_RETRY
+
         if captured:
             self._metrics.add("signals_captured")
         else:
             self._metrics.add("skipped_idempotent")
 
-        key = event_key_for(candidate)
-        phase1_key, phase1_observation_id = self._phase1_lookup(key)
+        try:
+            phase1 = self._phase1_lookup(key)
+        except DatabaseAccessError as exc:
+            self._metrics.add("errors")
+            self._last_error = str(exc)
+            log.error(
+                "ME SHORT A runtime Phase 1 linkage lookup failed; "
+                "retrying without writing lineage: %s", exc)
+            return HANDLER_RETRY
+
         linked = record_event_lineage(
             self._conn,
             symbol=candidate.symbol,
@@ -1002,11 +1411,11 @@ class ForwardOutcomeRuntime:
             target_price=candidate.target_1,
             event_key_stored=key,
             source_observation_id=candidate.source_observation_id,
-            phase1_event_key=phase1_key,
-            phase1_observation_id=phase1_observation_id,
+            phase1_event_key=phase1.event_key,
+            phase1_observation_id=phase1.observation_id,
             phase1_source_observation_ids=(
-                [phase1_observation_id] if phase1_observation_id else None),
-            source_signal_present=bool(captured),
+                list(phase1.source_observation_ids) or None),
+            source_signal_present=present,
         )
         if linked:
             self._metrics.add("lineages_recorded")
@@ -1016,6 +1425,7 @@ class ForwardOutcomeRuntime:
         self._last_event_time = max(
             filter(None, [self._last_event_time, candidate.signal_time]))
         self._remember(token)
+        return HANDLED
 
     # ── candle + outcome advancement ────────────────────────────────
     def _advance_open_events(self, freeze: datetime) -> None:

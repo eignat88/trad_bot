@@ -122,13 +122,60 @@ dds.scanner_setup (READ-ONLY)          Bybit /v5/market/kline (READ-ONLY)
 
 ### 4.1 Candidate intake (no scanner change)
 
-`DbScannerSetupCandidateSource` issues one **SELECT** against
+`DbScannerSetupCandidateSource` issues **read-only SELECTs** against
 `dds.scanner_setup` joined to `dds.instrument`. It never calls
 `app.scanners`, so scanner logic, filters, scoring and the ME SHORT direction
 gate are untouched. Candidate rows that cannot be represented honestly (broken
-identity, missing prices) are dropped with a log line, never repaired.
+identity, missing prices) are counted in `skipped_invalid_candidate` and
+surfaced by `setup_id`, never repaired and never silently dropped.
 
-### 4.2 `recent_high_window` — no lookahead, no imputation
+#### 4.1.1 Strict keyset pagination from the immutable freeze
+
+Intake is a **keyset** scan on `(detected_at, setup_id)`:
+
+```
+WHERE scanner_name=%s AND direction=%s
+  AND detected_at > <freeze_ts>
+  AND (detected_at > <cursor_detected_at>
+       OR (detected_at = <cursor_detected_at> AND setup_id > <cursor_setup_id>))
+ORDER BY detected_at ASC, setup_id ASC
+LIMIT <page_size>
+```
+
+| Guarantee | How |
+|---|---|
+| starts strictly at the **new immutable `freeze_ts`** | `detected_at > freeze_ts` is bound **inside** every query; `fetch_page` refuses to run without a `freeze_ts` |
+| a pre-freeze backlog never blocks the selection | the freeze predicate is in SQL, so historical rows are never read back, never occupy a page and can never push a post-freeze row out of one |
+| identical timestamps are never lost | the tie-breaker `setup_id` makes the order total; the composite cursor is expanded to `detected_at > ? OR (detected_at = ? AND setup_id > ?)` — a bare `detected_at > ?` would drop the siblings sharing the boundary row |
+| batches larger than one page are fully observed | pages are drained to exhaustion inside one cycle; `page_size` (default 500) is a batching parameter, never a cap |
+| nothing is lost at a page boundary | the cursor points at the **last raw row of the page**, including rejected rows, and advances only after the whole page has been handled |
+| a repeated run is idempotent | the cursor resets to the freeze and every writer is `ON CONFLICT DO NOTHING`, so a re-run re-reads but never re-writes and never duplicates |
+| resume after a failure loses nothing | a surfaced database error **stalls** the scan at that exact page: the cursor does not move, the same rows are retried next cycle, `errors`/`last_error` show it |
+
+### 4.2 `source_signal_present` reflects the table, not this INSERT
+
+`record_event_lineage` receives `source_signal_present` from a **READ-ONLY
+confirmation** against `research.me_short_a_source_signal_v1`, not from the
+return value of `capture_source_signal`. `INSERT ... ON CONFLICT DO NOTHING`
+returns "no fresh row" both when the row already exists and when the insert
+failed, and the capture tables are append-only — so a wrong value is written
+once and can never be repaired.
+
+| Situation | Old behaviour | Now |
+|---|---|---|
+| re-run / `ON CONFLICT DO NOTHING` | `source_signal_present=false`, `link_status=PENDING`, bogus `MISSING_LINEAGE` | row confirmed present → `source_signal_present=true`, `link_status=LINKED` |
+| partial recovery (source signal written, process died before the lineage row) | same false `source_signal_missing` | confirmed present → correct linkage |
+| the insert genuinely did not land | a permanent `PENDING`/`MISSING_LINEAGE` | **no lineage row is written at all**; the candidate is retried (`HANDLER_RETRY`), the keyset cursor does not move |
+| the confirmation query fails (e.g. least-privilege role without `SELECT`) | flattened into "absent" | `DatabaseAccessError` is surfaced in `errors`/`last_error` and the candidate is retried |
+
+The same rule governs `_phase1_lookup`: a database error raises
+`DatabaseAccessError` and the candidate is retried instead of being recorded
+as `phase1_linked = FALSE`, which would be a permanent `MISSING_LINEAGE`.
+`source_observation_ids` is parsed from whatever the driver returned
+(`jsonb` comes back as a list from psycopg and as text from pg8000, the
+documented fallback in the runner).
+
+### 4.3 `recent_high_window` — no lookahead, no imputation
 
 The five CLOSED 5m candles behind `reference_price` are only attached when
 
@@ -142,7 +189,7 @@ Otherwise nothing is attached and the gap is named explicitly
 `max(candles_5m[-5:])` at detection time; if the trigger candle was still
 forming, its high cannot legally enter a no-lookahead window.
 
-### 4.3 CLOSED 5m candles
+### 4.4 CLOSED 5m candles
 
 `BybitClosedCandleSource` drops any candle with `close_time > observed_at`
 before it reaches the collector, so a forming candle can never be observed.
@@ -151,7 +198,7 @@ retrieved_at`, and the candle-basis touch flags
 (`high_touches_stop`, `low_touches_target`, `high_touches_reference`) — a
 **candle** touch, never a fill.
 
-### 4.4 Controlled finalization
+### 4.5 Controlled finalization
 
 `finalize_outcome` is called only once the 240m horizon is settled on closed
 candles (`max(candle_close_time) >= horizon_end`). Before that the event stays
@@ -165,7 +212,7 @@ open and `skipped_unmatured` counts it. After maturation:
 `exit_fill_semantics` stays `MODELED_UNKNOWN` and `partial_fill_status` stays
 `UNKNOWN_NOT_INDEPENDENTLY_CAPTURED` — both `CHECK`-pinned in the database.
 
-### 4.5 Restart safety without mutable state
+### 4.6 Restart safety without mutable state
 
 Pending events are derived from the append-only tables
 (`me_short_a_event_lineage_v1` LEFT JOIN
@@ -294,6 +341,7 @@ backfill** path in the runtime and none is planned.
 
 ```
 python -m pytest -q tests/test_me_short_a_forward_outcome_runtime_v1.py
+python -m pytest -q tests/test_me_short_a_forward_outcome_runtime_pagination_and_lineage_v1.py
 python -m pytest -q tests/test_me_short_a_forward_outcome_runtime_migration_079_v1.py
 ```
 
@@ -311,6 +359,23 @@ reporting; append-only heartbeat with no evidence columns; isolation (no
 Phase 1 / frozen-OOS / `dds.` writes, no order or paper/live surface, no
 scanner imports, LONG excluded); and the SQL/deployment contract (migration
 079, grants, systemd unit, runner exit codes, docs and runbook, CI wiring).
+
+Plus the two runtime-blocker regressions
+(`test_me_short_a_forward_outcome_runtime_pagination_and_lineage_v1.py`):
+
+* **keyset pagination** — `>1700` historical rows plus `>500` new rows; pages
+  of 500; identical `detected_at` values including at a page boundary; page
+  partition with no loss and no duplication; a repeated run and a fresh
+  runner both idempotent; resume after a mid-page failure and a permanently
+  stalled page keeping the cursor in place; rejected rows counted without
+  stalling intake; the SQL asserted to use the composite keyset and never
+  `OFFSET`;
+* **`source_signal_present`** — partial recovery and `ON CONFLICT DO NOTHING`
+  both report the row as present and link; an unconfirmed source signal is
+  retried instead of recorded as `source_signal_missing`; permission errors on
+  the confirmation and on `_phase1_lookup` are surfaced and retried, never
+  flattened into `MISSING_LINEAGE`; `source_observation_ids` parsed from list,
+  tuple, scalar, bytes and JSON-text shapes.
 
 ---
 

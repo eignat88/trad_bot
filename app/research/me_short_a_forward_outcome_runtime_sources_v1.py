@@ -27,12 +27,15 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from app.research.me_short_a_forward_outcome_runtime_v1 import (
     Candle,
     Candidate,
+    CandidatePage,
+    CandidateSource,
     canonical_price,
     utcnow,
 )
 
 __all__ = [
     "CANDLE_MINUTES_MS",
+    "DEFAULT_PAGE_SIZE",
     "SCANNER_NAME",
     "DIRECTION",
     "canonical_price",
@@ -48,6 +51,9 @@ log = logging.getLogger(__name__)
 CANDLE_MINUTES_MS = 5 * 60 * 1000
 SCANNER_NAME = "MOMENTUM_EXHAUSTION"
 DIRECTION = "SHORT"
+# One keyset page of candidate rows. Pages are drained to exhaustion inside a
+# cycle, so this is a batching parameter, never a cap on observed candidates.
+DEFAULT_PAGE_SIZE = 500
 
 WINDOW_SIZE = 5
 
@@ -138,7 +144,7 @@ class BybitClosedCandleSource:
         return out
 
 
-class DbScannerSetupCandidateSource:
+class DbScannerSetupCandidateSource(CandidateSource):
     """READ-ONLY reader of the scanner's persisted ``MOMENTUM_EXHAUSTION``
     ``SHORT`` candidates.
 
@@ -151,18 +157,45 @@ class DbScannerSetupCandidateSource:
     ``invalidation_price``, ``target_1``), which is what makes the
     ``event_key`` shared across ``source signal -> Phase 1 snapshot ->
     outcome``.
+
+    Pagination contract
+    -------------------
+
+    Intake is a **keyset** scan on the composite key ``(detected_at,
+    setup_id)`` with the immutable ``freeze_ts`` as a strict lower bound:
+
+    * ``detected_at > freeze_ts`` is applied **inside the query**, so the
+      pre-freeze backlog is never read back, never occupies a page and can
+      never push a post-freeze row out of one. This is what stops thousands
+      of historical rows from blocking the selection.
+    * ``(detected_at, setup_id) > (cursor_detected_at, cursor_setup_id)`` is
+      applied as ``detected_at > ? OR (detected_at = ? AND setup_id > ?)`` so
+      rows sharing the very same ``detected_at`` are all returned exactly
+      once — including at a page boundary, where a plain ``detected_at > ?``
+      would silently drop the remaining siblings.
+    * ``setup_id`` is the tie-breaker, so the order is a total order and the
+      scan is stable across pages, re-runs and restarts.
+    * ``LIMIT`` only bounds one page; the caller drains pages to exhaustion,
+      so a batch larger than the page size is fully observed.
     """
 
-    SELECT_SQL = (
+    _PROJECTION = (
         "SELECT s.setup_id, i.symbol, s.detected_at, s.reference_price, "
         "s.invalidation_price, s.target_1, s.entry_zone_low, "
         "s.entry_zone_high, s.signal_candle_open_time, s.features, "
         "s.market_regime, s.status "
         "FROM dds.scanner_setup s "
         "JOIN dds.instrument i ON i.instrument_id = s.instrument_id "
-        "WHERE s.scanner_name=%s AND s.direction=%s AND s.detected_at > %s "
-        "ORDER BY s.detected_at ASC, s.setup_id ASC "
-        "LIMIT %s"
+        "WHERE s.scanner_name=%s AND s.direction=%s "
+        "AND s.detected_at > %s "
+    )
+    _ORDER_LIMIT = "ORDER BY s.detected_at ASC, s.setup_id ASC LIMIT %s"
+
+    SELECT_SQL = _PROJECTION + _ORDER_LIMIT
+    SELECT_AFTER_CURSOR_SQL = (
+        _PROJECTION
+        + "AND (s.detected_at > %s OR (s.detected_at = %s AND s.setup_id > %s)) "
+        + _ORDER_LIMIT
     )
 
     def __init__(
@@ -173,34 +206,129 @@ class DbScannerSetupCandidateSource:
         scanner_name: str = SCANNER_NAME,
         direction: str = DIRECTION,
         clock: Callable[[], datetime] = utcnow,
-        max_rows: int = 500,
+        max_rows: int = DEFAULT_PAGE_SIZE,
+        page_size: int | None = None,
     ) -> None:
         self._conn = conn
         self._candles = candle_source
         self._scanner_name = scanner_name
         self._direction = direction
         self._clock = clock
-        self._max_rows = int(max_rows)
+        self._page_size = int(page_size if page_size is not None else max_rows)
+        if self._page_size < 1:
+            raise ValueError("page_size must be >= 1")
 
     # ── plumbing ──────────────────────────────────────────────────
-    def __call__(self, since: datetime | None = None) -> list[Candidate]:
-        return self.fetch(since)
+    def __call__(self, freeze_ts: datetime | None = None) -> list[Candidate]:
+        return self.fetch(freeze_ts)
 
-    def fetch(self, since: datetime | None = None) -> list[Candidate]:
-        lower = since or datetime(1970, 1, 1, tzinfo=timezone.utc)
-        cursor = self._conn.cursor()
+    def fetch_page(
+        self,
+        cursor: tuple[datetime, Any] | None,
+        *,
+        freeze_ts: datetime,
+        page_size: int | None = None,
+    ) -> CandidatePage:
+        """Read exactly one keyset page after ``cursor``.
+
+        ``freeze_ts`` is REQUIRED and is the immutable activation freeze: the
+        runtime never reads a row at or before it, and a source is never used
+        without one.
+        """
+        if freeze_ts is None:
+            raise ValueError(
+                "fetch_page requires the immutable freeze_ts; refusing to "
+                "read candidates without a freeze bound")
+        if cursor is not None and len(tuple(cursor)) != 2:
+            raise ValueError("cursor must be (detected_at, setup_id)")
+        limit = int(page_size if page_size is not None else self._page_size)
+        if limit < 1:
+            raise ValueError("page_size must be >= 1")
+        lower = self._as_utc(freeze_ts)
+        if lower is None:
+            raise ValueError("freeze_ts must be a datetime")
+
+        cursor_detected_at = None
+        cursor_setup_id = None
+        if cursor is not None:
+            cursor_detected_at = self._as_utc(cursor[0])
+            cursor_setup_id = cursor[1]
+            if cursor_detected_at is None:
+                raise ValueError("cursor detected_at must be a datetime")
+
+        if cursor is None:
+            sql, params = self.SELECT_SQL, (
+                self._scanner_name, self._direction, lower, limit)
+        else:
+            sql, params = self.SELECT_AFTER_CURSOR_SQL, (
+                self._scanner_name, self._direction, lower,
+                cursor_detected_at, cursor_detected_at, cursor_setup_id, limit)
+
+        cursor_obj = self._conn.cursor()
         try:
-            cursor.execute(
-                self.SELECT_SQL,
-                (self._scanner_name, self._direction, lower, self._max_rows))
-            rows = cursor.fetchall()
+            cursor_obj.execute(sql, params)
+            rows = cursor_obj.fetchall()
         finally:
-            cursor.close()
-        out: list[Candidate] = []
+            cursor_obj.close()
+
+        candidates: list[Candidate] = []
+        rejected: list[str] = []
+        last: tuple[datetime, Any] | None = None
         for row in rows:
-            candidate = self._map_row(row)
-            if candidate is not None:
-                out.append(candidate)
+            detected_at = self._as_utc(row[2]) if len(row) > 2 else None
+            setup_id = row[0]
+            # The cursor always tracks the LAST RAW ROW read — including rows
+            # that cannot be mapped. Advancing past a rejected row is correct
+            # (it can never become a candidate) and is what keeps one broken
+            # row from blocking the whole intake.
+            if detected_at is not None:
+                last = (detected_at, setup_id)
+            try:
+                candidate = self._map_row(row)
+            except Exception:  # pragma: no cover - defensive
+                candidate = None
+            if candidate is None:
+                rejected.append(str(setup_id))
+                continue
+            candidates.append(candidate)
+
+        rows_read = len(rows)
+        return CandidatePage(
+            candidates=tuple(candidates),
+            rejected=tuple(rejected),
+            rows_read=rows_read,
+            page_size=limit,
+            cursor=last,
+            exhausted=rows_read < limit,
+        )
+
+    def fetch(
+        self, freeze_ts: datetime | None = None, *, limit: int | None = None,
+    ) -> list[Candidate]:
+        """Drain keyset pages into one list (tests and small batches).
+
+        The runtime itself walks pages so that it can stop mid-stream without
+        losing anything; this helper is for callers that genuinely want the
+        whole post-freeze set.
+        """
+        if freeze_ts is None:
+            raise ValueError("fetch requires the immutable freeze_ts")
+        out: list[Candidate] = []
+        cursor: tuple[datetime, Any] | None = None
+        budget = self._page_size if limit is None else max(1, int(limit))
+        while True:
+            page = self.fetch_page(
+                cursor, freeze_ts=freeze_ts,
+                page_size=min(self._page_size, budget - len(out))
+                if limit is not None else self._page_size)
+            out.extend(page.candidates)
+            if page.rows_read <= 0:
+                break
+            if limit is not None and len(out) >= budget:
+                break
+            if page.exhausted:
+                break
+            cursor = page.next_cursor
         return out
 
     # ── mapping ───────────────────────────────────────────────────

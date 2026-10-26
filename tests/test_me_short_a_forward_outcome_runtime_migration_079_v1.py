@@ -367,6 +367,49 @@ def test_runbook_documents_the_isolation_guarantees():
         assert needle in text, needle
 
 
+def test_runbook_applies_078_grants078_079_grants079_in_order():
+    text = RUNBOOK.read_text(encoding="utf-8")
+    assert "078  ->  grants078  ->  079  ->  grants079" in text
+
+    positions = {
+        "078": text.index("sql/migrations/078_me_short_a_forward_only_outcome_lineage_v1.sql"),
+        "grants078": text.index(
+            "sql/grants/me_short_a_forward_outcome_lineage_least_privilege_v1.sql"),
+        "079": text.index("sql/migrations/079_me_short_a_forward_outcome_runtime_integration_v1.sql"),
+        "grants079": text.index(
+            "sql/grants/me_short_a_forward_outcome_runtime_least_privilege_v1.sql"),
+    }
+    assert positions["078"] < positions["grants078"] < positions["079"] < \
+        positions["grants079"], positions
+
+    # each apply step is verified before the next one starts
+    for marker in ("Step 1 — apply migration 078",
+                   "Step 2 — apply the Issue #208 lineage grants",
+                   "Step 3 — apply migration 079",
+                   "Step 4 — apply the least-privilege runtime grants"):
+        assert marker in text, marker
+
+
+def test_runbook_rollback_is_real_and_ordered():
+    text = RUNBOOK.read_text(encoding="utf-8")
+    upper = text.upper()
+    assert "Reverse order of the apply chain" in text
+    # every apply step has a matching undo step
+    for needle in ("undo step 4", "undo step 3", "undo steps 1–2"):
+        assert needle.lower() in text.lower(), needle
+    # the primary rollback is a real, non-destructive stop
+    assert "sudo rm -f /opt/trad_bot/etc/me_short_a_forward_runtime_enabled" in text
+    assert "sudo systemctl stop trad-bot-me-short-a-forward-outcome" in text
+    # and the destructive paths are gated and explicit
+    assert "DESTRUCTIVE" in upper
+    assert "DROP TABLE IF EXISTS research.me_short_a_forward_outcome_runtime_heartbeat_v1" in text
+    assert "DROP TABLE IF EXISTS research.me_short_a_source_signal_v1" in text
+    assert "NEVER" in text.upper()
+    # rollback depth is chosen by symptom
+    for depth in ("3.1", "3.3", "3.4", "3.5", "3.7"):
+        assert depth in text, depth
+
+
 # ── CI wiring ──────────────────────────────────────────────────────────
 
 
@@ -380,6 +423,7 @@ def test_ci_workflow_covers_the_new_runtime_files():
                    "me_short_a_forward_outcome_runtime_least_privilege_v1.sql",
                    "test_me_short_a_forward_outcome_runtime_v1.py",
                    "test_me_short_a_forward_outcome_runtime_migration_079_v1.py",
+                   "test_me_short_a_forward_outcome_runtime_pagination_and_lineage_v1.py",
                    "trad-bot-me-short-a-forward-outcome.service"):
         assert needle in text, needle
 

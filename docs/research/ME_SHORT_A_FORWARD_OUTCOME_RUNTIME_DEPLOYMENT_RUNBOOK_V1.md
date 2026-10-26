@@ -36,6 +36,19 @@ outputs. If any step seems to require one of those, stop and escalate.
 
 ## 1. DEPLOYMENT
 
+> **Mandatory apply order — do not reorder, do not combine:**
+>
+> ```text
+> 078  ->  grants078  ->  079  ->  grants079
+> ```
+>
+> Migration 078 creates the Issue #208 capture schema that migration 079
+> depends on, and the grants scripts must run **after** the objects they
+> privilege exist (`grants078` after 078, `grants079` after 079) — otherwise
+> the `REVOKE`/`GRANT` statements fail on missing relations and the least
+> -privilege model is left half-applied. Each step is verified before the next
+> one starts. Nothing in this chain is rolled forward automatically.
+
 ### 1.1 Update the VPS checkout
 
 ```bash
@@ -49,7 +62,61 @@ git rev-parse HEAD      # record this hash in the change ticket
 
 Do **not** pull over unknown local changes.
 
-### 1.2 Apply migration 079 (append-only runtime log + status view)
+### 1.2 Step 1 — apply migration 078 (Issue #208 capture schema)
+
+`sql/migrations/078_me_short_a_forward_only_outcome_lineage_v1.sql` is the
+**prerequisite** of everything below: it creates the append-only capture
+tables (`me_short_a_source_signal_v1`, `me_short_a_post_signal_candle_v1`,
+`me_short_a_event_lineage_v1`, `me_short_a_outcome_observation_v1`), the
+activation state machine and the lineage status view.
+
+```bash
+sudo -u postgres psql -d trad_bot -X -v ON_ERROR_STOP=1 -1 \
+  -f sql/migrations/078_me_short_a_forward_only_outcome_lineage_v1.sql
+```
+
+Verify (READ-ONLY) before continuing:
+
+```bash
+sudo -u postgres psql -d trad_bot -P pager=off -c \
+  "SELECT to_regclass('research.me_short_a_lineage_activation_v1') AS activation,
+          to_regclass('research.me_short_a_event_lineage_v1')     AS lineage,
+          to_regclass('research.me_short_a_outcome_observation_v1') AS outcome,
+          to_regclass('research.me_short_a_source_signal_v1')     AS source_signal;"
+```
+
+Expected: all four non-NULL. If any is NULL, **stop** — 079 will abort.
+
+### 1.3 Step 2 — apply the Issue #208 lineage grants (grants078)
+
+```bash
+sudo -u postgres psql -d trad_bot -X -v ON_ERROR_STOP=1 -1 \
+  -f sql/grants/me_short_a_forward_outcome_lineage_least_privilege_v1.sql
+```
+
+Verify (READ-ONLY):
+
+```bash
+sudo -u postgres psql -d trad_bot -P pager=off -c \
+  "SELECT grantee, privilege_type, table_name
+     FROM information_schema.role_table_grants
+    WHERE table_name LIKE 'me_short_a_%'
+    ORDER BY table_name, grantee, privilege_type;"
+```
+
+Expected: `trad_bot_me_short_a_collector` = `INSERT` only on the four capture
+tables, `trad_bot_me_short_a_audit` = `SELECT` only, and **no** `UPDATE` /
+`DELETE` / `TRUNCATE` for anyone. Confirm the append-only triggers exist:
+
+```bash
+sudo -u postgres psql -d trad_bot -P pager=off -c \
+  "SELECT tgname, tgrelid::regclass AS tbl FROM pg_trigger
+    WHERE NOT tgisinternal
+      AND tgrelid::regclass::text LIKE 'research.me_short_a_%'
+    ORDER BY tbl, tgname;"
+```
+
+### 1.4 Step 3 — apply migration 079 (append-only runtime log + status view)
 
 Run with a role allowed to create objects (e.g. `postgres`), inside one
 transaction, and with `ON_ERROR_STOP`:
@@ -90,7 +157,7 @@ sudo -u postgres psql -d trad_bot -P pager=off -c \
 
 Expected: `0`.
 
-### 1.3 Apply the least-privilege runtime grants
+### 1.5 Step 4 — apply the least-privilege runtime grants (grants079)
 
 ```bash
 sudo -u postgres psql -d trad_bot -X -v ON_ERROR_STOP=1 -1 \
@@ -122,7 +189,7 @@ Expected:
 * **no** grant at all on `research.prospective_observation` or
   `research.prospective_outcome` (the closed frozen OOS cohort).
 
-### 1.4 Create the dedicated runtime credentials
+### 1.6 Create the dedicated runtime credentials
 
 Create `/opt/trad_bot/etc/me_short_a_forward_runtime.env` with mode `0600`,
 owner `tradbot:tradbot`. It must contain the least-privilege login and the
@@ -141,7 +208,7 @@ The shared application `.env` is intentionally **not** loaded by this unit: the
 runtime must never reuse scanner, paper or live credentials. The password file
 is `0600`, owner `tradbot`.
 
-### 1.5 Install the systemd unit
+### 1.7 Install the systemd unit
 
 ```bash
 sudo install -m 0644 deploy/systemd/trad-bot-me-short-a-forward-outcome.service \
@@ -155,7 +222,7 @@ it cannot start before the operator creates that flag file. Do **not**
 `systemctl enable` it as part of a routine deploy; enablement is an explicit
 operator decision recorded in the change ticket.
 
-### 1.6 Activation checkpoint (separate, explicit approval)
+### 1.8 Activation checkpoint (separate, explicit approval)
 
 This is the point where evidence starts being recorded. It is **not** part of
 the code deployment and must be approved on its own.
@@ -198,7 +265,7 @@ the code deployment and must be approved on its own.
 
    This file must never be created automatically.
 
-### 1.7 Start the runtime
+### 1.9 Start the runtime
 
 ```bash
 sudo systemctl start trad-bot-me-short-a-forward-outcome
@@ -269,9 +336,30 @@ touching any panel definition.
 
 ## 3. ROLLBACK
 
-Rollback must be able to stop evidence collection at any moment **without
-destroying anything that was already captured**. All captured data is
-append-only and is preserved in every scenario below.
+Rollback is the deployment chain in reverse, and it must be able to stop
+evidence collection at any moment **without destroying anything that was
+already captured**. All captured data is append-only and is preserved in
+every scenario below.
+
+> **Reverse order of the apply chain:**
+>
+> ```text
+> stop runtime  ->  flags/credentials  ->  grants079  ->  079
+>                                                  |
+>                                    (078 / grants078: separate approval only)
+> ```
+>
+> Choose the *shallowest* step that fixes the problem. Steps 3.1–3.2 are
+> non-destructive and are always safe; 3.3–3.8 remove things and are each
+> gated on their own approval.
+
+| Symptom | Rollback depth needed |
+|---|---|
+| bad data being captured / wrong counters | 3.1 (fast stop) |
+| runtime must never start again | 3.1 + 3.3 |
+| runtime role is over-privileged | 3.4 |
+| 079 schema is wrong | 3.4 + 3.5 |
+| the whole integration must be reverted | 3.1 → 3.3 → 3.4 → 3.5 → 3.7 |
 
 ### 3.1 Fast stop (preferred, non-destructive)
 
@@ -281,7 +369,8 @@ sudo systemctl stop trad-bot-me-short-a-forward-outcome
 ```
 
 Removing the flag file also prevents an accidental restart. No data is lost:
-whatever was captured remains in the append-only tables.
+whatever was captured remains in the append-only tables. **No SQL is
+required to stop collection** — this is the primary rollback.
 
 ### 3.2 Freeze further capture at the protocol level
 
@@ -299,29 +388,41 @@ UPDATE research.me_short_a_lineage_activation_v1
 **not** attempt to move `freeze_ts` — it is immutable by design and a failed
 attempt is expected.
 
-### 3.3 Remove the runtime artifacts (full rollback)
+### 3.3 Remove the runtime artifacts
 
 ```bash
 sudo systemctl disable --now trad-bot-me-short-a-forward-outcome 2>/dev/null || true
 sudo rm -f /etc/systemd/system/trad-bot-me-short-a-forward-outcome.service
-sudo systemctl daemon-reload
 sudo rm -f /opt/trad_bot/etc/me_short_a_forward_runtime_enabled
 sudo rm -f /opt/trad_bot/etc/me_short_a_forward_runtime.env
 sudo rm -f /opt/trad_bot/etc/me_short_a_forward_runtime.dbpass
+sudo systemctl daemon-reload
 ```
 
-### 3.4 Revoke the runtime grants (optional, complete isolation)
+### 3.4 Revoke the runtime grants (undo step 4 — `grants079`)
 
 ```bash
-sudo -u postgres psql -d trad_bot -X -v ON_ERROR_STOP=1 -1 -c \
-  "REVOKE ALL ON SCHEMA research FROM trad_bot_me_short_a_runtime;
-   REVOKE ALL ON SCHEMA research FROM trad_bot_me_short_a_runtime_audit;"
+sudo -u postgres psql -d trad_bot -X -v ON_ERROR_STOP=1 -1 \
+  -c "REVOKE ALL ON SCHEMA research FROM trad_bot_me_short_a_runtime;
+      REVOKE ALL ON SCHEMA research FROM trad_bot_me_short_a_runtime_audit;"
 ```
 
-### 3.5 Roll back the schema (DESTRUCTIVE — requires explicit approval)
+Verify (READ-ONLY) that nothing is left:
 
-Only if the captured data is genuinely worthless and a separate destructive
-approval exists. **Not applied by default.**
+```bash
+sudo -u postgres psql -d trad_bot -P pager=off -c \
+  "SELECT grantee, table_name, privilege_type
+     FROM information_schema.role_table_grants
+    WHERE grantee IN ('trad_bot_me_short_a_runtime',
+                      'trad_bot_me_short_a_runtime_audit');"
+```
+
+Expected: zero rows.
+
+### 3.5 Roll back the 079 schema (undo step 3 — DESTRUCTIVE)
+
+Only if the captured runtime data is genuinely worthless and a separate
+destructive approval exists. **Not applied by default.**
 
 ```sql
 BEGIN;
@@ -331,9 +432,9 @@ DROP FUNCTION IF EXISTS research.fn_block_me_short_a_runtime_heartbeat_mutation(
 COMMIT;
 ```
 
-Dropping the heartbeat log destroys the operational audit trail. The capture
-tables created by migration 078 are **not** part of this rollback: they belong
-to the Issue #208 collector and hold research evidence.
+Dropping the heartbeat log destroys the operational audit trail. Re-applying
+it later is safe: migration 079 is `CREATE ... IF NOT EXISTS` /
+`CREATE OR REPLACE` and can be re-run unchanged.
 
 ### 3.6 Application rollback
 
@@ -347,6 +448,34 @@ git log --oneline -3
 
 If the regression is in the runtime code only, roll the checkout back to the
 last known-good `main` commit and re-run section 2.
+
+### 3.7 Rolling back 078 / `grants078` (undo steps 1–2) — SEPARATE APPROVAL
+
+These belong to the Issue #208 collector, not to this runtime integration,
+and they hold **research evidence**. They are **never** rolled back as part of
+a routine runtime rollback.
+
+Only with a separate, explicit approval, and in reverse order (`grants078`
+first, then 078):
+
+```sql
+BEGIN;
+-- grants078: revoke the collector/audit roles first
+REVOKE ALL ON SCHEMA research FROM trad_bot_me_short_a_collector;
+REVOKE ALL ON SCHEMA research FROM trad_bot_me_short_a_audit;
+-- 078
+DROP VIEW IF EXISTS research.v_me_short_a_lineage_status_v1;
+DROP TABLE IF EXISTS research.me_short_a_outcome_observation_v1;
+DROP TABLE IF EXISTS research.me_short_a_post_signal_candle_v1;
+DROP TABLE IF EXISTS research.me_short_a_event_lineage_v1;
+DROP TABLE IF EXISTS research.me_short_a_source_signal_v1;
+DROP TABLE IF EXISTS research.me_short_a_lineage_activation_v1;
+COMMIT;
+```
+
+**This destroys captured research evidence and the activation/freeze record.**
+Confirm with the requester in writing before running it. If in doubt: stop at
+3.1 and leave the schema in place.
 
 ---
 
