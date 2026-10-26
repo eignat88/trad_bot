@@ -189,6 +189,139 @@ Expected:
 * **no** grant at all on `research.prospective_observation` or
   `research.prospective_outcome` (the closed frozen OOS cohort).
 
+### 1.5.1 Verify the `dds` read-only intake and the role separation (READ-ONLY)
+
+The candidate intake reads exactly two `dds` tables. Verify the full matrix
+before creating credentials.
+
+```bash
+sudo -u postgres psql -d trad_bot -P pager=off -c \
+  "SELECT grantee, table_schema, table_name,
+          string_agg(privilege_type, ',' ORDER BY privilege_type) AS privs
+     FROM information_schema.role_table_grants
+    WHERE grantee IN ('trad_bot_me_short_a_runtime',
+                      'trad_bot_me_short_a_runtime_audit')
+      AND table_schema = 'dds'
+    GROUP BY grantee, table_schema, table_name
+    ORDER BY grantee, table_name;"
+```
+
+Expected — **exactly two rows**, both `SELECT`, nothing for the audit role:
+
+| grantee | table_schema | table_name | privs |
+|---|---|---|---|
+| `trad_bot_me_short_a_runtime` | `dds` | `instrument` | `SELECT` |
+| `trad_bot_me_short_a_runtime` | `dds` | `scanner_setup` | `SELECT` |
+
+`dds.instrument` is granted **separately and explicitly**: it is the
+`JOIN dds.instrument i ON i.instrument_id = s.instrument_id` half of the
+intake query, and without it the scan fails with a permission error. That
+error is surfaced in `errors` / `last_error` (it is never flattened into
+"no candidates"), so a missing `dds.instrument` grant is loud rather than
+silent.
+
+Schema visibility (`USAGE`, never `CREATE`):
+
+```bash
+sudo -u postgres psql -d trad_bot -P pager=off -c \
+  "SELECT grantee, privilege_type
+     FROM information_schema.usage_privileges
+    WHERE object_schema = 'dds' AND object_type = 'SCHEMA'
+      AND grantee IN ('trad_bot_me_short_a_runtime',
+                      'trad_bot_me_short_a_runtime_audit');"
+```
+
+Expected: `USAGE` for `trad_bot_me_short_a_runtime` only. The audit role has
+**no** `dds` visibility at all.
+
+No write verb anywhere outside the append-only `INSERT` grants:
+
+```bash
+sudo -u postgres psql -d trad_bot -P pager=off -c \
+  "SELECT grantee, table_schema, table_name, privilege_type
+     FROM information_schema.role_table_grants
+    WHERE grantee IN ('trad_bot_me_short_a_runtime',
+                      'trad_bot_me_short_a_runtime_audit')
+      AND privilege_type IN ('INSERT','UPDATE','DELETE','TRUNCATE',
+                             'REFERENCES','TRIGGER')
+      AND NOT (table_schema = 'research'
+               AND table_name IN ('me_short_a_source_signal_v1',
+                                  'me_short_a_post_signal_candle_v1',
+                                  'me_short_a_event_lineage_v1',
+                                  'me_short_a_outcome_observation_v1',
+                                  'me_short_a_forward_outcome_runtime_heartbeat_v1')
+               AND privilege_type = 'INSERT')
+    ORDER BY 1, 2, 3, 4;"
+```
+
+Expected: **zero rows**. This is the single most important check: it proves
+the runtime cannot write to `dds` (scanner state), to the paper tables
+(`dds.paper_safety_event`, `dds.paper_shadow_trade`), to the direction gates
+(`dds.scanner_direction_config`, `config.scanner_direction_gate`,
+`config.scanner_direction_gate_history`) or to anything live.
+
+Role separation — the runtime must authenticate as the runtime role, never as
+the collector role:
+
+```bash
+sudo -u postgres psql -d trad_bot -P pager=off -c \
+  "SELECT rolname, rolcanlogin, rolinherit FROM pg_roles
+    WHERE rolname IN ('trad_bot_me_short_a_runtime',
+                      'trad_bot_me_short_a_runtime_audit',
+                      'trad_bot_me_short_a_collector');"
+```
+
+and confirm the credentials file and the unit agree:
+
+```bash
+grep -E '^ME_SHORT_A_RUNTIME_DB_USER=' /opt/trad_bot/etc/me_short_a_forward_runtime.env
+```
+
+Expected: `ME_SHORT_A_RUNTIME_DB_USER=trad_bot_me_short_a_runtime` — **never**
+`trad_bot_me_short_a_collector`. The collector role has no `dds` privilege and
+no Phase 1 privilege; substituting it would both break intake and defeat the
+audit boundary. The runner refuses to start if that variable is absent and
+never falls back to application credentials.
+
+### 1.5.2 Read-only transactions for the intake
+
+The intake runs on its **own** connection with
+`default_transaction_read_only = on`, so PostgreSQL opens every transaction on
+it as a `READ ONLY` transaction and rejects any write server-side. This is
+separate from the connection used for the append-only capture `INSERT`s, which
+needs `default_transaction_read_only = off` and is never exposed to the intake.
+
+After the service has run at least one cycle, verify it from the database
+(READ-ONLY):
+
+```bash
+sudo -u postgres psql -d trad_bot -P pager=off -c \
+  "SELECT pid, usename, state, query
+     FROM pg_stat_activity
+    WHERE usename = 'trad_bot_me_short_a_runtime'
+    ORDER BY pid;"
+```
+
+Expected: two sessions of `trad_bot_me_short_a_runtime` — one with
+`INSERT INTO research.me_short_a_...` activity (the write path) and one whose
+statements are all `SELECT ... FROM dds.scanner_setup` (the read path). If
+only one session exists, the read-only separation was not applied and the
+service must be stopped until it is.
+
+A quick way to prove the guarantee holds for the read session:
+
+```sql
+-- run AS trad_bot_me_short_a_runtime; the error IS the expected result
+BEGIN READ ONLY;
+INSERT INTO dds.instrument (symbol) VALUES ('probe');
+ROLLBACK;
+-- ERROR:  cannot execute INSERT in a read-only transaction
+```
+
+Do **not** run the `INSERT` outside a `READ ONLY` block on the write session:
+it would depend on grants rather than on the transaction mode, and the grants
+already reject it (the previous check).
+
 ### 1.6 Create the dedicated runtime credentials
 
 Create `/opt/trad_bot/etc/me_short_a_forward_runtime.env` with mode `0600`,
@@ -404,20 +537,41 @@ sudo systemctl daemon-reload
 ```bash
 sudo -u postgres psql -d trad_bot -X -v ON_ERROR_STOP=1 -1 \
   -c "REVOKE ALL ON SCHEMA research FROM trad_bot_me_short_a_runtime;
-      REVOKE ALL ON SCHEMA research FROM trad_bot_me_short_a_runtime_audit;"
+      REVOKE ALL ON SCHEMA dds FROM trad_bot_me_short_a_runtime;
+      REVOKE ALL ON SCHEMA research FROM trad_bot_me_short_a_runtime_audit;
+      REVOKE ALL ON SCHEMA dds FROM trad_bot_me_short_a_runtime_audit;"
+```
+
+Then remove the table-level grants that `REVOKE ALL ON SCHEMA` does not cover:
+
+```bash
+sudo -u postgres psql -d trad_bot -X -v ON_ERROR_STOP=1 -1 \
+  -c "REVOKE ALL ON dds.scanner_setup FROM trad_bot_me_short_a_runtime;
+      REVOKE ALL ON dds.instrument FROM trad_bot_me_short_a_runtime;
+      REVOKE ALL ON research.me_short_a_source_signal_v1 FROM trad_bot_me_short_a_runtime;
+      REVOKE ALL ON research.me_short_a_post_signal_candle_v1 FROM trad_bot_me_short_a_runtime;
+      REVOKE ALL ON research.me_short_a_event_lineage_v1 FROM trad_bot_me_short_a_runtime;
+      REVOKE ALL ON research.me_short_a_outcome_observation_v1 FROM trad_bot_me_short_a_runtime;
+      REVOKE ALL ON research.me_short_a_fill_feasibility_v1 FROM trad_bot_me_short_a_runtime;
+      REVOKE ALL ON research.me_short_a_lineage_activation_v1 FROM trad_bot_me_short_a_runtime;
+      REVOKE ALL ON research.me_short_a_forward_outcome_runtime_heartbeat_v1 FROM trad_bot_me_short_a_runtime;
+      REVOKE ALL ON research.v_me_short_a_forward_outcome_runtime_status_v1 FROM trad_bot_me_short_a_runtime;
+      REVOKE ALL ON research.me_short_a_forward_outcome_runtime_heartbeat_v1 FROM trad_bot_me_short_a_runtime_audit;
+      REVOKE ALL ON research.v_me_short_a_forward_outcome_runtime_status_v1 FROM trad_bot_me_short_a_runtime_audit;"
 ```
 
 Verify (READ-ONLY) that nothing is left:
 
 ```bash
 sudo -u postgres psql -d trad_bot -P pager=off -c \
-  "SELECT grantee, table_name, privilege_type
+  "SELECT grantee, table_schema, table_name, privilege_type
      FROM information_schema.role_table_grants
     WHERE grantee IN ('trad_bot_me_short_a_runtime',
                       'trad_bot_me_short_a_runtime_audit');"
 ```
 
-Expected: zero rows.
+Expected: zero rows — **including** `dds.scanner_setup` and `dds.instrument`,
+which are the intake's only reads and must disappear with everything else.
 
 ### 3.5 Roll back the 079 schema (undo step 3 — DESTRUCTIVE)
 

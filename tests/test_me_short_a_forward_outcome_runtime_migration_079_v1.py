@@ -390,6 +390,26 @@ def test_runbook_applies_078_grants078_079_grants079_in_order():
         assert marker in text, marker
 
 
+def test_runbook_verifies_the_dds_read_only_intake_and_the_role_separation():
+    text = RUNBOOK.read_text(encoding="utf-8")
+    # the two intake tables are named and verified
+    assert "dds.scanner_setup" in text and "dds.instrument" in text
+    assert "1.5.1" in text, "the dds verification section is missing"
+    # no write verb may survive anywhere outside the append-only INSERTs
+    assert "zero rows" in text.lower()
+    assert "privilege_type IN ('INSERT','UPDATE','DELETE','TRUNCATE'" in text
+    # role separation is a first-class check
+    assert "ME_SHORT_A_RUNTIME_DB_USER=trad_bot_me_short_a_runtime" in text
+    assert "trad_bot_me_short_a_collector" in text
+    # read-only transactions get their own verification
+    assert "Read-only transactions for the intake" in text
+    assert "default_transaction_read_only = on" in text
+    assert "READ ONLY" in text
+    # rollback removes the dds privileges too
+    assert "REVOKE ALL ON dds.scanner_setup" in text
+    assert "REVOKE ALL ON dds.instrument" in text
+
+
 def test_runbook_rollback_is_real_and_ordered():
     text = RUNBOOK.read_text(encoding="utf-8")
     upper = text.upper()
@@ -424,6 +444,7 @@ def test_ci_workflow_covers_the_new_runtime_files():
                    "test_me_short_a_forward_outcome_runtime_v1.py",
                    "test_me_short_a_forward_outcome_runtime_migration_079_v1.py",
                    "test_me_short_a_forward_outcome_runtime_pagination_and_lineage_v1.py",
+                   "test_me_short_a_forward_outcome_runtime_permissions_v1.py",
                    "trad-bot-me-short-a-forward-outcome.service"):
         assert needle in text, needle
 

@@ -20,6 +20,7 @@ Neither adapter has any order, paper or live surface.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -29,6 +30,7 @@ from app.research.me_short_a_forward_outcome_runtime_v1 import (
     Candidate,
     CandidatePage,
     CandidateSource,
+    DatabaseAccessError,
     canonical_price,
     utcnow,
 )
@@ -38,6 +40,12 @@ __all__ = [
     "DEFAULT_PAGE_SIZE",
     "SCANNER_NAME",
     "DIRECTION",
+    "READ_ONLY_LABEL",
+    "READ_ONLY_GUC",
+    "ReadOnlyViolation",
+    "ReadOnlyCursor",
+    "assert_read_only_statement",
+    "assert_read_only_session",
     "canonical_price",
     "ms_to_datetime",
     "datetime_to_ms",
@@ -56,6 +64,157 @@ DIRECTION = "SHORT"
 DEFAULT_PAGE_SIZE = 500
 
 WINDOW_SIZE = 5
+
+# ── read-only transaction contract ───────────────────────────────────
+#
+# The candidate intake is a pure reader of two dds tables. Two independent
+# mechanisms keep it that way:
+#
+#   1. PostgreSQL level — the intake runs on a session whose
+#      `default_transaction_read_only` is ON, so every transaction opened on
+#      it is a READ ONLY transaction and the server itself rejects any write
+#      with "cannot execute INSERT in a read-only transaction";
+#   2. statement level — this module refuses to even hand a non-read
+#      statement to a cursor (see :func:`assert_read_only_statement`).
+#
+# Neither depends on the grants file, and the grants file in turn never gives
+# the runtime role a write privilege on dds. Three layers, independently
+# verifiable.
+
+READ_ONLY_LABEL = "ME_SHORT_A_FORWARD_OUTCOME_RUNTIME_READ_ONLY_INTAKE"
+READ_ONLY_GUC = "default_transaction_read_only"
+
+#: Statement kinds a read-only adapter may run.
+_READ_KINDS = ("SELECT", "WITH", "SHOW", "EXPLAIN", "VALUES", "TABLE")
+
+#: Data-modifying CTE: `WITH x AS (INSERT ...)` starts with WITH and mutates.
+_MUTATING_CTE = re.compile(
+    r"\bAS\s*\(\s*(?:INSERT|UPDATE|DELETE|MERGE)\b", re.IGNORECASE)
+
+#: Bare mutating statements, searched in literal-stripped text.
+_MUTATING_STMT = re.compile(
+    r"\b(?:INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM|TRUNCATE\s|MERGE\s+INTO"
+    r"|COPY\s+\w|CALL\s+\w|CREATE\s|ALTER\s|DROP\s|GRANT\s|REVOKE\s)\b",
+    re.IGNORECASE)
+
+_SQL_LITERAL = re.compile(r"'(?:''|[^'])*'")
+
+
+class ReadOnlyViolation(DatabaseAccessError):
+    """A read-only adapter was asked to run or to commit a mutating action."""
+
+
+def _strip_literals(sql: str) -> str:
+    """Blank out single-quoted literals so keyword scans ignore string data."""
+    return _SQL_LITERAL.sub("''", sql)
+
+
+def assert_read_only_statement(sql: str) -> str:
+    """Return the normalised statement kind, or raise ``ReadOnlyViolation``.
+
+    Accepts only read statements. Both a plain ``INSERT`` and a
+    data-modifying ``WITH ... AS (INSERT ...)`` are rejected, so a candidate
+    source can never write even by accident.
+    """
+    text = (sql or "").strip()
+    if not text:
+        raise ReadOnlyViolation("empty statement is not a read")
+    if text.startswith("(") and text.endswith(")"):
+        text = text[1:-1].strip()
+    kind = text.split(None, 1)[0].upper().rstrip("(")
+    if kind not in _READ_KINDS:
+        raise ReadOnlyViolation(
+            f"read-only intake refused non-read statement kind={kind!r}")
+    body = _strip_literals(text)
+    if _MUTATING_CTE.search(body):
+        raise ReadOnlyViolation(
+            "read-only intake refused a data-modifying WITH clause")
+    if _MUTATING_STMT.search(body):
+        raise ReadOnlyViolation(
+            "read-only intake refused a statement containing a mutating "
+            "clause")
+    return kind
+
+
+class ReadOnlyCursor:
+    """Cursor wrapper that refuses to execute a mutating statement.
+
+    Every read path of the runtime goes through this wrapper (see
+    :func:`assert_read_only_statement`), so the read-only property holds even
+    if the session-level guarantee is ever lost.
+    """
+
+    def __init__(self, cursor: Any) -> None:
+        self._cur = cursor
+
+    # -- reads are allowed -------------------------------------------------
+    def execute(self, sql: Any, params: Any = None) -> Any:
+        assert_read_only_statement(sql if isinstance(sql, str) else str(sql))
+        try:
+            if params is None:
+                return self._cur.execute(sql)
+            return self._cur.execute(sql, params)
+        except (ReadOnlyViolation, DatabaseAccessError):
+            raise
+        except Exception as exc:  # noqa: BLE001 - normalise driver errors
+            raise DatabaseAccessError(
+                f"read-only query failed: {type(exc).__name__}: {exc}") from exc
+
+    def fetchall(self) -> Any:
+        return self._cur.fetchall()
+
+    def fetchone(self) -> Any:
+        return self._cur.fetchone()
+
+    def fetchmany(self, size: int | None = None) -> Any:
+        if size is None:
+            return self._cur.fetchmany()
+        return self._cur.fetchmany(size)
+
+    def close(self) -> Any:
+        return self._cur.close()
+
+    # -- observability ----------------------------------------------------
+    @property
+    def description(self) -> Any:
+        return self._cur.description
+
+    @property
+    def rowcount(self) -> Any:
+        return self._cur.rowcount
+
+    def __iter__(self) -> Any:
+        return iter(self._cur)
+
+    def __enter__(self) -> "ReadOnlyCursor":
+        return self
+
+    def __exit__(self, *exc: Any) -> Any:
+        self.close()
+        return False
+
+
+def assert_read_only_session(conn: Any) -> None:
+    """Verify the connection really is a READ ONLY session, else raise.
+
+    This is the runtime-side check of the read-only transaction contract: the
+    intake refuses to run on a session where a write would be accepted.
+    """
+    cursor_obj = conn.cursor()
+    try:
+        cursor_obj.execute(f"SHOW {READ_ONLY_GUC}")
+        row = cursor_obj.fetchone()
+    except Exception as exc:  # noqa: BLE001 - normalise driver errors
+        raise DatabaseAccessError(
+            f"could not verify the read-only session: "
+            f"{type(exc).__name__}: {exc}") from exc
+    finally:
+        cursor_obj.close()
+    value = row[0] if row else None
+    if str(value).strip().lower() not in ("on", "true", "1", "yes", "t"):
+        raise ReadOnlyViolation(
+            f"candidate intake requires a READ ONLY session "
+            f"({READ_ONLY_GUC}={value!r}); refusing to scan dds read-write")
 
 
 def ms_to_datetime(value: int | float) -> datetime:
@@ -191,6 +350,11 @@ class DbScannerSetupCandidateSource(CandidateSource):
     )
     _ORDER_LIMIT = "ORDER BY s.detected_at ASC, s.setup_id ASC LIMIT %s"
 
+    #: This source is a pure reader and must run on a READ ONLY session.
+    requires_read_only_session = True
+    #: Exactly these two tables are read; nothing else in dds is touched.
+    read_tables = ("dds.scanner_setup", "dds.instrument")
+
     SELECT_SQL = _PROJECTION + _ORDER_LIMIT
     SELECT_AFTER_CURSOR_SQL = (
         _PROJECTION
@@ -221,6 +385,14 @@ class DbScannerSetupCandidateSource(CandidateSource):
     # ── plumbing ──────────────────────────────────────────────────
     def __call__(self, freeze_ts: datetime | None = None) -> list[Candidate]:
         return self.fetch(freeze_ts)
+
+    def verify_session(self) -> None:
+        """Assert the intake connection is a READ ONLY session.
+
+        Called before the first scan so a misconfigured connection is a loud,
+        fail-closed error instead of a silently read-write intake.
+        """
+        assert_read_only_session(self._conn)
 
     def fetch_page(
         self,
@@ -264,7 +436,7 @@ class DbScannerSetupCandidateSource(CandidateSource):
                 self._scanner_name, self._direction, lower,
                 cursor_detected_at, cursor_detected_at, cursor_setup_id, limit)
 
-        cursor_obj = self._conn.cursor()
+        cursor_obj = ReadOnlyCursor(self._conn.cursor())
         try:
             cursor_obj.execute(sql, params)
             rows = cursor_obj.fetchall()

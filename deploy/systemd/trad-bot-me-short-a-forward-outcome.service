@@ -23,12 +23,22 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/trad_bot
 # Dedicated secrets file for this runtime only (chmod 0600, owner tradbot).
-# It must contain ME_SHORT_A_RUNTIME_DB_HOST/PORT/NAME/USER and
-# ME_SHORT_A_RUNTIME_DB_PASSWORD (or ..._PASSWORD_FILE) plus
-# ME_SHORT_A_LINEAGE_CAPTURE_ENABLED. The shared application .env is
-# intentionally NOT loaded: the runtime authenticates as the least-privilege
-# role trad_bot_me_short_a_runtime and must never reuse scanner / paper / live
-# credentials. See the runbook for the secrets contract.
+# It must contain exactly these keys:
+#   ME_SHORT_A_RUNTIME_DB_HOST
+#   ME_SHORT_A_RUNTIME_DB_PORT
+#   ME_SHORT_A_RUNTIME_DB_NAME
+#   ME_SHORT_A_RUNTIME_DB_USER          <- MUST be trad_bot_me_short_a_runtime
+#   ME_SHORT_A_RUNTIME_DB_PASSWORD (or ME_SHORT_A_RUNTIME_DB_PASSWORD_FILE)
+#   ME_SHORT_A_LINEAGE_CAPTURE_ENABLED
+#
+# ROLE CONTRACT: the user above is the least-privilege role
+# trad_bot_me_short_a_runtime and NOTHING ELSE. In particular it must never be
+# trad_bot_me_short_a_collector (the Issue #208 collector login: no dds access,
+# no Phase 1 access) and never an application/scanner/paper/live role. The
+# runner refuses to start if ME_SHORT_A_RUNTIME_DB_USER is absent and never
+# falls back to application credentials. The shared application .env is
+# intentionally NOT loaded. See the runbook for the secrets contract and the
+# apply order 078 -> grants078 -> 079 -> grants079.
 EnvironmentFile=/opt/trad_bot/etc/me_short_a_forward_runtime.env
 # --candle-source bybit: CLOSED 5m klines only. The forming candle is dropped
 # before it can reach the collector. There is deliberately NO csv/replay

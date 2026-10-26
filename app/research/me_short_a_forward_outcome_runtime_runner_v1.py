@@ -54,6 +54,7 @@ __all__ = [
     "main",
     "build_runtime",
     "connect",
+    "connect_readonly",
 ]
 
 log = logging.getLogger(__name__)
@@ -118,12 +119,50 @@ def connect(env: dict[str, str] | None = None) -> Any:
         host=host, port=port, database=name, user=user, password=password)
 
 
+def _close_quietly(conn: Any) -> None:
+    """Close a connection without letting a driver error mask the real one."""
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+def connect_readonly(env: dict[str, str] | None = None) -> Any:
+    """Open a dedicated **READ ONLY** connection for the candidate intake.
+
+    The intake reads exactly ``dds.scanner_setup`` and ``dds.instrument`` and
+    must never write anywhere. The session is switched to
+    ``default_transaction_read_only = on``, so PostgreSQL opens every
+    transaction on it as a READ ONLY transaction and rejects any write with
+    ``cannot execute INSERT in a read-only transaction``.
+
+    This is deliberately a *separate connection* from the one used for the
+    append-only capture writes: the write path needs ``default_transaction_read_only
+    = off``, and mixing the two on one session would weaken both guarantees.
+    """
+    conn = connect(env)
+    cursor_obj = conn.cursor()
+    try:
+        cursor_obj.execute("SET default_transaction_read_only = on")
+        conn.commit()
+    finally:
+        cursor_obj.close()
+    return conn
+
+
 # ── runtime assembly ──────────────────────────────────────────────────
 
-def build_runtime(conn: Any, args: argparse.Namespace) -> ForwardOutcomeRuntime:
+def build_runtime(
+    conn: Any,
+    args: argparse.Namespace,
+    read_conn: Any = None,
+) -> ForwardOutcomeRuntime:
     from app.research.me_short_a_forward_outcome_runtime_sources_v1 import (
         BybitClosedCandleSource,
         DbScannerSetupCandidateSource,
+        assert_read_only_session,
     )
 
     config = resolve_config(registry_path=args.registry)
@@ -147,8 +186,14 @@ def build_runtime(conn: Any, args: argparse.Namespace) -> ForwardOutcomeRuntime:
             "closed-candle source the runtime fails closed instead of "
             "replaying stale data")
 
+    # The candidate intake runs on the READ ONLY connection. It never sees
+    # the write connection, and it refuses to run unless the session really is
+    # a PostgreSQL READ ONLY session.
+    intake_conn = conn if read_conn is None else read_conn
     candidate_source = DbScannerSetupCandidateSource(
-        conn, candle_source, max_rows=args.max_rows)
+        intake_conn, candle_source, max_rows=args.max_rows)
+    if getattr(candidate_source, "requires_read_only_session", False):
+        assert_read_only_session(intake_conn)
 
     return ForwardOutcomeRuntime(
         conn,
@@ -227,10 +272,20 @@ def main(argv: list[str] | None = None) -> int:
         log.error("dedicated runtime DB credentials are not usable: %s", exc)
         return EXIT_NOT_RUNNABLE
 
+    read_conn = None
     try:
-        runtime = build_runtime(conn, args)
+        read_conn = connect_readonly()
+    except Exception as exc:
+        log.error("READ ONLY intake connection could not be opened: %s", exc)
+        _close_quietly(conn)
+        return EXIT_NOT_RUNNABLE
+
+    try:
+        runtime = build_runtime(conn, args, read_conn=read_conn)
     except Exception as exc:
         log.error("runtime could not be assembled: %s", exc)
+        _close_quietly(read_conn)
+        _close_quietly(conn)
         return EXIT_STATE_ERROR
 
     _install_signal_handlers(runtime)
@@ -270,10 +325,8 @@ def main(argv: list[str] | None = None) -> int:
         if runtime.state != RUNNER_STATE_FAILED:
             runtime.stop("SIGTERM" if runtime.state == "STOPPING" else "RUN_COMPLETED")
             runtime.heartbeat()
-        try:
-            conn.close()
-        except Exception:  # pragma: no cover
-            pass
+        _close_quietly(read_conn)
+        _close_quietly(conn)
 
     return EXIT_OK
 

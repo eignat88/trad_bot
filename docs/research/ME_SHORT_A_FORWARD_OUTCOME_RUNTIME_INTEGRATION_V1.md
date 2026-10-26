@@ -310,8 +310,43 @@ backfill** path in the runtime and none is planned.
 
 | Role | Privileges |
 |---|---|
-| `trad_bot_me_short_a_runtime` | `INSERT` on the four capture tables and the heartbeat log; `SELECT` on the activation row, on the lineage/outcome tables (pending-event derivation) and on Phase 1 (**read-only** linkage lookup) |
-| `trad_bot_me_short_a_runtime_audit` | `SELECT` on the heartbeat log and the runtime status view |
+| `trad_bot_me_short_a_runtime` | `INSERT` on the four capture tables and the heartbeat log; `SELECT` on the activation row, on the lineage/outcome tables (pending-event derivation) and on Phase 1 (**read-only** linkage lookup); `USAGE` on schema `dds` and **`SELECT` only** on `dds.scanner_setup` + `dds.instrument` (candidate intake — the complete `dds` grant) |
+| `trad_bot_me_short_a_runtime_audit` | `SELECT` on the heartbeat log and the runtime status view; **no** `dds` access at all |
+
+**No write path into `dds`.** The runtime role receives no `INSERT` /
+`UPDATE` / `DELETE` / `TRUNCATE` on anything in `dds`, so it can never touch
+scanner state, paper state, live state or the direction gates
+(`dds.scanner_direction_config`, `config.scanner_direction_gate`,
+`config.scanner_direction_gate_history`). This is enforced three ways: the
+grant list is read-only, the write verbs are explicitly revoked again, and the
+intake runs inside a `READ ONLY` transaction (see 4.1.2).
+
+**The runtime never authenticates as `trad_bot_me_short_a_collector`.** The
+systemd unit mandates `ME_SHORT_A_RUNTIME_DB_USER=trad_bot_me_short_a_runtime`,
+the runner refuses to start without it and never falls back to application
+credentials, and the collector role is a different login with no `dds` and no
+Phase 1 privilege.
+
+#### 4.1.2 Read-only transactions for the intake
+
+The candidate intake runs on its **own** connection opened by
+`connect_readonly()`, whose session has `default_transaction_read_only = on`.
+PostgreSQL therefore opens every transaction on it as a `READ ONLY`
+transaction and rejects any write server-side
+(`cannot execute INSERT in a read-only transaction`). The connection used for
+the append-only capture `INSERT`s is separate and is never exposed to the
+intake.
+
+Two further layers back this up independently:
+
+* `assert_read_only_session()` runs before the first scan and raises
+  `ReadOnlyViolation` if the session is not actually read-only, so a
+  misconfigured connection fails closed instead of silently scanning
+  read-write;
+* every intake statement goes through `ReadOnlyCursor` /
+  `assert_read_only_statement()`, which refuses any non-read statement —
+  including a data-modifying `WITH ... AS (INSERT ...)` — before it reaches
+  the driver.
 
 * `UPDATE` / `DELETE` / `TRUNCATE` are granted to **nobody** and revoked
   explicitly.

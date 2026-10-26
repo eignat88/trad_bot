@@ -35,6 +35,7 @@ on:
       - 'tests/test_me_short_a_forward_outcome_runtime_v1.py'
       - 'tests/test_me_short_a_forward_outcome_runtime_migration_079_v1.py'
       - 'tests/test_me_short_a_forward_outcome_runtime_pagination_and_lineage_v1.py'
+      - 'tests/test_me_short_a_forward_outcome_runtime_permissions_v1.py'
       - 'sql/migrations/073_me_short_abc_terminal_lifecycle.sql'
       - 'tests/test_prospective_evaluator_variant_tuple_hardening_v1.py'
       - 'tests/test_vc_short_execution_prospective_protocol.py'
@@ -85,7 +86,8 @@ jobs:
             tests/test_me_short_a_forward_outcome_lineage_migration_078_v1.py \
             tests/test_me_short_a_forward_outcome_runtime_v1.py \
             tests/test_me_short_a_forward_outcome_runtime_migration_079_v1.py \
-            tests/test_me_short_a_forward_outcome_runtime_pagination_and_lineage_v1.py
+            tests/test_me_short_a_forward_outcome_runtime_pagination_and_lineage_v1.py \
+            tests/test_me_short_a_forward_outcome_runtime_permissions_v1.py
 
       - name: Run execution protocol regressions
         env:
@@ -101,6 +103,7 @@ jobs:
             tests/test_me_short_a_forward_outcome_runtime_v1.py \
             tests/test_me_short_a_forward_outcome_runtime_migration_079_v1.py \
             tests/test_me_short_a_forward_outcome_runtime_pagination_and_lineage_v1.py \
+            tests/test_me_short_a_forward_outcome_runtime_permissions_v1.py \
             tests/test_prospective_evaluator_variant_tuple_hardening_v1.py \
             tests/test_vc_short_execution_prospective_protocol.py \
             --tb=short
