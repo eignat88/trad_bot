@@ -256,6 +256,31 @@ def _get_research_observer(repository: ScannerRepository):
     return _research_observer
 
 
+def _observe_prospective_with_fill(client, prospective_obs, **kwargs):
+    """Preserve existing OOS routing; independently collect Phase-1 depth."""
+    ids = prospective_obs.observe(**kwargs)
+    if (
+        os.environ.get("ME_SHORT_A_FILL_CAPTURE_ENABLED") == "1"
+        and kwargs.get("scanner_name") == "MOMENTUM_EXHAUSTION"
+        and kwargs.get("direction") == "SHORT"
+    ):
+        try:
+            from app.research.me_short_a_fill_feasibility_v1 import capture
+            capture(
+                prospective_obs._conn, client,
+                scanner_name=kwargs["scanner_name"],
+                direction=kwargs["direction"],
+                symbol=kwargs["symbol"],
+                signal_time=kwargs["signal_time"],
+                reference_price=kwargs["reference_price"],
+                invalidation_price=kwargs["invalidation_price"],
+                target_1=kwargs["target_1"],
+            )
+        except Exception:
+            logger.exception("ME fill feasibility capture error; scanner unaffected")
+    return ids
+
+
 # --- Prospective OOS Observer -------------------------------------------
 
 _prospective_observer = None
@@ -729,7 +754,7 @@ def run_scan_cycle(
                     # Fail-open: never blocks scanner cycle.
                     if prospective_obs is not None:
                         try:
-                            prospective_obs.observe(
+                            _observe_prospective_with_fill(client, prospective_obs, 
                                 scanner_name=c.scanner_name,
                                 direction=c.direction,
                                 symbol=c.symbol,
@@ -789,7 +814,7 @@ def run_scan_cycle(
                     # Capture for prospective OOS
                     if prospective_obs is not None:
                         try:
-                            prospective_obs.observe(
+                            _observe_prospective_with_fill(client, prospective_obs, 
                                 scanner_name=oc.scanner_name,
                                 direction=oc.direction,
                                 symbol=oc.symbol,
@@ -854,7 +879,7 @@ def run_scan_cycle(
                                 clean_ctx, c.detected_at,
                             )
                             if capture_timely:
-                                prospective_obs.observe(
+                                _observe_prospective_with_fill(client, prospective_obs, 
                                     scanner_name=c.scanner_name,
                                     direction=c.direction,
                                     symbol=c.symbol,
@@ -944,7 +969,7 @@ def run_scan_cycle(
                                 features["_actual_regime"] = erc.market_regime
                                 features["_required_regime"] = "TREND_UP"
                             
-                            prospective_obs.observe(
+                            _observe_prospective_with_fill(client, prospective_obs, 
                                 scanner_name=erc.scanner_name,
                                 direction=erc.direction,
                                 symbol=erc.symbol,
@@ -974,7 +999,7 @@ def run_scan_cycle(
                             features["_actual_regime"] = rrc.market_regime
                             features["_required_regime"] = "TREND_UP"
                             
-                            prospective_obs.observe(
+                            _observe_prospective_with_fill(client, prospective_obs, 
                                 scanner_name=rrc.scanner_name,
                                 direction=rrc.direction,
                                 symbol=rrc.symbol,
@@ -1018,7 +1043,7 @@ def run_scan_cycle(
                         logger.debug("HTF key-level observation failed for %s", symbol, exc_info=True)
 
                 # ── Prospective OOS: log observation stats ──
-                # Promotion happens immediately inside prospective_obs.observe()
+                # Promotion happens immediately inside _observe_prospective_with_fill(client, prospective_obs, )
                 # Fail-open: never blocks scanner cycle.
                 if prospective_obs is not None:
                     try:
