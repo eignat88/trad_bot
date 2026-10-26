@@ -1,4 +1,4 @@
-"""Regression guards for terminal ME A/B/C and live A execution isolation."""
+"""Regression guards for terminal ME A/B/C and finalized A execution lifecycle."""
 import json
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -20,7 +20,7 @@ def test_retired_abc_rejected_even_if_registry_running_or_db_unavailable():
     conn.cursor.assert_not_called()
 
 
-def test_registry_is_terminal_for_abc_but_not_execution():
+def test_registry_is_terminal_for_abc_and_execution_after_positive_verdict():
     data = json.loads(
         (Path(__file__).resolve().parents[1]
          / "app/research/prospective_registry.json").read_text(encoding="utf-8")
@@ -28,7 +28,18 @@ def test_registry_is_terminal_for_abc_but_not_execution():
     specs = {item["experiment_id"]: item for item in data["experiments"]}
     for key in OLD:
         assert specs[key]["status"] == "CANCELLED"
-    assert specs[NEW]["status"] not in {"CANCELLED", "COMPLETED", "INACTIVE"}
+
+    assert specs[NEW]["status"] == "COMPLETED"
+    assert specs[NEW]["lifecycle_verdict"] == "VALIDATED_POSITIVE_EXECUTION_EDGE_CONFIRMED"
+
+    checkpoint = specs[NEW]["decision_checkpoint"]
+    assert checkpoint["finalized_n"] == 368
+    assert checkpoint["symbols"] == 43
+    assert checkpoint["oos_days"] == 8
+    assert checkpoint["pre_freeze_contamination"] == 0
+    assert checkpoint["normal_net_er"] > 0
+    assert checkpoint["normal_net_pf"] > 1
+    assert checkpoint["bootstrap_ci_95"][0] > 0
 
 
 def test_migration_contains_db_fuse_and_execution_guard():
