@@ -211,7 +211,31 @@
       "discovery_source": "ME_SHORT_GEOMETRY_ABC_PAIRED_VALIDATION_V1",
       "paired_with": null,
       "started_at": null,
-      "status": "READY_TO_START"
+      "status": "COMPLETED",
+      "lifecycle_verdict": "VALIDATED_POSITIVE_EXECUTION_EDGE_CONFIRMED",
+      "lifecycle_reason": "Clean strictly post-freeze prospective execution validation passed. At decision checkpoint: 368 finalized observations, 43 symbols, 8 OOS days, zero pre-freeze contamination. Normal Net E[R]=+5.0735, Net PF=4.8046, Total Net R=+1867.03. Elevated Net E[R]=+4.5765, Net PF=3.7302. Bootstrap 95% CI for mean normal Net R=[+3.177142,+7.196802], P(mean>0)=1.0. Robustness remained positive without top-10 winners (Net E[R]=+2.3466, PF=2.7119) and with winners capped at +10R (Net E[R]=+0.9744). Research execution edge confirmed. This verdict does not authorize live trading.",
+      "decision_checkpoint": {
+        "date": "2026-10-26",
+        "finalized_n": 368,
+        "symbols": 43,
+        "oos_days": 8,
+        "pre_freeze_contamination": 0,
+        "normal_net_er": 5.0735,
+        "normal_net_pf": 4.8046,
+        "normal_total_net_r": 1867.03,
+        "elevated_net_er": 4.5765,
+        "elevated_net_pf": 3.7302,
+        "bootstrap_ci_95": [
+          3.177142,
+          7.196802
+        ],
+        "bootstrap_p_mean_gt_zero": 1.0,
+        "without_top_10_net_er": 2.3466,
+        "without_top_10_net_pf": 2.7119,
+        "cap_10r_net_er": 0.9744,
+        "max_drawdown_r": -61.2,
+        "max_consecutive_losses": 29
+      }
     },
     {
       "experiment_id": "ME_SHORT_GEOM_B_V1",
