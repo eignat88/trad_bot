@@ -1,0 +1,23 @@
+{
+  "experiment_id": "ME_SHORT_A_EXECUTION_FILL_FEASIBILITY_AUDIT_V1",
+  "source_experiment_id": "ME_SHORT_GEOM_A_EXECUTION_V1",
+  "issue": 202,
+  "status": "READY_TO_START",
+  "direction": "SHORT",
+  "scanner_name": "MOMENTUM_EXHAUSTION",
+  "mode": "OBSERVE_ONLY_NO_ORDERS",
+  "activation": "ME_SHORT_A_FILL_CAPTURE_ENABLED=1 and DB activation row",
+  "freeze_ts": null,
+  "source": "new prospective candidate, matched to source observation at capture time",
+  "risk_geometry": "frozen A: entry=reference_price, stop=invalidation_price, target=target_1",
+  "fee_per_side": 0.00055,
+  "normal_slippage_per_side": 0.0005,
+  "elevated_slippage_per_side": 0.001,
+  "notional_scenarios_usdt": [
+    100,
+    500,
+    1000
+  ],
+  "book_staleness_limit_ms": 10000,
+  "note": "No activation, no capture, no backfill until a separate deploy/freeze checkpoint. Paper/live forbidden."
+}
