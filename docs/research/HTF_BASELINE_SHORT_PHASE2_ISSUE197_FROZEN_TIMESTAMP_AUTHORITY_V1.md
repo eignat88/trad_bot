@@ -93,6 +93,18 @@ fingerprint)` (migration 074, hardened by 075):
   fails because PR #193 legitimately modified `app/research/prospective_observer.py`
   after the test's hard-coded `BASE_SHA` (`4ef60d1e`). This failure exists on
   `origin/main` itself and is reported, not masked, by this task.
+  **Resolved as a documented historical exception (PR #200 FIX-5):** `BASE_SHA`
+  stays `4ef60d1e6bb7d2fbbd7fe2b4e3de0591995dc5ba` and the other seven frozen
+  artifacts remain strictly byte-identical; for `prospective_observer.py` the
+  isolation test tolerates EXCLUSIVELY the single one-line replacement
+  introduced by commit `41536cc5bc967331846d045eaae18a0702da8b89` ("scoped ME
+  V3 draining lifecycle", PR #193 — ME V3 capture is RUNNING-only while
+  Point-B keeps the original `_active_status()` branch semantics). The exact
+  source and resulting fragments, the delta of `41536cc5` itself and the
+  expected content hash are all verified with that provenance; ANY other change
+  to the protected file (including a revert) fails the test, and negative
+  tests keep Point-B-dependent logic changes detectable. See the module
+  docstring of `tests/test_htf_baseline_short_phase2_isolation_v1.py`.
 
 ### 1.6 Non-atomic / partial-activation states found
 
