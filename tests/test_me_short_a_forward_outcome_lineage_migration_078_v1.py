@@ -58,7 +58,12 @@ def test_migration_number_follows_the_highest_existing_migration():
     numbers = sorted(
         int(p.name.split("_", 1)[0]) for p in MIGRATIONS.glob("[0-9]*.sql")
         if p.name.split("_", 1)[0].isdigit())
-    assert numbers[-1] == 78
+    # 078 is exactly one past the previous maximum and is used exactly once.
+    assert numbers.count(78) == 1
+    assert max(n for n in numbers if n < 78) == 77
+    # Later migrations (079+) may exist; the sequence must not go backwards.
+    assert numbers == sorted(numbers)
+    assert numbers[-1] >= 78
 
 
 def test_migration_is_transactional_and_idempotent():

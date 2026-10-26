@@ -1,0 +1,72 @@
+[Unit]
+Description=trad_bot ME SHORT A forward-only outcome + lineage runtime (OBSERVE ONLY, DISABLED BY DEFAULT)
+Documentation=file:///opt/trad_bot/docs/research/ME_SHORT_A_FORWARD_OUTCOME_RUNTIME_INTEGRATION_V1.md
+# ME_SHORT_A_FORWARD_OUTCOME_RUNTIME_INTEGRATION_V1 — Issue #208.
+#
+# Independent, strictly forward-only, observe-only runtime that drives the
+# migration 078 collector (capture_source_signal -> record_event_lineage ->
+# capture_post_signal_candle -> finalize_outcome) for MOMENTUM_EXHAUSTION SHORT
+# candidates. It NEVER places an order, NEVER routes to paper/live trading,
+# NEVER calls scanner code and NEVER modifies the frozen OOS stack or Phase 1.
+#
+# Disabled by default: the unit is gated on an explicit operator-created flag
+# file. Without it the service does not start at all. Creating the flag file is
+# part of the operator authorization sequence in
+# docs/research/ME_SHORT_A_FORWARD_OUTCOME_RUNTIME_DEPLOYMENT_RUNBOOK_V1.md and
+# must never be automated. This unit is NOT enabled at install time and has no
+# dependency that would start it automatically.
+ConditionPathExists=/opt/trad_bot/etc/me_short_a_forward_runtime_enabled
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trad_bot
+# Dedicated secrets file for this runtime only (chmod 0600, owner tradbot).
+# It must contain ME_SHORT_A_RUNTIME_DB_HOST/PORT/NAME/USER and
+# ME_SHORT_A_RUNTIME_DB_PASSWORD (or ..._PASSWORD_FILE) plus
+# ME_SHORT_A_LINEAGE_CAPTURE_ENABLED. The shared application .env is
+# intentionally NOT loaded: the runtime authenticates as the least-privilege
+# role trad_bot_me_short_a_runtime and must never reuse scanner / paper / live
+# credentials. See the runbook for the secrets contract.
+EnvironmentFile=/opt/trad_bot/etc/me_short_a_forward_runtime.env
+# --candle-source bybit: CLOSED 5m klines only. The forming candle is dropped
+# before it can reach the collector. There is deliberately NO csv/replay
+# source wired: without a real closed-candle source the runtime fails closed
+# (exit 3) instead of replaying stale data.
+#
+# --poll-seconds: one observe-only cycle per interval; every cycle appends one
+# heartbeat row so operators can see the runner's lifecycle and counters.
+ExecStart=/opt/trad_bot/.venv/bin/python -m app.research.me_short_a_forward_outcome_runtime_runner_v1 --candle-source bybit --poll-seconds 30 --max-rows 500 --log-level INFO
+
+Restart=on-failure
+RestartSec=60
+# Exit-code contract (runner constants): 0 = OK/stop requested, 3 =
+# EXIT_NOT_RUNNABLE (capture disabled / activation not RUNNING / freeze_ts NULL
+# / missing dedicated credentials — the EXPECTED fail-closed outcome before the
+# activation checkpoint), 4 = EXIT_STATE_ERROR, 5 = EXIT_WRITER_ERROR.
+# Exit 3 must NOT trigger a restart loop: it needs operator action, not retry.
+RestartPreventExitStatus=3
+
+# Explicit shutdown: SIGTERM finishes the current cycle, appends a final
+# heartbeat and exits.
+TimeoutStopSec=60
+KillSignal=SIGTERM
+
+# Secrets are private to the service user.
+UMask=0077
+
+# Resource limits (documented requirement).
+MemoryMax=512M
+TasksMax=64
+LimitNOFILE=4096
+
+User=tradbot
+Group=tradbot
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trad-bot-me-short-a-forward-outcome
+
+[Install]
+WantedBy=multi-user.target
