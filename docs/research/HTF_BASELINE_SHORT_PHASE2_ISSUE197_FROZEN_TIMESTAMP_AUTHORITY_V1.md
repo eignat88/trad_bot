@@ -378,6 +378,67 @@ fail-closed without receipt, one-time seal) and
 `tests/test_htf_baseline_short_phase2_timestamp_authority_v1.py` (receipt
 purity/identity binding).
 
+### 4.4 Atomic no-clobber immutable publication (PR #200 FIX-6)
+
+**Defect (Codex Review P2).** `_atomic_write_bytes()` published immutable
+artifacts with `os.replace(tmp, target)` after a `target.exists()` pre-check.
+That is a TOCTOU race: a competing writer publishing between the check and
+the replace is silently CLOBBERED — the "never overwritten" rule held only
+for sequential use. The race affects every immutable artifact written by the
+tool: the freeze record (`cmd_mint`), the claim receipt
+(`_seal_claim_receipt`), and the initial activation JSON.
+
+**Fix — atomic no-clobber publication.** For `overwrite=False` the temp file
+(after `write` + `fsync`, mode 0600, `O_EXCL` creation) is published with
+`os.link(tmp, target)`, never `os.replace`:
+
+* `os.link` fails with `FileExistsError` when the destination exists
+  **atomically at link time** (Windows `CreateHardLinkW` →
+  `ERROR_ALREADY_EXISTS`; POSIX `link(2)` → `EEXIST`), so exactly one of any
+  number of concurrent publications wins and the winner's bytes are the
+  final content — a published artifact can never be replaced;
+* rename-based no-clobber is deliberately NOT used: `os.rename` refuses an
+  existing destination on Windows but clobbers it on POSIX, so its semantics
+  cannot be relied on cross-platform. `os.link` is no-clobber on both; the
+  platform property is *proven* by
+  `test_os_link_refuses_existing_target_on_this_platform` on each OS the
+  suite runs on (Windows locally, Linux on VPS), not assumed;
+* `FileExistsError` → fail-closed `ToolRefused`; any other `OSError`
+  (e.g. a filesystem without hard links) → fail-closed `ToolRefused` too —
+  the tool never degrades to a clobberable write;
+* the temp name is removed on EVERY path (success, interrupted write,
+  publication conflict), preserving the FIX-2 interrupted-write behaviour
+  and the `O_EXCL` squatting refusal.
+
+`overwrite=True` keeps its exclusive meaning — the authorized
+`--repair-activation-json` path — and is the ONLY remaining `os.replace`
+user inside the primitive.
+
+**Identity consequences.** The freeze record and the claim receipt become
+true write-once artifacts under concurrency: if two operators claim two
+different records in the same window, exactly one receipt is sealed and
+`verify_claim_identity` can only ever bind that winner's `record_id` +
+`record_sha256`; the losing seal attempt is refused and can never rewrite
+the identity (and vice versa for the freeze record).
+
+**Reintroduction guard.** `test_immutable_publication_never_calls_os_replace`
+monkeypatches `os.replace` to explode and proves immutable publication and
+receipt sealing still succeed while the repair path still raises through it;
+`test_immutable_publication_source_has_single_replace_on_repair_path` is an
+AST guard requiring `os.link()` and exactly one `os.replace` call — inside
+the `overwrite=True` branch only.
+
+**Race regressions.** `tests/test_htf_baseline_short_phase2_freeze_record_v1.py`
+runs real multi-process races (spawn + Barrier, different payloads):
+`test_concurrent_immutable_publications_exactly_one_wins` (4 competing
+writers: exactly one OK, final content = winner's, no temp leftovers) and
+`test_concurrent_claim_receipt_seals_bind_one_identity` (two different
+records: exactly one seal, loser can never bind or re-seal), plus the
+deterministic `test_publication_conflict_cleans_temp_and_preserves_winner`
+(simulated competitor) and
+`test_temp_file_cleaned_up_on_precheck_refusal` /
+`test_temp_file_cleaned_up_on_symlink_refusal`.
+
 ## 5. Verification performed in this task (isolated, no production access)
 
 * pure-logic + stubbed-gate regression:

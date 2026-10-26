@@ -60,6 +60,11 @@ Hard rules (any violation aborts with a non-zero exit and STOP guidance):
     and is never overwritten (only a byte-identical re-seal of the SAME record
     is accepted); delayed repair requires an exact record_id + record_sha256
     match against it and fails closed when it is missing;
+  * every immutable artifact (freeze record, claim receipt, initial activation
+    JSON) is published with atomic NO-CLOBBER semantics (FIX-6: ``os.link``,
+    never ``os.replace``) — a concurrent claimer can never overwrite a
+    successfully published artifact; only --repair-activation-json may
+    replace an activation JSON on disk;
   * observer_enabled, systemd units, gate files and paper/live are NEVER
     touched by this tool — observe-only startup is issue #198.
 
@@ -176,10 +181,14 @@ def _atomic_write_json(path: str | Path, payload: dict, *, overwrite: bool) -> N
         is used ONLY for the activation-JSON repair path; the immutable freeze
         record is always written with ``overwrite=False`` and can therefore
         never be replaced;
+      * FIX-6: with ``overwrite=False`` the publication is atomic NO-CLOBBER
+        (``os.link``), so even a concurrent writer that publishes between the
+        existence check and the publication cannot be overwritten — see
+        ``_atomic_write_bytes``;
       * the temp file is created with ``O_EXCL`` so a pre-existing or
         symlinked temp file is refused instead of clobbered;
-      * the temp file is fsynced before the atomic ``os.replace`` and carries
-        mode 0600 on POSIX.
+      * the temp file is fsynced before publication and carries mode 0600 on
+        POSIX; the temp name is removed on every error path.
     """
     payload_text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     _atomic_write_bytes(path, payload_text, overwrite=overwrite)
@@ -194,6 +203,18 @@ def _atomic_write_bytes(path: str | Path, text: str, *, overwrite: bool) -> None
     artifacts: an interruption of the activation-JSON write never invalidates
     the already-sealed receipt, and the receipt is never rewritten by any
     later step.
+
+    FIX-6 atomic no-clobber publication: for ``overwrite=False`` the file is
+    published with ``os.link`` — NEVER ``os.replace``. ``os.link`` fails with
+    ``FileExistsError`` when the destination exists ATOMICALLY at link time,
+    so a concurrently published artifact can never be overwritten: exactly
+    one competing publication wins and the winner's bytes are the final
+    content. Rename-based no-clobber is deliberately NOT used — ``os.rename``
+    refuses an existing destination on Windows but clobbers it on POSIX —
+    while ``os.link`` is no-clobber on both platforms (CreateHardLinkW /
+    ``link(2)``), proven by tests on each. If the filesystem cannot provide
+    hard-link publication the write fails closed. The temp name is removed on
+    EVERY path — success, interrupted write, or publication conflict.
     """
     target = Path(str(path))
     if target.is_symlink():
@@ -220,15 +241,36 @@ def _atomic_write_bytes(path: str | Path, text: str, *, overwrite: bool) -> None
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-    except Exception:
+        if os.name == "posix":
+            os.chmod(str(tmp), 0o600)
+        if overwrite:
+            # Authorized activation-JSON repair path ONLY (FIX-1/FIX-6): the
+            # one documented place where re-derived bytes replace an existing
+            # artifact on disk.
+            os.replace(str(tmp), str(target))
+        else:
+            # Immutable publication (freeze record, claim receipt, initial
+            # activation JSON): atomic NO-CLOBBER — never os.replace().
+            try:
+                os.link(str(tmp), str(target))
+            except FileExistsError as exc:
+                raise ToolRefused(
+                    f"{target} already exists (a concurrent publication won "
+                    "the race); refusing to overwrite an immutable artifact"
+                ) from exc
+            except OSError as exc:
+                raise ToolRefused(
+                    f"cannot atomically publish {target} without clobbering "
+                    f"({exc}); the filesystem must support hard links — "
+                    "refusing to write (fail closed)"
+                ) from exc
+    finally:
+        # FIX-6: the temp name never survives on ANY path — success (only the
+        # target name may remain), interrupted write, or publication conflict.
         try:
             os.unlink(str(tmp))
         except OSError:
             pass
-        raise
-    if os.name == "posix":
-        os.chmod(str(tmp), 0o600)
-    os.replace(str(tmp), str(target))
 
 
 def _require_pinned_protocol() -> str:

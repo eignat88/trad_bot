@@ -23,9 +23,13 @@ Covers, with a fully stubbed database boundary (real SQL is exercised in
 """
 from __future__ import annotations
 
+import ast
+import inspect
 import json
+import multiprocessing
 import os
 import sys
+import textwrap
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -545,3 +549,232 @@ def test_loaded_record_roundtrip_matches_hash(box, tmp_path):
     write_json(record_path, record)
     loaded = load_freeze_record(record_path)
     assert freeze_record_hash(loaded) == loaded["record_sha256"]
+
+
+# ==========================================================================
+# FIX-6: atomic no-clobber immutable publication (concurrent overwrite race)
+# ==========================================================================
+
+
+def _mp_worker_publish(result_path: str, target: str, text: str, barrier) -> None:
+    """Module-level (spawn-picklable) worker: one competing publication."""
+    barrier.wait()
+    try:
+        tool._atomic_write_bytes(target, text, overwrite=False)
+        outcome = "OK"
+    except tool.ToolRefused:
+        outcome = "REFUSED"
+    except Exception as exc:  # pragma: no cover - must never happen
+        outcome = f"ERROR:{type(exc).__name__}:{exc}"
+    Path(result_path).write_text(outcome, encoding="utf-8")
+
+
+def _mp_worker_seal(result_path: str, activation_out: str, record: dict, barrier) -> None:
+    """Module-level worker: one competing claim-receipt identity seal."""
+    barrier.wait()
+    try:
+        tool._seal_claim_receipt(activation_out, record)
+        outcome = "OK"
+    except tool.ToolRefused:
+        outcome = "REFUSED"
+    except Exception as exc:  # pragma: no cover - must never happen
+        outcome = f"ERROR:{type(exc).__name__}:{exc}"
+    Path(result_path).write_text(outcome, encoding="utf-8")
+
+
+def _run_concurrently(worker, arg_sets, tmp_path) -> list[str]:
+    """Run ``worker`` in spawn processes released simultaneously (a real
+    multiprocessing race, not threads)."""
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(len(arg_sets))
+    procs = [
+        ctx.Process(target=worker, args=(*args, barrier)) for args in arg_sets
+    ]
+    for proc in procs:
+        proc.start()
+    for proc in procs:
+        proc.join(timeout=120)
+        assert proc.exitcode == 0, f"worker crashed: exitcode={proc.exitcode}"
+    return [
+        (tmp_path / f"result_{i}.txt").read_text(encoding="utf-8")
+        for i in range(len(arg_sets))
+    ]
+
+
+def test_concurrent_immutable_publications_exactly_one_wins(tmp_path):
+    """FIX-6 req. 1/6: competing writers publish DIFFERENT payloads with
+    overwrite=False — exactly one publication succeeds and the final file
+    contents belong to the winner. A concurrent writer must never overwrite
+    a successfully published immutable artifact."""
+    target = tmp_path / "freeze_record.json"
+    n = 4
+    payloads = [f"payload-{i}\n" for i in range(n)]
+    arg_sets = [
+        (str(tmp_path / f"result_{i}.txt"), str(target), payloads[i])
+        for i in range(n)
+    ]
+    outcomes = _run_concurrently(_mp_worker_publish, arg_sets, tmp_path)
+    assert outcomes.count("OK") == 1, outcomes
+    assert outcomes.count("REFUSED") == n - 1, outcomes
+    winner = outcomes.index("OK")
+    assert target.read_text(encoding="utf-8") == payloads[winner]
+    # req. 5: no temp name survives a publication conflict
+    assert list(tmp_path.glob(".freeze_record.json.tmp.*")) == []
+
+
+def test_concurrent_claim_receipt_seals_bind_one_identity(tmp_path):
+    """FIX-6 req. 3/7: two DIFFERENT records claimed concurrently — the
+    claim-receipt identity is sealed for exactly one of them and can never
+    change afterwards."""
+    activation_out = tmp_path / "htf_phase2_activation.json"
+    record_a = make_record(experiment_id="EXPERIMENT_A")
+    record_b = make_record(experiment_id="EXPERIMENT_B")
+    arg_sets = [
+        (str(tmp_path / "result_0.txt"), str(activation_out), record_a),
+        (str(tmp_path / "result_1.txt"), str(activation_out), record_b),
+    ]
+    outcomes = _run_concurrently(_mp_worker_seal, arg_sets, tmp_path)
+    assert outcomes.count("OK") == 1, outcomes
+    assert outcomes.count("REFUSED") == 1, outcomes
+    winner_record, loser_record = (
+        (record_a, record_b) if outcomes[0] == "OK" else (record_b, record_a)
+    )
+    receipt = tool.load_claim_receipt(
+        str(tool._claim_receipt_path(str(activation_out)))
+    )
+    tool.verify_claim_identity(receipt, winner_record)  # winner binds
+    with pytest.raises(tool.FreezeRecordError):
+        tool.verify_claim_identity(receipt, loser_record)  # loser can never bind
+    # the sealed identity cannot change, not even by a later seal attempt
+    with pytest.raises(tool.ToolRefused):
+        tool._seal_claim_receipt(str(activation_out), loser_record)
+    assert list(tmp_path.glob(".htf_phase2_activation.json.tmp.*")) == []
+
+
+def test_publication_conflict_cleans_temp_and_preserves_winner(monkeypatch, tmp_path):
+    """FIX-6 req. 4/5: when a competitor publishes between the existence
+    check and our publication, the conflict fails closed, the winner's bytes
+    are preserved, and the temp file is cleaned up."""
+    target = tmp_path / "artifact.json"
+    real_link = os.link
+
+    def _racing_link(src, dst):
+        # simulate the concurrent winner that published first
+        Path(dst).write_text("winner\n", encoding="utf-8")
+        real_link(src, dst)  # must now fail with FileExistsError
+
+    monkeypatch.setattr(tool.os, "link", _racing_link)
+    with pytest.raises(tool.ToolRefused):
+        tool._atomic_write_bytes(target, "late-comer\n", overwrite=False)
+    assert target.read_text(encoding="utf-8") == "winner\n"
+    assert list(tmp_path.glob(".artifact.json.tmp.*")) == []
+
+
+def test_immutable_publication_never_calls_os_replace(monkeypatch, tmp_path):
+    """FIX-6 req. 9: regression guard — immutable publication must NEVER go
+    through os.replace() again; the authorized repair path (overwrite=True)
+    remains the only os.replace() user."""
+    calls: list[tuple[str, str]] = []
+
+    def _bomb(src, dst):
+        calls.append((str(src), str(dst)))
+        raise AssertionError("os.replace() must not run in the immutable path")
+
+    monkeypatch.setattr(os, "replace", _bomb)
+
+    # freeze-record / claim-receipt / initial-activation style publication
+    path = tmp_path / "immutable_artifact.json"
+    tool._atomic_write_bytes(path, "first\n", overwrite=False)
+    assert path.read_text(encoding="utf-8") == "first\n"
+    assert calls == []
+
+    # the claim-receipt identity seal equally never uses os.replace()
+    receipt_path = tool._seal_claim_receipt(
+        tmp_path / "activation.json", make_record()
+    )
+    assert receipt_path.exists()
+    assert calls == []
+
+    # the authorized activation-JSON repair path is the ONLY os.replace user
+    with pytest.raises(AssertionError):
+        tool._atomic_write_bytes(path, "repaired\n", overwrite=True)
+    assert len(calls) == 1
+    assert path.read_text(encoding="utf-8") == "first\n"
+    assert list(tmp_path.glob(".*.tmp.*")) == []
+
+
+def test_immutable_publication_source_has_single_replace_on_repair_path():
+    """FIX-6 req. 9: static AST guard — immutable publication must use
+    os.link(), and at most ONE os.replace() call may exist inside
+    _atomic_write_bytes: the authorized repair one, inside ``if overwrite``."""
+    source = inspect.getsource(tool._atomic_write_bytes)
+    tree = ast.parse(textwrap.dedent(source))
+    os_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "os"
+    ]
+    link_calls = [n for n in os_calls if n.func.attr == "link"]
+    replace_calls = [n for n in os_calls if n.func.attr == "replace"]
+    assert link_calls, "immutable publication must use os.link()"
+    assert len(replace_calls) == 1, (
+        "os.replace() is allowed exactly once — the authorized repair path"
+    )
+    overwrite_bodies = [
+        stmt
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "overwrite"
+        for stmt in node.body
+    ]
+    assert any(
+        replace_calls[0] is node
+        for stmt in overwrite_bodies
+        for node in ast.walk(stmt)
+    ), "the only os.replace() call must sit inside the overwrite=True branch"
+
+
+def test_os_link_refuses_existing_target_on_this_platform(tmp_path):
+    """FIX-6 req. 8: PROVE, don't assume — os.link() must be no-clobber on
+    the platform under test (Windows: CreateHardLinkW fails with
+    ERROR_ALREADY_EXISTS; Linux: link(2) fails with EEXIST). Immutable
+    publication relies on exactly this, never on rename semantics (which
+    differ across platforms)."""
+    a = tmp_path / "a.txt"
+    b = tmp_path / "b.txt"
+    a.write_text("a\n", encoding="utf-8")
+    b.write_text("b\n", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        os.link(str(a), str(b))
+    assert b.read_text(encoding="utf-8") == "b\n"
+    # a free destination still publishes
+    c = tmp_path / "c.txt"
+    os.link(str(a), str(c))
+    assert c.read_text(encoding="utf-8") == "a\n"
+
+
+def test_temp_file_cleaned_up_on_precheck_refusal(tmp_path):
+    """FIX-6 req. 5: fail-closed error paths never leave a temp file."""
+    path = tmp_path / "artifact.json"
+    path.write_text("published\n", encoding="utf-8")
+    with pytest.raises(tool.ToolRefused):
+        tool._atomic_write_bytes(path, "late\n", overwrite=False)
+    assert list(tmp_path.glob(".artifact.json.tmp.*")) == []
+
+
+def test_temp_file_cleaned_up_on_symlink_refusal(tmp_path):
+    """FIX-6 req. 5: the symlink fail-closed path also leaves no temp file."""
+    path = tmp_path / "artifact.json"
+    path.write_text("published\n", encoding="utf-8")
+    link = tmp_path / "link.json"
+    try:
+        link.symlink_to(path)
+    except (OSError, NotImplementedError) as exc:  # pragma: no cover - Windows
+        pytest.skip(f"symlinks unavailable: {exc}")
+    with pytest.raises(tool.ToolRefused):
+        tool._atomic_write_bytes(link, "x\n", overwrite=False)
+    assert list(tmp_path.glob(".link.json.tmp.*")) == []
