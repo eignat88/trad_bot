@@ -132,6 +132,7 @@ def box(monkeypatch):
         "db_now": _dt(BASE_TS),
         "activated": None,
         "executed": [],
+        "modes": [],
     }
 
     def fake_load_state(conn, experiment_id):
@@ -140,7 +141,13 @@ def box(monkeypatch):
             return running_state(ts, fp)
         return box["state"]
 
-    monkeypatch.setattr(tool, "_connect", lambda: _FakeConn(box))
+    def fake_connect(mode):
+        # issue #205: every admin session is opened for an explicit mode
+        # (read_only = mint/verify/repair, activate = initial claim only)
+        box["modes"].append(mode)
+        return _FakeConn(box)
+
+    monkeypatch.setattr(tool, "_connect", fake_connect)
     monkeypatch.setattr(tool, "_close", lambda conn: None)
     monkeypatch.setattr(tool, "_db_now", lambda conn: box["db_now"])
     monkeypatch.setattr(tool, "_load_state", fake_load_state)
@@ -778,3 +785,81 @@ def test_temp_file_cleaned_up_on_symlink_refusal(tmp_path):
     with pytest.raises(tool.ToolRefused):
         tool._atomic_write_bytes(link, "x\n", overwrite=False)
     assert list(tmp_path.glob(".link.json.tmp.*")) == []
+
+
+# ======================================================================
+# Issue #205: admin connection routing — per-operation session modes
+# ======================================================================
+
+
+def _mint_argv(record_path: Path) -> list:
+    return [
+        "mint",
+        "--operator-approval-ref",
+        "GO-UNIT-205",
+        "--issued-by",
+        "unit-operator",
+        "--record-id",
+        str(uuid.uuid4()),
+        "--out",
+        str(record_path),
+    ]
+
+
+def test_mint_uses_read_only_admin_session_and_writes_nothing(box, tmp_path):
+    """FIX-2: mint must never hold write capability (issue #205)."""
+    record_path = tmp_path / "freeze_record.json"
+    assert tool.main(_mint_argv(record_path)) == tool.EXIT_OK
+    assert record_path.exists()
+    assert box["modes"] == ["read_only"]
+    assert box["activated"] is None  # no activation, no DB write, ever
+    assert not _any_activation_write(box["executed"])
+
+
+def test_initial_claim_opens_read_probe_then_activate_session(box, tmp_path):
+    """The activation privilege is held ONLY by the initial claim (issue #205)."""
+    record_path = tmp_path / "freeze_record.json"
+    assert tool.main(_mint_argv(record_path)) == tool.EXIT_OK
+    activation = tmp_path / "activation.json"
+    assert tool.main(_claim_argv(record_path, activation)) == tool.EXIT_OK
+    assert box["modes"] == ["read_only", "read_only", "activate"]
+    assert box["activated"] is not None
+
+
+def test_repair_never_opens_an_activate_session(box, tmp_path):
+    """--repair-activation-json stays read-only end to end (issue #205)."""
+    record_path = tmp_path / "freeze_record.json"
+    assert tool.main(_mint_argv(record_path)) == tool.EXIT_OK
+    activation = tmp_path / "activation.json"
+    assert tool.main(_claim_argv(record_path, activation)) == tool.EXIT_OK
+    activation.unlink()
+    box["registry"] = {"experiment_id": EXPERIMENT_ID, "protocol_fingerprint": FP}
+    assert tool.main(_claim_argv(record_path, activation, repair=True)) == tool.EXIT_OK
+    assert box["modes"] == ["read_only", "read_only", "activate", "read_only"]
+    assert activation.exists()
+
+
+def test_verify_is_read_only_and_requires_registry_evidence(box, tmp_path):
+    record_path = tmp_path / "freeze_record.json"
+    assert tool.main(_mint_argv(record_path)) == tool.EXIT_OK
+    activation = tmp_path / "activation.json"
+    assert tool.main(_claim_argv(record_path, activation)) == tool.EXIT_OK
+    box["registry"] = {"experiment_id": EXPERIMENT_ID, "protocol_fingerprint": FP}
+    assert (
+        tool.main(["verify", "--record", str(record_path), "--activation", str(activation)])
+        == tool.EXIT_OK
+    )
+    assert box["modes"][-1] == "read_only"
+
+
+def test_verify_refuses_missing_registry_evidence(box, tmp_path):
+    """FIX-4: without freeze_registry evidence the agreement cannot be proven."""
+    record_path = tmp_path / "freeze_record.json"
+    assert tool.main(_mint_argv(record_path)) == tool.EXIT_OK
+    activation = tmp_path / "activation.json"
+    assert tool.main(_claim_argv(record_path, activation)) == tool.EXIT_OK
+    box["registry"] = None
+    assert (
+        tool.main(["verify", "--record", str(record_path), "--activation", str(activation)])
+        == tool.EXIT_REFUSED
+    )
