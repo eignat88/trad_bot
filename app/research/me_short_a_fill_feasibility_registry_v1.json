@@ -1,0 +1,48 @@
+{
+  "experiment_id": "ME_SHORT_A_EXECUTION_FILL_FEASIBILITY_AUDIT_V1",
+  "source_experiment_id": "ME_SHORT_GEOM_A_EXECUTION_V1",
+  "issue": 202,
+  "phase": "PHASE_1_FILL_FEASIBILITY_AUDIT",
+  "status": "READY_TO_START",
+  "direction": "SHORT",
+  "scanner_name": "MOMENTUM_EXHAUSTION",
+  "mode": "OBSERVE_ONLY_NO_ORDERS",
+  "activation": "ME_SHORT_A_FILL_CAPTURE_ENABLED=1 AND DB activation row status=RUNNING with explicit freeze_ts",
+  "activation_lifecycle": {
+    "seed": "migration 077 seeds READY_TO_START with freeze_ts=null",
+    "transitions": "READY_TO_START -> RUNNING (explicit freeze) -> COMPLETED/CANCELLED; READY_TO_START -> CANCELLED; terminal states are final",
+    "freeze_ts": "immutable once set; capture requires strictly signal_time > freeze_ts",
+    "evidence_rows": "append-only (UPDATE/DELETE blocked by trigger)"
+  },
+  "freeze_ts": null,
+  "source": "new prospective candidate, matched to source observation ids at capture time (source_observation_ids)",
+  "eligibility": "every valid new MOMENTUM_EXHAUSTION SHORT candidate strictly after freeze_ts (reference_price > target_1 > 0 and invalidation_price > reference_price); no post-hoc signal filter",
+  "idempotency": "event_key = sha256(symbol|SHORT|signal_time|reference|stop|target); ON CONFLICT DO NOTHING; capture returns True only for a fresh insert",
+  "risk_geometry": "frozen A: entry=reference_price, stop=invalidation_price, target=target_1",
+  "structural_r": "invalidation_price - reference_price",
+  "fee_per_side": 0.00055,
+  "normal_slippage_per_side": 0.0005,
+  "elevated_slippage_per_side": 0.001,
+  "normal_round_trip_cost": 0.0021,
+  "elevated_round_trip_cost": 0.0031,
+  "cost_estimate_model": "cost_pct = (reference - estimated_fill)/reference + (ask - bid)/mid + 2*fee_per_side; cost_r = cost_pct * reference / structural_r; cost_class = NORMAL <= 0.0021 < ELEVATED <= 0.0031 < ABOVE_ELEVATED (frozen thresholds, classification only, never retuned)",
+  "notional_scenarios_usdt": [
+    100,
+    500,
+    1000
+  ],
+  "scenario_semantics": "quantity-first per-scenario modeling: requested_qty = notional/reference rounded DOWN to qtyStep -> executable_qty; the book walk fills exactly executable_qty (never a USDT proceeds target), so feasibility/fill/cost describe the same modeled order; below-exchange-minimum checks use the modeled order value (executable_qty * estimated_fill, fallback reference); per-scenario fill/slippage/cost/min-constraint feasibility in scenario_results; top-level feasibility_status mirrors the FIRST (base) scenario",
+  "exchange_constraints": "minOrderQty/qtyStep/minNotionalValue from Bybit /v5/market/instruments-info (lotSizeFilter.minNotionalValue for category=linear, fallback minNotional/minOrderAmt); BELOW_EXCHANGE_MIN when executable qty < minOrderQty, qty rounds to zero at qtyStep, or order value < minNotionalValue; a missing/empty lotSizeFilter is never treated as known: constraints=None with lookup error and constraints_known=false, and such rows are excluded from min-constraint analysis",
+  "book_source": "Bybit /v5/market/orderbook category=linear limit=50, top bid/ask + bid depth within 10bps",
+  "book_staleness_limit_ms": 10000,
+  "book_future_skew_limit_ms": 1000,
+  "feasibility_statuses": [
+    "OK",
+    "INSUFFICIENT_DEPTH",
+    "STALE_BOOK",
+    "INVALID_BOOK",
+    "BELOW_EXCHANGE_MIN",
+    "ERROR"
+  ],
+  "note": "No activation, no capture, no backfill until a separate deploy/freeze checkpoint. Paper/live forbidden. Frozen geometry A methodology is never modified by this audit."
+}
