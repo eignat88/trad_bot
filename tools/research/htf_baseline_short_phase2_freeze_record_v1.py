@@ -45,7 +45,9 @@ claim  (operator GO)  Two explicit paths (FIX-1):
                         never treated as proof of provenance.
                       Without --repair-activation-json an existing activation
                       JSON is never overwritten.
-verify (read-only)    Re-check the three authorities end to end.
+verify (read-only)    Re-check the three authorities end to end (record,
+                      PostgreSQL registration + freeze_registry evidence,
+                      runtime activation JSON).
 
 Hard rules (any violation aborts with a non-zero exit and STOP guidance):
   * the protocol payload must match the pinned FROZEN fingerprint;
@@ -68,7 +70,27 @@ Hard rules (any violation aborts with a non-zero exit and STOP guidance):
   * observer_enabled, systemd units, gate files and paper/live are NEVER
     touched by this tool — observe-only startup is issue #198.
 
-Usage (from the repository root, as the dedicated admin role via HTF_P2_DB_*)::
+Database routing (issue #205 FIX-1 — ADMIN channel, NOT the observer channel)
+----------------------------------------------------------------------------
+Every subcommand connects through the dedicated OPERATOR/ADMIN connection path
+(``app.research.htf_baseline_short_phase2_admin_connection_v1``) driven by the
+``HTF_P2_ADMIN_DB_*`` environment ONLY: an explicit operator LOGIN credential
+(target cluster/database pinned, password required) that drops into the
+NOLOGIN role ``trad_bot_htf_p2_admin`` via a controlled ``SET ROLE``. The
+observer ``HTF_P2_DB_*`` loader is NEVER used here and is unchanged — observer
+credentials are refused by the admin channel.
+
+Per-operation privileges (fail closed, enforced by PostgreSQL):
+  * ``mint``, ``verify`` and ``--repair-activation-json`` open a READ-ONLY
+    admin session (``SET TRANSACTION READ ONLY``) — they CANNOT write to the
+    database even by accident, and they do not require the activation
+    privilege at all;
+  * only the INITIAL ``claim`` opens a read-write admin session, and its single
+    database write is the sanctioned
+    ``research.htf_baseline_short_phase2_activate(...)`` call; direct DML is
+    denied to the admin role by the database (no INSERT/UPDATE/DELETE).
+
+Usage (from the repository root, with HTF_P2_ADMIN_DB_* exported)::
 
     python tools/research/htf_baseline_short_phase2_freeze_record_v1.py mint \\
         --operator-approval-ref "GO-2026-xx (issue #198)" --issued-by operator \\
@@ -93,6 +115,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from app.research.htf_baseline_short_phase2_admin_connection_v1 import (  # noqa: E402
+    ACTIVATE_MODE,
+    ADMIN_ROLE,
+    READ_ONLY_MODE,
+    AdminConnectionError,
+    connect_admin_db,
+    close_admin_db,
+)
 from app.research.htf_baseline_short_phase2_freeze_v1 import parse_ts_ms  # noqa: E402
 from app.research.htf_baseline_short_phase2_protocol_v1 import (  # noqa: E402
     EXPERIMENT_ID,
@@ -119,8 +149,6 @@ EXIT_OK = 0
 EXIT_REFUSED = 1
 EXIT_NOT_RUNNABLE = 3
 
-ADMIN_ROLE = "trad_bot_htf_p2_admin"
-
 #: Legacy freeze boundaries that must NEVER be re-used by Phase-2. The Point-B
 #: prospective freeze is the known one; the freeze registry additionally makes
 #: every re-used timestamp structurally impossible at the database boundary.
@@ -136,20 +164,21 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _connect():
-    from app.research.htf_baseline_short_phase2_observer_runner_v1 import (
-        connect_db_from_env,
-    )
+def _connect(mode: str):
+    """Open the ADMIN-channel session for ``mode`` (issue #205 FIX-1).
 
-    return connect_db_from_env()
+    ``READ_ONLY_MODE`` (mint / verify / repair) and ``ACTIVATE_MODE`` (initial
+    claim) both run inside the controlled ``SET ROLE trad_bot_htf_p2_admin``
+    context; the mode pins the transaction write mode and the privilege
+    matrix. Fail-closed on any missing/mismatched credential or authority.
+    """
+    conn = connect_admin_db(mode)
+    print(f"ADMIN_DB_CONNECTED mode={mode} role={ADMIN_ROLE}")
+    return conn
 
 
 def _close(conn) -> None:
-    from app.research.htf_baseline_short_phase2_observer_runner_v1 import (
-        close_db_connection,
-    )
-
-    close_db_connection(conn)
+    close_admin_db(conn)
 
 
 def _db_now(conn) -> datetime:
@@ -299,7 +328,9 @@ def cmd_mint(args) -> int:
 
     conn = None
     try:
-        conn = _connect()
+        # FIX-2: mint writes NOTHING to PostgreSQL — enforced by the READ-ONLY
+        # admin session (issue #205), not by convention.
+        conn = _connect(READ_ONLY_MODE)
         db_now = _db_now(conn)
     finally:
         if conn is not None:
@@ -572,7 +603,9 @@ def _repair_after_committed_claim(args, conn, record) -> int:
     repair only re-derives runtime authority 3 from an already-validated
     agreement. Re-activation with a NEW timestamp is structurally impossible
     on this path — there is no ``activate()`` call, and the status/registry
-    guards would reject any other timestamp anyway.
+    guards would reject any other timestamp anyway. Since issue #205 the
+    repair additionally runs on a PostgreSQL READ-ONLY admin session, so the
+    database itself guarantees it cannot write (FIX-2/FIX-4).
     """
     state = _load_state(conn, record["experiment_id"])
     if not _committed_claim_matches(state, record):
@@ -613,9 +646,15 @@ def cmd_claim(args) -> int:
     # for a mis-pointed --activation-out that would target the immutable
     # freeze record.
     _require_activation_path_distinct_from_record(args)
+
+    # ---- Phase 1 (issue #205): READ-ONLY reconnaissance session -----------
+    # The path decision needs database state only; a READ-ONLY admin session
+    # (PostgreSQL-enforced) is enough and keeps mint/verify/repair-grade
+    # operations free of any write capability. The activation privilege is
+    # deliberately NOT held here.
     conn = None
     try:
-        conn = _connect()
+        conn = _connect(READ_ONLY_MODE)
         db_now = _db_now(conn)
         now_ms = parse_ts_ms(db_now)
         # Structural record validation FIRST (integrity only, no freshness):
@@ -635,6 +674,8 @@ def cmd_claim(args) -> int:
                     "— never with a NEW timestamp and never with another "
                     "record on the same boundary"
                 )
+            # Delayed repair stays on this READ-ONLY session: it performs no
+            # activation and provably cannot write to the database.
             return _repair_after_committed_claim(args, conn, record)
         if args.repair_activation_json:
             raise ToolRefused(
@@ -666,6 +707,40 @@ def cmd_claim(args) -> int:
                 f"fingerprint={record['protocol_fingerprint']}"
             )
             return EXIT_OK
+    except FreezeRecordError as exc:
+        raise ToolRefused(str(exc)) from exc
+    finally:
+        if conn is not None:
+            _close(conn)
+
+    # ---- Phase 2 (issue #205): the ONLY session holding activation rights --
+    # A fresh read-write admin session performs exactly one database write:
+    # research.htf_baseline_short_phase2_activate(...) — the sanctioned
+    # administrative entry point. Direct DML is denied to the admin role by
+    # the database; no other write path exists on this connection.
+    conn = None
+    try:
+        conn = _connect(ACTIVATE_MODE)
+        # Re-read the authoritative state in THIS session before anything is
+        # written: a concurrent claim between the phases must fail closed with
+        # nothing sealed.
+        state = _load_state(conn, record["experiment_id"])
+        if _committed_claim_matches(state, record):
+            raise ToolRefused(
+                "database is ALREADY activated on this freeze boundary "
+                "(concurrent claim won between preflight and activation); "
+                "nothing was written. If the activation JSON is missing, "
+                "re-run with --repair-activation-json using the ORIGINAL "
+                "claim record — never with a NEW timestamp"
+            )
+        if state.status not in ("PENDING", "READY_TO_START") or (
+            state.freeze_ts is not None or state.protocol_fingerprint
+        ):
+            raise ToolRefused(
+                "database state changed between the read-only preflight and "
+                "activation (concurrent attempt?); nothing was written. STOP "
+                "and escalate — never mint a new timestamp"
+            )
         # FIX-4: seal the identity of THIS record BEFORE the activation
         # transaction commits. Every committed claim therefore provably carries
         # the claim receipt of exactly one record: a same-second second mint
@@ -701,9 +776,23 @@ def cmd_verify(args) -> int:
     _require_pinned_protocol()
     conn = None
     try:
-        conn = _connect()
+        # FIX-4: verify is READ-ONLY end to end (issue #205: PostgreSQL
+        # enforces it — this session cannot write even by accident).
+        conn = _connect(READ_ONLY_MODE)
         record = _load_and_validate_record(args, now_ms=None)
         state = _load_state(conn, record["experiment_id"])
+        # Authority 2 covers BOTH the registration row AND the immutable
+        # freeze_registry evidence of the claim.
+        row = _registry_row(conn, record["freeze_ts"])
+        if (
+            row is None
+            or row["experiment_id"] != record["experiment_id"]
+            or row["protocol_fingerprint"] != record["protocol_fingerprint"]
+        ):
+            raise ToolRefused(
+                f"freeze_registry does not evidence this exact claim (row={row}); "
+                "three-authority agreement CANNOT be confirmed — STOP and escalate"
+            )
         activation = json.loads(Path(str(args.activation)).read_text(encoding="utf-8"))
         agreement = verify_authority_agreement(
             record=record,
@@ -719,6 +808,7 @@ def cmd_verify(args) -> int:
             "experiment_id": agreement["experiment_id"],
             "db_status": state.status,
             "observer_enabled": state.observer_enabled,
+            "freeze_registry_evidence": "OK",
             "record_sha256": freeze_record_hash(record),
         }}, indent=2, sort_keys=True))
         return EXIT_OK
@@ -773,6 +863,11 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_verify(args)
     except ToolRefused as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
+    except AdminConnectionError as exc:
+        # fail-closed authorization/credential boundary (issue #205): the tool
+        # aborts BEFORE any freeze artifact or database write
+        print(f"REFUSED (admin connection): {exc}", file=sys.stderr)
         return EXIT_REFUSED
     except Exception as exc:  # fail closed on anything unexpected
         print(f"REFUSED (unexpected error): {exc}", file=sys.stderr)

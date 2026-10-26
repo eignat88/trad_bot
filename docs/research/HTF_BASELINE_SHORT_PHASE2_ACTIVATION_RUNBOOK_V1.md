@@ -21,6 +21,22 @@ none is part of CI, merge or deployment.
 > matrix: `HTF_BASELINE_SHORT_PHASE2_ISSUE197_FROZEN_TIMESTAMP_AUTHORITY_V1.md`.
 > Nothing here authorizes activation — `PHASE_2_NO_GO` remains in force.
 
+> **Issue #205 update (admin connection routing).** `mint`/`claim`/`verify` no
+> longer open any database session through the observer credential loader. The
+> tool uses a separate **admin channel**
+> (`app/research/htf_baseline_short_phase2_admin_connection_v1.py`, env prefix
+> `HTF_P2_ADMIN_DB_*`): an operator LOGIN that is a member of the NOLOGIN role
+> `trad_bot_htf_p2_admin` gets there via a controlled `SET ROLE`, with
+> per-operation privileges — `mint`, `verify` and claim-recovery run in
+> PostgreSQL READ-ONLY sessions with SELECT only, and only the initial `claim`
+> opens read-write, where its single write is the sanctioned
+> `research.htf_baseline_short_phase2_activate(...)` call (direct DML is denied
+> to the admin role by the database). The dedicated observer role/credentials
+> serve ONLY the observer runner and are refused by the admin tool. Design
+> rationale and the failure matrix:
+> `HTF_BASELINE_SHORT_PHASE2_ADMIN_CONNECTION_V1.md`. Nothing here authorizes
+> activation — `PHASE_2_NO_GO` remains in force.
+
 > **Issue #184 update (systemd Bybit wiring).** The observer unit now selects
 > the Bybit closed-candle source **explicitly** via `--candle-source bybit` in
 > `ExecStart`. The former CSV runtime limitation is gone: CSV remains only the
@@ -124,9 +140,30 @@ Freeze timestamp selection rules (enforced, not advisory):
 
 1. Prepare the operator-maintained configuration artifacts (§12) — the
    dedicated secrets file `htf_phase2_observer.env` and the runtime activation
-   config path `htf_phase2_activation.json` (written by `claim`, step 3).
+   config path `htf_phase2_activation.json` (written by `claim`, step 4).
    None is ever generated automatically; none may be committed to Git.
-2. **Mint the freeze record** (operator GO; writes nothing to the database):
+2. **Configure the admin channel and run the pre-mint connection check**
+   (issue #205) — the freeze tool never uses observer credentials; it needs the
+   separate admin channel (§12). Create the admin credentials (password file
+   0600, `HTF_P2_ADMIN_DB_*`), preferably pin the cluster with
+   `HTF_P2_ADMIN_DB_SYSTEM_IDENTIFIER`, then run the pre-mint connection check
+   (a scratch `mint` — it opens a READ-ONLY session and writes **nothing** to
+   the database):
+
+   ```bash
+   python tools/research/htf_baseline_short_phase2_freeze_record_v1.py mint \
+     --operator-approval-ref "<pre-mint connection check>" \
+     --issued-by "<operator>" --record-id "$(uuidgen)" \
+     --out /tmp/htf_p2_conncheck_freeze_record.json
+   rm -f /tmp/htf_p2_conncheck_freeze_record.json
+   ```
+
+   Expected: `ADMIN_DB_CONNECTED mode=read_only role=trad_bot_htf_p2_admin` and
+   a minted scratch record. ANY `REFUSED` / `REFUSED (admin connection)` here
+   is a hard STOP **before** the real GO: fix credentials, cluster/database
+   target or RBAC drift now — never at claim time. Confirm the admin env is
+   complete and that no `HTF_P2_DB_*` observer variable is set in this shell.
+3. **Mint the freeze record** (operator GO; writes nothing to the database):
 
    ```bash
    python tools/research/htf_baseline_short_phase2_freeze_record_v1.py mint \
@@ -136,12 +173,16 @@ Freeze timestamp selection rules (enforced, not advisory):
    ```
 
    Record the printed `record_sha256` + canonical JSON in the change log
-   (independent verification recipe and its limits — tamper evidence only,
-   NOT a signature — in
-   `HTF_BASELINE_SHORT_PHASE2_ISSUE197_FROZEN_TIMESTAMP_AUTHORITY_V1.md` §4.2).
+   **before running `claim`** — that hash fixes the record's identity for the
+   whole lifecycle (the claim receipt binds it exactly; any later repair must
+   match it byte-for-byte). Never re-mint to "refresh" a record: `mint`
+   refuses to overwrite an existing file and a second record can never claim
+   the same boundary. Independent verification recipe and its limits — tamper
+   evidence only, NOT a signature — in
+   `HTF_BASELINE_SHORT_PHASE2_ISSUE197_FROZEN_TIMESTAMP_AUTHORITY_V1.md` §4.2.
    `mint` refuses on pinned-fingerprint drift, non-canonical timestamps,
    out-of-window values and legacy boundary timestamps.
-3. **Claim** (same GO, immediately after) — this is the ONE sanctioned
+4. **Claim** (same GO, immediately after) — this is the ONE sanctioned
    activation path (`research.htf_baseline_short_phase2_activate(...)`), then
    the runtime activation config is written and all three authorities are
    re-verified:
@@ -169,9 +210,22 @@ Freeze timestamp selection rules (enforced, not advisory):
    is refused. It performs no activation and fails closed before any write on
    the slightest mismatch, and also when the claim receipt is missing (the
    original identity cannot be established — STOP and escalate).
-4. Read-only confirmation (`... verify --record ... --activation ...`) plus the
-   §4 SQL checks; keep the output in the change log.
-5. **Issue #198 only — observe-only startup** (a separate
+5. Read-only confirmation (`... verify --record ... --activation ...`) plus the
+   §4 SQL checks; keep the output in the change log. `verify` is READ-ONLY and
+   additionally requires the freeze-registry evidence row
+   (`FREEZE_REGISTRY_EVIDENCE=OK` inside `THREE_AUTHORITY_AGREEMENT=OK`).
+   **Observer-still-off check** (expected after claim AND after verify):
+
+   ```sql
+   SELECT status, freeze_ts, observer_enabled
+     FROM research.htf_baseline_short_phase2_experiment;
+   SELECT count(*) FROM research.htf_baseline_short_phase2_observation;
+   ```
+
+   Expected: `status = RUNNING`, `observer_enabled = FALSE`, count `0` — the
+   claim/verify cycle must never enable the observer or write observations;
+   anything else is a hard STOP.
+6. **Issue #198 only — observe-only startup** (a separate
    `GO_FOR_OBSERVE_ONLY_STARTUP`, NOT part of this activation):
 
    ```sql
@@ -180,16 +234,16 @@ Freeze timestamp selection rules (enforced, not advisory):
     WHERE experiment_id = 'HTF_KEYLEVEL_BASELINE_SHORT_CAUSAL_OBSERVER_V1';
    ```
 
-6. Verify the effective systemd unit (§13) and run the fail-closed checks
+7. Verify the effective systemd unit (§13) and run the fail-closed checks
    (§14) **before** creating the flag file.
-7. Create the unit gate flag file (never automated; the LAST authorization
+8. Create the unit gate flag file (never automated; the LAST authorization
    step before start):
 
    ```bash
    install -d /opt/trad_bot/etc && touch /opt/trad_bot/etc/htf_phase2_observer_enabled
    ```
 
-8. Start the service **disabled-by-default unit** — and only this unit:
+9. Start the service **disabled-by-default unit** — and only this unit:
 
    ```bash
    systemctl daemon-reload
@@ -201,10 +255,15 @@ Freeze timestamp selection rules (enforced, not advisory):
    and must remain start-on-demand only.
 
 **STOP conditions (hard):** pinned fingerprint drift; `operator_decisions_pending() != []`;
-any `REFUSED`/`PARTIAL ACTIVATION` from mint/claim/verify; DB registration not
-`PENDING` before the claim; freeze registry non-empty without a matching
-record; any three-authority disagreement; unit or flag file present before
-step 7; any pre-freeze row in the observation table.
+any `REFUSED`/`PARTIAL ACTIVATION` from mint/claim/verify — including any
+`REFUSED (admin connection)`: missing admin credentials, observer credentials
+supplied to the admin channel, wrong password, a login that may not
+`SET ROLE` to `trad_bot_htf_p2_admin`, admin-role/observer-RBAC drift, wrong
+cluster/database target (fix the channel in step 2, never at claim time);
+DB registration not `PENDING` before the claim; freeze registry non-empty
+without a matching record; any three-authority disagreement; unit or flag
+file present before step 8; `observer_enabled` anything but `FALSE` after the
+claim; any pre-freeze row in the observation table.
 
 ## 4. Post-activation health check
 
@@ -400,6 +459,7 @@ All artifacts below are operator-created, never automated, never committed:
 | --- | --- | --- |
 | `/opt/trad_bot/etc/htf_phase2_observer_enabled` | `tradbot:tradbot` 0600 | empty flag file; exists = allowed to start |
 | `/opt/trad_bot/etc/htf_phase2_observer.env` | `tradbot:tradbot` 0600 | `HTF_P2_DB_HOST/PORT/NAME/USER` (dedicated observer role) + `HTF_P2_DB_PASSWORD` or preferably `HTF_P2_DB_PASSWORD_FILE` pointing to a 0600 password file |
+| `/opt/trad_bot/secrets/htf_phase2_admin_password` + operator shell env | operator `0600` | the ADMIN channel for `mint`/`claim`/`verify` (issue #205): `HTF_P2_ADMIN_DB_HOST/PORT/NAME/USER` (an operator LOGIN that is a member of `trad_bot_htf_p2_admin`) + `HTF_P2_ADMIN_DB_PASSWORD_FILE` (0600) and preferably `HTF_P2_ADMIN_DB_SYSTEM_IDENTIFIER`; never inside the observer unit, never in Git |
 | `/opt/trad_bot/etc/htf_phase2_activation.json` | `tradbot:tradbot` 0600 | `experiment_id`, `freeze_ts`, `protocol_fingerprint` (§7) |
 | `/opt/trad_bot/etc/htf_phase2_activation.json.claim_receipt.json` | `tradbot:tradbot` 0600 | the claim receipt (schema `HTF_PHASE2_CLAIM_RECEIPT_V1`): binds `record_id` + `record_sha256` of the ONE freeze record the original claim committed; sealed exactly once BEFORE the DB commit and never overwritten (PR #200 FIX-4) |
 | `/opt/trad_bot/etc/htf_phase2_freeze_record.json` | `tradbot:tradbot` 0600 | the immutable freeze record (schema `HTF_PHASE2_FREEZE_RECORD_V1`), minted at the GO; its `record_sha256` is recorded in the change log at mint time (§3, §7) |
@@ -414,6 +474,16 @@ Credentials rules (enforced in code, not only by convention):
   shared/admin roles (`postgres`, `trad_bot`, `analytics_*`) are refused;
 * a missing password refuses the connection (no trust/peer fallback); the
   password is never logged;
+* the freeze tool (`mint`/`claim`/`verify`) reads ONLY `HTF_P2_ADMIN_DB_*`
+  (issue #205) — observer credentials are refused by its loader and can never
+  open the admin channel; the admin loader likewise never reads `.env` or
+  scanner variables and never logs the password;
+* the admin role `trad_bot_htf_p2_admin` stays `NOLOGIN` (membership +
+  controlled `SET ROLE` only) and the admin tool refuses to run if that role
+  has been converted to `LOGIN`, to a superuser, or if observer RBAC has been
+  expanded; every session is verified against the real server report
+  (`current_database()`, `inet_server_addr()`, `inet_server_port()`,
+  `session_user`) before any artifact is written;
 * no hardcoded passwords or API keys exist in the unit, the runner or the
   repository; real production secrets must be created only on the VPS, only at
   activation time.
