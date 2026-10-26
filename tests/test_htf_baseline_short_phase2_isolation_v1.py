@@ -806,6 +806,15 @@ def test_no_tracked_file_modified_against_base():
         # Phase-2 runbook document is touched; its VERIFICATION_SQL contract
         # block is preserved byte-for-byte.
         "docs/research/HTF_BASELINE_SHORT_PHASE2_MIGRATION_074_075_RUNBOOK_V1.md",
+        # Issue #205: admin connection routing — the freeze tool stops using
+        # the observer-only connection helper and opens its own admin channel
+        # (new module, Phase-2 surface). The tool itself and its two existing
+        # test modules change strictly inside the Phase-2 surface: tool routing
+        # (read-only mint/verify/repair, activate-only claim) and the matching
+        # test fixtures/assertions; no other tracked file is touched.
+        "tools/research/htf_baseline_short_phase2_freeze_record_v1.py",
+        "tests/test_htf_baseline_short_phase2_freeze_record_v1.py",
+        "tests/test_htf_baseline_short_phase2_freeze_record_postgres_v1.py",
     )
 
     unexpected = []
