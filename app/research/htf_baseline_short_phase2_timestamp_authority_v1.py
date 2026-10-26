@@ -45,11 +45,21 @@ Rules enforced here (pure logic unless documented otherwise; all fail-closed)
   including the Point-B boundary); the freshness rules make such reuse
   impossible anyway;
 * any missing source or pairwise disagreement between the three authorities
-  raises :class:`FreezeRecordError` — the runner must then refuse to start.
+  raises :class:`FreezeRecordError` — the runner must then refuse to start;
+* record IDENTITY (PR #200 FIX-4): the record's ``record_sha256`` self-hash is
+  TAMPER EVIDENCE ONLY — it proves the file is internally intact, NOT that the
+  record belongs to the originally claimed GO. The trusted source of that
+  identity is the **claim receipt** (schema ``HTF_PHASE2_CLAIM_RECEIPT_V1``):
+  sealed exactly once by the operator tool at the initial claim, before the
+  activation transaction commits, and never overwritten. Delayed repair binds
+  the presented record to that receipt (``record_id`` AND ``record_sha256``
+  must match exactly) and fails closed when the identity cannot be
+  established.
 
 Nothing in this module mutates state, opens a database connection or activates
-an experiment. ``load_freeze_record`` only reads a file; the single write path
-is the operator tool (``tools/research/htf_baseline_short_phase2_freeze_record_v1.py``).
+an experiment. ``load_freeze_record`` / ``load_claim_receipt`` only read files;
+the single write path is the operator tool
+(``tools/research/htf_baseline_short_phase2_freeze_record_v1.py``).
 """
 from __future__ import annotations
 
@@ -306,4 +316,138 @@ def load_freeze_record(path: str | Path) -> dict:
         raise FreezeRecordError(f"freeze record unreadable: {exc}") from exc
     if not isinstance(data, dict):
         raise FreezeRecordError("freeze record must be a JSON object")
+    return data
+
+
+# ------------------------------------------------------ claim receipt (FIX-4)
+CLAIM_RECEIPT_SCHEMA = "HTF_PHASE2_CLAIM_RECEIPT_V1"
+
+_RECEIPT_REQUIRED_FIELDS = (
+    "schema",
+    "experiment_id",
+    "protocol_fingerprint",
+    "freeze_ts",
+    "claimed_at",
+    "record_id",
+    "record_sha256",
+)
+
+#: Fields whose EXACT agreement binds a presented freeze record to the record
+#: the original claim committed. ``record_id`` and ``record_sha256`` are the
+#: identity proper; the rest bind the receipt to the claimed DB boundary.
+_IDENTITY_BOUND_FIELDS = (
+    "experiment_id",
+    "protocol_fingerprint",
+    "freeze_ts",
+    "claimed_at",
+    "record_id",
+    "record_sha256",
+)
+
+
+def canonical_receipt_json(receipt: dict) -> str:
+    """Deterministic canonical serialization of the receipt payload (no hash)."""
+    payload = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def claim_receipt_hash(receipt: dict) -> str:
+    """SHA-256 over the canonical receipt payload WITHOUT ``receipt_sha256``.
+
+    Integrity only — never provenance (see :func:`verify_claim_identity`).
+    """
+    return sha256(canonical_receipt_json(receipt).encode("utf-8")).hexdigest()
+
+
+def build_claim_receipt(record: dict) -> dict:
+    """Compose the claim receipt for ``record`` — a DETERMINISTIC pure function.
+
+    The receipt is sealed by the operator tool EXACTLY ONCE at the initial
+    claim (strictly before the activation transaction commits) and is never
+    overwritten. Because it depends only on the record payload, re-running the
+    seal after an interrupted claim reproduces byte-identical content
+    (idempotent retry of the SAME record), while any other record — a second
+    ``mint`` in the same second has a different ``record_id`` and
+    ``record_sha256`` even when ``freeze_ts`` and the protocol fingerprint are
+    identical — yields different content and can never replace the seal.
+    """
+    receipt = {
+        "schema": CLAIM_RECEIPT_SCHEMA,
+        "experiment_id": record["experiment_id"],
+        "protocol_fingerprint": record["protocol_fingerprint"],
+        "freeze_ts": record["freeze_ts"],
+        "claimed_at": record["claimed_at"],
+        "record_id": record["record_id"],
+        "record_sha256": record["record_sha256"],
+    }
+    receipt["receipt_sha256"] = claim_receipt_hash(receipt)
+    return receipt
+
+
+def validate_claim_receipt(receipt: dict) -> dict:
+    """Validate one claim receipt fully (structure, canonical form, self-hash).
+
+    Returns a normalized copy; raises :class:`FreezeRecordError` on anything
+    missing, malformed or tampered. Note that a valid self-hash proves only
+    internal integrity — provenance is established by the one-time seal at the
+    original claim, never by this hash.
+    """
+    if not isinstance(receipt, dict):
+        raise FreezeRecordError("claim receipt must be a JSON object")
+    missing = [key for key in _RECEIPT_REQUIRED_FIELDS if not receipt.get(key)]
+    if missing:
+        raise FreezeRecordError(f"claim receipt missing field(s): {missing}")
+    if receipt.get("schema") != CLAIM_RECEIPT_SCHEMA:
+        raise FreezeRecordError(
+            f"unsupported claim receipt schema {receipt.get('schema')!r}"
+        )
+    expected_hash = receipt.get("receipt_sha256")
+    if not isinstance(expected_hash, str) or not _FINGERPRINT_RE.match(expected_hash):
+        raise FreezeRecordError("claim receipt receipt_sha256 must be 64 hex chars")
+    if claim_receipt_hash(receipt) != expected_hash:
+        raise FreezeRecordError("claim receipt hash mismatch (tampered or truncated)")
+    _require_canonical_ts(receipt["freeze_ts"], "freeze_ts")
+    _require_canonical_ts(receipt["claimed_at"], "claimed_at")
+    return dict(receipt)
+
+
+def verify_claim_identity(receipt: dict, record: dict) -> None:
+    """Bind a presented freeze record to the ORIGINAL claimed record identity.
+
+    The trusted source of that identity is the claim receipt sealed at the
+    initial claim. The presented record's own ``record_sha256`` self-hash is
+    NOT evidence that the record belongs to the original GO — a second record
+    minted in the same second carries a perfectly valid self-hash and a fully
+    matching DB boundary. Therefore BOTH ``record_id`` and ``record_sha256``
+    (plus every boundary field) must equal the receipt EXACTLY; any mismatch
+    raises :class:`FreezeRecordError` and the caller must fail closed BEFORE
+    any artifact is written.
+    """
+    problems = [
+        field for field in _IDENTITY_BOUND_FIELDS if receipt.get(field) != record.get(field)
+    ]
+    if problems:
+        raise FreezeRecordError(
+            "presented freeze record is NOT the record of the original claim: "
+            + ", ".join(f"{field} mismatch" for field in problems)
+            + f" (claimed record_id={receipt.get('record_id')!r}, "
+            f"record_sha256={receipt.get('record_sha256')!r}; presented "
+            f"record_id={record.get('record_id')!r}, "
+            f"record_sha256={record.get('record_sha256')!r})"
+        )
+
+
+def load_claim_receipt(path: str | Path) -> dict:
+    """Read the claim-receipt file defensively (read-only).
+
+    Raises :class:`FreezeRecordError` on any missing/unreadable/non-object file
+    — an absent receipt means the original identity cannot be established and
+    every repair must fail closed.
+    """
+    try:
+        data = json.loads(Path(str(path)).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FreezeRecordError(f"claim receipt unreadable: {exc}") from exc
+    if not isinstance(data, dict):
+        raise FreezeRecordError("claim receipt must be a JSON object")
     return data

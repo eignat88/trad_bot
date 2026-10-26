@@ -45,14 +45,20 @@ from app.research.htf_baseline_short_phase2_protocol_v1 import (
 from app.research.htf_baseline_short_phase2_timestamp_authority_v1 import (
     ACCEPTANCE_FUTURE_WINDOW_S,
     ACCEPTANCE_PAST_WINDOW_S,
+    CLAIM_RECEIPT_SCHEMA,
     FREEZE_RECORD_SCHEMA,
     FreezeRecordError,
+    build_claim_receipt,
     build_freeze_record,
     canonical_record_json,
+    claim_receipt_hash,
     freeze_record_hash,
+    load_claim_receipt,
     load_freeze_record,
+    validate_claim_receipt,
     validate_freeze_record,
     verify_authority_agreement,
+    verify_claim_identity,
 )
 
 FP = "a" * 64
@@ -290,6 +296,85 @@ def test_load_freeze_record_fails_closed(tmp_path):
     arr.write_text("[]", encoding="utf-8")
     with pytest.raises(FreezeRecordError, match="JSON object"):
         load_freeze_record(arr)
+
+
+# ============================================= claim receipt / record identity
+def test_claim_receipt_is_deterministic_pure_function_of_the_record():
+    record = make_sealed_record()
+    receipt = build_claim_receipt(record)
+    assert receipt["schema"] == CLAIM_RECEIPT_SCHEMA
+    assert receipt["record_id"] == record["record_id"]
+    assert receipt["record_sha256"] == record["record_sha256"]
+    assert receipt["freeze_ts"] == record["freeze_ts"]
+    assert receipt["receipt_sha256"] == claim_receipt_hash(receipt)
+    assert build_claim_receipt(record) == receipt  # deterministic -> idempotent
+    validate_claim_receipt(receipt)
+
+    # a same-second twin (identical boundary, different identity) yields a
+    # DIFFERENT receipt and can never be sealed over the original one
+    twin = make_sealed_record(record_id="00000000-0000-0000-0000-000000000002")
+    assert twin["freeze_ts"] == record["freeze_ts"]
+    assert twin["protocol_fingerprint"] == record["protocol_fingerprint"]
+    assert twin["record_id"] != record["record_id"]
+    assert twin["record_sha256"] != record["record_sha256"]
+    assert build_claim_receipt(twin) != receipt
+
+
+def test_claim_identity_binds_record_id_and_record_sha256():
+    record = make_sealed_record()
+    receipt = build_claim_receipt(record)
+    verify_claim_identity(receipt, record)  # exact same record: admitted
+
+    # same freeze_ts + fingerprint + claimed_at, different record identity —
+    # the record self-hash is valid but proves nothing about provenance
+    twin = make_sealed_record(record_id="00000000-0000-0000-0000-000000000002")
+    assert freeze_record_hash(twin) == twin["record_sha256"]  # self-hash intact
+    with pytest.raises(FreezeRecordError, match="record_id mismatch"):
+        verify_claim_identity(receipt, twin)
+
+    # a re-sealed FAKE with the claimed record_id but different content is
+    # caught by record_sha256 (the receipt binds the full identity)
+    fake = make_sealed_record(record_id=record["record_id"], issued_by="someone-else")
+    with pytest.raises(FreezeRecordError, match="record_sha256 mismatch"):
+        verify_claim_identity(receipt, fake)
+
+    # boundary drift is also refused
+    drifted = make_sealed_record(freeze_ts=TS_OTHER)
+    with pytest.raises(FreezeRecordError):
+        verify_claim_identity(receipt, drifted)
+
+
+def test_claim_receipt_tamper_and_bad_shape_fail_closed():
+    record = make_sealed_record()
+    receipt = build_claim_receipt(record)
+
+    tampered = dict(receipt, record_id="00000000-0000-0000-0000-000000000002")
+    with pytest.raises(FreezeRecordError, match="hash mismatch"):
+        validate_claim_receipt(tampered)
+
+    missing = {k: v for k, v in receipt.items() if k != "record_sha256"}
+    with pytest.raises(FreezeRecordError, match="missing field"):
+        validate_claim_receipt(missing)
+
+    bad_schema = dict(receipt)
+    bad_schema["schema"] = "SOMETHING_ELSE"
+    bad_schema["receipt_sha256"] = claim_receipt_hash(bad_schema)
+    with pytest.raises(FreezeRecordError, match="schema"):
+        validate_claim_receipt(bad_schema)
+
+
+def test_load_claim_receipt_fails_closed_when_identity_cannot_be_established(tmp_path):
+    missing = tmp_path / "nope.json"
+    with pytest.raises(FreezeRecordError, match="unreadable"):
+        load_claim_receipt(missing)
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    with pytest.raises(FreezeRecordError, match="unreadable"):
+        load_claim_receipt(bad)
+    arr = tmp_path / "arr.json"
+    arr.write_text("[]", encoding="utf-8")
+    with pytest.raises(FreezeRecordError, match="JSON object"):
+        load_claim_receipt(arr)
 
 
 # ======================================================= three-authority agreement

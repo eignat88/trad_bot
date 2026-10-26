@@ -155,12 +155,20 @@ Freeze timestamp selection rules (enforced, not advisory):
    Expected terminal line: `THREE_AUTHORITY_AGREEMENT=OK`. On any `REFUSED` /
    `PARTIAL ACTIVATION` output: STOP — never mint a new timestamp; follow the
    recovery matrix in `HTF_BASELINE_SHORT_PHASE2_ISSUE197_FROZEN_TIMESTAMP_AUTHORITY_V1.md` §4.1.
+   The initial claim first seals the **claim receipt**
+   `htf_phase2_activation.json.claim_receipt.json` (printed as
+   `CLAIM_RECEIPT_SEALED=...`) — the trusted record-identity binding written
+   exactly once BEFORE the database commit (§7, and §4.3 of the design doc).
    If the database commit succeeded but the activation JSON is missing, the
    recovery is `claim --repair-activation-json` with the SAME record — this
    **delayed repair** also works after the acceptance window has expired
    (PR #200 FIX-1): it requires the unchanged DB record and its matching
-   immutable `freeze_registry` row, performs no activation and fails closed
-   before any write on the slightest mismatch.
+   immutable `freeze_registry` row **and** an exact `record_id` +
+   `record_sha256` match against the sealed claim receipt (PR #200 FIX-4) — a
+   record minted later, even with the identical `freeze_ts` and fingerprint,
+   is refused. It performs no activation and fails closed before any write on
+   the slightest mismatch, and also when the claim receipt is missing (the
+   original identity cannot be established — STOP and escalate).
 4. Read-only confirmation (`... verify --record ... --activation ...`) plus the
    §4 SQL checks; keep the output in the change log.
 5. **Issue #198 only — observe-only startup** (a separate
@@ -284,6 +292,10 @@ The three values are maintained by different people/artifacts; nothing copies
 one into another automatically at RUNTIME, so a stale or divergent source is
 always detectable. The `record_sha256` of the freeze record (recorded in the
 change log at mint time) makes any post-approval edit detectable as well.
+Record IDENTITY — which of several minted records the claim actually
+committed — is bound only by the claim receipt (PR #200 FIX-4): the
+`record_sha256` self-hash is tamper evidence and never proof that a record
+belongs to the original GO.
 
 ## 8. Timestamp skew tolerance (remediation CP1)
 
@@ -389,6 +401,7 @@ All artifacts below are operator-created, never automated, never committed:
 | `/opt/trad_bot/etc/htf_phase2_observer_enabled` | `tradbot:tradbot` 0600 | empty flag file; exists = allowed to start |
 | `/opt/trad_bot/etc/htf_phase2_observer.env` | `tradbot:tradbot` 0600 | `HTF_P2_DB_HOST/PORT/NAME/USER` (dedicated observer role) + `HTF_P2_DB_PASSWORD` or preferably `HTF_P2_DB_PASSWORD_FILE` pointing to a 0600 password file |
 | `/opt/trad_bot/etc/htf_phase2_activation.json` | `tradbot:tradbot` 0600 | `experiment_id`, `freeze_ts`, `protocol_fingerprint` (§7) |
+| `/opt/trad_bot/etc/htf_phase2_activation.json.claim_receipt.json` | `tradbot:tradbot` 0600 | the claim receipt (schema `HTF_PHASE2_CLAIM_RECEIPT_V1`): binds `record_id` + `record_sha256` of the ONE freeze record the original claim committed; sealed exactly once BEFORE the DB commit and never overwritten (PR #200 FIX-4) |
 | `/opt/trad_bot/etc/htf_phase2_freeze_record.json` | `tradbot:tradbot` 0600 | the immutable freeze record (schema `HTF_PHASE2_FREEZE_RECORD_V1`), minted at the GO; its `record_sha256` is recorded in the change log at mint time (§3, §7) |
 | `/opt/trad_bot/var/htf_phase2/` (checkpoint, lease) | `tradbot:tradbot` 0700 | created by the operator; `UMask=0077` keeps runtime files private |
 

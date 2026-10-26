@@ -6,7 +6,13 @@ Covers, with a fully stubbed database boundary (real SQL is exercised in
 * FIX-1 delayed activation repair: ``--repair-activation-json`` keeps working
   after the ``now()-60s .. now()+5min`` acceptance window expires, but ONLY
   against an already-committed, exactly-matching, registry-evidenced claim;
-* the initial activation path keeps the strict window in full;
+* FIX-4 claim-receipt record identity: delayed repair binds the presented
+  record to the claim receipt sealed at the original claim (``record_id`` AND
+  ``record_sha256`` must match exactly); a second record minted in the same
+  second with a fully matching DB boundary is refused, and a missing claim
+  receipt fails closed (the record self-hash is never proof of provenance);
+* the initial activation path keeps the strict window in full and seals the
+  claim receipt BEFORE the activation transaction commits;
 * re-activation with a NEW timestamp is impossible (fail-closed, no JSON);
 * any mismatch (record vs DB, tampered record, missing/mismatched
   freeze_registry evidence) fails closed BEFORE the activation JSON is
@@ -169,6 +175,16 @@ def test_initial_claim_inside_window_activates_and_writes_json(box, tmp_path):
     assert activation["experiment_id"] == EXPERIMENT_ID
     assert _any_activation_write(box["executed"])
 
+    # FIX-4: the initial claim seals the claim receipt BEFORE activation; it
+    # binds exactly this record identity for any later delayed repair
+    record = load_freeze_record(record_path)
+    receipt = json.loads(
+        tool._claim_receipt_path(activation_path).read_text(encoding="utf-8")
+    )
+    assert receipt["record_id"] == record["record_id"]
+    assert receipt["record_sha256"] == record["record_sha256"]
+    assert receipt["freeze_ts"] == record["freeze_ts"]
+
 
 def test_initial_claim_enforces_window_after_expiry(box, tmp_path):
     record_path = tmp_path / "freeze_record.json"
@@ -205,11 +221,23 @@ def _committed(box):
     box["db_now"] = _dt(BASE_TS) + timedelta(hours=3)  # window long expired
 
 
+def _seal(record: dict, activation_path: Path) -> Path:
+    """Simulate the initial claim's one-time identity seal (FIX-4).
+
+    The real seal is written by the initial claim BEFORE the activation
+    transaction commits (exercised in the PostgreSQL IT suite); the repair
+    fixtures below only need its presence and content.
+    """
+    return tool._seal_claim_receipt(activation_path, record)
+
+
 def test_repair_delayed_after_window_succeeds(box, tmp_path):
     record_path = tmp_path / "freeze_record.json"
     activation_path = tmp_path / "activation.json"
-    write_json(record_path, make_record())
+    record = make_record()
+    write_json(record_path, record)
     _committed(box)
+    _seal(record, activation_path)  # original claim bound this record identity
 
     assert (
         tool.main(_claim_argv(record_path, activation_path, repair=True)) == tool.EXIT_OK
@@ -224,8 +252,10 @@ def test_partial_recovery_missing_activation_json_restored(box, tmp_path):
     # documented recovery: claim committed, activation JSON lost -> repair
     record_path = tmp_path / "freeze_record.json"
     activation_path = tmp_path / "activation.json"
-    write_json(record_path, make_record())
+    record = make_record()
+    write_json(record_path, record)
     _committed(box)
+    _seal(record, activation_path)
     assert (
         tool.main(_claim_argv(record_path, activation_path, repair=True)) == tool.EXIT_OK
     )
@@ -294,8 +324,10 @@ def test_repair_refuses_tampered_record(box, tmp_path):
 def test_repair_refuses_missing_registry_evidence(box, tmp_path):
     record_path = tmp_path / "freeze_record.json"
     activation_path = tmp_path / "activation.json"
-    write_json(record_path, make_record())
+    record = make_record()
+    write_json(record_path, record)
     _committed(box)
+    _seal(record, activation_path)  # identity OK -> refusal must be the registry
     box["registry"] = None  # claim not evidenced -> partial failure state
 
     assert (
@@ -308,8 +340,10 @@ def test_repair_refuses_missing_registry_evidence(box, tmp_path):
 def test_repair_refuses_registry_mismatch(box, tmp_path):
     record_path = tmp_path / "freeze_record.json"
     activation_path = tmp_path / "activation.json"
-    write_json(record_path, make_record())
+    record = make_record()
+    write_json(record_path, record)
     _committed(box)
+    _seal(record, activation_path)  # identity OK -> refusal must be the registry
     box["registry"] = {"experiment_id": EXPERIMENT_ID, "protocol_fingerprint": "1" * 64}
 
     assert (
@@ -358,6 +392,76 @@ def test_activation_out_must_not_be_the_record_path(box, tmp_path):
         tool.main(_claim_argv(record_path, record_path, repair=True)) == tool.EXIT_REFUSED
     )
     assert record_path.read_text(encoding="utf-8") == before  # record unchanged
+
+
+# ======================================= FIX-4: claim-receipt record identity
+def test_repair_refuses_same_boundary_twin_record_identity(box, tmp_path):
+    # Deterministic twin of the independent VPS defect: two ``mint`` runs in
+    # the SAME second produce records with an identical DB boundary
+    # (freeze_ts + protocol fingerprint) but DIFFERENT record_id /
+    # record_sha256. Delayed repair accepts ONLY the record bound to the
+    # original claim by the sealed claim receipt — never the twin, no matter
+    # how completely the DB boundary matches.
+    record_path = tmp_path / "freeze_record.json"
+    twin_path = tmp_path / "freeze_record_twin.json"
+    activation_path = tmp_path / "activation.json"
+    record = make_record()
+    twin = make_record()  # same freeze_ts + claimed_at + fingerprint, new UUID
+    write_json(record_path, record)
+    write_json(twin_path, twin)
+    assert twin["freeze_ts"] == record["freeze_ts"]
+    assert twin["protocol_fingerprint"] == record["protocol_fingerprint"]
+    assert twin["record_id"] != record["record_id"]
+    assert twin["record_sha256"] != record["record_sha256"]
+    _committed(box)
+    _seal(record, activation_path)  # the original claim sealed record's identity
+
+    # the twin matches the DB boundary completely but is NOT the claimed record
+    assert (
+        tool.main(_claim_argv(twin_path, activation_path, repair=True))
+        == tool.EXIT_REFUSED
+    )
+    assert not activation_path.exists()
+    assert not _any_activation_write(box["executed"])
+
+    # the ORIGINAL record still repairs successfully
+    assert (
+        tool.main(_claim_argv(record_path, activation_path, repair=True)) == tool.EXIT_OK
+    )
+    assert activation_path.exists()
+
+
+def test_repair_fails_closed_without_claim_receipt(box, tmp_path):
+    # FIX-4: when the original identity cannot be established (no claim
+    # receipt), the repair fails closed — the record self-hash is tamper
+    # evidence ONLY and is never accepted as proof that the record belongs to
+    # the original GO
+    record_path = tmp_path / "freeze_record.json"
+    activation_path = tmp_path / "activation.json"
+    write_json(record_path, make_record())
+    _committed(box)
+
+    assert (
+        tool.main(_claim_argv(record_path, activation_path, repair=True))
+        == tool.EXIT_REFUSED
+    )
+    assert not activation_path.exists()
+    assert not _any_activation_write(box["executed"])
+
+
+def test_claim_receipt_seal_is_idempotent_for_the_same_record_only(tmp_path):
+    activation_path = tmp_path / "activation.json"
+    record = make_record()
+    path = _seal(record, activation_path)
+    first = path.read_text(encoding="utf-8")
+
+    _seal(record, activation_path)  # byte-identical retry of the SAME record OK
+    assert path.read_text(encoding="utf-8") == first
+
+    twin = make_record()  # same boundary, different record identity
+    with pytest.raises(tool.ToolRefused):
+        tool._seal_claim_receipt(activation_path, twin)  # never replaced
+    assert path.read_text(encoding="utf-8") == first
 
 
 # ================================================== FIX-2: atomic JSON hardening

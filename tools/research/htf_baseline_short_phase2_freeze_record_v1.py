@@ -17,21 +17,32 @@ claim  (operator GO)  Two explicit paths (FIX-1):
                       * INITIAL ACTIVATION — the database is still PENDING:
                         validates the record against the PostgreSQL acceptance
                         window ``now()-60s .. now()+5min`` (tool side AND
-                        inside the function), claims the timestamp via
+                        inside the function), seals the CLAIM RECEIPT (the
+                        trusted source of this record's identity, written
+                        exactly once BEFORE the activation transaction commits
+                        — FIX-4), claims the timestamp via
                         research.htf_baseline_short_phase2_activate() (the ONLY
                         sanctioned activation entry point), then writes the
                         private runtime activation JSON and verifies exact
                         agreement of all three freeze authorities.
                       * DELAYED REPAIR ``--repair-activation-json`` — the
                         database ALREADY carries a committed claim: re-derives
-                        the activation JSON from a freeze record that matches
+                        the activation JSON ONLY from the freeze record whose
+                        identity (record_id AND record_sha256) is bound to the
+                        original claim by its claim receipt and that matches
                         the unchanged DB record and its immutable
                         freeze_registry evidence EXACTLY (experiment id,
                         freeze timestamp, protocol fingerprint). The freshness
                         window is not re-applied (the original claim passed it
                         transactionally); no activation is performed and a NEW
-                        timestamp can never be introduced. Any mismatch fails
-                        closed BEFORE the activation JSON is written.
+                        timestamp can never be introduced. Any mismatch — and
+                        any case where the original identity cannot be
+                        established — fails closed BEFORE the activation JSON
+                        is written. A second record minted in the same second
+                        (identical freeze_ts + fingerprint, different
+                        record_id/record_sha256) is therefore always refused;
+                        the record's self-hash is tamper evidence ONLY and is
+                        never treated as proof of provenance.
                       Without --repair-activation-json an existing activation
                       JSON is never overwritten.
 verify (read-only)    Re-check the three authorities end to end.
@@ -45,6 +56,10 @@ Hard rules (any violation aborts with a non-zero exit and STOP guidance):
   * one record = one claim; a second claim with the same record is a no-op
     repair only, a claim with a NEW timestamp after a claim already succeeded
     is refused (the freeze registry also rejects it);
+  * the claim receipt is sealed exactly once, before the activation commit,
+    and is never overwritten (only a byte-identical re-seal of the SAME record
+    is accepted); delayed repair requires an exact record_id + record_sha256
+    match against it and fails closed when it is missing;
   * observer_enabled, systemd units, gate files and paper/live are NEVER
     touched by this tool — observe-only startup is issue #198.
 
@@ -83,12 +98,16 @@ from app.research.htf_baseline_short_phase2_timestamp_authority_v1 import (  # n
     ACCEPTANCE_FUTURE_WINDOW_S,
     ACCEPTANCE_PAST_WINDOW_S,
     FreezeRecordError,
+    build_claim_receipt,
     build_freeze_record,
     canonical_record_json,
     freeze_record_hash,
+    load_claim_receipt,
     load_freeze_record,
+    validate_claim_receipt,
     validate_freeze_record,
     verify_authority_agreement,
+    verify_claim_identity,
 )
 
 EXIT_OK = 0
@@ -162,6 +181,20 @@ def _atomic_write_json(path: str | Path, payload: dict, *, overwrite: bool) -> N
       * the temp file is fsynced before the atomic ``os.replace`` and carries
         mode 0600 on POSIX.
     """
+    payload_text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    _atomic_write_bytes(path, payload_text, overwrite=overwrite)
+
+
+def _atomic_write_bytes(path: str | Path, text: str, *, overwrite: bool) -> None:
+    """Atomic, symlink-safe raw-text write (same properties as above).
+
+    FIX-4: the claim receipt is sealed through THIS primitive — deliberately
+    a separate write path from ``_atomic_write_json`` — so the one-time
+    identity seal and the derived activation JSON remain independent
+    artifacts: an interruption of the activation-JSON write never invalidates
+    the already-sealed receipt, and the receipt is never rewritten by any
+    later step.
+    """
     target = Path(str(path))
     if target.is_symlink():
         raise ToolRefused(f"{target} is a symlink; refusing to write through it")
@@ -181,11 +214,10 @@ def _atomic_write_json(path: str | Path, payload: dict, *, overwrite: bool) -> N
             f"{tmp} already exists; refusing to clobber a pre-existing temp "
             "file (possible squatting)"
         )
-    payload_text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload_text)
+            handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
     except Exception:
@@ -320,14 +352,112 @@ def _registry_row(conn, freeze_ts: str):
 def _require_activation_path_distinct_from_record(args) -> None:
     """FIX-2: the immutable freeze record is never overwritten, even by a
     mis-pointed ``--activation-out``."""
-    if Path(str(args.activation_out)).resolve() == Path(str(args.record)).resolve():
+    record_path = Path(str(args.record)).resolve()
+    if Path(str(args.activation_out)).resolve() == record_path:
         raise ToolRefused(
             "--activation-out must not point at the freeze record itself: the "
             "freeze record is immutable and is never overwritten"
         )
+    if _claim_receipt_path(args.activation_out).resolve() == record_path:
+        raise ToolRefused(
+            "--activation-out must not place the claim receipt on the freeze "
+            "record itself: the freeze record is immutable and is never "
+            "overwritten"
+        )
+
+
+# -------------------------------------------------- claim receipt identity seal
+def _claim_receipt_path(activation_out: str | Path) -> Path:
+    """The claim receipt lives next to the runtime activation JSON (authority
+    3) it authenticates: ``<activation-out>.claim_receipt.json``."""
+    return Path(str(activation_out) + ".claim_receipt.json")
+
+
+def _seal_claim_receipt(activation_out: str | Path, record: dict) -> Path:
+    """FIX-4: seal the ORIGINAL record identity at the initial claim.
+
+    The receipt is written EXACTLY ONCE and strictly BEFORE the ``activate()``
+    transaction commits, so every committed claim provably carries the identity
+    of the freeze record that was claimed: a second ``mint`` in the same second
+    (identical ``freeze_ts`` + fingerprint, different ``record_id`` /
+    ``record_sha256``) can never be mistaken for the original record later.
+
+    A pre-existing receipt is accepted ONLY when it is byte-identical to the
+    receipt of THIS record (idempotent retry of the same claim after an
+    interruption); any other content fails closed BEFORE the database is
+    touched. The receipt is never overwritten and never re-sealed by repair.
+    """
+    path = _claim_receipt_path(activation_out)
+    # the full receipt (WITH its ``receipt_sha256`` self-hash, exactly like the
+    # freeze record file carries ``record_sha256``); the hash input itself is
+    # the canonical payload WITHOUT the hash field
+    text = json.dumps(build_claim_receipt(record), indent=2, sort_keys=True) + "\n"
+    try:
+        _atomic_write_bytes(path, text, overwrite=False)
+    except ToolRefused:
+        # Idempotent retry of the SAME record is safe and expected after an
+        # interrupted claim; anything else is a fail-closed STOP.
+        if path.is_symlink() or path.parent.is_symlink():
+            raise ToolRefused(
+                f"claim receipt {path} is (under) a symlink; refusing to read "
+                "it as identity evidence — STOP and escalate"
+            )
+        try:
+            existing = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ToolRefused(
+                f"claim receipt {path} exists but is unreadable; refusing to "
+                "claim — STOP and escalate"
+            ) from exc
+        if existing != text:
+            raise ToolRefused(
+                f"claim receipt {path} already exists with DIFFERENT content: "
+                "the seal belongs to another freeze record (or has been "
+                "tampered with). Refusing to claim — the seal is written once "
+                "and never replaced. STOP and escalate"
+            )
+    return path
+
+
+def _require_original_record_identity(activation_out: str | Path, record: dict) -> None:
+    """FIX-4 identity gate for DELAYED REPAIR: fail closed unless the presented
+    record is EXACTLY the record the original claim committed.
+
+    The trusted source is the sealed claim receipt. The presented record's
+    ``record_sha256`` self-hash is tamper evidence ONLY — it does NOT prove the
+    record belongs to the original GO. When the receipt is missing, unreadable
+    or bound to a different ``record_id`` / ``record_sha256`` (e.g. a second
+    record minted in the same second), the original identity cannot be
+    established and the repair refuses BEFORE any artifact is written.
+    """
+    path = _claim_receipt_path(activation_out)
+    if path.is_symlink() or path.parent.is_symlink():
+        raise ToolRefused(
+            f"DELAYED REPAIR REFUSED: claim receipt {path} is (under) a "
+            "symlink; identity evidence must be the sealed regular file. Fail "
+            "closed: nothing is written; STOP and escalate"
+        )
+    try:
+        receipt = validate_claim_receipt(load_claim_receipt(path))
+        verify_claim_identity(receipt, record)
+    except FreezeRecordError as exc:
+        raise ToolRefused(
+            f"DELAYED REPAIR REFUSED: the identity of the originally claimed "
+            f"freeze record cannot be established from {path} ({exc}). The "
+            "record self-hash is tamper evidence ONLY, never proof that the "
+            "record belongs to the original GO. Fail closed: nothing is "
+            "written; STOP and escalate — never mint or claim another record"
+        ) from exc
 
 
 def _committed_claim_matches(state, record) -> bool:
+    """DB-BOUNDARY match ONLY (status + freeze_ts + fingerprint).
+
+    This does NOT establish record identity: a second record minted in the
+    same second has the identical DB boundary with a different ``record_id`` /
+    ``record_sha256``. Identity is gated separately by
+    :func:`_require_original_record_identity` (FIX-4).
+    """
     return (
         state.status == "RUNNING"
         and state.freeze_ts is not None
@@ -384,6 +514,13 @@ def _repair_after_committed_claim(args, conn, record) -> int:
       * the database registration carries exactly this record's experiment id,
         freeze timestamp and protocol fingerprint (the DB record must be the
         unchanged, originally claimed one);
+      * FIX-4: the presented record is EXACTLY the record the original claim
+        committed — ``record_id`` AND ``record_sha256`` must match the claim
+        receipt sealed at that claim (the trusted source of identity). The
+        record self-hash is tamper evidence ONLY and never counts as proof of
+        provenance; a second record minted in the same second with the same
+        boundary is refused, and when the identity cannot be established at
+        all the repair fails closed;
       * the immutable ``freeze_registry`` row evidences the SAME claim;
       * the record itself passed structural validation (self-hash intact).
 
@@ -404,6 +541,7 @@ def _repair_after_committed_claim(args, conn, record) -> int:
             f"protocol_fingerprint={state.protocol_fingerprint!r}); refusing "
             "repair — STOP and escalate, never re-mint a timestamp"
         )
+    _require_original_record_identity(args.activation_out, record)
     row = _registry_row(conn, record["freeze_ts"])
     if (
         row is None
@@ -429,6 +567,10 @@ def _repair_after_committed_claim(args, conn, record) -> int:
 
 def cmd_claim(args) -> int:
     _require_pinned_protocol()
+    # Argument-shape checks FIRST (FIX-2/4): nothing is activated or sealed
+    # for a mis-pointed --activation-out that would target the immutable
+    # freeze record.
+    _require_activation_path_distinct_from_record(args)
     conn = None
     try:
         conn = _connect()
@@ -444,10 +586,12 @@ def cmd_claim(args) -> int:
             # Path B: recovery after an already-committed identical claim.
             if not args.repair_activation_json:
                 raise ToolRefused(
-                    "database is ALREADY activated with exactly this freeze "
-                    "record; nothing to claim. If the activation JSON is "
-                    "missing (interrupted activation), re-run with "
-                    "--repair-activation-json — never with a NEW timestamp"
+                    "database is ALREADY activated on this freeze boundary; "
+                    "nothing to claim. If the activation JSON is missing "
+                    "(interrupted activation), re-run with "
+                    "--repair-activation-json using the ORIGINAL claim record "
+                    "— never with a NEW timestamp and never with another "
+                    "record on the same boundary"
                 )
             return _repair_after_committed_claim(args, conn, record)
         if args.repair_activation_json:
@@ -480,6 +624,13 @@ def cmd_claim(args) -> int:
                 f"fingerprint={record['protocol_fingerprint']}"
             )
             return EXIT_OK
+        # FIX-4: seal the identity of THIS record BEFORE the activation
+        # transaction commits. Every committed claim therefore provably carries
+        # the claim receipt of exactly one record: a same-second second mint
+        # (different record_id / record_sha256) can never be presented later as
+        # the original, and an interrupted seal leaves the DB un-claimed.
+        receipt_path = _seal_claim_receipt(args.activation_out, record)
+        print(f"CLAIM_RECEIPT_SEALED={receipt_path}")
         cur = conn.cursor()
         try:
             cur.execute(
@@ -562,7 +713,9 @@ def main(argv: list[str] | None = None) -> int:
         "--repair-activation-json",
         action="store_true",
         help="interrupted-activation recovery ONLY: re-derive the activation JSON "
-        "from a record that already matches the database exactly",
+        "from the ORIGINAL claim record (its record_id/record_sha256 must match "
+        "the sealed claim receipt and the database exactly); any other record "
+        "fails closed",
     )
 
     p_verify = sub.add_parser("verify", help="read-only three-authority check")

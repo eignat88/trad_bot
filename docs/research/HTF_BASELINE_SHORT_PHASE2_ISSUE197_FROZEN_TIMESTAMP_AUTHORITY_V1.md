@@ -251,7 +251,7 @@ the observation table.
 |---|---|---|
 | before mint | nothing changed | normal PR/review flow |
 | mint done, claim not run | inert record only | claim later **only if** still inside the acceptance window; otherwise discard record and re-mint under the same GO decision (old record cannot be claimed — freshness rules) |
-| claim: DB committed, activation JSON write failed | DB `RUNNING`, no runtime config → observer cannot start (fail-closed) | `claim --repair-activation-json` with the SAME record; never a new `freeze_ts`; if the record is lost, STOP and escalate. This **delayed repair** also works after the `now()-60s .. now()+5min` window has expired (PR #200 FIX-1): it requires the unchanged DB record (same experiment id, `freeze_ts`, protocol fingerprint) **and** the matching immutable `freeze_registry` row; any mismatch fails closed before the activation JSON is written |
+| claim: DB committed, activation JSON write failed | DB `RUNNING`, no runtime config → observer cannot start (fail-closed) | `claim --repair-activation-json` with the SAME record; never a new `freeze_ts`; if the record is lost, STOP and escalate. This **delayed repair** also works after the `now()-60s .. now()+5min` window has expired (PR #200 FIX-1): it requires the unchanged DB record (same experiment id, `freeze_ts`, protocol fingerprint) **and** the matching immutable `freeze_registry` row **and** an exact `record_id` + `record_sha256` match against the claim receipt sealed at the original claim (PR #200 FIX-4, §4.3); any mismatch — or a missing claim receipt — fails closed before the activation JSON is written |
 | claim refused (concurrent attempt won) | exactly one freeze claimed | STOP; inspect registry + record; never mint a new timestamp to "fix" it |
 | disagreement found at verify/startup | mixed artifacts | hard NO_GO; keep observer stopped; preserve evidence; operators decide: recover the exact same boundary or `CANCEL` and version a new experiment |
 | after issue #198 startup error | observer running/partial | stop ONLY the observer unit, remove ONLY its gate file, set `observer_enabled=false` (always allowed); never rewind the freeze, never edit observations |
@@ -302,6 +302,69 @@ python -c "import json,hashlib,sys; r=json.load(open(sys.argv[1], encoding='utf-
 
 Any mismatch at any step = the record cannot be trusted = **STOP** (no claim,
 no repair, no activation JSON).
+
+### 4.3 Claim-receipt record identity (PR #200 FIX-4)
+
+**Defect found by the independent VPS run.** A second `mint` executed within
+the same wall-clock second produces a NEW freeze record with the SAME
+`freeze_ts` and protocol fingerprint — and therefore a fully matching DB
+boundary — but a different `record_id` and `record_sha256`. The delayed-repair
+path compared only (experiment id, `freeze_ts`, fingerprint), so it accepted
+this second record and re-derived the activation JSON from it. The record's
+self-hash could not help: it verifies only that a record is internally intact
+(tamper evidence), never that the record is the one the original GO claimed.
+
+**Trusted source of identity — the claim receipt** (schema
+`HTF_PHASE2_CLAIM_RECEIPT_V1`, file
+`<activation-out>.claim_receipt.json`, e.g.
+`/opt/trad_bot/etc/htf_phase2_activation.json.claim_receipt.json`):
+
+* the receipt binds `experiment_id`, `protocol_fingerprint`, `freeze_ts`,
+  `claimed_at`, **`record_id`** and **`record_sha256`** (plus its own
+  `receipt_sha256` self-hash) and is a deterministic pure function of the
+  freeze record;
+* it is sealed **exactly once** by the initial claim, **strictly BEFORE the
+  `activate()` transaction commits** — so every committed claim provably
+  carries the identity of exactly one record, and an interrupted seal leaves
+  the database un-claimed (fail-closed both ways);
+* it is written through a dedicated atomic primitive (`O_EXCL`, fsync, 0600,
+  symlink-safe) and is **never overwritten**: only a byte-identical re-seal of
+  the SAME record (idempotent retry of an interrupted claim) is accepted; any
+  other content refuses the claim before the database is touched;
+* the repair path re-derives the activation JSON ONLY when the presented
+  record's `record_id` AND `record_sha256` (and every bound field) equal the
+  receipt EXACTLY; a same-second twin record is refused even when the DB
+  boundary matches completely.
+
+**Fail closed (required).** A missing, unreadable or mismatched receipt means
+the original identity cannot be established → the repair refuses BEFORE any
+write and the operator must STOP and escalate. The record self-hash is never
+substituted for provenance. This does not weaken the initial claim path (the
+acceptance window, the single `activate()` call and the registry guards are
+unchanged) and never permits re-activation.
+
+**Why not the database.** `freeze_registry` is keyed by `freeze_ts` and holds
+no record identity; it is trigger-immutable. Recording `record_id` /
+`record_sha256` there would require a schema/function change to migrations
+074/075, which is forbidden without separate approval. The claim receipt is
+therefore the pre-commit write that stands in for that binding.
+
+**Residual trust (documented, not hidden).** The receipt is a local artifact
+protected by the same controls as the record and the activation JSON (0600,
+operator-owned). An attacker who can rewrite those files can also forge a
+receipt — which is exactly why §4.2 requires recording `record_sha256` in the
+change log (and optionally GPG-signing it): a reviewer comparing the receipt,
+the record and the change-log entry detects the forgery. DELETING the receipt
+only denies repair (fail closed); it never admits a different record.
+
+**Regression.** `tests/test_htf_baseline_short_phase2_freeze_record_postgres_v1.py::test_two_mints_same_second_delayed_repair_binds_original_record_identity`
+(Linux/PostgreSQL IT) deterministically mints two records with one shared
+`--freeze-ts`, claims the first, and proves that delayed repair refuses the
+twin and succeeds ONLY with the original record. Unit coverage (no DB):
+`tests/test_htf_baseline_short_phase2_freeze_record_v1.py` (twin refusal,
+fail-closed without receipt, one-time seal) and
+`tests/test_htf_baseline_short_phase2_timestamp_authority_v1.py` (receipt
+purity/identity binding).
 
 ## 5. Verification performed in this task (isolated, no production access)
 

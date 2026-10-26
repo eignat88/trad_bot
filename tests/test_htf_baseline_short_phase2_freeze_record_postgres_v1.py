@@ -658,6 +658,72 @@ def test_delayed_repair_refuses_mismatched_record(tool_db, tmp_path, monkeypatch
     assert fingerprint == FP
 
 
+def test_two_mints_same_second_delayed_repair_binds_original_record_identity(
+    tool_db, tmp_path, monkeypatch
+):
+    """FIX-4 Linux regression: two ``mint`` runs in the SAME second.
+
+    An explicitly shared ``--freeze-ts`` deterministically reproduces the
+    independent VPS defect (two mints inside one wall-clock second): both
+    records are structurally valid and carry the IDENTICAL DB boundary
+    (freeze_ts + protocol fingerprint) but DIFFERENT record identities
+    (record_id / record_sha256). Delayed repair must refuse the twin — even
+    with a fully matching DB boundary — and succeed ONLY with the record the
+    original claim committed, bound by the claim receipt sealed at that claim.
+    The record self-hash is never treated as proof of provenance.
+    """
+    shared_freeze_ts = (datetime.now(timezone.utc) + timedelta(seconds=2)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    first_path = tmp_path / "freeze_record.json"
+    twin_path = tmp_path / "freeze_record_twin.json"
+    assert _mint(first_path, freeze_ts=shared_freeze_ts) == tool.EXIT_OK
+    assert _mint(twin_path, freeze_ts=shared_freeze_ts) == tool.EXIT_OK  # same second
+
+    first = load_freeze_record(first_path)
+    twin = load_freeze_record(twin_path)
+    # defect preconditions: identical DB boundary, different record identity
+    assert twin["freeze_ts"] == first["freeze_ts"]
+    assert twin["protocol_fingerprint"] == first["protocol_fingerprint"]
+    assert twin["record_id"] != first["record_id"]
+    assert twin["record_sha256"] != first["record_sha256"]
+
+    activation_path = tmp_path / "activation.json"
+    assert _claim(first_path, activation_path) == tool.EXIT_OK
+    assert tool._claim_receipt_path(activation_path).exists()  # sealed pre-commit
+
+    activation_path.unlink()  # interrupted second half -> activation JSON missing
+
+    # delayed repair with the TWIN record: the DB boundary matches completely,
+    # the identity does not -> refused, fail closed, nothing written
+    assert (
+        _claim_late(twin_path, activation_path, monkeypatch, hours=2)
+        == tool.EXIT_REFUSED
+    )
+    assert not activation_path.exists()
+    tool_db.rollback()
+
+    # delayed repair with the ORIGINAL record: exactly the committed identity
+    assert (
+        _claim_late(first_path, activation_path, monkeypatch, hours=2) == tool.EXIT_OK
+    )
+    assert activation_path.exists()
+    activation = json.loads(activation_path.read_text(encoding="utf-8"))
+    assert activation["freeze_ts"] == first["freeze_ts"]
+    assert activation["protocol_fingerprint"] == first["protocol_fingerprint"]
+
+    # the database boundary is still the original claim
+    with tool_db.cursor() as cur:
+        cur.execute(
+            "SELECT freeze_ts, protocol_fingerprint FROM "
+            "research.htf_baseline_short_phase2_experiment WHERE experiment_id = %s",
+            (EXPERIMENT_ID,),
+        )
+        freeze_ts, fingerprint = cur.fetchone()
+    assert parse_ts_ms(freeze_ts) == parse_ts_ms(first["freeze_ts"])
+    assert fingerprint == FP
+
+
 def test_delayed_repair_refuses_tampered_record(tool_db, tmp_path, monkeypatch):
     record_path = tmp_path / "freeze_record.json"
     activation_path = tmp_path / "activation.json"
