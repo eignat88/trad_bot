@@ -31,8 +31,8 @@
     500,
     1000
   ],
-  "scenario_semantics": "per-scenario fill/slippage/cost/min-constraint feasibility in scenario_results; top-level feasibility_status mirrors the FIRST (base) scenario",
-  "exchange_constraints": "minOrderQty/qtyStep/minNotional from Bybit /v5/market/instruments-info (lotSizeFilter, minNotional fallback minOrderAmt); BELOW_EXCHANGE_MIN when executable qty < minOrderQty or notional < minNotional; constraints_known=false rows are excluded from min-constraint analysis",
+  "scenario_semantics": "quantity-first per-scenario modeling: requested_qty = notional/reference rounded DOWN to qtyStep -> executable_qty; the book walk fills exactly executable_qty (never a USDT proceeds target), so feasibility/fill/cost describe the same modeled order; below-exchange-minimum checks use the modeled order value (executable_qty * estimated_fill, fallback reference); per-scenario fill/slippage/cost/min-constraint feasibility in scenario_results; top-level feasibility_status mirrors the FIRST (base) scenario",
+  "exchange_constraints": "minOrderQty/qtyStep/minNotionalValue from Bybit /v5/market/instruments-info (lotSizeFilter.minNotionalValue for category=linear, fallback minNotional/minOrderAmt); BELOW_EXCHANGE_MIN when executable qty < minOrderQty, qty rounds to zero at qtyStep, or order value < minNotionalValue; a missing/empty lotSizeFilter is never treated as known: constraints=None with lookup error and constraints_known=false, and such rows are excluded from min-constraint analysis",
   "book_source": "Bybit /v5/market/orderbook category=linear limit=50, top bid/ask + bid depth within 10bps",
   "book_staleness_limit_ms": 10000,
   "book_future_skew_limit_ms": 1000,

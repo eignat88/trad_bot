@@ -147,9 +147,55 @@ def test_weighted_short_fill_and_spread():
     assert out["book_age_ms"] == 100
 
 
-def test_estimate_bid_fill_partial_book_returns_none():
-    assert _estimate_bid_fill([["99.9", "0.001"]], 100) is None
-    assert _estimate_bid_fill([["0", "5"]], 100) is None  # invalid level skipped
+def test_estimate_bid_fill_quantity_boundaries():
+    # The walk models ORDER SIZE in base units (executable qty), not USDT.
+    assert _estimate_bid_fill([["99.9", "2"], ["99.8", "3"]], 3) == \
+        (Decimal("2") * Decimal("99.9") + Decimal("99.8")) / Decimal("3")
+    assert _estimate_bid_fill([["99.9", "1"]], 1) == Decimal("99.9")  # exact depth
+    assert _estimate_bid_fill([["99.9", "1"]], Decimal("1.0000001")) is None  # just over
+    assert _estimate_bid_fill([["99.9", "0.001"]], Decimal("0.001")) is not None
+    assert _estimate_bid_fill([["0", "5"]], 3) is None  # invalid level skipped
+    assert _estimate_bid_fill([], 1) is None
+
+
+def test_fill_uses_rounded_executable_qty_not_usdt_proceeds():
+    # Review case: 100 USDT @ ref 100 with qtyStep 1 = sell ONE unit; a book
+    # with exactly one unit at bid 99 executes that order even though the
+    # proceeds are only 99 USDT. The old proceeds-based walk wrongly reported
+    # INSUFFICIENT_DEPTH here.
+    constraints = default_constraints(
+        min_order_qty=Decimal("1"), qty_step=Decimal("1"))
+    out = calculate_snapshot(
+        100, 100.2, book(bids=[["99", "1"]], asks=[["99.2", "1"]]),
+        constraints=constraints, notional_scenarios=[100], now_ms=100100)
+    scenario = out["scenario_results"][0]
+    assert scenario["requested_qty"] == Decimal("1")
+    assert scenario["executable_qty"] == Decimal("1")
+    assert scenario["status"] == "OK"
+    assert scenario["estimated_fill"] == Decimal("99")
+    assert scenario["estimated_order_value_usdt"] == Decimal("99")
+
+    # Rounded-down order size is what gets filled (1.5 -> 1 at step 1).
+    out2 = calculate_snapshot(
+        100, 100.2, book(bids=[["99.5", "1"]], asks=[["99.7", "1"]]),
+        constraints=default_constraints(qty_step=Decimal("1")),
+        notional_scenarios=[150], now_ms=100100)
+    scenario2 = out2["scenario_results"][0]
+    assert scenario2["requested_qty"] == Decimal("1.5")
+    assert scenario2["executable_qty"] == Decimal("1")
+    assert scenario2["status"] == "OK"
+    assert scenario2["estimated_fill"] == Decimal("99.5")  # exactly one unit sold
+
+
+def test_qty_step_rounding_to_zero_is_blocked():
+    out = calculate_snapshot(
+        100, 100.2, book(bids=[["99.9", "100"]], asks=[["100.1", "100"]]),
+        constraints=default_constraints(qty_step=Decimal("2")),
+        notional_scenarios=[50], now_ms=100100)  # 0.5 qty -> 0 at step 2
+    scenario = out["scenario_results"][0]
+    assert scenario["executable_qty"] == 0
+    assert scenario["status"] == "BELOW_EXCHANGE_MIN"
+    assert "rounds to zero" in scenario["reason"]
 
 
 def test_multi_scenario_depth_sensitivity():
@@ -294,6 +340,88 @@ def test_instrument_constraints_parsing_and_cache():
     got, err = instrument_constraints(failing, "ETHUSDT")
     assert got is None
     assert err == "instruments_info:RuntimeError"
+
+
+# Actual Bybit v5 linear instruments-info shape: minimum notional lives in
+# lotSizeFilter.minNotionalValue (not minNotional / minOrderAmt).
+LINEAR_INSTRUMENT = {"result": {"list": [{
+    "symbol": "BTCUSDT",
+    "contractType": "LinearPerpetual",
+    "status": "Trading",
+    "lotSizeFilter": {
+        "maxOrderQty": "1000", "maxMktOrderQty": "1000",
+        "minOrderQty": "0.001", "qtyStep": "0.001",
+        "postOnlyMaxOrderQty": "1000", "minNotionalValue": "5"}}]}}
+
+
+def test_linear_min_notion_value_parsed_and_enforced():
+    client = FakeClient(instruments=LINEAR_INSTRUMENT)
+    got, err = instrument_constraints(client, "BTCUSDT")
+    assert err is None
+    assert got["min_notional"] == Decimal("5")  # minNotionalValue, not skipped
+
+    # Below-minimum scenario cannot be classified feasible.
+    out = calculate_snapshot(
+        100, 100.2, book(bids=[["99.9", "100"]], asks=[["100.1", "100"]]),
+        constraints=got, notional_scenarios=[5], now_ms=100100)
+    scenario = out["scenario_results"][0]
+    assert scenario["below_min_notional"] is True
+    assert scenario["status"] == "BELOW_EXCHANGE_MIN"
+    assert "minNotionalValue" in scenario["reason"]
+
+    # Exact boundary: order value == minNotionalValue is NOT blocked.
+    out2 = calculate_snapshot(
+        100, 100.2, book(bids=[["100", "10"]], asks=[["100.2", "10"]]),
+        constraints=got, notional_scenarios=[5], now_ms=100100)
+    scenario2 = out2["scenario_results"][0]
+    assert scenario2["below_min_notional"] is False
+    assert scenario2["estimated_order_value_usdt"] == Decimal("5")
+    assert scenario2["status"] == "OK"
+
+
+def test_min_order_qty_boundary_inclusive():
+    at_min = calculate_snapshot(
+        100, 100.2, book(bids=[["99.9", "5"]], asks=[["100.1", "5"]]),
+        constraints=default_constraints(
+            min_order_qty=Decimal("1"), qty_step=Decimal("1")),
+        notional_scenarios=[100], now_ms=100100)  # qty 1 == minOrderQty
+    assert at_min["scenario_results"][0]["status"] == "OK"
+
+    below = calculate_snapshot(
+        100, 100.2, book(bids=[["99.9", "5"]], asks=[["100.1", "5"]]),
+        constraints=default_constraints(
+            min_order_qty=Decimal("1.5"), qty_step=Decimal("1")),
+        notional_scenarios=[100], now_ms=100100)  # qty 1 < 1.5
+    assert below["scenario_results"][0]["status"] == "BELOW_EXCHANGE_MIN"
+    assert "minOrderQty" in below["scenario_results"][0]["reason"]
+
+
+@pytest.mark.parametrize("instruments", [
+    {"result": {"list": []}},                                # no instrument row
+    {"result": {"list": [{"symbol": "BTCUSDT"}]}},           # no lotSizeFilter
+    {"result": {"list": [{"symbol": "BTCUSDT",
+                          "lotSizeFilter": {}}]}},           # empty filter
+    {"result": {"list": [{"symbol": "BTCUSDT",
+                          "lotSizeFilter": {"foo": "1"}}]}},  # unrecognized keys
+    {"result": {}},                                          # empty result
+])
+def test_missing_lot_size_filter_marks_constraints_unknown(instruments):
+    client = FakeClient(instruments=instruments)
+    got, err = instrument_constraints(client, "BTCUSDT")
+    assert got is None  # never a known all-None dict
+    assert err == "instruments_info:MISSING_LOT_SIZE_FILTER"
+
+    # Unknown stays unknown on cache hits too (exclusion semantics hold).
+    assert instrument_constraints(client, "BTCUSDT") == (None, err)
+    assert len(client.calls) == 1
+
+    out = calculate_snapshot(
+        100, 100.2, book(bids=[["99.9", "5"]], asks=[["100.1", "5"]]),
+        constraints=got, constraints_error=err, now_ms=100100)
+    scenario = out["scenario_results"][0]
+    assert scenario["constraints_known"] is False
+    assert out["constraints"]["known"] is False
+    assert out["constraints"]["lookup_error"] == "instruments_info:MISSING_LOT_SIZE_FILTER"
 
 
 # ── capture gates / fail-closed activation ────────────────────

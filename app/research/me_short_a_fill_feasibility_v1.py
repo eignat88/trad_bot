@@ -86,19 +86,24 @@ def _jsonable(value):
     return value
 
 
-def _estimate_bid_fill(levels, notional):
-    """Weighted sale price into bids for a requested USDT short notional."""
-    remaining = Decimal(str(notional))
+def _estimate_bid_fill(levels, qty):
+    """Weighted sale price for selling exactly ``qty`` base units into bids.
+
+    The walk always models the ORDER SIZE (executable quantity), never a USDT
+    proceeds target: feasibility, fill price and costs must describe the same
+    modeled order (qtyStep-rounded ``executable_qty``).
+    """
+    remaining = Decimal(str(qty))
     qty_total = Decimal("0")
     proceeds = Decimal("0")
     for price_raw, qty_raw in levels:
-        price, qty = Decimal(str(price_raw)), Decimal(str(qty_raw))
-        if price <= 0 or qty <= 0:
+        price, level_qty = Decimal(str(price_raw)), Decimal(str(qty_raw))
+        if price <= 0 or level_qty <= 0:
             continue
-        take = min(qty, remaining / price)
+        take = min(level_qty, remaining)
         proceeds += take * price
         qty_total += take
-        remaining -= take * price
+        remaining -= take
         if remaining <= Decimal("0.00000001"):
             break
     if remaining > Decimal("0.00000001") or qty_total <= 0:
@@ -112,12 +117,28 @@ def _round_down_to_step(value, step):
     return (value / step).to_integral_value(rounding="ROUND_DOWN") * step
 
 
+def _first_decimal(mapping, keys):
+    """First parseable, non-null value among ``keys`` (explicit None checks)."""
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            value = _decimal(mapping[key])
+            if value is not None:
+                return value
+    return None
+
+
 def instrument_constraints(client, symbol, *, now=None):
     """Return ``(constraints_dict | None, error | None)`` for a linear symbol.
 
     Fail-open on the lookup itself (quote capture must survive a flaky
     instruments endpoint) but fail-closed in reporting: when constraints are
     unknown the per-scenario results are flagged instead of assumed feasible.
+
+    Known constraints require an actual instrument specification: a row with a
+    non-empty ``lotSizeFilter`` exposing at least one recognized field. A
+    missing/empty spec is reported as ``None`` with a lookup error so
+    ``constraints_known=false`` exclusion semantics apply. The linear API
+    exposes the minimum notional as ``lotSizeFilter.minNotionalValue``.
     """
     now_s = time.time() if now is None else float(now)
     cached = _INSTRUMENT_CACHE.get(symbol)
@@ -129,21 +150,34 @@ def instrument_constraints(client, symbol, *, now=None):
         payload = client._public_get(
             INSTRUMENTS_ENDPOINT, category="linear", symbol=symbol)
         rows = (payload.get("result") or {}).get("list") or []
-        lot = (rows[0].get("lotSizeFilter") or {}) if rows else {}
-        constraints = {
-            "min_order_qty": _decimal(lot.get("minOrderQty")),
-            "qty_step": _decimal(lot.get("qtyStep")),
-            # Bybit field name varies by market type; accept both spellings.
-            "min_notional": _decimal(lot.get("minNotional") or lot.get("minOrderAmt")),
-        }
+        lot = rows[0].get("lotSizeFilter") if rows else None
+        if not isinstance(lot, dict) or not lot:
+            error = "instruments_info:MISSING_LOT_SIZE_FILTER"
+        else:
+            parsed = {
+                "min_order_qty": _decimal(lot.get("minOrderQty")),
+                "qty_step": _decimal(lot.get("qtyStep")),
+                # Linear v5 field is minNotionalValue; keep legacy fallbacks.
+                "min_notional": _first_decimal(
+                    lot, ("minNotionalValue", "minNotional", "minOrderAmt")),
+            }
+            if all(value is None for value in parsed.values()):
+                error = "instruments_info:MISSING_LOT_SIZE_FILTER"
+            else:
+                constraints = parsed
     except Exception as exc:
         error = f"instruments_info:{type(exc).__name__}"
     _INSTRUMENT_CACHE[symbol] = (now_s, constraints, error)
     return constraints, error
 
 
-def _scenario_result(notional, ref, fill, constraints):
+def _scenario_result(notional, ref, bids, constraints):
     """Per-notional-scenario feasibility, slippage and cost estimate.
+
+    Order modeling is quantity-first: ``requested_qty = notional / reference``
+    is rounded DOWN to ``qtyStep`` into ``executable_qty`` and the book walk
+    fills exactly that quantity, so feasibility, fill price and costs all
+    describe the same modeled order.
 
     Exchange minimum checks are applied only when constraints are known;
     ``constraints_known=False`` marks rows whose min-qty/min-notional
@@ -155,16 +189,22 @@ def _scenario_result(notional, ref, fill, constraints):
     qty_step = (constraints or {}).get("qty_step")
     min_notional = (constraints or {}).get("min_notional")
     executable_qty = _round_down_to_step(requested_qty, qty_step)
+    fill = _estimate_bid_fill(bids, executable_qty) if executable_qty > 0 else None
+    # Modeled order value at submission (weighted fill when depth allows).
+    order_value = executable_qty * (fill if fill is not None else ref)
     below_min_qty = bool(min_qty is not None and executable_qty < min_qty)
     below_min_notional = bool(
-        min_notional is not None and executable_qty * ref < min_notional)
-    if below_min_qty or below_min_notional:
+        min_notional is not None and order_value < min_notional)
+    if executable_qty <= 0:
+        status = "BELOW_EXCHANGE_MIN"
+        reason = "below exchange minimum: executable qty rounds to zero at qtyStep"
+    elif below_min_qty or below_min_notional:
         status = "BELOW_EXCHANGE_MIN"
         broken = []
         if below_min_qty:
             broken.append("minOrderQty")
         if below_min_notional:
-            broken.append("minNotional")
+            broken.append("minNotionalValue")
         reason = "below exchange minimum: " + "+".join(broken)
     elif fill is None:
         status, reason = "INSUFFICIENT_DEPTH", "insufficient executable bid depth"
@@ -175,6 +215,7 @@ def _scenario_result(notional, ref, fill, constraints):
         "notional_usdt": notional,
         "requested_qty": requested_qty,
         "executable_qty": executable_qty,
+        "estimated_order_value_usdt": order_value,
         "constraints_known": constraints is not None,
         "below_min_qty": below_min_qty,
         "below_min_notional": below_min_notional,
@@ -239,8 +280,8 @@ def calculate_snapshot(reference, stop, book, *, notional_scenarios=None,
     )
     scenario_results = []
     for notional in scenarios:
-        fill = _estimate_bid_fill(bids, notional)
-        scenario = _scenario_result(notional, ref, fill, constraints)
+        scenario = _scenario_result(notional, ref, bids, constraints)
+        fill = scenario["estimated_fill"]
         if fill is not None:
             # Quote-side round-trip cost estimate (module docstring / registry).
             cost_pct = (ref - fill) / ref + spread_pct + 2 * fee_per_side
