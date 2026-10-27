@@ -1117,3 +1117,88 @@ def test_executable_fill_requires_verified_exchange_feasibility():
 
     for scenario, expected in cases:
         assert scenario_executable_fill(scenario) == expected
+
+def test_forward_validator_distinguishes_positive_no_lookahead_marker():
+    from app.research.me_short_a_ref_exec_alignment_audit_v1 import validate_forward_event
+
+    evidence = evidence_row()
+    source = {
+        "event_key": evidence["event_key"],
+        "symbol": evidence["symbol"],
+        "direction": "SHORT",
+        "signal_time": evidence["signal_time"],
+        "reference_price": evidence["reference_price"],
+        "stop_price": evidence["stop_price"],
+        "target_price": evidence["target_price"],
+        "no_lookahead_flags": ["recent_high_window_closed_before_signal"],
+        "source_quality_flags": [],
+        "missing_fields": [],
+    }
+    lineage = {
+        **source,
+        "link_status": "LINKED",
+        "event_key_integrity": True,
+        "phase1_linked": True,
+        "source_signal_present": True,
+        "phase1_event_key": evidence["event_key"],
+    }
+    outcome = {
+        **source,
+        "outcome_status": "MATCHED_FINALIZED",
+        "is_final": True,
+        "coverage_complete": True,
+        "asof_ok": True,
+        "horizon_end_time": SIGNAL + timedelta(minutes=240),
+        "finalization_candle_close_time": SIGNAL + timedelta(minutes=240),
+        "finalized_at": SIGNAL + timedelta(minutes=241),
+        "path_class": "TARGET_HIT",
+        "exit_price": 95.0,
+        "source_quality_flags": [],
+        "missing_fields": [],
+    }
+    now = SIGNAL + timedelta(hours=5)
+
+    valid = validate_forward_event(evidence, source, lineage, outcome, now)
+    assert valid["eligible"] is True
+
+    invalid_source = {
+        **source,
+        "no_lookahead_flags": [
+            "recent_high_window_closed_before_signal",
+            "UNEXPECTED_LOOKAHEAD_FLAG",
+        ],
+    }
+    invalid = validate_forward_event(
+        evidence, invalid_source, lineage, outcome, now
+    )
+    assert invalid["eligible"] is False
+    assert "SOURCE_LOOKAHEAD_FLAGS" in invalid["reasons"]
+
+def test_feasibility_requires_sufficient_verified_exchange_constraints():
+    def make_evidence(known):
+        return {
+            "feasibility_status": "OK",
+            "scenario_results": {
+                "scenarios": [{
+                    "status": "OK",
+                    "constraints_known": known,
+                    "below_min_qty": False,
+                    "below_min_notional": False,
+                }]
+            },
+        }
+
+    for verified_n in (0, 1):
+        rows = (
+            [make_evidence(True) for _ in range(verified_n)]
+            + [make_evidence(False) for _ in range(30 - verified_n)]
+        )
+
+        result = fill_feasibility_verdict(rows)
+
+        assert result["verdict"] == FEAS_INCONCLUSIVE
+        assert result["n_quote_valid"] == 30
+        assert any(
+            "constraints" in reason.lower()
+            for reason in result["reasons"]
+        )

@@ -558,7 +558,18 @@ def validate_forward_event(evidence: dict, source: dict | None,
             reasons.append("OUTCOME_SOURCE_QUALITY_FLAGS")
 
     if source:
-        if source.get("no_lookahead_flags"):
+        allowed_no_lookahead_markers = {
+            "recent_high_window_closed_before_signal",
+        }
+        flags = source.get("no_lookahead_flags") or []
+        if (
+            not isinstance(flags, list)
+            or any(
+                not isinstance(flag, str)
+                or flag not in allowed_no_lookahead_markers
+                for flag in flags
+            )
+        ):
             reasons.append("SOURCE_LOOKAHEAD_FLAGS")
         if source.get("source_quality_flags"):
             reasons.append("SOURCE_QUALITY_FLAGS")
@@ -986,6 +997,22 @@ def fill_feasibility_verdict(evidence_rows: Sequence[dict]) -> dict[str, Any]:
     ok_rate = Decimal(len(ok_rows)) / Decimal(n)
     min_rate = (Decimal(len(min_ok)) / Decimal(len(constraints_known))
                 if constraints_known else None)
+    verified_n = len(constraints_known)
+
+    if verified_n < ESTIMATE_MIN_N:
+        return {
+            "verdict": FEAS_INCONCLUSIVE,
+            "n_quote_valid": n,
+            "n_constraints_known": verified_n,
+            "ok_rate": float(ok_rate),
+            "min_constraint_feasible_rate": (
+                float(min_rate) if min_rate is not None else None
+            ),
+            "reasons": [
+                f"n_constraints_known={verified_n} < {ESTIMATE_MIN_N}"
+            ],
+        }
+
     verdict = FEAS_PASS
     if ok_rate < FEASIBILITY_PASS_RATE:
         verdict = FEAS_FAIL
