@@ -1,0 +1,1 @@
+event_key,symbol,scenario_notional_usdt,reference_price,bid,ask,estimated_fill,A_reference_to_bid_pct,B_bid_to_fill_pct,C_spread_pct,D_fees_pct,entry_deviation_total_pct,diagnostic_phase1_cost_pct,overlap_if_subtracted_again_pct,entry_availability,scenario_status

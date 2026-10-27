@@ -1,0 +1,103 @@
+{
+  "audit": "ME_SHORT_A_REFERENCE_TO_EXECUTION_PRICE_ALIGNMENT_AUDIT_V1",
+  "generated_at": "2026-10-26T13:35:20.970845+00:00",
+  "read_only": true,
+  "frozen_protocol": {
+    "experiment_id": "ME_SHORT_GEOM_A_EXECUTION_V1",
+    "freeze_ts": "2026-10-19T08:26:00+00:00",
+    "entry": "reference_price (= recent_high)",
+    "stop": "invalidation_price (= recent_high * 1.002)",
+    "target": "target_1",
+    "max_hold_minutes": 240,
+    "intrabar_policy": "STOP_FIRST",
+    "costs": "taker 0.055%/side + slippage 0.05%/side normal (0.10%/side elevated) - migration 071"
+  },
+  "double_counting_policy": {
+    "definition": "A=(ref-bid)/ref, B=(bid-fill)/ref, C=spread, D=2*fee",
+    "entry_side": "A+B (+ entry-side spread) is realized inside fill; never subtracted from a fill-rebased payoff",
+    "exit_side_only_for_executable": "fee_per_side + slippage_per_side (+ spread in worst-case variant)",
+    "diagnostic_cost_warning": "Phase-1 estimated_roundtrip_cost_pct = A+B+C+D is reference-anchored; combining it with fill-rebased payoffs double counts A+B+C"
+  },
+  "sources": {
+    "database": {
+      "database": "trad_bot_research_snapshot"
+    },
+    "phase1_activation": null,
+    "phase1_activation_error": "DatabaseError: \u043e\u0442\u043d\u043e\u0448\u0435\u043d\u0438\u0435 \"research.me_short_a_fill_activation_v1\" \u043d\u0435 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u0435\u0442",
+    "evidence_rows": null,
+    "evidence_error": "DatabaseError: \u043e\u0442\u043d\u043e\u0448\u0435\u043d\u0438\u0435 \"research.me_short_a_fill_feasibility_v1\" \u043d\u0435 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u0435\u0442",
+    "observations_matched": 0,
+    "outcomes_matched": 0
+  },
+  "rows": [],
+  "aggregates": {
+    "matched_conclusive_rows": 0,
+    "symbols": 0,
+    "independent_symbol_clusters": 0,
+    "clusters": [],
+    "control_net_r": {
+      "n": 0,
+      "insufficient_sample": true,
+      "point_estimate": null,
+      "net_pf": null,
+      "bootstrap": null
+    },
+    "executable_net_r_frozen_exit": {
+      "n": 0,
+      "insufficient_sample": true,
+      "point_estimate": null,
+      "net_pf": null,
+      "bootstrap": null
+    },
+    "executable_net_r_worst_exit": {
+      "n": 0,
+      "insufficient_sample": true,
+      "point_estimate": null,
+      "net_pf": null,
+      "bootstrap": null
+    }
+  },
+  "symbol_concentration": [],
+  "fill_feasibility": {
+    "verdict": "FILL_FEASIBILITY_INCONCLUSIVE",
+    "n_quote_valid": 0,
+    "reasons": [
+      "n_quote_valid=0 < 30"
+    ],
+    "ok_rate": null,
+    "min_constraint_feasible_rate": null
+  },
+  "alignment": {
+    "verdict": "INCONCLUSIVE",
+    "reasons": [
+      "matched_conclusive_rows=0 < minimum_n=200",
+      "symbols=0 < minimum_symbols=20",
+      "no aggregate estimate published below the statistical floor",
+      "Phase 1 evidence source unavailable or empty in this environment"
+    ]
+  },
+  "alignment_verdict": "INCONCLUSIVE",
+  "fill_feasibility_verdict": "FILL_FEASIBILITY_INCONCLUSIVE",
+  "missing_fields": {
+    "registry": {
+      "trigger_5m_close": "candidate features at signal time (scanner current_price)",
+      "entry_zone_low": "scanner entry_zone_low (current_price*0.998)",
+      "entry_zone_high": "scanner entry_zone_high (current_price*1.001)",
+      "recent_high_window_candles": "the five 5m highs that formed reference_price",
+      "post_signal_candle_highs_240m": "absolute post-signal 5m highs/closes for limit-touch and realized exit validation",
+      "realized_exit_fills": "actual fill prices for exits (unknown - model only)"
+    },
+    "observed_missing_in_rows": [],
+    "source_unavailable": [
+      "phase1_activation_error",
+      "evidence_error"
+    ]
+  },
+  "prospective_only_plan": [
+    "Keep Phase 1 RUNNING and strictly append-only: continue signal-time capture for every new MOMENTUM_EXHAUSTION SHORT candidate; no backfill, no mutation of existing evidence rows.",
+    "Register a SEPARATE forward-only append-only supplement (new table via its own migration + PR) for trigger_5m_close, entry_zone_low/high and signal-window candle context; link via event_key, never update me_short_a_fill_feasibility_v1.",
+    "Accumulate at least minimum_n=200 matched matured outcomes across minimum_symbols=20 symbols (frozen cohort thresholds) before any profitability claim.",
+    "Re-run this audit (read-only) on the enlarged population; only then may ALIGNMENT_CONFIRMED / ALIGNMENT_INVALID be issued.",
+    "No paper/live activation, no scanner changes, no Phase 1 freeze/status changes, no production SQL writes as part of this audit."
+  ]
+}
