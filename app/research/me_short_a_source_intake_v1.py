@@ -58,6 +58,11 @@ from app.research.me_short_a_forward_outcome_lineage_v1 import (
     PROTOCOL_VERSION,
     event_key as _lineage_event_key,
 )
+from app.research.me_short_a_forward_outcome_runtime_v1 import (
+    # The SAME normalization the frozen runtime uses when it recomputes an
+    # event_key from a ``numeric`` column. One function, one representation.
+    canonical_price as _identity_price,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -197,10 +202,23 @@ def compute_event_key(
     """Deterministic event identity, byte-identical to Phase 1 / Issue #208.
 
     ``sha256(symbol|SHORT|<utc isoformat signal_time>|<ref>|<stop>|<target>)``
+
+    Identity prices are mapped onto the FROZEN representation first. Phase 1
+    (``me_short_a_fill_feasibility_v1.capture``) hashes the scanner's
+    in-memory ``float`` prices via ``Decimal(str(<float>))`` — the exact
+    contract of ``canonical_price`` in the frozen runtime — so every other
+    spelling of the same number (``Decimal("342.10")``, ``"342.10"``,
+    ``Decimal("342.1")``, ``342.1``) MUST hash as ``342.1``. Without this
+    mapping the writer's key would not match the key the runtime recomputes
+    from the stored ``numeric`` column after a PostgreSQL round-trip, and one
+    event would join nothing in the ``source intake -> Phase 1 -> lineage ->
+    outcome`` chain.
     """
     return _lineage_event_key(
         symbol, DIRECTION_SHORT, signal_time,
-        reference_price, stop_price, target_price)
+        _identity_price(reference_price),
+        _identity_price(stop_price),
+        _identity_price(target_price))
 
 
 def activation_snapshot(conn: Any) -> tuple[str, datetime | None] | None:
@@ -281,9 +299,13 @@ def capture_with_status(
 
     try:
         event_time = _datetime(signal_time)
-        ref = _decimal(reference_price)
-        stop = _decimal(invalidation_price)
-        target = _decimal(target_1)
+        # Identity columns in the FROZEN representation — exactly what Phase 1
+        # stores as its identity inputs — so the row is self-consistent with
+        # its event_key and one number never produces two rows. Payload
+        # columns (window, zones, context) keep the captured values verbatim.
+        ref = _identity_price(reference_price)
+        stop = _identity_price(invalidation_price)
+        target = _identity_price(target_1)
         if ref is None or stop is None or target is None:
             LOG.error(
                 "ME SHORT A source intake: unparseable geometry for %s %s",
