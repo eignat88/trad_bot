@@ -59,7 +59,7 @@ Cost accounting — NO DOUBLE COUNTING (the audit's core invariant):
         cost_r_control = ROUND_TRIP_frozen * reference / structural_r
 
     EXECUTABLE accounting (fill-rebased payoff):
-        net_R_exec = gross_R_exec - cost_r_exec_exit_only
+        net_R_exec = gross_R_exec - cost_r_entry_fee - cost_r_exec_exit_only
         cost_r_exec_exit_only = exit_cost_pct * fill / risk_exec
         exit_cost_pct_frozen = fee_per_side + slippage_normal_per_side
         exit_cost_pct_worst  = fee_per_side + slippage_elevated_per_side + spread
@@ -305,6 +305,20 @@ def symbol_cluster(symbol: str) -> str:
 
 def derive_path_class(outcome: dict) -> str:
     """ME A path class; AMBIGUOUS under frozen STOP_FIRST resolves to stop."""
+    if "outcome_status" in outcome:
+        if outcome.get("outcome_status") != "MATCHED_FINALIZED":
+            raise ValueError("forward outcome is not finalized")
+        mapping = {
+            "TARGET_HIT": "TP_FIRST",
+            "STOP_HIT": "SL_FIRST",
+            "TIMEOUT_240M": "TIMEOUT",
+        }
+        path = outcome.get("path_class")
+        if path not in mapping:
+            raise ValueError(f"unsupported forward outcome path: {path}")
+        if outcome.get("ambiguous_intrabar"):
+            return "AMBIGUOUS_STOP_FIRST"
+        return mapping[path]
     if outcome.get("ambiguous_intrabar"):
         return "AMBIGUOUS_STOP_FIRST"
     if outcome.get("tp_before_sl"):
@@ -404,6 +418,157 @@ def load_evidence(conn) -> list[dict]:
         row["source_observation_ids"] = _json(row.get("source_observation_ids"))
         row["raw_snapshot"] = _json(row.get("raw_snapshot"))
     return rows
+
+
+
+def load_forward_sources(conn, event_keys: Sequence[str]) -> dict[str, dict]:
+    """Read source signals from collector #208 without modifying them."""
+    if not event_keys:
+        return {}
+    rows = _select(
+        conn,
+        "SELECT event_key, symbol, direction, signal_time, "
+        "reference_price, stop_price, target_price, "
+        "trigger_5m_close, entry_zone_low, entry_zone_high, "
+        "missing_fields, source_quality_flags, no_lookahead_flags "
+        "FROM research.me_short_a_source_signal_v1 "
+        "WHERE event_key = ANY(%s)",
+        (list(event_keys),),
+    )
+    return {row["event_key"]: row for row in rows}
+
+
+def load_forward_lineage(conn, event_keys: Sequence[str]) -> dict[str, dict]:
+    """Read verified event-key lineage from collector #208."""
+    if not event_keys:
+        return {}
+    rows = _select(
+        conn,
+        "SELECT event_key, symbol, direction, signal_time, "
+        "reference_price, stop_price, target_price, "
+        "event_key_integrity, link_status, quarantine_reason, "
+        "source_signal_present, phase1_event_key, phase1_linked, "
+        "linkage_checks "
+        "FROM research.me_short_a_event_lineage_v1 "
+        "WHERE event_key = ANY(%s)",
+        (list(event_keys),),
+    )
+    return {row["event_key"]: row for row in rows}
+
+
+def load_forward_outcomes(conn, event_keys: Sequence[str]) -> dict[str, dict]:
+    """Read forward-only outcomes, including incomplete diagnostics."""
+    if not event_keys:
+        return {}
+    rows = _select(
+        conn,
+        "SELECT event_key, symbol, direction, signal_time, "
+        "reference_price, stop_price, target_price, "
+        "outcome_status, path_class, sl_before_tp, tp_before_sl, "
+        "ambiguous_intrabar, exit_price, gross_r, return_at_240m, "
+        "mae_240m, limit_at_reference_touch, is_final, "
+        "finalized_at, finalization_candle_close_time, "
+        "horizon_end_time, coverage_complete, asof_ok, "
+        "source_quality_flags, missing_fields "
+        "FROM research.me_short_a_outcome_observation_v1 "
+        "WHERE event_key = ANY(%s)",
+        (list(event_keys),),
+    )
+    return {row["event_key"]: row for row in rows}
+
+
+
+def validate_forward_event(evidence: dict, source: dict | None,
+                           lineage: dict | None, outcome: dict | None,
+                           now: datetime) -> dict[str, Any]:
+    """Fail-closed verification of collector #208 evidence."""
+    reasons = []
+    key = evidence.get("event_key")
+
+    if not source:
+        reasons.append("SOURCE_SIGNAL_MISSING")
+    if not lineage:
+        reasons.append("FORWARD_LINEAGE_MISSING")
+    if not outcome:
+        reasons.append("FORWARD_OUTCOME_MISSING")
+
+    for label, row in (("source", source), ("lineage", lineage),
+                       ("outcome", outcome)):
+        if not row:
+            continue
+        if row.get("event_key") != key:
+            reasons.append(f"{label}_EVENT_KEY_MISMATCH")
+        if row.get("symbol") != evidence.get("symbol"):
+            reasons.append(f"{label}_SYMBOL_MISMATCH")
+        if row.get("direction") != "SHORT":
+            reasons.append(f"{label}_DIRECTION_MISMATCH")
+        if _dt(row.get("signal_time")) != _dt(evidence.get("signal_time")):
+            reasons.append(f"{label}_SIGNAL_TIME_MISMATCH")
+        for field in ("reference_price", "stop_price", "target_price"):
+            if _dec(row.get(field)) != _dec(evidence.get(field)):
+                reasons.append(f"{label}_{field.upper()}_MISMATCH")
+
+    if lineage:
+        if lineage.get("link_status") != "LINKED":
+            reasons.append("LINEAGE_NOT_LINKED")
+        if lineage.get("event_key_integrity") is not True:
+            reasons.append("EVENT_KEY_INTEGRITY_FAILED")
+        if lineage.get("phase1_linked") is not True:
+            reasons.append("PHASE1_NOT_LINKED")
+        if lineage.get("source_signal_present") is not True:
+            reasons.append("SOURCE_SIGNAL_NOT_CONFIRMED")
+        if lineage.get("phase1_event_key") != key:
+            reasons.append("PHASE1_EVENT_KEY_MISMATCH")
+
+    if outcome:
+        if outcome.get("outcome_status") != "MATCHED_FINALIZED":
+            reasons.append("OUTCOME_NOT_FINALIZED")
+        if outcome.get("is_final") is not True:
+            reasons.append("IS_FINAL_FALSE")
+        if outcome.get("coverage_complete") is not True:
+            reasons.append("COVERAGE_INCOMPLETE")
+        if outcome.get("asof_ok") is not True:
+            reasons.append("ASOF_INVALID")
+        end = _dt(outcome.get("horizon_end_time"))
+        close = _dt(outcome.get("finalization_candle_close_time"))
+        finalized = _dt(outcome.get("finalized_at"))
+        signal_time = _dt(evidence.get("signal_time"))
+        expected_end = (
+            signal_time + timedelta(minutes=MAX_HOLD_MINUTES)
+            if signal_time is not None else None
+        )
+        if end is None or expected_end is None or end != expected_end:
+            reasons.append("HORIZON_END_MISMATCH")
+        if end is None or close is None or close < end:
+            reasons.append("FINALIZATION_BEFORE_HORIZON")
+        if (
+            finalized is None
+            or end is None
+            or finalized < end
+            or finalized > _dt(now)
+        ):
+            reasons.append("FINALIZATION_TIME_INVALID")
+        if outcome.get("path_class") not in (
+            "STOP_HIT", "TARGET_HIT", "TIMEOUT_240M"
+        ):
+            reasons.append("PATH_UNRESOLVED")
+        if _dec(outcome.get("exit_price")) is None:
+            reasons.append("EXIT_PRICE_MISSING")
+        if outcome.get("source_quality_flags"):
+            reasons.append("OUTCOME_SOURCE_QUALITY_FLAGS")
+
+    if source:
+        if source.get("no_lookahead_flags"):
+            reasons.append("SOURCE_LOOKAHEAD_FLAGS")
+        if source.get("source_quality_flags"):
+            reasons.append("SOURCE_QUALITY_FLAGS")
+        if source.get("missing_fields"):
+            reasons.append("SOURCE_MISSING_FIELDS")
+
+    if outcome and outcome.get("missing_fields"):
+        reasons.append("OUTCOME_MISSING_FIELDS")
+
+    return {"eligible": not reasons, "reasons": reasons}
 
 
 def load_observations(conn, observation_ids: Sequence[int]) -> dict[int, dict]:
@@ -597,7 +762,16 @@ def counterfactual(evidence: dict, outcome: dict, fill: Decimal | None,
 
     path_class = derive_path_class(outcome)
     ret_240 = _dec(outcome.get("return_at_240m"))
-    timeout_close = (ref * (1 + ret_240 / 100)) if (ref is not None and ret_240 is not None) else None
+    if "outcome_status" in outcome:
+        timeout_close = (
+            _dec(outcome.get("exit_price"))
+            if path_class == "TIMEOUT" else None
+        )
+    else:
+        timeout_close = (
+            ref * (1 + ret_240 / 100)
+            if (ref is not None and ret_240 is not None) else None
+        )
 
     result: dict[str, Any] = {
         "scenario_notional_usdt": _num(scenario_notional),
@@ -628,7 +802,7 @@ def counterfactual(evidence: dict, outcome: dict, fill: Decimal | None,
     else:
         result["control"] = {"gross_r": None, "net_r": None, "cost_r": None}
 
-    # Executable view (fill-rebased; exit-side costs ONLY).
+    # Executable view (fill-rebased; entry fee once + exit-side costs).
     if fill is None or stop is None or ref is None:
         result["executable"] = {
             "entry": _num(fill),
@@ -651,6 +825,7 @@ def counterfactual(evidence: dict, outcome: dict, fill: Decimal | None,
     exit_frozen = FEE_PER_SIDE + SLIPPAGE_NORMAL_PER_SIDE
     exit_worst = FEE_PER_SIDE + SLIPPAGE_ELEVATED_PER_SIDE + (
         _dec(spread_pct) or Decimal("0"))
+    cost_entry_fee = float(FEE_PER_SIDE) * float(fill) / risk_exec
     cost_frozen = float(exit_frozen) * float(fill) / risk_exec
     cost_worst = float(exit_worst) * float(fill) / risk_exec
     result["executable"] = {
@@ -660,10 +835,11 @@ def counterfactual(evidence: dict, outcome: dict, fill: Decimal | None,
         "risk_inflation_pct": (risk_exec - (float(stop) - float(ref)))
                               / (float(stop) - float(ref)) * 100,
         "gross_r": gross_exec,
+        "cost_r_entry_fee": cost_entry_fee,
         "cost_r_exit_only_frozen": cost_frozen,
         "cost_r_exit_only_worst": cost_worst,
-        "net_r_frozen_exit": (gross_exec - cost_frozen) if gross_exec is not None else None,
-        "net_r_worst_exit": (gross_exec - cost_worst) if gross_exec is not None else None,
+        "net_r_frozen_exit": (gross_exec - cost_entry_fee - cost_frozen) if gross_exec is not None else None,
+        "net_r_worst_exit": (gross_exec - cost_entry_fee - cost_worst) if gross_exec is not None else None,
         "status": "OK" if gross_exec is not None else MISSING_EXIT_DATA,
     }
     return result
@@ -681,10 +857,32 @@ def scenario_table(evidence: dict) -> list[dict[str, Any]]:
 
 # ── aggregation ───────────────────────────────────────────────────────────
 
-def aggregate(rows: Sequence[dict], *, bootstrap_n: int, seed: int) -> dict[str, Any]:
+def eligible_for_decision(row: dict, *, require_forward: bool = True) -> bool:
+    """Shared fail-closed eligibility for forward-only OOS decisions."""
+    if row.get("lineage_status") != OK:
+        return False
+    if row.get("lookahead_flags"):
+        return False
+    if not require_forward and "forward_link_status" not in row:
+        return True
+    return (
+        row.get("forward_validated") is True
+        and row.get("forward_link_status") == "LINKED"
+        and row.get("forward_event_key_integrity") is True
+        and row.get("forward_phase1_linked") is True
+        and row.get("forward_outcome_status") == "MATCHED_FINALIZED"
+        and row.get("forward_is_final") is True
+    )
+
+
+def aggregate(rows: Sequence[dict], *, bootstrap_n: int, seed: int,
+              require_forward: bool = False) -> dict[str, Any]:
     """Aggregate matched conclusive rows. Point estimates are published only
     when at least ESTIMATE_MIN_N conclusive rows exist (never from a handful)."""
-    conclusive = [r for r in rows if r.get("lineage_status") == OK]
+    conclusive = [
+        r for r in rows
+        if eligible_for_decision(r, require_forward=require_forward)
+    ]
     matched_n = len(conclusive)
     symbols = {r["symbol"] for r in conclusive}
     clusters = {symbol_cluster(s) for s in symbols}
@@ -854,7 +1052,7 @@ def run_audit(conn, *, now: datetime | None = None,
             "definition": "A=(ref-bid)/ref, B=(bid-fill)/ref, C=spread, D=2*fee",
             "entry_side": "A+B (+ entry-side spread) is realized inside fill; "
                           "never subtracted from a fill-rebased payoff",
-            "exit_side_only_for_executable": "fee_per_side + slippage_per_side "
+            "entry_fee_once_plus_exit_cost_for_executable": "fee_per_side + slippage_per_side "
                                              "(+ spread in worst-case variant)",
             "diagnostic_cost_warning": "Phase-1 estimated_roundtrip_cost_pct = "
                                        "A+B+C+D is reference-anchored; combining "
@@ -886,6 +1084,34 @@ def run_audit(conn, *, now: datetime | None = None,
         sources["evidence_error"] = _error_text(exc)
         _safe_rollback(conn)
 
+    # Forward-only collector #208: read-only diagnostic loading.
+    event_keys = [
+        str(row["event_key"])
+        for row in evidence_rows
+        if row.get("event_key")
+    ]
+    forward_sources = {}
+    forward_lineage = {}
+    forward_outcomes = {}
+    if event_keys:
+        for label, loader in (
+            ("forward_sources", load_forward_sources),
+            ("forward_lineage", load_forward_lineage),
+            ("forward_outcomes", load_forward_outcomes),
+        ):
+            try:
+                loaded = loader(conn, event_keys)
+                if label == "forward_sources":
+                    forward_sources = loaded
+                elif label == "forward_lineage":
+                    forward_lineage = loaded
+                else:
+                    forward_outcomes = loaded
+                sources[label + "_rows"] = len(loaded)
+            except Exception as exc:
+                sources[label + "_error"] = _error_text(exc)
+                _safe_rollback(conn)
+
     all_ids: list[int] = []
     for row in evidence_rows:
         obs_id = _first_observation_id(row.get("source_observation_ids"))
@@ -904,9 +1130,52 @@ def run_audit(conn, *, now: datetime | None = None,
     sources["outcomes_matched"] = len(outcomes)
     report["sources"] = sources
 
+    # Forward-only eligibility: fail closed on missing or invalid evidence.
+    forward_checks = {
+        row["event_key"]: validate_forward_event(
+            row,
+            forward_sources.get(row["event_key"]),
+            forward_lineage.get(row["event_key"]),
+            forward_outcomes.get(row["event_key"]),
+            now,
+        )
+        for row in evidence_rows
+    }
+    sources["forward_eligible"] = sum(
+        check["eligible"] for check in forward_checks.values()
+    )
+
     # 2. Lineage per evidence row.
-    lineage_rows = [build_row_lineage(row, observations, outcomes, now)
-                    for row in evidence_rows]
+    lineage_rows = []
+    for evidence in evidence_rows:
+        key = evidence["event_key"]
+        legacy = build_row_lineage(evidence, observations, outcomes, now)
+        check = forward_checks[key]
+
+        # Legacy diagnostics only; never used for forward OOS eligibility.
+        legacy_outcome = legacy.get("outcome") if legacy["lineage_status"] == OK else None
+        legacy_mae = _dec((legacy_outcome or {}).get("mae_240m"))
+        legacy["legacy_limit_at_reference_touch"] = (
+            None if legacy_mae is None else bool(legacy_mae > 0)
+        )
+
+        if check["eligible"]:
+            forward = forward_outcomes[key]
+            source = forward_sources[key]
+
+            # Keep the original Phase 1 diagnostic separate from OOS lineage.
+            legacy["legacy_lineage_status"] = legacy["lineage_status"]
+            legacy["legacy_missing_fields"] = list(legacy["missing_fields"])
+            legacy["lineage_status"] = OK
+            legacy["missing_fields"] = []
+            legacy["outcome"] = forward
+            legacy["features_present"] = {
+                "trigger_5m_close": source.get("trigger_5m_close") is not None,
+                "entry_zone_low": source.get("entry_zone_low") is not None,
+                "entry_zone_high": source.get("entry_zone_high") is not None,
+            }
+
+        lineage_rows.append(legacy)
 
     # 3. Economics per row x scenario (matched rows only).
     per_row: list[dict[str, Any]] = []
@@ -917,15 +1186,32 @@ def run_audit(conn, *, now: datetime | None = None,
             "signal_time": str(evidence.get("signal_time")),
             "lineage_status": lineage["lineage_status"],
             "missing_fields": lineage["missing_fields"],
+            "legacy_lineage_status": lineage.get(
+                "legacy_lineage_status", lineage["lineage_status"]
+            ),
+            "legacy_missing_fields": lineage.get(
+                "legacy_missing_fields", list(lineage["missing_fields"])
+            ),
             "lookahead_flags": lineage["lookahead_flags"],
             "features_present": lineage.get("features_present"),
             "feasibility_status": evidence.get("feasibility_status"),
+            "forward_eligibility": forward_checks[evidence["event_key"]],
+            "legacy_limit_at_reference_touch": lineage.get(
+                "legacy_limit_at_reference_touch"
+            ),
             "scenarios": [],
         }
-        outcome = lineage.get("outcome")
+        outcome = (
+            lineage.get("outcome")
+            if forward_checks[evidence["event_key"]]["eligible"]
+            else None
+        )
         mae_240 = _dec((outcome or {}).get("mae_240m"))
         entry["limit_at_reference_touch"] = (
-            None if (outcome is None or mae_240 is None) else bool(mae_240 > 0))
+            outcome.get("limit_at_reference_touch")
+            if outcome is not None and "outcome_status" in outcome
+            else (None if outcome is None or mae_240 is None else bool(mae_240 > 0))
+        )
         if outcome is not None:
             scenarios = scenario_table(evidence)
             if not scenarios:
@@ -954,20 +1240,46 @@ def run_audit(conn, *, now: datetime | None = None,
             "symbol": entry["symbol"],
             "lineage_status": entry["lineage_status"],
             "lookahead_flags": entry["lookahead_flags"],
+            "forward_link_status": (
+                forward_lineage.get(entry["event_key"]) or {}
+            ).get("link_status"),
+            "forward_event_key_integrity": (
+                forward_lineage.get(entry["event_key"]) or {}
+            ).get("event_key_integrity"),
+            "forward_phase1_linked": (
+                forward_lineage.get(entry["event_key"]) or {}
+            ).get("phase1_linked"),
+            "forward_outcome_status": (
+                forward_outcomes.get(entry["event_key"]) or {}
+            ).get("outcome_status"),
+            "forward_is_final": (
+                forward_outcomes.get(entry["event_key"]) or {}
+            ).get("is_final"),
+            "forward_validated": entry["forward_eligibility"]["eligible"],
             "control": {}, "executable": {},
         }
         if entry["scenarios"]:
             row_view["control"] = entry["scenarios"][0]["counterfactual"].get("control") or {}
             row_view["executable"] = entry["scenarios"][0]["counterfactual"].get("executable") or {}
         base_view_rows.append(row_view)
-    report["aggregates"] = aggregate(base_view_rows, bootstrap_n=bootstrap_n, seed=seed)
-    report["symbol_concentration"] = symbol_concentration(base_view_rows)
+    report["aggregates"] = aggregate(
+        base_view_rows,
+        bootstrap_n=bootstrap_n,
+        seed=seed,
+        require_forward=True,
+    )
+    # All decision-level views use the same forward-validated population.
+    decision_rows = [
+        row for row in base_view_rows
+        if eligible_for_decision(row, require_forward=True)
+    ]
+    report["symbol_concentration"] = symbol_concentration(decision_rows)
 
     # 5. Fill feasibility population view.
     report["fill_feasibility"] = fill_feasibility_verdict(evidence_rows)
 
     # 6. Verdicts + missing fields + prospective-only plan.
-    report["alignment"] = alignment_verdict(base_view_rows, report["aggregates"])
+    report["alignment"] = alignment_verdict(decision_rows, report["aggregates"])
     report["alignment_verdict"] = report["alignment"]["verdict"]
     report["fill_feasibility_verdict"] = report["fill_feasibility"]["verdict"]
 
@@ -1105,7 +1417,7 @@ def write_reports(report: dict[str, Any], out_dir: str) -> list[str]:
         "(0.0021 normal / 0.0031 elevated) in structural R.",
         "- EXECUTABLE: payoff rebased on the modeled bid fill; entry-side "
         "reference-to-bid drift + book impact + entry spread are already inside "
-        "the fill price and are NEVER subtracted again; only exit-side costs "
+        "the fill price and are NEVER subtracted again; entry fee plus exit-side costs "
         "(fee + slippage; worst-case adds the spread) are applied.",
         "- The Phase-1 diagnostic cost (A+B+C+2*fee) is reference-anchored; "
         "see `overlap_if_subtracted_again_pct` in the CSV.",

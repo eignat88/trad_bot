@@ -107,7 +107,9 @@ FROM research.me_short_a_fill_feasibility_v1 e
 GROUP BY 1, 2
 ORDER BY 1, 2;
 
--- Q5. Timestamp / lookahead sanity (all counts must be zero).
+-- Q5. Timestamp / lookahead sanity.
+-- First four counters: violations (expected zero).
+-- Last two counters: capture-lag diagnostics, not automatic violations.
 SELECT
     COUNT(*) FILTER (WHERE signal_time <= freeze_ts)                        AS signal_not_after_phase1_freeze,
     COUNT(*) FILTER (WHERE signal_time <= TIMESTAMPTZ '2026-10-19 08:26:00+00')
@@ -116,7 +118,10 @@ SELECT
     COUNT(*) FILTER (WHERE book_time_ms IS NOT NULL
                         AND book_time_ms > EXTRACT(EPOCH FROM captured_at) * 1000 + 1000)
                                                                             AS book_in_future,
-    COUNT(*) FILTER (WHERE signal_time >= captured_at - INTERVAL '1 second') AS zero_lag_suspects
+    COUNT(*) FILTER (WHERE captured_at = signal_time)                    AS exact_zero_lag,
+    COUNT(*) FILTER (WHERE captured_at > signal_time
+                        AND captured_at - signal_time < INTERVAL '1 second')
+                                                                            AS subsecond_capture_lag
 FROM research.me_short_a_fill_feasibility_v1;
 
 -- Q6. Per-scenario min-constraint feasibility (UNKNOWN constraints excluded).
@@ -143,3 +148,28 @@ ORDER BY 1;
 SELECT experiment_id, status, freeze_ts
 FROM research.me_short_a_fill_activation_v1
 WHERE experiment_id = 'ME_SHORT_A_EXECUTION_FILL_FEASIBILITY_AUDIT_V1';
+-- Q8. Forward-only collector #208: event-key linkage and outcome readiness.
+-- Diagnostic counts only; final economic eligibility is validated in Python.
+SELECT
+    COUNT(*) AS phase1_events,
+    COUNT(s.event_key) AS forward_source_present,
+    COUNT(l.event_key) AS forward_lineage_present,
+    COUNT(o.event_key) AS forward_outcome_present,
+    COUNT(*) FILTER (
+        WHERE l.link_status = 'LINKED'
+          AND l.event_key_integrity IS TRUE
+          AND l.phase1_linked IS TRUE
+          AND l.source_signal_present IS TRUE
+          AND l.phase1_event_key = e.event_key
+          AND o.outcome_status = 'MATCHED_FINALIZED'
+          AND o.is_final IS TRUE
+          AND o.coverage_complete IS TRUE
+          AND o.asof_ok IS TRUE
+    ) AS forward_status_ready
+FROM research.me_short_a_fill_feasibility_v1 e
+LEFT JOIN research.me_short_a_source_signal_v1 s
+       ON s.event_key = e.event_key
+LEFT JOIN research.me_short_a_event_lineage_v1 l
+       ON l.event_key = e.event_key
+LEFT JOIN research.me_short_a_outcome_observation_v1 o
+       ON o.event_key = e.event_key;

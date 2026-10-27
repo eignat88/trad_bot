@@ -86,7 +86,8 @@ class FakeConnection:
         return FakeCursor(self)
 
 
-def fake_conn(evidence_rows=(), observations=(), outcomes=(), activation=()):
+def fake_conn(evidence_rows=(), observations=(), outcomes=(), activation=(),
+              forward_sources=(), forward_lineage=(), forward_outcomes=()):
     def dicts(rows):
         if not rows:
             return ([], [])
@@ -99,6 +100,9 @@ def fake_conn(evidence_rows=(), observations=(), outcomes=(), activation=()):
         ("FROM research.me_short_a_fill_feasibility_v1", evidence_rows),
         ("FROM research.prospective_observation", observations),
         ("FROM research.prospective_outcome", outcomes),
+        ("FROM research.me_short_a_source_signal_v1", forward_sources),
+        ("FROM research.me_short_a_event_lineage_v1", forward_lineage),
+        ("FROM research.me_short_a_outcome_observation_v1", forward_outcomes),
     ):
         columns, tuples = dicts(rows)
         routes.append((matcher, columns, tuples))
@@ -312,8 +316,12 @@ def test_executable_net_never_subtracts_entry_side_again():
     assert execu["gross_r"] == pytest.approx((98.9 - 95.0) / (100.2 - 98.9))
     assert execu["cost_r_exit_only_frozen"] == pytest.approx(
         0.00105 * 98.9 / (100.2 - 98.9))
+    assert execu["cost_r_entry_fee"] == pytest.approx(
+        0.00055 * 98.9 / (100.2 - 98.9))
     assert execu["net_r_frozen_exit"] == pytest.approx(
-        execu["gross_r"] - execu["cost_r_exit_only_frozen"])
+        execu["gross_r"]
+        - execu["cost_r_entry_fee"]
+        - execu["cost_r_exit_only_frozen"])
     # The misapplied diagnostic cost (A+B+C+D at reference anchor) would be
     # far larger than the exit-only cost actually used.
     diagnostic = 0.011 + 0.2 / 99.1 + 0.0011
@@ -387,7 +395,7 @@ def test_limit_touch_derived_from_mae():
                            "status": "RUNNING", "freeze_ts": SIGNAL}])
         report = run_audit(conn, now=SIGNAL + timedelta(hours=5),
                            bootstrap_n=10, seed=3)
-        return report["rows"][0]["limit_at_reference_touch"]
+        return report["rows"][0]["legacy_limit_at_reference_touch"]
 
     # MAE for SHORT = adverse up-move above entry: >0 means the reference
     # price traded again (limit at reference would fill); 0 is a NO_TOUCH.
@@ -511,10 +519,50 @@ def test_bootstrap_is_deterministic():
 
 
 def test_run_audit_end_to_end_matched_row():
-    conn = fake_conn([evidence_row()], [observation_row()], [outcome_row()],
-                     [{"experiment_id": "ME_SHORT_A_EXECUTION_FILL_FEASIBILITY_AUDIT_V1",
-                       "status": "RUNNING",
-                       "freeze_ts": datetime(2026, 10, 26, 12, 53, 57, tzinfo=UTC)}])
+    source = {
+        "event_key": "evt-1",
+        "symbol": "ARIAUSDT",
+        "direction": "SHORT",
+        "signal_time": SIGNAL,
+        "reference_price": 100.0,
+        "stop_price": 100.2,
+        "target_price": 95.0,
+        "no_lookahead_flags": [],
+    }
+    lineage = {
+        **source,
+        "link_status": "LINKED",
+        "event_key_integrity": True,
+        "phase1_linked": True,
+        "source_signal_present": True,
+        "phase1_event_key": "evt-1",
+    }
+    forward_outcome = {
+        **source,
+        "outcome_status": "MATCHED_FINALIZED",
+        "is_final": True,
+        "coverage_complete": True,
+        "asof_ok": True,
+        "horizon_end_time": SIGNAL + timedelta(minutes=240),
+        "finalization_candle_close_time": SIGNAL + timedelta(minutes=240),
+        "finalized_at": SIGNAL + timedelta(minutes=241),
+        "path_class": "TARGET_HIT",
+        "exit_price": 95.0,
+        "source_quality_flags": [],
+    }
+    conn = fake_conn(
+        evidence_rows=[evidence_row()],
+        observations=[observation_row()],
+        outcomes=[outcome_row()],
+        activation=[{
+            "experiment_id": "ME_SHORT_A_EXECUTION_FILL_FEASIBILITY_AUDIT_V1",
+            "status": "RUNNING",
+            "freeze_ts": datetime(2026, 10, 26, 12, 53, 57, tzinfo=UTC),
+        }],
+        forward_sources=[source],
+        forward_lineage=[lineage],
+        forward_outcomes=[forward_outcome],
+    )
     report = run_audit(conn, now=SIGNAL + timedelta(hours=5), bootstrap_n=50, seed=3)
     assert report["alignment_verdict"] == ALIGNMENT_INCONCLUSIVE  # n < minimum
     assert report["fill_feasibility_verdict"] == FEAS_INCONCLUSIVE
@@ -525,7 +573,7 @@ def test_run_audit_end_to_end_matched_row():
     base = row["scenarios"][0]["counterfactual"]
     assert base["control"]["gross_r"] == pytest.approx(25.0)  # (100-95)/0.2
     assert base["executable"]["gross_r"] == pytest.approx(3.0)  # (98.9-95)/1.3
-    assert row["limit_at_reference_touch"] is False  # mae_240m == 0 -> NO_TOUCH
+    assert row["legacy_limit_at_reference_touch"] is False  # mae_240m == 0 -> NO_TOUCH
     assert report["prospective_only_plan"]
 
 
@@ -573,3 +621,419 @@ def test_write_reports_emits_all_deliverables(tmp_path):
     md = (tmp_path / "EXECUTABLE_ENTRY_COUNTERFACTUAL.md").read_text("utf-8")
     assert "No double counting" in md
     assert "prospective-only plan" in md.lower()
+
+def test_executable_net_includes_entry_fee_exactly_once():
+    cf = counterfactual(evidence_row(), outcome_row(), 98.9, 1000)
+    execu = cf["executable"]
+
+    entry_fee_r = 0.00055 * 98.9 / (100.2 - 98.9)
+
+    assert execu["cost_r_entry_fee"] == pytest.approx(entry_fee_r)
+    assert execu["net_r_frozen_exit"] == pytest.approx(
+        execu["gross_r"] - entry_fee_r - execu["cost_r_exit_only_frozen"]
+    )
+    assert execu["net_r_worst_exit"] == pytest.approx(
+        execu["gross_r"] - entry_fee_r - execu["cost_r_exit_only_worst"]
+    )
+
+def test_forward_outcome_timeout_uses_absolute_exit_price():
+    outcome = {
+        "outcome_status": "MATCHED_FINALIZED",
+        "path_class": "TIMEOUT_240M",
+        "exit_price": 97.5,
+        "return_at_240m": 999.0,
+        "tp_before_sl": False,
+        "sl_before_tp": False,
+        "ambiguous_intrabar": False,
+    }
+
+    cf = counterfactual(evidence_row(), outcome, 98.9, 1000)
+
+    assert cf["path_class"] == "TIMEOUT"
+    assert cf["timeout_close_abs"] == pytest.approx(97.5)
+    assert cf["control"]["gross_r"] == pytest.approx(
+        (100.0 - 97.5) / (100.2 - 100.0)
+    )
+    assert cf["executable"]["gross_r"] == pytest.approx(
+        (98.9 - 97.5) / (100.2 - 98.9)
+    )
+
+@pytest.mark.parametrize("path,expected", [
+    ("TARGET_HIT", "TP_FIRST"),
+    ("STOP_HIT", "SL_FIRST"),
+    ("TIMEOUT_240M", "TIMEOUT"),
+])
+def test_forward_outcome_path_mapping(path, expected):
+    outcome = {
+        "outcome_status": "MATCHED_FINALIZED",
+        "path_class": path,
+        "exit_price": 97.5,
+        "ambiguous_intrabar": False,
+    }
+    assert derive_path_class(outcome) == expected
+
+
+def test_forward_outcome_ambiguous_stop_first():
+    outcome = {
+        "outcome_status": "MATCHED_FINALIZED",
+        "path_class": "STOP_HIT",
+        "ambiguous_intrabar": True,
+    }
+    assert derive_path_class(outcome) == "AMBIGUOUS_STOP_FIRST"
+
+
+@pytest.mark.parametrize("status,path", [
+    ("OUTCOME_UNMATURED", "TARGET_HIT"),
+    ("SOURCE_INCOMPLETE", "TARGET_HIT"),
+    ("MATCHED_FINALIZED", "UNRESOLVED"),
+])
+def test_forward_outcome_rejects_invalid_or_unfinalized(status, path):
+    outcome = {
+        "outcome_status": status,
+        "path_class": path,
+        "ambiguous_intrabar": False,
+    }
+    with pytest.raises(ValueError):
+        derive_path_class(outcome)
+
+def test_forward_aggregate_rejects_unverified_lineage():
+    row = {
+        "event_key": "evt-1",
+        "symbol": "ARIAUSDT",
+        "lineage_status": OK,
+        "forward_link_status": "QUARANTINED",
+        "forward_event_key_integrity": False,
+        "forward_phase1_linked": False,
+        "forward_outcome_status": "SOURCE_INCOMPLETE",
+        "forward_is_final": False,
+        "lookahead_flags": [],
+        "control": {"net_r": 2.0},
+        "executable": {"net_r_frozen_exit": 1.5,
+                       "net_r_worst_exit": 1.4},
+    }
+
+    result = aggregate([row], bootstrap_n=100, seed=7)
+
+    assert result["matched_conclusive_rows"] == 0
+    assert result["control_net_r"]["n"] == 0
+    assert result["executable_net_r_frozen_exit"]["n"] == 0
+
+def test_forward_aggregate_missing_lineage_is_fail_closed():
+    row = {
+        "event_key": "evt-no-forward",
+        "symbol": "ARIAUSDT",
+        "lineage_status": OK,
+        "lookahead_flags": [],
+        "control": {"net_r": 2.0},
+        "executable": {
+            "net_r_frozen_exit": 1.5,
+            "net_r_worst_exit": 1.4,
+        },
+    }
+
+    result = aggregate(
+        [row], bootstrap_n=100, seed=7, require_forward=True
+    )
+
+    assert result["matched_conclusive_rows"] == 0
+    assert result["control_net_r"]["n"] == 0
+    assert result["executable_net_r_frozen_exit"]["n"] == 0
+
+def test_run_audit_excludes_legacy_outcomes_without_forward_lineage():
+    conn = fake_conn(
+        evidence_rows=[evidence_row()],
+        observations=[observation_row()],
+        outcomes=[outcome_row()],
+    )
+
+    report = run_audit(
+        conn,
+        now=SIGNAL + timedelta(hours=5),
+        bootstrap_n=10,
+        seed=7,
+    )
+
+    assert report["aggregates"]["matched_conclusive_rows"] == 0
+    assert report["aggregates"]["control_net_r"]["n"] == 0
+    assert report["aggregates"]["executable_net_r_frozen_exit"]["n"] == 0
+
+def test_validate_forward_event_accepts_verified_finalized():
+    from app.research.me_short_a_ref_exec_alignment_audit_v1 import validate_forward_event
+
+    evidence = evidence_row()
+    source = {
+        "event_key": "evt-1", "symbol": "ARIAUSDT",
+        "direction": "SHORT", "signal_time": SIGNAL,
+        "reference_price": 100.0, "stop_price": 100.2,
+        "target_price": 95.0, "no_lookahead_flags": [],
+    }
+    lineage = {
+        **source,
+        "link_status": "LINKED",
+        "event_key_integrity": True,
+        "phase1_linked": True,
+        "source_signal_present": True,
+        "phase1_event_key": "evt-1",
+    }
+    outcome = {
+        **source,
+        "outcome_status": "MATCHED_FINALIZED",
+        "is_final": True,
+        "coverage_complete": True,
+        "asof_ok": True,
+        "horizon_end_time": SIGNAL + timedelta(minutes=240),
+        "finalization_candle_close_time": SIGNAL + timedelta(minutes=240),
+        "finalized_at": SIGNAL + timedelta(minutes=241),
+        "path_class": "TARGET_HIT",
+        "exit_price": 95.0,
+        "source_quality_flags": [],
+    }
+
+    result = validate_forward_event(
+        evidence, source, lineage, outcome, SIGNAL + timedelta(hours=5)
+    )
+    assert result["eligible"] is True
+    assert result["reasons"] == []
+
+
+def test_validate_forward_event_rejects_incomplete_outcome():
+    from app.research.me_short_a_ref_exec_alignment_audit_v1 import validate_forward_event
+
+    result = validate_forward_event(
+        evidence_row(), None, None,
+        {"event_key": "evt-1", "outcome_status": "SOURCE_INCOMPLETE",
+         "is_final": False, "coverage_complete": False, "asof_ok": False},
+        SIGNAL + timedelta(hours=5),
+    )
+
+    assert result["eligible"] is False
+    assert "SOURCE_SIGNAL_MISSING" in result["reasons"]
+    assert "FORWARD_LINEAGE_MISSING" in result["reasons"]
+    assert "OUTCOME_NOT_FINALIZED" in result["reasons"]
+
+def test_run_audit_uses_forward_outcome_without_legacy_observation():
+    evidence = evidence_row(source_observation_ids=None)
+    source = {
+        "event_key": "evt-1", "symbol": "ARIAUSDT",
+        "direction": "SHORT", "signal_time": SIGNAL,
+        "reference_price": 100.0, "stop_price": 100.2,
+        "target_price": 95.0, "no_lookahead_flags": [],
+    }
+    lineage = {
+        **source,
+        "link_status": "LINKED",
+        "event_key_integrity": True,
+        "phase1_linked": True,
+        "source_signal_present": True,
+        "phase1_event_key": "evt-1",
+    }
+    outcome = {
+        **source,
+        "outcome_status": "MATCHED_FINALIZED",
+        "is_final": True,
+        "coverage_complete": True,
+        "asof_ok": True,
+        "horizon_end_time": SIGNAL + timedelta(minutes=240),
+        "finalization_candle_close_time": SIGNAL + timedelta(minutes=240),
+        "finalized_at": SIGNAL + timedelta(minutes=241),
+        "path_class": "TARGET_HIT",
+        "exit_price": 95.0,
+        "source_quality_flags": [],
+        "mae_240m": 0.0,
+    }
+
+    conn = fake_conn(
+        evidence_rows=[evidence],
+        forward_sources=[source],
+        forward_lineage=[lineage],
+        forward_outcomes=[outcome],
+    )
+    report = run_audit(
+        conn, now=SIGNAL + timedelta(hours=5),
+        bootstrap_n=10, seed=7,
+    )
+
+    assert report["sources"]["forward_eligible"] == 1
+    assert report["rows"][0]["forward_eligibility"]["eligible"] is True
+    assert report["rows"][0]["lineage_status"] == OK
+    assert report["rows"][0]["legacy_lineage_status"] == MISSING_LINEAGE_OBSERVATION
+    assert "source_observation_ids[0] -> prospective_observation" in (
+        report["rows"][0]["legacy_missing_fields"]
+    )
+    assert report["aggregates"]["matched_conclusive_rows"] == 1
+    assert report["rows"][0]["scenarios"][0]["counterfactual"]["executable"]["gross_r"] == pytest.approx(3.0)
+
+def test_forward_success_preserves_legacy_missing_observation_diagnostic():
+    evidence = evidence_row(source_observation_ids=None)
+    legacy = build_row_lineage(
+        evidence, {}, {}, SIGNAL + timedelta(hours=5)
+    )
+
+    assert legacy["lineage_status"] == MISSING_LINEAGE_OBSERVATION
+    assert "source_observation_ids[0] -> prospective_observation" in legacy["missing_fields"]
+def test_shared_forward_eligibility_is_fail_closed():
+    from app.research.me_short_a_ref_exec_alignment_audit_v1 import eligible_for_decision
+
+    valid = {
+        "lineage_status": OK,
+        "lookahead_flags": [],
+        "forward_validated": True,
+        "forward_link_status": "LINKED",
+        "forward_event_key_integrity": True,
+        "forward_phase1_linked": True,
+        "forward_outcome_status": "MATCHED_FINALIZED",
+        "forward_is_final": True,
+    }
+
+    assert eligible_for_decision(valid, require_forward=True)
+
+    for field in (
+        "forward_validated",
+        "forward_link_status",
+        "forward_event_key_integrity",
+        "forward_phase1_linked",
+        "forward_outcome_status",
+        "forward_is_final",
+    ):
+        invalid = dict(valid)
+        invalid.pop(field)
+        assert not eligible_for_decision(invalid, require_forward=True), field
+
+    invalid = dict(valid, lookahead_flags=["capture_before_signal"])
+    assert not eligible_for_decision(invalid, require_forward=True)
+
+    invalid = dict(valid, lineage_status=MISSING_LINEAGE_OBSERVATION)
+    assert not eligible_for_decision(invalid, require_forward=True)
+def test_shared_forward_eligibility_is_fail_closed():
+    from app.research.me_short_a_ref_exec_alignment_audit_v1 import eligible_for_decision
+
+    valid = {
+        "lineage_status": OK,
+        "lookahead_flags": [],
+        "forward_validated": True,
+        "forward_link_status": "LINKED",
+        "forward_event_key_integrity": True,
+        "forward_phase1_linked": True,
+        "forward_outcome_status": "MATCHED_FINALIZED",
+        "forward_is_final": True,
+    }
+
+    assert eligible_for_decision(valid, require_forward=True)
+
+    for field in (
+        "forward_validated",
+        "forward_link_status",
+        "forward_event_key_integrity",
+        "forward_phase1_linked",
+        "forward_outcome_status",
+        "forward_is_final",
+    ):
+        invalid = dict(valid)
+        invalid.pop(field)
+        assert not eligible_for_decision(invalid, require_forward=True), field
+
+    invalid = dict(valid, lookahead_flags=["capture_before_signal"])
+    assert not eligible_for_decision(invalid, require_forward=True)
+
+    invalid = dict(valid, lineage_status=MISSING_LINEAGE_OBSERVATION)
+    assert not eligible_for_decision(invalid, require_forward=True)
+
+def test_forward_validator_rejects_source_quality_and_missing_fields():
+    from app.research.me_short_a_ref_exec_alignment_audit_v1 import validate_forward_event
+
+    evidence = evidence_row()
+    source = {
+        "event_key": evidence["event_key"],
+        "symbol": evidence["symbol"],
+        "direction": "SHORT",
+        "signal_time": evidence["signal_time"],
+        "reference_price": evidence["reference_price"],
+        "stop_price": evidence["stop_price"],
+        "target_price": evidence["target_price"],
+        "source_quality_flags": ["INVALID_SOURCE"],
+        "missing_fields": ["trigger_5m_close"],
+        "no_lookahead_flags": [],
+    }
+    lineage = {
+        **source,
+        "link_status": "LINKED",
+        "event_key_integrity": True,
+        "phase1_linked": True,
+        "source_signal_present": True,
+        "phase1_event_key": evidence["event_key"],
+    }
+    outcome = {
+        **source,
+        "outcome_status": "MATCHED_FINALIZED",
+        "is_final": True,
+        "coverage_complete": True,
+        "asof_ok": True,
+        "horizon_end_time": SIGNAL + timedelta(minutes=240),
+        "finalization_candle_close_time": SIGNAL + timedelta(minutes=240),
+        "finalized_at": SIGNAL + timedelta(minutes=241),
+        "path_class": "TARGET_HIT",
+        "exit_price": 95.0,
+        "source_quality_flags": [],
+        "missing_fields": [],
+    }
+
+    result = validate_forward_event(
+        evidence, source, lineage, outcome, SIGNAL + timedelta(hours=5)
+    )
+
+    assert result["eligible"] is False
+    assert "SOURCE_QUALITY_FLAGS" in result["reasons"]
+    assert "SOURCE_MISSING_FIELDS" in result["reasons"]
+
+def test_forward_validator_rejects_invalid_finalization_timing():
+    from app.research.me_short_a_ref_exec_alignment_audit_v1 import validate_forward_event
+
+    evidence = evidence_row()
+    source = {
+        "event_key": evidence["event_key"],
+        "symbol": evidence["symbol"],
+        "direction": "SHORT",
+        "signal_time": evidence["signal_time"],
+        "reference_price": evidence["reference_price"],
+        "stop_price": evidence["stop_price"],
+        "target_price": evidence["target_price"],
+        "no_lookahead_flags": [],
+        "source_quality_flags": [],
+        "missing_fields": [],
+    }
+    lineage = {
+        **source,
+        "link_status": "LINKED",
+        "event_key_integrity": True,
+        "phase1_linked": True,
+        "source_signal_present": True,
+        "phase1_event_key": evidence["event_key"],
+    }
+    outcome = {
+        **source,
+        "outcome_status": "MATCHED_FINALIZED",
+        "is_final": True,
+        "coverage_complete": True,
+        "asof_ok": True,
+        "horizon_end_time": SIGNAL + timedelta(minutes=240),
+        "finalization_candle_close_time": SIGNAL + timedelta(minutes=240),
+        "finalized_at": SIGNAL + timedelta(minutes=241),
+        "path_class": "TARGET_HIT",
+        "exit_price": 95.0,
+        "source_quality_flags": [],
+        "missing_fields": [],
+    }
+
+    assert validate_forward_event(
+        evidence, source, lineage, outcome, SIGNAL + timedelta(hours=5)
+    )["eligible"] is True
+
+    premature = dict(outcome, finalized_at=SIGNAL + timedelta(minutes=239))
+    assert validate_forward_event(
+        evidence, source, lineage, premature, SIGNAL + timedelta(hours=5)
+    )["eligible"] is False
+
+    wrong_horizon = dict(outcome, horizon_end_time=SIGNAL + timedelta(minutes=230))
+    assert validate_forward_event(
+        evidence, source, lineage, wrong_horizon, SIGNAL + timedelta(hours=5)
+    )["eligible"] is False
