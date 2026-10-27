@@ -780,8 +780,11 @@ class DbSourceIntakeCandidateSource(CandidateSource):
     def lower_bound(self) -> datetime | None:
         """Immutable activation floor of this mechanism, or ``None``.
 
-        Sibling sources can adopt this floor so the whole intake observes the
-        same forward-only cohort boundary. Read failures return ``None``
+        This floor applies ONLY inside this source's own reads
+        (``max(freeze_ts, intake_freeze_ts)``).  Sibling transports keep
+        their own bounds — in particular ``dds.scanner_setup`` keeps the
+        ORIGINAL Issue #208 ``freeze_ts`` — and the composite never raises
+        a common boundary from this value.  Read failures return ``None``
         (soft): this source still fail-closes its own reads.
         """
         try:
@@ -1032,10 +1035,19 @@ class CompositeCandidateSource(CandidateSource):
     * every fetch re-visits every sub-source from its own cursor, so new rows
       in any sub-source are always observed and a drained sub-source never
       blocks the others;
-    * the immutable freeze bound is raised to the highest activation floor
-      requested by any sub-source (see
-      :meth:`DbSourceIntakeCandidateSource.lower_bound`), so all transports
-      observe the same forward-only cohort boundary.
+    * every sub-source keeps ITS OWN immutable cohort bound and the
+      ``freeze_ts`` handed to it is passed through VERBATIM: the
+      ``dds.scanner_setup`` transport reads strictly after the ORIGINAL Issue
+      #208 ``freeze_ts`` (its frozen cohort is never shrunk), while the
+      research intake reads strictly after ``max(freeze_ts,
+      intake_freeze_ts)`` (its own activation floor — backfill is
+      impossible).  The composite never raises a common boundary: a raised
+      bound would silently exclude legitimate post-#208-freeze ``dds`` rows
+      and change the frozen cohort;
+    * each fetch gives every sub-source a guaranteed minimum share of the
+      page BEFORE any leftover capacity is distributed, so a constant full
+      stream in one transport (e.g. a busy ``dds.scanner_setup``) can never
+      starve another (e.g. new research intake rows).
     """
 
     def __init__(self, sources: Sequence[CandidateSource]) -> None:
@@ -1056,23 +1068,6 @@ class CompositeCandidateSource(CandidateSource):
             out.extend(getattr(source, "read_tables", ()))
         return tuple(out)
 
-    def lower_bound(self) -> datetime | None:
-        best: datetime | None = None
-        for source in self._sources:
-            getter = getattr(source, "lower_bound", None)
-            if getter is None:
-                continue
-            try:
-                value = getter()
-            except Exception:  # noqa: BLE001 - sub-sources fail-close their own reads
-                log.warning(
-                    "ME SHORT A composite lower_bound probe failed",
-                    exc_info=True)
-                continue
-            if value is not None and (best is None or value > best):
-                best = value
-        return best
-
     def fetch_page(
         self,
         cursor: tuple[datetime, Any] | None,
@@ -1090,27 +1085,38 @@ class CompositeCandidateSource(CandidateSource):
 
         state = self._decode_cursor(cursor)
 
-        effective_freeze = freeze_ts
-        floor = self.lower_bound()
-        if floor is not None and floor > effective_freeze:
-            effective_freeze = floor
-
+        # ``freeze_ts`` (the ORIGINAL Issue #208 freeze) is passed through
+        # VERBATIM to every sub-source; each sub-source applies its own
+        # cohort bound on top of it.  The composite deliberately computes NO
+        # common boundary: raising it would shrink the frozen ``dds`` cohort.
         candidates: list[Candidate] = []
         rejected: list[str] = []
         rows_read = 0
-        for index, source in enumerate(self._sources):
-            if len(candidates) >= limit:
-                break
-            page = source.fetch_page(
-                state[index],
-                freeze_ts=effective_freeze,
-                page_size=limit - len(candidates),
-            )
-            rows_read += page.rows_read
-            rejected.extend(page.rejected)
-            candidates.extend(page.candidates)
-            if page.rows_read > 0:
-                state[index] = page.next_cursor
+
+        # Fair share: every sub-source is guaranteed a minimum share of each
+        # page BEFORE leftover capacity is distributed, so a constant full
+        # stream in one transport can never starve another.  The two rounds
+        # are deterministic (no hidden rotation state), so re-reading a page
+        # from the same cursor returns the same composition.
+        min_share = max(1, limit // len(self._sources))
+        for round_index in (0, 1):
+            for index, source in enumerate(self._sources):
+                want = (
+                    min_share if round_index == 0
+                    else limit - len(candidates)
+                )
+                if want <= 0:
+                    break
+                page = source.fetch_page(
+                    state[index],
+                    freeze_ts=freeze_ts,
+                    page_size=want,
+                )
+                rows_read += page.rows_read
+                rejected.extend(page.rejected)
+                candidates.extend(page.candidates)
+                if page.rows_read > 0:
+                    state[index] = page.next_cursor
 
         # One event can arrive through several transports. Collapse the
         # duplicates within THIS fetch by the deterministic identity; the

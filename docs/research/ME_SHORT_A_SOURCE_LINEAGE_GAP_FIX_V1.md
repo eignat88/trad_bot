@@ -151,6 +151,18 @@ Three independent layers:
    `max(#208 freeze_ts, intake_freeze_ts)` as the keyset lower bound and is
    fail-closed until the activation row is `RUNNING`.
 
+Per-source cohort bounds (review P1) — the composite candidate source NEVER
+raises a common boundary:
+
+* `dds.scanner_setup` keeps the **original** Issue #208 `freeze_ts`
+  verbatim: the frozen #208 cohort is never shrunk and its old acceptable
+  range stays exactly what it was before the intake existed;
+* the research intake binds `max(#208 freeze_ts, intake_freeze_ts)` inside
+  its own query;
+* `CompositeCandidateSource` passes the runtime's `freeze_ts` through to
+  every sub-source untouched, so each transport observes exactly its own
+  cohort and intake backfill is impossible by construction.
+
 The original #208 `freeze_ts` is intentionally NOT modified — modifying it
 would retroactively change the frozen #208 cohort.
 
@@ -165,6 +177,13 @@ would retroactively change the frozen #208 cohort.
   composite page containing it was handled in full. Cross-transport duplicates
   are collapsed by the deterministic `event_key` and, across fetches, by
   `ON CONFLICT DO NOTHING`.
+* Fair share (review P1): every composite fetch gives each sub-source a
+  guaranteed minimum share of the page BEFORE leftover capacity is
+  distributed, so a constant full `dds.scanner_setup` stream can never
+  starve new research intake rows — a fresh intake row is observed in the
+  first page, not after the whole dds backlog is drained. The two-round fill
+  is deterministic, so re-reading a stalled page returns the same
+  composition.
 * Research capture errors never affect the scanner: the hook fails open
   (`capture_with_status` returns `ERROR`; the hook rolls back research state
   only), and persistence errors get their own diagnostics —
@@ -205,8 +224,10 @@ The `setups_saved` funnel metric is now computed **after** the regime filter
   writer (`capture` / `capture_with_status`), frozen-identity `compute_event_key`.
 * `app/research/me_short_a_forward_outcome_runtime_sources_v1.py` — shared
   `reconstruct_recent_high_window`; NEW `DbSourceIntakeCandidateSource`
-  (READ ONLY, keyset `(signal_time, event_key)`, fail-soft reads) and
-  `CompositeCandidateSource`.
+  (READ ONLY, keyset `(signal_time, event_key)`, fail-soft reads, own bound
+  `max(freeze_ts, intake_freeze_ts)`) and `CompositeCandidateSource`
+  (per-source cohort bounds passed through verbatim, fair-share
+  anti-starvation pagination, cross-transport `event_key` dedup).
 * `app/research/me_short_a_forward_outcome_runtime_v1.py` — `Candidate`
   accepts full-precision `signal_time` (was: whole seconds only — latent
   gap 1.3); idempotency token is the deterministic `event_key`; typing
@@ -228,22 +249,137 @@ The `setups_saved` funnel metric is now computed **after** the regime filter
   `tests/test_me_short_a_source_intake_migration_080_v1.py`,
   `tests/test_me_short_a_source_lineage_gap_fix_v1.py`.
 
-## 9. Activation runbook note (SEPARATE approved step)
+## 9. Deployment runbook (SEPARATE approved step — nothing here is executed by this PR)
 
-1. Apply migration 080 and the grants file (they are source-controlled only).
-2. Freeze the boundary AFTER deployment, in one explicit transaction:
-   `UPDATE research.me_short_a_source_intake_activation_v1
-    SET status = 'RUNNING', intake_freeze_ts = NOW()
+Scope note: this PR ships source-controlled SQL and code only. Every step
+below is a VPS operation that runs **only after PR merge and an explicit
+deployment approval**. No migration is applied and no service is restarted
+by the development task itself.
+
+### 9.1 Preconditions
+
+* PR merged into `main`; VPS repo state clean (`git status -sb` empty) at
+  `cd /opt/trad_bot`, then `git fetch origin`, `git switch main`,
+  `git pull --ff-only origin main`.
+* A maintenance window where a scanner restart is acceptable.
+
+### 9.2 Apply the migration and grants (REQUIRED before activation)
+
+```bash
+sudo -u postgres psql -d trad_bot -v ON_ERROR_STOP=1 -1 \
+  -f sql/migrations/080_me_short_a_source_intake_v1.sql
+sudo -u postgres psql -d trad_bot -v ON_ERROR_STOP=1 -1 \
+  -f sql/grants/me_short_a_source_intake_least_privilege_v1.sql
+```
+
+Verify (read-only) that the activation row exists, is
+`READY_TO_START`, and its `intake_freeze_ts` is still `NULL`:
+
+```bash
+sudo -u postgres psql -d trad_bot -P pager=off -c \
+  "SELECT experiment_id, status, intake_freeze_ts
+     FROM research.me_short_a_source_intake_activation_v1
+    WHERE experiment_id = 'ME_SHORT_A_PROSPECTIVE_SOURCE_INTAKE_V1';"
+```
+
+Expected: exactly one row, `READY_TO_START`, `intake_freeze_ts = NULL`.
+If the tables already exist, stop — do not re-run the migration; check for
+code drift first (§30 of the development skill).
+
+### 9.3 Activate the intake (sets the immutable cohort boundary)
+
+In ONE explicit transaction, AFTER the new scanner code is deployed:
+
+```sql
+BEGIN;
+UPDATE research.me_short_a_source_intake_activation_v1
+   SET status = 'RUNNING', intake_freeze_ts = NOW()
+ WHERE experiment_id = 'ME_SHORT_A_PROSPECTIVE_SOURCE_INTAKE_V1'
+   AND status = 'READY_TO_START';
+COMMIT;
+```
+
+The guard trigger enforces `READY_TO_START -> RUNNING` and the set-once
+freeze. Re-run the §9.2 SELECT: now `RUNNING` with
+`intake_freeze_ts = NOW()`. This timestamp is the activation boundary: the
+writer refuses `signal_time <= intake_freeze_ts` (`PRE_FREEZE`) and the
+reader binds `max(#208 freeze_ts, intake_freeze_ts)` — backfill, including
+the TSLAUSDT incident event, is impossible by construction.
+
+### 9.4 Scanner feature flag
+
+Set `ME_SHORT_A_SOURCE_INTAKE_ENABLED=1` in the **scanner** process
+environment (`.env` / service environment, per project configuration) and
+verify it is visible to the scanner process. The writer is fail-closed:
+without the flag and a `RUNNING` activation row nothing is captured (and
+`DISABLED` / `NOT_ACTIVE` / `PRE_FREEZE` are logged, never silent).
+
+### 9.5 Controlled restarts (only the two affected services)
+
+```bash
+sudo systemctl restart trad-bot-scanner
+sudo systemctl restart trad-bot-me-short-a-forward-outcome
+```
+
+Both restarts are part of the approved maintenance window. Do NOT restart
+`trad-bot-paper` or any live service — this change touches no paper/live
+code.
+
+### 9.6 Post-restart health
+
+```bash
+systemctl is-active trad-bot-scanner trad-bot-me-short-a-forward-outcome
+journalctl -u trad-bot-scanner -n 50 --no-pager -l
+journalctl -u trad-bot-me-short-a-forward-outcome -n 50 --no-pager -l
+```
+
+Expect: both `active`; new scan cycles appear; no `ERROR`/`Traceback`;
+the runtime heartbeat shows growing `candidates_seen`; no
+`ME_SHORT_A_SOURCE_INTAKE_ERROR` rows in `dds.scanner_error`.
+
+### 9.7 Read-only E2E verification (closes the loop; READ-ONLY only)
+
+Run `sql/research/me_short_a_source_intake_diagnostics_v1.sql` with a
+read-only role and verify:
+
+* Q1: `RUNNING`, `intake_freeze_ts` set;
+* Q2: intake rows appear with `capture_route` evidence —
+  `REGIME_FILTER_REJECTED` is the incident class;
+* Q3: `source_events_saved` and `excluded_by_regime_but_captured` are
+  non-zero once a regime-rejected ME SHORT has been seen;
+* Q4/Q8: the SAME `event_key` joins intake → Phase 1 → lineage → outcome;
+* Q5: empty (no post-activation silent loss);
+* Q6: the four statuses are honest (an immature event stays
+  `OUTCOME_UNMATURED`, never `MATCHED_FINALIZED` early);
+* Q9: the historical TSLAUSDT gap stays OUTSIDE the new cohort.
+
+The decisive check remains a NEW real prospective ME SHORT event reaching
+`MATCHED_FINALIZED` end-to-end; only then may Issue #208 be closed.
+
+### 9.8 Safe rollback (no destructive SQL, ever)
+
+1. Turn the writer off first (fail-closed): remove
+   `ME_SHORT_A_SOURCE_INTAKE_ENABLED` / set it to `0` and restart
+   `trad-bot-scanner`.
+2. Deactivate the intake (guard-permitted transition; captured rows are
+   append-only EVIDENCE and are never deleted):
+
+   ```sql
+   UPDATE research.me_short_a_source_intake_activation_v1
+      SET status = 'CANCELLED'
     WHERE experiment_id = 'ME_SHORT_A_PROSPECTIVE_SOURCE_INTAKE_V1'
-      AND status = 'READY_TO_START';`
-   (the guard trigger enforces `READY_TO_START -> RUNNING` and the set-once
-   freeze). Fix code + activation define ONE clean cohort boundary.
-3. Set `ME_SHORT_A_SOURCE_INTAKE_ENABLED=1` for the scanner process
-   (fail-closed by default: without the flag and the RUNNING row nothing is
-   captured).
-4. Restart `trad-bot-me-short-a-forward-outcome` to pick up the composite
-   candidate source (deployment step; requires the usual approval).
-5. Confirm E2E on a NEW real prospective ME SHORT event (see §10).
+      AND status = 'RUNNING';
+   ```
+
+   The reader goes idle (fail-closed) immediately; the `dds.scanner_setup`
+   transport and the whole #208 chain continue untouched.
+3. If the code itself must be rolled back: revert the merge on `main` (or
+   `git pull --ff-only` the previous `main`) and restart the two services
+   from §9.5. The migration and captured rows can stay in place — they are
+   inert append-only research tables.
+4. NEVER run `DELETE`/`TRUNCATE`/`DROP` against the intake, the four #208
+   capture tables, Phase 1, or the closed frozen OOS cohort as part of a
+   rollback.
 
 ## 10. Limitations / risks
 

@@ -710,17 +710,82 @@ def test_composite_keeps_sub_cursors_when_a_source_reads_nothing():
     assert empty.next_cursor == cursor
 
 
-def test_composite_raises_the_freeze_bound_to_the_intake_floor():
-    conn = GapConn(dds_rows=[make_dds_row()])
+def test_composite_keeps_each_sources_own_freeze_bound():
+    """The composite NEVER raises a common boundary (review P1).
+
+    The ``dds.scanner_setup`` transport keeps the ORIGINAL Issue #208
+    ``freeze_ts`` — its frozen cohort is never shrunk — while the research
+    intake applies its own activation floor ``max(freeze_ts,
+    intake_freeze_ts)`` internally.
+    """
+    conn = GapConn(dds_rows=[make_dds_row()], intake_rows=[make_intake_row()])
     sources = CompositeCandidateSource((
         DbScannerSetupCandidateSource(conn, candle_source_for()),
         DbSourceIntakeCandidateSource(conn, candle_source_for()),
     ))
-    assert sources.lower_bound() == INTAKE_FREEZE
     sources.fetch_page(None, freeze_ts=FREEZE)
     dds_params = [p for sql, p in conn.statements
                   if "DDS.SCANNER_SETUP" in sql.upper()][-1]
-    assert dds_params[2] == INTAKE_FREEZE
+    intake_params = [p for sql, p in conn.statements
+                     if ("ME_SHORT_A_SOURCE_INTAKE_V1" in sql.upper()
+                         and "ORDER BY" in sql.upper())][-1]
+    assert dds_params[2] == FREEZE          # original #208 freeze preserved
+    assert intake_params[2] == INTAKE_FREEZE  # own floor = max(FREEZE, INTAKE_FREEZE)
+
+
+def test_original_dds_cohort_range_is_preserved_behind_the_intake_floor():
+    """Rows of the ORIGINAL acceptable range (between the #208 freeze and
+    the later intake activation floor) stay readable — the old cohort is
+    byte-for-byte what it was before the intake existed."""
+    mid = INTAKE_FREEZE - timedelta(minutes=5)   # FREEZE < mid < INTAKE_FREEZE
+    conn = GapConn(
+        dds_rows=[make_dds_row(detected_at=mid, setup_id="dds-old-range")],
+        intake_rows=[make_intake_row(symbol="LATER1USDT")],
+    )
+    sources = CompositeCandidateSource((
+        DbScannerSetupCandidateSource(conn, candle_source_for()),
+        DbSourceIntakeCandidateSource(conn, candle_source_for()),
+    ))
+    page = sources.fetch_page(None, freeze_ts=FREEZE)
+    assert [c.symbol for c in page.candidates] == [SYMBOL, "LATER1USDT"]
+
+
+def test_intake_backfill_before_the_activation_floor_is_impossible():
+    """An intake row AFTER the original #208 freeze but BEFORE
+    ``intake_freeze_ts`` can never be read back (no backfill), while a dds
+    row at the very same instant — part of the original cohort — is still
+    observed."""
+    mid = INTAKE_FREEZE - timedelta(minutes=5)
+    conn = GapConn(
+        dds_rows=[make_dds_row(detected_at=mid, setup_id="dds-mid")],
+        intake_rows=[make_intake_row(signal_time=mid,
+                                     symbol="BACKFILL1USDT")],
+    )
+    sources = CompositeCandidateSource((
+        DbScannerSetupCandidateSource(conn, candle_source_for()),
+        DbSourceIntakeCandidateSource(conn, candle_source_for()),
+    ))
+    page = sources.fetch_page(None, freeze_ts=FREEZE)
+    assert [c.symbol for c in page.candidates] == [SYMBOL]  # dds only
+    assert "BACKFILL1USDT" not in [c.symbol for c in page.candidates]
+
+
+def test_intake_source_binds_the_max_of_both_freezes():
+    """The intake source binds ``max(original freeze_ts, intake_freeze_ts)``
+    inside its own query — never only ``intake_freeze_ts`` and never less
+    than the original freeze."""
+    earlier_activation = INTAKE_FREEZE - timedelta(hours=4)  # < FREEZE
+    conn = GapConn(
+        intake_rows=[make_intake_row()],
+        intake_activation=("RUNNING", earlier_activation),
+    )
+    source = DbSourceIntakeCandidateSource(conn, candle_source_for())
+    page = source.fetch_page(None, freeze_ts=FREEZE)
+    assert page.rows_read == 1                      # SIG_US > FREEZE anyway
+    params = [p for sql, p in conn.statements
+              if ("ME_SHORT_A_SOURCE_INTAKE_V1" in sql.upper()
+                  and "ORDER BY" in sql.upper())][-1]
+    assert params[2] == FREEZE                      # max(FREEZE, earlier) = FREEZE
 
 
 def test_composite_cursor_shape_is_opaque_and_stable():
@@ -735,6 +800,137 @@ def test_composite_cursor_shape_is_opaque_and_stable():
     assert len(tuple(cursor)) == 2
     with pytest.raises(ValueError):
         sources.fetch_page((cursor[0],), freeze_ts=FREEZE)
+
+
+def _drain(sources, *, freeze_ts=FREEZE, page_size, max_fetches=1000):
+    seen = []
+    cursor = None
+    for _ in range(max_fetches):
+        page = sources.fetch_page(cursor, freeze_ts=freeze_ts,
+                                  page_size=page_size)
+        seen.extend(page.candidates)
+        if page.rows_read <= 0:
+            break
+        cursor = page.next_cursor
+    return seen
+
+
+def test_new_intake_rows_are_never_starved_by_a_constant_dds_stream():
+    """Review P1: a constant full ``dds.scanner_setup`` stream must never
+    starve the research intake — a new intake row is observed in the FIRST
+    page, not after the whole dds backlog is drained."""
+    dds = [make_dds_row(setup_id=f"dds-{i}",
+                        detected_at=SIG_US + timedelta(seconds=i))
+           for i in range(200)]
+    intake = [make_intake_row(symbol="FRESH1USDT")]
+    conn = GapConn(dds_rows=dds, intake_rows=intake)
+    sources = CompositeCandidateSource((
+        DbScannerSetupCandidateSource(conn, candle_source_for()),
+        DbSourceIntakeCandidateSource(conn, candle_source_for()),
+    ))
+    page = sources.fetch_page(None, freeze_ts=FREEZE, page_size=10)
+    assert any(c.symbol == "FRESH1USDT" for c in page.candidates)  # page 1!
+    seen = _drain(sources, page_size=10)
+    assert len(seen) == 201
+    assert len({mod.event_key_for(c) for c in seen}) == 201
+
+
+def test_composite_drains_a_large_multi_transport_stream_losslessly():
+    """Large streams across both transports lose nothing and duplicate
+    nothing, no matter how small the page is."""
+    dds = [make_dds_row(setup_id=f"dds-{i}",
+                        detected_at=SIG_US + timedelta(seconds=i))
+           for i in range(120)]
+    intake = [make_intake_row(symbol=f"SYM{i:03d}USDT",
+                              signal_time=SIG_US + timedelta(milliseconds=i))
+              for i in range(120)]
+    conn = GapConn(dds_rows=dds, intake_rows=intake)
+    sources = CompositeCandidateSource((
+        DbScannerSetupCandidateSource(conn, candle_source_for()),
+        DbSourceIntakeCandidateSource(conn, candle_source_for()),
+    ))
+    seen = _drain(sources, page_size=7)
+    keys = [mod.event_key_for(c) for c in seen]
+    assert len(seen) == 240                      # 120 + 120, nothing dropped
+    assert len(set(keys)) == 240                 # nothing duplicated
+
+
+def test_identical_timestamps_are_each_returned_exactly_once():
+    """Rows sharing the very same timestamp are each returned exactly once —
+    the per-source tie-breakers keep the keyset order total across page
+    boundaries."""
+    same = SIG_US
+    dds = [make_dds_row(setup_id=f"dds-{sym}", detected_at=same, symbol=sym)
+           for sym in ("ASYM", "BSYM", "CSYM")]
+    intake = [make_intake_row(signal_time=same, symbol=f"D{i}SYM")
+              for i in range(2)]
+    conn = GapConn(dds_rows=dds, intake_rows=intake)
+    sources = CompositeCandidateSource((
+        DbScannerSetupCandidateSource(conn, candle_source_for()),
+        DbSourceIntakeCandidateSource(conn, candle_source_for()),
+    ))
+    seen = _drain(sources, page_size=2)          # tie-breaks across pages
+    keys = [mod.event_key_for(c) for c in seen]
+    assert sorted(c.symbol for c in seen) == ["ASYM", "BSYM", "CSYM",
+                                              "D0SYM", "D1SYM"]
+    assert len(set(keys)) == len(keys) == 5      # exactly once each
+
+
+def test_same_timestamp_cross_transport_twin_collapses_to_one_candidate():
+    """The very same event arriving through two transports at the same
+    timestamp is collapsed to one candidate (one fetch, deterministic)."""
+    same = SIG_US
+    dds = [make_dds_row(setup_id="dds-ASYM", detected_at=same, symbol="ASYM")]
+    intake = [make_intake_row(signal_time=same, symbol="ASYM")]
+    conn = GapConn(dds_rows=dds, intake_rows=intake)
+    sources = CompositeCandidateSource((
+        DbScannerSetupCandidateSource(conn, candle_source_for()),
+        DbSourceIntakeCandidateSource(conn, candle_source_for()),
+    ))
+    page = sources.fetch_page(None, freeze_ts=FREEZE, page_size=10)
+    assert page.rows_read == 2                   # both rows were read
+    assert [c.symbol for c in page.candidates] == ["ASYM"]  # one event
+
+
+def test_dds_read_error_retries_the_same_page_without_loss():
+    """A surfaced read error stalls the composite page; retrying from the
+    same cursor returns the same rows — nothing is lost."""
+    dds = [make_dds_row(setup_id=f"dds-{i}",
+                        detected_at=SIG_US + timedelta(seconds=i))
+           for i in range(3)]
+    conn = GapConn(dds_rows=dds)
+    sources = CompositeCandidateSource((
+        DbScannerSetupCandidateSource(conn, candle_source_for()),
+        DbSourceIntakeCandidateSource(conn, candle_source_for()),
+    ))
+    conn.fail_select = "DDS.SCANNER_SETUP"
+    with pytest.raises(mod.DatabaseAccessError):
+        sources.fetch_page(None, freeze_ts=FREEZE, page_size=2)
+    conn.fail_select = None
+    first = sources.fetch_page(None, freeze_ts=FREEZE, page_size=2)  # same cursor
+    assert len(first.candidates) == 2
+    seen = _drain(sources, page_size=2)          # full replay after the retry
+    keys = {mod.event_key_for(c) for c in seen}
+    assert len(seen) == 3 and len(keys) == 3     # lossless, no duplicates
+    assert {mod.event_key_for(c) for c in first.candidates} <= keys
+
+
+def test_intake_read_error_fails_soft_and_the_dds_stream_continues():
+    """An intake read error never stalls the dds transport, and the intake
+    rows behind it are re-read losslessly on the next fetch."""
+    dds = [make_dds_row(setup_id="dds-1")]
+    intake = [make_intake_row(symbol="FRESH1USDT")]
+    conn = GapConn(dds_rows=dds, intake_rows=intake)
+    sources = CompositeCandidateSource((
+        DbScannerSetupCandidateSource(conn, candle_source_for()),
+        DbSourceIntakeCandidateSource(conn, candle_source_for()),
+    ))
+    conn.fail_select = "ME_SHORT_A_SOURCE_INTAKE_V1"
+    page = sources.fetch_page(None, freeze_ts=FREEZE, page_size=10)
+    assert [c.symbol for c in page.candidates] == [SYMBOL]      # dds unaffected
+    conn.fail_select = None
+    after = sources.fetch_page(page.next_cursor, freeze_ts=FREEZE, page_size=10)
+    assert [c.symbol for c in after.candidates] == ["FRESH1USDT"]  # lossless
 
 
 # ── F. the full chain through the frozen runtime ────────────────────────
