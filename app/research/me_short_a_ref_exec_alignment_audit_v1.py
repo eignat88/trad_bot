@@ -845,6 +845,20 @@ def counterfactual(evidence: dict, outcome: dict, fill: Decimal | None,
     return result
 
 
+def scenario_executable_fill(scenario: dict) -> Decimal | None:
+    """Fail-closed executable fill, respecting exchange constraints."""
+    if scenario.get("status") != "OK":
+        return None
+    if scenario.get("constraints_known") is not True:
+        return None
+    if scenario.get("below_min_qty") is not False:
+        return None
+    if scenario.get("below_min_notional") is not False:
+        return None
+    fill = _dec(scenario.get("estimated_fill"))
+    return fill if fill is not None and fill > 0 else None
+
+
 def scenario_table(evidence: dict) -> list[dict[str, Any]]:
     """Per-scenario fills from Phase 1 scenario_results (no substitution)."""
     results = evidence.get("scenario_results") or {}
@@ -884,19 +898,25 @@ def aggregate(rows: Sequence[dict], *, bootstrap_n: int, seed: int,
         if eligible_for_decision(r, require_forward=require_forward)
     ]
     matched_n = len(conclusive)
-    symbols = {r["symbol"] for r in conclusive}
+    paired = [
+        r for r in conclusive
+        if (r.get("control") or {}).get("net_r") is not None
+        and (r.get("executable") or {}).get("net_r_frozen_exit") is not None
+    ]
+    paired_n = len(paired)
+    symbols = {r["symbol"] for r in paired}
     clusters = {symbol_cluster(s) for s in symbols}
 
     def series(view: str, key: str) -> list[float | None]:
         out = []
-        for row in conclusive:
+        for row in paired:
             cell = row.get(view) or {}
             out.append(cell.get(key))
         return out
 
     def summarize(net_values: list[float | None]) -> dict[str, Any]:
         values = [v for v in net_values if v is not None]
-        if matched_n < ESTIMATE_MIN_N:
+        if len(values) < ESTIMATE_MIN_N:
             return {"n": len(values), "insufficient_sample": True,
                     "point_estimate": None, "net_pf": None,
                     "bootstrap": None}
@@ -912,6 +932,7 @@ def aggregate(rows: Sequence[dict], *, bootstrap_n: int, seed: int,
 
     return {
         "matched_conclusive_rows": matched_n,
+        "usable_paired_rows": paired_n,
         "symbols": len(symbols),
         "independent_symbol_clusters": len(clusters),
         "clusters": sorted(clusters),
@@ -985,9 +1006,9 @@ def alignment_verdict(rows: Sequence[dict], agg: dict[str, Any]) -> dict[str, An
     estimates; anything less is INCONCLUSIVE with explicit reasons.
     """
     reasons: list[str] = []
-    conclusive_n = agg["matched_conclusive_rows"]
+    conclusive_n = agg.get("usable_paired_rows", 0)
     if conclusive_n < MINIMUM_N:
-        reasons.append(f"matched_conclusive_rows={conclusive_n} < minimum_n={MINIMUM_N}")
+        reasons.append(f"usable_paired_rows={conclusive_n} < minimum_n={MINIMUM_N}")
     if agg["symbols"] < MINIMUM_SYMBOLS:
         reasons.append(f"symbols={agg['symbols']} < minimum_symbols={MINIMUM_SYMBOLS}")
     if conclusive_n < ESTIMATE_MIN_N:
@@ -1012,7 +1033,7 @@ def alignment_verdict(rows: Sequence[dict], agg: dict[str, Any]) -> dict[str, An
     # Material misalignment: frozen-entry economics look profitable while the
     # executable-entry economics are not (CI upper bound below zero).
     exec_ci_high = (executable.get("bootstrap") or {}).get("ci_95_high")
-    if control_er > 0 and exec_ci_high is not None and exec_ci_high < 0:
+    if not reasons and control_er > 0 and exec_ci_high is not None and exec_ci_high < 0:
         return {"verdict": ALIGNMENT_INVALID,
                 "reasons": ["control Net E[R] > 0 but executable-entry Net E[R] "
                             "CI entirely below zero"]}
@@ -1221,7 +1242,9 @@ def run_audit(conn, *, now: datetime | None = None,
                 notional = _dec(scenario.get("notional_usdt")) or Decimal("0")
                 cell = {
                     "cost_terms": cost_terms(evidence, fill),
-                    "counterfactual": counterfactual(evidence, outcome, fill, notional),
+                    "counterfactual": counterfactual(
+                        evidence, outcome, scenario_executable_fill(scenario), notional
+                    ),
                     "scenario_status": scenario.get("status"),
                     "entry_availability": AVAILABILITY.get(
                         scenario.get("status"), "UNKNOWN"),

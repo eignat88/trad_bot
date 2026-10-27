@@ -8,6 +8,7 @@ coverage gating, symbol clustering, lookahead/timestamp checks, verdict
 transitions and the read-only contract.
 """
 from __future__ import annotations
+from pathlib import Path
 
 import json
 import math
@@ -604,7 +605,7 @@ def test_write_reports_emits_all_deliverables(tmp_path):
                        "status": "RUNNING", "freeze_ts": SIGNAL}])
     report = run_audit(conn, now=SIGNAL + timedelta(hours=5), bootstrap_n=20, seed=3)
     written = write_reports(report, str(tmp_path))
-    names = sorted(p.split("\\")[-1] for p in written)
+    names = sorted(Path(p).name for p in written)
     assert names == [
         "EXECUTABLE_ENTRY_COUNTERFACTUAL.md",
         "REFERENCE_PRICE_LINEAGE.md",
@@ -1037,3 +1038,82 @@ def test_forward_validator_rejects_invalid_finalization_timing():
     assert validate_forward_event(
         evidence, source, lineage, wrong_horizon, SIGNAL + timedelta(hours=5)
     )["eligible"] is False
+
+def test_alignment_requires_usable_paired_executable_sample():
+    rows = [
+        _base_view(f"S{i:03d}USDT", 2.0, 1.5)
+        for i in range(200)
+    ]
+    for row in rows[1:]:
+        row["executable"]["net_r_frozen_exit"] = None
+        row["executable"]["net_r_worst_exit"] = None
+
+    agg = aggregate(rows, bootstrap_n=50, seed=7)
+    verdict = alignment_verdict(rows, agg)
+
+    assert agg["matched_conclusive_rows"] == 200
+    assert agg["executable_net_r_frozen_exit"]["n"] == 1
+    assert agg["executable_net_r_frozen_exit"]["insufficient_sample"] is True
+    assert agg["executable_net_r_frozen_exit"]["point_estimate"] is None
+    assert agg["executable_net_r_frozen_exit"]["bootstrap"] is None
+    assert verdict["verdict"] == ALIGNMENT_INCONCLUSIVE
+
+
+def test_alignment_invalid_requires_frozen_cohort_thresholds():
+    rows = [
+        _base_view("BTCUSDT", 2.0, -3.0)
+        for _ in range(30)
+    ]
+
+    agg = aggregate(rows, bootstrap_n=50, seed=7)
+    verdict = alignment_verdict(rows, agg)
+
+    assert verdict["verdict"] == ALIGNMENT_INCONCLUSIVE
+    assert any(
+        "minimum_n=200" in reason
+        for reason in verdict["reasons"]
+    )
+    assert any(
+        "minimum_symbols=20" in reason
+        for reason in verdict["reasons"]
+    )
+
+def test_executable_fill_requires_verified_exchange_feasibility():
+    from decimal import Decimal
+    from app.research.me_short_a_ref_exec_alignment_audit_v1 import scenario_executable_fill
+
+    cases = [
+        (
+            {
+                "status": "BELOW_EXCHANGE_MIN",
+                "estimated_fill": "98.9",
+                "constraints_known": True,
+                "below_min_qty": True,
+                "below_min_notional": False,
+            },
+            None,
+        ),
+        (
+            {
+                "status": "OK",
+                "estimated_fill": "98.9",
+                "constraints_known": False,
+                "below_min_qty": False,
+                "below_min_notional": False,
+            },
+            None,
+        ),
+        (
+            {
+                "status": "OK",
+                "estimated_fill": "98.9",
+                "constraints_known": True,
+                "below_min_qty": False,
+                "below_min_notional": False,
+            },
+            Decimal("98.9"),
+        ),
+    ]
+
+    for scenario, expected in cases:
+        assert scenario_executable_fill(scenario) == expected
