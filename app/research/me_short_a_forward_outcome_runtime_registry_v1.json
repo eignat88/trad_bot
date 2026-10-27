@@ -1,0 +1,89 @@
+{
+  "experiment": "ME_SHORT_A_FORWARD_OUTCOME_RUNTIME_INTEGRATION_V1",
+  "protocol_version": "ME_SHORT_A_FORWARD_OUTCOME_RUNTIME_INTEGRATION_V1",
+  "runtime_protocol_hash": "5abb0b88a33ffe5aaa40df9d4ecd0d80696004102f685cf8218f697cddca4579",
+  "kind": "FORWARD_OUTCOME_RUNTIME_INTEGRATION",
+  "mode": "OBSERVE_ONLY_NO_ORDERS",
+  "issue": 208,
+  "status": "IMPLEMENTED_NOT_DEPLOYED_NOT_ACTIVATED",
+  "collector_protocol_version": "ME_SHORT_A_FORWARD_ONLY_OUTCOME_AND_LINEAGE_CAPTURE_V1",
+  "collector_registry": "app/research/me_short_a_forward_outcome_lineage_registry_v1.json",
+  "event_key_contract": "sha256(symbol|SHORT|<utc isoformat signal_time>|<str(Decimal(str(reference_price)))>|<str(Decimal(str(invalidation_price)))>|<str(Decimal(str(target_1)))>)",
+  "event_key_shared_with_phase1": true,
+  "phase1_identity_source": "research.me_short_a_fill_feasibility_v1.capture()",
+  "direction": "SHORT",
+  "scanner": "MOMENTUM_EXHAUSTION",
+  "max_hold_minutes": 240,
+  "candle_granularity_minutes": 5,
+  "intrabar_policy": "STOP_FIRST",
+  "closed_5m_candles_only": true,
+  "closed_candle_rule": "candle_close_time <= observed_at",
+  "candle_provenance_required": true,
+  "forwards_only_after_freeze_ts": true,
+  "lookahead_free": true,
+  "no_backfill": true,
+  "append_only": true,
+  "order_pathway": null,
+  "order_pathway_forbidden": true,
+  "paper_surface": null,
+  "live_surface": null,
+  "scanner_gate_surface": null,
+  "collector_role": "trad_bot_me_short_a_collector",
+  "runtime_role": "trad_bot_me_short_a_runtime",
+  "audit_role": "trad_bot_me_short_a_audit",
+  "runtime_audit_role": "trad_bot_me_short_a_runtime_audit",
+  "read_only_toward": [
+    "research.me_short_a_fill_feasibility_v1",
+    "research.prospective_observation",
+    "research.prospective_outcome"
+  ],
+  "forbidden_actions": [
+    "deploy",
+    "sql writes on the VPS outside the collector role",
+    "service restart outside the approved runbook",
+    "paper activation",
+    "live activation",
+    "scanner gate change",
+    "direction gate change",
+    "historical backfill",
+    "retro-fitting source_observation_ids on pre-freeze rows",
+    "mutation of research.me_short_a_fill_feasibility_v1",
+    "mutation of the closed frozen OOS cohort"
+  ],
+  "runtime": {
+    "heartbeat_interval_seconds": 60,
+    "diagnostics_retention_rows": 2000,
+    "idle_sleep_seconds": 5.0,
+    "max_events_per_cycle": 500,
+    "feature_flag": "ME_SHORT_A_LINEAGE_CAPTURE_ENABLED",
+    "systemd_unit": "trad-bot-me-short-a-forward-outcome.service",
+    "runner_module": "app.research.me_short_a_forward_outcome_runtime_v1",
+    "runner_entrypoint": "app/research/me_short_a_forward_outcome_runtime_runner_v1",
+    "idempotency": "INSERT ... ON CONFLICT DO NOTHING on append-only tables; in-memory seen-set is advisory only",
+    "concurrency_safety": "idempotent append-only writes; no lease required"
+  },
+  "lifecycle": {
+    "activation_states": ["READY_TO_START", "RUNNING", "COMPLETED", "CANCELLED"],
+    "runner_states": ["IDLE", "RUNNING", "STOPPING", "STOPPED", "FAILED"],
+    "activation_source": "research.me_short_a_lineage_activation_v1",
+    "activation_is_read_by_the_runtime": true,
+    "activation_is_written_by_the_runtime": false
+  },
+  "output_statuses": [
+    "MISSING_LINEAGE",
+    "OUTCOME_UNMATURED",
+    "SOURCE_INCOMPLETE",
+    "MATCHED_FINALIZED"
+  ],
+  "accumulation_gate": {
+    "minimum_n": 200,
+    "minimum_symbols": 20,
+    "kind": "MINIMUM_ELIGIBILITY_NOT_AN_AUTOMATIC_PASS",
+    "notionals": [100, 500, 1000]
+  },
+  "deployment": {
+    "runbook": "docs/research/ME_SHORT_A_FORWARD_OUTCOME_RUNTIME_INTEGRATION_V1.md",
+    "requires_separate_explicit_approval": true,
+    "performed_in_this_change": false
+  }
+}
