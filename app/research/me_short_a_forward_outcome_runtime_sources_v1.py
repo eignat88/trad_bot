@@ -32,6 +32,7 @@ from app.research.me_short_a_forward_outcome_runtime_v1 import (
     CandidateSource,
     DatabaseAccessError,
     canonical_price,
+    event_key_for,
     utcnow,
 )
 
@@ -50,8 +51,11 @@ __all__ = [
     "ms_to_datetime",
     "datetime_to_ms",
     "to_runtime_candle",
+    "reconstruct_recent_high_window",
     "BybitClosedCandleSource",
     "DbScannerSetupCandidateSource",
+    "DbSourceIntakeCandidateSource",
+    "CompositeCandidateSource",
 ]
 
 log = logging.getLogger(__name__)
@@ -260,6 +264,73 @@ def to_runtime_candle(
     except (ValueError, ArithmeticError):
         log.warning("ME SHORT A runtime rejected malformed candle %s", symbol)
         return None
+
+
+def reconstruct_recent_high_window(
+    candle_source: Any,
+    symbol: str,
+    signal_time: datetime,
+    signal_candle_open_time: Any,
+    reference_price: Decimal | None,
+    missing: list[str],
+    flags: list[str],
+) -> tuple[list[Candle], Decimal | None]:
+    """The five CLOSED 5m candles behind the frozen A ``reference_price``.
+
+    Shared by every candidate source (``dds.scanner_setup`` and the research
+    source intake): the window is only accepted when it is closed before
+    ``signal_time`` AND reproduces ``reference_price``; otherwise nothing is
+    attached and the gap is named explicitly instead of being imputed.
+
+    ``signal_candle_open_time`` may be epoch milliseconds (the dds column) or
+    a datetime (the intake column).
+    """
+    try:
+        if isinstance(signal_candle_open_time, datetime):
+            opened = signal_candle_open_time
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=timezone.utc)
+        elif signal_candle_open_time:
+            opened = ms_to_datetime(signal_candle_open_time)
+        else:
+            opened = None
+        end = opened + timedelta(minutes=5) if opened else signal_time
+    except (TypeError, ValueError):
+        end = signal_time
+    if end > signal_time:
+        end = signal_time
+    start = end - timedelta(minutes=5 * WINDOW_SIZE)
+
+    try:
+        rows = candle_source.closed_candles(symbol, start=start, end=end)
+    except Exception:
+        log.warning("ME SHORT A runtime candle lookup failed for %s", symbol,
+                    exc_info=True)
+        missing.append("recent_high_window_candles")
+        flags.append("source_window_unavailable")
+        return [], None
+
+    usable = [c for c in rows if c.close_time <= signal_time][-WINDOW_SIZE:]
+    if len(usable) < WINDOW_SIZE:
+        missing.append("recent_high_window_candles")
+        flags.append("source_window_incomplete")
+        return [], None
+
+    if reference_price is not None:
+        observed = max(c.high for c in usable)
+        if observed != reference_price:
+            # The frozen A reference included a candle that had not closed
+            # at signal_time (or the scanner context differed). Never
+            # silently "fix" the geometry: report it and stay without a
+            # window so the row lands in SOURCE_INCOMPLETE.
+            missing.append("recent_high_window_candles")
+            flags.append("recent_high_window_reference_mismatch")
+            return [], None
+
+    signal_candle_close = next(
+        (c.close for c in usable
+         if c.open_time + timedelta(minutes=5) == end), None)
+    return usable, signal_candle_close
 
 
 class BybitClosedCandleSource:
@@ -568,51 +639,10 @@ class DbScannerSetupCandidateSource(CandidateSource):
         signal_candle_open_time: Any, reference_price: Decimal | None,
         missing: list[str], flags: list[str],
     ) -> tuple[list[Candle], Decimal | None]:
-        """The five CLOSED 5m candles behind the frozen A ``reference_price``.
-
-        The window is only accepted when it is closed before ``signal_time``
-        AND reproduces ``reference_price``; otherwise nothing is attached and
-        the gap is named explicitly instead of being imputed.
-        """
-        try:
-            end = ms_to_datetime(signal_candle_open_time) \
-                + timedelta(minutes=5) if signal_candle_open_time else signal_time
-        except (TypeError, ValueError):
-            end = signal_time
-        if end > signal_time:
-            end = signal_time
-        start = end - timedelta(minutes=5 * WINDOW_SIZE)
-
-        try:
-            rows = self._candles.closed_candles(symbol, start=start, end=end)
-        except Exception:
-            log.warning("ME SHORT A runtime candle lookup failed for %s", symbol,
-                        exc_info=True)
-            missing.append("recent_high_window_candles")
-            flags.append("source_window_unavailable")
-            return [], None
-
-        usable = [c for c in rows if c.close_time <= signal_time][-WINDOW_SIZE:]
-        if len(usable) < WINDOW_SIZE:
-            missing.append("recent_high_window_candles")
-            flags.append("source_window_incomplete")
-            return [], None
-
-        if reference_price is not None:
-            observed = max(c.high for c in usable)
-            if observed != reference_price:
-                # The frozen A reference included a candle that had not closed
-                # at signal_time (or the scanner context differed). Never
-                # silently "fix" the geometry: report it and stay without a
-                # window so the row lands in SOURCE_INCOMPLETE.
-                missing.append("recent_high_window_candles")
-                flags.append("recent_high_window_reference_mismatch")
-                return [], None
-
-        signal_candle_close = next(
-            (c.close for c in usable
-             if c.open_time + timedelta(minutes=5) == end), None)
-        return usable, signal_candle_close
+        """Delegates to :func:`reconstruct_recent_high_window`."""
+        return reconstruct_recent_high_window(
+            self._candles, symbol, signal_time, signal_candle_open_time,
+            reference_price, missing, flags)
 
     # ── small converters ──────────────────────────────────────────
     @staticmethod
@@ -639,3 +669,481 @@ class DbScannerSetupCandidateSource(CandidateSource):
             except Exception:
                 return {}
         return {}
+
+
+class DbSourceIntakeCandidateSource(CandidateSource):
+    """READ-ONLY reader of the research-only ME SHORT A source intake.
+
+    Issue #208 corrective: this source observes the ORIGINAL
+    ``MOMENTUM_EXHAUSTION`` ``SHORT`` events captured before/independent of
+    the trading regime filter (``research.me_short_a_source_intake_v1``,
+    migration 080).  Events the trading filters dropped — the confirmed
+    incident class (``SHORT`` in ``TREND_UP``) — reach the forward outcome
+    runtime through here, so the ``source signal -> Phase 1 -> lineage ->
+    outcome`` chain can never be silently truncated by a trading decision.
+
+    Contract
+    --------
+    * Pure reader, on a READ ONLY session, of exactly two research tables.
+      It never writes anywhere and never calls scanner code.
+    * Keyset-paginated on ``(signal_time, event_key)`` with the same lossless
+      cursor semantics as :class:`DbScannerSetupCandidateSource`.
+    * Strict forward-only: the effective lower bound is
+      ``max(freeze_ts, intake_freeze_ts)`` where ``intake_freeze_ts`` is the
+      immutable activation boundary of the fixed mechanism
+      (``research.me_short_a_source_intake_activation_v1``).  Pre-activation
+      history — including the confirmed incident event — can never be read
+      back.  When the intake is not ``RUNNING`` this source yields nothing
+      (fail-closed).
+    * Read failures fail SOFT and lossless: an empty page is returned and the
+      caller's cursor stays put, so the same rows are re-read next cycle.
+      Read errors are counted in ``error_count`` / ``last_error`` for
+      separate source-capture diagnostics and never stall the sibling
+      ``dds.scanner_setup`` stream.
+    * The deterministic ``event_key`` column IS the frozen identity
+      (``sha256(symbol|SHORT|<utc iso signal_time>|<ref>|<stop>|<target>)``,
+      byte-identical to Phase 1 and Issue #208), so no identity is ever
+      derived from mutable trading statuses.
+    """
+
+    _PROJECTION = (
+        "SELECT r.event_key, r.symbol, r.signal_time, r.reference_price, "
+        "r.stop_price, r.target_price, r.target_2, r.trigger_5m_close, "
+        "r.entry_zone_low, r.entry_zone_high, r.signal_candle_open_time, "
+        "r.recent_high_window, r.market_context, r.signal_time_quote, "
+        "r.capture_route, r.blocked_stage, r.blocked_reason, "
+        "r.market_regime, r.setup_id, r.missing_fields, "
+        "r.source_quality_flags, r.no_lookahead_flags "
+        "FROM research.me_short_a_source_intake_v1 r "
+        "WHERE r.scanner_name=%s AND r.direction=%s "
+        "AND r.signal_time > %s "
+    )
+    _ORDER_LIMIT = "ORDER BY r.signal_time ASC, r.event_key ASC LIMIT %s"
+
+    #: Pure reader: must run on a READ ONLY session.
+    requires_read_only_session = True
+    #: Exactly these two research tables are read.
+    read_tables = ("research.me_short_a_source_intake_v1",
+                   "research.me_short_a_source_intake_activation_v1")
+
+    SELECT_SQL = _PROJECTION + _ORDER_LIMIT
+    SELECT_AFTER_CURSOR_SQL = (
+        _PROJECTION
+        + "AND (r.signal_time > %s OR (r.signal_time = %s AND r.event_key > %s)) "
+        + _ORDER_LIMIT
+    )
+
+    ACTIVATION_SQL = (
+        "SELECT status,intake_freeze_ts "
+        "FROM research.me_short_a_source_intake_activation_v1 "
+        "WHERE experiment_id=%s"
+    )
+    ACTIVATION_EXPERIMENT = "ME_SHORT_A_PROSPECTIVE_SOURCE_INTAKE_V1"
+
+    def __init__(
+        self,
+        conn: Any,
+        candle_source: Any,
+        *,
+        scanner_name: str = SCANNER_NAME,
+        direction: str = DIRECTION,
+        clock: Callable[[], datetime] = utcnow,
+        max_rows: int = DEFAULT_PAGE_SIZE,
+        page_size: int | None = None,
+    ) -> None:
+        self._conn = conn
+        self._candles = candle_source
+        self._scanner_name = scanner_name
+        self._direction = direction
+        self._clock = clock
+        self._page_size = int(page_size if page_size is not None else max_rows)
+        if self._page_size < 1:
+            raise ValueError("page_size must be >= 1")
+        #: Source-capture read diagnostics (never affects scanner execution).
+        self.error_count = 0
+        self.last_error: str | None = None
+
+    # ── activation (forward-only boundary of the fixed mechanism) ──
+    def activation_state(self) -> tuple[str, datetime | None] | None:
+        """``(status, intake_freeze_ts)`` of the intake activation row."""
+        cursor_obj = ReadOnlyCursor(self._conn.cursor())
+        try:
+            cursor_obj.execute(self.ACTIVATION_SQL, (self.ACTIVATION_EXPERIMENT,))
+            row = cursor_obj.fetchone()
+        finally:
+            cursor_obj.close()
+        if row is None:
+            return None
+        freeze = self._as_utc(row[1]) if row[1] is not None else None
+        return str(row[0]), freeze
+
+    def lower_bound(self) -> datetime | None:
+        """Immutable activation floor of this mechanism, or ``None``.
+
+        Sibling sources can adopt this floor so the whole intake observes the
+        same forward-only cohort boundary. Read failures return ``None``
+        (soft): this source still fail-closes its own reads.
+        """
+        try:
+            state = self.activation_state()
+        except Exception as exc:  # noqa: BLE001 - fail-soft, lossless
+            self.error_count += 1
+            self.last_error = f"intake activation read failed: {type(exc).__name__}: {exc}"
+            log.warning("ME SHORT A source intake activation read failed",
+                        exc_info=True)
+            return None
+        if state is None or state[0] != "RUNNING" or state[1] is None:
+            return None
+        return state[1]
+
+    # ── pagination ────────────────────────────────────────────────
+    def fetch_page(
+        self,
+        cursor: tuple[datetime, Any] | None,
+        *,
+        freeze_ts: datetime,
+        page_size: int | None = None,
+    ) -> CandidatePage:
+        if freeze_ts is None:
+            raise ValueError(
+                "fetch_page requires the immutable freeze_ts; refusing to "
+                "read candidates without a freeze bound")
+        if cursor is not None and len(tuple(cursor)) != 2:
+            raise ValueError("cursor must be (signal_time, event_key)")
+        limit = int(page_size if page_size is not None else self._page_size)
+        if limit < 1:
+            raise ValueError("page_size must be >= 1")
+        lower = self._as_utc(freeze_ts)
+        if lower is None:
+            raise ValueError("freeze_ts must be a datetime")
+
+        empty = self._empty_page(limit)
+        try:
+            activation = self.activation_state()
+        except Exception as exc:  # noqa: BLE001 - fail-soft, lossless
+            self.error_count += 1
+            self.last_error = f"intake activation read failed: {type(exc).__name__}: {exc}"
+            log.warning("ME SHORT A source intake activation read failed",
+                        exc_info=True)
+            return empty
+        if activation is None or activation[0] != "RUNNING" or activation[1] is None:
+            log.debug("ME SHORT A source intake not active; intake source idle")
+            return empty
+        intake_freeze = activation[1]
+        effective_lower = max(lower, intake_freeze)
+
+        cursor_signal_time = None
+        cursor_event_key = None
+        if cursor is not None:
+            cursor_signal_time = self._as_utc(cursor[0])
+            cursor_event_key = cursor[1]
+            if cursor_signal_time is None:
+                raise ValueError("cursor signal_time must be a datetime")
+
+        if cursor is None:
+            sql, params = self.SELECT_SQL, (
+                self._scanner_name, self._direction, effective_lower, limit)
+        else:
+            sql, params = self.SELECT_AFTER_CURSOR_SQL, (
+                self._scanner_name, self._direction, effective_lower,
+                cursor_signal_time, cursor_signal_time, cursor_event_key, limit)
+
+        try:
+            cursor_obj = ReadOnlyCursor(self._conn.cursor())
+            try:
+                cursor_obj.execute(sql, params)
+                rows = cursor_obj.fetchall()
+            finally:
+                cursor_obj.close()
+        except Exception as exc:  # noqa: BLE001 - fail-soft, lossless
+            self.error_count += 1
+            self.last_error = f"intake page read failed: {type(exc).__name__}: {exc}"
+            log.warning("ME SHORT A source intake page read failed",
+                        exc_info=True)
+            return empty
+
+        candidates: list[Candidate] = []
+        rejected: list[str] = []
+        last: tuple[datetime, Any] | None = None
+        for row in rows:
+            signal_time = self._as_utc(row[2]) if len(row) > 2 else None
+            event_key = row[0]
+            # The cursor tracks the LAST RAW ROW read — including rows that
+            # cannot be mapped — so one broken row never blocks the intake.
+            if signal_time is not None:
+                last = (signal_time, event_key)
+            try:
+                candidate = self._map_row(row)
+            except Exception:  # pragma: no cover - defensive
+                candidate = None
+            if candidate is None:
+                rejected.append(str(event_key))
+                continue
+            candidates.append(candidate)
+
+        rows_read = len(rows)
+        return CandidatePage(
+            candidates=tuple(candidates),
+            rejected=tuple(rejected),
+            rows_read=rows_read,
+            page_size=limit,
+            cursor=last,
+            exhausted=rows_read < limit,
+        )
+
+    @staticmethod
+    def _empty_page(limit: int) -> CandidatePage:
+        return CandidatePage(
+            candidates=(), rejected=(), rows_read=0,
+            page_size=limit, cursor=None, exhausted=True)
+
+    # ── mapping ───────────────────────────────────────────────────
+    def _map_row(self, row: Sequence[Any]) -> Candidate | None:
+        (
+            event_key, symbol, signal_time, reference_price, stop_price,
+            target_price, _target_2, trigger_5m_close, entry_zone_low,
+            entry_zone_high, signal_candle_open_time, _recent_high_window,
+            market_context, signal_time_quote,
+            capture_route, blocked_stage, blocked_reason,
+            market_regime, setup_id,
+            missing_fields, source_quality_flags, no_lookahead_flags,
+        ) = row
+
+        if symbol is None or signal_time is None:
+            return None
+        if reference_price is None or stop_price is None or target_price is None:
+            return None
+
+        signal_dt = self._as_utc(signal_time)
+        if signal_dt is None:
+            return None
+
+        missing = [str(name) for name in (self._as_list(missing_fields))]
+        flags = [str(name) for name in (self._as_list(source_quality_flags))]
+
+        ref = self._as_decimal(reference_price)
+        window, signal_candle_close = reconstruct_recent_high_window(
+            self._candles, str(symbol), signal_dt, signal_candle_open_time,
+            ref, missing, flags)
+
+        trigger = self._as_decimal(trigger_5m_close)
+        if trigger is None and signal_candle_close is not None:
+            trigger = signal_candle_close
+        if trigger is None and "trigger_5m_close" not in missing:
+            missing.append("trigger_5m_close")
+
+        context: dict[str, Any] = {}
+        for key, value in (
+            ("market_regime", market_regime),
+            ("capture_route", capture_route),
+            ("blocked_stage", blocked_stage),
+            ("blocked_reason", blocked_reason),
+        ):
+            if value not in (None, ""):
+                context[key] = value
+        context.update(self._as_mapping(market_context))
+        quote = self._as_mapping(signal_time_quote)
+
+        try:
+            return Candidate(
+                symbol=str(symbol),
+                signal_time=signal_dt,
+                reference_price=ref,
+                invalidation_price=self._as_decimal(stop_price),
+                target_1=self._as_decimal(target_price),
+                trigger_5m_close=trigger,
+                entry_zone_low=self._as_decimal(entry_zone_low),
+                entry_zone_high=self._as_decimal(entry_zone_high),
+                recent_high_window=tuple(window),
+                market_context=context,
+                signal_time_quote=quote,
+                source_observation_id=None,
+                source="MOMENTUM_EXHAUSTION_SHORT_CANDIDATES",
+                observed_at=self._clock(),
+                event_id=f"intake:{event_key}",
+                missing_fields=tuple(missing),
+                source_quality_flags=tuple(flags),
+            )
+        except ValueError as exc:
+            log.warning(
+                "ME SHORT A runtime rejected intake candidate %s/%s: %s",
+                symbol, event_key, exc)
+            return None
+
+    # ── small converters ──────────────────────────────────────────
+    @staticmethod
+    def _as_utc(value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=timezone.utc) if value.tzinfo is None \
+                else value.astimezone(timezone.utc)
+        return None
+
+    @staticmethod
+    def _as_decimal(value: Any) -> Decimal | None:
+        return canonical_price(value)
+
+    @staticmethod
+    def _as_mapping(value: Any) -> Mapping[str, Any]:
+        if isinstance(value, Mapping):
+            return value
+        if isinstance(value, (str, bytes)):
+            try:
+                import json
+
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, Mapping) else {}
+            except Exception:
+                return {}
+        return {}
+
+    @staticmethod
+    def _as_list(value: Any) -> list[Any]:
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        if isinstance(value, (str, bytes)):
+            try:
+                import json
+
+                parsed = json.loads(value)
+                return list(parsed) if isinstance(parsed, list) else []
+            except Exception:
+                return []
+        return []
+
+
+class CompositeCandidateSource(CandidateSource):
+    """Merges keyset-paginated sources into one lossless candidate stream.
+
+    The Issue #208 runtime observes its ``MOMENTUM_EXHAUSTION`` ``SHORT``
+    candidates through more than one transport (``dds.scanner_setup`` and
+    the research source intake), but the handler loop consumes exactly one
+    :class:`CandidatePage` stream.  This composite keeps the per-source
+    keyset cursors and presents one page at a time, so the runtime's
+    "the cursor advances only after a fully handled page" contract holds for
+    EVERY sub-source at once:
+
+    * the composite cursor is the tuple of per-sub-source cursors and is
+      opaque to the runtime;
+    * a sub-source page is only recorded as handled when the composite page
+      that contains it is handled in full — a mid-page failure re-reads the
+      whole page and can never lose the rows behind it (duplicates are
+      removed by the deterministic ``event_key`` within a fetch and by the
+      collector's ``ON CONFLICT DO NOTHING`` across fetches);
+    * every fetch re-visits every sub-source from its own cursor, so new rows
+      in any sub-source are always observed and a drained sub-source never
+      blocks the others;
+    * the immutable freeze bound is raised to the highest activation floor
+      requested by any sub-source (see
+      :meth:`DbSourceIntakeCandidateSource.lower_bound`), so all transports
+      observe the same forward-only cohort boundary.
+    """
+
+    def __init__(self, sources: Sequence[CandidateSource]) -> None:
+        if not sources:
+            raise ValueError("CompositeCandidateSource needs at least one source")
+        self._sources = tuple(sources)
+
+    @property
+    def requires_read_only_session(self) -> bool:
+        return any(
+            getattr(source, "requires_read_only_session", False)
+            for source in self._sources)
+
+    @property
+    def read_tables(self) -> tuple[str, ...]:
+        out: list[str] = []
+        for source in self._sources:
+            out.extend(getattr(source, "read_tables", ()))
+        return tuple(out)
+
+    def lower_bound(self) -> datetime | None:
+        best: datetime | None = None
+        for source in self._sources:
+            getter = getattr(source, "lower_bound", None)
+            if getter is None:
+                continue
+            try:
+                value = getter()
+            except Exception:  # noqa: BLE001 - sub-sources fail-close their own reads
+                log.warning(
+                    "ME SHORT A composite lower_bound probe failed",
+                    exc_info=True)
+                continue
+            if value is not None and (best is None or value > best):
+                best = value
+        return best
+
+    def fetch_page(
+        self,
+        cursor: tuple[datetime, Any] | None,
+        *,
+        freeze_ts: datetime,
+        page_size: int | None = None,
+    ) -> CandidatePage:
+        if freeze_ts is None:
+            raise ValueError(
+                "fetch_page requires the immutable freeze_ts; refusing to "
+                "read candidates without a freeze bound")
+        limit = int(page_size if page_size is not None else DEFAULT_PAGE_SIZE)
+        if limit < 1:
+            raise ValueError("page_size must be >= 1")
+
+        state = self._decode_cursor(cursor)
+
+        effective_freeze = freeze_ts
+        floor = self.lower_bound()
+        if floor is not None and floor > effective_freeze:
+            effective_freeze = floor
+
+        candidates: list[Candidate] = []
+        rejected: list[str] = []
+        rows_read = 0
+        for index, source in enumerate(self._sources):
+            if len(candidates) >= limit:
+                break
+            page = source.fetch_page(
+                state[index],
+                freeze_ts=effective_freeze,
+                page_size=limit - len(candidates),
+            )
+            rows_read += page.rows_read
+            rejected.extend(page.rejected)
+            candidates.extend(page.candidates)
+            if page.rows_read > 0:
+                state[index] = page.next_cursor
+
+        # One event can arrive through several transports. Collapse the
+        # duplicates within THIS fetch by the deterministic identity; the
+        # runtime's seen-set and the collector's ON CONFLICT cover re-reads.
+        deduped: list[Candidate] = []
+        seen_keys: set[str] = set()
+        for candidate in candidates:
+            try:
+                key = event_key_for(candidate)
+            except Exception:  # noqa: BLE001 - defensive: keep the row
+                deduped.append(candidate)
+                continue
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(candidate)
+
+        return CandidatePage(
+            candidates=tuple(deduped),
+            rejected=tuple(rejected),
+            rows_read=rows_read,
+            page_size=limit,
+            cursor=tuple(state),
+            exhausted=rows_read < limit,
+        )
+
+    def _decode_cursor(
+        self, cursor: tuple[datetime, Any] | None,
+    ) -> list[tuple[datetime, Any] | None]:
+        if cursor is None:
+            return [None] * len(self._sources)
+        parts = tuple(cursor)
+        if len(parts) != len(self._sources):
+            raise ValueError(
+                "composite cursor does not match the number of sources")
+        return list(parts)

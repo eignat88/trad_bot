@@ -396,8 +396,8 @@ class Candidate:
     entry_zone_low: Decimal | None = None
     entry_zone_high: Decimal | None = None
     recent_high_window: Sequence[Candle] = ()
-    market_context: str = ""
-    signal_time_quote: str = ""
+    market_context: str | Mapping[str, Any] = ""
+    signal_time_quote: str | Mapping[str, Any] = ""
     source_observation_id: int | None = None
     source: str = "MOMENTUM_EXHAUSTION_SHORT_CANDIDATES"
     observed_at: datetime | None = None
@@ -420,8 +420,12 @@ class Candidate:
             raise ValueError("target_1 must be below reference_price")
         if self.signal_time.utcoffset() != timedelta(0):
             raise ValueError("signal_time must be UTC")
-        if self.signal_time.second or self.signal_time.microsecond:
-            raise ValueError("signal_time must be whole seconds")
+        # signal_time keeps FULL microsecond precision: the frozen identity is
+        # sha256(symbol|SHORT|<utc isoformat signal_time>|…) and Phase 1 hashes
+        # the exact observed timestamp (real detections are wall-clock, e.g.
+        # 2026-10-27T10:43:57.672455+00:00). Normalising the precision here
+        # would desynchronise the event_key from Phase 1 and turn every real
+        # event into a silent intake rejection.
         if self.recent_high_window and len(self.recent_high_window) > 5:
             raise ValueError("recent_high_window holds at most five candles")
         if self.recent_high_window:
@@ -448,9 +452,12 @@ class CandidatePage:
     """One keyset page of candidate rows, plus everything needed to resume.
 
     ``cursor`` is the composite keyset ``(detected_at, setup_id)`` of the LAST
-    row returned by this page — or ``None`` for an empty page. It is only ever
-    advanced by the caller after the whole page has been handled, so a failure
-    in the middle of a page can never lose the rows behind it.
+    row returned by this page — or ``None`` for an empty page. (A
+    multi-transport :class:`CandidateSource` may use its own composite cursor
+    shape, e.g. one sub-cursor per transport; the runtime treats it as an
+    opaque resume token.) It is only ever advanced by the caller after the
+    whole page has been handled, so a failure in the middle of a page can
+    never lose the rows behind it.
 
     ``rejected`` names the rows that could not be represented as a
     :class:`Candidate` at all. They are counted and surfaced, never silently
@@ -461,11 +468,11 @@ class CandidatePage:
     rejected: tuple[str, ...] = ()
     rows_read: int = 0
     page_size: int = 0
-    cursor: tuple[datetime, Any] | None = None
+    cursor: Any = None
     exhausted: bool = True
 
     @property
-    def next_cursor(self) -> tuple[datetime, Any] | None:
+    def next_cursor(self) -> Any:
         """Resume point: strictly AFTER this page's last row."""
         return self.cursor
 
@@ -1273,10 +1280,18 @@ class ForwardOutcomeRuntime:
         repaired and would show up as a bogus ``MISSING_LINEAGE`` /
         ``QUARANTINED`` forever.
         """
-        token = candidate.event_id or (
-            f"{candidate.symbol}|{candidate.signal_time.isoformat()}|"
-            f"{candidate.reference_price}|{candidate.invalidation_price}|"
-            f"{candidate.target_1}")
+        # The idempotency token is the DETERMINISTIC event identity, not the
+        # transport row id: the same event can arrive through several
+        # transports (dds.scanner_setup and the research source intake) with
+        # different event_ids, and must still be captured exactly once per
+        # process. The collector's ON CONFLICT DO NOTHING covers restarts.
+        try:
+            token = f"ek:{event_key_for(candidate)}"
+        except Exception:  # pragma: no cover - defensive
+            token = candidate.event_id or (
+                f"{candidate.symbol}|{candidate.signal_time.isoformat()}|"
+                f"{candidate.reference_price}|{candidate.invalidation_price}|"
+                f"{candidate.target_1}")
         if self._already_seen(token):
             self._metrics.add("skipped_idempotent")
             return HANDLED_SKIPPED

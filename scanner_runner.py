@@ -291,6 +291,145 @@ def _observe_prospective_with_fill(client, prospective_obs, **kwargs):
     return ids
 
 
+# --- ME SHORT A prospective source intake (Issue #208 corrective) -------
+#
+# Research-only, forward-only capture of the ORIGINAL MOMENTUM_EXHAUSTION
+# SHORT events, before/independent of the trading filters (direction gate,
+# regime filter, expectancy filter). The forward outcome runtime reads these
+# rows as an additional candidate source, so a trading filter can never
+# silently truncate the ME SHORT A source -> Phase 1 -> lineage -> outcome
+# chain again (confirmed incident: TSLAUSDT 2026-10-27 10:43:57.672455+00,
+# SHORT in TREND_UP, captured by Phase 1 but absent from dds.scanner_setup).
+#
+# Fail-open by contract: every error is swallowed and must NEVER affect
+# scanner execution; failures are logged with the full event identity and
+# sunk to dds.scanner_error as ME_SHORT_A_SOURCE_INTAKE_ERROR so a research
+# capture error can never become a silent signal loss.
+
+_me_short_a_source_intake_conn = None
+_me_short_a_source_intake_conn_retry_at = 0.0
+
+
+def _get_me_short_a_source_intake_conn(repository: ScannerRepository):
+    """Dedicated connection for the research-only source intake writer.
+
+    Independent from the scanner's main transaction and from the prospective
+    observer: research capture commits its own transactions only, and must
+    not depend on any trading-side routing decision.
+    """
+    global _me_short_a_source_intake_conn, _me_short_a_source_intake_conn_retry_at
+    if _me_short_a_source_intake_conn is not None:
+        return _me_short_a_source_intake_conn
+    now = time.monotonic()
+    if now - _me_short_a_source_intake_conn_retry_at < 60.0:
+        return None
+    try:
+        import pg8000
+
+        connect_kwargs = {
+            "database": repository._database,
+            "user": repository._user,
+            "password": repository._password,
+        }
+        if repository._unix_sock:
+            connect_kwargs["unix_sock"] = repository._unix_sock
+        else:
+            connect_kwargs["host"] = repository._host
+            connect_kwargs["port"] = repository._port
+        _me_short_a_source_intake_conn = pg8000.connect(**connect_kwargs)
+        return _me_short_a_source_intake_conn
+    except Exception:
+        _me_short_a_source_intake_conn = None
+        _me_short_a_source_intake_conn_retry_at = now
+        logger.debug(
+            "ME SHORT A source intake connection unavailable", exc_info=True)
+        return None
+
+
+def _capture_me_short_a_source(
+    repository: ScannerRepository,
+    candidate: SetupCandidate,
+    *,
+    capture_route: str,
+    blocked_stage: str | None = None,
+    blocked_reason: str | None = None,
+) -> None:
+    """Append ONE original ME SHORT event to the research source intake.
+
+    Only ``MOMENTUM_EXHAUSTION`` / ``SHORT`` candidates are captured. The
+    capture is strictly research-only: nothing is ever routed back into the
+    trading flow and no scanner decision is changed. Fail-open: the whole
+    call is wrapped and must never raise into the scanner cycle.
+    """
+    if (
+        candidate.scanner_name != "MOMENTUM_EXHAUSTION"
+        or candidate.direction != "SHORT"
+    ):
+        return
+
+    def _report_error() -> None:
+        """Separate source-capture error diagnostics; never silent."""
+        try:
+            repository.save_error(
+                symbol=candidate.symbol,
+                scanner_name=candidate.scanner_name,
+                error_type="ME_SHORT_A_SOURCE_INTAKE_ERROR",
+                error_message=(
+                    f"route={capture_route} signal_time={candidate.detected_at} "
+                    f"setup_id={candidate.setup_id}"),
+            )
+        except Exception:
+            logger.debug(
+                "ME SHORT A source intake error sink failed", exc_info=True)
+
+    try:
+        from app.research.me_short_a_source_intake_v1 import capture_with_status
+
+        conn = _get_me_short_a_source_intake_conn(repository)
+        if conn is None:
+            raise RuntimeError("source intake connection unavailable")
+        features = candidate.features or {}
+        status = capture_with_status(
+            conn,
+            scanner_name=candidate.scanner_name,
+            direction=candidate.direction,
+            symbol=candidate.symbol,
+            signal_time=candidate.detected_at,
+            reference_price=candidate.reference_price,
+            invalidation_price=candidate.invalidation_price,
+            target_1=candidate.target_1,
+            target_2=candidate.target_2,
+            trigger_5m_close=features.get("trigger_5m_close"),
+            entry_zone_low=candidate.entry_zone_low,
+            entry_zone_high=candidate.entry_zone_high,
+            signal_candle_open_time=candidate.signal_candle_open_time or None,
+            market_regime=candidate.market_regime,
+            setup_id=str(candidate.setup_id),
+            capture_route=capture_route,
+            blocked_stage=blocked_stage,
+            blocked_reason=blocked_reason,
+        )
+        # Persistence errors are sunk to dds.scanner_error and are never
+        # silent. Non-errors (duplicate replay / not active / pre-freeze) are
+        # expected states and stay in the intake module's debug log.
+        if status == "ERROR":
+            logger.error(
+                "ME SHORT A source intake persistence error; scanner unaffected "
+                "symbol=%s route=%s signal_time=%s",
+                candidate.symbol, capture_route, candidate.detected_at)
+            _report_error()
+        elif status in ("DISABLED", "NOT_ACTIVE", "PRE_FREEZE"):
+            logger.info(
+                "ME SHORT A source intake status=%s symbol=%s route=%s",
+                status, candidate.symbol, capture_route)
+    except Exception:
+        logger.exception(
+            "ME SHORT A source intake capture failed; scanner unaffected "
+            "symbol=%s route=%s signal_time=%s",
+            candidate.symbol, capture_route, candidate.detected_at)
+        _report_error()
+
+
 # --- Prospective OOS Observer -------------------------------------------
 
 _prospective_observer = None
@@ -760,6 +899,17 @@ def run_scan_cycle(
                             except Exception:
                                 logger.exception("ME direct OOS capture failed")
 
+                    # Issue #208 corrective: research-only ME SHORT A source
+                    # intake, captured independently of the trading filters.
+                    # Fail-open: never blocks the scanner cycle.
+                    _capture_me_short_a_source(
+                        repository, c,
+                        capture_route=(
+                            "SHADOW_CONTROL"
+                            if c.features.get("_shadow_control")
+                            else "TRADEABLE_FLOW"),
+                    )
+
                     # Prospective OOS: capture for frozen experiments
                     # Fail-open: never blocks scanner cycle.
                     if prospective_obs is not None:
@@ -793,6 +943,20 @@ def run_scan_cycle(
                     from app.scanners.models import SetupState as _ObsState
                     from dataclasses import replace as _obs_replace
                     obs_c = _obs_replace(oc, state=_ObsState.DETECTED)
+                    # Issue #208 corrective: research-only ME SHORT A source
+                    # intake. A direction-gate block must never prevent
+                    # research capture. Fail-open.
+                    _capture_me_short_a_source(
+                        repository, obs_c,
+                        capture_route=(
+                            "DIRECTION_GATE_BLOCKED"
+                            if oc.features.get("_blocked_for_prospective")
+                            else "OBSERVE_ONLY"),
+                        blocked_stage="direction_gate",
+                        blocked_reason=(
+                            oc.features.get("_blocked_reason")
+                            or oc.features.get("_observe_only_reason")),
+                    )
                     if (
                         obs_c.scanner_name == "ME_R_LONG_CLOSE_LOCATION_OOS_VALIDATION_V1"
                         and me_capture_spool is not None
@@ -960,6 +1124,15 @@ def run_scan_cycle(
                 # Capture candidates that passed all gates but were rejected by expectancy filter
                 expectancy_rejected_candidates = symbol_stats.get("_expectancy_rejected_candidates", [])
                 for erc in expectancy_rejected_candidates:
+                    # Issue #208 corrective: research-only ME SHORT A source
+                    # intake, independent of the prospective observer and of
+                    # every trading filter. Fail-open.
+                    _capture_me_short_a_source(
+                        repository, erc,
+                        capture_route="EXPECTANCY_FILTER_REJECTED",
+                        blocked_stage="expectancy_filter",
+                        blocked_reason=erc.features.get("_rejection_reason"),
+                    )
                     if prospective_obs is not None:
                         try:
                             # Add expectancy metadata to features
@@ -1000,6 +1173,19 @@ def run_scan_cycle(
                 # Capture candidates that passed all filters except regime filter
                 regime_rejected_candidates = symbol_stats.get("_regime_rejected_candidates", [])
                 for rrc in regime_rejected_candidates:
+                    # Issue #208 corrective: THE confirmed incident class.
+                    # The trading regime filter excludes this candidate from
+                    # dds.scanner_setup, but the original ME SHORT event is
+                    # still captured for research (REGIME_FILTER_REJECTED).
+                    # The regime filter itself stays untouched: nothing is
+                    # routed back into the trading flow. Fail-open.
+                    _capture_me_short_a_source(
+                        repository, rrc,
+                        capture_route="REGIME_FILTER_REJECTED",
+                        blocked_stage="regime_filter",
+                        blocked_reason=(
+                            f"{rrc.direction} in {rrc.market_regime}"),
+                    )
                     if prospective_obs is not None:
                         try:
                             # Add regime metadata to features

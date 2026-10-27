@@ -161,7 +161,9 @@ def build_runtime(
 ) -> ForwardOutcomeRuntime:
     from app.research.me_short_a_forward_outcome_runtime_sources_v1 import (
         BybitClosedCandleSource,
+        CompositeCandidateSource,
         DbScannerSetupCandidateSource,
+        DbSourceIntakeCandidateSource,
         assert_read_only_session,
     )
 
@@ -189,9 +191,22 @@ def build_runtime(
     # The candidate intake runs on the READ ONLY connection. It never sees
     # the write connection, and it refuses to run unless the session really is
     # a PostgreSQL READ ONLY session.
+    #
+    # Issue #208 corrective: candidates are observed through TWO read-only
+    # transports and merged losslessly by the composite:
+    #   * dds.scanner_setup          — what survived the trading filters;
+    #   * research source intake     — the ORIGINAL MOMENTUM_EXHAUSTION SHORT
+    #     events captured before/independent of the trading regime filter
+    #     (the class the confirmed TSLAUSDT incident belongs to).
+    # The composite raises the freeze bound to the intake activation floor so
+    # both transports observe the same strictly-forward-only cohort.
     intake_conn = conn if read_conn is None else read_conn
-    candidate_source = DbScannerSetupCandidateSource(
-        intake_conn, candle_source, max_rows=args.max_rows)
+    candidate_source = CompositeCandidateSource((
+        DbScannerSetupCandidateSource(
+            intake_conn, candle_source, max_rows=args.max_rows),
+        DbSourceIntakeCandidateSource(
+            intake_conn, candle_source, max_rows=args.max_rows),
+    ))
     if getattr(candidate_source, "requires_read_only_session", False):
         assert_read_only_session(intake_conn)
 
