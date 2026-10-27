@@ -20,8 +20,20 @@ SAFETY
   or the Issue #208 capture tables.
 * The scratch database is created with
   ``default_transaction_read_only = on`` (mirroring the production runtime
-  ROLE-level GUC, which survives ROLLBACK), so the reader session under test
-  is read-only by construction.
+  ROLE-level GUC, which survives ROLLBACK), and every test connection sets
+  its transaction mode EXPLICITLY on the session: the reader turns
+  ``default_transaction_read_only`` on (then verifies it exactly like the
+  production pre-flight), the writer turns it off. The writer's fail-closed
+  feature flag is likewise set explicitly for the test process only.
+* Connection target: ``ME_SHORT_A_PG_IT_HOST`` may be a HOST name or a
+  Unix-socket DIRECTORY (libpq convention, e.g. ``/var/run/postgresql``);
+  psycopg2 receives the directory, pg8000 the socket file
+  ``<dir>/.s.PGSQL.<port>``. TCP needs no password only where pg_hba says
+  so — the socket mode is the supported VPS path.
+* The scratch database starts EMPTY while migration 080 expects the
+  research-foundation helper ``research.fn_set_updated_at()`` (migration
+  035/049). The harness therefore installs that one function explicitly
+  before applying migration 080 — nothing else from production is assumed.
 """
 from __future__ import annotations
 
@@ -44,6 +56,9 @@ from app.research.me_short_a_forward_outcome_runtime_sources_v1 import (  # noqa
     DbScannerSetupCandidateSource,
     DbSourceIntakeCandidateSource,
     assert_read_only_session,
+)
+from app.research.me_short_a_forward_outcome_runtime_v1 import (  # noqa: E402
+    event_key_for,
 )
 
 HOST = os.environ.get("ME_SHORT_A_PG_IT_HOST", "127.0.0.1")
@@ -79,6 +94,42 @@ pytestmark = pytest.mark.skipif(
 # ── fixtures ─────────────────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _intake_flag(monkeypatch):
+    """The writer's fail-closed feature flag — set EXPLICITLY for the test
+    process only; production keeps it off until the runbook activation."""
+    monkeypatch.setenv(writer.ACTIVATION_FLAG, "1")
+    yield
+
+
+def _pg8000_target():
+    """pg8000 connection target for the configured host/socket.
+
+    A path-like HOST is a Unix-socket DIRECTORY (libpq convention):
+    psycopg2 accepts the directory directly, pg8000 needs the socket FILE.
+    """
+    if HOST.startswith("/"):
+        return {"unix_sock": os.path.join(HOST, f".s.PGSQL.{PORT}")}
+    return {"host": HOST, "port": PORT}
+
+
+def install_research_fn_set_updated_at(admin):
+    """Install the research-foundation helper migration 080 depends on.
+
+    ``research.fn_set_updated_at()`` is created by migrations 035/049 in
+    production; the empty scratch database must provide it explicitly or
+    migration 080's ``updated_at`` trigger cannot be created.
+    """
+    cur = admin.cursor()
+    cur.execute("CREATE SCHEMA IF NOT EXISTS research")
+    cur.execute(
+        "CREATE OR REPLACE FUNCTION research.fn_set_updated_at() "
+        "RETURNS TRIGGER AS $$ "
+        "BEGIN NEW.updated_at = NOW(); RETURN NEW; END; "
+        "$$ LANGUAGE plpgsql")
+    cur.close()
+
+
 @pytest.fixture()
 def admin():
     """Admin connection to a fresh READ-ONLY-by-default scratch database."""
@@ -109,17 +160,27 @@ def admin():
 
 
 def connect_reader(admin):
-    """The runtime's shared READ ONLY connection (both transports use it)."""
+    """The runtime's shared READ ONLY connection (both transports use it).
+
+    The READ ONLY mode is set EXPLICITLY on the session and committed before
+    use (so it survives the runtime's ROLLBACK), then verified exactly like
+    the production pre-flight.
+    """
     conn = pg8000_dbapi.connect(
-        host=HOST, port=PORT, database=admin.info.dbname, user=USER, timeout=5)
+        database=admin.info.dbname, user=USER, timeout=5, **_pg8000_target())
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute("SET default_transaction_read_only = on")
+    cur.close()
+    conn.autocommit = False
     assert_read_only_session(conn)     # exactly the production pre-flight
     return conn
 
 
 def connect_writer(admin):
-    """The scanner's cached writer connection (read-write session)."""
+    """The scanner's cached writer connection (explicit read-write session)."""
     conn = pg8000_dbapi.connect(
-        host=HOST, port=PORT, database=admin.info.dbname, user=USER, timeout=5)
+        database=admin.info.dbname, user=USER, timeout=5, **_pg8000_target())
     conn.autocommit = True
     cur = conn.cursor()
     cur.execute("SET default_transaction_read_only = off")
@@ -199,6 +260,7 @@ def test_missing_intake_schema_never_aborts_the_shared_dds_stream(admin):
 
         # Migration 080 arrives mid-session: the SAME connection keeps
         # serving both transports (intake: fail-closed empty until RUNNING).
+        install_research_fn_set_updated_at(admin)
         admin.execute(MIGRATION_080.read_text(encoding="utf-8"))
         activate_intake(admin, datetime.now(timezone.utc) - timedelta(minutes=5))
         later = sources.fetch_page(again.next_cursor, freeze_ts=FREEZE)
@@ -238,6 +300,7 @@ def test_writer_recovers_after_pre_migration_failure_without_restart(admin):
         assert status == "ERROR"
 
         # 2) Migration 080 + activation; the SAME cached connection captures.
+        install_research_fn_set_updated_at(admin)
         admin.execute(MIGRATION_080.read_text(encoding="utf-8"))
         activate_intake(admin, datetime.now(timezone.utc) - timedelta(minutes=5))
         status = writer.capture_with_status(
@@ -253,12 +316,14 @@ def test_writer_recovers_after_pre_migration_failure_without_restart(admin):
         )
         assert status == "CAPTURED"
 
-        # 3) Idempotent replay on the same connection.
+        # 3) Idempotent replay with the OTHER spelling of the SAME prices —
+        #    one event must stay ONE row (stable canonical event_key).
         status = writer.capture_with_status(
             conn,
             scanner_name="MOMENTUM_EXHAUSTION", direction="SHORT",
             symbol=symbol, signal_time=signal_time,
-            reference_price=ref, invalidation_price=stop, target_1=target,
+            reference_price=Decimal("342.1"), invalidation_price=Decimal("342.78"),
+            target_1=Decimal("338.0"),
             capture_route="REGIME_FILTER_REJECTED",
             blocked_stage="regime_filter", blocked_reason="SHORT in TREND_UP",
             market_regime="TREND_UP",
@@ -266,6 +331,22 @@ def test_writer_recovers_after_pre_migration_failure_without_restart(admin):
                 signal_time - timedelta(minutes=5)).timestamp() * 1000,
         )
         assert status == "DUPLICATE"
+
+        # The frozen identity is representation-independent: both spellings
+        # hash to the ONE production key (Phase 1 / lineage / reader agree).
+        expected_key = writer.compute_event_key(
+            symbol, signal_time, ref, stop, target)
+        assert expected_key == writer.compute_event_key(
+            symbol, signal_time, Decimal("342.1"), Decimal("342.78"),
+            Decimal("338.0"))
+        cur = admin.cursor()
+        cur.execute(
+            "SELECT count(*), min(event_key) "
+            "FROM research.me_short_a_source_intake_v1")
+        rows_count, stored_key = cur.fetchone()
+        cur.close()
+        assert rows_count == 1                 # one event, one row
+        assert stored_key == expected_key      # what the chain joins on
 
         # 4) The row is visible through the READ ONLY intake source with the
         #    frozen identity intact (round-trip through real PostgreSQL).
@@ -280,10 +361,10 @@ def test_writer_recovers_after_pre_migration_failure_without_restart(admin):
             page = sources.fetch_page(None, freeze_ts=FREEZE)
             candidates = [c for c in page.candidates if c.symbol == symbol]
             assert len(candidates) == 1
-            expected_key = writer.compute_event_key(
-                symbol, signal_time, ref, stop, target)
-            from app.research.me_short_a_forward_outcome_runtime_v1 import (
-                event_key_for)
+            # The reader recomputes the key from the stored numeric column
+            # (float-repr canonicalisation): after the PostgreSQL round-trip
+            # it must equal the writer's key byte for byte. This is the
+            # event_key round-trip regression.
             assert event_key_for(candidates[0]) == expected_key
         finally:
             reader.close()

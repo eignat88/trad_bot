@@ -135,10 +135,12 @@ def base_kwargs(**overrides):
 
 
 def test_event_key_matches_the_frozen_identity_formula():
-    """sha256(symbol|SHORT|<utc iso signal_time>|<ref>|<stop>|<target>)."""
+    """sha256(symbol|SHORT|<utc iso signal_time>|<ref>|<stop>|<target>) on
+    the FROZEN price representation (the scanner's float repr:
+    REF=Decimal('342.10') hashes as ``342.1``)."""
     key = compute_event_key(SYMBOL, AFTER_FREEZE, REF, STOP, TARGET)
     expected = hashlib.sha256(
-        f"{SYMBOL}|SHORT|{AFTER_FREEZE.isoformat()}|{REF}|{STOP}|{TARGET}"
+        f"{SYMBOL}|SHORT|{AFTER_FREEZE.isoformat()}|342.1|342.78|338.0"
         .encode()
     ).hexdigest()
     assert key == expected
@@ -147,19 +149,67 @@ def test_event_key_matches_the_frozen_identity_formula():
 def test_event_key_is_byte_identical_to_phase1_and_lineage():
     """One event joins intake -> Phase 1 -> lineage -> outcome on ONE key.
 
-    The Phase 1 writer (``me_short_a_fill_feasibility_v1``) hashes
-    ``f"{symbol}|SHORT|{event_time.isoformat()}|{ref}|{stop}|{target}"`` with
-    ``Decimal(str(...))`` prices; the lineage module hashes the same payload.
+    The Phase 1 writer (``me_short_a_fill_feasibility_v1.capture``) hashes
+    ``f"{symbol}|SHORT|{event_time.isoformat()}|{ref}|{stop}|{target}"``
+    over ``Decimal(str(<float>))`` prices — the scanner's in-memory float
+    representation, verified against production rows; the lineage module
+    hashes the same payload from canonical inputs. The intake writer must
+    produce that exact key for EVERY spelling of the same price.
     """
     key = compute_event_key(SYMBOL, AFTER_FREEZE, REF, STOP, TARGET)
-    ref, stop, target = Decimal(str(REF)), Decimal(str(STOP)), Decimal(str(TARGET))
+    # Phase 1's real code path (scanner float prices):
+    ref, stop, target = Decimal(str(342.1)), Decimal(str(342.78)), Decimal(str(338.0))
     phase1_formula = hashlib.sha256(
         f"{SYMBOL}|SHORT|{AFTER_FREEZE.isoformat()}|{ref}|{stop}|{target}"
         .encode()
     ).hexdigest()
     assert key == phase1_formula
+    # and the frozen lineage formula on canonical inputs:
     assert key == lineage_event_key(
-        SYMBOL, "SHORT", AFTER_FREEZE, REF, STOP, TARGET)
+        SYMBOL, "SHORT", AFTER_FREEZE,
+        Decimal("342.1"), Decimal("342.78"), Decimal("338.0"))
+
+
+def test_event_key_canonicalizes_price_representation():
+    """Every spelling of ONE number shares ONE frozen identity key.
+
+    ``Decimal("342.10")`` == ``Decimal("342.1")`` == ``"342.10"`` == ``342.1``
+    for the identity, and ``Decimal("338.0")`` == ``Decimal("338")`` ==
+    ``338.0``. This is what keeps the writer's key equal to the key the
+    runtime recomputes from the stored ``numeric`` column after a PostgreSQL
+    round-trip (regression: the round-trip used to desynchronise on
+    ``Decimal("342.10")``)."""
+    base = compute_event_key(SYMBOL, AFTER_FREEZE, Decimal("342.1"),
+                             Decimal("342.78"), Decimal("338.0"))
+    assert compute_event_key(SYMBOL, AFTER_FREEZE, Decimal("342.10"),
+                             Decimal("342.780"), Decimal("338")) == base
+    assert compute_event_key(SYMBOL, AFTER_FREEZE, "342.10", 342.78, 338.0) == base
+    assert compute_event_key(SYMBOL, AFTER_FREEZE, 342.1, "342.78", "338.0") == base
+
+
+def test_identity_columns_are_stored_in_the_frozen_representation():
+    """The row's identity columns hold exactly what the key was built from
+    (Phase 1 stores its identity inputs the same way)."""
+    conn = FakeConnection()
+    capture(conn, **base_kwargs(reference_price=Decimal("342.10"),
+                                invalidation_price=Decimal("342.780"),
+                                target_1=Decimal("338")))
+    _, params = conn.inserts[0]
+    spelled = [str(p) for p in params]
+    assert "342.1" in spelled and "342.78" in spelled and "338.0" in spelled
+    assert "342.10" not in spelled and "342.780" not in spelled and "338" not in spelled
+
+
+def test_one_event_across_price_spellings_maps_to_one_event_key():
+    """``ON CONFLICT (event_key)`` deduplicates one event only if the key is
+    stable across spellings — otherwise one event would append two rows."""
+    conn = FakeConnection()
+    capture(conn, **base_kwargs(reference_price=Decimal("342.10"),
+                                target_1=Decimal("338")))
+    capture(conn, **base_kwargs(reference_price=Decimal("342.1"),
+                                target_1=Decimal("338.0")))
+    keys = [p[0] for _, p in conn.inserts]
+    assert len(keys) == 2 and keys[0] == keys[1]
 
 
 def test_event_key_survives_microsecond_precision():
@@ -168,7 +218,7 @@ def test_event_key_survives_microsecond_precision():
     microsecond would desynchronise the key from Phase 1."""
     key = compute_event_key(SYMBOL, INCIDENT_TS, REF, STOP, TARGET)
     expected = hashlib.sha256(
-        f"{SYMBOL}|SHORT|{INCIDENT_TS.isoformat()}|{REF}|{STOP}|{TARGET}"
+        f"{SYMBOL}|SHORT|{INCIDENT_TS.isoformat()}|342.1|342.78|338.0"
         .encode()
     ).hexdigest()
     assert key == expected

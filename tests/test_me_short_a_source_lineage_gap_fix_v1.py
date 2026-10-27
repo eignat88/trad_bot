@@ -1202,6 +1202,39 @@ def test_full_chain_intake_to_outcome_on_one_event_key():
     assert outcome["is_final"] is True
 
 
+def test_chain_joins_one_event_across_price_representations():
+    """The chain closes on ONE key whatever spelling the captured prices
+    used (regression: the writer's key used to keep the raw spelling while
+    the reader canonicalised the stored ``numeric`` column, so a
+    ``Decimal("342.10")`` event joined nothing): the writer's key from
+    ``Decimal("...0")`` inputs, the reader's key recomputed from a
+    numeric(24,8)-style read-back, the Phase 1 key (scanner float repr) and
+    the lineage/outcome keys are byte-identical."""
+    key = compute_event_key(SYMBOL, SIG_US, REF, STOP, TARGET)
+    spelled = make_intake_row(
+        ref=Decimal(str(REF) + "0"), stop=Decimal(str(STOP) + "0"),
+        target=Decimal(str(TARGET) + "0"),
+        # what a numeric(24,8) round-trip delivers back:
+        reference_price=Decimal(f"{float(REF):.8f}"),
+        stop_price=Decimal(f"{float(STOP):.8f}"),
+        target_price=Decimal(f"{float(TARGET):.8f}"),
+    )
+    assert spelled["event_key"] == key          # writer side is canonical
+
+    conn = GapConn(intake_rows=[spelled])
+    conn.phase1_rows = [[key, [42]]]            # Phase 1 snapshot on THAT key
+    runtime = build_runtime(conn, candidates_source=intake_composite(conn))
+    runtime.run_cycle()
+
+    for table in (SOURCE_TABLE, LINEAGE_TABLE, OUTCOME_TABLE):
+        rows = conn.inserts_for(table)
+        assert len(rows) == 1
+        assert base._payload(rows[0])["event_key"] == key
+    lineage_row = base._payload(conn.inserts_for(LINEAGE_TABLE)[0])
+    assert lineage_row["phase1_linked"] is True
+    assert lineage_row["phase1_event_key"] == key
+
+
 def test_stop_first_and_horizon_are_unchanged_for_intake_sourced_events():
     key = compute_event_key(SYMBOL, SIG_US, REF, STOP, TARGET)
     candles = base.make_outcome_candles(
