@@ -555,6 +555,31 @@ class ScannerOrchestrator:
                 "scanner scan=%d symbol=%s candidates=%d unique=%d",
                 self.scan_count, ctx.symbol, len(all_candidates), len(valid),
             )
+
+        # Market regime filter: apply scanner-specific allow-lists first, then
+        # the generic direction-conflict policy for scanners without a rule.
+        regime_rejected_candidates = []
+        if regime_filter:
+            valid_before_regime = list(valid)
+            valid = self._apply_regime_filter(
+                ctx, valid, scanner_regime_whitelist or {},
+            )
+            
+            # Identify candidates rejected by regime filter
+            valid_ids = {c.setup_id for c in valid}
+            regime_rejected_candidates = [
+                c for c in valid_before_regime
+                if c.setup_id not in valid_ids
+            ]
+
+        # Attach regime-rejected candidates for OOS research
+        stats["_regime_rejected_candidates"] = regime_rejected_candidates
+
+        # setups_saved counts what is ACTUALLY returned for persistence.
+        # It is computed after the regime filter: counting before the filter
+        # reported phantom saves for candidates the filter later dropped
+        # (confirmed incident: setups_saved=1 while dds.scanner_setup stayed
+        # empty for the regime-rejected ME SHORT event).
         saved_by_scanner: dict[str, int] = {}
         for candidate in valid:
             saved_by_scanner[candidate.scanner_name] = (
@@ -581,25 +606,6 @@ class ScannerOrchestrator:
                     s["candidates_found"],
                     s["setups_saved"],
                 )
-
-        # Market regime filter: apply scanner-specific allow-lists first, then
-        # the generic direction-conflict policy for scanners without a rule.
-        regime_rejected_candidates = []
-        if regime_filter:
-            valid_before_regime = list(valid)
-            valid = self._apply_regime_filter(
-                ctx, valid, scanner_regime_whitelist or {},
-            )
-            
-            # Identify candidates rejected by regime filter
-            valid_ids = {c.setup_id for c in valid}
-            regime_rejected_candidates = [
-                c for c in valid_before_regime
-                if c.setup_id not in valid_ids
-            ]
-
-        # Attach regime-rejected candidates for OOS research
-        stats["_regime_rejected_candidates"] = regime_rejected_candidates
 
         return valid, stats
 
