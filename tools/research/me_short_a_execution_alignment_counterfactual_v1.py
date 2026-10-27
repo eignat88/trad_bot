@@ -47,9 +47,7 @@ def evaluate(signal: dict, candles: list[dict], *, entry_key: str, cost_rate: De
     )
     # Require contiguous 5m coverage through horizon, including timeout candle.
     # Early exits can be finalized with contiguous coverage only through exit bar.
-    expected = (start.replace(second=0, microsecond=0, minute=(start.minute // 5 + 1) * 5)
-                if start.minute % 5 != 4 else None)
-    # More robust ceiling by integer epoch, always strictly after signal:
+    # First complete 5-minute candle opening strictly after the signal:
     epoch = int(start.timestamp())
     first_open = datetime.fromtimestamp(((epoch // 300) + 1) * 300, timezone.utc)
     cursor = first_open
