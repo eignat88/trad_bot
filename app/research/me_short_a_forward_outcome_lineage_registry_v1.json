@@ -1,0 +1,139 @@
+{
+  "experiment_id": "ME_SHORT_A_FORWARD_ONLY_OUTCOME_AND_LINEAGE_CAPTURE_V1",
+  "protocol_version": "ME_SHORT_A_FORWARD_ONLY_OUTCOME_AND_LINEAGE_CAPTURE_V1",
+  "protocol_hash": "87f5a5bad48c2e969d28f5a5049cf4b27f68f7888ff2e0f7e3cf9312d785f7eb",
+  "protocol_payload_sha256_of": "sorted, compact JSON of the frozen fields below (see app/research/me_short_a_forward_outcome_lineage_v1.py PROTOCOL_PAYLOAD)",
+  "issue": 208,
+  "parent_issues": [202, 206],
+  "enables": {
+    "issue": 206,
+    "draft_pr": 207,
+    "purpose": "read-only reference-to-execution price alignment counterfactual on matched, matured, finalized outcomes"
+  },
+  "source_experiment_id": "ME_SHORT_GEOM_A_EXECUTION_V1",
+  "phase1_experiment_id": "ME_SHORT_A_EXECUTION_FILL_FEASIBILITY_AUDIT_V1",
+  "scanner_name": "MOMENTUM_EXHAUSTION",
+  "direction": "SHORT",
+  "mode": "OBSERVE_ONLY_NO_ORDERS",
+  "status": "READY_TO_START",
+  "freeze_ts": null,
+
+  "activation": "ME_SHORT_A_LINEAGE_CAPTURE_ENABLED=1 AND DB activation row status=RUNNING with explicit freeze_ts",
+  "activation_lifecycle": {
+    "seed": "migration 078 seeds READY_TO_START with freeze_ts=null",
+    "transitions": "READY_TO_START -> RUNNING (explicit freeze) -> COMPLETED/CANCELLED; READY_TO_START -> CANCELLED; terminal states are final",
+    "freeze_ts": "immutable once set; capture requires strictly signal_time > freeze_ts",
+    "evidence_rows": "append-only (UPDATE/DELETE blocked by trigger on every capture table)"
+  },
+
+  "frozen_geometry": {
+    "entry_rule": "immediate SHORT entry = reference_price (frozen A: max(last five 5m highs))",
+    "stop_rule": "stop = invalidation_price (absolute, > reference_price)",
+    "target_rule": "target = target_1 (absolute, < reference_price)",
+    "structural_r": "stop_price - reference_price",
+    "max_hold_minutes": 240,
+    "intrabar_policy": "STOP_FIRST",
+    "ambiguity_semantics": "a candle that touches both stop and target resolves to the STOP and is flagged ambiguous_intrabar; gross_r = -1",
+    "terminal_path": "first touch in the 240m window decides; no touch -> TIMEOUT_240M with exit at the close of the last in-window 5m candle",
+    "gross_r": "(reference_price - exit_price) / structural_r",
+    "return_at_240m": "(close_of_last_in_window_candle - reference_price) / reference_price * 100 — frozen direction-agnostic convention of research.prospective_outcome, so a favourable SHORT move is negative exactly as in the closed frozen OOS cohort",
+    "mae_240m": "(max high of window - reference_price) / reference_price * 100 (SHORT)",
+    "mfe_240m": "(reference_price - min low of window) / reference_price * 100 (SHORT)"
+  },
+
+  "event_key": {
+    "formula": "sha256(symbol|SHORT|<utc-iso signal_time>|<ref>|<stop>|<target>)",
+    "decimal_form": "str(Decimal(str(value)))",
+    "timestamp_form": "datetime in UTC, .isoformat()",
+    "compatibility": "byte-identical to research.me_short_a_fill_feasibility_v1.event_key (migration 077) and to the key used by PR #207",
+    "layers": [
+      "source signal detail: research.me_short_a_source_signal_v1",
+      "Phase 1 liquidity snapshot: research.me_short_a_fill_feasibility_v1",
+      "outcome observation: research.me_short_a_outcome_observation_v1"
+    ],
+    "verification": "research.me_short_a_event_lineage_v1 recomputes the key from the stored identity components and quarantines any mismatch; symbol, direction, exact signal timestamp, reference, absolute stop, absolute target, protocol version and protocol hash are all checked"
+  },
+
+  "eligibility": "every valid new MOMENTUM_EXHAUSTION SHORT candidate strictly after freeze_ts (reference_price > target_1 > 0 and invalidation_price > reference_price); no post-hoc signal filter",
+  "backfill": "FORBIDDEN — no historical rows, no retro-fitting of source_observation_ids on pre-freeze rows, no mutation of Phase 1 evidence, no mutation of the closed frozen OOS cohort",
+
+  "source_signal_capture": {
+    "table": "research.me_short_a_source_signal_v1",
+    "fields": [
+      "trigger_5m_close",
+      "entry_zone_low",
+      "entry_zone_high",
+      "signal_candle_open_time",
+      "signal_candle_close_time",
+      "recent_high_window (the exact five 5m candles whose highs formed reference_price)",
+      "recent_high_window_candles",
+      "recent_high_window_start",
+      "recent_high_window_end",
+      "market_context",
+      "signal_time_quote"
+    ],
+    "missing_data": "recorded explicitly in missing_fields; never imputed",
+    "no_lookahead": "recent_high_window_end <= signal_time and signal_candle_close_time <= signal_time are hard rejects enforced in code and by DB CHECK"
+  },
+
+  "post_signal_candle_provenance": {
+    "table": "research.me_short_a_post_signal_candle_v1",
+    "window": "the closed 5m candles whose OPEN time o satisfies signal_time < o < signal_time + 240m — identical inequality to the frozen prospective_evaluator window (47 candles for a grid-aligned signal, 48 otherwise; the count is derived from the window, never assumed)",
+    "closed_only": "is_closed must be TRUE and candle_close_time <= retrieved_at",
+    "touch_semantics": "CANDLE_OHLC_TOUCH_NOT_ORDERBOOK_FILL",
+    "limit_at_reference_touch": "candle high >= reference_price; classified on a candle basis and never presented as a fill",
+    "partial_fill": "UNKNOWN_NOT_INDEPENDENTLY_CAPTURED unless a separate independent capture proves otherwise"
+  },
+
+  "outcome_finalization": {
+    "table": "research.me_short_a_outcome_observation_v1",
+    "authority": "closed 5m candles only",
+    "completeness": "candles_expected is derived from the frozen window (never assumed), candles_present must equal candles_expected, candles_missing lists the exact missing open times",
+    "asof": "every used candle must close at or before asof_time (no lookahead); recorded as asof_ok",
+    "no_premature_finalization": "a row is written only after the horizon is settled on closed candles; OUTCOME_UNMATURED rows are never produced by this collector",
+    "incomplete_source": "SOURCE_INCOMPLETE rows carry NO path, NO exit price and NO R/return economics — a source-missing row can never be read as a result",
+    "exit_fill_semantics": "MODELED_UNKNOWN (enforced by DB CHECK)",
+    "retry_idempotency": "INSERT ... ON CONFLICT (event_key) DO NOTHING; replay returns False and writes nothing"
+  },
+
+  "lineage_output_statuses": [
+    "MISSING_LINEAGE",
+    "OUTCOME_UNMATURED",
+    "SOURCE_INCOMPLETE",
+    "MATCHED_FINALIZED"
+  ],
+  "analysis_eligible_status": "MATCHED_FINALIZED",
+
+  "cost_model": {
+    "fee_per_side": "0.00055",
+    "normal_round_trip_cost": "0.0021",
+    "elevated_round_trip_cost": "0.0031",
+    "net_r_normal": "gross_r - 0.0021 * reference_price / structural_r",
+    "net_r_elevated": "gross_r - 0.0031 * reference_price / structural_r",
+    "note": "frozen ME_SHORT_GEOM_A_EXECUTION_V1 constants, classification only, never retuned"
+  },
+
+  "accumulation_gate": {
+    "minimum_n": 200,
+    "minimum_symbols": 20,
+    "meaning": "minimum eligibility for the #206 evaluation, not an automatic PASS",
+    "evaluation": "#206 independent executable-entry Net E[R]/PF/CI by notionals 100/500/1000, entry-fee cost attribution, no double-count of reference-to-bid drift/spread, symbol/day concentration"
+  },
+
+  "holdout_cohort": "every event captured strictly after this protocol's freeze_ts forms a NEW prospective holdout cohort; it is never pooled with the closed 380-row ME_SHORT_GEOM_A_EXECUTION_V1 research cohort",
+
+  "forbidden": [
+    "orders",
+    "paper routing",
+    "live routing",
+    "direction gate changes",
+    "paper/live activation",
+    "historical backfill",
+    "retro-fitting source_observation_ids on pre-freeze rows",
+    "mutating research.me_short_a_fill_feasibility_v1",
+    "mutating research.prospective_observation / research.prospective_outcome",
+    "modifying the closed frozen OOS outputs"
+  ],
+
+  "note": "No activation, no capture, no backfill until a separate approved deploy/freeze checkpoint. Paper/live forbidden. The frozen A methodology is never modified by this collector."
+}

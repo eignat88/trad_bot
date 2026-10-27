@@ -8,13 +8,34 @@ on:
       - 'app/research/prospective_registry.json'
       - 'app/research/me_short_a_fill_feasibility_v1.py'
       - 'app/research/me_short_a_fill_feasibility_registry_v1.json'
+      - 'app/research/me_short_a_forward_outcome_lineage_v1.py'
+      - 'app/research/me_short_a_forward_outcome_lineage_registry_v1.json'
+      - 'app/research/me_short_a_forward_outcome_runtime_v1.py'
+      - 'app/research/me_short_a_forward_outcome_runtime_sources_v1.py'
+      - 'app/research/me_short_a_forward_outcome_runtime_runner_v1.py'
+      - 'app/research/me_short_a_forward_outcome_runtime_registry_v1.json'
       - 'sql/migrations/071_me_short_geom_a_execution_v1_registration.sql'
       - 'sql/migrations/072_me_short_geom_a_execution_v1_activation.sql'
       - 'sql/migrations/077_me_short_a_fill_feasibility_v1.sql'
+      - 'sql/migrations/078_me_short_a_forward_only_outcome_lineage_v1.sql'
+      - 'sql/migrations/079_me_short_a_forward_outcome_runtime_integration_v1.sql'
+      - 'sql/grants/me_short_a_forward_outcome_lineage_least_privilege_v1.sql'
+      - 'sql/grants/me_short_a_forward_outcome_runtime_least_privilege_v1.sql'
+      - 'sql/research/me_short_a_forward_outcome_lineage_audit_v1.sql'
+      - 'deploy/systemd/trad-bot-me-short-a-forward-outcome.service'
+      - 'docs/research/ME_SHORT_A_FORWARD_ONLY_OUTCOME_AND_LINEAGE_CAPTURE_V1.md'
+      - 'docs/research/ME_SHORT_A_FORWARD_OUTCOME_RUNTIME_INTEGRATION_V1.md'
+      - 'docs/research/ME_SHORT_A_FORWARD_OUTCOME_RUNTIME_DEPLOYMENT_RUNBOOK_V1.md'
       - 'tests/test_me_short_geom_a_execution_v1.py'
       - 'tests/test_me_short_abc_terminal_lifecycle_v1.py'
       - 'tests/test_me_short_a_fill_feasibility_v1.py'
       - 'tests/test_me_short_a_fill_feasibility_migration_077_v1.py'
+      - 'tests/test_me_short_a_forward_outcome_lineage_v1.py'
+      - 'tests/test_me_short_a_forward_outcome_lineage_migration_078_v1.py'
+      - 'tests/test_me_short_a_forward_outcome_runtime_v1.py'
+      - 'tests/test_me_short_a_forward_outcome_runtime_migration_079_v1.py'
+      - 'tests/test_me_short_a_forward_outcome_runtime_pagination_and_lineage_v1.py'
+      - 'tests/test_me_short_a_forward_outcome_runtime_permissions_v1.py'
       - 'sql/migrations/073_me_short_abc_terminal_lifecycle.sql'
       - 'tests/test_prospective_evaluator_variant_tuple_hardening_v1.py'
       - 'tests/test_vc_short_execution_prospective_protocol.py'
@@ -49,17 +70,40 @@ jobs:
 
       - name: Compile touched Python
         run: |
-          python -m compileall -q             app/research/prospective_observer.py             app/research/prospective_evaluator.py             app/research/me_short_a_fill_feasibility_v1.py             tests/test_me_short_geom_a_execution_v1.py \
+          python -m compileall -q \
+            app/research/prospective_observer.py \
+            app/research/prospective_evaluator.py \
+            app/research/me_short_a_fill_feasibility_v1.py \
+            app/research/me_short_a_forward_outcome_lineage_v1.py \
+            app/research/me_short_a_forward_outcome_runtime_v1.py \
+            app/research/me_short_a_forward_outcome_runtime_sources_v1.py \
+            app/research/me_short_a_forward_outcome_runtime_runner_v1.py \
+            tests/test_me_short_geom_a_execution_v1.py \
             tests/test_me_short_abc_terminal_lifecycle_v1.py \
             tests/test_me_short_a_fill_feasibility_v1.py \
-            tests/test_me_short_a_fill_feasibility_migration_077_v1.py
+            tests/test_me_short_a_fill_feasibility_migration_077_v1.py \
+            tests/test_me_short_a_forward_outcome_lineage_v1.py \
+            tests/test_me_short_a_forward_outcome_lineage_migration_078_v1.py \
+            tests/test_me_short_a_forward_outcome_runtime_v1.py \
+            tests/test_me_short_a_forward_outcome_runtime_migration_079_v1.py \
+            tests/test_me_short_a_forward_outcome_runtime_pagination_and_lineage_v1.py \
+            tests/test_me_short_a_forward_outcome_runtime_permissions_v1.py
 
       - name: Run execution protocol regressions
         env:
           PYTHONPATH: .
         run: |
-          python -m pytest -q -p no:cacheprovider             tests/test_me_short_geom_a_execution_v1.py \
+          python -m pytest -q -p no:cacheprovider \
+            tests/test_me_short_geom_a_execution_v1.py \
             tests/test_me_short_abc_terminal_lifecycle_v1.py \
             tests/test_me_short_a_fill_feasibility_v1.py \
             tests/test_me_short_a_fill_feasibility_migration_077_v1.py \
-            tests/test_prospective_evaluator_variant_tuple_hardening_v1.py             tests/test_vc_short_execution_prospective_protocol.py             --tb=short
+            tests/test_me_short_a_forward_outcome_lineage_v1.py \
+            tests/test_me_short_a_forward_outcome_lineage_migration_078_v1.py \
+            tests/test_me_short_a_forward_outcome_runtime_v1.py \
+            tests/test_me_short_a_forward_outcome_runtime_migration_079_v1.py \
+            tests/test_me_short_a_forward_outcome_runtime_pagination_and_lineage_v1.py \
+            tests/test_me_short_a_forward_outcome_runtime_permissions_v1.py \
+            tests/test_prospective_evaluator_variant_tuple_hardening_v1.py \
+            tests/test_vc_short_execution_prospective_protocol.py \
+            --tb=short
