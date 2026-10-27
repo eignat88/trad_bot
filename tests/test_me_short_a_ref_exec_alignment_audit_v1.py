@@ -408,7 +408,8 @@ def test_limit_touch_derived_from_mae():
 def test_lookahead_and_timestamp_flags():
     past_capture = evidence_row(captured_at=SIGNAL - timedelta(seconds=5))
     future_book = evidence_row(
-        book_time_ms=int((SIGNAL + timedelta(seconds=30)).timestamp() * 1000))
+        book_time_ms=int((SIGNAL + timedelta(seconds=30)).timestamp() * 1000),
+        book_age_ms=-5000)
     early_outcome = outcome_row(evaluated_240m_at=SIGNAL + timedelta(minutes=10),
                                 created_at=SIGNAL + timedelta(minutes=10))
     l1 = build_row_lineage(past_capture, {555: observation_row()},
@@ -1241,3 +1242,52 @@ def test_short_entry_above_target_remains_valid():
 
     assert cf["executable"]["status"] == "OK"
     assert cf["executable"]["gross_r"] is not None
+
+def test_delayed_api_receipt_does_not_create_false_book_lookahead():
+    evidence = evidence_row(
+        book_time_ms=int(
+            (SIGNAL + timedelta(seconds=5)).timestamp() * 1000
+        ),
+        book_age_ms=500,
+    )
+
+    lineage = build_row_lineage(
+        evidence,
+        {555: observation_row()},
+        {555: outcome_row()},
+        SIGNAL + timedelta(hours=5),
+    )
+
+    assert lineage["lineage_status"] == OK
+    assert "book_timestamp_in_future" not in lineage["lookahead_flags"]
+
+
+def test_negative_book_age_detects_genuine_future_timestamp():
+    evidence = evidence_row(
+        book_time_ms=int(
+            (SIGNAL + timedelta(seconds=5)).timestamp() * 1000
+        ),
+        book_age_ms=-5000,
+    )
+
+    lineage = build_row_lineage(
+        evidence,
+        {555: observation_row()},
+        {555: outcome_row()},
+        SIGNAL + timedelta(hours=5),
+    )
+
+    assert "book_timestamp_in_future" in lineage["lookahead_flags"]
+
+@pytest.mark.parametrize("book_age", [None, "invalid"])
+def test_missing_or_invalid_book_age_is_not_silently_accepted(book_age):
+    evidence = evidence_row(book_age_ms=book_age)
+
+    lineage = build_row_lineage(
+        evidence,
+        {555: observation_row()},
+        {555: outcome_row()},
+        SIGNAL + timedelta(hours=5),
+    )
+
+    assert "book_age_invalid" in lineage["lookahead_flags"]

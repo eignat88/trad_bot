@@ -710,10 +710,16 @@ def build_row_lineage(evidence: dict, observations: dict[int, dict],
     if captured_at is not None and ev_time is not None and captured_at < ev_time:
         result["lookahead_flags"].append("capture_before_signal")
     book_time_ms = evidence.get("book_time_ms")
-    if book_time_ms is not None and captured_at is not None:
-        book_age = int(book_time_ms) - int(captured_at.timestamp() * 1000)
-        if book_age > BOOK_FUTURE_SKEW_MS:
-            result["lookahead_flags"].append("book_timestamp_in_future")
+    book_age_ms = evidence.get("book_age_ms")
+    if book_time_ms is not None:
+        if book_age_ms is None:
+            result["lookahead_flags"].append("book_age_invalid")
+        else:
+            try:
+                if int(book_age_ms) < -BOOK_FUTURE_SKEW_MS:
+                    result["lookahead_flags"].append("book_timestamp_in_future")
+            except (TypeError, ValueError, OverflowError):
+                result["lookahead_flags"].append("book_age_invalid")
     if matured_at is not None and ev_time is not None and matured_at < signal_plus_hold:
         result["lookahead_flags"].append("outcome_finalized_before_maturity")
     outcome_created = _dt(outcome.get("created_at"))
