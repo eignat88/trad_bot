@@ -1045,9 +1045,15 @@ class CompositeCandidateSource(CandidateSource):
       bound would silently exclude legitimate post-#208-freeze ``dds`` rows
       and change the frozen cohort;
     * each fetch gives every sub-source a guaranteed minimum share of the
-      page BEFORE any leftover capacity is distributed, so a constant full
+      page BEFORE any leftover capacity is distributed, the sum of raw rows
+      in one composite page never exceeds ``page_size``, and when the page
+      cannot hold every transport (e.g. ``page_size=1``) the scarce slot
+      ROTATES — carried in the opaque cursor itself — so a constant full
       stream in one transport (e.g. a busy ``dds.scanner_setup``) can never
-      starve another (e.g. new research intake rows).
+      starve another (e.g. new research intake rows) at any
+      ``page_size >= 1``.  The rotation makes page composition a pure
+      function of the resume token, so a stalled page re-read from the same
+      cursor returns the same rows.
     """
 
     def __init__(self, sources: Sequence[CandidateSource]) -> None:
@@ -1084,6 +1090,7 @@ class CompositeCandidateSource(CandidateSource):
             raise ValueError("page_size must be >= 1")
 
         state = self._decode_cursor(cursor)
+        start, sub_cursors = state
 
         # ``freeze_ts`` (the ORIGINAL Issue #208 freeze) is passed through
         # VERBATIM to every sub-source; each sub-source applies its own
@@ -1092,23 +1099,39 @@ class CompositeCandidateSource(CandidateSource):
         candidates: list[Candidate] = []
         rejected: list[str] = []
         rows_read = 0
+        sources_total = len(self._sources)
 
-        # Fair share: every sub-source is guaranteed a minimum share of each
-        # page BEFORE leftover capacity is distributed, so a constant full
-        # stream in one transport can never starve another.  The two rounds
-        # are deterministic (no hidden rotation state), so re-reading a page
-        # from the same cursor returns the same composition.
-        min_share = max(1, limit // len(self._sources))
+        # Fair share, valid for EVERY ``page_size >= 1``:
+        #
+        # * the sum of raw rows in one composite page never exceeds
+        #   ``page_size`` — every sub-page request is capped by the REMAINING
+        #   capacity, including when ``page_size`` is smaller than the number
+        #   of sources;
+        # * every sub-source is guaranteed a minimum share BEFORE leftover
+        #   capacity is distributed, so a constant full stream in one
+        #   transport can never starve another;
+        # * when the page cannot hold every transport (e.g. ``page_size=1``),
+        #   the scarce slot rotates: the rotation start is carried in the
+        #   opaque cursor itself and advances by one per consumed page, so it
+        #   is a pure function of the resume token — re-reading a stalled
+        #   page from the same cursor returns the SAME composition, and no
+        #   transport can be skipped forever;
+        # * a fetch that consumed nothing returns the cursor unchanged.
+        min_share = max(1, limit // sources_total)
         for round_index in (0, 1):
-            for index, source in enumerate(self._sources):
+            for step in range(sources_total):
+                index = (start + step) % sources_total
+                remaining = limit - rows_read
+                if remaining <= 0:
+                    break
                 want = (
-                    min_share if round_index == 0
-                    else limit - len(candidates)
+                    min(min_share, remaining) if round_index == 0
+                    else remaining
                 )
                 if want <= 0:
                     break
-                page = source.fetch_page(
-                    state[index],
+                page = self._sources[index].fetch_page(
+                    sub_cursors[index],
                     freeze_ts=freeze_ts,
                     page_size=want,
                 )
@@ -1116,7 +1139,7 @@ class CompositeCandidateSource(CandidateSource):
                 rejected.extend(page.rejected)
                 candidates.extend(page.candidates)
                 if page.rows_read > 0:
-                    state[index] = page.next_cursor
+                    sub_cursors[index] = page.next_cursor
 
         # One event can arrive through several transports. Collapse the
         # duplicates within THIS fetch by the deterministic identity; the
@@ -1134,22 +1157,36 @@ class CompositeCandidateSource(CandidateSource):
             seen_keys.add(key)
             deduped.append(candidate)
 
+        # A page that consumed nothing leaves the resume token exactly where
+        # it was (rotation start included); a consumed page rotates the
+        # scarce slot by one so every transport is served in turn.
+        next_start = (start + 1) % sources_total if rows_read > 0 else start
         return CandidatePage(
             candidates=tuple(deduped),
             rejected=tuple(rejected),
             rows_read=rows_read,
             page_size=limit,
-            cursor=tuple(state),
+            cursor=(next_start, *sub_cursors),
             exhausted=rows_read < limit,
         )
 
     def _decode_cursor(
-        self, cursor: tuple[datetime, Any] | None,
-    ) -> list[tuple[datetime, Any] | None]:
+        self, cursor: Any,
+    ) -> tuple[int, list[tuple[datetime, Any] | None]]:
+        """``(rotation start, one sub-cursor per source)`` from the token.
+
+        The rotation start is part of the opaque resume token on purpose: it
+        makes the scarce-slot order a PURE FUNCTION of the cursor, so a
+        stalled page re-read from the same cursor returns the same
+        composition while the rotation still advances across consumed pages.
+        """
         if cursor is None:
-            return [None] * len(self._sources)
+            return 0, [None] * len(self._sources)
         parts = tuple(cursor)
-        if len(parts) != len(self._sources):
+        if len(parts) != len(self._sources) + 1:
             raise ValueError(
                 "composite cursor does not match the number of sources")
-        return list(parts)
+        start = int(parts[0])
+        if not 0 <= start < len(self._sources):
+            raise ValueError("composite cursor rotation start out of range")
+        return start, list(parts[1:])

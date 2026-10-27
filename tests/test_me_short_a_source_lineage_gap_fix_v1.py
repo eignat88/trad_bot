@@ -797,9 +797,12 @@ def test_composite_cursor_shape_is_opaque_and_stable():
     ))
     page = sources.fetch_page(None, freeze_ts=FREEZE)
     cursor = page.next_cursor
-    assert len(tuple(cursor)) == 2
+    # opaque resume token: rotation start + one sub-cursor per source
+    assert len(tuple(cursor)) == 3
     with pytest.raises(ValueError):
         sources.fetch_page((cursor[0],), freeze_ts=FREEZE)
+    with pytest.raises(ValueError):
+        sources.fetch_page((99, *cursor[1:]), freeze_ts=FREEZE)
 
 
 def _drain(sources, *, freeze_ts=FREEZE, page_size, max_fetches=1000):
@@ -931,6 +934,127 @@ def test_intake_read_error_fails_soft_and_the_dds_stream_continues():
     conn.fail_select = None
     after = sources.fetch_page(page.next_cursor, freeze_ts=FREEZE, page_size=10)
     assert [c.symbol for c in after.candidates] == ["FRESH1USDT"]  # lossless
+
+
+def test_page_size_one_rotates_the_scarce_slot_between_transports():
+    """Review fix: at ``page_size=1`` the single slot must NOT be monopolised
+    by the first source — it rotates deterministically via the cursor, the
+    raw-row cap is honoured and nothing is lost."""
+    dds = [make_dds_row(setup_id=f"dds-{i}",
+                        detected_at=SIG_US + timedelta(seconds=i))
+           for i in range(3)]
+    intake = [make_intake_row(symbol=f"SYM{i}USDT",
+                              signal_time=SIG_US + timedelta(milliseconds=i))
+              for i in range(3)]
+    conn = GapConn(dds_rows=dds, intake_rows=intake)
+    sources = CompositeCandidateSource((
+        DbScannerSetupCandidateSource(conn, candle_source_for()),
+        DbSourceIntakeCandidateSource(conn, candle_source_for()),
+    ))
+    seen = []
+    page_symbols = []
+    cursor = None
+    for _ in range(20):
+        page = sources.fetch_page(cursor, freeze_ts=FREEZE, page_size=1)
+        assert page.rows_read <= 1                 # raw-row cap honoured
+        if page.rows_read <= 0:
+            break
+        page_symbols.append(page.candidates[0].symbol)
+        seen.extend(page.candidates)
+        cursor = page.next_cursor
+    assert page_symbols == [SYMBOL, "SYM0USDT", SYMBOL, "SYM1USDT",
+                            SYMBOL, "SYM2USDT"]    # strict alternation
+    assert len(seen) == 6
+    assert len({mod.event_key_for(c) for c in seen}) == 6   # lossless
+
+
+def test_page_size_two_serves_both_transports_fairly():
+    """At ``page_size=2`` with two sources each page serves BOTH transports
+    one row at a time; the cap holds and the drain is lossless."""
+    dds = [make_dds_row(setup_id=f"dds-{i}",
+                        detected_at=SIG_US + timedelta(seconds=i))
+           for i in range(3)]
+    intake = [make_intake_row(symbol=f"SYM{i}USDT",
+                              signal_time=SIG_US + timedelta(milliseconds=i))
+              for i in range(3)]
+    conn = GapConn(dds_rows=dds, intake_rows=intake)
+    sources = CompositeCandidateSource((
+        DbScannerSetupCandidateSource(conn, candle_source_for()),
+        DbSourceIntakeCandidateSource(conn, candle_source_for()),
+    ))
+    cursor = None
+    pages = []
+    for _ in range(20):
+        page = sources.fetch_page(cursor, freeze_ts=FREEZE, page_size=2)
+        assert page.rows_read <= 2                 # raw-row cap honoured
+        if page.rows_read <= 0:
+            break
+        pages.append(page)
+        cursor = page.next_cursor
+    assert len(pages) == 3                         # 2 rows per page, 6 total
+    assert all(len(p.candidates) == 2 for p in pages)
+    for page in pages:                             # one of each per page
+        kinds = {c.symbol == SYMBOL for c in page.candidates}
+        assert kinds == {True, False}
+
+
+@pytest.mark.parametrize("page_size", [1, 2])
+def test_small_page_sizes_drain_a_load_without_loss(page_size):
+    """A sustained load across both transports drains completely at the
+    smallest page sizes: no row lost, no row duplicated, cap always held."""
+    dds = [make_dds_row(setup_id=f"dds-{i}",
+                        detected_at=SIG_US + timedelta(seconds=i))
+           for i in range(30)]
+    intake = [make_intake_row(symbol=f"SYM{i:03d}USDT",
+                              signal_time=SIG_US + timedelta(milliseconds=i))
+              for i in range(30)]
+    conn = GapConn(dds_rows=dds, intake_rows=intake)
+    sources = CompositeCandidateSource((
+        DbScannerSetupCandidateSource(conn, candle_source_for()),
+        DbSourceIntakeCandidateSource(conn, candle_source_for()),
+    ))
+    seen = []
+    cursor = None
+    for _ in range(500):
+        page = sources.fetch_page(cursor, freeze_ts=FREEZE,
+                                  page_size=page_size)
+        assert page.rows_read <= page_size         # raw-row cap honoured
+        if page.rows_read <= 0:
+            break
+        seen.extend(page.candidates)
+        cursor = page.next_cursor
+    keys = [mod.event_key_for(c) for c in seen]
+    assert len(seen) == 60                         # 30 + 30, nothing lost
+    assert len(set(keys)) == 60                    # nothing duplicated
+
+
+def test_page_size_one_retry_is_reproducible_and_lossless():
+    """Review fix: an error at ``page_size=1`` retries from the same cursor
+    with the SAME composition, sub-cursors stay independent, and the scarce
+    slot keeps rotating — nothing is lost or stuck."""
+    dds = [make_dds_row(setup_id="dds-1")]
+    intake = [make_intake_row(symbol="SYM0USDT")]
+    conn = GapConn(dds_rows=dds, intake_rows=intake)
+    sources = CompositeCandidateSource((
+        DbScannerSetupCandidateSource(conn, candle_source_for()),
+        DbSourceIntakeCandidateSource(conn, candle_source_for()),
+    ))
+    conn.fail_select = "DDS.SCANNER_SETUP"
+    with pytest.raises(mod.DatabaseAccessError):
+        sources.fetch_page(None, freeze_ts=FREEZE, page_size=1)
+    conn.fail_select = None
+    first = sources.fetch_page(None, freeze_ts=FREEZE, page_size=1)
+    again = sources.fetch_page(None, freeze_ts=FREEZE, page_size=1)  # reproducible
+    assert [c.symbol for c in first.candidates] == [SYMBOL]
+    assert ([mod.event_key_for(c) for c in first.candidates]
+            == [mod.event_key_for(c) for c in again.candidates])
+    second = sources.fetch_page(first.next_cursor, freeze_ts=FREEZE,
+                                page_size=1)       # the slot rotated to intake
+    assert [c.symbol for c in second.candidates] == ["SYM0USDT"]
+    third = sources.fetch_page(second.next_cursor, freeze_ts=FREEZE,
+                               page_size=1)
+    assert third.rows_read == 0                    # drained
+    assert third.next_cursor == second.next_cursor  # empty fetch keeps the token
 
 
 # ── F. the full chain through the frozen runtime ────────────────────────

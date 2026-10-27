@@ -179,11 +179,14 @@ would retroactively change the frozen #208 cohort.
   `ON CONFLICT DO NOTHING`.
 * Fair share (review P1): every composite fetch gives each sub-source a
   guaranteed minimum share of the page BEFORE leftover capacity is
-  distributed, so a constant full `dds.scanner_setup` stream can never
-  starve new research intake rows — a fresh intake row is observed in the
-  first page, not after the whole dds backlog is drained. The two-round fill
-  is deterministic, so re-reading a stalled page returns the same
-  composition.
+  distributed, the sum of raw rows in one composite page never exceeds
+  `page_size`, and when the page cannot hold every transport (e.g.
+  `page_size=1`) the scarce slot ROTATES — carried in the opaque cursor
+  itself — so a constant full `dds.scanner_setup` stream can never starve
+  new research intake rows at any `page_size >= 1`: a fresh intake row is
+  observed in the first feasible page, not after the whole dds backlog is
+  drained. The rotation makes page composition a pure function of the
+  resume token, so re-reading a stalled page returns the same composition.
 * Research capture errors never affect the scanner: the hook fails open
   (`capture_with_status` returns `ERROR`; the hook rolls back research state
   only), and persistence errors get their own diagnostics —
