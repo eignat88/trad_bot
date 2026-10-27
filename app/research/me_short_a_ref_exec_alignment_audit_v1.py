@@ -826,7 +826,7 @@ def counterfactual(evidence: dict, outcome: dict, fill: Decimal | None,
         return result
 
     risk_exec = float(stop) - float(fill)
-    if risk_exec <= 0:
+    if risk_exec <= 0 or target is None or float(fill) <= float(target):
         result["executable"] = {
             "entry": _num(fill), "gross_r": None, "net_r": None, "status": INVALID_GEOMETRY,
         }
@@ -1066,7 +1066,13 @@ def alignment_verdict(rows: Sequence[dict], agg: dict[str, Any]) -> dict[str, An
                             "CI entirely below zero"]}
     if reasons:
         return {"verdict": ALIGNMENT_INCONCLUSIVE, "reasons": reasons}
-    if exec_ci_low > 0 and control_er > 0:
+    control_ci_low = (control.get("bootstrap") or {}).get("ci_95_low")
+    if (
+        control_ci_low is not None
+        and control_ci_low > 0
+        and exec_ci_low > 0
+        and control_er > 0
+    ):
         return {"verdict": ALIGNMENT_CONFIRMED,
                 "reasons": ["frozen cohort thresholds met; both control and "
                             "executable-entry Net E[R] CIs exclude zero"]}

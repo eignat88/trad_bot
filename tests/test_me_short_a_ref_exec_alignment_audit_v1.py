@@ -1202,3 +1202,42 @@ def test_feasibility_requires_sufficient_verified_exchange_constraints():
             "constraints" in reason.lower()
             for reason in result["reasons"]
         )
+
+def test_alignment_requires_positive_control_confidence_interval():
+    rows = [
+        _base_view(
+            f"S{i:03d}USDT",
+            1.0 if i % 2 == 0 else -0.95,
+            1.5,
+        )
+        for i in range(200)
+    ]
+
+    agg = aggregate(rows, bootstrap_n=200, seed=7)
+    control_ci = agg["control_net_r"]["bootstrap"]
+    executable_ci = agg["executable_net_r_frozen_exit"]["bootstrap"]
+
+    assert agg["usable_paired_rows"] == 200
+    assert agg["symbols"] >= 20
+    assert agg["control_net_r"]["point_estimate"] > 0
+    assert control_ci["ci_95_low"] <= 0
+    assert executable_ci["ci_95_low"] > 0
+
+    verdict = alignment_verdict(rows, agg)
+    assert verdict["verdict"] == ALIGNMENT_INCONCLUSIVE
+
+@pytest.mark.parametrize("fill", [94.0, 95.0])
+def test_short_entry_at_or_below_target_is_invalid(fill):
+    cf = counterfactual(evidence_row(), outcome_row(), fill, 1000)
+
+    assert cf["control"]["gross_r"] is not None
+    assert cf["executable"]["status"] == "INVALID_GEOMETRY"
+    assert cf["executable"]["gross_r"] is None
+    assert cf["executable"].get("net_r_frozen_exit") is None
+
+
+def test_short_entry_above_target_remains_valid():
+    cf = counterfactual(evidence_row(), outcome_row(), 95.01, 1000)
+
+    assert cf["executable"]["status"] == "OK"
+    assert cf["executable"]["gross_r"] is not None
