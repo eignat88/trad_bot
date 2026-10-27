@@ -130,6 +130,13 @@ def install_research_fn_set_updated_at(admin):
     cur.close()
 
 
+def apply_migration_080(admin):
+    """Apply the real migration 080 script to the scratch database."""
+    cur = admin.cursor()
+    cur.execute(MIGRATION_080.read_text(encoding="utf-8"))
+    cur.close()
+
+
 @pytest.fixture()
 def admin():
     """Admin connection to a fresh READ-ONLY-by-default scratch database."""
@@ -146,6 +153,11 @@ def admin():
     conn = psycopg2.connect(
         host=HOST, port=PORT, database=name, user=USER, connect_timeout=5)
     conn.autocommit = True
+    # The DDL/setup connection states its mode EXPLICITLY too — read-write
+    # (the read-only default remains for every other session of this DB).
+    setup = conn.cursor()
+    setup.execute("SET default_transaction_read_only = off")
+    setup.close()
     yield conn
     conn.close()
     try:
@@ -261,7 +273,7 @@ def test_missing_intake_schema_never_aborts_the_shared_dds_stream(admin):
         # Migration 080 arrives mid-session: the SAME connection keeps
         # serving both transports (intake: fail-closed empty until RUNNING).
         install_research_fn_set_updated_at(admin)
-        admin.execute(MIGRATION_080.read_text(encoding="utf-8"))
+        apply_migration_080(admin)
         activate_intake(admin, datetime.now(timezone.utc) - timedelta(minutes=5))
         later = sources.fetch_page(again.next_cursor, freeze_ts=FREEZE)
         assert later.rows_read == 0          # no rows yet, but no abort state
@@ -301,7 +313,7 @@ def test_writer_recovers_after_pre_migration_failure_without_restart(admin):
 
         # 2) Migration 080 + activation; the SAME cached connection captures.
         install_research_fn_set_updated_at(admin)
-        admin.execute(MIGRATION_080.read_text(encoding="utf-8"))
+        apply_migration_080(admin)
         activate_intake(admin, datetime.now(timezone.utc) - timedelta(minutes=5))
         status = writer.capture_with_status(
             conn,
