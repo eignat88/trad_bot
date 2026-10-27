@@ -30,6 +30,7 @@ from app.research.me_short_a_source_intake_v1 import (
     ROUTE_TRADEABLE_FLOW,
     activation_snapshot,
     capture,
+    capture_with_status,
     compute_event_key,
 )
 from app.research.me_short_a_forward_outcome_lineage_v1 import (
@@ -336,6 +337,47 @@ def test_microsecond_signal_time_is_passed_through_unmodified():
     assert INCIDENT_TS.replace(hour=12, minute=1) in params
 
 
+# ── epoch-millisecond timestamps (review P1) ──────────────────
+
+
+def test_datetime_parses_epoch_milliseconds_to_utc():
+    """Scanner candle fields are epoch MILLISECONDS (e.g.
+    ``signal_candle_open_time = 1793102400000``). Reading them as ISO
+    strings used to fail the whole capture instead of converting them."""
+    expected = datetime(2026, 10, 27, 12, 0, 0, 0, tzinfo=timezone.utc)
+    assert mod._datetime(1793102400000) == expected
+    assert mod._datetime(1793102400000.0) == expected
+    # epoch seconds (small magnitude) stay seconds:
+    assert mod._datetime(1793102400) == expected
+    # ISO strings and datetimes are unchanged:
+    assert mod._datetime("2026-10-27T12:00:00Z") == expected
+    assert mod._datetime(expected) == expected
+    with pytest.raises(ValueError):
+        mod._datetime(True)  # bool is not a timestamp
+
+
+def test_signal_candle_open_time_epoch_ms_is_stored_as_utc_datetime():
+    """An epoch-ms ``signal_candle_open_time`` and epoch-ms window candle
+    times reach the INSERT as UTC datetimes, never as raw integers."""
+    expected = datetime(2026, 10, 27, 12, 0, 0, 0, tzinfo=timezone.utc)
+    window = [
+        {"open_time": 1793102340000,   # 2026-10-27 11:59:00Z
+         "close_time": 1793102400000,  # 2026-10-27 12:00:00Z
+         "high": "342.10", "close": "341.0"},
+    ]
+    conn = FakeConnection()
+    capture(conn, **base_kwargs(
+        signal_time=AFTER_FREEZE,
+        signal_candle_open_time=1793102400000,
+        recent_high_window=window))
+    _, params = conn.inserts[0]
+    assert expected in params                       # signal_candle_open_time
+    assert datetime(2026, 10, 27, 11, 59, 0, 0,
+                    tzinfo=timezone.utc) in params  # window_start
+    assert 1793102400000 not in params              # never a raw integer
+    assert 1793102340000 not in params
+
+
 def test_no_lookahead_window_candles_only():
     """Candles closing after the signal can never enter the window."""
     window = [
@@ -380,6 +422,27 @@ def test_db_failure_on_activation_read_fails_open():
     conn = FakeConnection(fail_on="SELECT STATUS,INTAKE_FREEZE_TS")
     assert capture(conn, **base_kwargs()) is False
     assert conn.inserts == []
+    assert conn.rollbacks == 1  # the cached writer connection is un-aborted
+
+
+def test_activation_read_failure_recovers_on_the_cached_connection():
+    """A capture attempted BEFORE migration 080 is installed must not poison
+    the CACHED writer connection: it fails open, rolls back, and the very
+    next capture on the SAME connection succeeds — no scanner restart."""
+    conn = FakeConnection(fail_on="SELECT STATUS,INTAKE_FREEZE_TS")
+    assert capture_with_status(conn, **base_kwargs()) == "ERROR"
+    assert conn.rollbacks == 1 and conn.inserts == []
+    conn.fail_on = None                       # migration 080 now installed
+    assert capture_with_status(conn, **base_kwargs()) == "CAPTURED"
+    assert conn.commits == 1 and len(conn.persisted) == 1
+
+
+def test_write_failure_recovers_on_the_cached_connection():
+    conn = FakeConnection(fail_on="INSERT INTO")
+    assert capture_with_status(conn, **base_kwargs()) == "ERROR"
+    assert conn.rollbacks == 1
+    conn.fail_on = None
+    assert capture_with_status(conn, **base_kwargs()) == "CAPTURED"
 
 
 def test_capture_fails_open_on_none_connection():

@@ -425,6 +425,58 @@ class GapConn(base.FakeConnection):
         ]
 
 
+class _AbortCursor:
+    """FakeCursor wrapper with PostgreSQL abort semantics: once a statement
+    fails, every later statement on the connection fails with "current
+    transaction is aborted" until ROLLBACK/COMMIT."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._cur = base.FakeCursor(conn)
+        self.rowcount = -1
+
+    def execute(self, sql, params=None):
+        if self._conn.aborted:
+            raise RuntimeError(
+                "current transaction is aborted, commands ignored until "
+                "end of transaction block")
+        try:
+            self._cur.execute(sql, params)
+        except Exception:
+            self._conn.aborted = True
+            raise
+        self.rowcount = self._cur.rowcount
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    def close(self):
+        pass
+
+
+class AbortEmulatingConn(GapConn):
+    """GapConn whose transaction aborts on a failed statement — exactly what
+    PostgreSQL does to the SHARED read-only transaction of both transports."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.aborted = False
+
+    def cursor(self):
+        return _AbortCursor(self)
+
+    def rollback(self):
+        self.aborted = False
+        super().rollback()
+
+    def commit(self):
+        self.aborted = False
+        super().commit()
+
+
 def make_intake_row(signal_time=SIG_US, *, symbol=SYMBOL,
                     ref=REF, stop=STOP, target=TARGET, **overrides):
     row = dict(
@@ -934,6 +986,44 @@ def test_intake_read_error_fails_soft_and_the_dds_stream_continues():
     conn.fail_select = None
     after = sources.fetch_page(page.next_cursor, freeze_ts=FREEZE, page_size=10)
     assert [c.symbol for c in after.candidates] == ["FRESH1USDT"]  # lossless
+
+
+def test_intake_read_failure_never_aborts_the_shared_transaction_for_dds():
+    """PostgreSQL aborts the WHOLE transaction on one failed statement. The
+    optional intake read must un-abort it, or one missing/forbidden intake
+    table (e.g. before migration 080) would permanently break the MANDATORY
+    dds.scanner_setup stream on the shared READ ONLY connection."""
+    conn = AbortEmulatingConn(
+        dds_rows=[make_dds_row(setup_id="dds-1")],
+        intake_rows=[make_intake_row(symbol="FRESH1USDT")])
+    conn.fail_select = "ME_SHORT_A_SOURCE_INTAKE_V1"
+    sources = CompositeCandidateSource((
+        DbScannerSetupCandidateSource(conn, candle_source_for()),
+        DbSourceIntakeCandidateSource(conn, candle_source_for()),
+    ))
+    page = sources.fetch_page(None, freeze_ts=FREEZE, page_size=10)
+    assert [c.symbol for c in page.candidates] == [SYMBOL]   # dds unaffected
+    assert conn.aborted is False                             # un-aborted
+    conn.fail_select = None
+    after = sources.fetch_page(page.next_cursor, freeze_ts=FREEZE, page_size=10)
+    assert [c.symbol for c in after.candidates] == ["FRESH1USDT"]  # lossless
+    assert conn.rollbacks >= 1
+
+
+def test_dds_read_error_un_aborts_and_the_same_page_retries():
+    """A dds read error stays fail-loud (the runtime stalls the page), but
+    the transaction is un-aborted so the retry can actually run instead of
+    failing with "current transaction is aborted" forever."""
+    conn = AbortEmulatingConn(dds_rows=[make_dds_row(setup_id="dds-1")])
+    source = DbScannerSetupCandidateSource(conn, candle_source_for())
+    conn.fail_select = "DDS.SCANNER_SETUP"
+    with pytest.raises(mod.DatabaseAccessError):
+        source.fetch_page(None, freeze_ts=FREEZE)
+    assert conn.aborted is False                 # ready for the retry
+    assert conn.rollbacks == 1
+    conn.fail_select = None
+    page = source.fetch_page(None, freeze_ts=FREEZE)   # same cursor, no loss
+    assert [c.symbol for c in page.candidates] == [SYMBOL]
 
 
 def test_page_size_one_rotates_the_scarce_slot_between_transports():

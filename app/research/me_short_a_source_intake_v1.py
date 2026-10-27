@@ -124,8 +124,25 @@ INSERT_SQL = """
 
 
 def _datetime(value: Any) -> datetime:
-    dt = value if isinstance(value, datetime) else datetime.fromisoformat(
-        str(value).replace("Z", "+00:00"))
+    """Parse a timestamp into a UTC datetime.
+
+    Accepts datetime objects, ISO strings and epoch numbers. Numeric values
+    are epoch MILLISECONDS when their magnitude says so (``>= 1e11`` — every
+    real millisecond timestamp since 1973, and no plausible epoch-seconds
+    value) and epoch seconds otherwise. The scanner's candle fields
+    (``signal_candle_open_time``, window ``open_time``/``close_time``) are
+    epoch milliseconds: reading them as ISO strings used to fail the whole
+    capture instead of converting them.
+    """
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, bool):
+        raise ValueError("boolean is not a timestamp")
+    elif isinstance(value, (int, float)):
+        seconds = value / 1000.0 if abs(value) >= 10**11 else float(value)
+        dt = datetime.fromtimestamp(seconds, tz=timezone.utc)
+    else:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
@@ -283,6 +300,15 @@ def capture_with_status(
         try:
             state = activation_snapshot(conn)
         except Exception:
+            # A failed read aborts the whole transaction in PostgreSQL. The
+            # writer connection is a CACHED singleton reused by the scanner,
+            # so the rollback here is what lets the NEXT capture succeed
+            # without a scanner restart (e.g. the capture attempted before
+            # migration 080 is applied).
+            try:
+                conn.rollback()
+            except Exception:
+                LOG.debug("ME SHORT A source intake rollback failed", exc_info=True)
             LOG.exception("ME SHORT A source intake activation read failed")
             return "ERROR"
         if state is None:

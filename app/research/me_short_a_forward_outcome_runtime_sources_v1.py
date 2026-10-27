@@ -221,6 +221,28 @@ def assert_read_only_session(conn: Any) -> None:
             f"({READ_ONLY_GUC}={value!r}); refusing to scan dds read-write")
 
 
+def _unabort(conn: Any) -> None:
+    """Return the shared transaction to a usable state after a failed read.
+
+    In PostgreSQL one failed statement aborts the WHOLE transaction, and
+    every later statement on the same connection then fails with "current
+    transaction is aborted". Both transports share one READ ONLY connection,
+    so without this a failure of the OPTIONAL research intake read (missing
+    table before migration 080, revoked SELECT, a typo) would permanently
+    break the MANDATORY ``dds.scanner_setup`` stream. Rolling back is safe
+    here: this module only ever reads, and every scan position lives in the
+    callers' keyset cursors — never in the transaction — so no page, row or
+    progress is lost by it.
+    """
+    rollback = getattr(conn, "rollback", None)
+    if rollback is None:
+        return
+    try:
+        rollback()
+    except Exception:  # noqa: BLE001 - best effort, never masks the read error
+        log.debug("ME SHORT A read-only rollback failed", exc_info=True)
+
+
 def ms_to_datetime(value: int | float) -> datetime:
     """Epoch milliseconds -> timezone-aware UTC datetime."""
     return datetime.fromtimestamp(int(value) / 1000.0, tz=timezone.utc)
@@ -511,6 +533,14 @@ class DbScannerSetupCandidateSource(CandidateSource):
         try:
             cursor_obj.execute(sql, params)
             rows = cursor_obj.fetchall()
+        except Exception:
+            # Keep the fail-loud contract (the caller stalls this page and
+            # retries), but un-abort the shared transaction first — otherwise
+            # the retry would hit "current transaction is aborted" forever.
+            # The keyset cursor is unchanged, so the retry re-reads the same
+            # page and loses nothing.
+            _unabort(self._conn)
+            raise
         finally:
             cursor_obj.close()
 
@@ -770,6 +800,11 @@ class DbSourceIntakeCandidateSource(CandidateSource):
         try:
             cursor_obj.execute(self.ACTIVATION_SQL, (self.ACTIVATION_EXPERIMENT,))
             row = cursor_obj.fetchone()
+        except Exception:
+            # Fail-soft for THIS source, but never leave the shared READ ONLY
+            # transaction aborted for the sibling dds transport.
+            _unabort(self._conn)
+            raise
         finally:
             cursor_obj.close()
         if row is None:
@@ -859,6 +894,9 @@ class DbSourceIntakeCandidateSource(CandidateSource):
             finally:
                 cursor_obj.close()
         except Exception as exc:  # noqa: BLE001 - fail-soft, lossless
+            # Un-abort the shared transaction so the sibling dds transport
+            # keeps working; our own cursor stays put (lossless retry).
+            _unabort(self._conn)
             self.error_count += 1
             self.last_error = f"intake page read failed: {type(exc).__name__}: {exc}"
             log.warning("ME SHORT A source intake page read failed",
