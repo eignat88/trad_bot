@@ -364,9 +364,10 @@ class BybitClient:
             )
             result = payload.get("result")
             rows = result.get("list") if isinstance(result, dict) else None
-            if rows is None:
+            if not isinstance(rows, list):
                 raise BybitError(
-                    f"{symbol}: malformed kline payload without result.list")
+                    f"{symbol}: malformed kline payload: "
+                    "result.list must be a JSON array")
             for row in rows:
                 parsed = self._parse_range_row(row, step_ms=step_ms)
                 if parsed is None:

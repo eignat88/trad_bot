@@ -346,3 +346,22 @@ def test_legacy_get_klines_remains_latest_n():
     assert client.get_klines("BTCUSDT", "5", 20) == []
     assert "start" not in calls[0] and "end" not in calls[0]
     assert calls[0]["limit"] == 20
+
+
+@pytest.mark.parametrize("bad_rows", ["bad", {"key": "value"}, 123, None])
+def test_wrong_type_kline_list_raises_instead_of_returning_empty(bad_rows):
+    base = int(datetime(
+        2026, 10, 20, tzinfo=timezone.utc
+    ).timestamp() * 1000)
+
+    client = object.__new__(BybitClient)
+    client._public_get = lambda endpoint, **kw: {
+        "result": {"list": bad_rows}
+    }
+
+    with pytest.raises(BybitError, match="result.list must be a JSON array"):
+        client.get_klines_range(
+            "BTCUSDT",
+            start_ms=base,
+            end_ms=base + STEP_MS,
+        )
