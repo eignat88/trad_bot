@@ -380,10 +380,20 @@ class BybitClosedCandleSource:
     ) -> list[Candle]:
         if end <= start:
             return []
-        requested = int((end - start) / timedelta(minutes=5)) + 3
-        limit = max(1, min(requested, self._max_limit))
-        raw_rows = self._client.get_klines(symbol, self._interval, limit)
+        # Historical range, not the exchange's latest-N candles. Clamp
+        # the query to the observation clock; never request future bars.
         observed_at = self._clock()
+        if observed_at.tzinfo is None:
+            raise ValueError("observation clock must be timezone-aware")
+        upper = min(end, observed_at)
+        if upper <= start:
+            return []
+        raw_rows = self._client.get_klines_range(
+            symbol, self._interval,
+            start_ms=datetime_to_ms(start),
+            end_ms=datetime_to_ms(upper) - 1,
+            page_size=self._max_limit,
+        )
         out: list[Candle] = []
         for raw in raw_rows:
             candle = to_runtime_candle(
