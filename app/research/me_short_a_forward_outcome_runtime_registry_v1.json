@@ -55,6 +55,8 @@
     "diagnostics_retention_rows": 2000,
     "idle_sleep_seconds": 5.0,
     "max_events_per_cycle": 500,
+    "phase1_link_retry_attempts": 3,
+    "phase1_link_retry_sleep_seconds": 5.0,
     "feature_flag": "ME_SHORT_A_LINEAGE_CAPTURE_ENABLED",
     "systemd_unit": "trad-bot-me-short-a-forward-outcome.service",
     "runner_module": "app.research.me_short_a_forward_outcome_runtime_v1",
