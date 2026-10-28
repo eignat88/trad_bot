@@ -802,3 +802,62 @@ def test_invariants_no_side_effects_and_point_b_sentinel(prov, monkeypatch, tmp_
             "activation.json.claim_receipt.json",
         ]
     )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [admin.READ_ONLY_MODE, admin.ACTIVATE_MODE],
+)
+def test_admin_role_survives_commit_and_rollback(prov, monkeypatch, mode):
+    """A transaction boundary must never restore the privileged login."""
+    _set_admin_env(monkeypatch, prov, user="postgres")
+    conn = admin.connect_admin_db(mode)
+
+    try:
+        def check_context():
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    "SELECT current_user, session_user, "
+                    "current_setting('transaction_read_only')"
+                )
+                current_user, session_user, read_only = cur.fetchone()
+            finally:
+                cur.close()
+
+            assert current_user == ADMIN_ROLE
+            assert session_user == "postgres"
+            assert read_only == (
+                "on" if mode == admin.READ_ONLY_MODE else "off"
+            )
+
+        check_context()
+
+        conn.rollback()
+        check_context()
+
+        conn.commit()
+        check_context()
+
+        with pytest.raises(Exception) as excinfo:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    "UPDATE research.htf_baseline_short_phase2_experiment "
+                    "SET status = 'CANCELLED'"
+                )
+            finally:
+                cur.close()
+
+        error = str(excinfo.value).lower()
+
+        if mode == admin.READ_ONLY_MODE:
+            assert "read-only" in error
+        else:
+            assert "permission denied" in error
+
+        conn.rollback()
+        check_context()
+
+    finally:
+        admin.close_admin_db(conn)

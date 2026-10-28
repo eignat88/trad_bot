@@ -625,17 +625,26 @@ def connect_admin_db(mode: str, *, driver: str | None = None):
             f"admin database connection failed ({exc}); fail closed"
         ) from exc
     try:
-        # pin the transaction write mode FIRST — SET TRANSACTION is only legal
-        # before any query of the transaction.
-        if mode == READ_ONLY_MODE:
-            _exec_one(conn, "SET TRANSACTION READ ONLY")
-            _exec_one(conn, "SET default_transaction_read_only = on")
-        else:
-            _exec_one(conn, "SET TRANSACTION READ WRITE")
-            _exec_one(conn, "SET default_transaction_read_only = off")
+        # Validate the login and target before entering the restricted role.
         verify_admin_target_identity(conn, creds)
         verify_admin_rbac_invariants(conn, creds)
+
+        # Establish the restricted role as a SESSION property.
+        # Commit the setup transaction before starting operational work:
+        # otherwise a later rollback can restore the original login role.
         _exec_one(conn, f"SET ROLE {ADMIN_ROLE}")
+        conn.commit()
+
+        # Pin the mode for subsequent transactions as well as this one.
+        if mode == READ_ONLY_MODE:
+            _exec_one(conn, "SET default_transaction_read_only = on")
+            conn.commit()
+            _exec_one(conn, "SET TRANSACTION READ ONLY")
+        else:
+            _exec_one(conn, "SET default_transaction_read_only = off")
+            conn.commit()
+            _exec_one(conn, "SET TRANSACTION READ WRITE")
+
         verify_effective_admin_context(conn, mode=mode)
     except AdminConnectionError:
         close_admin_db(conn)

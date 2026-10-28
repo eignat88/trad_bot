@@ -75,9 +75,13 @@ class _FakeConn:
         self.failures = dict(failures or {})
         self.executed = []
         self.closed = False
+        self.commits = 0
 
     def cursor(self):
         return _FakeCursor(self)
+
+    def commit(self):
+        self.commits += 1
 
     def close(self):
         self.closed = True
@@ -576,7 +580,10 @@ def test_connect_read_only_pins_read_only_transaction(monkeypatch):
     assert out is conn
     statements = [sql for sql in conn.sql() if not sql.startswith("SELECT")
                   and not sql.startswith("SHOW")]
-    assert statements[0] == "SET TRANSACTION READ ONLY"
+    assert statements.index("SET ROLE trad_bot_htf_p2_admin") < statements.index(
+        "SET TRANSACTION READ ONLY"
+    )
+    assert conn.commits == 2
     assert "SET default_transaction_read_only = on" in statements
     assert "SET ROLE trad_bot_htf_p2_admin" in statements
     assert "SET TRANSACTION READ WRITE" not in statements
@@ -588,7 +595,10 @@ def test_connect_activate_pins_read_write_transaction(monkeypatch):
     admin.connect_admin_db(admin.ACTIVATE_MODE)
     statements = [sql for sql in conn.sql() if not sql.startswith("SELECT")
                   and not sql.startswith("SHOW")]
-    assert statements[0] == "SET TRANSACTION READ WRITE"
+    assert statements.index("SET ROLE trad_bot_htf_p2_admin") < statements.index(
+        "SET TRANSACTION READ WRITE"
+    )
+    assert conn.commits == 2
     assert "SET default_transaction_read_only = off" in statements
     assert "SET ROLE trad_bot_htf_p2_admin" in statements
     assert "SET TRANSACTION READ ONLY" not in statements
