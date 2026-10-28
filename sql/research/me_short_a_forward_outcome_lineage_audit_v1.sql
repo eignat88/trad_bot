@@ -32,6 +32,7 @@ SELECT
     COUNT(*) FILTER (WHERE link_status = 'LINKED')                  AS linked,
     COUNT(*) FILTER (WHERE link_status = 'PENDING')                 AS pending,
     COUNT(*) FILTER (WHERE link_status = 'QUARANTINED')             AS quarantined,
+    COUNT(*) FILTER (WHERE link_status = 'PHASE1_PENDING')          AS phase1_pending,
     COUNT(*) FILTER (WHERE phase1_linked)                           AS phase1_linked,
     COUNT(*) FILTER (WHERE source_observation_id IS NOT NULL)       AS with_source_observation_id
 FROM research.me_short_a_event_lineage_v1;
@@ -104,7 +105,12 @@ SELECT
                         AND quarantine_reason IS NULL)              AS quarantine_without_reason,
     COUNT(*) FILTER (WHERE link_status = 'LINKED'
                         AND (NOT source_signal_present
-                             OR NOT event_key_integrity))           AS invalid_links,
+                             OR NOT event_key_integrity
+                             OR NOT phase1_linked))           AS invalid_links,
+    COUNT(*) FILTER (WHERE link_status = 'LINKED'
+                        AND NOT phase1_linked)                AS linked_without_phase1,
+    COUNT(*) FILTER (WHERE link_status = 'PHASE1_PENDING'
+                        AND quarantine_reason IS NULL)        AS phase1_pending_without_reason,
     COUNT(*) FILTER (WHERE phase1_linked AND phase1_event_key <> event_key)
                                                                     AS phase1_key_mismatch
 FROM research.me_short_a_event_lineage_v1;

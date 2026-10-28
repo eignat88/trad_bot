@@ -124,6 +124,14 @@ PATH_CLASSES = (PATH_STOP_HIT, PATH_TARGET_HIT, PATH_TIMEOUT_240M, PATH_UNRESOLV
 LINK_PENDING = "PENDING"
 LINK_LINKED = "LINKED"
 LINK_QUARANTINED = "QUARANTINED"
+# PHASE1_PENDING (ME_SHORT_A_PHASE1_LINEAGE_CONSISTENCY_FIX_V1): the
+# independent event capture is verified (identity + source signal) but the
+# Phase 1 linkage is NOT confirmed: no Phase 1 row with this event_key was
+# observable after the bounded retry. This is the explicit research
+# exception for unconfirmed Phase 1 linkage — it never claims a fully
+# confirmed LINKED relation, is excluded from the Issue #206 eligible
+# cohort, and is observable in the audit diagnostics.
+LINK_PHASE1_PENDING = "PHASE1_PENDING"
 
 ACTIVATION_FLAG = "ME_SHORT_A_LINEAGE_CAPTURE_ENABLED"
 
@@ -875,6 +883,7 @@ def record_event_lineage(conn, *, symbol, signal_time, reference_price,
                          phase1_observation_id=None,
                          phase1_source_observation_ids=None,
                          source_signal_present=True,
+                         phase1_link_attempts=None,
                          protocol_version=PROTOCOL_VERSION,
                          protocol_hash=PROTOCOL_HASH,
                          expected_protocol_version=PROTOCOL_VERSION,
@@ -886,6 +895,13 @@ def record_event_lineage(conn, *, symbol, signal_time, reference_price,
     Phase 1 linkage is only ever asserted when a Phase 1 row with the SAME
     ``event_key`` is actually observed — no Phase 1 row is ever created,
     updated, or retro-fitted here.
+
+    A missing Phase 1 row is NEVER recorded as ``LINKED`` (that would falsely
+    imply a fully confirmed relation): the record is written as the
+    ``PHASE1_PENDING`` diagnostic status with ``phase1_linked = FALSE`` —
+    the explicit research exception for unconfirmed Phase 1 linkage.
+    ``phase1_link_attempts`` is optional diagnostic metadata: how many
+    READ-ONLY lookups were performed before this record was written.
 
     Returns True only when a new row was inserted.
     """
@@ -911,16 +927,25 @@ def record_event_lineage(conn, *, symbol, signal_time, reference_price,
     reason = verification["quarantine_reason"]
     checks = dict(verification["linkage_checks"])
     phase1_linked = False
-    if phase1_event_key is not None:
+    phase1_observed = phase1_event_key is not None
+    checks["phase1_observed"] = phase1_observed
+    if phase1_observed:
         phase1_linked = phase1_event_key == key
         checks["phase1_event_key_matches"] = phase1_linked
         if not phase1_linked:
             link_status = LINK_QUARANTINED
             reason = ",".join(filter(None, [reason, "phase1_event_key"]))
+    if phase1_link_attempts is not None:
+        checks["phase1_link_attempts"] = int(phase1_link_attempts)
     checks["source_signal_present"] = bool(source_signal_present)
     if link_status == LINK_LINKED and not source_signal_present:
         link_status = LINK_PENDING
         reason = "source_signal_missing"
+    elif link_status == LINK_LINKED and not phase1_observed:
+        # Independent capture confirmed, Phase 1 linkage NOT confirmed:
+        # never claim LINKED, record the explicit diagnostic exception.
+        link_status = LINK_PHASE1_PENDING
+        reason = "phase1_not_observed"
     if link_status != LINK_LINKED:
         phase1_linked = False
 

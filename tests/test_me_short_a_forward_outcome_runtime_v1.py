@@ -159,8 +159,19 @@ class FakeConnection:
         if "ME_SHORT_A_FILL_FEASIBILITY_V1" in head:
             key = params[0] if params else None
             return [r for r in self.phase1_rows if r[0] == key]
-        if "ME_SHORT_A_EVENT_LINEAGE_V1" in head and "COUNT(*)" in head:
+        if ("ME_SHORT_A_EVENT_LINEAGE_V1" in head and "COUNT(*)" in head):
             return [(len(self._pending()),)]
+        if ("ME_SHORT_A_EVENT_LINEAGE_V1" in head
+                and "WHERE EVENT_KEY=%S" in head):
+            # The lineage write read-back: the TABLE's state, exactly like
+            # the source_signal confirmation above.
+            key = params[0] if params else None
+            found = []
+            for sql, row_params in self.persisted_for(LINEAGE_TABLE):
+                payload = dict(zip(_insert_columns(sql), row_params))
+                if payload.get("event_key") == key:
+                    found.append((key,))
+            return found
         if "ME_SHORT_A_EVENT_LINEAGE_V1" in head:
             return self._pending()
         return []
@@ -989,6 +1000,12 @@ def test_phase1_absence_leaves_the_lineage_unlinked_not_faked():
     assert lineage_row["phase1_linked"] is False
     assert lineage_row["phase1_event_key"] is None
     assert lineage_row["phase1_observation_id"] is None
+    # ME_SHORT_A_PHASE1_LINEAGE_CONSISTENCY_FIX_V1: an unconfirmed Phase 1
+    # linkage is NEVER recorded as LINKED (that would falsely imply a fully
+    # confirmed relation) — it gets the explicit PHASE1_PENDING diagnostic
+    # exception instead.
+    assert lineage_row["link_status"] == "PHASE1_PENDING"
+    assert lineage_row["quarantine_reason"] == "phase1_not_observed"
 
 
 # ── sources: read-only, honest, no imputation ──────────────────────────

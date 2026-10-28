@@ -603,6 +603,14 @@ class RuntimeConfig:
     idle_sleep_seconds: float
     max_events_per_cycle: int
     registry_path: str
+    # ME_SHORT_A_PHASE1_LINEAGE_CONSISTENCY_FIX_V1: bounded READ-ONLY retry
+    # of the Phase 1 linkage lookup before the irreversible lineage write.
+    # ``attempts`` counts lookups (>= 1); ``sleep_seconds`` is the spacing
+    # between them (0 = immediate re-checks; the runner config sets the
+    # production spacing). The retry is strictly bounded so an absent Phase 1
+    # snapshot can never block the Source Intake forever.
+    phase1_link_retry_attempts: int = 3
+    phase1_link_retry_sleep_seconds: float = 0.0
 
     @property
     def activated(self) -> bool:
@@ -1040,6 +1048,37 @@ class ForwardOutcomeRuntime:
             cursor.close()
         return row is not None
 
+    def _lineage_present(self, key: str) -> bool:
+        """READ-ONLY confirmation that a lineage row exists for ``key``.
+
+        Used after a lineage write that inserted nothing: ``rowcount == 0``
+        means either ``ON CONFLICT DO NOTHING`` (the row already exists — the
+        normal idempotent replay case) or that the guarded INSERT did not
+        land (activation guard missed, CHECK violation on a not-yet-migrated
+        database, connection error). Only the TABLE's state distinguishes
+        them, and an event whose lineage row is missing must never be
+        silently dropped — the capture tables are append-only, so a lost
+        lineage row would strand the event as ``MISSING_LINEAGE`` forever.
+
+        Raises :class:`DatabaseAccessError` when the confirmation itself
+        cannot be read; the caller turns that into a retry, never into
+        "recorded".
+        """
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT event_key FROM research.me_short_a_event_lineage_v1 "
+                "WHERE event_key=%s",
+                (key,))
+            row = cursor.fetchone()
+        except Exception as exc:
+            raise DatabaseAccessError(
+                f"lineage confirmation failed for event_key={key[:16]}…: "
+                f"{type(exc).__name__}: {exc}") from exc
+        finally:
+            cursor.close()
+        return row is not None
+
     def _count_open_events(self) -> int:
         try:
             cursor = self._conn.cursor()
@@ -1417,7 +1456,35 @@ class ForwardOutcomeRuntime:
                 "retrying without writing lineage: %s", exc)
             return HANDLER_RETRY
 
-        linked = record_event_lineage(
+        # ME_SHORT_A_PHASE1_LINEAGE_CONSISTENCY_FIX_V1: the Phase 1 snapshot
+        # is committed by a DIFFERENT process/transaction than this runtime's
+        # lineage write, so at READ COMMITTED the lookup above can miss a
+        # snapshot whose transaction commits moments later (confirmed
+        # incidents: KORUUSDT/DOGEUSDT 2026-10-28 ended up with LINKED rows
+        # whose phase1_event_key was NULL). Retry the READ-ONLY lookup a
+        # BOUNDED number of times before the irreversible append-only write:
+        # a temporarily absent Phase 1 row then becomes a correct LINKED
+        # record, while a persistently absent one becomes the honest
+        # PHASE1_PENDING research exception — never a false LINKED relation,
+        # and never an unbounded Source Intake stall.
+        attempts = max(1, int(self._config.phase1_link_retry_attempts))
+        phase1_attempts = 1
+        while phase1.event_key is None and phase1_attempts < attempts:
+            if self._config.phase1_link_retry_sleep_seconds > 0:
+                self._sleep(self._config.phase1_link_retry_sleep_seconds)
+            try:
+                phase1 = self._phase1_lookup(key)
+            except DatabaseAccessError as exc:
+                self._metrics.add("errors")
+                self._last_error = str(exc)
+                log.error(
+                    "ME SHORT A runtime Phase 1 linkage lookup failed "
+                    "during bounded retry; retrying without writing "
+                    "lineage: %s", exc)
+                return HANDLER_RETRY
+            phase1_attempts += 1
+
+        written = record_event_lineage(
             self._conn,
             symbol=candidate.symbol,
             signal_time=candidate.signal_time,
@@ -1431,11 +1498,36 @@ class ForwardOutcomeRuntime:
             phase1_source_observation_ids=(
                 list(phase1.source_observation_ids) or None),
             source_signal_present=present,
+            phase1_link_attempts=phase1_attempts,
         )
-        if linked:
+        if written:
             self._metrics.add("lineages_recorded")
         else:
             self._metrics.add("skipped_idempotent")
+            # Fail closed: "nothing inserted" is either an idempotent replay
+            # (the row is already there) or a write that never landed (guard
+            # miss, CHECK violation on a not-yet-migrated database, driver
+            # error). Only the TABLE's state distinguishes them, and a
+            # missing lineage row must never be silently dropped — the
+            # candidate is retried instead of being lost forever.
+            try:
+                confirmed = self._lineage_present(key)
+            except DatabaseAccessError as exc:
+                self._metrics.add("errors")
+                self._last_error = str(exc)
+                log.error(
+                    "ME SHORT A runtime lineage confirmation failed; "
+                    "retrying: %s", exc)
+                return HANDLER_RETRY
+            if not confirmed:
+                self._metrics.add("errors")
+                self._last_error = (
+                    "lineage row neither inserted nor present; retrying")
+                log.error(
+                    "ME SHORT A runtime lineage write not confirmed for "
+                    "event_key=%s…; retrying without losing the candidate",
+                    key[:16])
+                return HANDLER_RETRY
 
         self._last_event_time = max(
             filter(None, [self._last_event_time, candidate.signal_time]))
@@ -1556,6 +1648,8 @@ def replace_activation(config: RuntimeConfig, status: str | None,
         idle_sleep_seconds=config.idle_sleep_seconds,
         max_events_per_cycle=config.max_events_per_cycle,
         registry_path=config.registry_path,
+        phase1_link_retry_attempts=config.phase1_link_retry_attempts,
+        phase1_link_retry_sleep_seconds=config.phase1_link_retry_sleep_seconds,
     )
 
 
@@ -1596,4 +1690,8 @@ def resolve_config(
         idle_sleep_seconds=float(runtime.get("idle_sleep_seconds") or 5.0),
         max_events_per_cycle=int(runtime.get("max_events_per_cycle") or 500),
         registry_path=str(registry_path or DEFAULT_REGISTRY_PATH),
+        phase1_link_retry_attempts=max(
+            1, int(runtime.get("phase1_link_retry_attempts") or 3)),
+        phase1_link_retry_sleep_seconds=max(
+            0.0, float(runtime.get("phase1_link_retry_sleep_seconds") or 5.0)),
     )
