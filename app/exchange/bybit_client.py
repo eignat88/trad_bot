@@ -309,6 +309,42 @@ class BybitClient:
         rows.reverse()
         return [Candle(int(r[0]), *(float(value) for value in r[1:6])) for r in rows]
 
+    def get_klines_range(
+        self, symbol: str, interval: str = "5", *, start_ms: int, end_ms: int,
+    ) -> list[Candle]:
+        """Read historical candles with explicit inclusive millisecond bounds.
+
+        Separate from get_klines(): trading callers retain their existing
+        latest-N behavior. Bybit returns pages newest-first; this method
+        returns unique ascending candle opens and never fabricates gaps.
+        """
+        minutes = int(interval)
+        if minutes <= 0 or minutes > 1440:
+            raise ValueError("get_klines_range requires a positive minute interval")
+        start_ms, end_ms = int(start_ms), int(end_ms)
+        if end_ms < start_ms:
+            return []
+        step_ms = minutes * 60_000
+        page_size = 1000
+        out: dict[int, Candle] = {}
+        page_start = start_ms
+        while page_start <= end_ms:
+            # Inclusive API boundaries; each page covers at most 1000 bars.
+            page_end = min(end_ms, page_start + page_size * step_ms - 1)
+            limit = min(page_size, (page_end - page_start) // step_ms + 1)
+            payload = self._public_get(
+                "/v5/market/kline", category="linear", symbol=symbol,
+                interval=interval, start=page_start, end=page_end, limit=limit,
+            )
+            for row in payload["result"]["list"]:
+                ts = int(row[0])
+                if page_start <= ts <= page_end and ts % step_ms == 0:
+                    out[ts] = Candle(
+                        ts, *(float(value) for value in row[1:6]))
+            # Explicit forward progress regardless of empty/duplicate pages.
+            page_start = page_end + 1
+        return [out[ts] for ts in sorted(out)]
+
     def get_open_interest(self, symbol: str, interval: str = "5min", limit: int = 200) -> list[tuple[int, float]]:
         payload = self._public_get("/v5/market/open-interest", category="linear", symbol=symbol,
                                    intervalTime=interval, limit=limit)
