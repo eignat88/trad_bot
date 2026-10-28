@@ -810,3 +810,9 @@ def recover_admin_db(
             f"admin context lost after transaction recovery: {exc}; "
             "connection closed, fail closed"
         ) from exc
+    except Exception as exc:
+        close_admin_db(conn)
+        raise AdminConnectionError(
+            "admin context verification failed after transaction recovery; "
+            "connection closed, fail closed"
+        ) from exc

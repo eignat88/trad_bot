@@ -832,3 +832,25 @@ def test_recover_cannot_override_recorded_identity():
         )
     assert conn.closed
     assert conn.rollbacks == 0
+
+
+def test_recover_verification_driver_error_fails_closed(monkeypatch):
+    """Unexpected driver errors during re-verification must close the DB."""
+    conn = _mode_conn(admin.ACTIVATE_MODE)
+    conn.admin_session_user = "oper"
+
+    def broken_verify(*args, **kwargs):
+        raise RuntimeError("simulated database driver failure")
+
+    monkeypatch.setattr(
+        admin, "verify_effective_admin_context", broken_verify
+    )
+
+    with pytest.raises(
+        admin.AdminConnectionError,
+        match="verification failed after transaction recovery",
+    ):
+        admin.recover_admin_db(conn, mode=admin.ACTIVATE_MODE)
+
+    assert conn.rollbacks == 1
+    assert conn.closed
