@@ -733,6 +733,7 @@ def test_connect_read_only_mode_commits_the_read_only_pin(monkeypatch):
 def test_recover_admin_db_rolls_back_and_reverifies():
     """Permitted transaction recovery keeps the admin context and re-checks it."""
     conn = _mode_conn(admin.ACTIVATE_MODE)
+    conn.admin_session_user = "oper"
     admin.recover_admin_db(conn, mode=admin.ACTIVATE_MODE)
     assert conn.rollbacks == 1
     assert not conn.closed
@@ -745,6 +746,7 @@ def test_recover_admin_db_rolls_back_and_reverifies():
 def test_recover_admin_db_lost_context_fails_closed_and_closes():
     """A lost admin context must never pass silently: refuse + close."""
     conn = _mode_conn(admin.ACTIVATE_MODE, **{"SELECT current_user": ("postgres",)})
+    conn.admin_session_user = "oper"
     with pytest.raises(admin.AdminConnectionError, match="fail closed"):
         admin.recover_admin_db(conn, mode=admin.ACTIVATE_MODE)
     assert conn.closed
@@ -753,6 +755,7 @@ def test_recover_admin_db_lost_context_fails_closed_and_closes():
 def test_recover_admin_db_lost_read_only_pin_fails_closed():
     """The mint/verify READ-ONLY pin is part of the recovered context."""
     conn = _mode_conn(admin.READ_ONLY_MODE, **{"SHOW transaction_read_only": ("off",)})
+    conn.admin_session_user = "oper"
     with pytest.raises(admin.AdminConnectionError, match="fail closed"):
         admin.recover_admin_db(conn, mode=admin.READ_ONLY_MODE)
     assert conn.closed
@@ -762,6 +765,7 @@ def test_recover_admin_db_rollback_error_fails_closed():
     """Even the rollback itself failing closes the connection."""
     conn = _mode_conn(admin.ACTIVATE_MODE)
     conn.rollback_error = RuntimeError("connection gone")
+    conn.admin_session_user = "oper"
     with pytest.raises(admin.AdminConnectionError, match="fail closed"):
         admin.recover_admin_db(conn, mode=admin.ACTIVATE_MODE)
     assert conn.closed
@@ -808,3 +812,23 @@ def test_recover_admin_db_reverifies_recorded_session_identity():
     with pytest.raises(admin.AdminConnectionError, match="fail closed"):
         admin.recover_admin_db(conn, mode=admin.ACTIVATE_MODE)
     assert conn.closed
+
+
+def test_recover_missing_recorded_identity_fails_closed():
+    conn = _mode_conn(admin.ACTIVATE_MODE)
+    with pytest.raises(admin.AdminConnectionError, match="identity missing"):
+        admin.recover_admin_db(conn, mode=admin.ACTIVATE_MODE)
+    assert conn.closed
+    assert conn.rollbacks == 0
+
+
+def test_recover_cannot_override_recorded_identity():
+    conn = _mode_conn(admin.ACTIVATE_MODE)
+    conn.admin_session_user = "oper"
+    with pytest.raises(admin.AdminConnectionError, match="identity mismatch"):
+        admin.recover_admin_db(
+            conn, mode=admin.ACTIVATE_MODE,
+            expected_session_user="different_user",
+        )
+    assert conn.closed
+    assert conn.rollbacks == 0

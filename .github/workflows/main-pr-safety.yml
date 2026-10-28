@@ -52,7 +52,7 @@ jobs:
             --tb=short
 
       - name: Verify HTF Phase-2 isolation
-        if: github.event_name == 'pull_request' && github.event.pull_request.number == 180
+        if: github.event_name == 'pull_request'
         env:
           PYTHONPATH: .
           PYTHONDONTWRITEBYTECODE: '1'

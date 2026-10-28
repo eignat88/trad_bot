@@ -777,8 +777,21 @@ def recover_admin_db(
         raise AdminConnectionError(f"unknown admin connection mode {mode!r} (fail closed)")
     if conn is None:
         raise AdminConnectionError("no admin session to recover (fail closed)")
-    if expected_session_user is None:
-        expected_session_user = getattr(conn, "admin_session_user", None)
+    recorded_session_user = getattr(conn, "admin_session_user", None)
+    if not isinstance(recorded_session_user, str) or not recorded_session_user.strip():
+        close_admin_db(conn)
+        raise AdminConnectionError(
+            "admin session identity missing; connection closed, fail closed"
+        )
+    if (
+        expected_session_user is not None
+        and expected_session_user != recorded_session_user
+    ):
+        close_admin_db(conn)
+        raise AdminConnectionError(
+            "admin session identity mismatch; connection closed, fail closed"
+        )
+    expected_session_user = recorded_session_user
     try:
         conn.rollback()
     except Exception as exc:
