@@ -23,8 +23,13 @@ from pathlib import Path
 
 import pytest
 
+from app.exchange.bybit_client import BybitError
 from app.research import me_short_a_forward_outcome_lineage_v1 as lineage
 from app.research import me_short_a_forward_outcome_runtime_v1 as mod
+from app.research.me_short_a_forward_outcome_runtime_sources_v1 import (
+    BybitClosedCandleSource,
+    datetime_to_ms,
+)
 from app.research.me_short_a_forward_outcome_runtime_v1 import (
     Candle,
     Candidate,
@@ -255,10 +260,20 @@ class FakeKlineClient:
     def __init__(self, rows):
         self.rows = rows
         self.calls = []
+        self.range_calls = []
+        self.fail_range = False
 
     def get_klines(self, symbol, interval="5", limit=200):
         self.calls.append((symbol, interval, limit))
         return list(self.rows)
+
+    def get_klines_range(self, symbol, interval="5", *, start_ms, end_ms,
+                         page_size=1000, max_pages=200):
+        self.range_calls.append((start_ms, end_ms))
+        if self.fail_range:
+            raise BybitError("simulated transient Bybit failure")
+        return [row for row in self.rows
+                if start_ms <= row.timestamp <= end_ms]
 
 
 class RowCursor:
@@ -374,10 +389,11 @@ def config(enabled=True, status="RUNNING", freeze=FREEZE):
     )
 
 
-def build(conn=None, *, cfg=None, candles=None, candidates=(), now=NOW):
+def build(conn=None, *, cfg=None, candles=None, candidates=(), now=NOW,
+          candle_source=None):
     conn = conn if conn is not None else FakeConnection()
-    source = InMemoryCandleSource(candles if candles is not None
-                                  else make_outcome_candles())
+    source = candle_source if candle_source is not None else InMemoryCandleSource(
+        candles if candles is not None else make_outcome_candles())
     runtime = ForwardOutcomeRuntime(
         conn,
         config=cfg if cfg is not None else config(),
@@ -847,6 +863,98 @@ def test_incomplete_window_produces_source_incomplete_without_economics():
     assert outcome["return_at_240m"] is None
     assert outcome["candles_present"] == len(candles)
     assert outcome["candles_expected"] == 47
+
+
+# ── historical range fetch through the full chain (#206 follow-up) ─────
+#
+# The exact VPS evidence event: an off-grid DOGEUSDT signal whose 240m
+# horizon matured hours before the runtime processed it. The post-signal
+# candles must come from the HISTORICAL range fetch (issue #213), never
+# from the exchange's latest-N window.
+
+DOGE_SIGNAL = datetime(2026, 10, 27, 21, 35, 41, 973578, tzinfo=timezone.utc)
+DOGE_ASOF = datetime(2026, 10, 28, 5, 31, 37, 10267, tzinfo=timezone.utc)
+
+
+def _doge_raw_rows(skip=None):
+    """Raw Bybit-shaped rows for the frozen 48-bar post-signal window."""
+    rows = []
+    for idx, candle in enumerate(make_outcome_candles(signal_time=DOGE_SIGNAL)):
+        if idx == skip:
+            continue
+        rows.append(FakeRawCandle(
+            datetime_to_ms(candle.open_time), float(candle.open),
+            float(candle.high), float(candle.low), float(candle.close)))
+    return rows
+
+
+def _build_doge_runtime(rows, *, now=DOGE_ASOF):
+    client = FakeKlineClient(rows)
+    source = BybitClosedCandleSource(client, clock=clock_at(now))
+    candidate = make_candidate(signal_time=DOGE_SIGNAL, observed_at=now)
+    runtime, conn = build(candidates=[candidate], now=now, candle_source=source)
+    return runtime, conn, client
+
+
+def test_late_matured_event_finalizes_48_of_48_via_historical_range_fetch():
+    runtime, conn, client = _build_doge_runtime(_doge_raw_rows())
+    runtime.run_cycle()
+
+    assert conn.inserted_tables.count(CANDLE_TABLE) == 48
+    assert runtime.metrics.candles_captured == 48
+    assert runtime.metrics.outcomes_finalized == 1
+    outcome = _payload(conn.inserts_for(OUTCOME_TABLE)[0])
+    assert outcome["outcome_status"] == "MATCHED_FINALIZED"
+    assert outcome["is_final"] is True
+    assert outcome["coverage_complete"] is True
+    assert outcome["candles_expected"] == 48
+    assert outcome["candles_present"] == 48
+    assert "post_signal_candles_incomplete" not in outcome["source_quality_flags"]
+    # every request is anchored to the event window, not to the ASOF clock
+    assert client.range_calls
+    for start_ms, end_ms in client.range_calls:
+        assert end_ms < datetime_to_ms(DOGE_ASOF)
+
+
+def test_exchange_history_gap_keeps_source_incomplete_without_economics():
+    runtime, conn, _ = _build_doge_runtime(_doge_raw_rows(skip=8))
+    runtime.run_cycle()
+
+    assert conn.inserted_tables.count(CANDLE_TABLE) == 47
+    assert runtime.metrics.outcomes_finalized == 1
+    rows = conn.inserts_for(OUTCOME_TABLE)
+    assert len(rows) == 1
+    outcome = _payload(rows[0])
+    assert outcome["outcome_status"] == "SOURCE_INCOMPLETE"
+    assert outcome["is_final"] is False
+    assert outcome["path_class"] is None
+    assert outcome["exit_price"] is None
+    assert outcome["gross_r"] is None
+    assert outcome["candles_present"] == 47
+    assert outcome["candles_expected"] == 48
+    assert outcome["coverage_complete"] is False
+    assert "post_signal_candles_incomplete" in outcome["source_quality_flags"]
+
+
+def test_transient_api_failure_never_finalizes_and_recovers_next_cycle():
+    runtime, conn, client = _build_doge_runtime(_doge_raw_rows())
+    client.fail_range = True
+    runtime.run_cycle()
+
+    # fail closed: no candles and no outcome from a partial/absent fetch
+    assert conn.inserts_for(CANDLE_TABLE) == []
+    assert conn.inserts_for(OUTCOME_TABLE) == []
+    assert runtime.metrics.outcomes_finalized == 0
+    assert runtime.metrics.errors >= 1
+
+    # the same event is retried on the next cycle and settles only once
+    client.fail_range = False
+    runtime.run_cycle()
+    assert conn.inserted_tables.count(CANDLE_TABLE) == 48
+    assert len(conn.inserts_for(OUTCOME_TABLE)) == 1
+    outcome = _payload(conn.inserts_for(OUTCOME_TABLE)[0])
+    assert outcome["outcome_status"] == "MATCHED_FINALIZED"
+    assert outcome["candles_present"] == 48
 
 
 def test_restart_resumes_pending_events_from_the_append_only_tables():
