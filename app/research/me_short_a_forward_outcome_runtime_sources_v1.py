@@ -392,6 +392,7 @@ class BybitClosedCandleSource:
             symbol, self._interval,
             start_ms=datetime_to_ms(start),
             end_ms=datetime_to_ms(upper) - 1,
+            page_size=self._max_limit,
         )
         out: list[Candle] = []
         for raw in raw_rows:

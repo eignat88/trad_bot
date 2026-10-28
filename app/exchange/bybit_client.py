@@ -5,6 +5,7 @@ import hmac
 import inspect
 import json
 import logging
+import math
 import random
 import socket
 import threading
@@ -311,39 +312,98 @@ class BybitClient:
 
     def get_klines_range(
         self, symbol: str, interval: str = "5", *, start_ms: int, end_ms: int,
+        page_size: int = 1000, max_pages: int = 200,
     ) -> list[Candle]:
         """Read historical candles with explicit inclusive millisecond bounds.
 
         Separate from get_klines(): trading callers retain their existing
         latest-N behavior. Bybit returns pages newest-first; this method
-        returns unique ascending candle opens and never fabricates gaps.
+        paginates the requested ``[start_ms, end_ms]`` range in bounded pages
+        and returns unique ascending candle opens, never fabricating gaps.
+
+        Error contract (fail closed):
+
+        * a transport, API or payload-shape error RAISES and no partial
+          history is returned, so a transient failure can never finalize a
+          historical outcome from half a window;
+        * a malformed or off-grid row is explicitly rejected (counted and
+          logged) and never synthesized — the caller's completeness check
+          then reports the gap instead of receiving invented OHLC;
+        * pagination is bounded: at most ``max_pages`` requests per call.
         """
-        minutes = int(interval)
+        try:
+            minutes = int(interval)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "get_klines_range supports minute intervals only, "
+                f"got {interval!r}")
         if minutes <= 0 or minutes > 1440:
             raise ValueError("get_klines_range requires a positive minute interval")
         start_ms, end_ms = int(start_ms), int(end_ms)
         if end_ms < start_ms:
             return []
+        # Bybit API hard cap is 1000 rows per request.
+        page_size = max(1, min(int(page_size), 1000))
         step_ms = minutes * 60_000
-        page_size = 1000
         out: dict[int, Candle] = {}
+        rejected = 0
+        pages = 0
         page_start = start_ms
         while page_start <= end_ms:
-            # Inclusive API boundaries; each page covers at most 1000 bars.
+            pages += 1
+            if pages > max_pages:
+                # Explicit request-count bound: pagination can never spin.
+                raise BybitError(
+                    f"{symbol}: kline range fetch exceeded {max_pages} pages")
+            # Inclusive API boundaries; each page covers at most page_size bars.
             page_end = min(end_ms, page_start + page_size * step_ms - 1)
             limit = min(page_size, (page_end - page_start) // step_ms + 1)
             payload = self._public_get(
                 "/v5/market/kline", category="linear", symbol=symbol,
                 interval=interval, start=page_start, end=page_end, limit=limit,
             )
-            for row in payload["result"]["list"]:
-                ts = int(row[0])
-                if page_start <= ts <= page_end and ts % step_ms == 0:
-                    out[ts] = Candle(
-                        ts, *(float(value) for value in row[1:6]))
+            result = payload.get("result")
+            rows = result.get("list") if isinstance(result, dict) else None
+            if rows is None:
+                raise BybitError(
+                    f"{symbol}: malformed kline payload without result.list")
+            for row in rows:
+                parsed = self._parse_range_row(row, step_ms=step_ms)
+                if parsed is None:
+                    rejected += 1
+                    continue
+                ts, candle = parsed
+                if page_start <= ts <= page_end:
+                    out[ts] = candle     # dedup on (symbol, interval, open)
             # Explicit forward progress regardless of empty/duplicate pages.
             page_start = page_end + 1
+        if rejected:
+            logger.warning(
+                "%s: rejected %d malformed/off-grid kline rows in range fetch",
+                symbol, rejected)
         return [out[ts] for ts in sorted(out)]
+
+    @staticmethod
+    def _parse_range_row(
+        row: Any, *, step_ms: int,
+    ) -> tuple[int, Candle] | None:
+        """Validate one raw kline row; ``None`` means reject, never synthesize.
+
+        A row must be a 6+ element sequence with an integer open timestamp on
+        the interval grid and finite numeric OHLC values.
+        """
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            return None
+        try:
+            ts = int(row[0])
+            values = [float(value) for value in row[1:6]]
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if ts < 0 or ts % step_ms != 0:
+            return None
+        if not all(math.isfinite(value) for value in values):
+            return None
+        return ts, Candle(ts, *values)
 
     def get_open_interest(self, symbol: str, interval: str = "5min", limit: int = 200) -> list[tuple[int, float]]:
         payload = self._public_get("/v5/market/open-interest", category="linear", symbol=symbol,
