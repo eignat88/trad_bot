@@ -653,6 +653,19 @@ def _exec_one(conn, sql: str, params=None):
         cur.close()
 
 
+class _AdminSessionConnection:
+    """Preserve verified login identity for drivers with fixed attributes."""
+
+    __slots__ = ("_connection", "admin_session_user")
+
+    def __init__(self, connection, session_user: str):
+        self._connection = connection
+        self.admin_session_user = session_user
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
 def connect_admin_db(mode: str, *, driver: str | None = None):
     """Open a verified admin-channel connection for ``mode`` (fail closed).
 
@@ -705,7 +718,12 @@ def connect_admin_db(mode: str, *, driver: str | None = None):
         # Phase 3 — verify in a FRESH transaction: proves the committed session
         # context (admin role + operator session identity + per-mode write pin
         # + privilege matrix) really holds before the session is handed over.
-        conn.admin_session_user = creds["user"]
+        try:
+            conn.admin_session_user = creds["user"]
+        except AttributeError:
+            # psycopg2 connections do not accept arbitrary attributes.
+            conn = _AdminSessionConnection(conn, creds["user"])
+
         verify_effective_admin_context(
             conn, mode=mode, expected_session_user=creds["user"]
         )

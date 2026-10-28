@@ -1039,3 +1039,36 @@ def test_invariants_no_side_effects_and_point_b_sentinel(prov, monkeypatch, tmp_
             "activation.json.claim_receipt.json",
         ]
     )
+
+
+def test_psycopg2_admin_recovery_preserves_restricted_role(prov, monkeypatch):
+    """psycopg2 recovery must preserve role, identity and DML denial."""
+    _set_admin_env(monkeypatch, prov, user="postgres")
+    conn = admin.connect_admin_db(admin.ACTIVATE_MODE, driver="psycopg2")
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT current_user, session_user")
+            assert cur.fetchone() == (ADMIN_ROLE, "postgres")
+
+            with pytest.raises(Exception):
+                cur.execute(
+                    "UPDATE research.htf_baseline_short_phase2_experiment "
+                    "SET status = 'CANCELLED'"
+                )
+        finally:
+            cur.close()
+
+        admin.recover_admin_db(conn, mode=admin.ACTIVATE_MODE)
+
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT current_user, session_user")
+            assert cur.fetchone() == (ADMIN_ROLE, "postgres")
+        finally:
+            cur.close()
+
+        conn.rollback()
+    finally:
+        admin.close_admin_db(conn)
+        assert conn.closed
