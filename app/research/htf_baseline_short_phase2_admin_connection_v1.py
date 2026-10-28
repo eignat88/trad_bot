@@ -81,6 +81,34 @@ insufficient privilege or authorization error raises
 :class:`AdminConnectionError` and the tool exits fail-closed BEFORE any freeze
 artifact or database write happens.
 
+Transaction scope of the session context (issue #205 rollback-safety)
+---------------------------------------------------------------------
+``SET ROLE`` and ``SET`` are TRANSACTIONAL in PostgreSQL: executed inside an
+open transaction they are reverted by ``ROLLBACK``. A setup that leaves them
+uncommitted therefore silently returns ``current_user`` to the operator LOGIN
+(e.g. the ``postgres`` superuser) on the first ``conn.rollback()`` — the
+discovered defect: direct DML would then pass the permission checks and hit a
+trigger error instead of ``permission denied``. This module instead:
+
+* runs the identity/RBAC checks in a PREPARATORY transaction that is ROLLED
+  BACK — nothing business-side can ever be committed there — and then
+  establishes ``SET ROLE trad_bot_htf_p2_admin`` and the session write-mode
+  pin (``SET default_transaction_read_only``) in a setup transaction
+  containing ONLY those ``SET`` statements, **committed** so the
+  administrative context is session-persistent and a later ROLLBACK of work
+  transactions can never restore the login's original privileges;
+* re-verifies the effective context in a FRESH transaction right after the
+  commit: ``current_user`` must be the admin role, ``session_user`` must be
+  the operator login recorded at connect time (the NOLOGIN admin role can
+  never be a ``session_user``), the per-mode privilege matrix and the
+  write-mode pin must hold;
+* exposes :func:`recover_admin_db` — the ONLY sanctioned transaction-recovery
+  entry point: it rolls the (possibly failed) transaction back and re-verifies
+  the effective admin context INCLUDING the recorded ``session_user`` login
+  identity; on any mismatch the connection is CLOSED and
+  :class:`AdminConnectionError` is raised. The session must never continue on
+  the login's privileges, and a privilege loss is never silent.
+
 Per-operation privilege matrix (issue #205 deliverable 2)
 --------------------------------------------------------
 ===================  ===============  ==================  =========================
@@ -495,20 +523,41 @@ def verify_admin_rbac_invariants(conn, creds: dict) -> None:
 
 
 # ----------------------------------------------------------- effective context
-def verify_effective_admin_context(conn, *, mode: str) -> None:
-    """Verify the POST-``SET ROLE`` context and the per-mode privilege matrix."""
+def verify_effective_admin_context(
+    conn, *, mode: str, expected_session_user: str | None = None
+) -> None:
+    """Verify the POST-``SET ROLE`` context and the per-mode privilege matrix.
+
+    BOTH identities are checked: ``current_user`` must be the administrative
+    role and ``session_user`` must be a real operator login — the NOLOGIN admin
+    role can never be a ``session_user``, so anything else means the session
+    identity is not what ``SET ROLE`` established. ``expected_session_user``
+    pins the login identity recorded at connect time, so transaction recovery
+    can prove the session did not silently switch logins.
+    """
     if mode not in (READ_ONLY_MODE, ACTIVATE_MODE):
         raise AdminConnectionError(f"unknown admin connection mode {mode!r} (fail closed)")
     cur = conn.cursor()
     try:
-        cur.execute("SELECT current_user")
+        cur.execute("SELECT current_user, session_user")
         row = cur.fetchone()
     finally:
         cur.close()
     current = row[0] if row else None
+    session = row[1] if row and len(row) > 1 else None
     if current != ADMIN_ROLE:
         raise AdminConnectionError(
             f"SET ROLE did not establish the admin context (current_user={current!r}); fail closed"
+        )
+    if not session or session == ADMIN_ROLE:
+        raise AdminConnectionError(
+            f"session_user={session!r} is not an operator login "
+            f"({ADMIN_ROLE} is NOLOGIN and can never be a session_user); fail closed"
+        )
+    if expected_session_user is not None and session != expected_session_user:
+        raise AdminConnectionError(
+            f"session_user={session!r} differs from the login {expected_session_user!r} "
+            "recorded at connect time (session identity changed after recovery?); fail closed"
         )
     for relation in PHASE2_RELATIONS:
         cur = conn.cursor()
@@ -625,18 +674,41 @@ def connect_admin_db(mode: str, *, driver: str | None = None):
             f"admin database connection failed ({exc}); fail closed"
         ) from exc
     try:
+        # Phase 1 — PREPARATORY transaction: identity + RBAC checks are pure
+        # SELECTs and the transaction is ROLLED BACK (never committed), so it
+        # is structurally impossible to commit business changes here.
         # pin the transaction write mode FIRST — SET TRANSACTION is only legal
         # before any query of the transaction.
         if mode == READ_ONLY_MODE:
             _exec_one(conn, "SET TRANSACTION READ ONLY")
-            _exec_one(conn, "SET default_transaction_read_only = on")
         else:
             _exec_one(conn, "SET TRANSACTION READ WRITE")
-            _exec_one(conn, "SET default_transaction_read_only = off")
         verify_admin_target_identity(conn, creds)
         verify_admin_rbac_invariants(conn, creds)
+        conn.rollback()
+        # Phase 2 — SESSION-CONTEXT SETUP transaction: contains ONLY the
+        # ``SET ROLE`` / session write-mode statements and is COMMITTED.
+        # Issue #205 rollback-safety: SET ROLE / SET are transactional in
+        # PostgreSQL — left inside the open transaction they would be silently
+        # reverted by the first conn.rollback(), restoring the operator login's
+        # original (superuser) privileges. The session context is therefore
+        # established here and COMMITTED in its own transaction, making it
+        # session-persistent across any later rollback of work transactions.
         _exec_one(conn, f"SET ROLE {ADMIN_ROLE}")
-        verify_effective_admin_context(conn, mode=mode)
+        _exec_one(
+            conn,
+            "SET default_transaction_read_only = on"
+            if mode == READ_ONLY_MODE
+            else "SET default_transaction_read_only = off",
+        )
+        conn.commit()
+        # Phase 3 — verify in a FRESH transaction: proves the committed session
+        # context (admin role + operator session identity + per-mode write pin
+        # + privilege matrix) really holds before the session is handed over.
+        conn.admin_session_user = creds["user"]
+        verify_effective_admin_context(
+            conn, mode=mode, expected_session_user=creds["user"]
+        )
     except AdminConnectionError:
         close_admin_db(conn)
         raise
@@ -660,3 +732,50 @@ def close_admin_db(conn) -> None:
         conn.close()
     except Exception as exc:  # pragma: no cover - best effort
         log.warning("admin db connection close failed: %s", exc)
+
+
+def recover_admin_db(
+    conn, *, mode: str, expected_session_user: str | None = None
+) -> None:
+    """Sanctioned transaction recovery for a live admin session (issue #205).
+
+    ``conn.rollback()`` is a permitted transaction-recovery step for an admin
+    session (clearing an aborted transaction between attempts). Because
+    :func:`connect_admin_db` COMMITS the ``SET ROLE`` / session write-mode
+    context, a rollback of work transactions keeps ``current_user =
+    trad_bot_htf_p2_admin`` — it can never silently restore the operator
+    login's original privileges.
+
+    This helper is the fail-closed counterpart: it rolls the (possibly failed)
+    transaction back and RE-VERIFIES the effective admin context
+    (``current_user``, the ``session_user`` identity recorded at connect time,
+    the per-mode privilege matrix and the write-mode pin). If the context is
+    lost anyway — explicit ``RESET ROLE``, session reset, driver-level
+    reconnect to another login — the connection is CLOSED and
+    :class:`AdminConnectionError` is raised. The caller must never continue on
+    the login's privileges.
+    """
+    if mode not in (READ_ONLY_MODE, ACTIVATE_MODE):
+        raise AdminConnectionError(f"unknown admin connection mode {mode!r} (fail closed)")
+    if conn is None:
+        raise AdminConnectionError("no admin session to recover (fail closed)")
+    if expected_session_user is None:
+        expected_session_user = getattr(conn, "admin_session_user", None)
+    try:
+        conn.rollback()
+    except Exception as exc:
+        close_admin_db(conn)
+        raise AdminConnectionError(
+            f"admin session transaction recovery failed ({exc}); "
+            "connection closed, fail closed"
+        ) from exc
+    try:
+        verify_effective_admin_context(
+            conn, mode=mode, expected_session_user=expected_session_user
+        )
+    except AdminConnectionError as exc:
+        close_admin_db(conn)
+        raise AdminConnectionError(
+            f"admin context lost after transaction recovery: {exc}; "
+            "connection closed, fail closed"
+        ) from exc

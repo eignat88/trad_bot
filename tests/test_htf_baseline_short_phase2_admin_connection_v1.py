@@ -75,9 +75,22 @@ class _FakeConn:
         self.failures = dict(failures or {})
         self.executed = []
         self.closed = False
+        self.commits = 0
+        self.rollbacks = 0
+        self.rollback_error = None
 
     def cursor(self):
         return _FakeCursor(self)
+
+    def commit(self):
+        self.commits += 1
+        self.executed.append(("COMMIT", None))
+
+    def rollback(self):
+        if self.rollback_error is not None:
+            raise self.rollback_error
+        self.rollbacks += 1
+        self.executed.append(("ROLLBACK", None))
 
     def close(self):
         self.closed = True
@@ -118,7 +131,7 @@ def default_rbac_responses():
 def context_responses(mode: str, **overrides):
     read_only = "on" if mode == admin.READ_ONLY_MODE else "off"
     base = {
-        "SELECT current_user": (ADMIN_ROLE,),
+        "SELECT current_user": (ADMIN_ROLE, "oper"),
         "has_table_privilege": (True, False, False, False, False),
         "SHOW transaction_read_only": (read_only,),
     }
@@ -656,3 +669,142 @@ def test_close_admin_db_defensive():
     admin.close_admin_db(conn)
     assert conn.closed
     admin.close_admin_db(None)
+
+
+# ========================================== issue #205 rollback-role safety
+def test_connect_commits_the_set_role_context(monkeypatch):
+    """SET ROLE / session write-mode are COMMITTED by connect_admin_db.
+
+    ``SET ROLE`` is transactional in PostgreSQL: left uncommitted it is
+    reverted by the first ``ROLLBACK``, silently restoring the operator
+    login's original (superuser) privileges — the discovered issue #205
+    defect. The context must therefore be committed in its own transaction.
+    """
+    _set_admin_env(monkeypatch)
+    conn, _ = _scripted(monkeypatch, context_responses(admin.ACTIVATE_MODE))
+    admin.connect_admin_db(admin.ACTIVATE_MODE)
+    sqls = conn.sql()
+    assert conn.commits == 1
+    assert conn.rollbacks == 1  # preparatory checks are ROLLED BACK, never committed
+    assert sqls.index("ROLLBACK") < sqls.index("SET ROLE trad_bot_htf_p2_admin")
+    assert sqls.index("SET ROLE trad_bot_htf_p2_admin") < sqls.index("COMMIT")
+    first_matrix_check = next(
+        i for i, sql in enumerate(sqls) if "has_table_privilege" in sql
+    )
+    assert sqls.index("COMMIT") < first_matrix_check  # verified AFTER commit
+
+
+def test_connect_prep_transaction_cannot_commit_business_changes(monkeypatch):
+    """The preparatory transaction is rolled back; the committed setup
+    transaction contains ONLY the session-context SET statements (issue #205:
+    no business changes can ever be committed by the setup)."""
+    _set_admin_env(monkeypatch)
+    conn, _ = _scripted(monkeypatch, context_responses(admin.ACTIVATE_MODE))
+    admin.connect_admin_db(admin.ACTIVATE_MODE)
+    sqls = conn.sql()
+    rollback_at = sqls.index("ROLLBACK")
+    commit_at = sqls.index("COMMIT")
+    assert rollback_at < commit_at
+    setup = sqls[rollback_at + 1:commit_at]
+    assert setup == [
+        "SET ROLE trad_bot_htf_p2_admin",
+        "SET default_transaction_read_only = off",
+    ]
+
+
+def test_connect_records_session_identity_for_recovery(monkeypatch):
+    """connect_admin_db records the operator login used for SET ROLE."""
+    _set_admin_env(monkeypatch)
+    conn, _ = _scripted(monkeypatch, context_responses(admin.ACTIVATE_MODE))
+    admin.connect_admin_db(admin.ACTIVATE_MODE)
+    assert conn.admin_session_user == "oper"
+
+
+def test_connect_read_only_mode_commits_the_read_only_pin(monkeypatch):
+    """The mint/verify READ-ONLY pin is session-persistent after the commit."""
+    _set_admin_env(monkeypatch)
+    conn, _ = _scripted(monkeypatch, context_responses(admin.READ_ONLY_MODE))
+    admin.connect_admin_db(admin.READ_ONLY_MODE)
+    sqls = conn.sql()
+    assert conn.commits == 1
+    assert sqls.index("SET default_transaction_read_only = on") < sqls.index("COMMIT")
+
+
+def test_recover_admin_db_rolls_back_and_reverifies():
+    """Permitted transaction recovery keeps the admin context and re-checks it."""
+    conn = _mode_conn(admin.ACTIVATE_MODE)
+    admin.recover_admin_db(conn, mode=admin.ACTIVATE_MODE)
+    assert conn.rollbacks == 1
+    assert not conn.closed
+    sqls = conn.sql()
+    assert sqls.index("ROLLBACK") < next(
+        i for i, sql in enumerate(sqls) if "SELECT current_user" in sql
+    )
+
+
+def test_recover_admin_db_lost_context_fails_closed_and_closes():
+    """A lost admin context must never pass silently: refuse + close."""
+    conn = _mode_conn(admin.ACTIVATE_MODE, **{"SELECT current_user": ("postgres",)})
+    with pytest.raises(admin.AdminConnectionError, match="fail closed"):
+        admin.recover_admin_db(conn, mode=admin.ACTIVATE_MODE)
+    assert conn.closed
+
+
+def test_recover_admin_db_lost_read_only_pin_fails_closed():
+    """The mint/verify READ-ONLY pin is part of the recovered context."""
+    conn = _mode_conn(admin.READ_ONLY_MODE, **{"SHOW transaction_read_only": ("off",)})
+    with pytest.raises(admin.AdminConnectionError, match="fail closed"):
+        admin.recover_admin_db(conn, mode=admin.READ_ONLY_MODE)
+    assert conn.closed
+
+
+def test_recover_admin_db_rollback_error_fails_closed():
+    """Even the rollback itself failing closes the connection."""
+    conn = _mode_conn(admin.ACTIVATE_MODE)
+    conn.rollback_error = RuntimeError("connection gone")
+    with pytest.raises(admin.AdminConnectionError, match="fail closed"):
+        admin.recover_admin_db(conn, mode=admin.ACTIVATE_MODE)
+    assert conn.closed
+
+
+def test_recover_admin_db_invalid_inputs_refused():
+    with pytest.raises(admin.AdminConnectionError, match="unknown admin connection mode"):
+        admin.recover_admin_db(_mode_conn(admin.ACTIVATE_MODE), mode="rw")
+    with pytest.raises(admin.AdminConnectionError, match="fail closed"):
+        admin.recover_admin_db(None, mode=admin.ACTIVATE_MODE)
+
+
+def test_verify_effective_context_checks_session_user_identity():
+    """session_user must be an operator login — never the NOLOGIN admin role."""
+    conn = _mode_conn(
+        admin.ACTIVATE_MODE, **{"SELECT current_user": (ADMIN_ROLE, ADMIN_ROLE)}
+    )
+    with pytest.raises(admin.AdminConnectionError, match="session_user"):
+        admin.verify_effective_admin_context(conn, mode=admin.ACTIVATE_MODE)
+
+
+def test_verify_effective_context_requires_recorded_login():
+    """A session_user differing from the recorded login fails closed."""
+    conn = _mode_conn(
+        admin.ACTIVATE_MODE, **{"SELECT current_user": (ADMIN_ROLE, "someone_else")}
+    )
+    with pytest.raises(admin.AdminConnectionError, match="fail closed"):
+        admin.verify_effective_admin_context(
+            conn, mode=admin.ACTIVATE_MODE, expected_session_user="oper"
+        )
+
+
+def test_recover_admin_db_reverifies_recorded_session_identity():
+    """Transaction recovery re-checks the login identity recorded at connect."""
+    conn = _mode_conn(admin.ACTIVATE_MODE)
+    conn.admin_session_user = "oper"
+    admin.recover_admin_db(conn, mode=admin.ACTIVATE_MODE)
+    assert not conn.closed
+
+    conn = _mode_conn(
+        admin.ACTIVATE_MODE, **{"SELECT current_user": (ADMIN_ROLE, "someone_else")}
+    )
+    conn.admin_session_user = "oper"
+    with pytest.raises(admin.AdminConnectionError, match="fail closed"):
+        admin.recover_admin_db(conn, mode=admin.ACTIVATE_MODE)
+    assert conn.closed

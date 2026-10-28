@@ -84,7 +84,12 @@ does not exist because no admin password exists.
    (SELECT + EXECUTE `insert_observation`, no EXECUTE `activate`, no
    INSERT/UPDATE/DELETE/TRUNCATE anywhere);
 5. `SET ROLE trad_bot_htf_p2_admin` — refused for non-member logins;
-6. **effective context** — `current_user` is the admin role, SELECT is
+6. the identity/RBAC checks run in a preparatory transaction that is **rolled
+   back** (it can never commit business changes), then the session context
+   (`SET ROLE` + `SET default_transaction_read_only`) is **committed in a
+   setup transaction containing only those SET statements** and re-verified
+   in a fresh transaction (see §6);
+7. **effective context** — `current_user` is the admin role, SELECT is
    allowed, INSERT/UPDATE/DELETE/TRUNCATE are denied (all three Phase-2
    relations), EXECUTE `activate()` only in activate mode, and
    `SHOW transaction_read_only` matches the operation.
@@ -130,8 +135,53 @@ works while claim refuses).
 | crash after DB commit, before activation JSON | `REFUSED` + recovery via `claim --repair-activation-json` with the sealed claim receipt |
 | missing / damaged claim receipt in recovery | `REFUSED` (identity unverifiable — STOP and escalate) |
 | observer attempting to bypass the freeze | cannot `SET ROLE` admin, cannot execute `activate()` |
+| admin context lost after a permitted `ROLLBACK` / transaction recovery | `recover_admin_db` re-verifies and REFUSES + closes the connection — the session never continues on the login's privileges |
+| `session_user` drifts from the login recorded at connect time (driver reconnect / session reset to another login) | `REFUSED` + connection closed (fail closed) |
 
-## 6. Verification of the freeze (three authorities + registry evidence)
+## 6. Transaction scope and rollback safety (issue #205 defect fix)
+
+`SET ROLE` and `SET` are **transactional** in PostgreSQL: executed inside an
+open transaction they are reverted by `ROLLBACK`. An earlier setup left the
+`SET ROLE trad_bot_htf_p2_admin` context uncommitted, so the first
+`conn.rollback()` of a work transaction silently returned `current_user` to
+the operator login (`postgres`, superuser). Direct DML then passed the
+permission checks and failed on a trigger guard (`P2_EXPERIMENT_NOT_REGISTERED`)
+instead of `permission denied` — a silent privilege restoration that the
+`test_claim_session_denies_direct_dml` regression test caught.
+
+Fixed semantics:
+
+* `connect_admin_db()` establishes `SET ROLE` and the session write-mode pin
+  (`SET default_transaction_read_only`) and **commits** them in a setup
+  transaction that contains ONLY those `SET` statements (the preparatory
+  identity/RBAC transaction is rolled back, so business changes can never be
+  committed by the setup) — the administrative context is session-persistent
+  and every later `ROLLBACK` of work transactions keeps `current_user =
+  trad_bot_htf_p2_admin`. The mint/verify READ-ONLY pin survives the same way.
+* the effective context is verified again in a fresh transaction right after
+  the commit and by `recover_admin_db` after every permitted transaction
+  recovery: `current_user` must be the admin role and `session_user` must be
+  the operator login recorded at connect time (the NOLOGIN admin role can
+  never be a `session_user`);
+* `recover_admin_db(conn, mode=...)` is the ONLY sanctioned transaction
+  recovery entry point: `ROLLBACK` + mandatory re-verification of the
+  effective role, the recorded `session_user` login identity, the per-mode
+  privilege matrix and the write-mode pin. Any mismatch (explicit
+  `RESET ROLE`, session reset, driver reconnect) closes the connection and
+  raises — fail closed, never a silent superuser fallback.
+
+Regression tests: `test_admin_context_survives_rollback_no_superuser_restore`,
+`test_read_only_pin_survives_rollback_for_mint_verify`,
+`test_failed_transaction_recovery_keeps_admin_context`,
+`test_reconnect_reestablishes_and_reverifies_admin_context`,
+`test_lost_admin_context_fails_closed_and_closes_connection`,
+`test_commit_keeps_admin_context_after_claim_shaped_transaction`,
+`test_repeated_direct_dml_remains_denied_after_rollback_and_commit`,
+`test_admin_channel_holds_only_the_sanctioned_activation_function`
+(PostgreSQL IT) and the `recover_admin_db` / commit-semantics / session-identity
+unit tests.
+
+## 7. Verification of the freeze (three authorities + registry evidence)
 
 `verify` remains READ-ONLY and requires full agreement of the freeze record,
 the database registration and the activation config — plus the freeze-registry
@@ -141,12 +191,13 @@ observation table stays empty across the entire `mint → claim → verify`
 cycle; enabling the observer is a separate operator action outside this tool
 (runbook §3.6).
 
-## 7. Test evidence
+## 8. Test evidence
 
 * `tests/test_htf_baseline_short_phase2_admin_connection_v1.py` — unit:
   loader/credential matrix, refusal of observer credentials, password-file
   handling and never-logged passwords, identity pinning, RBAC invariant
   refusals, effective-context matrix, connect orchestration and ordering,
+  committed `SET ROLE` semantics and `recover_admin_db` fail-closed behavior,
   source-scan (no `.env`, no `os.environ` outside the admin prefix).
 * `tests/test_htf_baseline_short_phase2_freeze_record_v1.py` — tool routing:
   `mint`/`verify`/recovery never open an activate session; the initial claim
@@ -157,4 +208,5 @@ cycle; enabling the observer is a separate operator action outside this tool
   `trad_bot_p2_it_*` databases, real SCRAM + operator-logins): the full cycle
   through both driver paths, the privilege matrix above and the complete
   failure matrix, including the Point-B sentinel and the observer-still-off
-  invariants.
+  invariants, plus the rollback / failed-transaction / reconnect /
+  effective-role-re-verification regression matrix of §6.

@@ -21,6 +21,11 @@ Positive evidence:
   sessions and work WITHOUT the activation privilege; only the initial claim
   opens read-write and its single write is the sanctioned activation function;
   direct DML is denied to the admin role in BOTH modes.
+* rollback-role safety (issue #205 defect fix): the committed ``SET ROLE``
+  context survives ``conn.rollback()`` and failed-transaction recovery,
+  reconnects re-establish and re-verify it, the mint/verify READ-ONLY pin
+  survives rollback, and a lost admin context always fails closed (connection
+  closed) instead of silently restoring the login's privileges.
 
 Negative evidence (all fail-closed, nothing written, database untouched):
 missing admin credentials (the production incident shape), observer
@@ -441,6 +446,238 @@ def test_claim_session_denies_direct_dml(prov, monkeypatch):
             (admin.ACTIVATE_FUNCTION_SIGNATURE,),
         )
         assert cur.fetchone()[0] is True
+        cur.close()
+    finally:
+        admin.close_admin_db(conn)
+
+
+# ========================================== issue #205 rollback-role safety
+def test_admin_context_survives_rollback_no_superuser_restore(prov, monkeypatch):
+    """REGRESSION (issue #205 discovered defect): ``conn.rollback()`` must NOT
+    silently restore the operator login's original privileges.
+
+    ``SET ROLE`` is transactional in PostgreSQL — executed inside the open
+    transaction it used to be reverted by the first rollback, returning
+    ``current_user`` to the ``postgres`` superuser; direct DML then passed the
+    permission checks and failed on a trigger guard
+    (``P2_EXPERIMENT_NOT_REGISTERED``) instead of ``permission denied``. The
+    admin context is committed by ``connect_admin_db`` and must survive every
+    permitted transaction recovery.
+    """
+    _set_admin_env(monkeypatch, prov, user="postgres")
+    conn = admin.connect_admin_db(admin.ACTIVATE_MODE)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT session_user, current_user")
+        assert tuple(cur.fetchone()) == ("postgres", ADMIN_ROLE)
+        with pytest.raises(Exception) as excinfo:
+            cur.execute(f"INSERT INTO {admin.PHASE2_RELATIONS[0]} DEFAULT VALUES")
+        assert "permission denied" in str(excinfo.value).lower()
+        conn.rollback()  # the exact step that used to restore superuser rights
+        cur.execute("SELECT session_user, current_user")
+        assert tuple(cur.fetchone()) == ("postgres", ADMIN_ROLE), (
+            "ROLLBACK restored the login's privileges: the SET ROLE context was "
+            "not session-persistent (issue #205 defect)"
+        )
+        with pytest.raises(Exception) as excinfo:
+            cur.execute(f"INSERT INTO {admin.PHASE2_RELATIONS[0]} DEFAULT VALUES")
+        message = str(excinfo.value).lower()
+        assert "permission denied" in message
+        assert "p2_experiment_not_registered" not in message  # never a trigger error
+        conn.rollback()
+        # repeated effective-role verification after the recovery
+        admin.verify_effective_admin_context(conn, mode=admin.ACTIVATE_MODE)
+        cur.close()
+    finally:
+        admin.close_admin_db(conn)
+
+
+def test_read_only_pin_survives_rollback_for_mint_verify(prov, monkeypatch):
+    """mint/verify: the PostgreSQL READ-ONLY pin survives permitted rollback."""
+    _set_admin_env(monkeypatch, prov, user="postgres")
+    conn = admin.connect_admin_db(admin.READ_ONLY_MODE)
+    try:
+        cur = conn.cursor()
+        cur.execute("SHOW transaction_read_only")
+        assert cur.fetchone()[0] == "on"
+        with pytest.raises(Exception) as excinfo:
+            cur.execute(
+                "UPDATE research.htf_baseline_short_phase2_experiment "
+                "SET status = 'CANCELLED' WHERE experiment_id = %s",
+                (EXPERIMENT_ID,),
+            )
+        assert "read-only" in str(excinfo.value).lower()
+        conn.rollback()
+        cur.execute("SELECT session_user, current_user")
+        assert tuple(cur.fetchone()) == ("postgres", ADMIN_ROLE)
+        cur.execute("SHOW transaction_read_only")
+        assert cur.fetchone()[0] == "on", "READ-ONLY pin lost after rollback"
+        with pytest.raises(Exception) as excinfo:
+            cur.execute(
+                "UPDATE research.htf_baseline_short_phase2_experiment "
+                "SET status = 'CANCELLED' WHERE experiment_id = %s",
+                (EXPERIMENT_ID,),
+            )
+        assert "read-only" in str(excinfo.value).lower()
+        cur.close()
+    finally:
+        admin.close_admin_db(conn)
+
+
+def test_failed_transaction_recovery_keeps_admin_context(prov, monkeypatch):
+    """A failed transaction + sanctioned recovery keeps the admin context."""
+    _set_admin_env(monkeypatch, prov, user="postgres")
+    conn = admin.connect_admin_db(admin.ACTIVATE_MODE)
+    try:
+        cur = conn.cursor()
+        with pytest.raises(Exception):
+            cur.execute("SELECT * FROM research.no_such_relation_issue205")
+        admin.recover_admin_db(conn, mode=admin.ACTIVATE_MODE)  # sanctioned recovery
+        cur.execute("SELECT session_user, current_user")
+        assert tuple(cur.fetchone()) == ("postgres", ADMIN_ROLE)
+        with pytest.raises(Exception) as excinfo:
+            cur.execute(f"INSERT INTO {admin.PHASE2_RELATIONS[0]} DEFAULT VALUES")
+        assert "permission denied" in str(excinfo.value).lower()
+        admin.recover_admin_db(conn, mode=admin.ACTIVATE_MODE)
+        # repeated effective-role verification after recovery
+        admin.verify_effective_admin_context(conn, mode=admin.ACTIVATE_MODE)
+        cur.execute(
+            "SELECT has_function_privilege(%s, 'EXECUTE')",
+            (admin.ACTIVATE_FUNCTION_SIGNATURE,),
+        )
+        assert cur.fetchone()[0] is True
+        cur.close()
+    finally:
+        admin.close_admin_db(conn)
+
+
+def test_reconnect_reestablishes_and_reverifies_admin_context(prov, monkeypatch):
+    """Every reconnect re-enters AND re-verifies the admin context."""
+    _set_admin_env(monkeypatch, prov, user="postgres")
+    for _attempt in (1, 2):
+        conn = admin.connect_admin_db(admin.ACTIVATE_MODE)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT session_user, current_user")
+            assert tuple(cur.fetchone()) == ("postgres", ADMIN_ROLE)
+            admin.verify_effective_admin_context(conn, mode=admin.ACTIVATE_MODE)
+            cur.close()
+        finally:
+            admin.close_admin_db(conn)
+
+
+def test_lost_admin_context_fails_closed_and_closes_connection(prov, monkeypatch):
+    """If the admin context is ever lost, recovery REFUSES and closes the
+    connection — the session must never continue with the login's privileges."""
+    _set_admin_env(monkeypatch, prov, user="postgres")
+    conn = admin.connect_admin_db(admin.ACTIVATE_MODE)
+    try:
+        cur = conn.cursor()
+        cur.execute("RESET ROLE")  # explicit context loss (manual/session reset)
+        conn.commit()  # make it persistent so no rollback could restore it
+        with pytest.raises(admin.AdminConnectionError):
+            admin.recover_admin_db(conn, mode=admin.ACTIVATE_MODE)
+        with pytest.raises(Exception):
+            cur.execute("SELECT 1")  # the connection is closed (fail closed)
+    finally:
+        admin.close_admin_db(conn)
+
+
+def test_commit_keeps_admin_context_after_claim_shaped_transaction(prov, monkeypatch):
+    """``claim.commit()`` must not change the role: the admin context is
+    session-persistent across commits as well as rollbacks (issue #205)."""
+    _set_admin_env(monkeypatch, prov, user="postgres")
+    conn = admin.connect_admin_db(admin.ACTIVATE_MODE)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT session_user, current_user")
+        assert tuple(cur.fetchone()) == ("postgres", ADMIN_ROLE)
+        conn.commit()  # the claim path's single sanctioned commit step
+        cur.execute("SELECT session_user, current_user")
+        assert tuple(cur.fetchone()) == ("postgres", ADMIN_ROLE), (
+            "commit changed the effective role (issue #205 invariant)"
+        )
+        admin.verify_effective_admin_context(conn, mode=admin.ACTIVATE_MODE)
+        with pytest.raises(Exception) as excinfo:
+            cur.execute(f"INSERT INTO {admin.PHASE2_RELATIONS[0]} DEFAULT VALUES")
+        assert "permission denied" in str(excinfo.value).lower()
+        conn.rollback()
+        cur.close()
+    finally:
+        admin.close_admin_db(conn)
+
+
+def test_repeated_direct_dml_remains_denied_after_rollback_and_commit(
+    prov, monkeypatch
+):
+    """Repeated INSERT/UPDATE/DELETE stays denied after BOTH permitted
+    transaction-recovery steps (rollback and commit) — never a superuser
+    fallback (issue #205)."""
+    _set_admin_env(monkeypatch, prov, user="postgres")
+    conn = admin.connect_admin_db(admin.ACTIVATE_MODE)
+    try:
+        cur = conn.cursor()
+        for _round in (1, 2):
+            for relation in admin.PHASE2_RELATIONS:
+                with pytest.raises(Exception) as excinfo:
+                    cur.execute(f"INSERT INTO {relation} DEFAULT VALUES")
+                assert "permission denied" in str(excinfo.value).lower()
+                conn.rollback()
+            for verb, stmt in (
+                (
+                    "UPDATE",
+                    "UPDATE research.htf_baseline_short_phase2_experiment "
+                    "SET status = 'CANCELLED' WHERE experiment_id = %s",
+                ),
+                (
+                    "DELETE",
+                    "DELETE FROM research.htf_baseline_short_phase2_experiment "
+                    "WHERE experiment_id = %s",
+                ),
+            ):
+                with pytest.raises(Exception) as excinfo:
+                    cur.execute(stmt, (EXPERIMENT_ID,))
+                message = str(excinfo.value).lower()
+                assert "permission denied" in message, f"{verb} escaped the RBAC surface"
+                assert "p2_experiment" not in message  # never a trigger/constraint error
+                conn.rollback()
+        conn.commit()  # the other permitted recovery step
+        for relation in admin.PHASE2_RELATIONS:
+            with pytest.raises(Exception) as excinfo:
+                cur.execute(f"INSERT INTO {relation} DEFAULT VALUES")
+            assert "permission denied" in str(excinfo.value).lower()
+            conn.rollback()
+        cur.close()
+    finally:
+        admin.close_admin_db(conn)
+
+
+def test_admin_channel_holds_only_the_sanctioned_activation_function(
+    prov, monkeypatch
+):
+    """The claim session can execute ONLY the sanctioned activation function:
+    EXECUTE on the observer insert function stays absent and direct DML stays
+    denied (issue #205 — no write path widens)."""
+    _set_admin_env(monkeypatch, prov, user="postgres")
+    conn = admin.connect_admin_db(admin.ACTIVATE_MODE)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT has_function_privilege(%s, 'EXECUTE')",
+            (admin.ACTIVATE_FUNCTION_SIGNATURE,),
+        )
+        assert cur.fetchone()[0] is True
+        cur.execute(
+            "SELECT has_function_privilege(%s, 'EXECUTE')",
+            (admin.INSERT_FUNCTION_SIGNATURE,),
+        )
+        assert cur.fetchone()[0] is False, (
+            f"{ADMIN_ROLE} must not hold EXECUTE on the observer insert function"
+        )
+        with pytest.raises(Exception) as excinfo:
+            cur.execute(f"INSERT INTO {admin.PHASE2_RELATIONS[0]} DEFAULT VALUES")
+        assert "permission denied" in str(excinfo.value).lower()
+        conn.rollback()
         cur.close()
     finally:
         admin.close_admin_db(conn)
