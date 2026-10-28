@@ -404,8 +404,12 @@ def test_partial_recovery_still_reports_source_signal_present_true():
     assert len(rows) == 1
     payload = base._payload(rows[0])
     assert payload["source_signal_present"] is True
-    assert payload["link_status"] == "LINKED"
-    assert payload["quarantine_reason"] is None
+    # ME_SHORT_A_PHASE1_LINEAGE_CONSISTENCY_FIX_V1: with no Phase 1 row
+    # observed after the bounded retry, the record no longer claims LINKED
+    # (that falsely implied a fully confirmed relation) — the explicit
+    # PHASE1_PENDING exception carries the honest state.
+    assert payload["link_status"] == "PHASE1_PENDING"
+    assert payload["quarantine_reason"] == "phase1_not_observed"
     assert payload["linkage_checks"].find(
         'source_signal_present": true') >= 0
     # the INSERT itself was a no-op and is reported as such
@@ -435,7 +439,9 @@ def test_rerun_after_a_complete_capture_records_nothing_new():
     assert len(conn.persisted_for(LINEAGE_TABLE)) == 1
     payload = base._payload(conn.persisted_for(LINEAGE_TABLE)[0])
     assert payload["source_signal_present"] is True
-    assert payload["link_status"] == "LINKED"
+    # no Phase 1 row was ever observed for this event: the honest
+    # PHASE1_PENDING state, never a false LINKED relation
+    assert payload["link_status"] == "PHASE1_PENDING"
 
 
 def test_unconfirmed_source_signal_is_retried_never_recorded_as_missing():
@@ -545,7 +551,10 @@ def test_phase1_absence_is_still_reported_honestly():
     assert payload["phase1_linked"] is False
     assert payload["phase1_event_key"] is None
     assert payload["source_signal_present"] is True
-    assert payload["link_status"] == "LINKED"
+    # ME_SHORT_A_PHASE1_LINEAGE_CONSISTENCY_FIX_V1: "honestly" now means the
+    # explicit PHASE1_PENDING exception — the old LINKED + phase1_linked
+    # FALSE combination was the confirmed KORUUSDT/DOGEUSDT defect class.
+    assert payload["link_status"] == "PHASE1_PENDING"
 
 
 def test_forward_only_bound_is_enforced_by_the_query_and_the_runtime():
