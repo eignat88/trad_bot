@@ -51,8 +51,37 @@ jobs:
             tests/test_paper_safety_gate_config.py \
             --tb=short
 
+      - name: Fetch PR base for HTF Phase-2 scope
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags origin "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+
+      - name: Detect HTF Phase-2 changes
+        if: github.event_name == 'pull_request'
+        id: htf_phase2_scope
+        shell: bash
+        run: |
+          git diff --name-only -z "origin/${{ github.base_ref }}...HEAD" > /tmp/htf_phase2_changed_files
+          python3 - <<'PY_SCOPE'
+          import os
+          from pathlib import Path
+
+          paths = [
+              p.decode('utf-8', 'surrogateescape')
+              for p in Path('/tmp/htf_phase2_changed_files').read_bytes().split(b'\0')
+              if p
+          ]
+          relevant = any(
+              'htf_baseline_short_phase2' in p.lower()
+              for p in paths
+          )
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f"changed={'true' if relevant else 'false'}\n")
+          print(f"HTF_PHASE2_RELEVANT={relevant}")
+          PY_SCOPE
+
       - name: Verify HTF Phase-2 isolation
-        if: github.event_name == 'pull_request' && github.event.pull_request.number == 180
+        if: github.event_name == 'pull_request' && steps.htf_phase2_scope.outputs.changed == 'true'
         env:
           PYTHONPATH: .
           PYTHONDONTWRITEBYTECODE: '1'

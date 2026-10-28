@@ -132,7 +132,7 @@ def tool_db(db, monkeypatch):
     """Point the timestamp-authority tool at the disposable database."""
     conns = []
 
-    def fake_connect():
+    def fake_connect(mode=None):
         conn = _fresh_conn(db)
         conn.autocommit = False
         conns.append(conn)
