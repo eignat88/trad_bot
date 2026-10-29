@@ -220,20 +220,32 @@ class IncrementalPhase2CandleSource:
     def _read(self, path: Path, symbol: str) -> list[Candle] | None:
         if not path.exists():
             return None
-        obj = json.loads(path.read_text(encoding='utf-8'))
-        if obj.get('schema') != _SCHEMA or obj.get('symbol') != symbol:
-            raise CacheIntegrityError('wrong schema or symbol')
-        bars_data = obj.get('bars')
-        payload = {'schema': obj['schema'], 'symbol': obj['symbol'], 'bars': bars_data}
-        if sha256(_canonical(payload).encode()).hexdigest() != obj.get('sha256'):
-            raise CacheIntegrityError('cache checksum mismatch')
-        if not isinstance(bars_data, list):
-            raise CacheIntegrityError('invalid cache bars')
-        bars = [Candle(*row) for row in bars_data]
-        # Verify calendar continuity using last bar's close as the ASOF.
-        if bars:
-            _closed_bars(bars, int(bars[-1].timestamp) + BAR_MS)
-        return bars
+        try:
+            obj = json.loads(path.read_text(encoding='utf-8'))
+            if not isinstance(obj, dict):
+                raise CacheIntegrityError('cache document must be an object')
+            if obj.get('schema') != _SCHEMA or obj.get('symbol') != symbol:
+                raise CacheIntegrityError('wrong schema or symbol')
+            bars_data = obj.get('bars')
+            payload = {'schema': obj['schema'], 'symbol': obj['symbol'], 'bars': bars_data}
+            if sha256(_canonical(payload).encode()).hexdigest() != obj.get('sha256'):
+                raise CacheIntegrityError('cache checksum mismatch')
+            if not isinstance(bars_data, list):
+                raise CacheIntegrityError('invalid cache bars')
+            if any(not isinstance(row, list) or len(row) != 6 for row in bars_data):
+                raise CacheIntegrityError('invalid cache candle row shape')
+            bars = [Candle(*row) for row in bars_data]
+            # Verify calendar continuity using last bar's close as the ASOF.
+            if bars:
+                _closed_bars(bars, int(bars[-1].timestamp) + BAR_MS)
+            return bars
+        except CacheIntegrityError:
+            raise
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError,
+                KeyError, OverflowError, AttributeError) as exc:
+            raise CacheIntegrityError(
+                f'unreadable or malformed cache document: {type(exc).__name__}'
+            ) from exc
 
     def _write(self, path: Path, symbol: str, bars: list[Candle]):
         payload = {'schema': _SCHEMA, 'symbol': symbol,
@@ -243,7 +255,7 @@ class IncrementalPhase2CandleSource:
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix='.' + symbol + '.', suffix='.tmp')
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-                os.fchmod(handle.fileno(), 0o600)
+                # mkstemp is exclusive; POSIX requires restrictive mode.\n                # Windows uses inherited directory/file ACLs (no os.fchmod).\n                if os.name == 'posix':\n                    os.fchmod(handle.fileno(), 0o600)
                 handle.write(_canonical(payload))
                 handle.flush()
                 os.fsync(handle.fileno())
