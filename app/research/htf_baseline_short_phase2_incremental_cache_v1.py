@@ -255,7 +255,10 @@ class IncrementalPhase2CandleSource:
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix='.' + symbol + '.', suffix='.tmp')
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-                # mkstemp is exclusive; POSIX requires restrictive mode.\n                # Windows uses inherited directory/file ACLs (no os.fchmod).\n                if os.name == 'posix':\n                    os.fchmod(handle.fileno(), 0o600)
+                # mkstemp is exclusive; POSIX requires restrictive mode.
+                # Windows uses inherited directory/file ACLs (no os.fchmod).
+                if os.name == 'posix':
+                    os.fchmod(handle.fileno(), 0o600)
                 handle.write(_canonical(payload))
                 handle.flush()
                 os.fsync(handle.fileno())
