@@ -50,7 +50,10 @@ output without control characters or ``=`` is preserved byte-for-byte.
 Security contract: No API keys, secrets, signatures, authorization headers,
 or private request payloads are ever captured or logged — records hold an
 explicit allowlist of scalar fields only; response headers are reduced to the
-three ``X-Bapi-Limit*`` values before anything is stored.
+three ``X-Bapi-Limit*`` values before anything is stored. Failure records
+carry only the exception type/category label (e.g. ``ConnectionResetError``)
+— exception text (``str(exc)``/``repr(exc)``) may embed credentials or the
+signed payload and never reaches telemetry.
 
 Telemetry is strictly observational (fail-open): recording errors are
 swallowed by the caller-side guard and must never fail or alter a fetch.

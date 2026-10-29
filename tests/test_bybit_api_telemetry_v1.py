@@ -12,6 +12,9 @@ Coverage requested by the first PR slice:
 * transport / HTTP / API error classification, including previously
   unhandled transport exceptions (``ConnectionResetError`` & friends) with
   exactly one record per attempt and identical exception identity;
+* exception-text secrecy: failure records carry only the safe type/category
+  label — never ``str(exc)``/``repr(exc)`` — even when the exception message
+  embeds an API key, signature or signed payload;
 * secret hygiene (no keys, secrets, signatures, auth headers or private
   payload in any record or log line);
 * ``create_order`` POST instrumentation;
@@ -933,3 +936,123 @@ def test_secret_hygiene_with_injection_attempts(caplog):
     assert "\n" not in line
     assert "X-BAPI-SIGN\\x3dFORGED_SIGNATURE" in line  # forged key=value defused
     assert field(line, "bapi_limit") == "600"          # allowlist header still captured
+
+
+# ----------------------------------------------------------------------
+# P1 security follow-up: exception TEXT must never reach telemetry —
+# only the safe type/category label (review PR #232 / Issue #228)
+# ----------------------------------------------------------------------
+
+EXC_API_KEY = "APIKEY_IN_EXC_SENTINEL"
+EXC_SIGNATURE = "SIGNATURE_IN_EXC_SENTINEL"
+EXC_SIGNED_PAYLOAD = "SIGNED_PAYLOAD_IN_EXC_SENTINEL"
+
+
+def _hostile_transport_error():
+    """Transport exception whose message embeds an API key, a signature and
+    a signed payload — exactly the leak the P1 finding describes."""
+    return ConnectionResetError(10054, (
+        "transport failure while sending "
+        f"X-BAPI-API-KEY={EXC_API_KEY} X-BAPI-SIGN={EXC_SIGNATURE} "
+        f"data={EXC_SIGNED_PAYLOAD}"
+    ))
+
+
+def _assert_no_exception_text_leak(text, error):
+    """Nothing from the exception message (or its repr) may be logged."""
+    for secret in (EXC_API_KEY, EXC_SIGNATURE, EXC_SIGNED_PAYLOAD,
+                   str(error), repr(error)):
+        assert secret not in text
+    assert "[Errno" not in text
+
+
+def test_safe_exc_category_returns_type_name_only():
+    from app.exchange.bybit_client import _safe_exc_category
+    exc = ConnectionResetError(10054, f"message {EXC_API_KEY}")
+    assert _safe_exc_category(exc) == "ConnectionResetError"
+    assert EXC_API_KEY not in _safe_exc_category(exc)
+
+
+def test_get_transport_exception_text_never_reaches_telemetry(caplog):
+    error = _hostile_transport_error()
+    session = ExplodingSession(error)
+    with pytest.raises(type(error)) as exc_info:
+        make_client(session).get_klines("BTCUSDT")
+    assert exc_info.value is error          # original exception preserved
+    assert len(session.calls) == 1          # exactly one HTTP attempt
+    lines = attempt_lines(caplog)
+    assert len(lines) == 1                  # exactly one record for it
+    line = lines[0]
+    assert field(line, "retMsg") == "ConnectionResetError"  # type label only
+    assert field(line, "result") == "ERROR"
+    assert field(line, "status_code") == "0"
+    assert field(line, "status_code_source") == "no_response"
+    _assert_no_exception_text_leak(caplog.text, error)
+    _assert_no_exception_text_leak(line, error)
+
+
+def test_post_transport_exception_text_never_reaches_telemetry(caplog):
+    error = _hostile_transport_error()
+    session = ExplodingSession(error)
+    with pytest.raises(type(error)) as exc_info:
+        BybitClient(live_settings(), session).create_order("BTCUSDT", "Buy", 1)
+    assert exc_info.value is error          # original exception preserved
+    assert len(session.calls) == 1          # exactly one HTTP attempt
+    lines = attempt_lines(caplog)
+    assert len(lines) == 1                  # exactly one record for it
+    line = lines[0]
+    assert field(line, "method") == "POST"
+    assert field(line, "retMsg") == "ConnectionResetError"  # type label only
+    _assert_no_exception_text_leak(caplog.text, error)
+    _assert_no_exception_text_leak(line, error)
+    # configured trading credentials must never appear either
+    assert "APIKEY_SENTINEL_1234567890" not in caplog.text
+    assert "APISECRET_SENTINEL_0987654321" not in caplog.text
+    assert "X-BAPI" not in caplog.text
+
+
+def test_rate_limit_retry_transport_exception_text_never_reaches_telemetry(
+        caplog, monkeypatch):
+    monkeypatch.setattr(bybit_client_module.time, "sleep", lambda *_: None)
+    rate_limited = FakeResponse({"retCode": 10006, "retMsg": "Too many visits", "result": {}})
+    error = _hostile_transport_error()
+    session = ScriptedSession([rate_limited, error])
+    with pytest.raises(ConnectionResetError) as exc_info:
+        make_client(session).get_klines("BTCUSDT")
+    assert exc_info.value is error
+    assert len(session.calls) == 2          # original send + one rate-limit retry
+    lines = attempt_lines(caplog)
+    assert len(lines) == 2                  # exactly one record per attempt
+    assert [field(line, "result") for line in lines] == ["RATE_LIMIT", "ERROR"]
+    assert field(lines[1], "retMsg") == "ConnectionResetError"
+    assert [int(field(line, "attempt_index")) for line in lines] == [1, 2]
+    _assert_no_exception_text_leak(caplog.text, error)
+
+
+def test_http_failure_label_never_carries_exception_text(caplog):
+    """HTTP-level failures label by measured status, never str(exc)."""
+
+    class HostileHttpResponse:
+        status = 502
+        headers = None
+
+        def raise_for_status(self):
+            raise BybitError(
+                f"HTTP 502 {EXC_API_KEY} {EXC_SIGNATURE} {EXC_SIGNED_PAYLOAD}")
+
+        def json(self):
+            return {}
+
+    session = ScriptedSession([HostileHttpResponse()])
+    with pytest.raises(BybitError) as exc_info:
+        make_client(session).get_klines("BTCUSDT")
+    # the original exception (with its text) is preserved for the caller
+    assert EXC_API_KEY in str(exc_info.value)
+    lines = attempt_lines(caplog)
+    assert len(lines) == 1
+    line = lines[0]
+    assert "retMsg=HTTP 502" in line        # derived from the response status
+    assert field(line, "status_code") == "502"
+    for secret in (EXC_API_KEY, EXC_SIGNATURE, EXC_SIGNED_PAYLOAD):
+        assert secret not in caplog.text
+        assert secret not in line

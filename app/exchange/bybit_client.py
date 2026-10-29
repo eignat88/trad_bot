@@ -126,6 +126,34 @@ def _record_attempt(
         pass
 
 
+def _safe_exc_category(exc: BaseException) -> str:
+    """Secret-free telemetry label for a failure: the exception TYPE only.
+
+    Exception messages may embed URLs, auth headers, API keys, signatures or
+    the signed request payload, so no ``str(exc)``/``repr(exc)`` may ever
+    reach a telemetry record (P1 security follow-up, review PR #232 /
+    Issue #228). The exception object itself is never modified or wrapped —
+    callers re-raise the identical object with its original traceback.
+    """
+    return type(exc).__name__
+
+
+def _http_failure_label(response: Any) -> str:
+    """Secret-free label for an HTTP-level failure: ``HTTP <status>``.
+
+    Derived from the measured response status only — never from exception
+    text — so the legacy ``retMsg=HTTP <status>`` output stays byte-compatible
+    while exception messages can never leak into it. Falls back to the bare
+    ``HTTP_ERROR`` category when the response exposes no measurable status.
+    """
+    try:
+        from app.exchange.api_telemetry import extract_response_meta
+        status = extract_response_meta(response).status_code
+    except Exception:
+        status = None
+    return f"HTTP {status}" if status is not None else "HTTP_ERROR"
+
+
 def _send_audited(send, record_failure):
     """Run one HTTP send with a narrow unhandled-failure attempt recorder.
 
@@ -139,6 +167,10 @@ def _send_audited(send, record_failure):
     unexpected transport ``OSError``) is recorded here exactly once and
     re-raised as the identical exception object without retrying. Recording
     is fail-open and can never mask the original failure.
+
+    ``record_failure`` receives the exception only to derive a safe label
+    with :func:`_safe_exc_category` (type/category name) — exception text
+    must never reach telemetry.
     """
     try:
         return send()
@@ -279,7 +311,7 @@ class BybitClient:
                         interval=interval, limit=limit,
                         duration_ms=(time.monotonic() - t_start) * 1000,
                         result="ERROR",
-                        ret_msg=f"{type(exc).__name__}: {exc}",
+                        ret_msg=_safe_exc_category(exc),
                         logical_request_id=logical_request_id,
                         attempt_index=attempt_index,
                         total_attempts=attempt_budget,
@@ -288,15 +320,17 @@ class BybitClient:
                 )
                 try:
                     response.raise_for_status()
-                except Exception as http_exc:
+                except Exception:
                     # HTTP-level failure: record the attempt (previously
-                    # invisible) and keep the fail-fast behavior.
+                    # invisible) with a secret-free label derived from the
+                    # measured response status — never str(exc) — and keep
+                    # the fail-fast behavior.
                     _record_attempt(
                         telemetry, response=response,
                         endpoint=endpoint, caller=caller, symbol=symbol,
                         interval=interval, limit=limit,
                         duration_ms=(time.monotonic() - t_start) * 1000,
-                        result="ERROR", ret_msg=str(http_exc),
+                        result="ERROR", ret_msg=_http_failure_label(response),
                         logical_request_id=logical_request_id,
                         attempt_index=attempt_index,
                         total_attempts=attempt_budget,
@@ -372,7 +406,7 @@ class BybitClient:
                                         limit=limit,
                                         duration_ms=(time.monotonic() - t_retry_start) * 1000,
                                         result="ERROR",
-                                        ret_msg=f"{type(exc).__name__}: {exc}",
+                                        ret_msg=_safe_exc_category(exc),
                                         logical_request_id=logical_request_id,
                                         attempt_index=attempt_index,
                                         total_attempts=attempt_budget,
@@ -381,14 +415,15 @@ class BybitClient:
                                 )
                                 try:
                                     retry_resp.raise_for_status()
-                                except Exception as http_exc:
+                                except Exception:
                                     _record_attempt(
                                         telemetry, response=retry_resp,
                                         endpoint=endpoint, caller=caller,
                                         symbol=symbol, interval=interval,
                                         limit=limit,
                                         duration_ms=(time.monotonic() - t_retry_start) * 1000,
-                                        result="ERROR", ret_msg=str(http_exc),
+                                        result="ERROR",
+                                        ret_msg=_http_failure_label(retry_resp),
                                         logical_request_id=logical_request_id,
                                         attempt_index=attempt_index,
                                         total_attempts=attempt_budget,
@@ -790,7 +825,7 @@ class BybitClient:
                     interval="", limit=0,
                     duration_ms=(time.monotonic() - t_start) * 1000,
                     result="ERROR",
-                    ret_msg=f"{type(exc).__name__}: {exc}",
+                    ret_msg=_safe_exc_category(exc),
                     logical_request_id=logical_request_id,
                     attempt_index=1, total_attempts=1, method="POST",
                 ),
@@ -819,13 +854,13 @@ class BybitClient:
             raise
         try:
             response.raise_for_status()
-        except Exception as http_exc:
+        except Exception:
             _record_attempt(
                 telemetry, response=response,
                 endpoint="/v5/order/create", caller=caller, symbol=symbol,
                 interval="", limit=0,
                 duration_ms=(time.monotonic() - t_start) * 1000,
-                result="ERROR", ret_msg=str(http_exc),
+                result="ERROR", ret_msg=_http_failure_label(response),
                 logical_request_id=logical_request_id,
                 attempt_index=1, total_attempts=1, method="POST",
             )
