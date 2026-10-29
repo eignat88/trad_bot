@@ -6,14 +6,19 @@ Coverage requested by the first PR slice:
 * logical-request <-> retry binding (``logical_request_id`` + strictly
   ordered ``attempt_index`` for timeout and rate-limit retries);
 * ``X-Bapi-Limit*`` header capture in both modes (values when present,
-  explicit ``headers_absent`` marker when stripped) and always-populated
-  ``status_code``;
-* transport / HTTP / API error classification;
+  explicit ``headers_absent`` marker when stripped) and never-guessed
+  ``status_code`` plus its ``status_code_source`` provenance marker
+  (``measured`` / ``unknown_response_status`` / ``no_response``);
+* transport / HTTP / API error classification, including previously
+  unhandled transport exceptions (``ConnectionResetError`` & friends) with
+  exactly one record per attempt and identical exception identity;
 * secret hygiene (no keys, secrets, signatures, auth headers or private
   payload in any record or log line);
 * ``create_order`` POST instrumentation;
 * service tagging regression (no known consumer maps to ``other``);
 * BYBIT_API_CALL legacy prefix compatibility;
+* log-injection hardening (control-character and key=value escaping of
+  free-form fields, incl. multiline provider messages and env values);
 * fail-open telemetry and unchanged HTTP request counts.
 """
 from __future__ import annotations
@@ -310,17 +315,20 @@ def test_extract_response_meta_is_fail_open():
     assert meta.headers_absent is True
 
 
-def test_status_code_always_populated(caplog):
-    # explicit HTTP status
+def test_status_code_never_guessed_and_source_always_present(caplog):
+    # explicit HTTP status -> measured
     session = ScriptedSession([FakeResponse(status=200)])
     make_client(session).get_klines("BTCUSDT")
     assert field(attempt_lines(caplog)[0], "status_code") == "200"
+    assert field(attempt_lines(caplog)[0], "status_code_source") == "measured"
 
-    # response without status attribute -> best-effort derivation
+    # response without status attribute -> 0 sentinel + explicit marker,
+    # NEVER a guessed HTTP 200 (review PR #232 / Issue #228)
     caplog.clear()
     session = ScriptedSession([MinimalResponse()])
     make_client(session).get_klines("BTCUSDT")
-    assert field(attempt_lines(caplog)[0], "status_code") == "200"
+    assert field(attempt_lines(caplog)[0], "status_code") == "0"
+    assert field(attempt_lines(caplog)[0], "status_code_source") == "unknown_response_status"
 
     # no HTTP response at all -> explicit 0 (transport failure)
     caplog.clear()
@@ -328,6 +336,47 @@ def test_status_code_always_populated(caplog):
     with pytest.raises(URLError):
         make_client(session).get_klines("BTCUSDT")
     assert field(attempt_lines(caplog)[0], "status_code") == "0"
+    assert field(attempt_lines(caplog)[0], "status_code_source") == "no_response"
+
+
+def test_api_error_status_is_measured_not_assumed(caplog):
+    """retCode != 0 with a real HTTP 200 keeps the measured status."""
+    session = ScriptedSession([
+        FakeResponse({"retCode": 10001, "retMsg": "params error", "result": {}}),
+    ])
+    with pytest.raises(BybitError):
+        make_client(session).get_klines("BTCUSDT")
+    line = attempt_lines(caplog)[0]
+    assert field(line, "status_code") == "200"
+    assert field(line, "status_code_source") == "measured"
+
+
+def test_api_error_with_unknown_status_is_marked(caplog):
+    """retCode != 0 from a status-less transport must not claim HTTP 200."""
+
+    class NoStatusResponse(MinimalResponse):
+        def json(self):
+            return {"retCode": 10001, "retMsg": "params error", "result": {}}
+
+    session = ScriptedSession([NoStatusResponse()])
+    with pytest.raises(BybitError):
+        make_client(session).get_klines("BTCUSDT")
+    line = attempt_lines(caplog)[0]
+    assert field(line, "status_code") == "0"
+    assert field(line, "status_code_source") == "unknown_response_status"
+    assert field(line, "ret_code") == "10001"
+
+
+def test_create_order_unknown_status_is_marked(caplog):
+    class NoStatusOrderResponse(MinimalResponse):
+        def json(self):
+            return {"retCode": 0, "retMsg": "OK", "result": {"orderId": "OID"}}
+
+    session = ScriptedSession([NoStatusOrderResponse()])
+    BybitClient(live_settings(), session).create_order("BTCUSDT", "Buy", 1)
+    line = attempt_lines(caplog)[0]
+    assert field(line, "status_code") == "0"
+    assert field(line, "status_code_source") == "unknown_response_status"
 
 
 # ----------------------------------------------------------------------
@@ -664,3 +713,223 @@ def test_http_request_count_unchanged_by_telemetry(monkeypatch):
     session = ScriptedSession([rate_limited, FakeResponse()])
     make_client(session).get_klines("BTCUSDT")
     assert len(session.calls) == 2
+
+
+# ----------------------------------------------------------------------
+# Review PR #232 fixes: unhandled transport exceptions (P1), never-guessed
+# status (P2 above) and log-injection hardening (P2)
+# ----------------------------------------------------------------------
+
+
+class ExplodingSession:
+    """Session double that raises an unhandled transport exception on send."""
+
+    def __init__(self, error):
+        self.error = error
+        self.calls = []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append(("GET", url))
+        raise self.error
+
+    def post(self, url, data=None, headers=None, timeout=None):
+        self.calls.append(("POST", url))
+        raise self.error
+
+
+UNHANDLED_TRANSPORT_ERRORS = [
+    ConnectionResetError(10054, "Connection reset by peer"),
+    ConnectionAbortedError(10053, "Connection aborted"),
+    OSError("simulated transport failure"),
+]
+
+
+@pytest.mark.parametrize("error", UNHANDLED_TRANSPORT_ERRORS,
+                         ids=lambda e: type(e).__name__)
+def test_get_unhandled_transport_exception_records_exactly_one_attempt(caplog, error):
+    session = ExplodingSession(error)
+    with pytest.raises(type(error)) as exc_info:
+        make_client(session).get_klines("BTCUSDT")
+    assert exc_info.value is error          # identical exception preserved
+    assert len(session.calls) == 1          # request count unchanged, no retry
+    lines = attempt_lines(caplog)
+    assert len(lines) == 1                  # exactly one record per attempt
+    line = lines[0]
+    assert field(line, "result") == "ERROR"
+    assert field(line, "method") == "GET"
+    assert field(line, "status_code") == "0"
+    assert field(line, "status_code_source") == "no_response"
+    assert field(line, "retry_reason") == "none"
+    assert field(line, "attempt_index") == "1"
+    assert type(error).__name__ in line
+
+
+@pytest.mark.parametrize("error", UNHANDLED_TRANSPORT_ERRORS,
+                         ids=lambda e: type(e).__name__)
+def test_post_unhandled_transport_exception_records_exactly_one_attempt(caplog, error):
+    session = ExplodingSession(error)
+    with pytest.raises(type(error)) as exc_info:
+        BybitClient(live_settings(), session).create_order("BTCUSDT", "Buy", 1)
+    assert exc_info.value is error          # identical exception preserved
+    assert len(session.calls) == 1          # request count unchanged, no retry
+    lines = attempt_lines(caplog)
+    assert len(lines) == 1                  # exactly one record per attempt
+    line = lines[0]
+    assert field(line, "method") == "POST"
+    assert field(line, "endpoint") == "/v5/order/create"
+    assert field(line, "result") == "ERROR"
+    assert field(line, "status_code") == "0"
+    assert field(line, "status_code_source") == "no_response"
+    assert type(error).__name__ in line
+
+
+def test_unhandled_transport_exception_in_rate_limit_retry_records_exactly_once(
+        caplog, monkeypatch):
+    monkeypatch.setattr(bybit_client_module.time, "sleep", lambda *_: None)
+    rate_limited = FakeResponse({"retCode": 10006, "retMsg": "Too many visits", "result": {}})
+    error = ConnectionResetError(10054, "Connection reset by peer")
+    session = ScriptedSession([rate_limited, error])
+    with pytest.raises(ConnectionResetError) as exc_info:
+        make_client(session).get_klines("BTCUSDT")
+    assert exc_info.value is error
+    assert len(session.calls) == 2          # original send + one rate-limit retry
+    lines = attempt_lines(caplog)
+    assert len(lines) == 2                  # no double-record on either attempt
+    assert [field(line, "result") for line in lines] == ["RATE_LIMIT", "ERROR"]
+    assert [field(line, "retry_reason") for line in lines] == ["none", "rate_limit"]
+    assert [int(field(line, "attempt_index")) for line in lines] == [1, 2]
+
+
+def test_unexpected_payload_exception_records_exactly_one_attempt(caplog):
+    class ExplodingJsonResponse:
+        status = 200
+        headers = None
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            raise RuntimeError("unexpected decoder failure")
+
+    session = ScriptedSession([ExplodingJsonResponse()])
+    with pytest.raises(RuntimeError, match="unexpected decoder failure"):
+        make_client(session).get_klines("BTCUSDT")
+    assert len(session.calls) == 1
+    lines = attempt_lines(caplog)
+    assert len(lines) == 1                  # exactly one record, no double
+    line = lines[0]
+    assert field(line, "result") == "ERROR"
+    assert field(line, "status_code") == "200"
+    assert field(line, "status_code_source") == "measured"
+
+
+def test_create_order_unexpected_payload_exception_records_exactly_one_attempt(caplog):
+    class ExplodingJsonResponse:
+        status = 200
+        headers = None
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            raise RuntimeError("unexpected decoder failure")
+
+    session = ScriptedSession([ExplodingJsonResponse()])
+    with pytest.raises(RuntimeError, match="unexpected decoder failure"):
+        BybitClient(live_settings(), session).create_order("BTCUSDT", "Buy", 1)
+    assert len(session.calls) == 1
+    lines = attempt_lines(caplog)
+    assert len(lines) == 1
+    assert field(lines[0], "method") == "POST"
+
+
+def test_malformed_json_records_exactly_one_attempt(caplog):
+    session = ScriptedSession([BadJsonResponse()])
+    with pytest.raises(ValueError):
+        make_client(session).get_klines("BTCUSDT")
+    assert len(attempt_lines(caplog)) == 1  # widened handler must not double-record
+
+
+# ----------------------------------------------------------------------
+# Log-injection hardening (control characters / key=value forgery)
+# ----------------------------------------------------------------------
+
+
+def test_ret_msg_multiline_injection_cannot_forge_records(caplog):
+    evil_msg = (
+        "bad response\nBYBIT_API_CALL service=evil endpoint=/fake result=FORGED\r\n"
+        "X-Injected=1"
+    )
+    session = ScriptedSession([
+        FakeResponse({"retCode": 10001, "retMsg": evil_msg, "result": {}}),
+    ])
+    with pytest.raises(BybitError):
+        make_client(session).get_klines("BTCUSDT")
+    lines = attempt_lines(caplog)
+    assert len(lines) == 1
+    line = lines[0]
+    assert "\n" not in line and "\r" not in line and "\t" not in line
+    assert "\\n" in line and "\\r" in line    # control chars visibly escaped
+    assert "result\\x3dFORGED" in line       # key=value forgery neutralized
+    assert field(line, "result") == "ERROR"  # real fields still parse
+
+
+def test_service_env_value_injection_is_escaped(caplog, monkeypatch):
+    monkeypatch.setenv(SERVICE_ENV, "evil\nservice=FORGED result=FORGED")
+    session = ScriptedSession([FakeResponse()])
+    make_client(session).get_klines("BTCUSDT")
+    lines = attempt_lines(caplog)
+    assert len(lines) == 1
+    line = lines[0]
+    assert "\n" not in line
+    service = field(line, "service")
+    assert service.startswith("evil\\n")
+    assert "service\\x3dFORGED" in service
+    assert "\\x20" in service                # spaces escaped in keyed fields
+    assert field(line, "result") == "OK"     # real fields unaffected
+
+
+def test_control_chars_in_keyed_fields_are_escaped(caplog):
+    session = ScriptedSession([FakeResponse()])
+    make_client(session).get_klines("BTC\nUSDT", interval="5\x00")
+    line = attempt_lines(caplog)[0]
+    assert field(line, "symbol") == "BTC\\nUSDT"
+    assert field(line, "interval") == "5\\x00"
+    assert "\n" not in line and "\x00" not in line
+
+
+def test_sanitize_escapes_control_chars_and_key_value_tokens():
+    from app.exchange.api_telemetry import _sanitize
+    assert _sanitize("plain value") == "plain value"
+    assert _sanitize("a\nb\rc\td") == "a\\nb\\rc\\td"
+    assert _sanitize("k=v") == "k\\x3dv"
+    assert _sanitize("back\\slash") == "back\\\\slash"
+    assert _sanitize("\x00\x1b\x7f") == "\\x00\\x1b\\x7f"
+    assert _sanitize("a b") == "a b"                        # free text keeps spaces
+    assert _sanitize("a b", escape_spaces=True) == "a\\x20b"
+
+
+def test_secret_hygiene_with_injection_attempts(caplog):
+    """Injection hardening must not weaken the secret-hygiene guarantee."""
+    headers = {
+        "X-Bapi-Limit": "600",
+        "Authorization": "Bearer SUPERSECRET_TOKEN_XYZ",
+        "X-BAPI-SIGN": "DEADBEEF_SIGNATURE",
+    }
+    evil_msg = "boom\nX-BAPI-SIGN=FORGED_SIGNATURE"
+    session = ScriptedSession([
+        FakeResponse({"retCode": 10001, "retMsg": evil_msg, "result": {}},
+                     headers=headers),
+    ])
+    with pytest.raises(BybitError):
+        make_client(session).get_klines("BTCUSDT")
+    text = caplog.text
+    assert "SUPERSECRET_TOKEN_XYZ" not in text
+    assert "DEADBEEF_SIGNATURE" not in text
+    assert "Authorization" not in text
+    lines = attempt_lines(caplog)
+    assert len(lines) == 1
+    line = lines[0]
+    assert "\n" not in line
+    assert "X-BAPI-SIGN\\x3dFORGED_SIGNATURE" in line  # forged key=value defused
+    assert field(line, "bapi_limit") == "600"          # allowlist header still captured

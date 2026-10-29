@@ -126,6 +126,30 @@ def _record_attempt(
         pass
 
 
+def _send_audited(send, record_failure):
+    """Run one HTTP send with a narrow unhandled-failure attempt recorder.
+
+    Guarantees exactly one telemetry record per HTTP attempt (Issue #228,
+    review PR #232): the instrumented branches already record
+    ``TimeoutError``/``socket.timeout`` (timeout retry), ``URLError``
+    (transport retry / fail-fast), ``BybitError`` (HTTP and API errors) and
+    ``ValueError`` (malformed JSON), so those propagate untouched and are
+    never double-recorded. Any other exception raised while sending the
+    request (e.g. ``ConnectionResetError``, ``ConnectionAbortedError``, an
+    unexpected transport ``OSError``) is recorded here exactly once and
+    re-raised as the identical exception object without retrying. Recording
+    is fail-open and can never mask the original failure.
+    """
+    try:
+        return send()
+    except (TimeoutError, socket.timeout, URLError):
+        # recorded by the established timeout/transport branches
+        raise
+    except Exception as exc:
+        record_failure(exc)
+        raise
+
+
 def _resolve_caller() -> str:
     """Walk the stack to find the first caller outside bybit_client.py."""
     for frame_info in inspect.stack():
@@ -244,13 +268,27 @@ class BybitClient:
             attempt_index = http_attempt
 
             try:
-                response = self.session.get(
-                    self.BASE_URL + endpoint, params=params,
-                    timeout=self.settings.bybit_timeout,
+                response = _send_audited(
+                    lambda: self.session.get(
+                        self.BASE_URL + endpoint, params=params,
+                        timeout=self.settings.bybit_timeout,
+                    ),
+                    lambda exc: _record_attempt(
+                        telemetry, response=None,
+                        endpoint=endpoint, caller=caller, symbol=symbol,
+                        interval=interval, limit=limit,
+                        duration_ms=(time.monotonic() - t_start) * 1000,
+                        result="ERROR",
+                        ret_msg=f"{type(exc).__name__}: {exc}",
+                        logical_request_id=logical_request_id,
+                        attempt_index=attempt_index,
+                        total_attempts=attempt_budget,
+                        retry_reason=retry_reason,
+                    ),
                 )
                 try:
                     response.raise_for_status()
-                except BybitError as http_exc:
+                except Exception as http_exc:
                     # HTTP-level failure: record the attempt (previously
                     # invisible) and keep the fail-fast behavior.
                     _record_attempt(
@@ -267,9 +305,12 @@ class BybitClient:
                     raise
                 try:
                     payload = response.json()
-                except ValueError:
-                    # Malformed JSON body: record the attempt and re-raise
-                    # unchanged (no retry, as before).
+                    ret_code = payload.get("retCode", 0)
+                    ret_msg = payload.get("retMsg", "")
+                except Exception:
+                    # Any payload failure (malformed JSON body or an
+                    # unexpected decode/shape exception): record the attempt
+                    # once and re-raise unchanged (no retry, as before).
                     _record_attempt(
                         telemetry, response=response,
                         endpoint=endpoint, caller=caller, symbol=symbol,
@@ -284,8 +325,6 @@ class BybitClient:
                     raise
 
                 duration_ms = (time.monotonic() - t_start) * 1000
-                ret_code = payload.get("retCode", 0)
-                ret_msg = payload.get("retMsg", "")
 
                 if ret_code != 0:
                     # Check for rate limit before raising
@@ -321,13 +360,28 @@ class BybitClient:
                             http_attempt += 1
                             attempt_index = http_attempt
                             try:
-                                retry_resp = self.session.get(
-                                    self.BASE_URL + endpoint, params=params,
-                                    timeout=self.settings.bybit_timeout,
+                                retry_resp = _send_audited(
+                                    lambda: self.session.get(
+                                        self.BASE_URL + endpoint, params=params,
+                                        timeout=self.settings.bybit_timeout,
+                                    ),
+                                    lambda exc: _record_attempt(
+                                        telemetry, response=None,
+                                        endpoint=endpoint, caller=caller,
+                                        symbol=symbol, interval=interval,
+                                        limit=limit,
+                                        duration_ms=(time.monotonic() - t_retry_start) * 1000,
+                                        result="ERROR",
+                                        ret_msg=f"{type(exc).__name__}: {exc}",
+                                        logical_request_id=logical_request_id,
+                                        attempt_index=attempt_index,
+                                        total_attempts=attempt_budget,
+                                        retry_reason="rate_limit",
+                                    ),
                                 )
                                 try:
                                     retry_resp.raise_for_status()
-                                except BybitError as http_exc:
+                                except Exception as http_exc:
                                     _record_attempt(
                                         telemetry, response=retry_resp,
                                         endpoint=endpoint, caller=caller,
@@ -343,7 +397,9 @@ class BybitClient:
                                     raise
                                 try:
                                     retry_payload = retry_resp.json()
-                                except ValueError:
+                                    retry_ret_code = retry_payload.get("retCode", 0)
+                                    retry_ret_msg = retry_payload.get("retMsg", "")
+                                except Exception:
                                     _record_attempt(
                                         telemetry, response=retry_resp,
                                         endpoint=endpoint, caller=caller,
@@ -358,8 +414,6 @@ class BybitClient:
                                     )
                                     raise
                                 retry_duration = (time.monotonic() - t_retry_start) * 1000
-                                retry_ret_code = retry_payload.get("retCode", 0)
-                                retry_ret_msg = retry_payload.get("retMsg", "")
 
                                 if retry_ret_code == 0:
                                     _record_attempt(
@@ -725,7 +779,22 @@ class BybitClient:
         caller = _resolve_caller()
         t_start = time.monotonic()
         try:
-            response = self.session.post(self.BASE_URL + "/v5/order/create", data=body, headers=headers, timeout=10)
+            response = _send_audited(
+                lambda: self.session.post(
+                    self.BASE_URL + "/v5/order/create", data=body,
+                    headers=headers, timeout=10,
+                ),
+                lambda exc: _record_attempt(
+                    telemetry, response=None,
+                    endpoint="/v5/order/create", caller=caller, symbol=symbol,
+                    interval="", limit=0,
+                    duration_ms=(time.monotonic() - t_start) * 1000,
+                    result="ERROR",
+                    ret_msg=f"{type(exc).__name__}: {exc}",
+                    logical_request_id=logical_request_id,
+                    attempt_index=1, total_attempts=1, method="POST",
+                ),
+            )
         except (TimeoutError, socket.timeout):
             _record_attempt(
                 telemetry, response=None,
@@ -750,7 +819,7 @@ class BybitClient:
             raise
         try:
             response.raise_for_status()
-        except BybitError as http_exc:
+        except Exception as http_exc:
             _record_attempt(
                 telemetry, response=response,
                 endpoint="/v5/order/create", caller=caller, symbol=symbol,
@@ -763,7 +832,8 @@ class BybitClient:
             raise
         try:
             payload = response.json()
-        except ValueError:
+            ret_code = payload.get("retCode")
+        except Exception:
             _record_attempt(
                 telemetry, response=response,
                 endpoint="/v5/order/create", caller=caller, symbol=symbol,
@@ -775,7 +845,6 @@ class BybitClient:
             )
             raise
         duration_ms = (time.monotonic() - t_start) * 1000
-        ret_code = payload.get("retCode")
         if ret_code != 0:
             _record_attempt(
                 telemetry, response=response,

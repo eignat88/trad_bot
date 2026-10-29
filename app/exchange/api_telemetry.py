@@ -16,9 +16,14 @@ Schema ``BYBIT_API_TELEMETRY_V1`` — every attempt record carries:
 * ``service_tag`` — explicit service tag (env ``BYBIT_SERVICE_NAME`` wins,
   otherwise caller-path heuristics) for per-service / per-checkout
   breakdown;
-* ``endpoint``, ``method``, ``status_code`` — ``status_code`` is always
-  populated: the real HTTP status when a response was received (0 means no
-  HTTP response at all, i.e. transport/timeout failure);
+* ``endpoint``, ``method``, ``status_code`` / ``status_code_source`` —
+  ``status_code`` is always populated with an integer sentinel and never
+  guesses a status: the real HTTP status when one was measured
+  (``status_code_source=measured``), ``0`` with
+  ``status_code_source=unknown_response_status`` when a response exists but
+  exposes no measurable status, and ``0`` with
+  ``status_code_source=no_response`` when no HTTP response was received at
+  all (transport/timeout failure);
 * ``ret_code`` / ``ret_msg`` — Bybit API result envelope;
 * ``retry_reason`` — why this attempt happened: ``none`` (first attempt),
   ``timeout`` or ``rate_limit`` (retry of the same logical request);
@@ -31,6 +36,16 @@ Log format: one ``BYBIT_API_CALL`` line per attempt. The historical prefix
 plus ``retMsg=``/``status=`` where they existed before) is byte-compatible
 with pre-existing analytics; the V1 fields are appended as one uniform
 ``telemetry_v=1 ...`` suffix on every variant.
+
+Untrusted free-form values (Bybit ``retMsg``, the ``BYBIT_SERVICE_NAME``
+override, caller/symbol/interval strings) are escaped before emission: ``\\``,
+newline, carriage return and tab become visible two-character escapes, any
+other control character becomes ``\\xNN`` and ``=`` becomes ``\\x3d``, so a
+provider message or env value can never forge an extra record, forge a
+``key=value`` token or break the one-line-per-attempt contract. Space is
+additionally escaped to ``\\x20`` in every keyed field except ``retMsg``
+(whose ordinary legacy output legitimately contains spaces); ordinary legacy
+output without control characters or ``=`` is preserved byte-for-byte.
 
 Security contract: No API keys, secrets, signatures, authorization headers,
 or private request payloads are ever captured or logged — records hold an
@@ -62,6 +77,45 @@ _NONE = "none"
 def _fmt_opt(value: Any) -> str:
     """Render an optional scalar for a journald-friendly key=value line."""
     return _NONE if value is None else str(value)
+
+
+# ---------------------------------------------------------------------------
+# Free-form value sanitization (log-injection hardening)
+# ---------------------------------------------------------------------------
+
+_ESCAPE_MAP = {
+    "\\": "\\\\",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+}
+
+
+def _sanitize(value: Any, *, escape_spaces: bool = False) -> str:
+    """Escape control characters in a free-form value before log emission.
+
+    Backslash, newline, carriage return and tab become visible two-character
+    escapes; every other control character becomes ``\\xNN`` and ``=``
+    becomes ``\\x3d`` so no value can forge a ``key=value`` token. With
+    ``escape_spaces`` the space character becomes ``\\x20`` as well, keeping
+    keyed ``field=\\S+`` values parseable and injection-proof. Ordinary
+    legacy output (plain text without control characters or ``=``) is
+    preserved byte-for-byte.
+    """
+    out: list[str] = []
+    for ch in str(value):
+        escape = _ESCAPE_MAP.get(ch)
+        if escape is not None:
+            out.append(escape)
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append("\\x%02x" % ord(ch))
+        elif ch == "=":
+            out.append("\\x3d")
+        elif escape_spaces and ch == " ":
+            out.append("\\x20")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +318,10 @@ class ApiCallRecord:
     bapi_limit_status: int | None = None
     bapi_limit_reset_ms: int | None = None
     headers_absent: bool = True
+    # measured | unknown_response_status | no_response — never guess a
+    # status: status_code keeps the integer sentinel (0 = not measured) and
+    # this marker says why (review PR #232 / Issue #228).
+    status_code_source: str = "measured"
 
 
 @dataclass
@@ -313,7 +371,7 @@ _RL_FMT = _OK_FMT + " retMsg=%s"
 _ERR_FMT = _RL_FMT + " status=%d"
 _TELEMETRY_SUFFIX = (
     " telemetry_v=1 logical_request_id=%s attempt_index=%d total_attempts=%d"
-    " method=%s status_code=%d ret_code=%s retry_reason=%s"
+    " method=%s status_code=%d status_code_source=%s ret_code=%s retry_reason=%s"
     " bapi_limit=%s bapi_limit_status=%s bapi_limit_reset_ms=%s"
     " headers_absent=%s"
 )
@@ -400,16 +458,23 @@ class ApiTelemetry:
         The response is reduced to the allowlisted metadata (HTTP status and
         the ``X-Bapi-Limit*`` headers) via :func:`extract_response_meta`;
         nothing else from the response is ever kept. ``status_code`` is
-        always populated: the real status when the response exposes one,
-        ``200`` as a best-effort derivation when a response object exists but
-        exposes no status, and ``0`` only when no HTTP response was received
+        always populated without guessing: the real status when the response
+        exposes one (``status_code_source=measured``), the ``0`` sentinel
+        with ``status_code_source=unknown_response_status`` when a response
+        exists but exposes no measurable status, and ``0`` with
+        ``status_code_source=no_response`` when no HTTP response was received
         (transport/timeout failure).
         """
         meta = extract_response_meta(response) if response is not None else EMPTY_RESPONSE_META
         if meta.status_code is not None:
             status_code = meta.status_code
+            status_code_source = "measured"
+        elif response is not None:
+            status_code = 0
+            status_code_source = "unknown_response_status"
         else:
-            status_code = 200 if response is not None else 0
+            status_code = 0
+            status_code_source = "no_response"
         return self.record_call(
             endpoint=endpoint,
             caller=caller,
@@ -420,6 +485,7 @@ class ApiTelemetry:
             result=result,
             ret_msg=ret_msg,
             status_code=status_code,
+            status_code_source=status_code_source,
             logical_request_id=logical_request_id,
             attempt_index=attempt_index,
             total_attempts=total_attempts,
@@ -456,20 +522,27 @@ class ApiTelemetry:
         bapi_limit_status: int | None = None,
         bapi_limit_reset_ms: int | None = None,
         headers_absent: bool = True,
+        status_code_source: str = "",
     ) -> ApiCallRecord:
         """Record one API call (== one HTTP attempt) and emit its log line.
 
         The first nine parameters are positional-compatible with the
         historical signature; the keyword-only tail carries the
-        ``BYBIT_API_TELEMETRY_V1`` fields.
+        ``BYBIT_API_TELEMETRY_V1`` fields. When ``status_code_source`` is not
+        given it is derived from the supplied ``status_code``: a non-zero
+        code is ``measured``, the ``0`` sentinel is ``no_response`` (the
+        historical meaning of ``status_code=0``).
         """
         now = time.monotonic()
+        if not status_code_source:
+            status_code_source = "measured" if status_code else "no_response"
         tag = service_tag or resolve_service_tag(caller)
         record = ApiCallRecord(
             timestamp=now, endpoint=endpoint, caller=caller,
             symbol=symbol, interval=interval, limit=limit,
             duration_ms=duration_ms, result=result,
             ret_msg=ret_msg, status_code=status_code,
+            status_code_source=status_code_source,
             logical_request_id=logical_request_id,
             attempt_index=attempt_index,
             total_attempts=total_attempts,
@@ -524,34 +597,49 @@ class ApiTelemetry:
         The legacy ``BYBIT_API_CALL`` prefixes are preserved byte-compatible;
         the V1 fields share one uniform ``telemetry_v=1`` suffix on every
         variant so parsers can rely on it.
+
+        Every free-form value is passed through :func:`_sanitize` first, so
+        control characters or ``key=value`` tokens embedded in provider
+        messages or env values cannot forge an extra record or corrupt field
+        parsing. Numeric fields are ints/floats by construction and need no
+        escaping.
         """
         suffix = (
-            record.logical_request_id or _NONE,
+            _sanitize(record.logical_request_id or _NONE, escape_spaces=True),
             record.attempt_index,
             record.total_attempts,
-            record.method,
+            _sanitize(record.method, escape_spaces=True),
             record.status_code,
-            _fmt_opt(record.ret_code),
-            record.retry_reason or _NONE,
-            _fmt_opt(record.bapi_limit),
-            _fmt_opt(record.bapi_limit_status),
-            _fmt_opt(record.bapi_limit_reset_ms),
+            _sanitize(record.status_code_source or _NONE, escape_spaces=True),
+            _sanitize(_fmt_opt(record.ret_code), escape_spaces=True),
+            _sanitize(record.retry_reason or _NONE, escape_spaces=True),
+            _sanitize(_fmt_opt(record.bapi_limit), escape_spaces=True),
+            _sanitize(_fmt_opt(record.bapi_limit_status), escape_spaces=True),
+            _sanitize(_fmt_opt(record.bapi_limit_reset_ms), escape_spaces=True),
             "true" if record.headers_absent else "false",
         )
         base = (
-            record.service_tag or _NONE, record.endpoint, record.caller,
-            record.symbol, record.interval, record.limit,
-            record.duration_ms, record.result,
+            _sanitize(record.service_tag or _NONE, escape_spaces=True),
+            _sanitize(record.endpoint, escape_spaces=True),
+            _sanitize(record.caller, escape_spaces=True),
+            _sanitize(record.symbol, escape_spaces=True),
+            _sanitize(record.interval, escape_spaces=True),
+            record.limit,
+            record.duration_ms,
+            _sanitize(record.result, escape_spaces=True),
         )
+        # Free-text field: control characters escaped, ordinary spaces kept
+        # byte-compatible with legacy retMsg=... output.
+        ret_msg = _sanitize(record.ret_msg)
         if record.result == "RATE_LIMIT":
             logger.warning(
                 _RL_FMT + _TELEMETRY_SUFFIX,
-                *base, record.ret_msg, *suffix,
+                *base, ret_msg, *suffix,
             )
         elif record.result != "OK":
             logger.warning(
                 _ERR_FMT + _TELEMETRY_SUFFIX,
-                *base, record.ret_msg, record.status_code, *suffix,
+                *base, ret_msg, record.status_code, *suffix,
             )
         else:
             logger.info(
