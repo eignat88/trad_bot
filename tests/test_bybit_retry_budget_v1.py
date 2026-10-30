@@ -86,11 +86,11 @@ class ScriptedSession:
         self.calls = []
 
     def get(self, url, params=None, timeout=None):
-        self.calls.append(("GET", url, dict(params or {})))
+        self.calls.append(("GET", url, dict(params or {}), timeout))
         return self._next()
 
     def post(self, url, data=None, headers=None, timeout=None):
-        self.calls.append(("POST", url, data))
+        self.calls.append(("POST", url, data, timeout))
         return self._next()
 
     def _next(self):
@@ -98,6 +98,19 @@ class ScriptedSession:
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
+
+
+class FakeClock:
+    """Controlled clock: sleep() advances time deterministically."""
+
+    def __init__(self, start: float = 1000.0):
+        self.now = float(start)
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += float(seconds)
 
 
 def make_client(session, **overrides):
@@ -527,7 +540,12 @@ def test_create_order_guard_is_per_fingerprint(no_sleep):
     assert len(session.calls) == 2
 
 
-def test_create_order_guard_window_expires(no_sleep, monkeypatch):
+def test_create_order_unknown_state_never_timer_released(no_sleep):
+    """Review #5709376849 (P1): the block is NEVER released by a timer.
+
+    Even with the legacy block window at zero, an UNKNOWN outcome keeps
+    blocking identical re-submission until reconciliation evidence arrives.
+    """
     session = ScriptedSession([
         TimeoutError("slow"),
         FakeResponse({"retCode": 0, "retMsg": "OK", "result": {"orderId": "1"}}),
@@ -536,10 +554,9 @@ def test_create_order_guard_window_expires(no_sleep, monkeypatch):
         live_settings(bybit_order_resubmit_block_s=0.0), session)
     with pytest.raises(TimeoutError):
         client.create_order("BTCUSDT", "Buy", 1)
-    # zero block window: the outcome is resolved by the guard expiry
-    payload = client.create_order("BTCUSDT", "Buy", 1)
-    assert payload["retCode"] == 0
-    assert len(session.calls) == 2
+    with pytest.raises(BybitOrderUncertainError, match="UNKNOWN"):
+        client.create_order("BTCUSDT", "Buy", 1)
+    assert len(session.calls) == 1        # no resend, no timer release
 
 
 # ----------------------------------------------------------------------
@@ -605,3 +622,72 @@ def test_isolated_oos_inherits_client_budget_without_own_retry_loop():
     assert "for attempt" not in source
     assert "MAX_RETRIES" not in source
     assert "get_klines" in source                # still fetches per symbol
+
+
+# ----------------------------------------------------------------------
+# 9. Retry deadline (code review #5709376849, P2) — controlled clocks
+# ----------------------------------------------------------------------
+
+def install_fake_clock(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(bybit_client_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(bybit_client_module.time, "sleep", clock.sleep)
+    # the token limiter waits on real Event time — neutralize it so only the
+    # controlled clock governs these tests
+    class _NoopLimiter:
+        def acquire(self):
+            return None
+
+    monkeypatch.setattr(BybitClient, "_global_limiter", _NoopLimiter())
+    return clock
+
+
+def test_deadline_rechecked_after_breaker_wait(monkeypatch):
+    """After the bounded breaker wait the deadline is re-checked BEFORE the
+    HTTP send: an expired operation must fail closed with zero requests."""
+    clock = install_fake_clock(monkeypatch)
+    retry_budget.get_breaker().trip(30.0)     # cooldown open for 30s
+    session = ScriptedSession([FakeResponse()])
+    client = make_client(session,
+                         bybit_rate_limit_cooldown_s=30.0,
+                         bybit_breaker_max_wait_s=30.0,
+                         bybit_retry_deadline_s=10.0)
+    with pytest.raises(BybitTimeoutError, match="deadline"):
+        client.get_klines("BTCUSDT")
+    assert session.calls == []                # nothing was sent after expiry
+    assert clock.now >= 1000.0 + 10.0         # the wait really consumed time
+
+
+def test_deadline_rechecked_after_backoff_sleep(monkeypatch):
+    """The backoff sleep is a blocking wait too: the next attempt must not
+    leave after the deadline expired."""
+    clock = install_fake_clock(monkeypatch)
+    session = ScriptedSession(
+        [outcome("timeout"), outcome("timeout"), FakeResponse()])
+    client = make_client(session,
+                         bybit_retry_backoff=10.0,
+                         bybit_retry_deadline_s=5.0)
+    with pytest.raises(BybitTimeoutError, match="deadline"):
+        client.get_klines("BTCUSDT")
+    assert len(session.calls) == 1            # second attempt never sent
+    assert clock.now >= 1000.0 + 10.0
+
+
+def test_network_timeout_clamped_to_remaining_deadline(monkeypatch):
+    """The per-attempt network timeout is bounded by the remaining operation
+    time, never larger than the request timeout."""
+    install_fake_clock(monkeypatch)
+    session = ScriptedSession([FakeResponse()])
+    make_client(session, bybit_timeout=15,
+                bybit_retry_deadline_s=5.0).get_klines("BTCUSDT")
+    assert session.calls[0][3] == 5.0         # clamped to the remaining time
+
+
+def test_network_timeout_unchanged_when_deadline_comfortable(monkeypatch):
+    """With plenty of deadline left the configured timeout passes through
+    unchanged (frozen scanner semantics preserved)."""
+    install_fake_clock(monkeypatch)
+    session = ScriptedSession([FakeResponse()])
+    make_client(session, bybit_timeout=15,
+                bybit_retry_deadline_s=60.0).get_klines("BTCUSDT")
+    assert session.calls[0][3] == 15.0

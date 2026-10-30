@@ -35,10 +35,14 @@ parity: exactly one ``BYBIT_API_CALL`` record per HTTP attempt).
 """
 from __future__ import annotations
 
+import json
+import logging
+import os
 import random
 import threading
 import time
 from collections import deque
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 #: The unified attempt budget: at most 3 HTTP attempts per logical request.
@@ -164,6 +168,15 @@ def float_setting(settings: Any, name: str, default: float) -> float:
         return float(getattr(settings, name, default))
     except (TypeError, ValueError):
         return float(default)
+
+
+def str_setting(settings: Any, name: str, default: str) -> str:
+    """Read a str setting defensively (mock/plain objects fall back)."""
+    try:
+        value = getattr(settings, name, None)
+    except Exception:
+        return str(default)
+    return str(default) if value is None else str(value)
 
 
 # ---------------------------------------------------------------- backoff
@@ -373,53 +386,249 @@ def raise_bybit_rate_limit_deferred(remaining_s: float) -> None:
 
 
 # ------------------------------------------------------- order submit guard
-class OrderSubmitGuard:
-    """Double-submit protection for POST ``/v5/order/create`` (fail-closed).
+# Persistent journal for the double-submit guard (code review #5709376849):
+# submission state must survive process restarts, so it is stored as JSON and
+# never released by a timer.
+ORDER_JOURNAL_SCHEMA = 1
+ORDER_JOURNAL_DEFAULT_PATH = "var/reports/bybit_order_submit_journal_v1.json"
 
-    A submission whose outcome is INDETERMINATE (no HTTP response, a 5xx, or
-    an unparseable body — the order may or may not exist server-side) blocks
-    any identical re-submission inside the block window, so a caller retry can
-    never create a duplicate order. Definitive outcomes (a parsed API result,
-    including a rejection) clear the fingerprint: a rejected order was not
-    created and re-submitting it is a fresh decision, not a blind retry.
+_ORDER_ACTIVE_STATES = ("in_flight", "unknown")
+_logger = logging.getLogger(__name__)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _order_uncertain_error(message: str) -> BaseException:
+    """Build the fail-closed order error (import avoids a cycle)."""
+    from app.exchange.bybit_client import BybitOrderUncertainError
+
+    return BybitOrderUncertainError(message)
+
+
+class OrderSubmitGuard:
+    """Persistent fail-closed double-submit guard for POST ``/v5/order/create``.
+
+    Code review #5709376849 (P1 — indeterminate create_order outcome):
+
+    * an UNKNOWN outcome (timeout / transport failure / 5xx / unparseable
+      body — the order may exist server-side) is **never released by a
+      timer**. The legacy ``bybit_order_resubmit_block_s`` window is kept
+      for config rollback compatibility only; it does not unblock anything;
+    * the block is lifted only by definitive evidence: a parsed API result
+      of the submission itself (including a rejection), an HTTP 4xx
+      rejection, or an explicit **reconciliation** against the exchange by
+      the recorded ``orderLinkId`` (or a documented operator resolution);
+    * state is journaled (schema 1) and survives restarts: a crash while a
+      POST was ``in_flight`` reloads as ``unknown`` — fail-closed;
+    * ``in_flight`` persists until the operation actually finishes,
+      regardless of any TTL — concurrent identical submits are blocked
+      (code review P1 — concurrent POSTs).
+
+    If the journal cannot be read or written the guard FAILS CLOSED: order
+    submission is refused instead of silently losing the block.
     """
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._state: dict[tuple, tuple[str, float]] = {}
+    def __init__(self, journal_path: str | None = None) -> None:
+        self._lock = threading.RLock()
+        self._journal_path: str | None = None
+        self._load_error: str | None = None
+        self._write_degraded = False
+        self._entries: dict[str, dict[str, Any]] = {}
+        if journal_path:
+            self.configure(journal_path)
 
-    def begin(self, fingerprint: tuple, block_s: float, *, now: float | None = None) -> bool:
+    # ------------------------------------------------------- persistence
+    def configure(self, journal_path: str) -> None:
+        """Bind the journal path (reload when it changes)."""
+        with self._lock:
+            journal_path = str(journal_path)
+            if journal_path == self._journal_path:
+                return
+            self._journal_path = journal_path
+            self._load_error = None
+            self._write_degraded = False
+            self._entries = {}
+            self._load()
+
+    def _load(self) -> None:
+        path = self._journal_path
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            entries = data.get("entries", {})
+            if not isinstance(entries, dict):
+                raise ValueError("journal entries must be an object")
+        except (OSError, ValueError) as exc:
+            # Fail closed: an unreadable journal cannot prove anything was
+            # resolved — refuse submissions until an operator restores it.
+            self._load_error = (
+                f"order-submit journal unreadable ({type(exc).__name__})")
+            return
+        for key, entry in entries.items():
+            entry = dict(entry)
+            if entry.get("state") == "in_flight":
+                # Crashed/restarted mid-send: the outcome is UNKNOWN.
+                entry["state"] = "unknown"
+                entry["reason"] = (
+                    str(entry.get("reason") or "")
+                    or "in_flight at crash/restart (outcome UNKNOWN)")
+            self._entries[str(key)] = entry
+
+    def _write(self) -> bool:
+        """Persist the journal atomically; False on failure (degraded)."""
+        path = self._journal_path
+        if not path:
+            return True
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"schema": ORDER_JOURNAL_SCHEMA,
+                           "entries": self._entries},
+                          fh, indent=1, sort_keys=True)
+            os.replace(tmp, path)
+            return True
+        except OSError as exc:
+            self._write_degraded = True
+            _logger.critical(
+                "order-submit journal write failed (%s) — further order "
+                "submissions will be refused (fail-closed)", type(exc).__name__)
+            return False
+
+    @staticmethod
+    def _key(fingerprint: tuple, order_link_id: str) -> str:
+        # Unique per submission attempt: the journal is an audit trail —
+        # resolved records are preserved, never overwritten (review P1).
+        return json.dumps([[str(part) for part in fingerprint],
+                           str(order_link_id)], separators=(",", ":"))
+
+    # ------------------------------------------------------- transitions
+    def begin(self, fingerprint: tuple, *, order_link_id: str) -> bool:
         """Reserve the fingerprint for one submission attempt.
 
-        Returns ``False`` (and reserves nothing) while an identical
-        submission is in flight or its outcome is still indeterminate.
+        Returns ``False`` while an identical submission is ``in_flight`` or
+        its outcome is still ``unknown`` (no timer release). Fails closed
+        (raises) when the journal is unusable.
         """
-        now = time.monotonic() if now is None else float(now)
         with self._lock:
-            self._prune(now)
-            state = self._state.get(fingerprint)
-            if state is not None:
-                return False
-            self._state[fingerprint] = ("in_flight", now + max(0.0, float(block_s)))
+            if self._load_error or self._write_degraded:
+                raise _order_uncertain_error(
+                    f"{self._load_error or 'order-submit journal write degraded'}"
+                    " — submissions are blocked (fail-closed)")
+            fp_list = [str(part) for part in fingerprint]
+            for entry in self._entries.values():
+                if entry.get("state") not in _ORDER_ACTIVE_STATES:
+                    continue
+                # blocked by an identical submission OR an active owner of
+                # this operation identity (orderLinkId collision)
+                if (entry.get("fingerprint") == fp_list
+                        or str(entry.get("order_link_id", ""))
+                        == str(order_link_id)):
+                    return False
+            self._entries[self._key(fingerprint, order_link_id)] = {
+                "fingerprint": fp_list,
+                "order_link_id": str(order_link_id),
+                "state": "in_flight",
+                "reason": "",
+                "evidence": "",
+                "ts_utc": _utc_now(),
+            }
+            if not self._write():
+                self._entries.pop(self._key(fingerprint, order_link_id), None)
+                raise _order_uncertain_error(
+                    "cannot persist order submission state — submission "
+                    "blocked (fail-closed, no send)")
             return True
 
-    def mark_indeterminate(self, fingerprint: tuple, block_s: float, *, now: float | None = None) -> None:
-        now = time.monotonic() if now is None else float(now)
+    def mark_unknown(self, fingerprint: tuple, *, order_link_id: str,
+                     reason: str) -> None:
+        """Record an INDETERMINATE outcome (blocks until reconciliation)."""
         with self._lock:
-            self._state[fingerprint] = ("indeterminate", now + max(0.0, float(block_s)))
+            key = self._key(fingerprint, order_link_id)
+            entry = self._entries.get(key) or {
+                "fingerprint": [str(part) for part in fingerprint],
+                "order_link_id": str(order_link_id)}
+            entry.update({
+                "order_link_id": str(order_link_id),
+                "state": "unknown",
+                "reason": str(reason),
+                "ts_utc": _utc_now(),
+            })
+            self._entries[key] = entry
+            self._write()
 
-    def mark_resolved(self, fingerprint: tuple) -> None:
+    def mark_resolved(self, fingerprint: tuple, *, order_link_id: str,
+                      evidence: str) -> None:
+        """Record a DEFINITIVE outcome of the submission itself."""
         with self._lock:
-            self._state.pop(fingerprint, None)
+            key = self._key(fingerprint, order_link_id)
+            entry = self._entries.get(key) or {
+                "fingerprint": [str(part) for part in fingerprint],
+                "order_link_id": str(order_link_id)}
+            entry.update({
+                "state": "resolved",
+                "evidence": str(evidence),
+                "ts_utc": _utc_now(),
+            })
+            self._entries[key] = entry
+            self._write()
 
-    def _prune(self, now: float) -> None:
-        expired = [key for key, (_, until) in self._state.items() if until <= now]
-        for key in expired:
-            del self._state[key]
+    def resolve_reconciled(self, order_link_id: str, *, evidence: str) -> bool:
+        """Lift the block with explicit exchange-confirmed evidence.
+
+        Used by the reconciliation procedure (or a documented operator
+        resolution). Never time-based. Returns False when no active entry
+        owns ``order_link_id``.
+        """
+        with self._lock:
+            for entry in self._entries.values():
+                if (str(entry.get("order_link_id", "")) == str(order_link_id)
+                        and entry.get("state") in _ORDER_ACTIVE_STATES):
+                    entry["state"] = "resolved"
+                    entry["evidence"] = str(evidence)
+                    entry["ts_utc"] = _utc_now()
+                    self._write()
+                    return True
+            return False
+
+    # ------------------------------------------------------- inspection
+    def blocking_entry(self, fingerprint: tuple) -> tuple[str | None, str]:
+        """Return ``(state, order_link_id)`` of the active blocking entry."""
+        fp_list = [str(part) for part in fingerprint]
+        with self._lock:
+            for entry in self._entries.values():
+                if (entry.get("state") in _ORDER_ACTIVE_STATES
+                        and entry.get("fingerprint") == fp_list):
+                    return (str(entry.get("state")),
+                            str(entry.get("order_link_id", "")))
+            return None, ""
+
+    def pending_unknown(self) -> list[dict[str, Any]]:
+        """Entries awaiting reconciliation (state == ``unknown``)."""
+        with self._lock:
+            return [dict(entry) for entry in self._entries.values()
+                    if entry.get("state") == "unknown"]
+
+    def active_unknown(self) -> list[dict[str, Any]]:
+        """All entries blocking a re-submission (in_flight + unknown)."""
+        with self._lock:
+            return [dict(entry) for entry in self._entries.values()
+                    if entry.get("state") in _ORDER_ACTIVE_STATES]
 
     def reset(self) -> None:
+        """In-memory reset (tests / process teardown).
+
+        The journal file is the durable record and is deliberately NOT
+        deleted here — restart recovery depends on it.
+        """
         with self._lock:
-            self._state.clear()
+            self._entries = {}
+            self._load_error = None
+            self._write_degraded = False
+            self._journal_path = None
 
 
 # ------------------------------------------------------- process singletons

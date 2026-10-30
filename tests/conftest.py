@@ -34,9 +34,16 @@ _TMP_ROOT = Path(__file__).parent / ".tmp"
 # ======================================================================
 
 @pytest.fixture(autouse=True)
-def _reset_bybit_retry_governance():
+def _reset_bybit_retry_governance(monkeypatch, tmp_path):
     from app.exchange import retry_budget
 
+    # Every test gets its own order-submit journal (review #5709376849):
+    # the guard is persistent by design, so test state must never share the
+    # production journal path (restart recovery is covered by dedicated
+    # tests with explicit paths).
+    monkeypatch.setattr(
+        retry_budget, "ORDER_JOURNAL_DEFAULT_PATH",
+        str(tmp_path / "bybit_order_submit_journal.json"))
     retry_budget.reset_process_state()
     yield
     retry_budget.reset_process_state()

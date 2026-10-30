@@ -173,9 +173,111 @@ market → P2) и может быть явно передан как `retry_prio
 ## 6. Rollback
 
 Config-compatible revert (имена/дефолты env сохранены); release revert для
-`/opt/trad_bot`. Постоянного состояния нет (всё process-local). No fingerprint change.
+`/opt/trad_bot`. No fingerprint change. После исправлений ревью #5709376849 появилось
+персистентное состояние — журнал отправки ордеров (JSON-файл
+`bybit_order_submit_journal_path`): при rollback файл можно оставить (он лишь хранит
+audit-записи и блокировки fail-closed; безопаснее удалить только вместе с полным
+откатом изменений guard'а).
 
 ## 7. Hold gates (сохранены)
 
 `API_BUDGET_NOT_CLEARED`, `V2_NO_GO`, PR #227 Draft (`DO NOT MERGE`), PR #232 Draft — не
 объявлять готовым до прохождения регрессии; deploy — только operator GO (вне этой работы).
+
+---
+
+# Ревью #5709376849 (PR #233) — исправления
+
+**База исправлений:** `268344b`; ветка `research/issue229-retry-budget-hardening-v1`.
+
+## R1 (P1) — Неопределённый результат create_order: таймер больше не снимает блокировку
+
+Состояние отправки ордера теперь ведёт **персистентный журнал**
+(`bybit_order_submit_journal_path`, по умолчанию
+`var/reports/bybit_order_submit_journal_v1.json`, схема 1; записи ключуются парой
+fingerprint + orderLinkId — audit trail не перезаписывается):
+
+| Состояние | Переходы | Снятие блокировки |
+|---|---|---|
+| `in_flight` | ставится ПЕРЕД отправкой POST | только фактическим завершением операции (никакого TTL) |
+| `unknown` | timeout / transport / 5xx / битое тело ответа — исход НЕОПРЕДЕЛЁН | **только** явным reconciliation (подтверждение состояния на бирже) или документированным операторским разрешением |
+| `resolved` | дефинитивный исход (parsed retCode, HTTP 4xx) либо reconciliation с доказательством | не блокирует; запись сохраняется как audit trail |
+
+* легаси-настройка `bybit_order_resubmit_block_s` сохранена для rollback-совместимости,
+  но **больше ничего не разблокирует**;
+* неразрешимый журнал (не читается / не пишется) = fail-closed: отправка ордера
+  блокируется (`BybitOrderUncertainError`), а не молча теряет защиту.
+
+**Безопасная идентичность операции:** каждая отправка несёт уникальный клиентский
+`orderLinkId` (`rb<uuid32>` либо явный параметр `create_order(..., order_link_id=...)`),
+который уходит в подписанное тело POST и фиксируется в журнале ДО отправки.
+
+**Восстановление после рестарта:** журнал загружается при старте; запись `in_flight`,
+оставшаяся от упавшего процесса, перечитывается как `unknown` (fail-closed).
+
+## R2 (P1) — Конкурентные POST
+
+`in_flight` сохраняется до фактического завершения операции независимо от какого-либо
+TTL; идентичный повторный вызов во время летящего HTTP-запроса отказывает
+(`BybitOrderUncertainError`, `state=in_flight`) и не порождает второго POST. Тест с
+двумя одновременными вызовами и заблокированным первым HTTP-запросом
+(`test_concurrent_identical_post_blocked_while_in_flight`) подтверждает: до завершения
+первого запроса сеть покинул ровно один POST.
+
+## R3 (P1) — Явная процедура reconciliation
+
+Никакой таймер не подменяет проверку состояния ордера:
+
+* `BybitClient.get_order_by_link_id(symbol, order_link_id)` — read-only
+  `GET /v5/order/realtime` + `GET /v5/order/history` (по одному бюджетированному
+  логическому запросу на endpoint);
+* `BybitClient.reconcile_order_submissions()` — для каждой записи `unknown` журнала:
+  найден дефинитивный ответ биржи (open/filled/cancelled/rejected) → блок снимается с
+  доказательством в журнале (`exchange-confirmed orderStatus=...`); записи НЕТ →
+  **явный `UNRESOLVED BLOCKER`**, блокировка остаётся (fail-closed), требуется
+  подтверждение оператора; сбой запроса reconciliation также оставляет блок;
+* CLI `tools/bybit_order_submit_reconcile_v1.py`:
+  * `--list` — офлайн-список блокирующих записей;
+  * `--reconcile` — процедура выше (exit code 2 при любом UNRESOLVED BLOCKER);
+  * `--mark-resolved <orderLinkId> --confirm-manual "<доказательство>"` —
+    документированное операторское разрешение; `--confirm-manual` **обязателен**,
+    доказательство сохраняется в журнале.
+
+## R4 (P2) — Retry deadline
+
+* deadline перепроверяется **после каждого блокирующего ожидания** (breaker-gate,
+  limiter, backoff-сон) **перед** HTTP-отправкой; истёкший deadline → fail-closed
+  без попытки (0 HTTP-запросов);
+* сетевой timeout попытки ограничен оставшимся временем операции:
+  `min(bybit_timeout, deadline_at - now)` (при комфортном deadline значение timeout
+  не меняется — замороженные контракты сохранены);
+* тесты на управляемых часах (`FakeClock`): `test_deadline_rechecked_after_breaker_wait`,
+  `test_deadline_rechecked_after_backoff_sleep`,
+  `test_network_timeout_clamped_to_remaining_deadline`,
+  `test_network_timeout_unchanged_when_deadline_comfortable`.
+
+## Тесты (fake transport, без реальных ордеров и запросов к Bybit)
+
+Новый модуль `tests/test_bybit_order_submit_guard_v1.py` (11 тестов): конкурентные POST,
+in_flight без TTL, unknown без TTL, orderLinkId в теле POST и в журнале, restart
+recovery, crash-mid-send → unknown, reconciliation (found / not-found / query failure),
+CLI (--list, обязательный --confirm-manual). Обновлён
+`tests/test_bybit_retry_budget_v1.py`: TTL-тест заменён на
+`test_create_order_unknown_state_never_timer_released` (санкционировано P1: старая
+семантика авто-снятия через 60 c прямо противоречила замечанию — тест фиксировал баг),
+добавлена секция deadline с FakeClock (4 теста). Итог: 51 passed по двум модулям.
+
+Сохранены и зелёные: HARD_MAX_ATTEMPTS ≤ 3 (property 819 последовательностей),
+telemetry parity (suite #228), отсутствие nested retries (static contracts), frozen
+`test_scanner_runtime` (sleeps `[1, 2]`, логи `retry N/3`), торговая логика, OOS/registry
+не тронуты, PR #233 Draft, `API_BUDGET_NOT_CLEARED` / `V2_NO_GO`.
+
+## Регрессия round-2 (локально, Windows)
+
+| Набор | Результат |
+|---|---|
+| `test_bybit_order_submit_guard_v1.py` + `test_bybit_retry_budget_v1.py` | **51 passed** |
+| CI-набор (7 файлов) | **213 passed** |
+| Затронутая регрессия (16 файлов: scanner/shadow/HTF/candle/core/live_gate/analysis/paper) | 309 passed / 7 failed — ровно pre-existing падения `test_analysis_runner` (6) + `test_paper_runner` (1), атрибутированы baseline-сравнением ранее |
+| Полный прогон (минус 4 pre-existing битых модуля) | **5226 passed / 79 skipped / 81 failed / 53 errors** |
+| Baseline comparison vs `268344b` (25 файлов с падениями прогнаны на копии HEAD) | **128 unique == 128 unique, `Compare-Object` пуст** → **регрессий нет** |

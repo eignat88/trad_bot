@@ -116,7 +116,9 @@ jobs:
             app/shadow/v2d_runner.py \
             app/analytics/candle_sync.py \
             app/research/htf_baseline_short_phase2_bybit_candle_source_v1.py \
-            tests/test_bybit_retry_budget_v1.py
+            tools/bybit_order_submit_reconcile_v1.py \
+            tests/test_bybit_retry_budget_v1.py \
+            tests/test_bybit_order_submit_guard_v1.py
 
       - name: Run retry-budget regression suites (offline fake transport)
         env:
@@ -127,6 +129,7 @@ jobs:
         run: |
           python -m pytest -q -p no:cacheprovider \
             tests/test_bybit_retry_budget_v1.py \
+            tests/test_bybit_order_submit_guard_v1.py \
             tests/test_bybit_api_telemetry_v1.py \
             tests/test_scanner_runtime.py \
             tests/test_shadow_cli.py \
@@ -144,6 +147,7 @@ jobs:
           set -euo pipefail
           python -m pytest -q -p no:cacheprovider --collect-only \
             tests/test_bybit_retry_budget_v1.py \
+            tests/test_bybit_order_submit_guard_v1.py \
             tests/test_bybit_api_telemetry_v1.py \
             tests/test_scanner_runtime.py \
             tests/test_shadow_cli.py \
@@ -154,6 +158,7 @@ jobs:
           cat /tmp/collected_files.txt
           printf '%s\n' \
             tests/test_bybit_retry_budget_v1.py \
+            tests/test_bybit_order_submit_guard_v1.py \
             tests/test_bybit_api_telemetry_v1.py \
             tests/test_scanner_runtime.py \
             tests/test_shadow_cli.py \

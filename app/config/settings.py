@@ -117,7 +117,8 @@ class Settings:
     bybit_retry_storm_window_s: float = 60.0     # storm-guard sliding window
     bybit_retry_storm_max_retries: int = 30      # absolute retry cap per window
     bybit_retry_storm_max_share: float = 0.5     # retry share cap per window
-    bybit_order_resubmit_block_s: float = 60.0   # POST order double-submit block window
+    bybit_order_resubmit_block_s: float = 60.0   # LEGACY (review #5709376849): kept for config rollback compatibility only; no longer releases the submit block (UNKNOWN is never timer-released)
+    bybit_order_submit_journal_path: str = ""    # persistent order-submit state (restart recovery); empty = retry_budget.ORDER_JOURNAL_DEFAULT_PATH
     scanner_workers: int = 5
     scan_interval: int = 300
     # OOS evaluator interval in scanner cycles (default 12 = every 60 minutes

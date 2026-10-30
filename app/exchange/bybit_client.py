@@ -374,13 +374,16 @@ class BybitClient:
         deadline_at = (time.monotonic() + deadline_s) if deadline_s > 0 else None
 
         attempt_index = 0
+        sends_made = 0
         rl_retries_used = 0
         timeout_retries_used = 0
         last_class: str | None = None
         last_error: BaseException | None = None
 
-        def send_once(retry_reason: str):
+        def send_once(retry_reason: str, attempt_timeout: float):
             """One HTTP attempt + exactly one telemetry record (Issue #228)."""
+            nonlocal sends_made
+            sends_made += 1
             t_start = time.monotonic()
 
             def rec(result: str, *, response: Any = None,
@@ -402,7 +405,7 @@ class BybitClient:
                 response = _send_audited(
                     lambda: self.session.get(
                         self.BASE_URL + endpoint, params=params,
-                        timeout=self.settings.bybit_timeout,
+                        timeout=attempt_timeout,
                     ),
                     lambda exc: rec(
                         "ERROR", ret_msg=_safe_exc_category(exc)),
@@ -463,15 +466,15 @@ class BybitClient:
             if last_class == retry_budget.CLASS_RATE_LIMIT:
                 raise BybitRateLimitError(
                     f"{symbol}: Rate limited on {endpoint} after "
-                    f"{attempt_index} attempt(s) ({reason})")
+                    f"{sends_made} attempt(s) ({reason})")
             if reason == "attempt budget":
-                # legacy concise message, preserved byte-for-byte
+                # legacy concise message, preserved byte-for-bit
                 raise BybitTimeoutError(
                     f"{symbol}: Bybit request timed out after {budget} attempts"
                 ) from last_error
             raise BybitTimeoutError(
                 f"{symbol}: Bybit request timed out on {endpoint} after "
-                f"{attempt_index} attempt(s) ({reason})"
+                f"{sends_made} attempt(s) ({reason})"
             ) from last_error
 
         while True:
@@ -494,10 +497,22 @@ class BybitClient:
             # Breaker-aware gating: P3 defers while a cooldown is open,
             # P0/P1/P2 wait (bounded) and only leave after the cooldown.
             breaker.gate(priority, max_wait_s=max_wait_s, sleep=time.sleep)
-
             limiter.acquire()
+
+            # Review #5709376849 (P2 — retry deadline): the deadline is
+            # re-checked AFTER every blocking wait (breaker gate, limiter)
+            # and before the HTTP send, and the network timeout is bounded
+            # by the remaining operation time — an attempt may never outlive
+            # the logical operation's deadline.
+            attempt_timeout = float(self.settings.bybit_timeout)
+            if deadline_at is not None:
+                remaining_s = deadline_at - time.monotonic()
+                if remaining_s <= 0:
+                    deny("retry deadline exceeded")
+                attempt_timeout = min(attempt_timeout, remaining_s)
+
             storm.note_attempt(is_retry=is_retry)
-            payload, classification, error = send_once(retry_reason)
+            payload, classification, error = send_once(retry_reason, attempt_timeout)
             if classification == retry_budget.CLASS_OK:
                 return payload
             last_class, last_error = classification, error
@@ -715,15 +730,23 @@ class BybitClient:
             for rank, (symbol, turnover, volume) in enumerate(liquid[:top_n], start=1)
         ]
 
-    def create_order(self, symbol: str, side: str, qty: float, order_type: str = "Market") -> dict[str, Any]:
+    def create_order(self, symbol: str, side: str, qty: float, order_type: str = "Market",
+                     order_link_id: str | None = None) -> dict[str, Any]:
         """Submit one order as a SINGLE non-retryable POST attempt.
 
         BYBIT_RETRY_BUDGET_HARDENING_V1 (Issue #229): ``POST
         /v5/order/create`` is non-idempotent — this method NEVER retries and
-        no retry layer may wrap it. An identical submission whose outcome is
+        no retry layer may wrap it.
+
+        Code review #5709376849 (P1): every submission carries a unique
+        client order id (``orderLinkId``) recorded in the persistent
+        order-submit journal before the send — the safe operation identity
+        used for reconciliation. An identical submission whose outcome is
         indeterminate (timeout / transport failure / 5xx / unparseable body —
-        the order may already exist server-side) is blocked fail-closed by
-        the order-submit guard, so a caller-level retry can never double-fill.
+        the order may already exist server-side) is blocked fail-closed and
+        is NEVER released by a timer: only definitive evidence (the parsed
+        API result itself, an HTTP 4xx rejection, or an explicit
+        reconciliation against the exchange) lifts the block.
         """
         if self.settings.trading_mode != "live" or not self.settings.live_trading_enabled:
             raise RuntimeError("live order rejected: both live mode and explicit switch are required")
@@ -731,18 +754,26 @@ class BybitClient:
             raise RuntimeError("Bybit credentials are required for live trading")
 
         guard = retry_budget.get_order_guard()
-        block_s = retry_budget.float_setting(
-            self.settings, "bybit_order_resubmit_block_s", 60.0)
+        guard.configure(
+            retry_budget.str_setting(
+                self.settings, "bybit_order_submit_journal_path", "")
+            or retry_budget.ORDER_JOURNAL_DEFAULT_PATH)
         fingerprint = (str(symbol), str(side), str(qty), str(order_type))
-        if not guard.begin(fingerprint, block_s):
+        olink = str(order_link_id) if order_link_id else f"rb{uuid4().hex[:32]}"
+        if not guard.begin(fingerprint, order_link_id=olink):
+            state, blocking_link = guard.blocking_entry(fingerprint)
             raise BybitOrderUncertainError(
                 f"{symbol}: identical {side} {qty} {order_type} order submission "
-                "blocked — the previous identical submission has an unknown "
-                "outcome (fail-closed, no resend)")
+                f"blocked — previous identical submission state="
+                f"{state or 'unknown'}"
+                + (f" (orderLinkId={blocking_link})" if blocking_link else "")
+                + "; the outcome stays UNKNOWN until reconciliation confirms "
+                  "the exchange state (fail-closed, no resend, no timer release)")
 
         timestamp = str(int(time.time() * 1000))
         body = json.dumps({"category": "linear", "symbol": symbol, "side": side,
-                           "orderType": order_type, "qty": str(qty)}, separators=(",", ":"))
+                           "orderType": order_type, "qty": str(qty),
+                           "orderLinkId": olink}, separators=(",", ":"))
         recv_window = "5000"
         signature = hmac.new(self.settings.bybit_api_secret.encode(),
                              (timestamp + self.settings.bybit_api_key + recv_window + body).encode(),
@@ -785,7 +816,9 @@ class BybitClient:
                 logical_request_id=logical_request_id,
                 attempt_index=1, total_attempts=1, method="POST",
             )
-            guard.mark_indeterminate(fingerprint, block_s)
+            guard.mark_unknown(
+                fingerprint, order_link_id=olink,
+                reason="timeout sending POST /v5/order/create — outcome UNKNOWN")
             raise
         except URLError as exc:
             _record_attempt(
@@ -797,13 +830,17 @@ class BybitClient:
                 logical_request_id=logical_request_id,
                 attempt_index=1, total_attempts=1, method="POST",
             )
-            guard.mark_indeterminate(fingerprint, block_s)
+            guard.mark_unknown(
+                fingerprint, order_link_id=olink,
+                reason="transport failure sending POST /v5/order/create — outcome UNKNOWN")
             raise
         except Exception:
             # Unhandled transport failure: recorded exactly once by
             # _send_audited. The submission outcome is UNKNOWN — the order
             # may exist server-side — so block identical resends (fail-closed).
-            guard.mark_indeterminate(fingerprint, block_s)
+            guard.mark_unknown(
+                fingerprint, order_link_id=olink,
+                reason="unhandled transport failure sending POST /v5/order/create — outcome UNKNOWN")
             raise
         try:
             response.raise_for_status()
@@ -819,10 +856,14 @@ class BybitClient:
             )
             status = _response_status(response)
             if status is None or status >= 500:
-                guard.mark_indeterminate(fingerprint, block_s)
+                guard.mark_unknown(
+                    fingerprint, order_link_id=olink,
+                    reason=f"HTTP {status} on POST /v5/order/create — outcome UNKNOWN")
             else:
                 # Definitive HTTP rejection (4xx): no order was created.
-                guard.mark_resolved(fingerprint)
+                guard.mark_resolved(
+                    fingerprint, order_link_id=olink,
+                    evidence=f"definitive HTTP rejection (status={status}) — no order created")
             raise
         try:
             payload = response.json()
@@ -837,7 +878,9 @@ class BybitClient:
                 logical_request_id=logical_request_id,
                 attempt_index=1, total_attempts=1, method="POST",
             )
-            guard.mark_indeterminate(fingerprint, block_s)
+            guard.mark_unknown(
+                fingerprint, order_link_id=olink,
+                reason="unparseable response body on POST /v5/order/create — outcome UNKNOWN")
             raise
         duration_ms = (time.monotonic() - t_start) * 1000
         if ret_code != 0:
@@ -852,7 +895,9 @@ class BybitClient:
             )
             # Definitive API rejection: the order was NOT created, so a later
             # identical submission is a fresh decision, not a blind retry.
-            guard.mark_resolved(fingerprint)
+            guard.mark_resolved(
+                fingerprint, order_link_id=olink,
+                evidence=f"definitive API rejection (retCode={ret_code}) — no order created")
             raise BybitError(payload.get("retMsg", "order rejected"))
         _record_attempt(
             telemetry, response=response,
@@ -862,5 +907,79 @@ class BybitClient:
             logical_request_id=logical_request_id,
             attempt_index=1, total_attempts=1, method="POST",
         )
-        guard.mark_resolved(fingerprint)
+        guard.mark_resolved(
+            fingerprint, order_link_id=olink,
+            evidence="order accepted by exchange "
+                     f"(retCode=0, orderId={payload.get('result', {}).get('orderId', '')})")
         return payload
+
+    # ------------------------------------------------- order reconciliation
+    def get_order_by_link_id(self, symbol: str, order_link_id: str) -> dict[str, Any] | None:
+        """Read-only reconciliation query: find the order by its ``orderLinkId``.
+
+        Code review #5709376849 (P1): the ONLY safe way to lift a
+        double-submit block is exchange-side confirmation. Two logical GET
+        requests (each budgeted like any request — never nested retries):
+        ``/v5/order/realtime`` (open / partially filled) and
+        ``/v5/order/history`` (filled / cancelled / rejected). Returns the
+        order row when found, ``None`` when no exchange record exists.
+        """
+        for endpoint in ("/v5/order/realtime", "/v5/order/history"):
+            params: dict[str, Any] = {
+                "category": "linear", "symbol": symbol,
+                "orderLinkId": order_link_id, "limit": 1,
+            }
+            if endpoint == "/v5/order/realtime":
+                params["openOnly"] = 0
+            payload = self._public_get(endpoint, **params)
+            rows = (payload.get("result") or {}).get("list") or []
+            for row in rows:
+                recorded = str(row.get("orderLinkId", ""))
+                if recorded in ("", str(order_link_id)):
+                    return row
+        return None
+
+    def reconcile_order_submissions(self) -> list[dict[str, Any]]:
+        """Explicit reconciliation procedure for UNKNOWN submissions (P1).
+
+        For every journal entry awaiting reconciliation this queries the
+        EXCHANGE (read-only) by the recorded ``orderLinkId``:
+
+        * a definitive exchange record (open / filled / cancelled /
+          rejected) resolves the block with recorded evidence;
+        * NO record is an EXPLICIT UNRESOLVED BLOCKER: the submission stays
+          fail-closed and requires documented operator confirmation — a
+          timer may never substitute for order-state verification.
+        """
+        guard = retry_budget.get_order_guard()
+        results: list[dict[str, Any]] = []
+        for entry in guard.pending_unknown():
+            olink = str(entry.get("order_link_id", ""))
+            symbol = (entry.get("fingerprint") or [""])[0]
+            base = {"order_link_id": olink, "symbol": symbol}
+            if not olink:
+                results.append({**base, "resolution": "UNRESOLVED_BLOCKER",
+                                "detail": "journal entry has no orderLinkId "
+                                          "(legacy) — operator confirmation required"})
+                continue
+            try:
+                row = self.get_order_by_link_id(symbol, olink)
+            except BybitError as exc:
+                results.append({**base, "resolution": "UNRESOLVED_BLOCKER",
+                                "detail": f"reconciliation query failed "
+                                          f"({type(exc).__name__}) — retry later or "
+                                          "confirm manually"})
+                continue
+            if row is not None:
+                evidence = (f"exchange-confirmed orderStatus="
+                            f"{row.get('orderStatus', 'unknown')} "
+                            f"(orderLinkId={olink})")
+                guard.resolve_reconciled(olink, evidence=evidence)
+                results.append({**base, "resolution": "resolved",
+                                "detail": evidence})
+            else:
+                results.append({**base, "resolution": "UNRESOLVED_BLOCKER",
+                                "detail": "no exchange record for orderLinkId — "
+                                          "operator confirmation required before "
+                                          "any resubmission"})
+        return results
