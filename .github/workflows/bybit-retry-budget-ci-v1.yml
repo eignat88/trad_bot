@@ -94,6 +94,19 @@ jobs:
           grep -q 'OWNER_UNVERIFIED_BLOCKER' app/exchange/bybit_client.py
           echo "issue229_r3_recovery_markers=ok"
 
+          # Review R4 markers: strict POST retCode handling (malformed answer
+          # stays UNKNOWN), journal directory initialization before the first
+          # lock transaction, signed private order queries (X-BAPI-*/HMAC),
+          # envelope-level category validation, and delivery-independent
+          # HTTP 429 classification inside HARD_MAX_ATTEMPTS.
+          grep -q '_ensure_journal_dir' app/exchange/retry_budget.py
+          grep -q 'is_valid_ret_code' app/exchange/retry_budget.py
+          grep -q '_sign_headers' app/exchange/bybit_client.py
+          grep -q 'ORDER_QUERY_CATEGORY' app/exchange/bybit_client.py
+          grep -q 'malformed response envelope' app/exchange/bybit_client.py
+          test -f tests/test_bybit_retry_budget_r4_v1.py
+          echo "issue229_r4_hardening_markers=ok"
+
           if [ -n "${PR_NUMBER}" ]; then
             PR_HEAD="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')"
             echo "pull_request_head=${PR_HEAD}"
@@ -128,8 +141,8 @@ jobs:
             app/research/htf_baseline_short_phase2_bybit_candle_source_v1.py \
             tools/bybit_order_submit_reconcile_v1.py \
             tests/test_bybit_retry_budget_v1.py \
+            tests/test_bybit_retry_budget_r4_v1.py \
             tests/test_bybit_order_submit_guard_v1.py \
-            tests/test_bybit_order_submit_guard_multiproc_v1.py \
             tests/test_bybit_order_submit_guard_multiproc_v1.py
 
       - name: Run retry-budget regression suites (offline fake transport)
@@ -141,6 +154,7 @@ jobs:
         run: |
           python -m pytest -q -p no:cacheprovider \
             tests/test_bybit_retry_budget_v1.py \
+            tests/test_bybit_retry_budget_r4_v1.py \
             tests/test_bybit_order_submit_guard_v1.py \
             tests/test_bybit_order_submit_guard_multiproc_v1.py \
             tests/test_bybit_api_telemetry_v1.py \
@@ -160,6 +174,7 @@ jobs:
           set -euo pipefail
           python -m pytest -q -p no:cacheprovider --collect-only \
             tests/test_bybit_retry_budget_v1.py \
+            tests/test_bybit_retry_budget_r4_v1.py \
             tests/test_bybit_order_submit_guard_v1.py \
             tests/test_bybit_order_submit_guard_multiproc_v1.py \
             tests/test_bybit_api_telemetry_v1.py \
@@ -172,6 +187,7 @@ jobs:
           cat /tmp/collected_files.txt
           printf '%s\n' \
             tests/test_bybit_retry_budget_v1.py \
+            tests/test_bybit_retry_budget_r4_v1.py \
             tests/test_bybit_order_submit_guard_v1.py \
             tests/test_bybit_order_submit_guard_multiproc_v1.py \
             tests/test_bybit_api_telemetry_v1.py \

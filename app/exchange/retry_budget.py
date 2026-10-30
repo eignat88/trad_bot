@@ -123,6 +123,30 @@ def rl_retry_cap(priority: str) -> int:
 _RATE_LIMIT_PHRASES = ("too many visits", "exceeded the api rate limit")
 _ACCESS_DENIED_PHRASES = ("access too frequent",)
 
+#: Bybit V5 authentication / authorization failure retCodes (review R4-3):
+#: 10003 invalid API key, 10004 invalid signature, 10005 permission denied.
+#: The set is deliberately conservative: any OTHER auth-shaped failure still
+#: lands in ``API_ERROR`` which is fail-closed and never retried, so the
+#: safety contract never depends on this list being exhaustive.
+AUTH_DENIED_CODES = frozenset({10003, 10004, 10005})
+
+
+def is_valid_ret_code(ret_code: Any) -> bool:
+    """True only for a strict Bybit ``retCode`` (a JSON integer).
+
+    Review R4-1 (PR #233): a well-formed JSON body WITHOUT a valid
+    ``retCode`` (``{}``, ``{"retCode": null}``, a string/bool/float value) is
+    an AMBIGUOUS result — it must never be interpreted as a definitive API
+    answer. Callers must treat it as UNKNOWN (POST /v5/order/create: keep the
+    durable block, never a re-send) or as a payload error (read-only GET).
+    """
+    return isinstance(ret_code, int) and not isinstance(ret_code, bool)
+
+
+def is_auth_error_result(ret_code: Any) -> bool:
+    """Bybit result envelope signals an authentication/authorization failure."""
+    return is_valid_ret_code(ret_code) and ret_code in AUTH_DENIED_CODES
+
 
 def is_rate_limit_result(ret_code: Any, ret_msg: Any) -> bool:
     """Bybit API result indicates a rate limit (10006 / known phrases)."""
@@ -148,12 +172,18 @@ def classify_api_result(ret_code: Any, ret_msg: Any) -> str:
 
     ``ACCESS_DENIED`` takes precedence over the rate-limit class: a
     "access too frequent" answer is fail-closed by contract even when the
-    retCode looks like a rate limit (Issue #229 classification table).
+    retCode looks like a rate limit (Issue #229 classification table), and an
+    authentication/authorization retCode (review R4-3) is fail-closed the
+    same way — it is NEVER retried and NEVER an ``OK`` result.
     """
-    if is_access_denied_result(ret_msg):
+    if is_access_denied_result(ret_msg) or is_auth_error_result(ret_code):
         return CLASS_ACCESS_DENIED
     if is_rate_limit_result(ret_code, ret_msg):
         return CLASS_RATE_LIMIT
+    if not is_valid_ret_code(ret_code):
+        # A missing / malformed retCode is not a Bybit answer at all
+        # (review R4-1): ambiguous -> payload error, fail-closed, no retry.
+        return CLASS_PAYLOAD_ERROR
     if ret_code != 0:
         return CLASS_API_ERROR
     return CLASS_OK
@@ -536,7 +566,15 @@ class _JournalFileLock:
         self._fh = None
 
     def __enter__(self) -> "_JournalFileLock":
-        self._fh = open(self._lock_path, "a+")
+        try:
+            self._fh = open(self._lock_path, "a+")
+        except OSError as exc:
+            # Filesystem failure on the lock file (review R4-2): the guard
+            # FAILS CLOSED with zero HTTP attempts — never a raw OSError.
+            raise _order_uncertain_error(
+                "order-submit journal lock file cannot be opened "
+                f"({type(exc).__name__}) — submission blocked "
+                "(fail-closed, no send)") from exc
         deadline = time.monotonic() + self._timeout_s
         while True:
             try:
@@ -576,6 +614,32 @@ def _fsync_dir(directory: str) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _ensure_journal_dir(directory: str) -> None:
+    """Create the journal directory BEFORE the first lock transaction (R4-2).
+
+    Review R4-2 (PR #233): restart recovery used to open the journal LOCK
+    file before the journal's parent directory existed (empty installation,
+    nested journal path), turning recovery into a permanent fail-closed
+    state instead of a safe first start.
+
+    * the directory is created with ``os.makedirs(exist_ok=True)``, which is
+      RACE-SAFE across processes: losing the creation race to another
+      process is not an error (``FileExistsError`` is suppressed only when
+      the existing path is a directory);
+    * a FILE occupying the journal directory path is an error (fail-closed);
+    * an existing journal is NEVER touched here — this step creates
+      directories only, it reads/writes/deletes no file;
+    * any filesystem error propagates as ``OSError`` and the caller fails
+      CLOSED (submissions refused, zero HTTP attempts).
+    """
+    if os.path.isdir(directory):
+        return
+    os.makedirs(directory, exist_ok=True)   # FileExistsError -> see docstring
+    if not os.path.isdir(directory):
+        raise NotADirectoryError(
+            errno.ENOTDIR, "journal path is not a directory", directory)
 
 
 class _OwnerWitness:
@@ -916,8 +980,11 @@ class OrderSubmitGuard:
 
     @contextmanager
     def _transaction(self, *, strict_write: bool):
-        """LOCK → RELOAD → VALIDATE → RECOVERY → (mutate) → WRITE → UNLOCK.
+        """ENSURE DIR → LOCK → RELOAD → VALIDATE → RECOVERY → WRITE → UNLOCK.
 
+        The journal directory is created first (review R4-2), so recovery on
+        a fresh installation can open its lock file instead of failing
+        closed forever; every later step is unchanged.
         The RECOVERY step (review #5710398920) runs on EVERY journal
         transaction, so orphaned ``in_flight`` records become durable,
         reconciliation-visible state no matter which caller triggers the
@@ -936,6 +1003,19 @@ class OrderSubmitGuard:
                 raise _order_uncertain_error(
                     "order-submit journal not configured — submissions are "
                     "blocked (fail-closed)")
+            # Review R4-2: the journal directory is created BEFORE the first
+            # lock transaction (empty installation / nested journal path) —
+            # race-safe across processes, and a filesystem failure fails
+            # CLOSED exactly like a journal write failure.
+            try:
+                _ensure_journal_dir(
+                    os.path.dirname(self._journal_path) or ".")
+            except OSError as exc:
+                self._write_degraded = True
+                raise _order_uncertain_error(
+                    "order-submit journal directory cannot be created "
+                    f"({type(exc).__name__}) — submissions are blocked "
+                    "(fail-closed, no send)") from exc
             with _JournalFileLock(
                     self._journal_path + ".lock",
                     float(globals()["ORDER_LOCK_TIMEOUT_S"])):

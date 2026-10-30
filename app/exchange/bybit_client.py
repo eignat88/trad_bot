@@ -10,7 +10,7 @@ import socket
 import threading
 import time
 from typing import Any
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from uuid import uuid4
@@ -26,6 +26,17 @@ class BybitError(RuntimeError):
 
 class BybitTimeoutError(BybitError):
     pass
+
+
+class BybitAuthError(BybitError):
+    """Fail-closed authentication/authorization failure (review R4-3).
+
+    Raised when the exchange denies a signed request on authentication /
+    authorization grounds (``ACCESS_DENIED`` retCode — invalid API key,
+    invalid signature, permission denied — or HTTP 401/403). It is always
+    fail-closed: no retry, and during order reconciliation it keeps the
+    durable order-submit block in place (``UNRESOLVED_BLOCKER``).
+    """
 
 
 class BybitRateLimitError(BybitError):
@@ -178,6 +189,37 @@ def _http_failure_label(response: Any) -> str:
     return f"HTTP {status}" if status is not None else "HTTP_ERROR"
 
 
+def _http_status_error(status: int | None) -> BybitError:
+    """Uniform Bybit error for an HTTP status failure (review R4-5).
+
+    The SAME HTTP status produces the SAME exception contract whether the
+    status arrived as a returned response or as a raised
+    ``urllib.HTTPError``: ``HTTP 401``/``HTTP 403`` is an authentication /
+    authorization failure (:class:`BybitAuthError`), every other status is a
+    plain :class:`BybitError`. The message is derived from the measured
+    status only — never from exception text.
+    """
+    if status in (401, 403):
+        return BybitAuthError(f"HTTP {status}")
+    return BybitError(f"HTTP {status}" if status is not None else "HTTP_ERROR")
+
+
+def _reconciliation_failure_label(exc: BaseException) -> str:
+    """Secret-free category label for a reconciliation query failure.
+
+    Exception text may embed URLs, credentials or signatures (security
+    contract of BYBIT_API_TELEMETRY_V1), so only the exception TYPE name is
+    used — plus an explicit authentication marker for the two auth shapes
+    that are recognisable without reading any message content.
+    """
+    if isinstance(exc, BybitAuthError):
+        return "BybitAuthError: authentication/authorization failed"
+    if isinstance(exc, HTTPError) and exc.code in (401, 403):
+        return (f"HTTPError: authentication/authorization rejected "
+                f"(HTTP {exc.code})")
+    return type(exc).__name__
+
+
 def _send_audited(send, record_failure):
     """Run one HTTP send with a narrow unhandled-failure attempt recorder.
 
@@ -255,8 +297,17 @@ class _Response:
 
 
 class _UrlSession:
-    def get(self, url: str, params: dict[str, Any], timeout: int) -> _Response:
-        return _Response(urlopen(url + "?" + urlencode(params), timeout=timeout))
+    def get(self, url: str, params: dict[str, Any], timeout: int,
+            headers: dict[str, str] | None = None) -> _Response:
+        query = urlencode(params)
+        if headers is None:
+            return _Response(urlopen(url + "?" + query, timeout=timeout))
+        # Signed private GET (review R4-3): the caller signs EXACTLY the
+        # ``urlencode(params)`` string appended here, so the transmitted
+        # query string always matches the X-BAPI-SIGN payload.
+        return _Response(urlopen(
+            Request(url + "?" + query, headers=headers, method="GET"),
+            timeout=timeout))
 
     def post(self, url: str, data: str, headers: dict[str, str], timeout: int) -> _Response:
         request = Request(url, data=data.encode(), headers=headers, method="POST")
@@ -294,8 +345,65 @@ class BybitClient:
         assert cls._global_limiter is not None
         return cls._global_limiter
 
+    #: Bybit V5 recv-window (ms) for signed private requests.
+    RECV_WINDOW_MS = "5000"
+
+    def _sign_headers(self, signed_payload: str) -> dict[str, str]:
+        """Bybit V5 request authentication headers (review R4-3).
+
+        ``X-BAPI-SIGN = HMAC_SHA256(secret, timestamp + api_key +
+        recv_window + signed_payload)`` where ``signed_payload`` is the
+        URL-encoded query string for a GET and the raw request body for a
+        POST (Bybit V5 authentication contract). A FRESH timestamp is minted
+        for every HTTP attempt so a retried attempt can never carry a stale
+        timestamp outside the recv-window. Secret hygiene: the headers are
+        passed straight to the transport — they are never logged and never
+        recorded in telemetry.
+        """
+        timestamp = str(int(time.time() * 1000))
+        signature = hmac.new(
+            self.settings.bybit_api_secret.encode(),
+            (timestamp + self.settings.bybit_api_key
+             + self.RECV_WINDOW_MS + signed_payload).encode(),
+            hashlib.sha256).hexdigest()
+        return {
+            "X-BAPI-API-KEY": self.settings.bybit_api_key,
+            "X-BAPI-TIMESTAMP": timestamp,
+            "X-BAPI-RECV-WINDOW": self.RECV_WINDOW_MS,
+            "X-BAPI-SIGN": signature,
+        }
+
     def _public_get(
         self, endpoint: str, *, retry_priority: str | None = None, **params: Any
+    ) -> dict[str, Any]:
+        """One BUDGETED logical GET request (BYBIT_RETRY_BUDGET_HARDENING_V1)."""
+        return self._budgeted_get(
+            endpoint, signed=False, retry_priority=retry_priority, **params)
+
+    def _private_get(
+        self, endpoint: str, *, retry_priority: str | None = None, **params: Any
+    ) -> dict[str, Any]:
+        """One BUDGETED SIGNED logical GET (Bybit V5 auth contract, R4-3).
+
+        Used for the private order queries (``/v5/order/realtime`` /
+        ``/v5/order/history``). Identical retry budget, telemetry and
+        deadline semantics as :meth:`_public_get` (same single attempt state
+        machine, no nested retries); every HTTP attempt carries a FRESH
+        Bybit V5 signature over the exact transmitted query string.
+
+        Authentication failures are fail-closed: an exchange-side
+        authentication / authorization answer (``ACCESS_DENIED`` retCode or
+        HTTP 401/403) raises :class:`BybitAuthError` and during
+        reconciliation keeps the durable order-submit block
+        (``UNRESOLVED_BLOCKER``) — nothing is retried and nothing is
+        resolved without a verifiable exchange confirmation.
+        """
+        return self._budgeted_get(
+            endpoint, signed=True, retry_priority=retry_priority, **params)
+
+    def _budgeted_get(
+        self, endpoint: str, *, signed: bool = False,
+        retry_priority: str | None = None, **params: Any
     ) -> dict[str, Any]:
         """One BUDGETED logical GET request (BYBIT_RETRY_BUDGET_HARDENING_V1).
 
@@ -307,11 +415,21 @@ class BybitClient:
 
         * classification (``app.exchange.retry_budget``): only ``TIMEOUT``
           and ``RATE_LIMIT`` are retryable; non-rate-limit retCode,
-          ``ACCESS_DENIED`` (403 / "access too frequent"), other HTTP errors,
-          malformed payloads and unhandled transport errors are fail-closed —
-          the identical exception object propagates;
-        * HTTP 429 is a rate limit (retryable within caps), HTTP 403 is
-          fail-closed;
+          ``ACCESS_DENIED`` (auth denial / "access too frequent"), other HTTP
+          errors, malformed payloads and unhandled transport errors are
+          fail-closed — unhandled transport errors propagate as the identical
+          exception object;
+        * **delivery independence (review R4-5)**: an HTTP status is
+          classified identically whether it arrives as a returned response or
+          as a raised ``urllib.HTTPError`` — HTTP 429 is ALWAYS a rate limit
+          (retryable within caps), HTTP 401/403 is fail-closed
+          (:class:`BybitAuthError`), any other status fails closed
+          (:class:`BybitError`);
+        * a response envelope without a VALID ``retCode`` (review R4-1) is
+          ambiguous, never ``OK``: fail-closed payload error, no retry;
+        * ``signed=True`` (review R4-3) authenticates every attempt with the
+          Bybit V5 signature contract (fresh timestamp per attempt) — the
+          budget, telemetry and deadlines are identical;
         * per-priority rate-limit retry caps (P0 3 / P1 2 / P2 2 / P3 1)
           truncated by the unified budget and ``bybit_rate_limit_max_retries``;
         * exponential backoff, bounded and non-decreasing per sequence;
@@ -401,18 +519,41 @@ class BybitClient:
                     retry_reason=retry_reason,
                 )
 
+            def send():
+                if not signed:
+                    return self.session.get(
+                        self.BASE_URL + endpoint, params=params,
+                        timeout=attempt_timeout)
+                # Private endpoint (review R4-3): every HTTP attempt is
+                # authenticated with a FRESH Bybit V5 signature computed over
+                # exactly the query string the transport transmits.
+                return self.session.get(
+                    self.BASE_URL + endpoint, params=params,
+                    timeout=attempt_timeout,
+                    headers=self._sign_headers(urlencode(params)))
+
             try:
                 response = _send_audited(
-                    lambda: self.session.get(
-                        self.BASE_URL + endpoint, params=params,
-                        timeout=attempt_timeout,
-                    ),
+                    send,
                     lambda exc: rec(
                         "ERROR", ret_msg=_safe_exc_category(exc)),
                 )
             except (TimeoutError, socket.timeout) as exc:
                 rec("TIMEOUT")
                 return None, retry_budget.CLASS_TIMEOUT, exc
+            except HTTPError as exc:
+                # Review R4-5: an HTTP status delivered as a raised
+                # ``urllib.HTTPError`` is classified EXACTLY like the same
+                # status on a returned response — HTTP 429 is a rate limit
+                # regardless of the delivery mechanism (retryable within the
+                # budget/caps), every other status fails closed.
+                status = _response_status(exc)
+                if status == 429:
+                    rec("RATE_LIMIT", response=exc,
+                        ret_msg=_http_failure_label(exc))
+                    return None, retry_budget.CLASS_RATE_LIMIT, None
+                rec("ERROR", response=exc, ret_msg=_http_failure_label(exc))
+                raise _http_status_error(status) from exc
             except URLError as exc:
                 if isinstance(exc.reason, (TimeoutError, socket.timeout)):
                     rec("TIMEOUT")
@@ -440,14 +581,29 @@ class BybitClient:
                 raise
             try:
                 payload = response.json()
-                ret_code = payload.get("retCode", 0)
-                ret_msg = payload.get("retMsg", "")
             except Exception:
                 # Any payload failure (malformed JSON body or an unexpected
                 # decode/shape exception): record the attempt once and
                 # re-raise unchanged (fail-closed, no retry).
                 rec("ERROR", response=response)
                 raise
+
+            # Review R4-1: a body without a VALID retCode is an AMBIGUOUS
+            # answer — it is never classified as OK and never retried.
+            if not isinstance(payload, dict):
+                rec("ERROR", response=response,
+                    ret_msg="malformed response envelope (not a JSON object)")
+                raise BybitError(
+                    f"{symbol}: malformed Bybit response on {endpoint} "
+                    "(body is not a result envelope)")
+            ret_code = payload.get("retCode")
+            ret_msg = payload.get("retMsg", "")
+            if not retry_budget.is_valid_ret_code(ret_code):
+                rec("ERROR", response=response,
+                    ret_msg="malformed response envelope (missing/invalid retCode)")
+                raise BybitError(
+                    f"{symbol}: ambiguous Bybit response on {endpoint} "
+                    "(missing/invalid retCode)")
 
             classification = retry_budget.classify_api_result(ret_code, ret_msg)
             if classification == retry_budget.CLASS_OK:
@@ -459,6 +615,8 @@ class BybitClient:
                 return None, retry_budget.CLASS_RATE_LIMIT, None
             # API_ERROR / ACCESS_DENIED: fail-closed, NO retry (Issue #229).
             rec("ERROR", response=response, ret_msg=ret_msg, ret_code=ret_code)
+            if classification == retry_budget.CLASS_ACCESS_DENIED:
+                raise BybitAuthError(ret_msg or "access denied")
             raise BybitError(ret_msg or "Bybit request failed")
 
         def deny(reason: str) -> None:
@@ -770,17 +928,13 @@ class BybitClient:
                 + "; the outcome stays UNKNOWN until reconciliation confirms "
                   "the exchange state (fail-closed, no resend, no timer release)")
 
-        timestamp = str(int(time.time() * 1000))
         body = json.dumps({"category": "linear", "symbol": symbol, "side": side,
                            "orderType": order_type, "qty": str(qty),
                            "orderLinkId": olink}, separators=(",", ":"))
-        recv_window = "5000"
-        signature = hmac.new(self.settings.bybit_api_secret.encode(),
-                             (timestamp + self.settings.bybit_api_key + recv_window + body).encode(),
-                             hashlib.sha256).hexdigest()
-        headers = {"X-BAPI-API-KEY": self.settings.bybit_api_key, "X-BAPI-TIMESTAMP": timestamp,
-                   "X-BAPI-RECV-WINDOW": recv_window, "X-BAPI-SIGN": signature,
-                   "Content-Type": "application/json"}
+        # Bybit V5 authentication contract (review R4-3): the POST body is
+        # the signed payload (timestamp + api_key + recv_window + body).
+        headers = self._sign_headers(body)
+        headers["Content-Type"] = "application/json"
         # BYBIT_API_TELEMETRY_V1: instrument the POST /v5/order/create path
         # with exactly one record per HTTP attempt (always attempt 1 of 1).
         # Secret hygiene: the signed body, credentials and auth headers are
@@ -820,6 +974,41 @@ class BybitClient:
                 fingerprint, order_link_id=olink,
                 reason="timeout sending POST /v5/order/create — outcome UNKNOWN")
             raise
+        except HTTPError as exc:
+            # Review R4-5: an HTTP status delivered as a raised
+            # ``urllib.HTTPError`` is handled EXACTLY like the same status on
+            # a returned response. The POST is NEVER retried (it is
+            # non-idempotent) and HTTP 429 is an INDETERMINATE outcome:
+            # a throttled request may or may not have been processed, so the
+            # durable block is kept (fail-closed) instead of risking a
+            # double fill.
+            status = _response_status(exc)
+            _record_attempt(
+                telemetry, response=exc,
+                endpoint="/v5/order/create", caller=caller, symbol=symbol,
+                interval="", limit=0,
+                duration_ms=(time.monotonic() - t_start) * 1000,
+                result="RATE_LIMIT" if status == 429 else "ERROR",
+                ret_msg=_http_failure_label(exc),
+                logical_request_id=logical_request_id,
+                attempt_index=1, total_attempts=1, method="POST",
+            )
+            if status == 429 or status is None or status >= 500:
+                guard.mark_unknown(
+                    fingerprint, order_link_id=olink,
+                    reason=f"HTTP {status} on POST /v5/order/create — "
+                           "outcome UNKNOWN")
+                if status == 429:
+                    raise BybitRateLimitError(
+                        f"{symbol}: order submission rate limited (HTTP 429) "
+                        "on POST /v5/order/create — never retried, outcome "
+                        "UNKNOWN until reconciliation (fail-closed)") from exc
+                raise _http_status_error(status) from exc
+            # Definitive HTTP rejection (4xx): no order was created.
+            guard.mark_resolved(
+                fingerprint, order_link_id=olink,
+                evidence=f"definitive HTTP rejection (status={status}) — no order created")
+            raise _http_status_error(status) from exc
         except URLError as exc:
             _record_attempt(
                 telemetry, response=None,
@@ -844,17 +1033,30 @@ class BybitClient:
             raise
         try:
             response.raise_for_status()
-        except Exception:
+        except Exception as exc:
+            status = _response_status(response)
             _record_attempt(
                 telemetry, response=response,
                 endpoint="/v5/order/create", caller=caller, symbol=symbol,
                 interval="", limit=0,
                 duration_ms=(time.monotonic() - t_start) * 1000,
-                result="ERROR", ret_msg=_http_failure_label(response),
+                result="RATE_LIMIT" if status == 429 else "ERROR",
+                ret_msg=_http_failure_label(response),
                 logical_request_id=logical_request_id,
                 attempt_index=1, total_attempts=1, method="POST",
             )
-            status = _response_status(response)
+            if status == 429:
+                # Review R4-5 (delivery-independent): a throttled submission
+                # has an INDETERMINATE outcome — keep the durable block and
+                # NEVER retry the POST (fail-closed, no double fill).
+                guard.mark_unknown(
+                    fingerprint, order_link_id=olink,
+                    reason="HTTP 429 on POST /v5/order/create — throttled, "
+                           "outcome UNKNOWN")
+                raise BybitRateLimitError(
+                    f"{symbol}: order submission rate limited (HTTP 429) "
+                    "on POST /v5/order/create — never retried, outcome "
+                    "UNKNOWN until reconciliation (fail-closed)") from exc
             if status is None or status >= 500:
                 guard.mark_unknown(
                     fingerprint, order_link_id=olink,
@@ -864,10 +1066,9 @@ class BybitClient:
                 guard.mark_resolved(
                     fingerprint, order_link_id=olink,
                     evidence=f"definitive HTTP rejection (status={status}) — no order created")
-            raise
+            raise _http_status_error(status) from exc
         try:
             payload = response.json()
-            ret_code = payload.get("retCode")
         except Exception:
             _record_attempt(
                 telemetry, response=response,
@@ -883,6 +1084,33 @@ class BybitClient:
                 reason="unparseable response body on POST /v5/order/create — outcome UNKNOWN")
             raise
         duration_ms = (time.monotonic() - t_start) * 1000
+
+        # Review R4-1: strict retCode contract. A well-formed JSON body
+        # without a VALID retCode ({}, {"retCode": null}, wrong type) is an
+        # AMBIGUOUS answer — it is NOT a definitive rejection and must never
+        # release the block: the outcome is UNKNOWN (durable blocker until a
+        # reliable reconciliation) and an identical re-submission is refused,
+        # so at most ONE POST can ever reach the exchange.
+        if not isinstance(payload, dict) or \
+                not retry_budget.is_valid_ret_code(payload.get("retCode")):
+            _record_attempt(
+                telemetry, response=response,
+                endpoint="/v5/order/create", caller=caller, symbol=symbol,
+                interval="", limit=0,
+                duration_ms=duration_ms, result="ERROR",
+                ret_msg="malformed response envelope (missing/invalid retCode)",
+                logical_request_id=logical_request_id,
+                attempt_index=1, total_attempts=1, method="POST",
+            )
+            guard.mark_unknown(
+                fingerprint, order_link_id=olink,
+                reason="malformed POST /v5/order/create response "
+                       "(missing/invalid retCode) — outcome UNKNOWN")
+            raise BybitOrderUncertainError(
+                f"{symbol}: POST /v5/order/create answered without a valid "
+                "retCode — outcome UNKNOWN; the identical submission stays "
+                "blocked until reconciliation (fail-closed, no resend)")
+        ret_code = payload.get("retCode")
         if ret_code != 0:
             _record_attempt(
                 telemetry, response=response,
@@ -898,6 +1126,10 @@ class BybitClient:
             guard.mark_resolved(
                 fingerprint, order_link_id=olink,
                 evidence=f"definitive API rejection (retCode={ret_code}) — no order created")
+            if (retry_budget.is_auth_error_result(ret_code)
+                    or retry_budget.is_access_denied_result(
+                        payload.get("retMsg", ""))):
+                raise BybitAuthError(payload.get("retMsg", "order rejected"))
             raise BybitError(payload.get("retMsg", "order rejected"))
         _record_attempt(
             telemetry, response=response,
@@ -921,14 +1153,32 @@ class BybitClient:
     ORDER_CONFIRMING_STATUSES = ("New", "PartiallyFilled", "Filled",
                                  "Cancelled", "Rejected")
 
+    #: The only order category this client trades and queries (review R4-4):
+    #: validated on the response ENVELOPE (``result.category``), never on
+    #: individual order rows (which carry no category in Bybit V5).
+    ORDER_QUERY_CATEGORY = "linear"
+
     @staticmethod
     def _extract_order_rows(endpoint: str, payload: Any) -> list[dict[str, Any]]:
-        """Strict structure validation of an order query response."""
+        """Strict structure + category validation of an order query response.
+
+        Review R4-4: the category is validated on the RESPONSE ENVELOPE
+        (``result.category``) exactly as Bybit V5 returns it — a missing,
+        empty or different ``result.category`` means the answer is not for
+        this query (foreign category or malformed envelope) and is rejected
+        fail-closed (never used to lift a block).
+        """
         if not isinstance(payload, dict):
             raise BybitError(f"malformed order query response from {endpoint}")
         result = payload.get("result")
         if not isinstance(result, dict):
             raise BybitError(f"malformed order query response from {endpoint}")
+        category = result.get("category")
+        if not isinstance(category, str) or not category or \
+                category != BybitClient.ORDER_QUERY_CATEGORY:
+            raise BybitError(
+                f"order query response from {endpoint} has no valid "
+                "result.category — not accepted as a confirmation")
         rows = result.get("list")
         if not isinstance(rows, list) or any(
                 not isinstance(row, dict) for row in rows):
@@ -938,12 +1188,15 @@ class BybitClient:
     @staticmethod
     def _is_strict_order_match(row: dict[str, Any], *, symbol: str,
                                order_link_id: str) -> bool:
-        """Exact operation-identity match (review #5709889450, P1).
+        """Exact operation-identity match (review #5709889450 + R4-4).
 
-        An EMPTY / missing / different ``orderLinkId`` is NOT a match, a
-        foreign symbol is NOT a match and the expected category must be
-        present exactly. Foreign rows returned by the endpoint are never
-        used to lift a block.
+        A row is the SAME operation only when the ``orderLinkId`` is a
+        non-empty EXACT match AND the ``symbol`` is the expected one. Foreign
+        rows returned by the endpoint (other symbols, other orderLinkId) are
+        NEVER used to lift a block. When a row additionally carries its own
+        ``category`` contradicting the expected one it is rejected as well
+        (defense-in-depth; the authoritative category gate is the response
+        envelope, see :meth:`_extract_order_rows`).
         """
         recorded = row.get("orderLinkId")
         if not isinstance(recorded, str) or not recorded:
@@ -952,35 +1205,48 @@ class BybitClient:
             return False
         if str(row.get("symbol", "")) != str(symbol):
             return False
-        if str(row.get("category", "")) != "linear":
+        row_category = row.get("category")
+        if row_category is not None and \
+                str(row_category) != BybitClient.ORDER_QUERY_CATEGORY:
             return False
         return True
+
+    @staticmethod
+    def _is_confirming_row(row: dict[str, Any]) -> bool:
+        """True only for a row with an ACCEPTED order status (review R4-4).
+
+        An unknown / missing / empty ``orderStatus`` is never a confirmation.
+        """
+        status = row.get("orderStatus")
+        return isinstance(status, str) and status in BybitClient.ORDER_CONFIRMING_STATUSES
 
     def _strict_order_rows(self, symbol: str, order_link_id: str) -> list[dict[str, Any]]:
         """Collect rows that strictly match the expected operation identity.
 
-        Two budgeted read-only logical GETs (never nested retries):
-        ``/v5/order/realtime`` first and, when it did not confirm the
-        operation, ``/v5/order/history``. Malformed responses fail closed.
+        Two budgeted read-only SIGNED logical GETs (review R4-3 — the same
+        retry budget, telemetry and deadlines as every other request, never
+        nested retries): ``/v5/order/realtime`` first and, when it did not
+        confirm the operation, ``/v5/order/history``. Responses without a
+        valid ``result.category`` (review R4-4) or any other malformed shape
+        fail closed.
         """
         if not str(order_link_id):
             raise BybitError("reconciliation requires a non-empty orderLinkId")
         matched: list[dict[str, Any]] = []
         for endpoint in ("/v5/order/realtime", "/v5/order/history"):
             params: dict[str, Any] = {
-                "category": "linear", "symbol": symbol,
+                "category": self.ORDER_QUERY_CATEGORY, "symbol": symbol,
                 "orderLinkId": order_link_id, "limit": 1,
             }
             if endpoint == "/v5/order/realtime":
                 params["openOnly"] = 0
-            payload = self._public_get(endpoint, **params)
+            payload = self._private_get(endpoint, **params)
             rows = self._extract_order_rows(endpoint, payload)
             for row in rows:
                 if self._is_strict_order_match(
                         row, symbol=symbol, order_link_id=order_link_id):
                     matched.append(row)
-            if any(str(row.get("orderStatus", ""))
-                   in self.ORDER_CONFIRMING_STATUSES for row in matched):
+            if any(self._is_confirming_row(row) for row in matched):
                 # realtime already confirmed the operation — history is
                 # only consulted when it did not
                 break
@@ -991,15 +1257,15 @@ class BybitClient:
 
         Returns an order row ONLY when the exchange confirmed the expected
         operation identity EXACTLY (non-empty ``orderLinkId`` equal to the
-        expected value + expected ``symbol`` + expected category) AND the row
-        carries an accepted confirmation status
-        (:attr:`ORDER_CONFIRMING_STATUSES`). Empty / missing / differing
-        ``orderLinkId``, foreign symbols or categories, unknown statuses and
-        foreign rows are NEVER confirmation — those return ``None`` (stays
-        ``UNRESOLVED_BLOCKER``).
+        expected value + expected ``symbol``; the category is verified on the
+        response envelope) AND the row carries an accepted confirmation
+        status (:attr:`ORDER_CONFIRMING_STATUSES`). Empty / missing /
+        differing ``orderLinkId``, foreign symbols, foreign categories,
+        unknown statuses and foreign rows are NEVER confirmation — those
+        return ``None`` (stays ``UNRESOLVED_BLOCKER``).
         """
         for row in self._strict_order_rows(symbol, order_link_id):
-            if str(row.get("orderStatus", "")) in self.ORDER_CONFIRMING_STATUSES:
+            if self._is_confirming_row(row):
                 return row
         return None
 
@@ -1007,14 +1273,18 @@ class BybitClient:
         """Explicit reconciliation procedure for UNKNOWN submissions (P1/P3).
 
         For every journal entry awaiting reconciliation this queries the
-        EXCHANGE (read-only) with STRICT identity verification (review
-        #5709889450): exact ``orderLinkId`` + symbol + category + accepted
+        EXCHANGE (read-only, SIGNED private GET — review R4-3) with STRICT
+        identity verification (review #5709889450 + R4-4): the category on
+        the response envelope + exact ``orderLinkId`` + symbol + accepted
         order status. A verified confirmation resolves the block and stores
         a verifiable confirmation record as evidence; EVERYTHING else
         (no record, foreign rows, empty/other orderLinkId, unknown status,
-        malformed response, API error/timeout, order not found) is an
-        EXPLICIT UNRESOLVED BLOCKER: the submission stays fail-closed. A
-        timer may never substitute for order-state verification.
+        missing/wrong envelope category, malformed response, API error/
+        timeout, order not found) is an EXPLICIT UNRESOLVED BLOCKER: the
+        submission stays fail-closed. A timer may never substitute for
+        order-state verification. Authentication failures (review R4-3) are
+        fail-closed blockers too: they never resolve anything and never
+        release the block.
 
         Review #5710398920 (R3): the procedure FIRST runs the durable
         crash-recovery transaction (``LOCK → RELOAD → VALIDATE → RECOVERY
@@ -1066,21 +1336,24 @@ class BybitClient:
                 continue
             try:
                 rows = self._strict_order_rows(symbol, olink)
-            except BybitError as exc:
+            except Exception as exc:  # noqa: BLE001 — ANY query failure is a blocker
+                # Fail-closed (review R4-3/R4-5): a timeout, an API error, an
+                # authentication failure, an unexpected transport error —
+                # each is an explicit UNRESOLVED BLOCKER. The label is a
+                # secret-free TYPE/category name, never exception text.
                 results.append({**base, "resolution": "UNRESOLVED_BLOCKER",
                                 "detail": f"reconciliation query failed "
-                                          f"({type(exc).__name__}) — blocked "
-                                          "(fail-closed)"})
+                                          f"({_reconciliation_failure_label(exc)}) — "
+                                          "blocked (fail-closed)"})
                 continue
-            confirming = [row for row in rows
-                          if str(row.get("orderStatus", ""))
-                          in self.ORDER_CONFIRMING_STATUSES]
+            confirming = [row for row in rows if self._is_confirming_row(row)]
             if confirming:
                 row = confirming[0]
                 verified_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 evidence = (
                     f"exchange-confirmed orderLinkId={olink} symbol={symbol} "
-                    f"category=linear orderStatus={row.get('orderStatus')} "
+                    f"category={self.ORDER_QUERY_CATEGORY} "
+                    f"orderStatus={row.get('orderStatus')} "
                     f"orderId={row.get('orderId', '')} verified_at={verified_at}")
                 guard.resolve_reconciled(olink, evidence=evidence)
                 results.append({**base, "resolution": "resolved",
