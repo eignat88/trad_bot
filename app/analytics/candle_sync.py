@@ -230,48 +230,40 @@ class CandleSync:
         end_time: datetime,
         retry_count: int = 3,
     ) -> list[dict[str, Any]]:
-        """Fetch a batch of candles from Bybit with retry logic."""
-        for attempt in range(1, retry_count + 1):
-            try:
-                # Convert timeframe to Bybit format
-                bybit_timeframe = self._timeframe_to_bybit(timeframe)
-                
-                # Calculate limit based on time range
-                minutes_diff = (end_time - start_time).total_seconds() / 60
-                limit = min(200, int(minutes_diff / int(timeframe)) + 1)
-                
-                # Fetch from Bybit
-                payload = self._bybit._public_get(
-                    "/v5/market/kline",
-                    category="linear",
-                    symbol=symbol,
-                    interval=bybit_timeframe,
-                    start=int(start_time.timestamp() * 1000),
-                    end=int(end_time.timestamp() * 1000),
-                    limit=limit,
-                )
-                
-                if payload.get("retCode") != 0:
-                    raise ValueError(f"Bybit API error: {payload.get('retMsg')}")
-                
-                return payload.get("result", {}).get("list", [])
-                
-            except Exception as e:
-                if attempt < retry_count:
-                    logger.warning(
-                        "Bybit API attempt %d/%d failed: %s. Retrying...",
-                        attempt,
-                        retry_count,
-                        e,
-                    )
-                    time.sleep(1 * attempt)  # Exponential backoff
-                else:
-                    logger.error(
-                        "Bybit API failed after %d attempts: %s",
-                        retry_count,
-                        e,
-                    )
-                    raise
+        """Fetch one batch of candles from Bybit in a SINGLE logical request.
+
+        BYBIT_RETRY_BUDGET_HARDENING_V1 (Issue #229): the former
+        ``retry_count`` loop wrapped ``_public_get`` in an independent retry
+        layer (up to 3 x 18 = 54 HTTP attempts per batch). The unified
+        attempt budget (at most 3 HTTP attempts per logical request) is owned
+        by ``BybitClient._public_get`` — this wrapper never retries.
+        ``retry_count`` is retained for API compatibility only. Failures
+        propagate and are counted by the caller as ``failed_ranges`` (counted
+        drops, never silent).
+        """
+        # Convert timeframe to Bybit format
+        bybit_timeframe = self._timeframe_to_bybit(timeframe)
+
+        # Calculate limit based on time range
+        minutes_diff = (end_time - start_time).total_seconds() / 60
+        limit = min(200, int(minutes_diff / int(timeframe)) + 1)
+
+        # Fetch from Bybit (background priority: P3 defers under cooldown)
+        payload = self._bybit._public_get(
+            "/v5/market/kline",
+            category="linear",
+            symbol=symbol,
+            interval=bybit_timeframe,
+            start=int(start_time.timestamp() * 1000),
+            end=int(end_time.timestamp() * 1000),
+            limit=limit,
+            retry_priority="P3",
+        )
+
+        if payload.get("retCode") != 0:
+            raise ValueError(f"Bybit API error: {payload.get('retMsg')}")
+
+        return payload.get("result", {}).get("list", [])
 
     def _parse_candle(
         self,

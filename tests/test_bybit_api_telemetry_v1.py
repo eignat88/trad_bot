@@ -176,8 +176,10 @@ def test_one_log_line_per_http_attempt_success(caplog):
     assert field(line, "endpoint") == "/v5/market/kline"
     assert field(line, "result") == "OK"
     assert field(line, "attempt_index") == "1"
-    # budget: 3 outer attempts * (1 + 2 rate-limit retries)
-    assert field(line, "total_attempts") == "9"
+    # BYBIT_RETRY_BUDGET_HARDENING_V1 (Issue #229): the unified attempt
+    # budget is the telemetry budget — at most 3 HTTP attempts per logical
+    # request (was 3 * (1 + 2) before the nested loops were collapsed).
+    assert field(line, "total_attempts") == "3"
     assert field(line, "retry_reason") == "none"
     assert field(line, "status_code") == "200"
     assert field(line, "method") == "GET"

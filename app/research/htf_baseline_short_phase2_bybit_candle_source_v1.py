@@ -26,14 +26,22 @@ Pagination contract (blocker requirement 2/4):
 * requests are strictly bounded: aligned 5m windows, at most ``page_limit``
   bars per request, at most ``max_pages`` page requests per load, explicit
   request-bound validation of every returned row (``CANDLE_OUT_OF_WINDOW``);
-* missing bars trigger BOUNDED targeted re-requests (gap recovery) with bounded
-  retry/backoff; unrecovered gaps, duplicates (``DUPLICATE_CANDLE``), OHLC
-  conflicts (``CONFLICTING_CANDLE``), rate limits and API errors all fail closed
-  (:class:`BybitCandleSourceError`) so the runner can block the symbol and emit
-  nothing;
+* missing bars trigger BOUNDED targeted re-requests (gap recovery) with
+  bounded request budget; unrecovered gaps, duplicates (``DUPLICATE_CANDLE``),
+  OHLC conflicts (``CONFLICTING_CANDLE``), rate limits and API errors all fail
+  closed (:class:`BybitCandleSourceError`) so the runner can block the symbol
+  and emit nothing;
 * at least ``min_history_bars`` closed bars are returned so the causal 1H
   resistance universe (200 closed hours) and the 200-bar ATR window are always
   computable.
+
+Retry budget (``BYBIT_RETRY_BUDGET_HARDENING_V1``, Issue #229): this source
+performs exactly ONE logical ``_public_get`` request per server-time fetch and
+per page — it never wraps the transport in an independent retry loop. The
+unified attempt budget (at most 3 HTTP attempts per logical request) is owned
+by ``BybitClient._public_get``; every failure here is fail-closed
+(``REASON_RATE_LIMITED`` / ``REASON_API_ERROR`` quarantine semantics are
+preserved unchanged).
 
 Pure research surface: no production state, no OOS activation, no migrations.
 """
@@ -57,10 +65,18 @@ DEFAULT_MAX_PAGES = 20
 #: 200 closed 1H bars (level universe) + 200-bar ATR window + default 400-bar
 #: warmup: enough history for a canonical causal computation on every bar.
 DEFAULT_MIN_HISTORY_BARS = 3_000
+#: Retained for CLI/config compatibility (Issue #229): the source no longer
+#: runs its own request retries — the retry budget is owned by the transport
+#: (at most 3 HTTP attempts per logical request). This value is accepted and
+#: validated but never multiplies into nested attempts.
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_GAP_RECOVERY_ATTEMPTS = 2
 DEFAULT_MAX_GAP_WINDOWS = 8
 DEFAULT_RETRY_BACKOFF_S = 0.5
+#: Background/research priority for the shared retry budget (Issue #229):
+#: P3 defers the cycle while a rate-limit cooldown is open and carries the
+#: smallest rate-limit retry cap.
+BACKGROUND_PRIORITY = "P3"
 #: Maximum NEW closed bars delivered per catch-up batch when the durable
 #: cursor falls outside the steady window (bounded historical backfill).
 DEFAULT_MAX_BACKFILL_BARS = 800
@@ -199,6 +215,8 @@ class BybitPhase2CandleSource:
         self.page_limit = int(page_limit)
         self.max_pages = int(max_pages)
         self.min_history_bars = int(min_history_bars)
+        # Issue #229: retained for CLI/config compatibility; the source never
+        # multiplies it into nested retries (transport owns the <=3 budget).
         self.max_attempts = int(max_attempts)
         self.gap_recovery_attempts = int(gap_recovery_attempts)
         self.max_gap_windows = int(max_gap_windows)
@@ -280,6 +298,9 @@ class BybitPhase2CandleSource:
             "pages_fetched": 0,
             "page_requests": 0,
             "gap_recovery_requests": 0,
+            # BYBIT_RETRY_BUDGET_HARDENING_V1: source-level request retries
+            # are gone (audit-surface key retained, always 0) — retries live
+            # in the transport budget and appear in BYBIT_API_TELEMETRY_V1.
             "retries": 0,
             "unclosed_candles_excluded": 0,
             "bars_returned": 0,
@@ -315,7 +336,7 @@ class BybitPhase2CandleSource:
                 )
             page_end = min(window_end, cursor + (self.page_limit - 1) * BAR_MS)
             rows, page_time_ms = self._fetch_page(
-                symbol, cursor, page_end, window_end=window_end, attempts=self.max_attempts
+                symbol, cursor, page_end, window_end=window_end
             )
             metrics["pages_fetched"] += 1
             server_time_ms = min(server_time_ms, page_time_ms)
@@ -381,36 +402,35 @@ class BybitPhase2CandleSource:
         return self._evaluation_asof_ms
 
     def _fetch_server_time_ms(self) -> int:
-        last_error: Exception | None = None
-        for attempt in range(1, self.max_attempts + 1):
-            self._log_request(SERVER_TIME_ENDPOINT, attempt=attempt)
-            try:
-                payload = self.client._public_get(SERVER_TIME_ENDPOINT)
-            except Exception as exc:  # transport/rate-limit/timeout: bounded retry
-                last_error = exc
-                self.last_load_metrics["retries"] = self.last_load_metrics.get("retries", 0) + 1
-                if attempt < self.max_attempts:
-                    self._backoff(attempt)
-                continue
-            if isinstance(payload, dict) and payload.get("retCode", 0) != 0:
-                last_error = BybitCandleSourceError(
-                    REASON_API_ERROR, str(payload.get("retMsg", ""))[:120]
-                )
-                if attempt < self.max_attempts:
-                    self._backoff(attempt)
-                continue
-            try:
-                return _extract_server_time_ms(payload)
-            except BybitCandleSourceError as exc:
-                last_error = exc
-                if attempt < self.max_attempts:
-                    self._backoff(attempt)
-                continue
-        if isinstance(last_error, BybitCandleSourceError):
-            raise last_error
-        text = f"{type(last_error).__name__}: {last_error}" if last_error else "no attempt"
+        """Fetch the exchange clock in ONE logical request (fail-closed).
+
+        BYBIT_RETRY_BUDGET_HARDENING_V1 (Issue #229): no source-level retry
+        loop — the <=3 HTTP attempt budget lives solely in the transport. Any
+        transport / rate-limit / API failure fails closed via
+        :meth:`_transport_failure` (symbol quarantine preserved).
+        """
+        self._log_request(SERVER_TIME_ENDPOINT, attempt=1)
+        try:
+            payload = self.client._public_get(
+                SERVER_TIME_ENDPOINT, retry_priority=BACKGROUND_PRIORITY
+            )
+        except Exception as exc:
+            raise self._transport_failure("server time unavailable", exc) from exc
+        if isinstance(payload, dict) and payload.get("retCode", 0) != 0:
+            raise BybitCandleSourceError(
+                REASON_API_ERROR, str(payload.get("retMsg", ""))[:120]
+            )
+        return _extract_server_time_ms(payload)
+
+    def _transport_failure(self, context: str, exc: Exception) -> BybitCandleSourceError:
+        """Translate one transport-level failure into a fail-closed reason.
+
+        ``REASON_RATE_LIMITED`` quarantine semantics are preserved verbatim
+        (Issue #229 OOS-safety: never softened while collapsing layers).
+        """
+        text = f"{type(exc).__name__}: {exc}"
         reason = REASON_RATE_LIMITED if _is_rate_limit_text(text) else REASON_API_ERROR
-        raise BybitCandleSourceError(reason, f"server time unavailable ({text[:160]})") from last_error
+        return BybitCandleSourceError(reason, f"{context} ({text[:160]})")
 
     def _fetch_page(
         self,
@@ -419,54 +439,47 @@ class BybitPhase2CandleSource:
         end_ms: int,
         *,
         window_end: int,
-        attempts: int,
     ) -> tuple[list, int]:
+        """Fetch one page in ONE logical request (fail-closed).
+
+        BYBIT_RETRY_BUDGET_HARDENING_V1 (Issue #229): no source-level retry
+        loop — the <=3 HTTP attempt budget lives solely in the transport.
+        """
         self._check_request_bounds(start_ms, end_ms, window_end)
-        last_error: Exception | None = None
-        for attempt in range(1, attempts + 1):
-            self._log_request(
+        self._log_request(
+            KLINE_ENDPOINT,
+            attempt=1,
+            symbol=symbol,
+            start=start_ms,
+            end=end_ms,
+            limit=self.page_limit,
+        )
+        try:
+            payload = self.client._public_get(
                 KLINE_ENDPOINT,
-                attempt=attempt,
+                category=self.category,
                 symbol=symbol,
+                interval=self.interval,
                 start=start_ms,
                 end=end_ms,
                 limit=self.page_limit,
+                retry_priority=BACKGROUND_PRIORITY,
             )
-            try:
-                payload = self.client._public_get(
-                    KLINE_ENDPOINT,
-                    category=self.category,
-                    symbol=symbol,
-                    interval=self.interval,
-                    start=start_ms,
-                    end=end_ms,
-                    limit=self.page_limit,
-                )
-            except Exception as exc:
-                last_error = exc
-                self.last_load_metrics["retries"] = self.last_load_metrics.get("retries", 0) + 1
-                if attempt < attempts:
-                    self._backoff(attempt)
-                continue
-            if not isinstance(payload, dict):
-                raise BybitCandleSourceError(REASON_INVALID_API_RESPONSE, "payload is not a mapping")
-            if payload.get("retCode", 0) != 0:
-                last_error = BybitCandleSourceError(
-                    REASON_API_ERROR, str(payload.get("retMsg", ""))[:120]
-                )
-                if attempt < attempts:
-                    self._backoff(attempt)
-                continue
-            result = payload.get("result")
-            rows = result.get("list") if isinstance(result, dict) else None
-            if not isinstance(rows, list):
-                raise BybitCandleSourceError(REASON_INVALID_API_RESPONSE, "missing result.list")
-            return rows, _extract_server_time_ms(payload)
-        text = f"{type(last_error).__name__}: {last_error}" if last_error else "no attempt"
-        reason = REASON_RATE_LIMITED if _is_rate_limit_text(text) else REASON_API_ERROR
-        raise BybitCandleSourceError(
-            reason, f"page {start_ms}..{end_ms} failed after {attempts} attempt(s) ({text[:160]})"
-        ) from last_error
+        except Exception as exc:
+            raise self._transport_failure(
+                f"page {start_ms}..{end_ms} failed", exc
+            ) from exc
+        if not isinstance(payload, dict):
+            raise BybitCandleSourceError(REASON_INVALID_API_RESPONSE, "payload is not a mapping")
+        if payload.get("retCode", 0) != 0:
+            raise BybitCandleSourceError(
+                REASON_API_ERROR, str(payload.get("retMsg", ""))[:120]
+            )
+        result = payload.get("result")
+        rows = result.get("list") if isinstance(result, dict) else None
+        if not isinstance(rows, list):
+            raise BybitCandleSourceError(REASON_INVALID_API_RESPONSE, "missing result.list")
+        return rows, _extract_server_time_ms(payload)
 
     def _check_request_bounds(self, start_ms: int, end_ms: int, window_end: int) -> None:
         if start_ms % BAR_MS or end_ms % BAR_MS:
@@ -610,7 +623,7 @@ class BybitPhase2CandleSource:
                     if attempt > 1:
                         self._backoff(attempt)
                     rows, page_time_ms = self._fetch_page(
-                        symbol, cursor, page_end, window_end=page_end, attempts=1
+                        symbol, cursor, page_end, window_end=page_end
                     )
                     requests += 1
                     strict = min(strict_asof_ms, page_time_ms)

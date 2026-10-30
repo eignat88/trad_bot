@@ -107,6 +107,18 @@ class Settings:
     bybit_rate_limit_rps: float = 10.0
     bybit_rate_limit_max_retries: int = 5
     bybit_rate_limit_retry_backoff: float = 0.5
+    # BYBIT_RETRY_BUDGET_HARDENING_V1 (Issue #229) — retry governance.
+    # Existing bybit_* names/defaults above are preserved for config-compatible
+    # rollback; the unified attempt budget is HARD-CAPPED at 3 per logical
+    # request regardless of bybit_max_attempts (app/exchange/retry_budget.py).
+    bybit_rate_limit_cooldown_s: float = 2.0     # breaker cooldown after a rate-limit event
+    bybit_breaker_max_wait_s: float = 30.0       # bounded wait while the breaker is open
+    bybit_retry_deadline_s: float = 60.0         # fail-closed deadline per logical request
+    bybit_retry_storm_window_s: float = 60.0     # storm-guard sliding window
+    bybit_retry_storm_max_retries: int = 30      # absolute retry cap per window
+    bybit_retry_storm_max_share: float = 0.5     # retry share cap per window
+    bybit_order_resubmit_block_s: float = 60.0   # LEGACY (review #5709376849): kept for config rollback compatibility only; no longer releases the submit block (UNKNOWN is never timer-released)
+    bybit_order_submit_journal_path: str = ""    # persistent order-submit state (restart recovery); empty = retry_budget.ORDER_JOURNAL_DEFAULT_PATH
     scanner_workers: int = 5
     scan_interval: int = 300
     # OOS evaluator interval in scanner cycles (default 12 = every 60 minutes
@@ -631,6 +643,20 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         raise ValueError("bybit_rate_limit_max_retries cannot be negative")
     if settings.bybit_rate_limit_retry_backoff < 0:
         raise ValueError("bybit_rate_limit_retry_backoff cannot be negative")
+    if settings.bybit_rate_limit_cooldown_s < 0:
+        raise ValueError("bybit_rate_limit_cooldown_s cannot be negative")
+    if settings.bybit_breaker_max_wait_s < 0:
+        raise ValueError("bybit_breaker_max_wait_s cannot be negative")
+    if settings.bybit_retry_deadline_s < 0:
+        raise ValueError("bybit_retry_deadline_s cannot be negative")
+    if settings.bybit_retry_storm_window_s <= 0:
+        raise ValueError("bybit_retry_storm_window_s must be positive")
+    if settings.bybit_retry_storm_max_retries < 0:
+        raise ValueError("bybit_retry_storm_max_retries cannot be negative")
+    if not 0 <= settings.bybit_retry_storm_max_share <= 1:
+        raise ValueError("bybit_retry_storm_max_share must be in [0, 1]")
+    if settings.bybit_order_resubmit_block_s < 0:
+        raise ValueError("bybit_order_resubmit_block_s cannot be negative")
     if settings.initial_balance <= 0:
         raise ValueError("initial_balance must be positive")
     if not 0 < settings.risk_per_trade <= 1:
