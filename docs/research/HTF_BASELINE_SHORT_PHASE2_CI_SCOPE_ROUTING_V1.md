@@ -1,6 +1,6 @@
 # HTF Phase-2 CI Scope Routing V1 (Main PR Safety)
 
-Task ID: `MAIN_PR_SAFETY_HTF_PHASE2_SCOPE_FIX_V1` (round R2)
+Task ID: `MAIN_PR_SAFETY_HTF_PHASE2_SCOPE_FIX_V1` (round R3)
 Branch: `ci/main-pr-safety-htf-phase2-scope-routing-v1`
 Workflow: `.github/workflows/main-pr-safety.yml` (`Main PR Safety`, PR gate for `main`)
 Scope of this change: **CI workflow + routing tests + this document only.** No
@@ -32,6 +32,25 @@ files (`app/research/htf_baseline_short_phase2_bybit_candle_source_v1.py`,
 `tests/test_htf_baseline_short_phase2_bybit_candle_source_v1.py`) mixed with
 unrelated Bybit work, so the confinement tests failed with the same **2 FAIL**
 and blocked the PR.
+
+### R3 — Code Review findings on PR #234 (fixed in R3)
+
+* **P1 — Historical regression base.** The PR #233 integration test diffed
+  against the moving `origin/main`. After merge #233 its HEAD becomes an
+  ancestor of main, the three-dot diff collapses to empty and the mandatory
+  `Main PR Safety` would fail. **Fix:** the historical regression compares
+  only the AUDITED pinned commits
+  (`PR233_BASE_PIN = ad7353029fd158d4a3ab037ad3e98a179a487971` →
+  `PR233_HEAD_PIN = e5cd31f3c1e3e172d4fc6b91c11f3929bbc00b62`) — immutable
+  history, no moving refs, no `refs/pull/*`: the test is independent of the
+  PR #233 lifecycle (open, updated or merged).
+* **P2 — Stale FETCH_HEAD.** `_resolve_pr233_head()` read `FETCH_HEAD`
+  without checking the fetch's success, so a failed fetch could expose an
+  arbitrary stale `FETCH_HEAD` from an unrelated past fetch. **Fix:** the
+  resolver verifies fetch SUCCESS before anything fetch-derived may be used,
+  `FETCH_HEAD` is NEVER consulted at all, and the audited pin is used only
+  after presence (`cat-file -e`) + identity (`rev-parse <pin>^{commit}` ==
+  pin) verification; fetch targets the COMMIT BY SHA.
 
 ## 2. Fix — fail-closed three-way routing
 
@@ -81,12 +100,22 @@ classification script extracted from the workflow heredoc and pins:
 * one fixture per route (`FIXTURE_PHASE2_ONLY`, `FIXTURE_MIXED`,
   `FIXTURE_NO_PHASE2`) + this CI-fix PR's own file set (it routes
   `PHASE2_ONLY` and passes the full gate itself);
-* **mandatory integration test** `test_pr233_real_diff_routes_to_mixed_regression`:
-  classifies the REAL PR #233 diff against `origin/main` (live
-  `refs/pull/233/head` when fetchable, else audited head pin
-  `e5cd31f3c1e3e172d4fc6b91c11f3929bbc00b62`; no silent skip) and checks the
-  expected routing: `MIXED_WITH_PHASE2`, mixed gate runs, Phase-2-only
-  confinement never runs on it;
+* **mandatory integration test** `test_pr233_historical_diff_routes_to_mixed_regression`:
+  classifies the REAL historical diff of PR #233 between its AUDITED pinned
+  commits (R3 P1: never a moving ref / PR ref; equality against the audited
+  19-file pin) and checks the expected routing: `MIXED_WITH_PHASE2`, mixed
+  gate runs, Phase-2-only confinement never runs on it;
+* R3 lifecycle/robustness proofs: `test_historical_regression_survives_pr233_merge_into_main`
+  (an actual simulated merge commit whose history CONTAINS the PR head: the
+  moving-base diff collapses to empty exactly as P1 described, while the
+  pinned pair still yields the full 19-file diff and the same mixed routing),
+  `test_historical_regression_never_uses_moving_refs` (every git operand of
+  the regression is a pinned SHA — no `origin/*`, `refs/*`, `FETCH_HEAD`),
+  `test_failed_fetch_with_stale_fetch_head_never_substitutes_the_pin`
+  (failed fetch + stale `FETCH_HEAD` → fail-closed, never the stale SHA),
+  `test_offline_fallback_verifies_pin_without_network` (pins resolve offline,
+  zero fetches), `test_fetch_success_is_required_before_any_fetch_result`
+  (fetch-failure gate + post-fetch identity verification);
 * frozen fail-closed fixtures (frozen-only → full gate, frozen+outside →
   frozen-guarded mixed route);
 * drift guards (workflow lists vs isolation module; confinement set = PR-diff
@@ -98,11 +127,14 @@ classification script extracted from the workflow heredoc and pins:
 
 | Suite | Result |
 | --- | --- |
-| `tests/test_htf_baseline_short_phase2_scope_routing_v1.py` (incl. PR #233 integration test) | **56 passed** |
+| `tests/test_htf_baseline_short_phase2_scope_routing_v1.py` (incl. PR #233 historical integration test + R3 proofs) | **61 passed** |
 | `tests/test_htf_baseline_short_phase2_isolation_v1.py` (PHASE2_ONLY route, full gate) | **15 passed** |
 | mixed suite on this tree (workflow MIXED command verbatim) | **59 passed, 2 deselected** |
 | `tests/test_paper_safety_gate_config.py` (workflow baseline step) | **6 passed** |
+| consolidated CI run (routing + isolation + baseline) | **82 passed** |
 | workflow YAML parse (`yaml.safe_load`) | OK |
+| R3 P1 proof — simulated merge of #233 into main (merge commit containing the PR head) | moving-base diff collapses to empty (the P1 failure), pinned pair still yields the audited 19-file diff → `MIXED_WITH_PHASE2` |
+| R3 P2 proof — failed fetch + stale `FETCH_HEAD` | fail-closed (the stale SHA is never substituted); offline fallback resolves pins with zero fetches |
 
 ### Evidence on the REAL PR #233 tree (issue #229)
 
@@ -126,11 +158,11 @@ frozen constraints remain fail-closed for every class.
 | File | Change |
 | --- | --- |
 | `.github/workflows/main-pr-safety.yml` | three-way fail-closed classification (`PHASE2_ONLY`/`MIXED_WITH_PHASE2`/`NO_PHASE2`), class-routed gate steps (full isolation vs frozen-invariant + HTF causal/parity/closed-bar), `--no-renames`, unconditional routing-test step |
-| `tests/test_htf_baseline_short_phase2_scope_routing_v1.py` | routing tests: 3 fixtures, PR #233 real-diff integration test, frozen fail-closed fixtures, drift guards, workflow wiring |
-| `docs/research/HTF_BASELINE_SHORT_PHASE2_CI_SCOPE_ROUTING_V1.md` | this document (R1 + R2) |
+| `tests/test_htf_baseline_short_phase2_scope_routing_v1.py` | routing tests: 3 fixtures, PR #233 historical-diff integration test (R3 P1: audited pinned base/head, no moving refs), merge-#233 simulation, stale-FETCH_HEAD / offline / fetch-success proofs (R3 P2), frozen fail-closed fixtures, drift guards, workflow wiring |
+| `docs/research/HTF_BASELINE_SHORT_PHASE2_CI_SCOPE_ROUTING_V1.md` | this document (R1 + R2 + R3) |
 
 ## 6. Status
 
-`CI_SCOPE_FIX_R2_PREPARED / READY_FOR_INDEPENDENT_REVIEW`
+`CI_SCOPE_FIX_R3_PREPARED / READY_FOR_REVIEW`
 
 Commit/push is performed by the operator; merge/deploy is prohibited.

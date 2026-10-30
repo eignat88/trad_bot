@@ -25,10 +25,15 @@ workflow heredoc (``python3 - <<'PY_SCOPE'``) and pin:
 * one fixture per route (Phase-2-only, mixed, no-Phase2) plus the frozen
   fail-closed edges and this CI-fix PR's own file set (it must itself route
   ``PHASE2_ONLY`` and pass ``Main PR Safety``);
-* a MANDATORY integration test classifying the REAL diff of PR #233 against
-  ``origin/main`` (live ``refs/pull/233/head`` when fetchable, otherwise the
-  audited head pin) and checking the expected routing (mixed regression,
-  never the Phase-2-only confinement gate);
+* a MANDATORY integration test classifying the REAL historical diff of
+  PR #233 between its AUDITED pinned base/head commits (R3 P1: no moving
+  ``origin/main`` and no ``refs/pull/*`` — the regression is independent of
+  the PR lifecycle and keeps working after PR #233 merges into main) and
+  checking the expected routing (mixed regression, never the Phase-2-only
+  confinement gate), plus merge-simulation, stale-FETCH_HEAD and offline
+  fallback proofs (R3 P2: fetch success is verified before anything is taken
+  from a fetch, a stale ``FETCH_HEAD`` is never trusted, and the audited pin
+  is used only after presence + identity verification);
 * drift guards: the workflow's ``FROZEN_PATHS``/surface lists stay equal to
   the isolation gate's own lists, and the two confinement tests stay exactly
   the tests that depend on the PR diff;
@@ -74,15 +79,21 @@ MIXED_STEP = (
 )
 
 # --- PR #233 (issue #229 Bybit retry budget) -------------------------------
-#: audited PR #233 head at task time (fallback when the live ref cannot be
-#: fetched, e.g. in a write-restricted sandbox)
+#: AUDITED historical regression anchors (R3 P1): fixed commit SHAs of the
+#: original PR #233 state. The historical regression MUST NOT use moving refs
+#: (``origin/main`` becomes an ancestor container after merge #233 and the
+#: three-dot diff would collapse to empty).
+#: PR #233 base at audit time (its merge-base with main)
+PR233_BASE_PIN = "ad7353029fd158d4a3ab037ad3e98a179a487971"
+#: PR #233 head at audit time
 PR233_HEAD_PIN = "e5cd31f3c1e3e172d4fc6b91c11f3929bbc00b62"
 #: Phase-2 surface files PR #233 touches (the reason it routes "mixed")
 PR233_KNOWN_PHASE2_PATHS = {
     "app/research/htf_baseline_short_phase2_bybit_candle_source_v1.py",
     "tests/test_htf_baseline_short_phase2_bybit_candle_source_v1.py",
 }
-#: audited PR #233 changed-file list (name-only, --no-renames) vs origin/main
+#: audited PR #233 changed-file list (name-only, --no-renames) between the
+#: pinned base and head commits
 PR233_CHANGED_FILES_PIN = [
     ".github/workflows/bybit-retry-budget-ci-v1.yml",
     "app/analytics/candle_sync.py",
@@ -237,16 +248,17 @@ def _run_scope(paths, tmp_path, monkeypatch) -> str:
     return result
 
 
-def _git(*args: str) -> str:
+def _git(*args: str, root: Path = ROOT, env: dict | None = None) -> str:
     import subprocess
 
     result = subprocess.run(
         ["git", *args],
-        cwd=ROOT,
+        cwd=root,
         capture_output=True,
         text=True,
         encoding="utf-8",
         timeout=120,
+        env=env,
     )
     if result.returncode != 0:
         pytest.fail(
@@ -256,41 +268,90 @@ def _git(*args: str) -> str:
     return result.stdout
 
 
-def _git_ok(*args: str) -> str | None:
-    """Best-effort git call; None on failure (network/sandbox restrictions)."""
+def _git_ok(*args: str, root: Path = ROOT, env: dict | None = None) -> str | None:
+    """Best-effort git call; None on ANY failure (non-zero exit, network or
+    sandbox restrictions). Callers must check success before trusting output."""
     import subprocess
 
     try:
         result = subprocess.run(
             ["git", *args],
-            cwd=ROOT,
+            cwd=root,
             capture_output=True,
             text=True,
             encoding="utf-8",
             timeout=120,
+            env=env,
         )
     except Exception:  # noqa: BLE001 - best-effort resolver
         return None
     return result.stdout if result.returncode == 0 else None
 
 
-def _resolve_pr233_head() -> str:
-    """Resolve the REAL PR #233 head: live ref when fetchable, else the
-    audited pin. MANDATORY: no silent skip."""
-    for ref in ("refs/pull/233/head", "refs/remotes/origin/pr-233"):
-        sha = _git_ok("rev-parse", "--verify", ref)
-        if sha is not None and sha.strip():
-            return sha.strip()
-    _git_ok("fetch", "--no-tags", "origin", "refs/pull/233/head")
-    sha = _git_ok("rev-parse", "--verify", "FETCH_HEAD")
-    if sha is not None and sha.strip():
-        return sha.strip()
-    if _git_ok("cat-file", "-e", f"{PR233_HEAD_PIN}^{{commit}}") is not None:
-        return PR233_HEAD_PIN
-    pytest.fail(
-        "cannot resolve PR #233 head: refs/pull/233/head is not fetchable "
-        f"and the audited pin {PR233_HEAD_PIN} is not in the object store"
+def _verify_commit(sha: str, *, root: Path = ROOT) -> str | None:
+    """Return ``sha`` only after PRESENCE + IDENTITY verification: the object
+    must exist and resolve to exactly the audited commit id."""
+    if _git_ok("cat-file", "-e", f"{sha}^{{commit}}", root=root) is None:
+        return None
+    resolved = _git_ok("rev-parse", f"{sha}^{{commit}}", root=root)
+    if resolved is None or resolved.strip() != sha:
+        return None
+    return sha
+
+
+def _resolve_verified_commit(sha: str, *, root: Path = ROOT) -> str | None:
+    """Resolve one audited commit (R3 P2):
+
+    * presence + identity verification first (offline fast path);
+    * on a miss, fetch the COMMIT BY SHA — and only if that fetch is
+      SUCCESSFUL is its result ever usable;
+    * ``FETCH_HEAD`` is NEVER consulted: an arbitrary stale ``FETCH_HEAD``
+      left over from an unrelated/failed fetch can never substitute the
+      audited commit;
+    * the audited pin is returned only after presence + identity checks.
+    """
+    verified = _verify_commit(sha, root=root)
+    if verified is not None:
+        return verified
+    fetched = _git_ok("fetch", "--no-tags", "origin", sha, root=root)
+    if fetched is not None:
+        # fetch SUCCESS verified above before trusting anything from it
+        verified = _verify_commit(sha, root=root)
+        if verified is not None:
+            return verified
+    # fetch failed (or post-fetch identity mismatch): the audited pin is used
+    # only after presence + identity verification — never FETCH_HEAD
+    return _verify_commit(sha, root=root)
+
+
+def _resolve_pr233_regression_pair() -> tuple[str, str]:
+    """Verified AUDITED (base, head) commit pair of the historical PR #233
+    regression. MANDATORY: no silent skip, no moving refs, no PR refs."""
+    base = _resolve_verified_commit(PR233_BASE_PIN)
+    head = _resolve_verified_commit(PR233_HEAD_PIN)
+    missing = [
+        pin
+        for pin, sha in ((PR233_BASE_PIN, base), (PR233_HEAD_PIN, head))
+        if sha is None
+    ]
+    if missing:
+        pytest.fail(
+            "cannot materialize audited PR #233 commit(s) "
+            f"{missing}: fetch failed and the pin is absent/unverified"
+        )
+    return base, head
+
+
+def _changed_files_between(
+    base: str, head: str, *, root: Path = ROOT, env: dict | None = None
+) -> list[str]:
+    """Historical changed-file list between two COMMIT SHAs (immutable
+    history — never a moving ref)."""
+    diff = _git(
+        "diff", "--name-only", "--no-renames", f"{base}...{head}",
+        root=root, env=env,
     )
+    return sorted({ln.strip() for ln in diff.splitlines() if ln.strip()})
 
 
 # ---------------------------------------------------------------------------
@@ -401,19 +462,25 @@ def test_missing_changed_file_feed_fails_closed(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# MANDATORY integration test: the REAL diff of PR #233 vs origin/main
+# MANDATORY integration test: the REAL historical diff of PR #233 between
+# its AUDITED pinned commits
 # ---------------------------------------------------------------------------
 
 
-def test_pr233_real_diff_routes_to_mixed_regression(tmp_path, monkeypatch):
-    """Classify the real PR #233 diff against origin/main and check the
-    expected routing: MIXED_WITH_PHASE2 (frozen-invariant + HTF
+def test_pr233_historical_diff_routes_to_mixed_regression(tmp_path, monkeypatch):
+    """Classify the REAL historical diff of PR #233 (R3 P1: between its
+    AUDITED pinned base/head commits — never a moving ref, never a PR ref)
+    and check the expected routing: MIXED_WITH_PHASE2 (frozen-invariant + HTF
     causal/parity/closed-bar regression), NEVER the Phase-2-only confinement
-    gate that produced the 2 FAILs."""
-    head = _resolve_pr233_head()
-    diff = _git("diff", "--name-only", "--no-renames", f"origin/main...{head}")
-    paths = [ln.strip() for ln in diff.splitlines() if ln.strip()]
-    assert paths, f"empty PR #233 diff for head {head}"
+    gate that produced the 2 FAILs. Immortal: keeps passing after merge #233
+    because commit SHAs are immutable history."""
+    base, head = _resolve_pr233_regression_pair()
+    paths = _changed_files_between(base, head)
+    assert paths, f"empty PR #233 diff for {base}...{head}"
+    assert paths == sorted(PR233_CHANGED_FILES_PIN), (
+        "the audited PR #233 diff changed: "
+        f"{sorted(set(paths) ^ set(PR233_CHANGED_FILES_PIN))}"
+    )
 
     result = _run_scope(paths, tmp_path, monkeypatch)
     assert result == MIXED_WITH_PHASE2, (
@@ -442,6 +509,218 @@ def test_pr233_real_diff_routes_to_mixed_regression(tmp_path, monkeypatch):
 
 def _is_governed(path: str, tmp_path, monkeypatch) -> bool:
     return _run_scope([path], tmp_path, monkeypatch) != NO_PHASE2
+
+
+# ---------------------------------------------------------------------------
+# R3 P1: the historical regression survives PR #233 MERGING into main
+# ---------------------------------------------------------------------------
+
+
+def test_historical_regression_survives_pr233_merge_into_main(
+    tmp_path, monkeypatch
+):
+    """Imitate main CONTAINING PR #233 (post-merge): the old moving-base
+    three-dot diff collapses to empty, while the audited pinned pair still
+    yields the full PR #233 diff and the same mixed routing."""
+    base, head = _resolve_pr233_regression_pair()
+
+    # isolated object store for the simulated merge commit (nothing is
+    # written to the real repository; real objects are visible read-only)
+    import os
+
+    common_dir = (
+        _git("rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    )
+    sim_obj = tmp_path / "sim_objects"
+    sim_obj.mkdir()
+    sim_env = dict(
+        os.environ,
+        GIT_OBJECT_DIRECTORY=str(sim_obj),
+        GIT_ALTERNATE_OBJECT_DIRECTORIES=os.pathsep.join(
+            [str(Path(common_dir) / "objects")]
+        ),
+        GIT_AUTHOR_NAME="ci-fix-sim",
+        GIT_AUTHOR_EMAIL="ci-fix-sim@local",
+        GIT_AUTHOR_DATE="2026-01-01T00:00:00 +0000",
+        GIT_COMMITTER_NAME="ci-fix-sim",
+        GIT_COMMITTER_EMAIL="ci-fix-sim@local",
+        GIT_COMMITTER_DATE="2026-01-01T00:00:00 +0000",
+    )
+    # a merge commit whose history CONTAINS the PR #233 head (simulated
+    # post-merge main tip)
+    merged = _git(
+        "commit-tree",
+        f"{head}^{{tree}}",
+        "-p", base,
+        "-p", head,
+        "-m", "simulated merge of PR #233 into main",
+        env=sim_env,
+    ).strip()
+    assert _git_ok(
+        "merge-base", "--is-ancestor", head, merged, env=sim_env
+    ) is not None, "simulation broken: merged tip must contain the PR head"
+
+    # the OLD moving-base failure mode (what P1 fixes): once main contains
+    # the PR head, main...head is empty
+    assert _changed_files_between(merged, head, env=sim_env) == [], (
+        "expected the moving-base diff to collapse post-merge"
+    )
+
+    # the audited pinned historical regression is unaffected
+    paths = _changed_files_between(base, head, env=sim_env)
+    assert paths == sorted(PR233_CHANGED_FILES_PIN)
+    assert _run_scope(paths, tmp_path, monkeypatch) == MIXED_WITH_PHASE2
+
+
+def test_historical_regression_never_uses_moving_refs(monkeypatch):
+    """P1 wiring: every git operand of the historical regression must be a
+    pinned commit SHA — no ``origin/*``, no ``refs/*``, no ``FETCH_HEAD`` —
+    so Main PR Safety cannot depend on any PR lifecycle."""
+    calls: list[tuple[str, ...]] = []
+    real_git, real_git_ok = _git, _git_ok
+
+    def spy_git(*args, **kw):
+        calls.append(args)
+        return real_git(*args, **kw)
+
+    def spy_git_ok(*args, **kw):
+        calls.append(args)
+        return real_git_ok(*args, **kw)
+
+    monkeypatch.setitem(globals(), "_git", spy_git)
+    monkeypatch.setitem(globals(), "_git_ok", spy_git_ok)
+    base, head = _resolve_pr233_regression_pair()
+    _changed_files_between(base, head)
+
+    for args in calls:
+        joined = " ".join(args)
+        for moving in ("origin/", "refs/", "FETCH_HEAD"):
+            assert moving not in joined, (
+                f"historical regression used moving/untrusted git operand: {args}"
+            )
+    diff_args = [
+        args for args in calls if args and args[0] == "diff"
+    ]
+    assert any(
+        f"{PR233_BASE_PIN}...{PR233_HEAD_PIN}" in args for args in diff_args
+    ), "historical diff must run between the audited pinned commits"
+
+
+# ---------------------------------------------------------------------------
+# R3 P2: fetch-success gate, stale FETCH_HEAD, offline fallback
+# ---------------------------------------------------------------------------
+
+
+def _sim_repo_with_two_commits(tmp_path) -> tuple[str, str]:
+    """Tiny synthetic repo: returns (pin_commit, other_commit) SHAs."""
+    root = tmp_path / "sim"
+    root.mkdir()
+    _git("init", root=root)
+    ident = (
+        "-c", "user.name=ci-fix-sim",
+        "-c", "user.email=ci-fix-sim@local",
+    )
+    _git(*ident, "commit", "--allow-empty", "-m", "pin", root=root)
+    pin = _git("rev-parse", "HEAD", root=root).strip()
+    _git(*ident, "commit", "--allow-empty", "-m", "other", root=root)
+    other = _git("rev-parse", "HEAD", root=root).strip()
+    return root, pin, other
+
+
+def test_failed_fetch_with_stale_fetch_head_never_substitutes_the_pin(
+    tmp_path, monkeypatch
+):
+    """P2: a FAILED fetch plus an existing stale FETCH_HEAD must never
+    substitute the audited commit."""
+    root, pin, other = _sim_repo_with_two_commits(tmp_path)
+    # stale FETCH_HEAD from an unrelated past fetch, naming `other`
+    (root / ".git" / "FETCH_HEAD").write_text(
+        f"{other}\t\tbranch 'main' of https://example.invalid/repo.git\n",
+        encoding="utf-8",
+    )
+
+    # (a) audited pin present: resolved to the pin, never to FETCH_HEAD
+    assert _resolve_verified_commit(pin, root=root) == pin
+
+    # (b) audited pin MISSING, fetch FAILS (no 'origin' remote): resolution
+    #     fails closed instead of returning the stale FETCH_HEAD commit
+    missing = "1234567890abcdef1234567890abcdef12345678"
+    fetches: list[tuple[str, ...]] = []
+    real_git_ok = _git_ok
+
+    def spy(*args, **kw):
+        if args and args[0] == "fetch":
+            fetches.append(args)
+        return real_git_ok(*args, **kw)
+
+    monkeypatch.setitem(globals(), "_git_ok", spy)
+    resolved = _resolve_verified_commit(missing, root=root)
+    assert resolved is None, "missing pin must resolve fail-closed"
+    assert resolved != other, "stale FETCH_HEAD must never be accepted"
+    assert fetches, "the miss path must have attempted the fetch"
+
+
+def test_offline_fallback_verifies_pin_without_network(tmp_path, monkeypatch):
+    """The audited pins resolve OFFLINE (presence + identity only) — no
+    fetch, no network, no FETCH_HEAD."""
+    root, pin, _ = _sim_repo_with_two_commits(tmp_path)
+    calls: list[tuple[str, ...]] = []
+    real_git_ok = _git_ok
+
+    def spy(*args, **kw):
+        calls.append(args)
+        return real_git_ok(*args, **kw)
+
+    monkeypatch.setitem(globals(), "_git_ok", spy)
+    assert _resolve_verified_commit(pin, root=root) == pin
+    assert not any(args and args[0] == "fetch" for args in calls), (
+        "offline fast path must not attempt any fetch"
+    )
+
+
+def test_fetch_success_is_required_before_any_fetch_result(monkeypatch):
+    """P2 gate: when the fetch reports failure, nothing derived from a fetch
+    may be used (FETCH_HEAD is never read); only the identity-verified pin."""
+    pin = "1234567890abcdef1234567890abcdef12345678"
+    seen: list[tuple[str, ...]] = []
+
+    def fake_git_ok(*args, **kw):
+        seen.append(args)
+        if args and args[0] == "fetch":
+            return None  # fetch FAILS — must gate everything downstream
+        if args and args[0] == "cat-file":
+            return None  # audited pin absent (pre- and post-fetch checks)
+        if args and args[0] == "rev-parse":
+            raise AssertionError(
+                "fetch failed: no fetch-derived rev-parse may run (FETCH_HEAD)"
+            )
+        return None
+
+    monkeypatch.setitem(globals(), "_git_ok", fake_git_ok)
+    assert _resolve_verified_commit(pin) is None, "must fail closed"
+    assert any(args and args[0] == "fetch" for args in seen), (
+        "the miss path must have attempted the fetch"
+    )
+    assert not any("FETCH_HEAD" in args for args in seen), (
+        "FETCH_HEAD must never be consulted"
+    )
+
+    # success path: fetch OK, then the pin is returned only after
+    # presence + identity verification
+    def fake_git_ok_success(*args, **kw):
+        if args and args[0] == "fetch":
+            return ""  # success
+        if args and args[0] == "cat-file":
+            return ""  # present
+        if args and args[0] == "rev-parse":
+            assert args[1] == f"{pin}^{{commit}}", (
+                "identity check must resolve the audited pin itself"
+            )
+            return pin
+        return None
+
+    monkeypatch.setitem(globals(), "_git_ok", fake_git_ok_success)
+    assert _resolve_verified_commit(pin) == pin
 
 
 # ---------------------------------------------------------------------------
