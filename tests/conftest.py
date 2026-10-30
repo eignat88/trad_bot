@@ -28,6 +28,21 @@ _TMP_ROOT = Path(__file__).parent / ".tmp"
 
 
 # ======================================================================
+# BYBIT_RETRY_BUDGET_HARDENING_V1 (Issue #229) — process-local retry
+# governance state (breaker cooldown, storm-guard window, order-submit
+# guard) must never leak between tests.
+# ======================================================================
+
+@pytest.fixture(autouse=True)
+def _reset_bybit_retry_governance():
+    from app.exchange import retry_budget
+
+    retry_budget.reset_process_state()
+    yield
+    retry_budget.reset_process_state()
+
+
+# ======================================================================
 # Common PostgreSQL test connection
 # ======================================================================
 

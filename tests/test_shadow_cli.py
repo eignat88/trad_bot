@@ -72,7 +72,7 @@ class TestShadowRunnerCLI:
                                 "duplicates": 0,
                                 "scan_errors": 0,
                                 "db_errors": 0,
-                                "rate_limit_retries": 0,
+                                "rate_limit_drops": 0,
                             }
                             mock_runner.return_value = mock_runner_instance
 
@@ -526,22 +526,34 @@ class TestShadowRunnerRawCapture:
         # but signal_time must come from the candle timestamp
         assert "last_closed.timestamp" in source
 
-    def test_runner_has_rate_limit_retry(self):
-        """_scan_symbol_with_retry implements bounded retry."""
+    def test_runner_has_no_independent_retry_loop(self):
+        """BYBIT_RETRY_BUDGET_HARDENING_V1 (Issue #229): L3 is GONE.
+
+        Static source contract (style of this file): the shadow runner must
+        not keep an independent per-symbol retry loop — the unified <= 3 HTTP
+        attempt budget is owned by BybitClient._public_get, and rate-limit
+        outcomes are counted fail-closed drops instead of retried here.
+        """
         import inspect
+
+        import app.shadow.runner as runner_module
         from app.shadow.runner import ShadowScannerRunner
 
-        source = inspect.getsource(ShadowScannerRunner._scan_symbol_with_retry)
-        assert "MAX_RETRIES" in source
-        assert "_is_rate_limit_error" in source
+        class_source = inspect.getsource(ShadowScannerRunner)
+        assert "_scan_symbol_with_retry" not in class_source
+        assert "for attempt" not in class_source
+        assert "_scan_symbol_fail_closed" in class_source
+        module_source = inspect.getsource(runner_module)
+        assert "MAX_RETRIES" not in module_source
+        assert "BACKOFF_BASE" not in module_source
 
-    def test_run_cycle_returns_rate_limit_retries(self):
-        """run_cycle summary includes rate_limit_retries."""
+    def test_run_cycle_reports_rate_limit_drops(self):
+        """run_cycle summary counts fail-closed rate-limit drops."""
         import inspect
         from app.shadow.runner import ShadowScannerRunner
 
         source = inspect.getsource(ShadowScannerRunner.run_cycle)
-        assert "rate_limit_retries" in source
+        assert "rate_limit_drops" in source
 
     def test_runner_shadow_max_workers_constant(self):
         """SHADOW_MAX_WORKERS is defined and reasonable."""

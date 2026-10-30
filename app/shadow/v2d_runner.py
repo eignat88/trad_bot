@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import random
 import signal
 import sys
 import time
@@ -24,7 +23,7 @@ from typing import Any
 
 from app.config import Settings, load_settings
 from app.db.repository import ScannerRepository
-from app.exchange.bybit_client import BybitClient
+from app.exchange.bybit_client import BybitClient, BybitRateLimitError
 from app.models import Candle
 from app.scanners.atr_wick_rejection_short import AtrWickRejectionShortScanner, WickRejectionSignal
 from app.scanners.models import IndicatorSnapshot, MarketContext, MarketLevels
@@ -37,16 +36,19 @@ logger = logging.getLogger(__name__)
 SHADOW_MAX_WORKERS = 6
 SHADOW_KLINE_LIMIT = 200
 
-# Rate limit retry settings
-MAX_RETRIES = 3
-BACKOFF_BASE = 0.5
+# BYBIT_RETRY_BUDGET_HARDENING_V1 (Issue #229): the former L3 per-symbol
+# retry loop is REMOVED — the unified attempt budget (<= 3 HTTP attempts per
+# logical request) is owned by BybitClient._public_get, and every rate-limit
+# drop is reported fail-closed and counted (never silently retried here).
 
 # Bybit rate limit error phrases
 _RATE_LIMIT_PHRASES = ("Too many visits", "Exceeded the API Rate Limit")
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
-    """Check if an exception is a Bybit rate limit error."""
+    """Check if an exception is a Bybit rate limit outcome."""
+    if isinstance(exc, BybitRateLimitError):
+        return True
     msg = str(exc)
     return any(phrase in msg for phrase in _RATE_LIMIT_PHRASES)
 
@@ -159,27 +161,25 @@ class V2DRunner:
 
         return raw, False
 
-    def _scan_symbol_with_retry(self, symbol: str) -> tuple[WickRejectionSignal | None, bool, bool]:
-        """Scan with bounded retry for rate limit errors."""
-        last_exc: Exception | None = None
+    def _scan_symbol_fail_closed(self, symbol: str) -> tuple[WickRejectionSignal | None, bool]:
+        """Scan one symbol in a single logical request (client-owned budget).
 
-        for attempt in range(MAX_RETRIES):
-            try:
-                candidate, _ = self._scan_symbol(symbol)
-                return candidate, False, attempt > 0
-            except Exception as exc:
-                last_exc = exc
-                if _is_rate_limit_error(exc) and attempt < MAX_RETRIES - 1:
-                    backoff = BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 0.3)
-                    logger.warning(
-                        "Rate limit for %s (attempt %d/%d), retrying in %.1fs",
-                        symbol, attempt + 1, MAX_RETRIES, backoff,
-                    )
-                    time.sleep(backoff)
-                else:
-                    break
-
-        raise last_exc  # type: ignore[misc]
+        BYBIT_RETRY_BUDGET_HARDENING_V1 (Issue #229): no independent retry
+        loop — rate-limit budget exhaustion / breaker deferral is reported as
+        a COUNTED fail-closed drop (``rate_limited=True``), any other failure
+        is raised and counted as a scan error.
+        """
+        try:
+            candidate, _ = self._scan_symbol(symbol)
+            return candidate, False
+        except Exception as exc:
+            if _is_rate_limit_error(exc):
+                logger.warning(
+                    "V2D scan dropped for %s: rate limit (fail-closed, no retry)",
+                    symbol,
+                )
+                return None, True
+            raise
 
     def _persist_candidate(self, raw: WickRejectionSignal) -> str:
         """Apply V2_D filter and persist if PASS. Main thread only."""
@@ -251,19 +251,20 @@ class V2DRunner:
         candidates: list[WickRejectionSignal] = []
         raw_count = 0
         scan_errors = 0
-        rate_limit_retries = 0
+        rate_limit_drops = 0
 
         with ThreadPoolExecutor(max_workers=SHADOW_MAX_WORKERS) as executor:
             future_to_symbol = {
-                executor.submit(self._scan_symbol_with_retry, symbol): symbol
+                executor.submit(self._scan_symbol_fail_closed, symbol): symbol
                 for symbol in symbols
             }
             for future in as_completed(future_to_symbol):
                 symbol = future_to_symbol[future]
                 try:
-                    candidate, rate_limited, retry_used = future.result()
-                    if retry_used:
-                        rate_limit_retries += 1
+                    candidate, rate_limited = future.result()
+                    if rate_limited:
+                        # counted fail-closed drop (never silent)
+                        rate_limit_drops += 1
                     if candidate is not None:
                         raw_count += 1
                         candidates.append(candidate)
@@ -303,7 +304,7 @@ class V2DRunner:
             "duplicates": duplicates,
             "scan_errors": scan_errors,
             "db_errors": db_errors,
-            "rate_limit_retries": rate_limit_retries,
+            "rate_limit_drops": rate_limit_drops,
         }
 
         logger.info(

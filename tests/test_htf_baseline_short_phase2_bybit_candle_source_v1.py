@@ -380,7 +380,7 @@ def test_gap_recovery_retry_overlap_conflict_still_fails_closed():
 # ------------------------------------ 5. API / rate limit / incomplete pages
 
 
-def test_api_error_fails_closed_with_bounded_attempts():
+def test_api_error_fails_closed_with_single_logical_request():
     history = make_candles(60)
     client = FakeKlineClient(
         history, server_time_ms=history[-1].timestamp + BAR, fail_with=RuntimeError("connection reset")
@@ -389,7 +389,11 @@ def test_api_error_fails_closed_with_bounded_attempts():
     with pytest.raises(BybitCandleSourceError) as excinfo:
         source.load("BTCUSDT")
     assert excinfo.value.reason == REASON_API_ERROR
-    assert len(client.calls) == 2  # bounded retries, no unbounded loop
+    # BYBIT_RETRY_BUDGET_HARDENING_V1 (Issue #229): the hidden source-level
+    # retry layer is COLLAPSED — exactly one logical request per fetch (the
+    # transport owns the <=3 HTTP attempt budget), so a persistent failure
+    # can no longer amplify into max_attempts x budget attempts.
+    assert len(client.calls) == 1
 
 
 def test_rate_limit_fails_closed_and_creates_nothing():
