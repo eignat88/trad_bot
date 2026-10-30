@@ -65,8 +65,10 @@ class ScriptedSession:
         self.outcomes = list(outcomes)
         self.calls = []
 
-    def get(self, url, params=None, timeout=None):
-        self.calls.append(("GET", url, dict(params or {}), timeout))
+    def get(self, url, params=None, timeout=None, headers=None):
+        # review R4-3: private GETs are sent with authentication headers
+        self.calls.append(("GET", url, dict(params or {}), timeout,
+                           dict(headers or {})))
         return self._next()
 
     def post(self, url, data=None, headers=None, timeout=None):
@@ -250,9 +252,10 @@ def test_reconcile_confirmed_record_resolves_with_evidence(tmp_path):
                        reason="timeout — outcome UNKNOWN")
 
     session = ScriptedSession([
-        FakeResponse({"retCode": 0, "result": {"list": [
+        FakeResponse({"retCode": 0, "result": {"category": "linear",
+                                               "list": [
             {"orderLinkId": "rb-rec-1", "symbol": "BTCUSDT",
-             "category": "linear", "orderStatus": "Filled",
+             "orderStatus": "Filled",
              "orderId": "EX-1"}]}}),
     ])
     results = make_client(session).reconcile_order_submissions()
@@ -284,8 +287,10 @@ def test_reconcile_absent_record_is_explicit_unresolved_blocker(tmp_path):
                        reason="5xx — outcome UNKNOWN")
 
     session = ScriptedSession([
-        FakeResponse({"retCode": 0, "result": {"list": []}}),   # realtime
-        FakeResponse({"retCode": 0, "result": {"list": []}}),   # history
+        FakeResponse({"retCode": 0,
+                      "result": {"category": "linear", "list": []}}),  # realtime
+        FakeResponse({"retCode": 0,
+                      "result": {"category": "linear", "list": []}}),  # history
     ])
     results = make_client(session).reconcile_order_submissions()
 
@@ -332,17 +337,34 @@ def test_cli_lists_blockers_offline(tmp_path, capsys):
 # P1 (review #5709889450) — STRICT orderLinkId / symbol / category match
 # ----------------------------------------------------------------------
 
-def _row(order_link_id="rb-x", symbol="BTCUSDT", category="linear",
+def _row(order_link_id="rb-x", symbol="BTCUSDT", category=None,
          status="Filled", **extra):
-    row = {"symbol": symbol, "category": category, "orderStatus": status,
-           "orderId": "EX-1"}
+    """One Bybit V5 order row (an item of ``result.list``).
+
+    Real Bybit V5 order rows carry NO ``category`` — the category lives on
+    the response envelope (``result.category``, review R4-4). The optional
+    ``category`` key only models contradictory rows.
+    """
+    row = {"symbol": symbol, "orderStatus": status, "orderId": "EX-1"}
     if order_link_id is not None:
         row["orderLinkId"] = order_link_id
+    if category is not None:
+        row["category"] = category
     row.update(extra)
     return row
 
 
-# Acceptance table (review #5709889450 §3): response -> expected outcome.
+def _order_response(rows, category="linear"):
+    """A Bybit V5 /v5/order/* response envelope (review R4-4 shape)."""
+    result = {"list": list(rows)}
+    if category is not None:
+        result["category"] = category
+    return FakeResponse({"retCode": 0, "result": result})
+
+
+# Acceptance table (review #5709889450 §3 + R4-4): response -> expected
+# outcome. The envelope category is ALWAYS the expected one here; the
+# ``different_category`` case models a row contradicting the envelope.
 _STRICT_MATCH_CASES = [
     ("exact_match_valid_status", [_row()], [], "resolved"),
     ("exact_match_open_status", [_row(status="New")], [], "resolved"),
@@ -374,8 +396,9 @@ _STRICT_MATCH_CASES = [
     ids=[case[0] for case in _STRICT_MATCH_CASES])
 def test_strict_order_match_acceptance_table(tmp_path, realtime_rows,
                                              history_rows, expected):
-    """Only an exact non-empty orderLinkId + symbol + category + accepted
-    status is confirmation; everything else stays UNRESOLVED_BLOCKER."""
+    """Only an exact non-empty orderLinkId + symbol + accepted status inside
+    a correct response envelope is confirmation; everything else stays
+    UNRESOLVED_BLOCKER."""
     journal = tmp_path / "journal.json"
     guard = retry_budget.get_order_guard()
     guard.configure(str(journal))
@@ -384,8 +407,8 @@ def test_strict_order_match_acceptance_table(tmp_path, realtime_rows,
                        reason="timeout — outcome UNKNOWN")
 
     session = ScriptedSession([
-        FakeResponse({"retCode": 0, "result": {"list": realtime_rows}}),
-        FakeResponse({"retCode": 0, "result": {"list": history_rows}}),
+        _order_response(realtime_rows),
+        _order_response(history_rows),
     ])
     results = make_client(session).reconcile_order_submissions()
 
@@ -397,6 +420,44 @@ def test_strict_order_match_acceptance_table(tmp_path, realtime_rows,
     else:
         assert "UNRESOLVED_BLOCKER" == results[0]["resolution"]
         assert guard.begin(FP, order_link_id="rb-x-2") is False  # still blocked
+
+
+@pytest.mark.parametrize("category", [None, "", "spot", 7, ["linear"]],
+                         ids=["missing_category", "empty_category",
+                              "foreign_category", "non_string_category",
+                              "list_category"])
+def test_response_envelope_category_gate(tmp_path, category):
+    """Review R4-4: the category is validated on the RESPONSE ENVELOPE.
+    A missing / empty / foreign / non-string ``result.category`` is NEVER a
+    confirmation — the block stays (fail-closed), even for a perfectly
+    matching order row."""
+    journal = tmp_path / "journal.json"
+    guard = retry_budget.get_order_guard()
+    guard.configure(str(journal))
+    guard.begin(FP, order_link_id="rb-cat-1")
+    guard.mark_unknown(FP, order_link_id="rb-cat-1",
+                       reason="timeout — outcome UNKNOWN")
+
+    session = ScriptedSession([_order_response([_row()], category=category)])
+    results = make_client(session).reconcile_order_submissions()
+    assert results[0]["resolution"] == "UNRESOLVED_BLOCKER"
+    assert guard.begin(FP, order_link_id="rb-cat-2") is False  # still blocked
+
+
+def test_real_bybit_v5_rows_without_row_category_confirm(tmp_path):
+    """Review R4-4: the CORRECT Bybit V5 shape (``result.category`` on the
+    envelope, no category inside the order rows) is a valid confirmation."""
+    journal = tmp_path / "journal.json"
+    guard = retry_budget.get_order_guard()
+    guard.configure(str(journal))
+    guard.begin(FP, order_link_id="rb-v5-1")
+    guard.mark_unknown(FP, order_link_id="rb-v5-1",
+                       reason="timeout — outcome UNKNOWN")
+
+    session = ScriptedSession([_order_response([_row(order_link_id="rb-v5-1")])])
+    results = make_client(session).reconcile_order_submissions()
+    assert results[0]["resolution"] == "resolved"
+    assert guard.begin(FP, order_link_id="rb-v5-2") is True
 
 
 def test_strict_match_malformed_response_fails_closed(tmp_path):
@@ -426,8 +487,7 @@ def test_strict_match_history_only_queried_when_realtime_uncertain(tmp_path):
                        reason="timeout — outcome UNKNOWN")
 
     session = ScriptedSession([
-        FakeResponse({"retCode": 0, "result": {"list": [
-            _row(order_link_id="rb-hist", status="PartiallyFilled")]}}),
+        _order_response([_row(order_link_id="rb-hist", status="PartiallyFilled")]),
     ])
     results = make_client(session).reconcile_order_submissions()
     assert results[0]["resolution"] == "resolved"
@@ -796,9 +856,10 @@ def test_recovered_unknown_resolved_only_by_exchange_confirmation(tmp_path):
     assert guard.begin(FP, order_link_id="rb-r3-b-2") is False   # no repeat POST
 
     session = ScriptedSession([
-        FakeResponse({"retCode": 0, "result": {"list": [
+        FakeResponse({"retCode": 0, "result": {"category": "linear",
+                                               "list": [
             {"orderLinkId": "rb-r3-b-1", "symbol": "BTCUSDT",
-             "category": "linear", "orderStatus": "Filled",
+             "orderStatus": "Filled",
              "orderId": "EX-B"}]}}),
     ])
     results = make_client(session).reconcile_order_submissions()

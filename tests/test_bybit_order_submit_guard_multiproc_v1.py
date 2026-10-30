@@ -186,7 +186,7 @@ def _worker_hold_lock(lock_path, hold_s, ready):
 def _worker_reconcile_loop(journal, rounds, result_file):
     """Concurrent reconciliation on the shared journal (fake transport)."""
     class Session:
-        def get(self, url, params=None, timeout=None):
+        def get(self, url, params=None, timeout=None, headers=None):
             return FakeResp()
     client = BybitClient(_live_settings(
         bybit_order_submit_journal_path=journal), Session())
@@ -212,12 +212,16 @@ def _worker_recover_and_reconcile(journal, olink, confirm, post_log, result_file
                 fh.write("POST-B\n")
             return FakeResp()
 
-        def get(self, url, params=None, timeout=None):
+        def get(self, url, params=None, timeout=None, headers=None):
             if confirm:
-                return FakeResp({"retCode": 0, "result": {"list": [{
-                    "orderLinkId": olink, "symbol": "BTCUSDT",
-                    "category": "linear", "orderStatus": "Filled",
-                    "orderId": "EX-RECOVERED"}]}})
+                # Review R4-4: the Bybit V5 envelope carries the category;
+                # the order row itself does not.
+                return FakeResp({"retCode": 0, "result": {
+                    "category": "linear",
+                    "list": [{
+                        "orderLinkId": olink, "symbol": "BTCUSDT",
+                        "orderStatus": "Filled",
+                        "orderId": "EX-RECOVERED"}]}})
             return FakeResp()
     out: dict = {}
     client = BybitClient(_live_settings(
@@ -267,7 +271,7 @@ def _worker_recovery_reconcile_loop(journal, rounds, post_log, result_file):
     Never POSTs: a POST attempt is recorded and fails the worker.
     """
     class Session:
-        def get(self, url, params=None, timeout=None):
+        def get(self, url, params=None, timeout=None, headers=None):
             return FakeResp()
 
         def post(self, url, data=None, headers=None, timeout=None):

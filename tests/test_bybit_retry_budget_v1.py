@@ -569,11 +569,21 @@ def _source_of(obj) -> str:
 
 
 def test_bybit_client_has_single_budgeted_loop():
-    source = _source_of(BybitClient._public_get)
+    """Structure: the unified budget is the only attempt machine — one loop,
+    the unified hard budget constant, and NO nested retry layer. Review R4-3
+    moved the machine to ``_budgeted_get`` (public + signed private GETs both
+    delegate to it), so the loop-free contract is asserted for both wrappers.
+    """
+    source = _source_of(BybitClient._budgeted_get)
     assert source.count("while True") == 1     # one attempt state machine
     assert "for attempt" not in source         # no nested retry loops
     assert "for rl" not in source
     assert "retry_budget.HARD_MAX_ATTEMPTS" in source
+    for wrapper in (BybitClient._public_get, BybitClient._private_get):
+        wrapper_src = _source_of(wrapper)
+        assert "while True" not in wrapper_src
+        assert "for attempt" not in wrapper_src
+        assert "_budgeted_get" in wrapper_src  # delegates to the machine
 
 
 def test_create_order_source_has_no_retry_loop():
