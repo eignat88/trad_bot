@@ -26,6 +26,7 @@ Cross-process tests live in test_bybit_order_submit_guard_multiproc_v1.py.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 
@@ -688,3 +689,395 @@ def test_two_guard_instances_same_journal_path_serialize(tmp_path):
     t1.start(); t2.start()
     t1.join(timeout=15); t2.join(timeout=15)
     assert sorted(results) == [False, True]     # exactly one reservation
+
+
+# ----------------------------------------------------------------------
+# R3 (review #5710398920) — crash/restart recovery + owner liveness
+#
+# The restart-recovery contract:
+#   * ``in_flight`` of a LIVE owner is NEVER declared orphaned;
+#   * ``in_flight`` of a PROVABLY DEAD owner is durably transitioned to
+#     ``unknown`` (still blocking) and becomes reconciliation-visible —
+#     never an in-memory conversion, never an automatic unlock;
+#   * when owner liveness cannot be verified the record stays blocking and
+#     an explicit OWNER_UNVERIFIED_BLOCKER is returned;
+#   * recovery is idempotent and never loses/overwrites foreign records.
+# All tests run on fake transport — no Bybit, no real orders, no network.
+# ----------------------------------------------------------------------
+
+def _journal_doc(journal):
+    return json.loads(journal.read_text(encoding="utf-8"))
+
+
+def _journal_single_entry(journal):
+    entries = retry_budget._validate_journal_document(_journal_doc(journal))
+    assert len(entries) == 1
+    return next(iter(entries.values()))
+
+
+def _write_journal_doc(path, entries):
+    """Handcraft a journal document with a VALID checksum."""
+    canonical = json.dumps(entries, sort_keys=True, separators=(",", ":"))
+    doc = {"schema": retry_budget.ORDER_JOURNAL_SCHEMA,
+           "entries": entries,
+           "checksum": hashlib.sha256(canonical.encode("utf-8")).hexdigest()}
+    path.write_text(json.dumps(doc, indent=1, sort_keys=True),
+                    encoding="utf-8")
+
+
+def test_owner_witness_liveness_verdicts(tmp_path):
+    """Owner liveness comes ONLY from the OS witness lock — never from age
+    or TTL (review #5710398920): held -> ALIVE, released -> ORPHANED,
+    unusable/missing -> UNVERIFIED (fail-closed)."""
+    path = str(tmp_path / "journal.json.owner.witness.lock")
+    assert retry_budget.verify_owner_witness(path) == \
+        retry_budget.LIVENESS_UNVERIFIED
+    witness = retry_budget._OwnerWitness(path, "witnesstest01")
+    try:
+        assert retry_budget.verify_owner_witness(path) == \
+            retry_budget.LIVENESS_ALIVE
+    finally:
+        witness.release()
+    assert retry_budget.verify_owner_witness(path) == \
+        retry_budget.LIVENESS_ORPHANED
+
+
+# ---- Test A — crash before POST ------------------------------------
+
+def test_crash_before_post_recovery_durable_visible_and_stable(tmp_path):
+    """Test A (guard level): crash before POST -> 0 duplicate POST, the
+    operation becomes reconciliation-visible and the recovered state is
+    DURABLE (survives further restarts)."""
+    journal = tmp_path / "journal.json"
+    guard1 = retry_budget.OrderSubmitGuard(str(journal))
+    assert guard1.begin(FP, order_link_id="rb-r3-a-1") is True
+    pre_crash = _journal_single_entry(journal)
+    guard1.reset()                              # owner gone (crash)
+
+    # ---- restart #1 (process B): recovery must be durable
+    guard2 = retry_budget.OrderSubmitGuard(str(journal))
+    report = guard2.last_recovery_report()
+    assert [e["order_link_id"] for e in report["recovered"]] == ["rb-r3-a-1"]
+    assert guard2.blocking_entry(FP) == ("unknown", "rb-r3-a-1")
+    assert guard2.begin(FP, order_link_id="rb-r3-a-2") is False  # 0 duplicate
+    # recovery visible: the operation now participates in reconciliation
+    assert [e["order_link_id"] for e in guard2.pending_unknown()] == ["rb-r3-a-1"]
+
+    recovered = _journal_single_entry(journal)   # schema + checksum valid
+    assert recovered["state"] == "unknown"
+    assert recovered["recovery"]["from_state"] == "in_flight"
+    assert recovered["recovery"]["to_state"] == "unknown"
+    # orderLinkId / fingerprint / owner audit fields preserved
+    assert recovered["order_link_id"] == pre_crash["order_link_id"]
+    assert recovered["fingerprint"] == pre_crash["fingerprint"]
+    assert recovered["owner"] == pre_crash["owner"]
+    assert recovered["ts_utc"] == pre_crash["ts_utc"]
+
+    # ---- restart #2: the recovered state survives another restart
+    guard3 = retry_budget.OrderSubmitGuard(str(journal))
+    assert guard3.last_recovery_report()["recovered"] == []  # idempotent
+    assert guard3.blocking_entry(FP) == ("unknown", "rb-r3-a-1")
+    assert guard3.begin(FP, order_link_id="rb-r3-a-3") is False
+
+
+# ---- Test B — crash after POST, before response --------------------
+
+def test_recovered_unknown_resolved_only_by_exchange_confirmation(tmp_path):
+    """Test B (guard level): after crash recovery the block lifts ONLY on a
+    STRICT exchange confirmation of the ORIGINAL orderLinkId; the resolved
+    record keeps full audit evidence."""
+    journal = tmp_path / "journal.json"
+    guard1 = retry_budget.OrderSubmitGuard(str(journal))
+    guard1.begin(FP, order_link_id="rb-r3-b-1")
+    guard1.reset()                              # crash after POST sent
+
+    guard = _fresh_guard(journal)               # restart: durable recovery
+    assert guard.blocking_entry(FP) == ("unknown", "rb-r3-b-1")
+    assert guard.begin(FP, order_link_id="rb-r3-b-2") is False   # no repeat POST
+
+    session = ScriptedSession([
+        FakeResponse({"retCode": 0, "result": {"list": [
+            {"orderLinkId": "rb-r3-b-1", "symbol": "BTCUSDT",
+             "category": "linear", "orderStatus": "Filled",
+             "orderId": "EX-B"}]}}),
+    ])
+    results = make_client(session).reconcile_order_submissions()
+    assert results[0]["resolution"] == "resolved"
+    assert "orderLinkId=rb-r3-b-1" in results[0]["detail"]
+
+    resolved = _journal_single_entry(journal)
+    assert resolved["state"] == "resolved"
+    assert "exchange-confirmed" in resolved["evidence"]
+    assert "orderStatus=Filled" in resolved["evidence"]
+    assert resolved["order_link_id"] == "rb-r3-b-1"       # audit preserved
+    assert resolved["fingerprint"] == [str(p) for p in FP]
+    assert resolved["recovery"]["from_state"] == "in_flight"
+    assert resolved["owner"]                              # ownership audit kept
+
+
+# ---- Test C — owner still alive ------------------------------------
+
+def test_live_owner_in_flight_never_declared_orphaned(tmp_path):
+    """Test C: a LIVE owner's in_flight record is never recovered, never
+    touched, and an identical repeat submission stays blocked."""
+    journal = tmp_path / "journal.json"
+    guard1 = retry_budget.OrderSubmitGuard(str(journal))
+    assert guard1.begin(FP, order_link_id="rb-r3-c-1") is True
+    before = _journal_doc(journal)
+
+    guard2 = _fresh_guard(journal)              # "process B" recovery pass
+    report = guard2.last_recovery_report()
+    assert report["recovered"] == []            # NOT declared orphaned
+    assert report["owner_unverified"] == []
+    assert [e["order_link_id"] for e in report["owner_alive"]] == ["rb-r3-c-1"]
+    assert _journal_doc(journal) == before      # owner's state untouched
+    assert guard2.begin(FP, order_link_id="rb-r3-c-2") is False  # repeat blocked
+
+
+def test_reconcile_reports_owner_alive_blocker_without_touching_state(tmp_path):
+    """Test C: reconciliation names the live owner explicitly and changes
+    nothing — no orphan claim, no unlock, no exchange query, no POST."""
+    journal = tmp_path / "journal.json"
+    guard1 = retry_budget.OrderSubmitGuard(str(journal))
+    assert guard1.begin(FP, order_link_id="rb-r3-c-3") is True
+    before = _journal_doc(journal)
+
+    guard2 = _fresh_guard(journal)
+    session = ScriptedSession([])
+    results = make_client(session).reconcile_order_submissions()
+    assert [r["resolution"] for r in results] == [
+        retry_budget.ORDER_RESOLUTION_OWNER_ALIVE]
+    assert "NOT orphaned" in results[0]["detail"]
+    assert session.calls == []                  # no exchange query, no POST
+    assert _journal_doc(journal) == before      # state untouched
+    assert guard2.begin(FP, order_link_id="rb-r3-c-4") is False
+
+
+# ---- Test D — owner cannot be verified -----------------------------
+
+def test_owner_unverifiable_keeps_block_owner_unverified_blocker(tmp_path):
+    """Test D: when liveness cannot be established there is NO automatic
+    recovery and NO resolution — the record stays blocking and an explicit
+    OWNER_UNVERIFIED_BLOCKER is returned."""
+    journal = tmp_path / "journal.json"
+    guard1 = retry_budget.OrderSubmitGuard(str(journal))
+    assert guard1.begin(FP, order_link_id="rb-r3-d-1") is True
+    witness = journal.parent / _journal_single_entry(journal)["owner"]["witness"]
+    guard1.reset()                              # owner gone ...
+    witness.unlink()                            # ... and its witness is unusable
+
+    guard2 = _fresh_guard(journal)
+    report = guard2.last_recovery_report()
+    assert report["recovered"] == []            # no automatic transition
+    assert [e["order_link_id"] for e in report["owner_unverified"]] == ["rb-r3-d-1"]
+    assert guard2.blocking_entry(FP)[0] == "in_flight"      # kept blocking
+
+    session = ScriptedSession([])
+    results = make_client(session).reconcile_order_submissions()
+    assert results[0]["resolution"] == \
+        retry_budget.ORDER_RESOLUTION_OWNER_UNVERIFIED
+    assert session.calls == []                  # no exchange query, no POST
+    assert guard2.begin(FP, order_link_id="rb-r3-d-2") is False  # no POST
+    kept = _journal_single_entry(journal)
+    assert kept["state"] == "in_flight"         # never auto-resolved
+    assert "recovery" not in kept               # no recovery transition at all
+
+
+def test_legacy_entry_without_owner_metadata_is_owner_unverified(tmp_path):
+    """Test D: a record without ownership metadata has NO verifiable owner —
+    it keeps its block and surfaces as OWNER_UNVERIFIED_BLOCKER."""
+    journal = tmp_path / "journal.json"
+    entry = {
+        "fingerprint": [str(p) for p in FP],
+        "order_link_id": "rb-r3-d-legacy",
+        "state": "in_flight",
+        "reason": "",
+        "evidence": "",
+        "ts_utc": "2026-01-01T00:00:00+00:00",
+    }
+    key = retry_budget.OrderSubmitGuard._key(FP, "rb-r3-d-legacy")
+    _write_journal_doc(journal, {key: entry})
+
+    guard = _fresh_guard(journal)
+    report = guard.last_recovery_report()
+    assert report["recovered"] == []
+    assert [e["order_link_id"] for e in report["owner_unverified"]] == \
+        ["rb-r3-d-legacy"]
+
+    session = ScriptedSession([])
+    results = make_client(session).reconcile_order_submissions()
+    assert results[0]["resolution"] == \
+        retry_budget.ORDER_RESOLUTION_OWNER_UNVERIFIED
+    assert session.calls == []
+    assert guard.begin(FP, order_link_id="rb-r3-d-legacy-2") is False
+    assert _journal_single_entry(journal)["state"] == "in_flight"
+
+
+# ---- Test E — recovery idempotency ---------------------------------
+
+def test_recovery_idempotent_across_repeated_restarts(tmp_path):
+    """Test E: repeated restarts and repeated recovery of ONE operation —
+    no duplicates, intact checksum, stable blocking state, stable history."""
+    journal = tmp_path / "journal.json"
+    guard1 = retry_budget.OrderSubmitGuard(str(journal))
+    guard1.begin(FP, order_link_id="rb-r3-e-1")
+    guard1.reset()
+
+    snapshots = []
+    first_recovered = None
+    for i in range(3):
+        guard = retry_budget.OrderSubmitGuard(str(journal))
+        report = guard.last_recovery_report()
+        if first_recovered is None:
+            first_recovered = [e["order_link_id"] for e in report["recovered"]]
+        else:
+            assert report["recovered"] == []        # nothing left to recover
+        # explicit repeated recovery of the same operation
+        assert guard.recover_orphaned_in_flight()["recovered"] == []
+        assert guard.begin(FP, order_link_id=f"rb-r3-e-r{i}") is False
+        assert [e["order_link_id"] for e in guard.pending_unknown()] == \
+            ["rb-r3-e-1"]
+        snapshots.append(journal.read_text(encoding="utf-8"))
+
+    assert first_recovered == ["rb-r3-e-1"]
+    assert snapshots[1] == snapshots[2] == snapshots[0]   # idempotent writes
+    data = json.loads(snapshots[-1])
+    entries = retry_budget._validate_journal_document(data)   # checksum ok
+    assert len(entries) == 1                       # no duplicates
+    only = next(iter(entries.values()))
+    assert only["state"] == "unknown"              # stable blocking state
+    assert only["recovery"]["from_state"] == "in_flight"
+
+
+# ---- Test F — journal failure (fail-closed, 0 POST) ----------------
+
+def _assert_no_post_no_unlock(journal):
+    """A fresh submission is refused with zero HTTP attempts."""
+    _expect_fail_closed_no_send(journal)
+
+
+def test_recovery_fails_closed_on_invalid_checksum(tmp_path):
+    """Test F: an invalid checksum fails the recovery CLOSED — no state
+    transition, no journal rewrite, no POST."""
+    journal = tmp_path / "journal.json"
+    guard1 = retry_budget.OrderSubmitGuard(str(journal))
+    guard1.begin(FP, order_link_id="rb-r3-f-1")
+    guard1.reset()
+
+    data = _journal_doc(journal)
+    only = next(iter(data["entries"].values()))
+    only["state"] = "resolved"                     # tamper: claim resolved
+    journal.write_text(json.dumps(data, indent=1, sort_keys=True),
+                       encoding="utf-8")
+
+    guard2 = _fresh_guard(journal)                  # recovery must fail closed
+    assert guard2.last_recovery_report() is None
+    with pytest.raises(BybitOrderUncertainError):
+        guard2.begin(FP, order_link_id="rb-r3-f-2")
+    _assert_no_post_no_unlock(journal)
+    still = _journal_doc(journal)                   # never auto-rewritten
+    assert next(iter(still["entries"].values()))["state"] == "resolved"
+    with pytest.raises(ValueError):
+        retry_budget._validate_journal_document(still)
+
+
+def test_recovery_fails_closed_on_malformed_journal(tmp_path):
+    """Test F: malformed journal -> recovery fails closed, 0 POST."""
+    journal = tmp_path / "journal.json"
+    journal.write_text("{not json", encoding="utf-8")
+
+    guard = _fresh_guard(journal)
+    with pytest.raises(BybitOrderUncertainError):
+        guard.begin(FP, order_link_id="rb-r3-f-3")
+    _assert_no_post_no_unlock(journal)
+    assert journal.read_text(encoding="utf-8") == "{not json"
+
+
+def test_recovery_fails_closed_when_journal_lock_unavailable(tmp_path,
+                                                             monkeypatch):
+    """Test F: lock acquisition failure -> recovery fails closed, 0 POST."""
+    journal = tmp_path / "journal.json"
+    guard1 = retry_budget.OrderSubmitGuard(str(journal))
+    guard1.begin(FP, order_link_id="rb-r3-f-lock")
+    guard1.reset()                                 # orphaned: recovery needed
+
+    monkeypatch.setattr(retry_budget, "ORDER_LOCK_TIMEOUT_S", 0.2)
+    held, release = threading.Event(), threading.Event()
+
+    def hold_lock():
+        with retry_budget._JournalFileLock(str(journal) + ".lock", 30.0):
+            held.set()
+            release.wait(timeout=30)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    try:
+        assert held.wait(timeout=10)
+        guard2 = retry_budget.OrderSubmitGuard(str(journal))  # fails closed
+        assert guard2.last_recovery_report() is None
+        with pytest.raises(BybitOrderUncertainError):
+            guard2.begin(FP, order_link_id="rb-r3-f-lock-2")
+        session = ScriptedSession([])
+        client = BybitClient(live_settings(
+            bybit_timeout=5, bybit_max_attempts=3, bybit_retry_backoff=0.0,
+            bybit_order_submit_journal_path=str(journal)), session)
+        with pytest.raises(BybitOrderUncertainError):
+            client.create_order(*FP, order_link_id="rb-r3-f-lock-3")
+        assert session.calls == []                 # 0 HTTP attempts
+    finally:
+        release.set()
+        holder.join(timeout=30)
+    # the durable record is untouched and still blocking
+    assert _journal_single_entry(journal)["state"] == "in_flight"
+
+
+def test_recovery_durable_write_failure_fails_closed_then_idempotent(
+        tmp_path, monkeypatch):
+    """Test F: durable write failure during the recovery transition -> fail
+    closed (0 POST), journal NOT corrupted; a later restart recovers cleanly."""
+    journal = tmp_path / "journal.json"
+    guard1 = retry_budget.OrderSubmitGuard(str(journal))
+    guard1.begin(FP, order_link_id="rb-r3-f-w1")
+    guard1.reset()                                 # orphaned: recovery needed
+
+    def boom(*_a, **_k):
+        raise OSError("injected: durable write failure")
+    monkeypatch.setattr(retry_budget.os, "replace", boom)
+
+    guard2 = retry_budget.OrderSubmitGuard(str(journal))  # recovery write fails
+    assert guard2.last_recovery_report() is None
+    with pytest.raises(BybitOrderUncertainError):
+        guard2.begin(FP, order_link_id="rb-r3-f-w2")
+    _assert_no_post_no_unlock(journal)
+    monkeypatch.undo()
+
+    # the journal is NOT corrupted: still the original durable record
+    assert _journal_single_entry(journal)["state"] == "in_flight"
+    # a later restart recovers cleanly (idempotent, no duplicates, no POST)
+    guard3 = retry_budget.OrderSubmitGuard(str(journal))
+    assert guard3.blocking_entry(FP) == ("unknown", "rb-r3-f-w1")
+    assert guard3.begin(FP, order_link_id="rb-r3-f-w3") is False
+    assert _journal_single_entry(journal)["state"] == "unknown"
+
+
+# ---- no lost updates: foreign records are never overwritten --------
+
+def test_begin_preserves_prior_record_as_history(tmp_path):
+    """No record is lost or silently overwritten: a new reservation under an
+    existing key preserves the prior record as auditable history."""
+    journal = tmp_path / "journal.json"
+    guard1 = retry_budget.OrderSubmitGuard(str(journal))
+    guard1.begin(FP, order_link_id="rb-r3-h-1")
+    guard1.mark_resolved(FP, order_link_id="rb-r3-h-1",
+                         evidence="definitive outcome — done")
+    guard1.reset()
+
+    guard2 = retry_budget.OrderSubmitGuard(str(journal))
+    assert guard2.begin(FP, order_link_id="rb-r3-h-1") is True   # fresh decision
+    only = _journal_single_entry(journal)
+    assert only["state"] == "in_flight"
+    assert only["order_link_id"] == "rb-r3-h-1"
+    prior = only["history"][0]
+    assert prior["state"] == "resolved"
+    assert prior["evidence"] == "definitive outcome — done"
+    assert prior["order_link_id"] == "rb-r3-h-1"

@@ -1004,7 +1004,7 @@ class BybitClient:
         return None
 
     def reconcile_order_submissions(self) -> list[dict[str, Any]]:
-        """Explicit reconciliation procedure for UNKNOWN submissions (P1).
+        """Explicit reconciliation procedure for UNKNOWN submissions (P1/P3).
 
         For every journal entry awaiting reconciliation this queries the
         EXCHANGE (read-only) with STRICT identity verification (review
@@ -1015,9 +1015,46 @@ class BybitClient:
         malformed response, API error/timeout, order not found) is an
         EXPLICIT UNRESOLVED BLOCKER: the submission stays fail-closed. A
         timer may never substitute for order-state verification.
+
+        Review #5710398920 (R3): the procedure FIRST runs the durable
+        crash-recovery transaction (``LOCK → RELOAD → VALIDATE → RECOVERY
+        TRANSITION → DURABLE WRITE → UNLOCK``) so orphaned ``in_flight``
+        submissions of a PROVABLY DEAD owner become reconciliation-visible
+        ``unknown`` entries. Owner-liveness verdicts are reported explicitly
+        and can never unlock anything by themselves:
+
+        * ``OWNER_UNVERIFIED_BLOCKER`` — the owner's liveness cannot be
+          established (no usable witness): the record stays blocking, no
+          recovery transition, no POST (fail-closed);
+        * ``OWNER_ALIVE_BLOCKER`` — the owner is provably alive: the
+          operation is NOT orphaned, its state is untouched and any repeat
+          POST stays blocked.
+
+        Recovery is idempotent and never resolves, releases or rewrites
+        foreign records; a resolved block requires exchange confirmation.
         """
         guard = retry_budget.get_order_guard()
+        report = guard.recover_orphaned_in_flight()
         results: list[dict[str, Any]] = []
+        for entry in report.get("owner_unverified", []):
+            olink = str(entry.get("order_link_id", ""))
+            symbol = (entry.get("fingerprint") or [""])[0]
+            results.append({
+                "order_link_id": olink, "symbol": symbol,
+                "resolution": retry_budget.ORDER_RESOLUTION_OWNER_UNVERIFIED,
+                "detail": "in-flight submission owner liveness cannot be "
+                          "verified (no usable owner witness) — kept "
+                          "blocking, no recovery transition, no POST "
+                          "(fail-closed)"})
+        for entry in report.get("owner_alive", []):
+            olink = str(entry.get("order_link_id", ""))
+            symbol = (entry.get("fingerprint") or [""])[0]
+            results.append({
+                "order_link_id": olink, "symbol": symbol,
+                "resolution": retry_budget.ORDER_RESOLUTION_OWNER_ALIVE,
+                "detail": "in-flight submission owner is alive (witness lock "
+                          "held) — NOT orphaned, state untouched, repeat POST "
+                          "stays blocked"})
         for entry in guard.pending_unknown():
             olink = str(entry.get("order_link_id", ""))
             symbol = (entry.get("fingerprint") or [""])[0]

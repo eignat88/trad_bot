@@ -84,6 +84,16 @@ jobs:
           test -f tests/test_bybit_retry_budget_v1.py
           echo "issue229_markers=ok"
 
+          # Review #5710398920 (R3) markers: durable crash-restart recovery
+          # with owner-liveness witnesses — no in-memory-only recovery, no
+          # TTL/age heuristics, explicit OWNER_UNVERIFIED_BLOCKER.
+          grep -q 'class _OwnerWitness' app/exchange/retry_budget.py
+          grep -q 'recover_orphaned_in_flight' app/exchange/retry_budget.py
+          grep -q 'LIVENESS_ORPHANED' app/exchange/retry_budget.py
+          grep -q 'OWNER_UNVERIFIED_BLOCKER' app/exchange/retry_budget.py
+          grep -q 'OWNER_UNVERIFIED_BLOCKER' app/exchange/bybit_client.py
+          echo "issue229_r3_recovery_markers=ok"
+
           if [ -n "${PR_NUMBER}" ]; then
             PR_HEAD="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')"
             echo "pull_request_head=${PR_HEAD}"

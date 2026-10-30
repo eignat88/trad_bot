@@ -395,3 +395,71 @@ symbol, результат проверки статуса, timestamp UTC, пр�
 | CI-набор (8 файлов, полный состав workflow) | **245 passed** |
 | Полный прогон (минус 4 pre-existing битых модуля) | **5258 passed / 79 skipped / 81 failed / 53 errors** |
 | Baseline comparison vs `d8fbfd2` (25 файлов с падениями прогнаны на копии baseline) | **128 unique == 128 unique, `Compare-Object` пуст** → **регрессий нет**; новых failures/errors нет — новые модули полностью зелёные |
+
+---
+
+# Ревью #5710398920 (PR #233) — исправления R3: crash/restart recovery
+
+**База:** `8daa96f`; ветка `research/issue229-retry-budget-hardening-v1`.
+Полный дизайн: `docs/research/BYBIT_ORDER_SUBMIT_GUARD_RESTART_RECOVERY_R3_V1.md`.
+
+## R3 (P1) — Восстановление журнала после аварийного завершения процесса
+
+**Дефект:** `configure()` переводил `in_flight → unknown` только в памяти
+(`_read_journal(convert_in_flight=True)`), следующая транзакция перечитывала
+файл (`convert_in_flight=False`) и возвращала `in_flight`; `pending_unknown()`
+такие записи не видел — recovery/reconciliation contract нарушался.
+
+**Исправление — ownership/liveness модель + durable recovery:**
+
+* каждая запись несёт `owner` (uuid `owner_id`, `pid`, witness-файл,
+  `started_at`); живой владелец удерживает OS-байтовый лок на witness-файле
+  (Windows `msvcrt.locking` / POSIX `fcntl.flock`); liveness выносится
+  **только** по этому локу — защита от повторного использования PID,
+  никаких TTL/эвристик по возрасту;
+* вердикты: `alive` (запись не трогается, `OWNER_ALIVE_BLOCKER`),
+  `orphaned` (ОС сняла лок — владелец доказуемо мёртв), `unverified`
+  (witness недоступен/запись без владельца — блок сохраняется,
+  `OWNER_UNVERIFIED_BLOCKER`);
+* recovery-переход `in_flight → unknown` выполняется **внутри** стандартной
+  транзакции `LOCK → RELOAD → VALIDATE → RECOVERY TRANSITION → DURABLE
+  WRITE → UNLOCK` (в каждой транзакции и в `configure()`), а не в памяти:
+  состояние durable, checksum пересчитывается, `orderLinkId` / `fingerprint` /
+  `owner` / все audit-поля сохраняются, добавляется audit-блок `recovery`;
+* идемпотентность: повторные рестарты/восстановления ничего не переписывают
+  (durable write только при изменении), дубликатов нет, `unknown` никогда не
+  разблокируется автоматически, чужие записи не теряются и не перезаписываются
+  (занятый ключ сохраняет предыдущую запись в `history`);
+* fail-closed: ошибка lock / checksum / durable write → 0 HTTP attempts,
+  без восстановления и без разблокировки.
+
+## R3 — Reconciliation
+
+`BybitClient.reconcile_order_submissions()` сначала выполняет durable
+recovery, затем: `OWNER_UNVERIFIED_BLOCKER` / `OWNER_ALIVE_BLOCKER` для
+`in_flight`-записей (явные вердикты владельца) и прежние правила строгой
+идентичности для `unknown` (включая восстановленные): точный непустой
+`orderLinkId` + symbol + `linear` + принятый `orderStatus` → `resolved` с
+проверяемым evidence; всё остальное — `UNRESOLVED_BLOCKER` (fail-closed).
+
+## Тесты R3 (fake transport, без Bybit и реальных ордеров)
+
+Тесты A–G добавлены в существующие модули
+`tests/test_bybit_order_submit_guard_v1.py` (13 новых: A/B/C/D×2/E/F×4/
+history + witness-вердикты) и `tests/test_bybit_order_submit_guard_multiproc_v1.py`
+(6 новых: A/B/C/F×2/G — crash-воркеры, реальные OS-локи, spawn). Новые
+тестовые файлы не добавлялись — состав CI-workflow не менялся (добавлены
+только R3-маркеры в provenance guard).
+
+## Регрессия R3 (локально, Windows)
+
+| Набор | Результат |
+|---|---|
+| `test_bybit_order_submit_guard_v1.py` (50) + `test_bybit_order_submit_guard_multiproc_v1.py` (12) | **62 passed** |
+| CI-набор (8 файлов, полный состав workflow) | **264 passed** |
+| Полный прогон (`--continue-on-collection-errors`) | **5277 passed / 79 skipped / 81 failed / 57 errors** |
+| Baseline comparison vs `8daa96f` (множества FAILED/ERROR, `Compare-Object`) | **138 unique == 138 unique, пусто** → **регрессий нет**; +19 passed = ровно новые recovery-тесты |
+
+Детали и артефакты: `reports/R3_RESTART_RECOVERY_REGRESSION_REPORT.md`.
+Статус: `R3_FIX_PREPARED / READY_FOR_INDEPENDENT_REVIEW` (commit/push —
+оператор; `MERGE_READY`/`DEPLOY_READY`/`PRODUCTION_SAFE` не объявляются).
