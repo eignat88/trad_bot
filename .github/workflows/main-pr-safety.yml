@@ -51,6 +51,19 @@ jobs:
             tests/test_paper_safety_gate_config.py \
             --tb=short
 
+      # MAIN_PR_SAFETY_HTF_PHASE2_SCOPE_FIX_V1: the routing contract is
+      # verified on EVERY run (not routed), so a PR can never weaken the
+      # scope routing and slip past the gate unnoticed.
+      - name: Verify HTF Phase-2 scope routing
+        env:
+          PYTHONPATH: .
+          PYTHONDONTWRITEBYTECODE: '1'
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+        run: |
+          python -m pytest -q -p no:cacheprovider \
+            tests/test_htf_baseline_short_phase2_scope_routing_v1.py \
+            --tb=short
+
       - name: Fetch PR base for HTF Phase-2 scope
         if: github.event_name == 'pull_request'
         run: |
@@ -60,28 +73,106 @@ jobs:
         if: github.event_name == 'pull_request'
         id: htf_phase2_scope
         shell: bash
+        env:
+          HTF_PHASE2_CHANGED_FILES: /tmp/htf_phase2_changed_files
         run: |
-          git diff --name-only -z "origin/${{ github.base_ref }}...HEAD" > /tmp/htf_phase2_changed_files
+          git diff --name-only -z --no-renames "origin/${{ github.base_ref }}...HEAD" > "$HTF_PHASE2_CHANGED_FILES"
           python3 - <<'PY_SCOPE'
           import os
           from pathlib import Path
 
+          # MAIN_PR_SAFETY_HTF_PHASE2_SCOPE_FIX_V1 (R2) - fail-closed three-way
+          # scope routing. The Phase-2-only isolation gate (surface confinement)
+          # applies ONLY to PRs confined to the governed surface; mixed PRs get
+          # the frozen-invariant + HTF causal/parity/closed-bar regression
+          # instead (the confinement tests are meaningless outside a Phase-2
+          # -only PR), and they can NEVER bypass the frozen constraints. The
+          # governed surface mirrors
+          # tests/test_htf_baseline_short_phase2_isolation_v1.py (FROZEN_PATHS,
+          # allowed_modified, ALLOWED_NEW_PREFIXES); any drift between the two
+          # lists fails tests/test_htf_baseline_short_phase2_scope_routing_v1.py
+          # (wired into this workflow unconditionally).
+          PHASE2_ONLY = 'PHASE2_ONLY'
+          MIXED_WITH_PHASE2 = 'MIXED_WITH_PHASE2'
+          NO_PHASE2 = 'NO_PHASE2'
+
+          PHASE2_SUBSTRING = 'htf_baseline_short_phase2'
+
+          # Phase-2 surface files without the substring (the exact entries of
+          # the isolation gate's ALLOWED_NEW_PREFIXES)
+          PHASE2_EXACT_PATHS = {
+              "deploy/systemd/trad-bot-htf-baseline-short-observer.service",
+              "sql/migrations/074_htf_baseline_short_phase2_registration.sql",
+              "sql/migrations/075_htf_baseline_short_phase2_privilege_hardening.sql",
+          }
+
+          # frozen Point-B stack (FROZEN_PATHS of the isolation gate) -
+          # governed for EVERY PR class: a mixed PR must never bypass the
+          # frozen constraints
+          FROZEN_PATHS = {
+              "app/research/htf_keylevel_point_b.py",
+              "app/research/prospective_observer.py",
+              "app/research/prospective_registry.json",
+              "app/research/htf_baseline_short_multi_level_lifecycle_v1.py",
+              "app/research/htf_baseline_short_stateful_episode_v1.py",
+              "app/research/htf_baseline_short_causal_level_adapter_v1.py",
+              "app/research/htf_keylevel_baseline_short_causal_observer_v1.py",
+              "tools/research/htf_baseline_short_multi_level_replay_v1.py",
+          }
+
+          # the gate itself: changes to its own routing must be verified
+          GATE_PATHS = {
+              ".github/workflows/main-pr-safety.yml",
+          }
+
+          def _normalized(path):
+              normalized = path.replace("\\", "/").strip()
+              while normalized.startswith("./"):
+                  normalized = normalized[2:]
+              return normalized.lower()
+
+          def _is_phase2(path):
+              normalized = _normalized(path)
+              return (
+                  PHASE2_SUBSTRING in normalized
+                  or normalized in PHASE2_EXACT_PATHS
+              )
+
+          def _is_governed(path):
+              normalized = _normalized(path)
+              return (
+                  _is_phase2(path)
+                  or normalized in FROZEN_PATHS
+                  or normalized in GATE_PATHS
+              )
+
+          def _classify(paths):
+              if not any(_is_governed(p) for p in paths):
+                  return NO_PHASE2
+              if all(_is_governed(p) for p in paths):
+                  return PHASE2_ONLY
+              return MIXED_WITH_PHASE2
+
+          changed_file = os.environ.get(
+              "HTF_PHASE2_CHANGED_FILES", "/tmp/htf_phase2_changed_files"
+          )
           paths = [
               p.decode('utf-8', 'surrogateescape')
-              for p in Path('/tmp/htf_phase2_changed_files').read_bytes().split(b'\0')
+              for p in Path(changed_file).read_bytes().split(b'\0')
               if p
           ]
-          relevant = any(
-              'htf_baseline_short_phase2' in p.lower()
-              for p in paths
-          )
+          result = _classify(paths)
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
-              output.write(f"changed={'true' if relevant else 'false'}\n")
-          print(f"HTF_PHASE2_RELEVANT={relevant}")
+              output.write(f"class={result}\n")
+              output.write(f"changed={'false' if result == NO_PHASE2 else 'true'}\n")
+          print(f"HTF_PHASE2_CLASS={result}")
           PY_SCOPE
 
+      # PHASE2_ONLY: the full Phase-2 isolation gate, INCLUDING the
+      # surface-confinement checks (valid only for PRs confined to the
+      # governed surface).
       - name: Verify HTF Phase-2 isolation
-        if: github.event_name == 'pull_request' && steps.htf_phase2_scope.outputs.changed == 'true'
+        if: github.event_name == 'pull_request' && steps.htf_phase2_scope.outputs.class == 'PHASE2_ONLY'
         env:
           PYTHONPATH: .
           PYTHONDONTWRITEBYTECODE: '1'
@@ -90,4 +181,25 @@ jobs:
           git fetch --no-tags origin             "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
           python -m pytest -q -p no:cacheprovider \
             tests/test_htf_baseline_short_phase2_isolation_v1.py \
+            --tb=short
+
+      # MIXED_WITH_PHASE2: Phase-2-only surface confinement does NOT apply to
+      # mixed PRs (that was the PR #233 blocker), but the frozen constraints
+      # stay fail-closed and the HTF causal/parity/closed-bar regression still
+      # runs: frozen-invariant selection = the isolation module minus the two
+      # confinement tests, plus the causal / parity / closed-bar modules.
+      - name: Verify HTF frozen invariants and causal/parity/closed-bar regression
+        if: github.event_name == 'pull_request' && steps.htf_phase2_scope.outputs.class == 'MIXED_WITH_PHASE2'
+        env:
+          PYTHONPATH: .
+          PYTHONDONTWRITEBYTECODE: '1'
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+        run: |
+          python -m pytest -q -p no:cacheprovider \
+            tests/test_htf_baseline_short_phase2_isolation_v1.py \
+            tests/test_htf_baseline_short_phase2_causal_contracts_v1.py \
+            tests/test_htf_baseline_short_episode_id_parity_asof_batch_v1.py \
+            tests/test_htf_baseline_short_phase2_bybit_candle_source_v1.py \
+            --deselect tests/test_htf_baseline_short_phase2_isolation_v1.py::test_no_tracked_file_modified_against_base \
+            --deselect tests/test_htf_baseline_short_phase2_isolation_v1.py::test_new_files_are_confined_to_phase2_surface \
             --tb=short
