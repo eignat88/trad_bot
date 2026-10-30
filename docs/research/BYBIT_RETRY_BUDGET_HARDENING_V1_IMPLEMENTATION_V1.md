@@ -281,3 +281,117 @@ telemetry parity (suite #228), отсутствие nested retries (static contr
 | Затронутая регрессия (16 файлов: scanner/shadow/HTF/candle/core/live_gate/analysis/paper) | 309 passed / 7 failed — ровно pre-existing падения `test_analysis_runner` (6) + `test_paper_runner` (1), атрибутированы baseline-сравнением ранее |
 | Полный прогон (минус 4 pre-existing битых модуля) | **5226 passed / 79 skipped / 81 failed / 53 errors** |
 | Baseline comparison vs `268344b` (25 файлов с падениями прогнаны на копии HEAD) | **128 unique == 128 unique, `Compare-Object` пуст** → **регрессий нет** |
+
+---
+
+# Ревью #5709889450 (PR #233) — исправления R2
+
+**База:** `d8fbfd2`; ветка `research/issue229-retry-budget-hardening-v1`.
+Принцип: **ни один POST `/v5/order/create` не отправляется до гарантированного
+durable-сохранения идентичности операции и состояния `in_flight` в журнале**.
+
+## R2-P1 — Межпроцессная синхронизация журнала
+
+* Межпроцессная блокировка на **отдельном lock-файле** (`<journal>.lock`),
+  совместимая с Windows (`msvcrt.locking`, byte-range) и Linux
+  (`fcntl.flock`); lock-файл **никогда не удаляется** (unlink сломал бы
+  взаимное исключение на POSIX); OS-лок снимается автоматически при смерти
+  процесса.
+* Каждый переход выполняется атомарно как
+  **`LOCK → RELOAD → VALIDATE → RESERVE → DURABLE WRITE → UNLOCK`**;
+  HTTP POST разрешён только после подтверждённой durable-записи. Переходы
+  `in_flight → unknown/resolved` используют ту же транзакцию (перезагрузка
+  актуального состояния перед мутацией — lost updates исключены).
+* Защищено: lost updates, перезапись записей другого процесса, два
+  одновременных POST одного fingerprint, повторное использование активного
+  `orderLinkId`, разблокировка при повреждённом/недоступном журнале.
+* Lock/journal failure → **0 HTTP attempts** (fail-closed,
+  `BybitOrderUncertainError`). Несколько конфигураций на одном journal path
+  сериализуются тем же lock-файлом (покрыто тестом двух guard-инстансов и
+  мультипроцессными тестами).
+* Crash/restart: незавершённый `in_flight` перечитывается при старте как
+  `unknown` и остаётся блокирующим.
+
+## R2-P1 — Строгий reconciliation (`orderLinkId`)
+
+Условие `recorded in ("", orderLinkId)` удалено. Принимается **только точное
+непустое совпадение** `orderLinkId` **плюс** ожидаемый `symbol` **плюс**
+категория `linear`; пустое/отсутствующее/иное значение — не подтверждение.
+Посторонние записи не используются. Некорректная структура ответа —
+fail-closed (`BybitError` → остаётся `UNRESOLVED_BLOCKER`). Если realtime не
+подтвердил операцию — проверяется history; без достоверного подтверждения из
+обоих источников блок сохраняется. Неизвестный `orderStatus` — BLOCKED до
+определения допустимого статуса (допустимые:
+`New/PartiallyFilled/Filled/Cancelled/Rejected` — любой известный статус
+доказывает исход операции). Параметризованные тесты покрывают всю таблицу
+ревью (точное совпадение, пустой/отсутствующий/иной orderLinkId, иной
+symbol, иная категория, неизвестный/отсутствующий статус, только посторонние
+записи, malformed, API error/timeout, not found, подтверждение из history).
+
+## R2-P2 — Durable journal persistence
+
+Порядок записи: уникальный temporary-файл в каталоге журнала
+(`.tmp.<pid>.<uuid>`, `O_EXCL`) → контролируемые права (файл `0600`, каталог
+`0700` на POSIX) → сериализация → `flush()` → `os.fsync()` → атомарный
+`os.replace()` → `fsync()` каталога (POSIX). **Windows**: directory-fsync
+недоступен — формальная crash-durability гарантия НЕ заявляется; остаются
+атомарная замена namespace + file-level fsync (задокументировано).
+
+Чтение валидирует: schema (только v2), структуру, допустимые состояния,
+обязательные поля и **checksum** (sha256 канонического JSON записей). Любая
+инвалидность → fail-closed; повреждённый журнал **никогда не превращается в
+пустой автоматически** (авто-восстановление запрещено; при load-error запись
+в журнал также блокируется — повреждённый файл не может быть затёрт).
+
+## R2-P2 — Безопасное ручное разрешение
+
+Сценарий A (автоматический): только строгая проверка данных Bybit
+(точный orderLinkId + symbol + категория + принятый статус) снимает блок и
+сохраняет **проверяемое подтверждение** в журнале
+(`orderLinkId=… symbol=… orderStatus=… orderId=… verified_at=…`).
+
+Сценарий B (ручной): **`MANUAL_RESOLUTION_NOT_IMPLEMENTED`** — блок
+сохраняется. Ручное снятие требует верифицированной авторизации оператора и
+проверяемого подтверждения (operator identity, reference, orderLinkId,
+symbol, результат проверки статуса, timestamp UTC, причина); надёжного
+механизма авторизации нет, поэтому CLI `--manual-resolution` только печатает
+запись с реквизитами и возвращает exit 3, **не изменяя журнал**. Фиктивная
+система авторизации не вводится; по умолчанию ручное снятие запрещено.
+Старый `--mark-resolved --confirm-manual` удалён (произвольная строка не
+является доказательством).
+
+## Отчёт по сохранности и целостности журнала
+
+| Свойство | Механизм | Проверено |
+|---|---|---|
+| Межпроцессное взаимное исключение | отдельный lock-файл (msvcrt/fcntl), никогда не удаляется | multiproc: 1 POST из 2 процессов; lock-held → 0 attempts |
+| Атомарность обновлений | LOCK→RELOAD→…→UNLOCK транзакция | multiproc: 10/10 записей двух процессов |
+| Crash durability записи | unique tmp + fsync + os.replace + dir fsync (POSIX) | fault injection ×8 стадий |
+| Целостность чтения | schema + структура + состояния + обязательные поля + checksum | tamper checksum → fail-closed, файл не перезаписан |
+| Отказ без обхода защиты | load-error/write-degraded блокируют и отправку, и запись | corrupted JSON остаётся некорректным после отказа |
+| Crash recovery | in_flight → unknown при загрузке процесса | multiproc crash-before-POST / crash-after-POST |
+| Ручное снятие | NOT_IMPLEMENTED, fail-closed | exit 3, блок сохраняется |
+
+## Тесты R2 (fake transport, без Bybit и реальных ордеров)
+
+* `tests/test_bybit_order_submit_guard_v1.py` — 37 тестов: таблица строгого
+  соответствия (12 параметризованных случаев + malformed + семантика
+  realtime→history), fault injection (8 стадий записи/чтения), checksum,
+  manual resolution (guard + CLI), два guard-инстанса на одном journal path.
+* `tests/test_bybit_order_submit_guard_multiproc_v1.py` — 6 кросс-процессных
+  тестов (spawn, реальные OS-локи, файловый обмен результатами — named pipes
+  недоступны в sandbox): ровно один POST из двух процессов; нет lost updates;
+  crash после резервации и crash после POST; блокировка чужим процессом →
+  0 attempts; параллельные reconciliation + create.
+* `tests/test_bybit_retry_budget_v1.py` — 40 тестов без изменений поведения:
+  budget ≤3 (property), POST max one send, deadline, telemetry parity —
+  зелёные; итог CI-набора 245 passed.
+
+## Регрессия R2 (локально, Windows)
+
+| Набор | Результат |
+|---|---|
+| `test_bybit_order_submit_guard_v1.py` (37) + `multiproc_v1.py` (6) + `test_bybit_retry_budget_v1.py` (40) + `test_bybit_api_telemetry_v1.py` (57) | **140 passed** |
+| CI-набор (8 файлов, полный состав workflow) | **245 passed** |
+| Полный прогон (минус 4 pre-existing битых модуля) | **5258 passed / 79 skipped / 81 failed / 53 errors** |
+| Baseline comparison vs `d8fbfd2` (25 файлов с падениями прогнаны на копии baseline) | **128 unique == 128 unique, `Compare-Object` пуст** → **регрессий нет**; новых failures/errors нет — новые модули полностью зелёные |

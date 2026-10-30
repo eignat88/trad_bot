@@ -914,16 +914,58 @@ class BybitClient:
         return payload
 
     # ------------------------------------------------- order reconciliation
-    def get_order_by_link_id(self, symbol: str, order_link_id: str) -> dict[str, Any] | None:
-        """Read-only reconciliation query: find the order by its ``orderLinkId``.
+    #: Order statuses that constitute a verifiable confirmation of the
+    #: submission outcome (review #5709889450): any KNOWN status proves the
+    #: order exists server-side and the pending submission is decided.
+    #: An unknown/missing status is NEVER a confirmation (stays blocked).
+    ORDER_CONFIRMING_STATUSES = ("New", "PartiallyFilled", "Filled",
+                                 "Cancelled", "Rejected")
 
-        Code review #5709376849 (P1): the ONLY safe way to lift a
-        double-submit block is exchange-side confirmation. Two logical GET
-        requests (each budgeted like any request — never nested retries):
-        ``/v5/order/realtime`` (open / partially filled) and
-        ``/v5/order/history`` (filled / cancelled / rejected). Returns the
-        order row when found, ``None`` when no exchange record exists.
+    @staticmethod
+    def _extract_order_rows(endpoint: str, payload: Any) -> list[dict[str, Any]]:
+        """Strict structure validation of an order query response."""
+        if not isinstance(payload, dict):
+            raise BybitError(f"malformed order query response from {endpoint}")
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            raise BybitError(f"malformed order query response from {endpoint}")
+        rows = result.get("list")
+        if not isinstance(rows, list) or any(
+                not isinstance(row, dict) for row in rows):
+            raise BybitError(f"malformed order query response from {endpoint}")
+        return rows
+
+    @staticmethod
+    def _is_strict_order_match(row: dict[str, Any], *, symbol: str,
+                               order_link_id: str) -> bool:
+        """Exact operation-identity match (review #5709889450, P1).
+
+        An EMPTY / missing / different ``orderLinkId`` is NOT a match, a
+        foreign symbol is NOT a match and the expected category must be
+        present exactly. Foreign rows returned by the endpoint are never
+        used to lift a block.
         """
+        recorded = row.get("orderLinkId")
+        if not isinstance(recorded, str) or not recorded:
+            return False
+        if recorded != str(order_link_id):
+            return False
+        if str(row.get("symbol", "")) != str(symbol):
+            return False
+        if str(row.get("category", "")) != "linear":
+            return False
+        return True
+
+    def _strict_order_rows(self, symbol: str, order_link_id: str) -> list[dict[str, Any]]:
+        """Collect rows that strictly match the expected operation identity.
+
+        Two budgeted read-only logical GETs (never nested retries):
+        ``/v5/order/realtime`` first and, when it did not confirm the
+        operation, ``/v5/order/history``. Malformed responses fail closed.
+        """
+        if not str(order_link_id):
+            raise BybitError("reconciliation requires a non-empty orderLinkId")
+        matched: list[dict[str, Any]] = []
         for endpoint in ("/v5/order/realtime", "/v5/order/history"):
             params: dict[str, Any] = {
                 "category": "linear", "symbol": symbol,
@@ -932,24 +974,47 @@ class BybitClient:
             if endpoint == "/v5/order/realtime":
                 params["openOnly"] = 0
             payload = self._public_get(endpoint, **params)
-            rows = (payload.get("result") or {}).get("list") or []
+            rows = self._extract_order_rows(endpoint, payload)
             for row in rows:
-                recorded = str(row.get("orderLinkId", ""))
-                if recorded in ("", str(order_link_id)):
-                    return row
+                if self._is_strict_order_match(
+                        row, symbol=symbol, order_link_id=order_link_id):
+                    matched.append(row)
+            if any(str(row.get("orderStatus", ""))
+                   in self.ORDER_CONFIRMING_STATUSES for row in matched):
+                # realtime already confirmed the operation — history is
+                # only consulted when it did not
+                break
+        return matched
+
+    def get_order_by_link_id(self, symbol: str, order_link_id: str) -> dict[str, Any] | None:
+        """Read-only STRICT reconciliation query (review #5709889450, P1).
+
+        Returns an order row ONLY when the exchange confirmed the expected
+        operation identity EXACTLY (non-empty ``orderLinkId`` equal to the
+        expected value + expected ``symbol`` + expected category) AND the row
+        carries an accepted confirmation status
+        (:attr:`ORDER_CONFIRMING_STATUSES`). Empty / missing / differing
+        ``orderLinkId``, foreign symbols or categories, unknown statuses and
+        foreign rows are NEVER confirmation — those return ``None`` (stays
+        ``UNRESOLVED_BLOCKER``).
+        """
+        for row in self._strict_order_rows(symbol, order_link_id):
+            if str(row.get("orderStatus", "")) in self.ORDER_CONFIRMING_STATUSES:
+                return row
         return None
 
     def reconcile_order_submissions(self) -> list[dict[str, Any]]:
         """Explicit reconciliation procedure for UNKNOWN submissions (P1).
 
         For every journal entry awaiting reconciliation this queries the
-        EXCHANGE (read-only) by the recorded ``orderLinkId``:
-
-        * a definitive exchange record (open / filled / cancelled /
-          rejected) resolves the block with recorded evidence;
-        * NO record is an EXPLICIT UNRESOLVED BLOCKER: the submission stays
-          fail-closed and requires documented operator confirmation — a
-          timer may never substitute for order-state verification.
+        EXCHANGE (read-only) with STRICT identity verification (review
+        #5709889450): exact ``orderLinkId`` + symbol + category + accepted
+        order status. A verified confirmation resolves the block and stores
+        a verifiable confirmation record as evidence; EVERYTHING else
+        (no record, foreign rows, empty/other orderLinkId, unknown status,
+        malformed response, API error/timeout, order not found) is an
+        EXPLICIT UNRESOLVED BLOCKER: the submission stays fail-closed. A
+        timer may never substitute for order-state verification.
         """
         guard = retry_budget.get_order_guard()
         results: list[dict[str, Any]] = []
@@ -960,26 +1025,40 @@ class BybitClient:
             if not olink:
                 results.append({**base, "resolution": "UNRESOLVED_BLOCKER",
                                 "detail": "journal entry has no orderLinkId "
-                                          "(legacy) — operator confirmation required"})
+                                          "(legacy) — blocked (fail-closed)"})
                 continue
             try:
-                row = self.get_order_by_link_id(symbol, olink)
+                rows = self._strict_order_rows(symbol, olink)
             except BybitError as exc:
                 results.append({**base, "resolution": "UNRESOLVED_BLOCKER",
                                 "detail": f"reconciliation query failed "
-                                          f"({type(exc).__name__}) — retry later or "
-                                          "confirm manually"})
+                                          f"({type(exc).__name__}) — blocked "
+                                          "(fail-closed)"})
                 continue
-            if row is not None:
-                evidence = (f"exchange-confirmed orderStatus="
-                            f"{row.get('orderStatus', 'unknown')} "
-                            f"(orderLinkId={olink})")
+            confirming = [row for row in rows
+                          if str(row.get("orderStatus", ""))
+                          in self.ORDER_CONFIRMING_STATUSES]
+            if confirming:
+                row = confirming[0]
+                verified_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                evidence = (
+                    f"exchange-confirmed orderLinkId={olink} symbol={symbol} "
+                    f"category=linear orderStatus={row.get('orderStatus')} "
+                    f"orderId={row.get('orderId', '')} verified_at={verified_at}")
                 guard.resolve_reconciled(olink, evidence=evidence)
                 results.append({**base, "resolution": "resolved",
                                 "detail": evidence})
+            elif rows:
+                statuses = sorted({str(row.get("orderStatus", ""))
+                                   for row in rows})
+                results.append({**base, "resolution": "UNRESOLVED_BLOCKER",
+                                "detail": "order record found but orderStatus "
+                                          f"{statuses} is not an accepted "
+                                          "confirmation status — blocked "
+                                          "until the status is verified"})
             else:
                 results.append({**base, "resolution": "UNRESOLVED_BLOCKER",
-                                "detail": "no exchange record for orderLinkId — "
-                                          "operator confirmation required before "
-                                          "any resubmission"})
+                                "detail": "no exchange record with exact "
+                                          "orderLinkId — blocked until an "
+                                          "exchange-side confirmation exists"})
         return results

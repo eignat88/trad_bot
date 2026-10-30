@@ -50,12 +50,13 @@ head `76ddf5b`) CI не получает: изменения #229 никогда
 
 Python 3.12 — `actions/setup-python@v6` (конвенция Main PR Safety). Все тесты используют
 ScriptedSession/mock-транспорт: **ни одного сетевого вызова Bybit/VPS/production, ни одной
-БД**. Набор (213 тестов, локально зелёные за ~5 c):
+БД**. Набор (245 тестов, локально зелёные за ~30 c):
 
 | Файл | Что покрывает |
 |---|---|
 | `tests/test_bybit_retry_budget_v1.py` | RetryBudget: property «≤3 HTTP attempts на логический запрос» (819 последовательностей), классификация (10006/иные retCode/403/«access too frequent»/429), вложенные retry-лимиты (static contracts: нет L3-циклов в shadow/HTF/candle_sync/isolated_oos), backoff `[1,2]`-контракт, storm guard, breaker (P3 defer / P1-P2 wait / P0 after cooldown), **GET/POST order safety** (create_order: одна попытка, UNKNOWN не разблокируется таймером), deadline (перепроверка после ожиданий, clamp сетевого timeout — FakeClock), telemetry parity |
-| `tests/test_bybit_order_submit_guard_v1.py` | Ревью #5709376849 (P1): конкурентные POST (in_flight до фактического завершения), персистентный журнал и восстановление после рестарта (crash mid-send → unknown), orderLinkId как безопасная идентичность операции, явная процедура reconciliation (found → resolved с доказательством / not-found → UNRESOLVED BLOCKER fail-closed), операторское разрешение только с `--confirm-manual` |
+| `tests/test_bybit_order_submit_guard_v1.py` | Ревью #5709376849 (P1) + #5709889450: конкурентные POST (in_flight до фактического завершения), персистентный журнал и восстановление после рестарта, orderLinkId как безопасная идентичность операции, строгая таблица reconciliation (точный orderLinkId + symbol + категория + валидный статус; malformed → fail-closed), durable journal fault injection (8 стадий, checksum), manual resolution NOT_IMPLEMENTED (блок сохраняется) |
+| `tests/test_bybit_order_submit_guard_multiproc_v1.py` | Ревью #5709889450 (P1): кросс-процессная безопасность — ровно один POST из двух процессов при блокированном первом HTTP, отсутствие lost updates между процессами, crash после резервации/после POST, чужая блокировка журнала → 0 HTTP attempts, параллельные reconciliation + create |
 | `tests/test_bybit_api_telemetry_v1.py` | BYBIT_API_TELEMETRY_V1: одна запись на HTTP-попытку, `attempt_index`/`retry_reason`/`total_attempts`, безопасность секретов |
 | `tests/test_scanner_runtime.py` | Регрессия scanner: таймаут-ретраи и точное backoff-расписание |
 | `tests/test_shadow_cli.py` | Shadow runners: L3-циклы удалены, fail-closed дропы |
@@ -118,7 +119,7 @@ python -m pytest -q -p no:cacheprovider `
 | AC2 | Отдельный `BYBIT_RETRY_BUDGET_CI_V1` workflow существует; `pull_request` покрывает base `research/issue228-api-telemetry-v1` (auto для #233); `workflow_dispatch` требует `head_sha` | файл `.github/workflows/bybit-retry-budget-ci-v1.yml`, YAML парсится (проверено) | ✅ |
 | AC3 | Run проверяет именно head-коммит: checkout по `pull_request.head.sha`/`head_sha` + provenance guard (HEAD == SHA; маркеры #229: `HARD_MAX_ATTEMPTS = 3`, `RetryStormGuard`, `OrderSubmitGuard`, `BybitRateLimitError`, `tests/test_bybit_retry_budget_v1.py`) | шаг `Provenance guard` — fail-fast | ✅ |
 | AC4 | Dispatch привязан к head PR: `pr_number` сверяется с `pulls/{n}.head.sha` через `gh api` | шаг provenance guard | ✅ |
-| AC5 | Покрытие: RetryBudget ≤3 attempts, nested retry limits (static contracts), GET/POST order safety (вкл. review #5709376849: order-submit guard + reconciliation), telemetry parity, shadow runners, HTF candle source | таблица §2.3; локально 213 passed | ✅ |
+| AC5 | Покрытие: RetryBudget ≤3 attempts, nested retry limits (static contracts), GET/POST order safety (review #5709376849 + #5709889450: order-submit guard, cross-process safety, strict reconciliation, durable journal), telemetry parity, shadow runners, HTF candle source | таблица §2.3; локально 245 passed | ✅ |
 | AC6 | Python 3.12; offline fake transport; DB-зависимые тесты не выполняются | setup-python `'3.12'`; allowlist-дифф collected-файлов; env `ME_R_V3_*` | ✅ |
 | AC7 | Base PR #233 не меняется; нет merge/deploy/activation/DB/systemd изменений | PR #233 base = `research/issue228-api-telemetry-v1`; изменения только в `.github/workflows/` + `docs/research/` | ✅ |
 | AC8 | Hold gates сохранены: `API_BUDGET_NOT_CLEARED`, `V2_NO_GO`, PR #227/#232/#233 Draft | реестры не тронуты | ✅ |
@@ -129,7 +130,7 @@ python -m pytest -q -p no:cacheprovider `
 * VPS read-only measurement (AC из #229) — после deploy с operator GO, вне этой работы;
 * настоящая проверка «CI PASS/FAIL» требует запуска на GitHub; локально подтверждены:
   валидность YAML, корректность шагов (маркировки/allowlist прогнаны), зелёность
-  точного тест-набора (213 passed, Python 3.13.14 локально; CI использует 3.12 —
+  точного тест-набора (245 passed, Python 3.13.14 локально; CI использует 3.12 —
   код совместим: без синтаксиса новее 3.10).
 
 ## 6. Rollback

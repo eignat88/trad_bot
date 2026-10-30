@@ -1,20 +1,28 @@
-"""Order-submit guard hardening tests — code review #5709376849 (P1).
+"""Order-submit guard hardening tests — code reviews #5709376849 / #5709889450.
 
 Coverage:
 * indeterminate create_order outcome is NEVER released by a timer — only
-  definitive evidence (parsed API result, HTTP 4xx, or explicit
-  reconciliation against the exchange) lifts the block;
+  definitive evidence (parsed API result, HTTP 4xx, or STRICT exchange
+  confirmation) lifts the block;
 * safe operation identity: every submission carries an ``orderLinkId``
   recorded in the persistent journal before the send;
 * restart recovery: journal state survives a process crash; a crash while
   ``in_flight`` reloads as ``unknown`` (fail-closed);
 * concurrent POSTs: ``in_flight`` persists until the operation actually
   finishes (blocked first HTTP request, second identical call refused);
-* explicit reconciliation procedure: a confirmed exchange record resolves
-  with evidence; an absent record stays an UNRESOLVED BLOCKER;
-* the operator override requires explicit manual confirmation.
+* two guard instances on one journal path serialize correctly;
+* strict reconciliation identity (review #5709889450 P1): exact non-empty
+  ``orderLinkId`` + symbol + category + accepted order status — every other
+  answer is an explicit UNRESOLVED BLOCKER (parameterized acceptance table);
+* durable journal persistence (review #5709889450 P2): atomic unique temp
+  file + flush + fsync + os.replace + dir fsync, checksum + schema
+  validation, fault injection at every write stage, corrupted journals fail
+  closed and are NEVER auto-reset to an empty one;
+* manual operator resolution (review #5709889450 P2): NOT IMPLEMENTED —
+  the UNKNOWN block is kept, free-form CLI strings never unlock.
 
 All tests run on fake transport — no Bybit, no real orders, no network.
+Cross-process tests live in test_bybit_order_submit_guard_multiproc_v1.py.
 """
 from __future__ import annotations
 
@@ -242,18 +250,26 @@ def test_reconcile_confirmed_record_resolves_with_evidence(tmp_path):
 
     session = ScriptedSession([
         FakeResponse({"retCode": 0, "result": {"list": [
-            {"orderLinkId": "rb-rec-1", "orderStatus": "Filled"}]}}),
+            {"orderLinkId": "rb-rec-1", "symbol": "BTCUSDT",
+             "category": "linear", "orderStatus": "Filled",
+             "orderId": "EX-1"}]}}),
     ])
     results = make_client(session).reconcile_order_submissions()
 
     assert results[0]["resolution"] == "resolved"
     assert "Filled" in results[0]["detail"]
-    assert len(session.calls) == 1              # read-only, no order traffic
-    # block lifted WITH evidence -> a new submission is a fresh decision
+    assert len(session.calls) == 1              # realtime confirmed -> no history
+    # block lifted WITH a verifiable confirmation record
     assert guard.begin(FP, order_link_id="rb-rec-2") is True
     stored = json.loads(journal.read_text(encoding="utf-8"))
     evidence = [e.get("evidence", "") for e in stored["entries"].values()]
-    assert any("exchange-confirmed" in e for e in evidence)
+    confirming = [e for e in evidence if "exchange-confirmed" in e]
+    assert confirming, "confirmation record stored in journal"
+    record = confirming[0]
+    assert "orderLinkId=rb-rec-1" in record
+    assert "symbol=BTCUSDT" in record
+    assert "orderStatus=Filled" in record
+    assert "verified_at=" in record
 
 
 def test_reconcile_absent_record_is_explicit_unresolved_blocker(tmp_path):
@@ -311,28 +327,364 @@ def test_cli_lists_blockers_offline(tmp_path, capsys):
     assert "rb-cli-1" in out
 
 
-def test_cli_mark_resolved_requires_confirm_manual(tmp_path):
+# ----------------------------------------------------------------------
+# P1 (review #5709889450) — STRICT orderLinkId / symbol / category match
+# ----------------------------------------------------------------------
+
+def _row(order_link_id="rb-x", symbol="BTCUSDT", category="linear",
+         status="Filled", **extra):
+    row = {"symbol": symbol, "category": category, "orderStatus": status,
+           "orderId": "EX-1"}
+    if order_link_id is not None:
+        row["orderLinkId"] = order_link_id
+    row.update(extra)
+    return row
+
+
+# Acceptance table (review #5709889450 §3): response -> expected outcome.
+_STRICT_MATCH_CASES = [
+    ("exact_match_valid_status", [_row()], [], "resolved"),
+    ("exact_match_open_status", [_row(status="New")], [], "resolved"),
+    ("empty_order_link_id", [_row(order_link_id="")], [], "UNRESOLVED_BLOCKER"),
+    ("missing_order_link_id",
+     [_row(order_link_id=None)], [], "UNRESOLVED_BLOCKER"),
+    ("different_order_link_id",
+     [_row(order_link_id="rb-OTHER")], [], "UNRESOLVED_BLOCKER"),
+    ("different_symbol",
+     [_row(symbol="ETHUSDT")], [], "UNRESOLVED_BLOCKER"),
+    ("different_category",
+     [_row(category="spot")], [], "UNRESOLVED_BLOCKER"),
+    ("unknown_order_status",
+     [_row(status="Mystery")], [], "UNRESOLVED_BLOCKER"),
+    ("missing_order_status",
+     [_row(status=None)], [], "UNRESOLVED_BLOCKER"),
+    ("foreign_rows_only",
+     [_row(order_link_id="rb-OTHER"), _row(order_link_id="")],
+     [], "UNRESOLVED_BLOCKER"),
+    ("order_not_found", [], [], "UNRESOLVED_BLOCKER"),
+    ("history_confirms_when_realtime_does_not",
+     [], [_row(status="Cancelled")], "resolved"),
+]
+
+
+@pytest.mark.parametrize(
+    "realtime_rows,history_rows,expected",
+    [case[1:] for case in _STRICT_MATCH_CASES],
+    ids=[case[0] for case in _STRICT_MATCH_CASES])
+def test_strict_order_match_acceptance_table(tmp_path, realtime_rows,
+                                             history_rows, expected):
+    """Only an exact non-empty orderLinkId + symbol + category + accepted
+    status is confirmation; everything else stays UNRESOLVED_BLOCKER."""
+    journal = tmp_path / "journal.json"
+    guard = retry_budget.get_order_guard()
+    guard.configure(str(journal))
+    guard.begin(FP, order_link_id="rb-x")
+    guard.mark_unknown(FP, order_link_id="rb-x",
+                       reason="timeout — outcome UNKNOWN")
+
+    session = ScriptedSession([
+        FakeResponse({"retCode": 0, "result": {"list": realtime_rows}}),
+        FakeResponse({"retCode": 0, "result": {"list": history_rows}}),
+    ])
+    results = make_client(session).reconcile_order_submissions()
+
+    assert results[0]["resolution"] == expected
+    if expected == "resolved":
+        assert "exchange-confirmed" in results[0]["detail"]
+        assert "orderLinkId=rb-x" in results[0]["detail"]
+        assert guard.begin(FP, order_link_id="rb-x-2") is True   # unblocked
+    else:
+        assert "UNRESOLVED_BLOCKER" == results[0]["resolution"]
+        assert guard.begin(FP, order_link_id="rb-x-2") is False  # still blocked
+
+
+def test_strict_match_malformed_response_fails_closed(tmp_path):
+    """A malformed response is NEVER a confirmation — blocked (fail-closed)."""
+    journal = tmp_path / "journal.json"
+    guard = retry_budget.get_order_guard()
+    guard.configure(str(journal))
+    guard.begin(FP, order_link_id="rb-mal")
+    guard.mark_unknown(FP, order_link_id="rb-mal",
+                       reason="timeout — outcome UNKNOWN")
+
+    session = ScriptedSession([
+        FakeResponse({"retCode": 0, "result": "garbage-not-a-dict"}),
+    ])
+    results = make_client(session).reconcile_order_submissions()
+    assert results[0]["resolution"] == "UNRESOLVED_BLOCKER"
+    assert guard.begin(FP, order_link_id="rb-mal-2") is False
+
+
+def test_strict_match_history_only_queried_when_realtime_uncertain(tmp_path):
+    """realtime confirmed -> history is not consulted; uncertain -> history."""
+    journal = tmp_path / "journal.json"
+    guard = retry_budget.get_order_guard()
+    guard.configure(str(journal))
+    guard.begin(FP, order_link_id="rb-hist")
+    guard.mark_unknown(FP, order_link_id="rb-hist",
+                       reason="timeout — outcome UNKNOWN")
+
+    session = ScriptedSession([
+        FakeResponse({"retCode": 0, "result": {"list": [
+            _row(order_link_id="rb-hist", status="PartiallyFilled")]}}),
+    ])
+    results = make_client(session).reconcile_order_submissions()
+    assert results[0]["resolution"] == "resolved"
+    assert len(session.calls) == 1
+
+
+# ----------------------------------------------------------------------
+# P2 (review #5709889450) — durable journal persistence + fault injection
+# ----------------------------------------------------------------------
+
+def _fresh_guard(journal):
+    """Bind the process singleton guard (the one create_order uses)."""
+    guard = retry_budget.get_order_guard()
+    guard.configure(str(journal))
+    return guard
+
+
+def _expect_fail_closed_no_send(journal):
+    """A new submission must be refused with zero HTTP attempts."""
+    session = ScriptedSession([])
+    client = BybitClient(live_settings(
+        bybit_timeout=5, bybit_max_attempts=3, bybit_retry_backoff=0.0,
+        bybit_order_submit_journal_path=str(journal)), session)
+    with pytest.raises(BybitOrderUncertainError):
+        client.create_order(*FP, order_link_id="rb-fault-check")
+    assert session.calls == []            # 0 HTTP attempts
+
+
+def test_fails_closed_before_temp_file_write(tmp_path, monkeypatch):
+    journal = tmp_path / "journal.json"
+    guard = _fresh_guard(journal)
+
+    def boom(*_a, **_k):
+        raise OSError("injected: cannot create temp file")
+    monkeypatch.setattr(retry_budget.os, "makedirs", boom)
+
+    with pytest.raises(BybitOrderUncertainError):
+        guard.begin(FP, order_link_id="rb-f1")
+    monkeypatch.undo()
+    _expect_fail_closed_no_send(journal)
+
+
+def test_fails_closed_during_write(tmp_path, monkeypatch):
+    journal = tmp_path / "journal.json"
+    guard = _fresh_guard(journal)
+
+    class _FailingFile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def write(self, *_a, **_k):
+            raise OSError("injected: write failure")
+
+    monkeypatch.setattr(retry_budget.os, "fdopen", lambda *_a, **_k: _FailingFile())
+    with pytest.raises(BybitOrderUncertainError):
+        guard.begin(FP, order_link_id="rb-f2")
+    monkeypatch.undo()
+    _expect_fail_closed_no_send(journal)
+
+
+def test_fails_closed_after_flush_before_fsync(tmp_path, monkeypatch):
+    journal = tmp_path / "journal.json"
+    guard = _fresh_guard(journal)
+
+    def boom(*_a, **_k):
+        raise OSError("injected: fsync failure")
+    monkeypatch.setattr(retry_budget.os, "fsync", boom)
+
+    with pytest.raises(BybitOrderUncertainError):
+        guard.begin(FP, order_link_id="rb-f3")
+    monkeypatch.undo()
+    _expect_fail_closed_no_send(journal)
+
+
+def test_fails_closed_after_fsync_before_replace(tmp_path, monkeypatch):
+    journal = tmp_path / "journal.json"
+    guard = _fresh_guard(journal)
+
+    def boom(*_a, **_k):
+        raise OSError("injected: replace failure")
+    monkeypatch.setattr(retry_budget.os, "replace", boom)
+
+    with pytest.raises(BybitOrderUncertainError):
+        guard.begin(FP, order_link_id="rb-f4")
+    monkeypatch.undo()
+    _expect_fail_closed_no_send(journal)
+    # the reservation must NOT be visible as durable state
+    assert not journal.exists()
+
+
+def test_fails_closed_after_replace_before_dir_sync(tmp_path, monkeypatch):
+    journal = tmp_path / "journal.json"
+    guard = _fresh_guard(journal)
+
+    def boom(*_a, **_k):
+        raise OSError("injected: directory fsync failure")
+    monkeypatch.setattr(retry_budget, "_fsync_dir", boom)
+
+    with pytest.raises(BybitOrderUncertainError):
+        guard.begin(FP, order_link_id="rb-f5")
+    monkeypatch.undo()
+    # fail-closed: even though the file was replaced, the submission was
+    # refused and the durable reservation still blocks
+    _expect_fail_closed_no_send(journal)
+    # a fresh process instance (restart view) also sees the reservation
+    guard2 = retry_budget.OrderSubmitGuard(str(journal))
+    assert guard2.begin(FP, order_link_id="rb-f5-2") is False
+
+
+def test_fails_closed_on_reload_failure(tmp_path, monkeypatch):
+    journal = tmp_path / "journal.json"
+    guard = _fresh_guard(journal)
+    guard.begin(FP, order_link_id="rb-f6")
+
+    def boom(*_a, **_k):
+        raise ValueError("injected: reload failure")
+    monkeypatch.setattr(retry_budget.json, "load", boom)
+
+    with pytest.raises(BybitOrderUncertainError):
+        guard.begin(FP, order_link_id="rb-f6-2")
+    monkeypatch.undo()
+    _expect_fail_closed_no_send(journal)
+
+
+def test_invalid_checksum_fails_closed_without_autorecovery(tmp_path):
+    journal = tmp_path / "journal.json"
+    guard = _fresh_guard(journal)
+    guard.begin(FP, order_link_id="rb-f7")
+
+    # tamper with the content WITHOUT fixing the checksum
+    data = json.loads(journal.read_text(encoding="utf-8"))
+    only = next(iter(data["entries"].values()))
+    only["state"] = "resolved"                 # attacker: claim it is resolved
+    journal.write_text(json.dumps(data, indent=1, sort_keys=True),
+                       encoding="utf-8")
+
+    guard2 = _fresh_guard(journal)
+    with pytest.raises(BybitOrderUncertainError):
+        guard2.begin(FP, order_link_id="rb-f7-2")
+    # the corrupted journal is NOT reset to an empty/valid one
+    still = json.loads(journal.read_text(encoding="utf-8"))
+    assert next(iter(still["entries"].values()))["state"] == "resolved"
+    assert still["schema"] == retry_budget.ORDER_JOURNAL_SCHEMA
+    with pytest.raises(ValueError):
+        retry_budget._validate_journal_document(still)
+
+
+def test_corrupted_json_fails_closed_without_autorecovery(tmp_path):
+    journal = tmp_path / "journal.json"
+    journal.write_text("{this is not json", encoding="utf-8")
+
+    guard = _fresh_guard(journal)
+    with pytest.raises(BybitOrderUncertainError):
+        guard.begin(FP, order_link_id="rb-f8")
+    # no automatic empty-journal recovery after a read error
+    assert journal.read_text(encoding="utf-8") == "{this is not json"
+    _expect_fail_closed_no_send(journal)
+
+
+def test_journal_schema_and_checksum_present_on_every_write(tmp_path):
+    journal = tmp_path / "journal.json"
+    guard = _fresh_guard(journal)
+    guard.begin(FP, order_link_id="rb-ok")
+    data = json.loads(journal.read_text(encoding="utf-8"))
+    assert data["schema"] == retry_budget.ORDER_JOURNAL_SCHEMA
+    retry_budget._validate_journal_document(data)   # verifies the checksum
+
+
+# ----------------------------------------------------------------------
+# P2 (review #5709889450) — manual resolution is NOT IMPLEMENTED
+# ----------------------------------------------------------------------
+
+def test_guard_resolve_manual_never_unlocks(tmp_path):
+    journal = tmp_path / "journal.json"
+    guard = _fresh_guard(journal)
+    guard.begin(FP, order_link_id="rb-man-1")
+    guard.mark_unknown(FP, order_link_id="rb-man-1",
+                       reason="timeout — outcome UNKNOWN")
+
+    with pytest.raises(retry_budget.ManualResolutionNotImplemented):
+        guard.resolve_manual(order_link_id="rb-man-1",
+                             operator_id="ops-1", reference="ticket-1",
+                             symbol="BTCUSDT", status_check="filled in UI",
+                             reason="verified manually")
+    # the UNKNOWN block is kept — free-form strings never unlock
+    assert guard.begin(FP, order_link_id="rb-man-1-2") is False
+
+
+def test_cli_manual_resolution_is_not_implemented_and_keeps_block(
+        tmp_path, capsys):
     from tools.bybit_order_submit_reconcile_v1 import main
 
     journal = tmp_path / "journal.json"
-    guard = retry_budget.OrderSubmitGuard(str(journal))
-    guard.begin(FP, order_link_id="rb-cli-2")
-    guard.mark_unknown(FP, order_link_id="rb-cli-2",
+    guard = _fresh_guard(journal)
+    guard.begin(FP, order_link_id="rb-man-2")
+    guard.mark_unknown(FP, order_link_id="rb-man-2",
                        reason="timeout — outcome UNKNOWN")
 
-    with pytest.raises(SystemExit):
-        main(["--config", str(tmp_path / "no-config.yaml"),
-              "--journal", str(journal), "--mark-resolved", "rb-cli-2"])
-    # without explicit manual evidence the block is untouched
-    guard2 = retry_budget.OrderSubmitGuard(str(journal))
-    assert guard2.begin(FP, order_link_id="rb-cli-3") is False
+    code = main(["--config", str(tmp_path / "no-config.yaml"),
+                 "--journal", str(journal),
+                 "--manual-resolution",
+                 "--operator-id", "ops-1", "--reference", "ticket-1",
+                 "--order-link-id", "rb-man-2", "--symbol", "BTCUSDT",
+                 "--status-check", "order filled in Bybit UI",
+                 "--reason", "verified manually"])
+    out = capsys.readouterr()
+    assert code == 3
+    assert "MANUAL_RESOLUTION_NOT_IMPLEMENTED" in out.err
+    assert "manual_resolution_record" in out.out
+    guard2 = _fresh_guard(journal)
+    assert guard2.begin(FP, order_link_id="rb-man-2-2") is False   # kept
+
+
+def test_cli_manual_resolution_without_requisites_still_rejected(tmp_path, capsys):
+    """Even a fully-formatted manual attempt needs real authorization —
+    missing requisites are reported and the block never lifts."""
+    from tools.bybit_order_submit_reconcile_v1 import main
+
+    journal = tmp_path / "journal.json"
+    guard = _fresh_guard(journal)
+    guard.begin(FP, order_link_id="rb-man-3")
+    guard.mark_unknown(FP, order_link_id="rb-man-3",
+                       reason="timeout — outcome UNKNOWN")
 
     code = main(["--config", str(tmp_path / "no-config.yaml"),
-                 "--journal", str(journal), "--mark-resolved", "rb-cli-2",
-                 "--confirm-manual", "checked in Bybit UI: order filled"])
-    assert code == 0
-    guard3 = retry_budget.OrderSubmitGuard(str(journal))
-    assert guard3.begin(FP, order_link_id="rb-cli-4") is True
-    stored = json.loads(journal.read_text(encoding="utf-8"))
-    assert any("manual operator resolution" in e.get("evidence", "")
-               for e in stored["entries"].values())
+                 "--journal", str(journal),
+                 "--manual-resolution",
+                 "--order-link-id", "rb-man-3"])
+    out = capsys.readouterr()
+    assert code == 3
+    assert "MANUAL_RESOLUTION_NOT_IMPLEMENTED" in out.err
+    assert "missing_requisites" in out.out
+    guard2 = _fresh_guard(journal)
+    assert guard2.begin(FP, order_link_id="rb-man-3-2") is False   # kept
+
+
+# ----------------------------------------------------------------------
+# Multi-configuration safety: several guard instances on ONE journal path
+# ----------------------------------------------------------------------
+
+def test_two_guard_instances_same_journal_path_serialize(tmp_path):
+    """Two configurations sharing one journal path must not both submit
+    the identical order (the cross-process lock file serializes them)."""
+    journal = tmp_path / "journal.json"
+    guard_a = retry_budget.OrderSubmitGuard(str(journal))
+    guard_b = retry_budget.OrderSubmitGuard(str(journal))
+    results: list[bool] = []
+    barrier = threading.Barrier(2)
+
+    def attempt(guard):
+        barrier.wait(timeout=10)
+        results.append(guard.begin(FP, order_link_id="rb-2cfg"))
+
+    t1 = threading.Thread(target=attempt, args=(guard_a,))
+    t2 = threading.Thread(target=attempt, args=(guard_b,))
+    t1.start(); t2.start()
+    t1.join(timeout=15); t2.join(timeout=15)
+    assert sorted(results) == [False, True]     # exactly one reservation
