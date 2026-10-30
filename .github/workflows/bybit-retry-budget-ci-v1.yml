@@ -1,0 +1,166 @@
+name: Bybit Retry Budget CI V1
+
+# BYBIT_RETRY_BUDGET_CI_V1 — offline CI slice for Issue #229 (retry budget hardening).
+#
+# Why this exists: Main PR Safety triggers only for pull_request with base=main,
+# so stacked PRs (PR #233, base=research/issue228-api-telemetry-v1) receive no CI.
+# This workflow is deliberately separate and does NOT modify main-pr-safety.yml.
+#
+# Guarantees:
+#   * tests the EXACT PR head commit (not the merge commit, not the base branch);
+#   * provenance guard fails the run if the checked-out tree is not the requested
+#     head SHA or lacks the Issue #229 markers (i.e. it cannot silently test the
+#     #228 base branch);
+#   * offline fake transport only: no Bybit, no VPS, no production, no database
+#     (DB-dependent suites are explicitly out of scope and never collected).
+
+on:
+  pull_request:
+    # Stacked PR #233 uses base=research/issue228-api-telemetry-v1; any future
+    # re-stack onto main keeps firing here. No paths filter on purpose: the run
+    # must follow the PR head commit, not the touched-file set.
+    branches:
+      - main
+      - 'research/**'
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        description: 'Exact commit SHA to validate (e.g. 76ddf5b8f77493f91c709ebc560b8d13ee33d6ab). Use the PR head SHA.'
+        required: true
+        type: string
+      pr_number:
+        description: 'Optional: PR number whose head must equal head_sha (e.g. 233). Enforced when set.'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: bybit-retry-budget-ci-v1-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.head_sha || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  retry-budget-regression:
+    name: Bybit retry budget regression (offline)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact head commit
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.head_sha }}
+
+      - name: Provenance guard — exact head SHA, Issue #229 tree (not base #228)
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.head_sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RESOLVED="$(git rev-parse "${EXPECTED_SHA}^{commit}")"
+          ACTUAL="$(git rev-parse HEAD)"
+          echo "requested=${EXPECTED_SHA}"
+          echo "resolved =${RESOLVED}"
+          echo "checked_out=${ACTUAL}"
+          if [ "${RESOLVED}" != "${ACTUAL}" ]; then
+            echo "::error::checked-out HEAD does not match the requested head SHA — refusing to report CI for the wrong commit"
+            exit 1
+          fi
+          git log -1 --format='commit %H %ci %s'
+
+          # Issue #229 markers: prove this is the retry-budget head content and
+          # not the #228 telemetry base branch.
+          test -f app/exchange/retry_budget.py
+          grep -q 'HARD_MAX_ATTEMPTS = 3' app/exchange/retry_budget.py
+          grep -q 'class RetryStormGuard' app/exchange/retry_budget.py
+          grep -q 'BybitRateLimitError' app/exchange/bybit_client.py
+          grep -q 'OrderSubmitGuard' app/exchange/retry_budget.py
+          test -f tests/test_bybit_retry_budget_v1.py
+          echo "issue229_markers=ok"
+
+          if [ -n "${PR_NUMBER}" ]; then
+            PR_HEAD="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+            echo "pull_request_head=${PR_HEAD}"
+            if [ "${PR_HEAD}" != "${RESOLVED}" ]; then
+              echo "::error::requested head_sha is not the current head of PR #${PR_NUMBER}"
+              exit 1
+            fi
+          fi
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install offline test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest pyyaml python-dotenv numpy pandas scipy
+
+      - name: Compile retry-budget surface
+        run: |
+          python -m compileall -q \
+            app/exchange/retry_budget.py \
+            app/exchange/bybit_client.py \
+            app/exchange/api_telemetry.py \
+            app/config/settings.py \
+            app/shadow/runner.py \
+            app/shadow/v2d_runner.py \
+            app/analytics/candle_sync.py \
+            app/research/htf_baseline_short_phase2_bybit_candle_source_v1.py \
+            tests/test_bybit_retry_budget_v1.py
+
+      - name: Run retry-budget regression suites (offline fake transport)
+        env:
+          PYTHONPATH: .
+          PYTHONDONTWRITEBYTECODE: '1'
+          ME_R_V3_PG_INTEGRATION: 'false'
+          ME_R_V3_ATOMIC_E2E: 'false'
+        run: |
+          python -m pytest -q -p no:cacheprovider \
+            tests/test_bybit_retry_budget_v1.py \
+            tests/test_bybit_api_telemetry_v1.py \
+            tests/test_scanner_runtime.py \
+            tests/test_shadow_cli.py \
+            tests/test_htf_baseline_short_phase2_bybit_candle_source_v1.py \
+            tests/test_candle_sync.py \
+            --tb=short
+
+      - name: Assert offline scope (allowlisted files only, no DB-dependent tests)
+        env:
+          PYTHONPATH: .
+          PYTHONDONTWRITEBYTECODE: '1'
+          ME_R_V3_PG_INTEGRATION: 'false'
+          ME_R_V3_ATOMIC_E2E: 'false'
+        run: |
+          set -euo pipefail
+          python -m pytest -q -p no:cacheprovider --collect-only \
+            tests/test_bybit_retry_budget_v1.py \
+            tests/test_bybit_api_telemetry_v1.py \
+            tests/test_scanner_runtime.py \
+            tests/test_shadow_cli.py \
+            tests/test_htf_baseline_short_phase2_bybit_candle_source_v1.py \
+            tests/test_candle_sync.py > /tmp/collected.txt 2>&1
+          tail -1 /tmp/collected.txt
+          awk -F'::' '/^tests\// {print $1}' /tmp/collected.txt | sort -u > /tmp/collected_files.txt
+          cat /tmp/collected_files.txt
+          printf '%s\n' \
+            tests/test_bybit_retry_budget_v1.py \
+            tests/test_bybit_api_telemetry_v1.py \
+            tests/test_scanner_runtime.py \
+            tests/test_shadow_cli.py \
+            tests/test_htf_baseline_short_phase2_bybit_candle_source_v1.py \
+            tests/test_candle_sync.py | sort > /tmp/expected_files.txt
+          if ! diff -u /tmp/expected_files.txt /tmp/collected_files.txt; then
+            echo "::error::offline CI scope drifted — collected files differ from the allowlist (DB-dependent suites must never run here)"
+            exit 1
+          fi
+          echo "offline_scope=ok"
