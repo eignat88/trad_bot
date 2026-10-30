@@ -1,22 +1,300 @@
-"""Bybit API call telemetry — temporary diagnostic instrumentation.
+"""Bybit API call telemetry — BYBIT_API_TELEMETRY_V1 (Issue #228, first slice).
 
-Logs every HTTP request made through BybitClient._public_get(), collects
-per-cycle statistics, detects duplicate requests, and reports rate-limit
-events.
+Logs every HTTP request made through ``BybitClient`` (``_public_get`` GET
+calls and ``create_order`` POST calls) as exactly one structured record per
+HTTP attempt, collects per-cycle statistics, detects duplicate requests, and
+reports rate-limit events.
 
-NOT a production module — remove after the audit is complete.
+Schema ``BYBIT_API_TELEMETRY_V1`` — every attempt record carries:
 
-No API keys, secrets, signatures, or tokens are ever logged.
+* ``logical_request_id`` — one id per logical request (one ``_public_get`` /
+  ``create_order`` call); every HTTP attempt of that request (timeout
+  retries, rate-limit retries) shares it;
+* ``attempt_index`` / ``total_attempts`` — 1-based position of this HTTP
+  attempt inside the logical request (strictly ordered) and the attempt
+  budget (max HTTP attempts the logical request may make);
+* ``service_tag`` — explicit service tag (env ``BYBIT_SERVICE_NAME`` wins,
+  otherwise caller-path heuristics) for per-service / per-checkout
+  breakdown;
+* ``endpoint``, ``method``, ``status_code`` / ``status_code_source`` —
+  ``status_code`` is always populated with an integer sentinel and never
+  guesses a status: the real HTTP status when one was measured
+  (``status_code_source=measured``), ``0`` with
+  ``status_code_source=unknown_response_status`` when a response exists but
+  exposes no measurable status, and ``0`` with
+  ``status_code_source=no_response`` when no HTTP response was received at
+  all (transport/timeout failure);
+* ``ret_code`` / ``ret_msg`` — Bybit API result envelope;
+* ``retry_reason`` — why this attempt happened: ``none`` (first attempt),
+  ``timeout`` or ``rate_limit`` (retry of the same logical request);
+* ``X-Bapi-Limit`` / ``X-Bapi-Limit-Status`` / ``X-Bapi-Limit-Reset-Timestamp``
+  values, or an explicit ``headers_absent=true`` marker when the CDN strips
+  these headers (or the transport delivered none).
+
+Log format: one ``BYBIT_API_CALL`` line per attempt. The historical prefix
+(``service= endpoint= caller= symbol= interval= limit= duration_ms= result=``
+plus ``retMsg=``/``status=`` where they existed before) is byte-compatible
+with pre-existing analytics; the V1 fields are appended as one uniform
+``telemetry_v=1 ...`` suffix on every variant.
+
+Untrusted free-form values (Bybit ``retMsg``, the ``BYBIT_SERVICE_NAME``
+override, caller/symbol/interval strings) are escaped before emission: ``\\``,
+newline, carriage return and tab become visible two-character escapes, any
+other control character becomes ``\\xNN`` and ``=`` becomes ``\\x3d``, so a
+provider message or env value can never forge an extra record, forge a
+``key=value`` token or break the one-line-per-attempt contract. Space is
+additionally escaped to ``\\x20`` in every keyed field except ``retMsg``
+(whose ordinary legacy output legitimately contains spaces); ordinary legacy
+output without control characters or ``=`` is preserved byte-for-byte.
+
+Security contract: No API keys, secrets, signatures, authorization headers,
+or private request payloads are ever captured or logged — records hold an
+explicit allowlist of scalar fields only; response headers are reduced to the
+three ``X-Bapi-Limit*`` values before anything is stored. Failure records
+carry only the exception type/category label (e.g. ``ConnectionResetError``)
+— exception text (``str(exc)``/``repr(exc)``) may embed credentials or the
+signed payload and never reaches telemetry.
+
+Telemetry is strictly observational (fail-open): recording errors are
+swallowed by the caller-side guard and must never fail or alter a fetch.
 """
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import Any
 
 logger = logging.getLogger("bybit_api_telemetry")
+
+# Explicit service tag env var (wins over caller-path heuristics).
+SERVICE_ENV = "BYBIT_SERVICE_NAME"
+
+# Value used in log lines for absent optional scalars.
+_NONE = "none"
+
+
+def _fmt_opt(value: Any) -> str:
+    """Render an optional scalar for a journald-friendly key=value line."""
+    return _NONE if value is None else str(value)
+
+
+# ---------------------------------------------------------------------------
+# Free-form value sanitization (log-injection hardening)
+# ---------------------------------------------------------------------------
+
+_ESCAPE_MAP = {
+    "\\": "\\\\",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+}
+
+
+def _sanitize(value: Any, *, escape_spaces: bool = False) -> str:
+    """Escape control characters in a free-form value before log emission.
+
+    Backslash, newline, carriage return and tab become visible two-character
+    escapes; every other control character becomes ``\\xNN`` and ``=``
+    becomes ``\\x3d`` so no value can forge a ``key=value`` token. With
+    ``escape_spaces`` the space character becomes ``\\x20`` as well, keeping
+    keyed ``field=\\S+`` values parseable and injection-proof. Ordinary
+    legacy output (plain text without control characters or ``=``) is
+    preserved byte-for-byte.
+    """
+    out: list[str] = []
+    for ch in str(value):
+        escape = _ESCAPE_MAP.get(ch)
+        if escape is not None:
+            out.append(escape)
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append("\\x%02x" % ord(ch))
+        elif ch == "=":
+            out.append("\\x3d")
+        elif escape_spaces and ch == " ":
+            out.append("\\x20")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Response metadata extraction (status + X-Bapi-Limit* headers only)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ResponseMeta:
+    """The only response data telemetry is allowed to keep.
+
+    ``status_code`` is ``None`` when the response object exposes no status
+    (e.g. a minimal mock); ``headers_absent`` is ``True`` when none of the
+    ``X-Bapi-Limit*`` headers were observable.
+    """
+
+    status_code: int | None = None
+    bapi_limit: int | None = None
+    bapi_limit_status: int | None = None
+    bapi_limit_reset_ms: int | None = None
+    headers_absent: bool = True
+
+
+EMPTY_RESPONSE_META = ResponseMeta()
+
+_BAPI_LIMIT = "X-Bapi-Limit"
+_BAPI_LIMIT_STATUS = "X-Bapi-Limit-Status"
+_BAPI_LIMIT_RESET = "X-Bapi-Limit-Reset-Timestamp"
+
+
+def _header_value(headers: Any, name: str) -> Any:
+    """Case-insensitive single-header lookup over header-ish objects."""
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        try:
+            value = getter(name)
+        except Exception:
+            value = None
+        if value is not None:
+            return value
+        try:
+            items = list(headers.items())
+        except Exception:
+            items = []
+        for key, value in items:
+            if str(key).lower() == name.lower():
+                return value
+        return None
+    try:
+        for key, value in headers:
+            if str(key).lower() == name.lower():
+                return value
+    except Exception:
+        return None
+    return None
+
+
+def _parse_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_response_meta(response: Any) -> ResponseMeta:
+    """Reduce a response object to the allowlisted telemetry metadata.
+
+    Fail-open and side-effect-free: never raises, never touches request
+    data, and keeps only the HTTP status and the three ``X-Bapi-Limit*``
+    header values (never raw headers, never auth headers).
+    """
+    if response is None:
+        return EMPTY_RESPONSE_META
+    status: Any = None
+    try:
+        status = getattr(response, "status_code", None)
+        if status is None:
+            status = getattr(response, "status", None)
+        if status is None:
+            getcode = getattr(response, "getcode", None)
+            if callable(getcode):
+                status = getcode()
+    except Exception:
+        status = None
+    try:
+        headers = getattr(response, "headers", None)
+        if headers is None:
+            getheaders = getattr(response, "getheaders", None)
+            if callable(getheaders):
+                headers = getheaders()
+    except Exception:
+        headers = None
+
+    limit = _parse_int(_header_value(headers, _BAPI_LIMIT))
+    limit_status = _parse_int(_header_value(headers, _BAPI_LIMIT_STATUS))
+    limit_reset = _parse_int(_header_value(headers, _BAPI_LIMIT_RESET))
+    headers_absent = limit is None and limit_status is None and limit_reset is None
+    return ResponseMeta(
+        status_code=_parse_int(status),
+        bapi_limit=limit,
+        bapi_limit_status=limit_status,
+        bapi_limit_reset_ms=limit_reset,
+        headers_absent=headers_absent,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Service tagging (explicit tag first, heuristics as fallback)
+# ---------------------------------------------------------------------------
+
+# Ordered: first match wins. The legacy heuristics keep their historical
+# order and tags so existing BYBIT_API_CALL analytics stay stable; the V1
+# entries only cover callers that previously fell through to "other"
+# (ME R V3, SRR evaluator, v2d shadow, prospective/HTF research runners).
+_SERVICE_PATTERNS: tuple[tuple[str, str], ...] = (
+    # --- legacy heuristics (order preserved) ---
+    ("scanner_runner", "scanner"),
+    ("context_builder", "scanner"),
+    ("orchestrator", "scanner"),
+    ("paper_runner", "paper"),
+    ("paper/cli", "paper"),
+    ("position_monitor", "paper"),
+    ("shadow/runner", "shadow"),
+    ("shadow/backfill", "shadow"),
+    ("shadow/evaluator", "shadow"),
+    ("analytics", "analytics"),
+    ("candle_sync", "analytics"),
+    ("outcome_cli", "outcome"),
+    ("outcome", "outcome"),
+    ("market_data", "market_data"),
+    ("scanner/cli", "scanner_cli"),
+    # --- BYBIT_API_TELEMETRY_V1: explicit tags for former "other" consumers ---
+    ("me_r_long_early_mae_v3", "me_r_v3"),
+    ("isolated_oos", "me_r_v3"),
+    ("me_r_v3", "me_r_v3"),
+    ("srr_", "srr"),
+    ("me_short", "me_short_a"),
+    ("v2d_", "shadow_v2d"),
+    ("me_r_long_close_location", "me_r_close_location"),
+    ("prospective_evaluator", "prospective_eval"),
+    ("evaluator_runner", "prospective_eval"),
+    ("research/evaluator", "prospective_eval"),
+    ("htf_baseline", "htf_baseline"),
+    ("htf_keylevel", "htf_baseline"),
+    ("scanners/cli", "scanner_cli"),
+    ("live_exchange", "live"),
+    ("app/main.py", "live"),
+    ("bot.py", "live"),
+    ("backtest", "backtest"),
+)
+
+
+def detect_service_tag(caller: str) -> str:
+    """Map a caller path to a service tag via the ordered heuristics."""
+    normalized = (caller or "").replace("\\", "/")
+    for pattern, tag in _SERVICE_PATTERNS:
+        if pattern in normalized:
+            return tag
+    return "other"
+
+
+def resolve_service_tag(caller: str = "") -> str:
+    """Resolve the service tag: explicit env tag wins, heuristics fallback."""
+    explicit = os.environ.get(SERVICE_ENV, "").strip()
+    if explicit:
+        return explicit
+    return detect_service_tag(caller)
+
+
+# ---------------------------------------------------------------------------
+# Records
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -31,6 +309,22 @@ class ApiCallRecord:
     result: str          # OK | RATE_LIMIT | ERROR | TIMEOUT
     ret_msg: str = ""
     status_code: int = 0
+    # --- BYBIT_API_TELEMETRY_V1 (Issue #228) ---
+    logical_request_id: str = ""
+    attempt_index: int = 1
+    total_attempts: int = 1
+    service_tag: str = ""
+    method: str = "GET"
+    ret_code: int | None = None
+    retry_reason: str = "none"      # none | timeout | rate_limit
+    bapi_limit: int | None = None
+    bapi_limit_status: int | None = None
+    bapi_limit_reset_ms: int | None = None
+    headers_absent: bool = True
+    # measured | unknown_response_status | no_response — never guess a
+    # status: status_code keeps the integer sentinel (0 = not measured) and
+    # this marker says why (review PR #232 / Issue #228).
+    status_code_source: str = "measured"
 
 
 @dataclass
@@ -70,6 +364,22 @@ class CycleSummary:
     duration_sec: float = 0.0
 
 
+# Historical BYBIT_API_CALL prefixes — byte-compatible with pre-existing
+# journald analytics. The V1 fields are appended as one uniform suffix.
+_OK_FMT = (
+    "BYBIT_API_CALL service=%s endpoint=%s caller=%s "
+    "symbol=%s interval=%s limit=%d duration_ms=%.0f result=%s"
+)
+_RL_FMT = _OK_FMT + " retMsg=%s"
+_ERR_FMT = _RL_FMT + " status=%d"
+_TELEMETRY_SUFFIX = (
+    " telemetry_v=1 logical_request_id=%s attempt_index=%d total_attempts=%d"
+    " method=%s status_code=%d status_code_source=%s ret_code=%s retry_reason=%s"
+    " bapi_limit=%s bapi_limit_status=%s bapi_limit_reset_ms=%s"
+    " headers_absent=%s"
+)
+
+
 class ApiTelemetry:
     """Thread-safe telemetry singleton for BybitClient API calls."""
 
@@ -96,6 +406,7 @@ class ApiTelemetry:
         self._by_caller: dict[str, EndpointStats] = defaultdict(EndpointStats)
         self._by_symbol: dict[str, EndpointStats] = defaultdict(EndpointStats)
         self._by_interval: dict[str, EndpointStats] = defaultdict(EndpointStats)
+        self._by_service: dict[str, EndpointStats] = defaultdict(EndpointStats)
         self._duplicate_counts: dict[DuplicateKey, int] = defaultdict(int)
         self._call_timestamps: list[float] = []
         self._peak_rps = 0.0
@@ -119,11 +430,77 @@ class ApiTelemetry:
             self._by_caller.clear()
             self._by_symbol.clear()
             self._by_interval.clear()
+            self._by_service.clear()
             self._duplicate_counts.clear()
             self._call_timestamps.clear()
             self._peak_rps = 0.0
             self._peak_rps_window_ms = 0.0
         logger.info("CYCLE #%d BEGIN: symbols=%d", self._cycle_id, len(self._cycle_symbols))
+
+    def record_http_attempt(
+        self,
+        *,
+        endpoint: str,
+        caller: str,
+        symbol: str,
+        interval: str,
+        limit: int,
+        duration_ms: float,
+        result: str,
+        logical_request_id: str,
+        attempt_index: int,
+        total_attempts: int,
+        method: str = "GET",
+        ret_code: int | None = None,
+        ret_msg: str = "",
+        retry_reason: str = "none",
+        response: Any = None,
+    ) -> ApiCallRecord:
+        """Record exactly one HTTP attempt of a logical request.
+
+        The response is reduced to the allowlisted metadata (HTTP status and
+        the ``X-Bapi-Limit*`` headers) via :func:`extract_response_meta`;
+        nothing else from the response is ever kept. ``status_code`` is
+        always populated without guessing: the real status when the response
+        exposes one (``status_code_source=measured``), the ``0`` sentinel
+        with ``status_code_source=unknown_response_status`` when a response
+        exists but exposes no measurable status, and ``0`` with
+        ``status_code_source=no_response`` when no HTTP response was received
+        (transport/timeout failure).
+        """
+        meta = extract_response_meta(response) if response is not None else EMPTY_RESPONSE_META
+        if meta.status_code is not None:
+            status_code = meta.status_code
+            status_code_source = "measured"
+        elif response is not None:
+            status_code = 0
+            status_code_source = "unknown_response_status"
+        else:
+            status_code = 0
+            status_code_source = "no_response"
+        return self.record_call(
+            endpoint=endpoint,
+            caller=caller,
+            symbol=symbol,
+            interval=interval,
+            limit=limit,
+            duration_ms=duration_ms,
+            result=result,
+            ret_msg=ret_msg,
+            status_code=status_code,
+            status_code_source=status_code_source,
+            logical_request_id=logical_request_id,
+            attempt_index=attempt_index,
+            total_attempts=total_attempts,
+            service_tag=None,
+            method=method,
+            ret_code=ret_code,
+            retry_reason=retry_reason,
+            bapi_limit=meta.bapi_limit,
+            bapi_limit_status=meta.bapi_limit_status,
+            bapi_limit_reset_ms=meta.bapi_limit_reset_ms,
+            headers_absent=meta.headers_absent,
+        )
 
     def record_call(
         self,
@@ -136,13 +513,50 @@ class ApiTelemetry:
         result: str,
         ret_msg: str = "",
         status_code: int = 0,
-    ) -> None:
+        *,
+        logical_request_id: str = "",
+        attempt_index: int = 1,
+        total_attempts: int = 1,
+        service_tag: str | None = None,
+        method: str = "GET",
+        ret_code: int | None = None,
+        retry_reason: str = "none",
+        bapi_limit: int | None = None,
+        bapi_limit_status: int | None = None,
+        bapi_limit_reset_ms: int | None = None,
+        headers_absent: bool = True,
+        status_code_source: str = "",
+    ) -> ApiCallRecord:
+        """Record one API call (== one HTTP attempt) and emit its log line.
+
+        The first nine parameters are positional-compatible with the
+        historical signature; the keyword-only tail carries the
+        ``BYBIT_API_TELEMETRY_V1`` fields. When ``status_code_source`` is not
+        given it is derived from the supplied ``status_code``: a non-zero
+        code is ``measured``, the ``0`` sentinel is ``no_response`` (the
+        historical meaning of ``status_code=0``).
+        """
         now = time.monotonic()
+        if not status_code_source:
+            status_code_source = "measured" if status_code else "no_response"
+        tag = service_tag or resolve_service_tag(caller)
         record = ApiCallRecord(
             timestamp=now, endpoint=endpoint, caller=caller,
             symbol=symbol, interval=interval, limit=limit,
             duration_ms=duration_ms, result=result,
             ret_msg=ret_msg, status_code=status_code,
+            status_code_source=status_code_source,
+            logical_request_id=logical_request_id,
+            attempt_index=attempt_index,
+            total_attempts=total_attempts,
+            service_tag=tag,
+            method=method,
+            ret_code=ret_code,
+            retry_reason=retry_reason or "none",
+            bapi_limit=bapi_limit,
+            bapi_limit_status=bapi_limit_status,
+            bapi_limit_reset_ms=bapi_limit_reset_ms,
+            headers_absent=headers_absent,
         )
 
         with self._lock:
@@ -152,6 +566,7 @@ class ApiTelemetry:
                 (self._by_caller, caller),
                 (self._by_symbol, symbol),
                 (self._by_interval, interval),
+                (self._by_service, tag),
             ]:
                 s = stats_dict[key]
                 s.total += 1
@@ -176,28 +591,63 @@ class ApiTelemetry:
             self._call_timestamps.append(now)
             self._update_rps(now)
 
-        if result == "RATE_LIMIT":
+        self._emit(record)
+        return record
+
+    def _emit(self, record: ApiCallRecord) -> None:
+        """Emit exactly one log line for one attempt record.
+
+        The legacy ``BYBIT_API_CALL`` prefixes are preserved byte-compatible;
+        the V1 fields share one uniform ``telemetry_v=1`` suffix on every
+        variant so parsers can rely on it.
+
+        Every free-form value is passed through :func:`_sanitize` first, so
+        control characters or ``key=value`` tokens embedded in provider
+        messages or env values cannot forge an extra record or corrupt field
+        parsing. Numeric fields are ints/floats by construction and need no
+        escaping.
+        """
+        suffix = (
+            _sanitize(record.logical_request_id or _NONE, escape_spaces=True),
+            record.attempt_index,
+            record.total_attempts,
+            _sanitize(record.method, escape_spaces=True),
+            record.status_code,
+            _sanitize(record.status_code_source or _NONE, escape_spaces=True),
+            _sanitize(_fmt_opt(record.ret_code), escape_spaces=True),
+            _sanitize(record.retry_reason or _NONE, escape_spaces=True),
+            _sanitize(_fmt_opt(record.bapi_limit), escape_spaces=True),
+            _sanitize(_fmt_opt(record.bapi_limit_status), escape_spaces=True),
+            _sanitize(_fmt_opt(record.bapi_limit_reset_ms), escape_spaces=True),
+            "true" if record.headers_absent else "false",
+        )
+        base = (
+            _sanitize(record.service_tag or _NONE, escape_spaces=True),
+            _sanitize(record.endpoint, escape_spaces=True),
+            _sanitize(record.caller, escape_spaces=True),
+            _sanitize(record.symbol, escape_spaces=True),
+            _sanitize(record.interval, escape_spaces=True),
+            record.limit,
+            record.duration_ms,
+            _sanitize(record.result, escape_spaces=True),
+        )
+        # Free-text field: control characters escaped, ordinary spaces kept
+        # byte-compatible with legacy retMsg=... output.
+        ret_msg = _sanitize(record.ret_msg)
+        if record.result == "RATE_LIMIT":
             logger.warning(
-                "BYBIT_API_CALL service=%s endpoint=%s caller=%s "
-                "symbol=%s interval=%s limit=%d duration_ms=%.0f "
-                "result=%s retMsg=%s",
-                self._detect_service(caller), endpoint, caller,
-                symbol, interval, limit, duration_ms, result, ret_msg,
+                _RL_FMT + _TELEMETRY_SUFFIX,
+                *base, ret_msg, *suffix,
             )
-        elif result != "OK":
+        elif record.result != "OK":
             logger.warning(
-                "BYBIT_API_CALL service=%s endpoint=%s caller=%s "
-                "symbol=%s interval=%s limit=%d duration_ms=%.0f "
-                "result=%s retMsg=%s status=%d",
-                self._detect_service(caller), endpoint, caller,
-                symbol, interval, limit, duration_ms, result, ret_msg, status_code,
+                _ERR_FMT + _TELEMETRY_SUFFIX,
+                *base, ret_msg, record.status_code, *suffix,
             )
         else:
             logger.info(
-                "BYBIT_API_CALL service=%s endpoint=%s caller=%s "
-                "symbol=%s interval=%s limit=%d duration_ms=%.0f result=%s",
-                self._detect_service(caller), endpoint, caller,
-                symbol, interval, limit, duration_ms, result,
+                _OK_FMT + _TELEMETRY_SUFFIX,
+                *base, *suffix,
             )
 
     def end_cycle(self) -> CycleSummary:
@@ -271,6 +721,12 @@ class ApiTelemetry:
             "errors": self._lifetime_errors,
         }
 
+    @property
+    def service_totals(self) -> dict[str, EndpointStats]:
+        """Per-service breakdown keyed by explicit ``service_tag``."""
+        with self._lock:
+            return dict(self._by_service)
+
     def _update_rps(self, now: float) -> None:
         cutoff = now - 1.0
         self._call_timestamps = [t for t in self._call_timestamps if t > cutoff]
@@ -284,18 +740,4 @@ class ApiTelemetry:
 
     @staticmethod
     def _detect_service(caller: str) -> str:
-        if "scanner_runner" in caller or "context_builder" in caller or "orchestrator" in caller:
-            return "scanner"
-        if "paper_runner" in caller or "paper/cli" in caller or "position_monitor" in caller:
-            return "paper"
-        if "shadow/runner" in caller or "shadow/backfill" in caller or "shadow/evaluator" in caller:
-            return "shadow"
-        if "analytics" in caller or "candle_sync" in caller:
-            return "analytics"
-        if "outcome_cli" in caller or "outcome" in caller:
-            return "outcome"
-        if "market_data" in caller:
-            return "market_data"
-        if "scanner/cli" in caller:
-            return "scanner_cli"
-        return "other"
+        return detect_service_tag(caller)
