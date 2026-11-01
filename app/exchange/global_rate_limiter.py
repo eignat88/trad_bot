@@ -318,7 +318,19 @@ class SystemClock:
 
 
 def current_boot_id() -> str:
-    """Stable per-boot identifier (POSIX); 'local' fallback elsewhere."""
+    """Stable per-boot identifier (POSIX); 'local' fallback elsewhere.
+
+    Phase 3F / D3 — documented Windows/dev limitation: Windows has no
+    stdlib per-boot identity (no ``/proc/sys/kernel/random/boot_id``
+    equivalent; ``wmic`` is deprecated/removed on Win11; a
+    ``GetTickCount64``-derived id would break existing state files written
+    with ``"local"`` by reconciling every in-flight record of a
+    mixed-version deployment as foreign-boot — an unsafe recovery). The
+    reboot dimension is therefore deliberately inert on Windows and F2
+    relies on the tri-state owner-PID check below. A Windows PID reused
+    after a crash can only DELAY reconciliation (fail-closed cleanup),
+    never free a live in-flight request.
+    """
     if os.name == "posix":
         try:
             with open("/proc/sys/kernel/random/boot_id",
@@ -329,18 +341,101 @@ def current_boot_id() -> str:
     return "local"
 
 
-def _pid_alive(pid: int) -> bool:
-    """Best-effort liveness. NEVER called with os.kill(pid, 0) on Windows
-    (that would TerminateProcess); TTL covers non-POSIX platforms."""
-    if os.name != "posix" or pid <= 0:
-        return True
+# ---------------------------------------------------------------- pid liveness
+# Phase 3F / D3: tri-state owner-liveness model.
+#   ALIVE    — the PID is (still) a running process.
+#   DEAD     — the PID is PROVABLY gone: the only state that may close an
+#              orphaned non-terminal grant (F2) or prune a foreign demand.
+#   UNKNOWN  — the check could not be performed. UNKNOWN is NEVER treated
+#              as DEAD: reconciliation waits instead of freeing a grant
+#              that may still back a live in-flight HTTP operation.
+PID_ALIVE = "alive"
+PID_DEAD = "dead"
+PID_UNKNOWN = "unknown"
+
+
+def _posix_pid_state(pid: int) -> str:
     try:
         os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True
+        return PID_ALIVE
+    except ProcessLookupError:            # ESRCH: no such process
+        return PID_DEAD
+    except PermissionError:               # EPERM: exists, foreign owner
+        return PID_ALIVE
+    except OSError:                       # exotic errno — not provable
+        return PID_UNKNOWN
+
+
+def _win_pid_state(pid: int) -> str:
+    """Windows tri-state via kernel32 (ctypes — stdlib only, no deps).
+
+    Phase 3F / D3: NEVER use ``os.kill(pid, 0)`` as a Windows liveness
+    probe — it maps to ``TerminateProcess`` and would KILL the target.
+    ``OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`` + exit-code check:
+      * OpenProcess → ERROR_INVALID_PARAMETER (87): no such PID → DEAD;
+      * OpenProcess → ERROR_ACCESS_DENIED (5): the PID exists but is
+        protected → ALIVE (conservative — never frees anything);
+      * GetExitCodeProcess == STILL_ACTIVE (259) → ALIVE (259 is also a
+        legitimate exit code — conservative);
+      * any other failure → UNKNOWN.
+    PID reuse after a crash can only turn a DEAD owner into ALIVE:
+    cleanup is delayed fail-closed, never wrongly granted.
+    """
+    if pid <= 0:
+        return PID_UNKNOWN
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except (ImportError, AttributeError):
+        return PID_UNKNOWN
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL,
+                                wintypes.DWORD)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.GetExitCodeProcess.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    k32.GetExitCodeProcess.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    k32.CloseHandle.restype = wintypes.BOOL
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    ERROR_ACCESS_DENIED = 5
+    ERROR_INVALID_PARAMETER = 87
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False,
+                             int(pid) & 0xFFFFFFFF)
+    if not handle:
+        err = ctypes.get_last_error()
+        if err == ERROR_INVALID_PARAMETER:
+            return PID_DEAD
+        if err == ERROR_ACCESS_DENIED:    # exists, not ours to query
+            return PID_ALIVE
+        return PID_UNKNOWN
+    try:
+        code = wintypes.DWORD()
+        if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return PID_UNKNOWN
+        return PID_ALIVE if code.value == STILL_ACTIVE else PID_DEAD
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _pid_state(pid: int) -> str:
+    """Tri-state owner liveness (D3). UNKNOWN ≠ DEAD, always."""
+    if pid <= 0:
+        return PID_UNKNOWN
+    if os.name == "posix":
+        return _posix_pid_state(pid)
+    return _win_pid_state(pid)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Fail-closed liveness: True unless the owner is PROVABLY DEAD.
+
+    UNKNOWN (Windows ACCESS_DENIED, exotic POSIX errno, pid <= 0) maps to
+    True — reconciliation must never free a grant while a live in-flight
+    HTTP operation remains possible (D3).
+    """
+    return _pid_state(pid) != PID_DEAD
 
 
 # ---------------------------------------------------------------- file locking
@@ -373,6 +468,24 @@ def _is_lock_conflict(exc: OSError) -> bool:
     if getattr(exc, "winerror", None) in (33, 36):   # Win8/lock violation
         return True
     return getattr(exc, "errno", None) in _LOCK_ERRNOS
+
+
+def _release_fh(fh: Any) -> None:
+    """Unlock + close a witness handle; never raises (best-effort cleanup).
+
+    Phase 3F / D2: single release path used whenever a grant transaction
+    fails to commit — the OS lock must not outlive the operation that
+    took it (an fd + lock leak would block probe resolution until the
+    process exits).
+    """
+    try:
+        _unlock(fh)
+    except OSError:
+        pass
+    try:
+        fh.close()
+    except OSError:
+        pass
 
 
 class _FileLock:
@@ -508,7 +621,10 @@ def _default_state(cfg: LimiterConfig, wall: float, boot: str) -> dict[str, Any]
             "probe": None,
         },
         "anomalies": {"unknown_grant": 0, "probe_stalled": 0,
-                      "pending_pruned": 0},
+                      "pending_pruned": 0,
+                      # Phase 3F / D1: live waiter re-registered after its
+                      # own pending record was pruned mid-wait.
+                      "pending_reregistered": 0},
     }
 
 
@@ -762,6 +878,8 @@ class GlobalBybitRateLimiter:
                 # jumps and reboots deliberately discard credit).
 
         # --- pending registry prune (TTL / foreign boot / dead owner).
+        # Owner-PID pruning is tri-state (D3): only PROVABLY DEAD pids
+        # prune here; UNKNOWN waits for the liveness TTL (fail-closed).
         for rid, entry in list(st["pending"].items()):
             dead = False
             if not isinstance(entry, dict):
@@ -808,8 +926,11 @@ class GlobalBybitRateLimiter:
             dirty = True
 
         # --- owner-death reconciliation for ORDINARY grants (F2).
-        # A provably dead owner (foreign boot, or POSIX pid gone) leaves a
-        # non-terminal record. Close it as a NEUTRAL terminal outcome:
+        # A provably dead owner (foreign boot, or a tri-state-provably
+        # DEAD owner PID — Windows included since D3; UNKNOWN, e.g.
+        # Windows ACCESS_DENIED or a reused PID, is NEVER dead here)
+        # leaves a non-terminal record. Close it as a NEUTRAL terminal
+        # outcome:
         #   * no durable send-marker  -> NOT_SENT  (prepare_send is the
         #     transport gate, so the attempt provably never left the process)
         #   * durable send-marker set -> UNKNOWN   (indeterminate — never
@@ -1039,22 +1160,24 @@ class GlobalBybitRateLimiter:
                     "marker": False,
                     "stalled": False,
                 }
-                self._witnesses[gid] = witness_fh
-                witness_fh = None
+                # Phase 3F / D2: deliberately NO ownership transfer here —
+                # the commit runs only when the transaction exits; the
+                # handle stays local and is registered by acquire() after
+                # a successful write (see the returned dict below).
             st["pending"].pop(req, None)
             self._set_dirty()
             return {"gid": gid, "epoch": int(st["epoch"]),
-                    "probe": bool(recovery)}
+                    "probe": bool(recovery),
+                    # Phase 3F / D2: witness ownership passes to the CALLER
+                    # with the result. The durable write has not happened
+                    # yet (it runs at the transaction's exit), so the
+                    # persistent mapping may only take it AFTER a
+                    # successful commit; on a write failure the caller
+                    # releases it (fail-closed, no fd/lock leak).
+                    "witness_fh": witness_fh}
         except BaseException:
             if witness_fh is not None:       # never leak a held witness
-                try:
-                    _unlock(witness_fh)
-                except OSError:
-                    pass
-                try:
-                    witness_fh.close()
-                except OSError:
-                    pass
+                _release_fh(witness_fh)
             raise
 
     # ---------------------------------------------------------------- helpers
@@ -1122,6 +1245,18 @@ class GlobalBybitRateLimiter:
         # instead of a register-write + grant-write convoy (each fsync can
         # stall every other process behind the lock).
         registered = False
+        # Phase 3F / D1: the ORIGINAL FIFO anchor of this demand. It is
+        # captured at first registration and reused if the shared record is
+        # pruned mid-wait (clock step / liveness expiry), so a re-registered
+        # waiter keeps its true arrival position and never displaces a
+        # request that registered before it.
+        first_reg_wall: float | None = None
+        # Phase 3F / D2: the in-flight grant result and its witness handle
+        # (recovery probes only). Ownership of the handle stays LOCAL until
+        # the grant transaction commits; both error paths below release it
+        # so a failed durable write can never leak an fd + OS lock.
+        res: dict[str, Any] | None = None
+        witness_fh: Any = None
         try:
             for _ in range(cfg.loop_iter_cap):
                 now = self.clock.mono()
@@ -1142,6 +1277,8 @@ class GlobalBybitRateLimiter:
                         retry_after_ms=retry_after, reason="deadline")
 
                 hint: float | None = None
+                res = None                  # D2: per-iteration locals — a
+                witness_fh = None           # committed grant always returns
                 try:
                     with self._transaction(write=True) as st:
                         self._refresh(st)
@@ -1165,6 +1302,11 @@ class GlobalBybitRateLimiter:
                             }
                             self._set_dirty()
                             registered = True
+                            # Phase 3F / D1: the FIFO anchor of THIS waiter,
+                            # captured on first successful registration; used
+                            # for a safe re-registration if the shared record
+                            # is pruned mid-wait (see the else-branch below).
+                            first_reg_wall = now_wall
                         else:
                             # F5 shared-state reconciliation: renew an
                             # already-registered demand before its liveness
@@ -1174,8 +1316,58 @@ class GlobalBybitRateLimiter:
                             # failed / owner idle) is pruned by other
                             # processes within liveness, not the full TTL.
                             entry = st["pending"].get(req)
-                            if entry is not None:
-                                now_wall = self.clock.wall()
+                            now_wall = self.clock.wall()
+                            if entry is None:
+                                # Phase 3F / D1: OUR OWN record was pruned
+                                # mid-wait (forward wall-clock step past the
+                                # liveness window, prune race with another
+                                # process, leaked-drop self-heal) while this
+                                # waiter is provably alive inside the SAME
+                                # acquire() call. Re-register under the SAME
+                                # request identity (same req key — a duplicate
+                                # is impossible) anchored to the ORIGINAL
+                                # first_reg_wall: the waiter keeps its true
+                                # arrival position instead of being demoted
+                                # behind requests that arrived during the
+                                # gap, and no earlier-arriving request is
+                                # displaced (their registered_wall is still
+                                # smaller). The monotonic deadline is never
+                                # touched, and the hard demand-TTL cap stays
+                                # anchored at the ORIGINAL registration, so a
+                                # stale demand (forward wall jump past the
+                                # TTL / rollback re-baseline) is NOT restored.
+                                anchor = first_reg_wall \
+                                    if first_reg_wall is not None else now_wall
+                                if now_wall - anchor >= cfg.demand_ttl_s:
+                                    # demand outlived its hard wall TTL
+                                    # mid-wait: stale demand must not be
+                                    # resurrected — drop it fail-closed.
+                                    self._drop_locked(st, req)
+                                    return GrantOutcome(
+                                        GrantResult.SKIPPED,
+                                        waited_ms=int((now - t0) * 1000),
+                                        reason="demand_expired")
+                                if len(st["pending"]) >= cfg.pending_capacity:
+                                    raise LimiterUnavailableError(
+                                        "pending_capacity")
+                                st["pending"][req] = {
+                                    "prio": priority,
+                                    "pid": os.getpid(),
+                                    "boot_id": current_boot_id(),
+                                    "registered_wall": anchor,
+                                    # hard cap anchored at the ORIGINAL
+                                    # registration; liveness renewed from now
+                                    "expire_wall": min(
+                                        anchor + cfg.demand_ttl_s,
+                                        now_wall
+                                        + cfg.pending_liveness_ttl_s),
+                                    "lrid": str(logical_request_id)[:64],
+                                }
+                                st["anomalies"]["pending_reregistered"] = (
+                                    st["anomalies"].get(
+                                        "pending_reregistered", 0) + 1)
+                                self._set_dirty()
+                            else:
                                 exp = float(entry.get("expire_wall", 0.0))
                                 if exp - now_wall < \
                                         cfg.pending_liveness_ttl_s / 2.0:
@@ -1211,17 +1403,39 @@ class GlobalBybitRateLimiter:
                         else:
                             res = self._try_grant(st, priority, req)
                             if res is not None:
-                                return GrantOutcome(
-                                    GrantResult.GRANTED,
-                                    grant_id=res["gid"],
-                                    epoch=res["epoch"],
-                                    waited_ms=int((self.clock.mono() - t0)
-                                                  * 1000),
-                                    probe=res["probe"],
-                                    reason=("recovery_probe" if res["probe"]
-                                            else "granted"))
-                            hint = self._wait_hint(st, priority)
+                                # Phase 3F / D2: take the witness handle out
+                                # of the result; ownership stays local until
+                                # the transaction below has committed.
+                                witness_fh = res.pop("witness_fh", None)
+                            else:
+                                hint = self._wait_hint(st, priority)
+                    # ---- durable commit reached (with-block exited
+                    # cleanly). A write failure instead raises
+                    # LimiterUnavailableError from the transaction's exit
+                    # and is handled by the except below. ----
+                    if res is not None:
+                        if witness_fh is not None:
+                            # transfer to the persistent mapping ONLY now
+                            # that the probe record is durable (D2); after
+                            # a failed write the handle is released below.
+                            self._witnesses[res["gid"]] = witness_fh
+                            witness_fh = None
+                        return GrantOutcome(
+                            GrantResult.GRANTED,
+                            grant_id=res["gid"],
+                            epoch=res["epoch"],
+                            waited_ms=int((self.clock.mono() - t0) * 1000),
+                            probe=res["probe"],
+                            reason=("recovery_probe" if res["probe"]
+                                    else "granted"))
                 except LimiterUnavailableError as exc:
+                    if witness_fh is not None:
+                        # Phase 3F / D2: the grant transaction did NOT
+                        # commit (fsync/replace failed) — release the
+                        # witness this attempt acquired; the probe record
+                        # is not durable, so no slot semantics change.
+                        _release_fh(witness_fh)
+                        witness_fh = None
                     self._drop(req)
                     return self._unavailable(exc, t0)
 
@@ -1250,6 +1464,12 @@ class GlobalBybitRateLimiter:
         except BaseException:
             # Any unexpected failure: fail-closed, never leave our demand
             # registered (TTL is the backstop).
+            if witness_fh is not None:
+                # Phase 3F / D2: release an acquired-but-uncommitted witness
+                # before unwinding (ownership never reached the persistent
+                # mapping on this path).
+                _release_fh(witness_fh)
+                witness_fh = None
             self._drop(req)
             raise
 

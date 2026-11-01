@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 
@@ -36,6 +38,11 @@ from app.exchange.global_rate_limiter import (
     GlobalBybitRateLimiter,
     LimiterConfig,
 )
+
+# Phase 3F / D3: a PID above every platform's allocation range (Linux
+# pid_max ≤ 2^22, macOS maxpid 99998, Windows allocates far below) —
+# provably nonexistent on all of them.
+DEAD_PID = 99_999_999
 
 
 class FakeClock:
@@ -591,16 +598,84 @@ def test_pending_ttl_foreign_boot_and_dead_pid_prune(tmp_path):
         st["pending"]["expired"] = entry(-1.0, boot, pid)
         st["pending"]["foreign"] = entry(120.0, "other-boot", pid)
         st["pending"]["alive"] = entry(120.0, boot, pid)
-        if os.name == "posix":
-            st["pending"]["dead"] = entry(120.0, boot, 99_999_999)
+        # D3: dead-owner pruning now probes the PID on EVERY platform
+        # (Windows included — tri-state model, only PROVABLY DEAD prunes)
+        st["pending"]["dead"] = entry(120.0, boot, DEAD_PID)
         lim._set_dirty()
 
     snap = lim.refresh()
     # only the live same-boot owner survives: expired + foreign-boot are
-    # always pruned; on POSIX the dead pid goes as well (it is never
-    # inserted on Windows, where pid probing is unsupported)
+    # always pruned, and the dead pid goes as well on POSIX and Windows
     assert snap["pending_count"] == 1
-    assert snap["anomalies"]["pending_pruned"] >= 2
+    assert snap["anomalies"]["pending_pruned"] >= 3
+
+
+# =====================================================================
+# Phase 3F / D1: live waiter re-registers after a mid-wait pending prune
+# =====================================================================
+def test_pending_pruned_mid_wait_reregisters_with_original_anchor(tmp_path):
+    """D1 regression: a +20 s forward wall-clock set during the wait pushes
+    the waiter's liveness window (15 s) into the past, so `_refresh` prunes
+    its OWN pending record while the acquire loop is still alive. The loop
+    must re-register under the SAME request identity with the ORIGINAL
+    FIFO anchor (registered_wall == first registration), keep the original
+    monotonic deadline (waited_ms counts monotonic time only) and still be
+    granted — without minting tokens (the +20 s step is above the 10 s
+    clock-step cap here, so it re-baselines without credit)."""
+
+    class JumpOnSleepClock(FakeClock):
+        """FakeClock that simulates an external wall-clock set on the 1st
+        sleep and records the shared pending registry on the 2nd."""
+
+        def __init__(self, state_path, **kw):
+            super().__init__(**kw)
+            self.state_path = state_path
+            self.sleeps = 0
+            self.pending_after_reregister = None
+
+        def sleep(self, seconds: float) -> None:
+            self.sleeps += 1
+            if self.sleeps == 1:
+                self.jump(20.0)               # wall set mid-wait (mono kept)
+            elif self.sleeps == 2:
+                with open(self.state_path, encoding="utf-8") as fh:
+                    self.pending_after_reregister = json.load(fh)["pending"]
+                seconds = 3.0                 # let one token accrue
+            super().sleep(seconds)
+
+    clock = JumpOnSleepClock(tmp_path / "state.json")
+    lim = _lim(tmp_path, clock, g_rps=1.0, burst=1.0,
+               clock_step_cap_s=10.0)
+    t_start_wall = clock.wall()
+
+    # drain the single token so the 2nd acquire must wait
+    assert lim.acquire("P0", deadline=clock.mono() + 5.0).granted
+    out = lim.acquire("P0", deadline=clock.mono() + 25.0)
+
+    # the waiter survived the prune: re-registered and granted
+    assert out.granted, out
+    assert out.reason == "granted"
+    # monotonic deadline untouched: waited_ms counts mono time only
+    # (~3.05 fake-s), NOT the +20 s wall step
+    assert 3000 <= out.waited_ms <= 3500, out.waited_ms
+
+    # the restore kept the ORIGINAL FIFO anchor (first registration wall),
+    # not the post-jump wall — so it never displaces earlier waiters and
+    # is not demoted behind requests that arrived during the gap
+    pend = clock.pending_after_reregister
+    assert pend is not None and len(pend) == 1, pend
+    (entry,) = pend.values()
+    assert entry["registered_wall"] == t_start_wall
+    assert entry["pid"] == os.getpid()
+
+    snap = lim.snapshot()
+    assert snap["pending_count"] == 0              # consumed by the grant
+    assert snap["anomalies"]["pending_pruned"] >= 1
+    assert snap["anomalies"]["pending_reregistered"] >= 1
+    assert snap["total_grants"] == 2
+    # exact token identity: no token minted by the +20 s step (cap = 10 s)
+    assert snap["tokens"] == pytest.approx(
+        1.0 + snap["refill_total"] - snap["total_grants"])
 
 
 # =====================================================================
@@ -782,6 +857,71 @@ def test_dead_owner_grant_reconciled_bounded(tmp_path):
     assert lim.snapshot()["grants_count"] == 1         # only our live grant
 
 
+# =====================================================================
+# Phase 3F / D3: tri-state owner liveness (Windows orphan grants)
+# =====================================================================
+def test_f2_dead_pid_same_boot_reconciled(tmp_path):
+    """D3 regression: a SAME-boot grant whose owner PID is provably DEAD
+    (Windows tri-state included — the former Windows orphan case) closes
+    to NOT_SENT instead of leaking a non-terminal record forever."""
+    assert grl._pid_state(DEAD_PID) == grl.PID_DEAD   # platform truth
+    clock = FakeClock()
+    lim = _lim(tmp_path, clock)
+    with lim._transaction(write=True) as st:
+        st["grants"]["e1:910"] = {
+            "prio": "P0", "issued_wall": clock.wall(), "outcome": None,
+            "probe": False, "pid": DEAD_PID,
+            "boot_id": grl.current_boot_id(), "sent": False}
+        lim._set_dirty()
+    lim.refresh()
+    assert lim.grant_outcome("e1:910") == "NOT_SENT"
+    assert lim.snapshot()["success_streak"] == 0       # neutral close
+
+
+def test_f2_alive_pid_grant_never_freed(tmp_path):
+    """D3: a grant owned by a LIVE foreign process (in-flight HTTP) is
+    never reconciled — ALIVE must not be freed on any platform."""
+    child = subprocess.Popen([sys.executable, "-c",
+                              "import time; time.sleep(60)"])
+    try:
+        assert grl._pid_state(child.pid) == grl.PID_ALIVE
+        clock = FakeClock()
+        lim = _lim(tmp_path, clock)
+        with lim._transaction(write=True) as st:
+            st["grants"]["e1:911"] = {
+                "prio": "P0", "issued_wall": clock.wall(), "outcome": None,
+                "probe": False, "pid": child.pid,
+                "boot_id": grl.current_boot_id(), "sent": False}
+            lim._set_dirty()
+        lim.refresh()
+        assert lim.grant_outcome("e1:911") is None     # in-flight protected
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+
+
+def test_f2_unknown_pid_owner_never_reconciled(tmp_path, monkeypatch):
+    """D3: UNKNOWN liveness is NEVER treated as DEAD (fail-closed); once
+    the very same owner becomes provably DEAD, reconciliation proceeds."""
+    backend = ("_win_pid_state" if os.name == "nt" else "_posix_pid_state")
+    monkeypatch.setattr(grl, backend, lambda pid: grl.PID_UNKNOWN)
+    assert grl._pid_state(DEAD_PID) == grl.PID_UNKNOWN
+    assert grl._pid_alive(DEAD_PID) is True           # UNKNOWN ≠ DEAD
+    clock = FakeClock()
+    lim = _lim(tmp_path, clock)
+    with lim._transaction(write=True) as st:
+        st["grants"]["e1:912"] = {
+            "prio": "P0", "issued_wall": clock.wall(), "outcome": None,
+            "probe": False, "pid": DEAD_PID,
+            "boot_id": grl.current_boot_id(), "sent": False}
+        lim._set_dirty()
+    lim.refresh()
+    assert lim.grant_outcome("e1:912") is None         # NOT freed while unknown
+    monkeypatch.undo()
+    lim.refresh()
+    assert lim.grant_outcome("e1:912") == "NOT_SENT"   # provably gone → closed
+
+
 # ---------------------------------------------------------------- F3
 def test_record_result_transient_write_failure_retries(tmp_path, monkeypatch):
     """F3: a transient fsync failure is retried and applied (no HTTP)."""
@@ -862,6 +1002,59 @@ def test_record_result_failure_keeps_probe_slot_held(tmp_path, monkeypatch):
     assert lim.record_result(p.grant_id, "P0", "OK", epoch=p.epoch) == "APPLIED"
     assert lim.snapshot()["probe"] is None
     assert lim.snapshot()["success_streak"] == 1
+
+
+def test_probe_grant_write_failure_releases_witness(tmp_path, monkeypatch):
+    """D2: a durable-write failure while persisting the recovery-probe
+    grant must release/close the probe witness — no fd + OS-lock leak
+    until process exit — while staying FAIL_CLOSED with no partial state."""
+    clock = FakeClock()
+    lim = _lim(tmp_path, clock, breaker_cooldowns_s=(0.05, 0.1, 0.2))
+    g1 = lim.acquire("P0", deadline=clock.mono() + 5.0)
+    assert lim.record_result(g1.grant_id, "P0", "RATE_LIMIT",
+                             epoch=g1.epoch) == "APPLIED"
+    clock.advance(0.06)                    # OPEN cooldown elapses → RECOVERY
+
+    # inject the failure ONLY into the write that would persist the probe
+    # grant record (every other write goes through unchanged)
+    real_write = lim._write_state
+
+    def boom(st):
+        if isinstance(st.get("breaker", {}).get("probe"), dict):
+            raise grl.LimiterUnavailableError("write_failed")
+        return real_write(st)
+
+    monkeypatch.setattr(lim, "_write_state", boom)
+    out = lim.acquire("P0", deadline=clock.mono() + 2.0)
+    assert out.result is GrantResult.STATE_UNAVAILABLE
+    assert out.reason == "write_failed"          # FAIL_CLOSED, no fallback
+
+    # the failed attempt must not own the witness anymore …
+    assert lim._witnesses == {}
+    # … and its OS lock must be free: a lock conflict is detectable even
+    # from this process (flock/msvcrt conflict across separate handles)
+    wfiles = list(tmp_path.glob("*.witness"))
+    assert len(wfiles) == 1                       # created, never unlinked
+    assert wfiles[0].exists()
+    assert lim._witness_alive(wfiles[0].name) is False
+
+    # the failed transaction left no partial state behind: the probe
+    # record was NEVER persisted (atomic replace), and the breaker's
+    # OPEN→RECOVERY transition landed through the fail-closed drop path
+    snap = lim.snapshot()
+    assert snap["available"] is True
+    assert snap["state"] == "RECOVERY"
+    assert snap["level"] == 1
+    assert snap["probe"] is None
+
+    # recovery still works once the write path is healthy again
+    monkeypatch.undo()
+    p = lim.acquire("P0", deadline=clock.mono() + 2.0)
+    assert p.granted and p.probe
+    assert p.grant_id in lim._witnesses           # ownership after commit
+    assert lim.record_result(p.grant_id, "P0", "OK", epoch=p.epoch) == "APPLIED"
+    assert lim.snapshot()["probe"] is None
+    assert lim._witnesses == {}                   # released after terminal
 
 
 # ---------------------------------------------------------------- F4
