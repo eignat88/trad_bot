@@ -105,7 +105,13 @@ from enum import Enum
 from typing import Any, Iterator
 from uuid import uuid4
 
-from app.config.settings import parse_strict_bool_flag
+from app.config.settings import (
+    parse_strict_bool_flag,
+    parse_strict_number,
+    parse_strict_number_sequence,
+    parse_strict_text,
+    resolve_limiter_state_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +226,20 @@ class LimiterConfig:
     record_retry_backoff_s: float = 0.05
 
     def __post_init__(self) -> None:
+        # Issue 231 R2 — state-path safety: the SHARED state path is never
+        # cwd-relative. A relative value is anchored at the repository root
+        # (deterministic, independent of the process WorkingDirectory —
+        # see settings.resolve_limiter_state_path) so every service process
+        # resolves the SAME state/lock/witness files regardless of where it
+        # was started from; empty/non-string paths are rejected with an
+        # explicit configuration error. Purely lexical: no I/O here.
+        object.__setattr__(
+            self,
+            "state_path",
+            resolve_limiter_state_path(
+                parse_strict_text(self.state_path, "global_limiter_state_path")
+            ),
+        )
         if self.g_rps <= 0:
             raise ValueError("g_rps must be positive")
         if self.burst < 1:
@@ -270,47 +290,101 @@ class LimiterConfig:
 
     @classmethod
     def from_settings(cls, settings: Any = None) -> "LimiterConfig":
-        """Read config defensively; production Settings knows none of these
-        keys yet ⇒ default-off (no production configuration is modified).
+        """Read the limiter configuration contract defensively.
 
         Issue 231 R1 (strict boolean gate): ``enabled`` is resolved with
         ``parse_strict_bool_flag`` — a missing flag means ``False`` and only
         a real Python ``bool`` is accepted. Strings (``"false"``), numbers
         (``0``), ``None`` and other types raise an explicit configuration
-        error instead of being coerced by ``bool(...)``. Every other limiter
-        parameter keeps its existing defensive default conversion.
+        error instead of being coerced by ``bool(...)``.
+
+        Issue 231 R2 (deterministic config contract): every
+        ``global_limiter_*`` parameter is parsed STRICTLY — wrong types
+        (strings, booleans, null, containers), NaN/Infinity and
+        out-of-range values raise an explicit ``ValueError`` here, before
+        any shared-state file is opened and before any HTTP could be sent.
+        The two-factor ENV activation gate (permission in the config file +
+        explicit ``GLOBAL_BYBIT_RATE_LIMITER_ENABLED``) is applied earlier,
+        in ``load_settings()``; this method only sees the resolved flag.
+
+        State path (Issue 231 R2): non-empty text, anchored to the
+        repository root when relative (never the process WorkingDirectory),
+        and — when the limiter is ENABLED in live (production) trading
+        mode — an explicitly ABSOLUTE path is required so production never
+        depends on where the service was started from.
         """
+
         def get(name: str, default: Any) -> Any:
             return getattr(settings, name, default) if settings is not None \
                 else default
 
-        cooldowns = get("global_limiter_breaker_cooldowns_s",
-                        DEFAULT_COOLDOWNS_S)
+        enabled = parse_strict_bool_flag(
+            get("global_bybit_rate_limiter_enabled", False),
+            "global_bybit_rate_limiter_enabled")
+        state_path = parse_strict_text(
+            get("global_limiter_state_path", DEFAULT_STATE_PATH),
+            "global_limiter_state_path")
+        if enabled and \
+                str(get("trading_mode", "paper")).strip().lower() == "live" and \
+                not os.path.isabs(os.path.normpath(state_path)):
+            raise ValueError(
+                "global_limiter_state_path must be an absolute path when "
+                "the global Bybit rate limiter is enabled in live "
+                f"(production) trading mode; got relative {state_path!r}. "
+                "Point it at a shared absolute location (e.g. "
+                "/var/lib/trad_bot/state/...) writable by every service "
+                "user."
+            )
+        lock_timeout_s = parse_strict_number(
+            get("global_limiter_lock_timeout_s", 5.0),
+            "global_limiter_lock_timeout_s")
+        if lock_timeout_s <= 0:
+            raise ValueError("global_limiter_lock_timeout_s must be positive")
+        probe_lease_s = parse_strict_number(
+            get("global_limiter_probe_lease_s", 30.0),
+            "global_limiter_probe_lease_s")
+        if probe_lease_s <= 0:
+            raise ValueError("global_limiter_probe_lease_s must be positive")
+        cooldowns = parse_strict_number_sequence(
+            get("global_limiter_breaker_cooldowns_s", DEFAULT_COOLDOWNS_S),
+            "global_limiter_breaker_cooldowns_s")
         return cls(
-            enabled=parse_strict_bool_flag(
-                get("global_bybit_rate_limiter_enabled", False),
-                "global_bybit_rate_limiter_enabled"),
-            state_path=str(get("global_limiter_state_path",
-                               DEFAULT_STATE_PATH)),
-            g_rps=float(get("global_limiter_g_rps", DEFAULT_G_RPS)),
-            burst=float(get("global_limiter_burst", DEFAULT_BURST)),
-            lock_timeout_s=float(get("global_limiter_lock_timeout_s", 5.0)),
-            demand_ttl_s=float(get("global_limiter_demand_ttl_s", 120.0)),
-            breaker_cooldowns_s=tuple(float(c) for c in cooldowns),
-            recovery_success_target=int(
+            enabled=enabled,
+            state_path=state_path,       # normalised by __post_init__
+            g_rps=parse_strict_number(
+                get("global_limiter_g_rps", DEFAULT_G_RPS),
+                "global_limiter_g_rps"),
+            burst=parse_strict_number(
+                get("global_limiter_burst", DEFAULT_BURST),
+                "global_limiter_burst"),
+            lock_timeout_s=lock_timeout_s,
+            demand_ttl_s=parse_strict_number(
+                get("global_limiter_demand_ttl_s", 120.0),
+                "global_limiter_demand_ttl_s"),
+            breaker_cooldowns_s=cooldowns,
+            recovery_success_target=parse_strict_number(
                 get("global_limiter_recovery_success_target",
-                    RECOVERY_SUCCESS_TARGET)),
-            probe_lease_s=float(get("global_limiter_probe_lease_s", 30.0)),
-            registry_capacity=int(get("global_limiter_registry_capacity",
-                                      8192)),
-            max_lifetime_s=float(get("global_limiter_max_lifetime_s", 60.0)),
-            max_wait_s=float(get("global_limiter_max_wait_s", 30.0)),
-            pending_liveness_ttl_s=float(
-                get("global_limiter_pending_liveness_ttl_s", 15.0)),
-            record_retry_attempts=int(
-                get("global_limiter_record_retry_attempts", 3)),
-            record_retry_backoff_s=float(
-                get("global_limiter_record_retry_backoff_s", 0.05)),
+                    RECOVERY_SUCCESS_TARGET),
+                "global_limiter_recovery_success_target", integer=True),
+            probe_lease_s=probe_lease_s,
+            registry_capacity=parse_strict_number(
+                get("global_limiter_registry_capacity", 8192),
+                "global_limiter_registry_capacity", integer=True),
+            max_lifetime_s=parse_strict_number(
+                get("global_limiter_max_lifetime_s", 60.0),
+                "global_limiter_max_lifetime_s"),
+            max_wait_s=parse_strict_number(
+                get("global_limiter_max_wait_s", 30.0),
+                "global_limiter_max_wait_s"),
+            pending_liveness_ttl_s=parse_strict_number(
+                get("global_limiter_pending_liveness_ttl_s", 15.0),
+                "global_limiter_pending_liveness_ttl_s"),
+            record_retry_attempts=parse_strict_number(
+                get("global_limiter_record_retry_attempts", 3),
+                "global_limiter_record_retry_attempts", integer=True),
+            record_retry_backoff_s=parse_strict_number(
+                get("global_limiter_record_retry_backoff_s", 0.05),
+                "global_limiter_record_retry_backoff_s"),
         )
 
 
