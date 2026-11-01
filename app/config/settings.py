@@ -119,6 +119,13 @@ class Settings:
     bybit_retry_storm_max_share: float = 0.5     # retry share cap per window
     bybit_order_resubmit_block_s: float = 60.0   # LEGACY (review #5709376849): kept for config rollback compatibility only; no longer releases the submit block (UNKNOWN is never timer-released)
     bybit_order_submit_journal_path: str = ""    # persistent order-submit state (restart recovery); empty = retry_budget.ORDER_JOURNAL_DEFAULT_PATH
+    # GLOBAL_BYBIT_RATE_LIMITER_V1 (Issue 231 Phase 4) — shared cross-process
+    # token bucket. DEFAULT-OFF: when false the BybitClient GET/POST paths
+    # keep their exact Issue #229 behavior and touch no shared limiter state
+    # (zero I/O). When true both paths gate every HTTP attempt through the
+    # shared limiter (acquire → prepare_send → send → record_result) with
+    # FAIL_CLOSED semantics on any limiter deny/error.
+    global_bybit_rate_limiter_enabled: bool = False
     scanner_workers: int = 5
     scan_interval: int = 300
     # OOS evaluator interval in scanner cycles (default 12 = every 60 minutes
