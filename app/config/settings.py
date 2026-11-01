@@ -125,6 +125,8 @@ class Settings:
     # (zero I/O). When true both paths gate every HTTP attempt through the
     # shared limiter (acquire → prepare_send → send → record_result) with
     # FAIL_CLOSED semantics on any limiter deny/error.
+    # Issue 231 R1: STRICT boolean — load_settings() accepts only literal
+    # true/false (missing → False); strings/numbers/null raise ValueError.
     global_bybit_rate_limiter_enabled: bool = False
     scanner_workers: int = 5
     scan_interval: int = 300
@@ -531,6 +533,28 @@ def _parse_bool_env(value: str, env_name: str) -> bool:
     )
 
 
+def parse_strict_bool_flag(value: Any, name: str) -> bool:
+    """Strict interpretation of a safety-critical boolean config flag.
+
+    Issue 231 R1 (strict boolean gate): only Python ``bool`` values
+    (``True`` / ``False``) are accepted. The caller resolves a MISSING flag
+    to its default (``False`` for default-off flags) before calling this
+    helper, so "absent" is never an error. Strings (``"true"`` / ``"false"``
+    / ``"1"``), numbers (``1`` / ``0``), ``None`` and any other type raise
+    an explicit configuration error instead of being coerced: ``bool("false")``
+    is ``True`` and ``bool(0)`` silently flips the flag, which could enable
+    or disable a fail-closed safety feature without anyone noticing.
+    """
+    if isinstance(value, bool):
+        return value
+    raise ValueError(
+        f"{name} must be a Python bool (true or false); "
+        f"got {type(value).__name__} {value!r}. "
+        "Strings, numbers, null and other types are rejected so the flag "
+        "stays fail-closed instead of being coerced."
+    )
+
+
 def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env") -> Settings:
     _load_dotenv(Path(env_file))
     raw: dict[str, Any] = {}
@@ -612,6 +636,15 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
             dca_values = {"enabled": _parse_bool_env(dca_enabled_env, "DCA_ENABLED")}
             dca_source = "env"
             values["dca"] = DCASettings(**dca_values)
+    # GLOBAL_BYBIT_RATE_LIMITER_V1 (Issue 231 R1): STRICT boolean gate.
+    # Missing flag → False (default-off); only literal JSON/YAML booleans
+    # are accepted; strings/numbers/null raise an explicit configuration
+    # error instead of being coerced (bool("false") would silently enable
+    # the shared limiter). No other limiter parameter is touched here.
+    values["global_bybit_rate_limiter_enabled"] = parse_strict_bool_flag(
+        values.get("global_bybit_rate_limiter_enabled", False),
+        "global_bybit_rate_limiter_enabled",
+    )
     settings = Settings(**values)
     # Expose the DCA config source via module-level variable.
     # Used by paper_runner for startup logging.
