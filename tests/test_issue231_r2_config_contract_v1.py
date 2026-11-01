@@ -323,6 +323,20 @@ def test_registry_capacity_must_cover_g_times_lifetime(tmp_path):
         _load(tmp_path, {"global_limiter_g_rps": 100.0})
 
 
+@pytest.mark.parametrize("bad_ttl", [0.0, -5.0], ids=["zero", "negative"])
+def test_direct_limiter_config_rejects_non_positive_demand_ttl(bad_ttl):
+    """Direct LimiterConfig construction path (defense in depth).
+
+    load_settings() routes every range check through
+    LimiterConfig.__post_init__(); this covers the other entry point — a
+    hand-built LimiterConfig — which must reject the same non-positive
+    pending-demand TTL instead of letting _refresh() prune every
+    registered demand on its next pass.
+    """
+    with pytest.raises(ValueError, match="demand_ttl_s"):
+        LimiterConfig(demand_ttl_s=bad_ttl)
+
+
 def test_valid_custom_parameters_roundtrip(tmp_path):
     """A fully specified, in-range configuration loads and maps 1:1 onto
     the LimiterConfig fields consumed by the core."""

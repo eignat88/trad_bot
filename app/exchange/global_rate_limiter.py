@@ -256,6 +256,15 @@ class LimiterConfig:
             raise ValueError("max_lifetime_s must be positive")
         if self.max_wait_s <= 0:
             raise ValueError("max_wait_s must be positive")
+        # Pending-registry TTLs must be positive: a registered demand
+        # expires at registration + demand_ttl_s (see _refresh), so a
+        # non-positive TTL would prune EVERY pending entry on the next
+        # refresh — waiters could never be served (pending/fairness
+        # contract broken). This was the only TTL knob without a range
+        # check; load_settings() surfaces it as an explicit ValueError
+        # before any HTTP (Issue 231 R2 demand-TTL validation fix).
+        if self.demand_ttl_s <= 0:
+            raise ValueError("demand_ttl_s must be positive")
         if self.pending_liveness_ttl_s <= 0:
             raise ValueError("pending_liveness_ttl_s must be positive")
         if self.record_retry_attempts < 1:
