@@ -266,6 +266,90 @@ def _is_rate_limit(ret_msg: str) -> bool:
     return retry_budget.is_rate_limit_result(0, ret_msg)
 
 
+# ---------------------------------------------------------------------------
+# Shared cross-process limiter bridge (GLOBAL_BYBIT_RATE_LIMITER_V1, Phase 4)
+# ---------------------------------------------------------------------------
+
+#: The agreed single-order execution budget for POST /v5/order/create: it is
+#: BOTH the HTTP send timeout AND the bound on the shared P0 ``acquire`` wait.
+#: Passing ``deadline=None`` to ``acquire`` would instead cap the wait at the
+#: limiter's generic ``max_wait_s`` (30 s), letting a saturated bucket or an
+#: open breaker stall an order well past the execution timeout. Bounding the
+#: acquire with the same envelope guarantees ``limiter wait <= execution
+#: timeout`` and keeps the order delay acceptable (fail-closed past it).
+_ORDER_EXECUTION_TIMEOUT_S = 10.0
+
+
+def _limiter_skip_label(grant: Any) -> str:
+    """Secret-free telemetry label for a shared-limiter deny (``BYBIT_API_SKIP``).
+
+    Only the grant's result enum, reason code and queue-wait are surfaced —
+    never exception text or any secret. ``queue wait`` (``waited_ms``) is the
+    time ``acquire`` spent waiting for a token / breaker cooldown, which is
+    the figure ops needs when a request is deferred by the shared limiter.
+    """
+    result = getattr(grant, "result", None)
+    label = getattr(result, "value", str(result or ""))
+    reason = getattr(grant, "reason", "") or ""
+    parts = [f"limiter={label}"]
+    if reason:
+        parts.append(f"reason={reason}")
+    waited = getattr(grant, "waited_ms", None)
+    if waited:
+        parts.append(f"queue_wait_ms={waited}")
+    return " ".join(parts)
+
+
+def _limiter_outcome_for_class(classification: str) -> str:
+    """Map a ``retry_budget`` classification to a shared-limiter outcome.
+
+    The limiter's ``record_result`` accepts only {OK, RATE_LIMIT, TIMEOUT,
+    AUTH, ERROR, NOT_SENT, REVOKED}; every terminal non-rate-limit class maps
+    to ``ERROR`` so it stays NEUTRAL for the breaker (never re-trips it).
+    """
+    if classification == retry_budget.CLASS_OK:
+        return "OK"
+    if classification == retry_budget.CLASS_RATE_LIMIT:
+        return "RATE_LIMIT"
+    if classification == retry_budget.CLASS_TIMEOUT:
+        return "TIMEOUT"
+    if classification == retry_budget.CLASS_ACCESS_DENIED:
+        return "AUTH"
+    # API_ERROR / HTTP_ERROR / PAYLOAD_ERROR / TRANSPORT_ERROR: terminal,
+    # never a rate limit → neutral (ERROR) for the breaker accounting.
+    return "ERROR"
+
+
+def _limiter_outcome_for_exception(exc: BaseException) -> str:
+    """Map an exception raised by the request path to a limiter outcome.
+
+    ``HTTP 429`` (delivered as a raised ``HTTPError``) is a rate limit;
+    ``401/403`` is an auth denial; everything else is a terminal non-rate-limit
+    outcome so it can never re-trip the shared breaker.
+    """
+    if isinstance(exc, BybitAuthError):
+        return "AUTH"
+    if isinstance(exc, BybitRateLimitError):
+        return "RATE_LIMIT"
+    if isinstance(exc, BybitTimeoutError):
+        return "TIMEOUT"
+    if isinstance(exc, BybitOrderUncertainError):
+        # Indeterminate POST: terminal, never a rate limit (neutral).
+        return "ERROR"
+    if isinstance(exc, HTTPError):
+        status = _response_status(exc)
+        if status == 429:
+            return "RATE_LIMIT"
+        if status in (401, 403):
+            return "AUTH"
+        return "ERROR"
+    if isinstance(exc, URLError):
+        return "ERROR"          # transport failure: terminal, not a rate limit
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return "TIMEOUT"
+    return "ERROR"
+
+
 class _Response:
     def __init__(self, response):
         self._response = response
@@ -322,6 +406,9 @@ class BybitClient:
     def __init__(self, settings: Settings, session: Any | None = None):
         self.settings = settings
         self.session = session or _UrlSession()
+        # GLOBAL_BYBIT_RATE_LIMITER_V1 (Phase 4): lazily-built shared limiter
+        # (None until the default-off flag is enabled AND a request needs it).
+        self._shared_limiter_obj: Any = None
         self._ensure_global_limiter()
 
     @classmethod
@@ -344,6 +431,35 @@ class BybitClient:
         cls._ensure_global_limiter()
         assert cls._global_limiter is not None
         return cls._global_limiter
+
+    # ------------------------------------------- shared cross-process limiter
+    def _limiter_enabled(self) -> bool:
+        """True only when the default-off Phase 4 flag is switched on."""
+        return bool(getattr(
+            self.settings, "global_bybit_rate_limiter_enabled", False))
+
+    def _shared_limiter(self) -> Any:
+        """The process-shared cross-process limiter, or ``None`` when off.
+
+        DEFAULT-OFF (Issue #231): returns ``None`` without touching any shared
+        state while ``global_bybit_rate_limiter_enabled`` is false, so the GET
+        / POST paths keep their exact Issue #229 behavior. When enabled, the
+        limiter is built ONCE per client from the client's settings and then
+        coordinates through its state file (flock + epoch fencing) across
+        threads and processes — no per-request rebuild.
+        """
+        if not self._limiter_enabled():
+            return None                      # default-off: zero I/O
+        if self._shared_limiter_obj is None:
+            # Lazy import (avoids a module-import cycle) + build. Construction
+            # does no file I/O; the state file is opened on first acquire.
+            from app.exchange.global_rate_limiter import (
+                GlobalBybitRateLimiter,
+                LimiterConfig,
+            )
+            self._shared_limiter_obj = GlobalBybitRateLimiter(
+                LimiterConfig.from_settings(self.settings))
+        return self._shared_limiter_obj
 
     #: Bybit V5 recv-window (ms) for signed private requests.
     RECV_WINDOW_MS = "5000"
@@ -501,7 +617,6 @@ class BybitClient:
         def send_once(retry_reason: str, attempt_timeout: float):
             """One HTTP attempt + exactly one telemetry record (Issue #228)."""
             nonlocal sends_made
-            sends_made += 1
             t_start = time.monotonic()
 
             def rec(result: str, *, response: Any = None,
@@ -519,105 +634,165 @@ class BybitClient:
                     retry_reason=retry_reason,
                 )
 
-            def send():
-                if not signed:
+            # --- Phase 4: shared cross-process limiter gate (default-off) ---
+            # acquire → prepare_send BEFORE the attempt, record_result after.
+            # Any limiter deny/error is FAIL_CLOSED: no HTTP attempt leaves
+            # and the logical request stops (never retried at another layer).
+            shared = None
+            grant = None
+            if self._limiter_enabled():
+                try:
+                    shared = self._shared_limiter()
+                    grant = shared.acquire(
+                        priority, deadline=deadline_at,
+                        logical_request_id=logical_request_id)
+                except Exception as _limiter_exc:
+                    rec("BYBIT_API_SKIP",
+                        ret_msg=f"limiter_error:{type(_limiter_exc).__name__}")
+                    raise BybitRateLimitError(
+                        f"{symbol}: {endpoint} shared rate limiter unavailable "
+                        f"({type(_limiter_exc).__name__}) — not sent "
+                        "(fail-closed)") from _limiter_exc
+                if not grant.granted:
+                    rec("BYBIT_API_SKIP", ret_msg=_limiter_skip_label(grant))
+                    raise BybitRateLimitError(
+                        f"{symbol}: {endpoint} deferred by shared rate limiter "
+                        f"({grant.result.value}"
+                        + (f": {grant.reason}" if grant.reason else "")
+                        + ") — not sent (fail-closed)")
+                if not shared.prepare_send(grant.grant_id):
+                    shared.record_result(grant.grant_id, priority, "REVOKED")
+                    rec("BYBIT_API_SKIP",
+                        ret_msg="limiter grant revoked before send")
+                    raise BybitRateLimitError(
+                        f"{symbol}: {endpoint} limiter grant revoked before "
+                        "send (epoch moved) — not sent (fail-closed)")
+                # The queue wait is excluded from the HTTP-attempt duration.
+                t_start = time.monotonic()
+
+            sends_made += 1          # an actual HTTP attempt is about to go out
+
+            def attempt_once():
+                def send():
+                    if not signed:
+                        return self.session.get(
+                            self.BASE_URL + endpoint, params=params,
+                            timeout=attempt_timeout)
+                    # Private endpoint (review R4-3): every HTTP attempt is
+                    # authenticated with a FRESH Bybit V5 signature computed over
+                    # exactly the query string the transport transmits.
                     return self.session.get(
                         self.BASE_URL + endpoint, params=params,
-                        timeout=attempt_timeout)
-                # Private endpoint (review R4-3): every HTTP attempt is
-                # authenticated with a FRESH Bybit V5 signature computed over
-                # exactly the query string the transport transmits.
-                return self.session.get(
-                    self.BASE_URL + endpoint, params=params,
-                    timeout=attempt_timeout,
-                    headers=self._sign_headers(urlencode(params)))
+                        timeout=attempt_timeout,
+                        headers=self._sign_headers(urlencode(params)))
 
-            try:
-                response = _send_audited(
-                    send,
-                    lambda exc: rec(
-                        "ERROR", ret_msg=_safe_exc_category(exc)),
-                )
-            except (TimeoutError, socket.timeout) as exc:
-                rec("TIMEOUT")
-                return None, retry_budget.CLASS_TIMEOUT, exc
-            except HTTPError as exc:
-                # Review R4-5: an HTTP status delivered as a raised
-                # ``urllib.HTTPError`` is classified EXACTLY like the same
-                # status on a returned response — HTTP 429 is a rate limit
-                # regardless of the delivery mechanism (retryable within the
-                # budget/caps), every other status fails closed.
-                status = _response_status(exc)
-                if status == 429:
-                    rec("RATE_LIMIT", response=exc,
-                        ret_msg=_http_failure_label(exc))
-                    return None, retry_budget.CLASS_RATE_LIMIT, None
-                rec("ERROR", response=exc, ret_msg=_http_failure_label(exc))
-                raise _http_status_error(status) from exc
-            except URLError as exc:
-                if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                try:
+                    response = _send_audited(
+                        send,
+                        lambda exc: rec(
+                            "ERROR", ret_msg=_safe_exc_category(exc)),
+                    )
+                except (TimeoutError, socket.timeout) as exc:
                     rec("TIMEOUT")
                     return None, retry_budget.CLASS_TIMEOUT, exc
-                # Non-timeout transport failure: record the attempt and keep
-                # the fail-fast behavior (no retry).
-                rec("ERROR")
-                raise
-            status = _response_status(response)
-            if status == 429:
-                # HTTP 429 is a rate limit (Issue #229 classification table):
-                # retryable within the budget/caps, unlike other HTTP errors.
-                rec("RATE_LIMIT", response=response,
-                    ret_msg=_http_failure_label(response))
-                return None, retry_budget.CLASS_RATE_LIMIT, None
-            try:
-                response.raise_for_status()
-            except Exception:
-                # HTTP-level failure: record the attempt with a secret-free
-                # label derived from the measured response status — never
-                # str(exc) — and keep the fail-fast propagation of the
-                # identical exception (403 stays fail-closed, no retry).
-                rec("ERROR", response=response,
-                    ret_msg=_http_failure_label(response))
-                raise
-            try:
-                payload = response.json()
-            except Exception:
-                # Any payload failure (malformed JSON body or an unexpected
-                # decode/shape exception): record the attempt once and
-                # re-raise unchanged (fail-closed, no retry).
-                rec("ERROR", response=response)
-                raise
+                except HTTPError as exc:
+                    # Review R4-5: an HTTP status delivered as a raised
+                    # ``urllib.HTTPError`` is classified EXACTLY like the same
+                    # status on a returned response — HTTP 429 is a rate limit
+                    # regardless of the delivery mechanism (retryable within the
+                    # budget/caps), every other status fails closed.
+                    status = _response_status(exc)
+                    if status == 429:
+                        rec("RATE_LIMIT", response=exc,
+                            ret_msg=_http_failure_label(exc))
+                        return None, retry_budget.CLASS_RATE_LIMIT, None
+                    rec("ERROR", response=exc, ret_msg=_http_failure_label(exc))
+                    raise _http_status_error(status) from exc
+                except URLError as exc:
+                    if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                        rec("TIMEOUT")
+                        return None, retry_budget.CLASS_TIMEOUT, exc
+                    # Non-timeout transport failure: record the attempt and keep
+                    # the fail-fast behavior (no retry).
+                    rec("ERROR")
+                    raise
+                status = _response_status(response)
+                if status == 429:
+                    # HTTP 429 is a rate limit (Issue #229 classification table):
+                    # retryable within the budget/caps, unlike other HTTP errors.
+                    rec("RATE_LIMIT", response=response,
+                        ret_msg=_http_failure_label(response))
+                    return None, retry_budget.CLASS_RATE_LIMIT, None
+                try:
+                    response.raise_for_status()
+                except Exception:
+                    # HTTP-level failure: record the attempt with a secret-free
+                    # label derived from the measured response status — never
+                    # str(exc) — and keep the fail-fast propagation of the
+                    # identical exception (403 stays fail-closed, no retry).
+                    rec("ERROR", response=response,
+                        ret_msg=_http_failure_label(response))
+                    raise
+                try:
+                    payload = response.json()
+                except Exception:
+                    # Any payload failure (malformed JSON body or an unexpected
+                    # decode/shape exception): record the attempt once and
+                    # re-raise unchanged (fail-closed, no retry).
+                    rec("ERROR", response=response)
+                    raise
 
-            # Review R4-1: a body without a VALID retCode is an AMBIGUOUS
-            # answer — it is never classified as OK and never retried.
-            if not isinstance(payload, dict):
-                rec("ERROR", response=response,
-                    ret_msg="malformed response envelope (not a JSON object)")
-                raise BybitError(
-                    f"{symbol}: malformed Bybit response on {endpoint} "
-                    "(body is not a result envelope)")
-            ret_code = payload.get("retCode")
-            ret_msg = payload.get("retMsg", "")
-            if not retry_budget.is_valid_ret_code(ret_code):
-                rec("ERROR", response=response,
-                    ret_msg="malformed response envelope (missing/invalid retCode)")
-                raise BybitError(
-                    f"{symbol}: ambiguous Bybit response on {endpoint} "
-                    "(missing/invalid retCode)")
+                # Review R4-1: a body without a VALID retCode is an AMBIGUOUS
+                # answer — it is never classified as OK and never retried.
+                if not isinstance(payload, dict):
+                    rec("ERROR", response=response,
+                        ret_msg="malformed response envelope (not a JSON object)")
+                    raise BybitError(
+                        f"{symbol}: malformed Bybit response on {endpoint} "
+                        "(body is not a result envelope)")
+                ret_code = payload.get("retCode")
+                ret_msg = payload.get("retMsg", "")
+                if not retry_budget.is_valid_ret_code(ret_code):
+                    rec("ERROR", response=response,
+                        ret_msg="malformed response envelope (missing/invalid retCode)")
+                    raise BybitError(
+                        f"{symbol}: ambiguous Bybit response on {endpoint} "
+                        "(missing/invalid retCode)")
 
-            classification = retry_budget.classify_api_result(ret_code, ret_msg)
-            if classification == retry_budget.CLASS_OK:
-                rec("OK", response=response, ret_code=ret_code)
-                return payload, retry_budget.CLASS_OK, None
-            if classification == retry_budget.CLASS_RATE_LIMIT:
-                rec("RATE_LIMIT", response=response,
-                    ret_msg=ret_msg, ret_code=ret_code)
-                return None, retry_budget.CLASS_RATE_LIMIT, None
-            # API_ERROR / ACCESS_DENIED: fail-closed, NO retry (Issue #229).
-            rec("ERROR", response=response, ret_msg=ret_msg, ret_code=ret_code)
-            if classification == retry_budget.CLASS_ACCESS_DENIED:
-                raise BybitAuthError(ret_msg or "access denied")
-            raise BybitError(ret_msg or "Bybit request failed")
+                classification = retry_budget.classify_api_result(ret_code, ret_msg)
+                if classification == retry_budget.CLASS_OK:
+                    rec("OK", response=response, ret_code=ret_code)
+                    return payload, retry_budget.CLASS_OK, None
+                if classification == retry_budget.CLASS_RATE_LIMIT:
+                    rec("RATE_LIMIT", response=response,
+                        ret_msg=ret_msg, ret_code=ret_code)
+                    return None, retry_budget.CLASS_RATE_LIMIT, None
+                # API_ERROR / ACCESS_DENIED: fail-closed, NO retry (Issue #229).
+                rec("ERROR", response=response, ret_msg=ret_msg, ret_code=ret_code)
+                if classification == retry_budget.CLASS_ACCESS_DENIED:
+                    raise BybitAuthError(ret_msg or "access denied")
+                raise BybitError(ret_msg or "Bybit request failed")
+
+            # Exactly ONE shared-limiter record_result per acquired grant,
+            # on EVERY exit (return OR raise). Disabled ⇒ grant is None ⇒
+            # this block is a no-op (Issue #229 parity preserved).
+            limiter_outcome = "ERROR"
+            try:
+                payload, cls, err = attempt_once()
+                limiter_outcome = _limiter_outcome_for_class(cls)
+                return payload, cls, err
+            except Exception as _exc:
+                limiter_outcome = _limiter_outcome_for_exception(_exc)
+                raise
+            finally:
+                if shared is not None and grant is not None:
+                    try:
+                        shared.record_result(grant.grant_id, priority,
+                                             limiter_outcome)
+                    except Exception:  # never mask the request outcome
+                        logger.warning(
+                            "%s: shared limiter record_result failed on %s "
+                            "(outcome=%s)", symbol, endpoint, limiter_outcome)
 
         def deny(reason: str) -> None:
             """Fail closed: no further attempt (budget/cap/guard/deadline)."""
@@ -918,7 +1093,59 @@ class BybitClient:
             or retry_budget.ORDER_JOURNAL_DEFAULT_PATH)
         fingerprint = (str(symbol), str(side), str(qty), str(order_type))
         olink = str(order_link_id) if order_link_id else f"rb{uuid4().hex[:32]}"
+
+        # BYBIT_API_TELEMETRY_V1 + Phase 4 request identity (hoisted above the
+        # limiter gate so a shared-limiter skip can be instrumented).
+        logical_request_id = _new_logical_request_id()
+        telemetry = _get_telemetry()
+        caller = _resolve_caller()
+        t_start = time.monotonic()
+
+        # Phase 4 (GLOBAL_BYBIT_RATE_LIMITER_V1): shared acquire at P0 BEFORE
+        # the durable guard reservation. DEFAULT-OFF ⇒ shared is None and this
+        # whole block is skipped (Issue #229 parity). A limiter deny/error is
+        # FAIL_CLOSED: no guard entry is created and no HTTP send leaves.
+        shared = None
+        grant = None
+        if self._limiter_enabled():
+            try:
+                shared = self._shared_limiter()
+                grant = shared.acquire(
+                    "P0", deadline=time.monotonic() + _ORDER_EXECUTION_TIMEOUT_S,
+                    logical_request_id=logical_request_id)
+            except Exception as _limiter_exc:
+                _record_attempt(
+                    telemetry, response=None, endpoint="/v5/order/create",
+                    caller=caller, symbol=symbol, interval="", limit=0,
+                    duration_ms=0.0, result="BYBIT_API_SKIP",
+                    ret_msg=f"limiter_error:{type(_limiter_exc).__name__}",
+                    logical_request_id=logical_request_id,
+                    attempt_index=1, total_attempts=1, method="POST")
+                raise BybitRateLimitError(
+                    f"{symbol}: order create blocked — shared rate limiter "
+                    f"unavailable ({type(_limiter_exc).__name__}) — not sent "
+                    "(fail-closed)") from _limiter_exc
+            if not grant.granted:
+                _record_attempt(
+                    telemetry, response=None, endpoint="/v5/order/create",
+                    caller=caller, symbol=symbol, interval="", limit=0,
+                    duration_ms=float(getattr(grant, "waited_ms", 0) or 0),
+                    result="BYBIT_API_SKIP",
+                    ret_msg=_limiter_skip_label(grant),
+                    logical_request_id=logical_request_id,
+                    attempt_index=1, total_attempts=1, method="POST")
+                raise BybitRateLimitError(
+                    f"{symbol}: order create deferred by shared rate limiter "
+                    f"({grant.result.value}"
+                    + (f": {grant.reason}" if grant.reason else "")
+                    + ") — not sent (fail-closed)")
+
         if not guard.begin(fingerprint, order_link_id=olink):
+            # Phase 4: a guard-blocked duplicate never sends — close the (still
+            # unused) grant as NOT_SENT so its slot is accounted for exactly
+            # once and no token is left dangling.
+            if shared is not None and grant is not None:
+                shared.record_result(grant.grant_id, "P0", "NOT_SENT")
             state, blocking_link = guard.blocking_entry(fingerprint)
             raise BybitOrderUncertainError(
                 f"{symbol}: identical {side} {qty} {order_type} order submission "
@@ -935,19 +1162,58 @@ class BybitClient:
         # the signed payload (timestamp + api_key + recv_window + body).
         headers = self._sign_headers(body)
         headers["Content-Type"] = "application/json"
-        # BYBIT_API_TELEMETRY_V1: instrument the POST /v5/order/create path
-        # with exactly one record per HTTP attempt (always attempt 1 of 1).
-        # Secret hygiene: the signed body, credentials and auth headers are
-        # never passed to telemetry — only endpoint/symbol/scalars are logged.
-        logical_request_id = _new_logical_request_id()
-        telemetry = _get_telemetry()
-        caller = _resolve_caller()
-        t_start = time.monotonic()
+
+        # Phase 4: durable prepare_send fence BEFORE the single HTTP send —
+        # an epoch-moved / revoked grant is never sent (fail-closed).
+        if shared is not None and grant is not None:
+            if not shared.prepare_send(grant.grant_id):
+                shared.record_result(grant.grant_id, "P0", "REVOKED")
+                raise BybitRateLimitError(
+                    f"{symbol}: order create limiter grant revoked before send "
+                    "(epoch moved) — not sent (fail-closed)")
+
+        # ONE non-idempotent HTTP attempt (never retried) wrapped with exactly
+        # ONE shared-limiter record_result on EVERY exit (return OR raise).
+        limiter_outcome = "ERROR"
+        try:
+            payload = self._create_order_attempt(
+                symbol=symbol, body=body, headers=headers, guard=guard,
+                fingerprint=fingerprint, olink=olink, telemetry=telemetry,
+                caller=caller, logical_request_id=logical_request_id,
+                t_start=t_start)
+            limiter_outcome = "OK"   # definitive accepted submission
+            return payload
+        except Exception as _exc:
+            limiter_outcome = _limiter_outcome_for_exception(_exc)
+            raise
+        finally:
+            if shared is not None and grant is not None:
+                try:
+                    shared.record_result(grant.grant_id, "P0", limiter_outcome)
+                except Exception:  # never mask the POST outcome (the send
+                    logger.warning(  # already happened; accounting is secondary)
+                        "%s: shared limiter record_result failed (outcome=%s)",
+                        symbol, limiter_outcome)
+
+    def _create_order_attempt(self, *, symbol: str, body: str,
+                              headers: dict[str, str], guard: Any,
+                              fingerprint: tuple, olink: str, telemetry: Any,
+                              caller: str, logical_request_id: str,
+                              t_start: float) -> dict[str, Any]:
+        """ONE non-idempotent POST /v5/order/create HTTP attempt (never retried).
+
+        Phase 4 extraction: the Issue #229 single-attempt send + durable-guard
+        state machine, moved verbatim into its own method so
+        :meth:`create_order` can wrap it with the shared-limiter
+        acquire / prepare_send / record_result gate while preserving the exact
+        single-POST, no-double-send semantics byte-for-byte.
+        """
+
         try:
             response = _send_audited(
                 lambda: self.session.post(
                     self.BASE_URL + "/v5/order/create", data=body,
-                    headers=headers, timeout=10,
+                    headers=headers, timeout=_ORDER_EXECUTION_TIMEOUT_S,
                 ),
                 lambda exc: _record_attempt(
                     telemetry, response=None,
