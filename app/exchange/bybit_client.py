@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from app.config import Settings
+from app.config.settings import parse_strict_bool_flag
 from app.exchange import retry_budget
 from app.models import Candle
 
@@ -434,9 +435,21 @@ class BybitClient:
 
     # ------------------------------------------- shared cross-process limiter
     def _limiter_enabled(self) -> bool:
-        """True only when the default-off Phase 4 flag is switched on."""
-        return bool(getattr(
-            self.settings, "global_bybit_rate_limiter_enabled", False))
+        """True only when the default-off Phase 4 flag is switched on.
+
+        Issue 231 R1 (strict boolean gate): a MISSING flag means ``False``
+        (default-off) and only a real Python ``bool`` is accepted. Strings
+        (``"false"`` / ``"true"``), numbers, ``None`` and any other type
+        raise an explicit configuration error instead of being coerced —
+        ``bool("false")`` is ``True``, so coercion could silently switch
+        the shared limiter on. Fail-closed: the error propagates and the
+        request path never proceeds on a misconfigured flag.
+        """
+        return parse_strict_bool_flag(
+            getattr(self.settings,
+                    "global_bybit_rate_limiter_enabled", False),
+            "global_bybit_rate_limiter_enabled",
+        )
 
     def _shared_limiter(self) -> Any:
         """The process-shared cross-process limiter, or ``None`` when off.

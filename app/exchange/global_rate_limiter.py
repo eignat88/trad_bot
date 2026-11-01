@@ -105,6 +105,8 @@ from enum import Enum
 from typing import Any, Iterator
 from uuid import uuid4
 
+from app.config.settings import parse_strict_bool_flag
+
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------ constants
@@ -269,7 +271,15 @@ class LimiterConfig:
     @classmethod
     def from_settings(cls, settings: Any = None) -> "LimiterConfig":
         """Read config defensively; production Settings knows none of these
-        keys yet ⇒ default-off (no production configuration is modified)."""
+        keys yet ⇒ default-off (no production configuration is modified).
+
+        Issue 231 R1 (strict boolean gate): ``enabled`` is resolved with
+        ``parse_strict_bool_flag`` — a missing flag means ``False`` and only
+        a real Python ``bool`` is accepted. Strings (``"false"``), numbers
+        (``0``), ``None`` and other types raise an explicit configuration
+        error instead of being coerced by ``bool(...)``. Every other limiter
+        parameter keeps its existing defensive default conversion.
+        """
         def get(name: str, default: Any) -> Any:
             return getattr(settings, name, default) if settings is not None \
                 else default
@@ -277,7 +287,9 @@ class LimiterConfig:
         cooldowns = get("global_limiter_breaker_cooldowns_s",
                         DEFAULT_COOLDOWNS_S)
         return cls(
-            enabled=bool(get("global_bybit_rate_limiter_enabled", False)),
+            enabled=parse_strict_bool_flag(
+                get("global_bybit_rate_limiter_enabled", False),
+                "global_bybit_rate_limiter_enabled"),
             state_path=str(get("global_limiter_state_path",
                                DEFAULT_STATE_PATH)),
             g_rps=float(get("global_limiter_g_rps", DEFAULT_G_RPS)),

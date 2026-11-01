@@ -6,6 +6,7 @@ from .settings import (
     Settings,
     SrrShortWriterSettings,
     load_settings,
+    parse_strict_bool_flag,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "Settings",
     "SrrShortWriterSettings",
     "load_settings",
+    "parse_strict_bool_flag",
 ]
