@@ -11,8 +11,9 @@ import signal
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Mapping
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from app.config import Settings, load_settings
@@ -32,6 +33,109 @@ ENV_PATH = PROJECT_ROOT / ".env"
 LOG_DIR = PROJECT_ROOT / "logs"
 logger = logging.getLogger("scanner_runner")
 
+# --- Issue #231: isolated Scanner-only configuration source --------------
+#
+# ``SCANNER_CONFIG_PATH`` is the ONLY switch introduced here.  It exists so a
+# future Scanner-only canary can run the global Bybit rate limiter from its
+# own JSON file while every other consumer (Paper, Research, HTF, Analytics)
+# keeps reading the shared production ``config.yaml`` — which stays
+# limiter-off.  When the variable is unset NOTHING changes: the historical
+# ``<repo>/config.yaml`` is used, byte for byte, through the same
+# ``load_settings()`` call as before.
+#
+# Contracts enforced here (fail-closed, all BEFORE any ``BybitClient`` is
+# constructed and therefore before any Bybit request):
+#   * only an ABSOLUTE path is accepted (no WorkingDirectory dependence);
+#   * empty / relative / missing / directory / unreadable / non-JSON
+#     overrides raise ``ScannerConfigError`` — there is NO implicit
+#     fallback to the production config once an override was requested;
+#   * ``.env`` handling, API keys, DB credentials and every other setting
+#     are untouched: only the config-file source changes.
+SCANNER_CONFIG_ENV = "SCANNER_CONFIG_PATH"
+CONFIG_SOURCE_DEFAULT = "DEFAULT"
+CONFIG_SOURCE_OVERRIDE = "OVERRIDE"
+
+
+class ScannerConfigError(ValueError):
+    """Fail-closed Scanner configuration error.
+
+    Subclasses ``ValueError`` so every existing ``load_settings()`` failure
+    contract (validation errors, malformed JSON, bad limiter parameters)
+    keeps its historical exception type while gaining an explicit message
+    that names the offending configuration source and path.
+    """
+
+
+def _is_absolute_config_path(value: str) -> bool:
+    """True for POSIX *and* Windows absolute paths, False for relative ones.
+
+    Both pure path flavours are consulted so the check is identical on the
+    Linux production host and on a Windows development machine: ``/srv/x``
+    (POSIX), ``C:\\srv\\x`` / ``C:/srv/x`` (drive) and ``\\\\host\\share\\x``
+    (UNC) are absolute, while ``config.json`` and ``C:config.json`` are not.
+    ``pathlib`` never touches the filesystem or the WorkingDirectory here.
+    """
+    return PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute()
+
+
+def resolve_scanner_config_path(
+    env: Mapping[str, str] | None = None,
+) -> tuple[Path, str]:
+    """Resolve ``(config_path, source)`` for this Scanner process.
+
+    ``source`` is ``DEFAULT`` when ``SCANNER_CONFIG_PATH`` is unset (the
+    historical ``<repo>/config.yaml``, cwd-independent) and ``OVERRIDE``
+    when it points at an explicit absolute JSON file.
+
+    Every malformed override raises :class:`ScannerConfigError` instead of
+    silently degrading to the production config — an operator who asked for
+    an isolated canary config must never get the shared one.
+    """
+    environ = os.environ if env is None else env
+    raw = environ.get(SCANNER_CONFIG_ENV)
+    if raw is None:
+        return CONFIG_PATH, CONFIG_SOURCE_DEFAULT
+
+    value = raw.strip()
+    if not value:
+        raise ScannerConfigError(
+            f"{SCANNER_CONFIG_ENV} is set but empty/whitespace-only; unset it "
+            "to use the default config, or point it at an absolute path to a "
+            "JSON config file (no implicit fallback to config.yaml)"
+        )
+    if not _is_absolute_config_path(value):
+        raise ScannerConfigError(
+            f"{SCANNER_CONFIG_ENV} must be an absolute path, got {value!r}; "
+            "relative paths would depend on the process WorkingDirectory"
+        )
+
+    path = Path(value)
+    try:
+        if not path.exists():
+            raise ScannerConfigError(
+                f"{SCANNER_CONFIG_ENV}={value!r} does not exist; refusing to "
+                "fall back to the default config.yaml"
+            )
+        if path.is_dir():
+            raise ScannerConfigError(
+                f"{SCANNER_CONFIG_ENV}={value!r} is a directory, not a JSON "
+                "config file"
+            )
+        if not os.access(path, os.R_OK):
+            raise ScannerConfigError(
+                f"{SCANNER_CONFIG_ENV}={value!r} is not readable by this user"
+            )
+    except ScannerConfigError:
+        raise
+    except OSError as exc:
+        # Fail-closed: an unstatable path is a configuration error, never a
+        # reason to continue with a different config file.
+        raise ScannerConfigError(
+            f"{SCANNER_CONFIG_ENV}={value!r} cannot be inspected "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
+    return path, CONFIG_SOURCE_OVERRIDE
+
 
 def setup_logging() -> None:
     """Configure runner logging only when the executable is started."""
@@ -50,16 +154,45 @@ SHUTDOWN = False
 
 
 def _load_runner_settings() -> Settings:
-    """Load settings from files next to this runner, regardless of cwd."""
-    settings = load_settings(path=CONFIG_PATH, env_file=ENV_PATH)
+    """Load Scanner settings from the resolved configuration source.
+
+    Resolution and every validation step run BEFORE ``load_settings()``
+    reads the file and therefore before ``main()`` can construct a
+    ``BybitClient`` — an invalid ``SCANNER_CONFIG_PATH`` aborts startup
+    with :class:`ScannerConfigError` instead of silently falling back to
+    the shared production config.  ``.env`` loading and every other setting
+    source are unchanged; only the config-file path may differ.
+    """
+    config_path, source = resolve_scanner_config_path()
+    try:
+        settings = load_settings(path=config_path, env_file=ENV_PATH)
+    except ScannerConfigError:
+        raise
+    except Exception as exc:
+        # Fail-closed: report WHICH source failed and why, without echoing
+        # file contents (the message never includes secrets by contract).
+        logger.critical(
+            "scanner config load FAILED: source=%s config=%s error=%s: %s",
+            source, config_path, type(exc).__name__, exc,
+        )
+        raise ScannerConfigError(
+            f"scanner configuration load failed (source={source}, "
+            f"config={config_path}): {type(exc).__name__}: {exc}"
+        ) from exc
     logger.info(
-        "scanner config: universe_mode=%s top_n=%s symbols=%s cwd=%s config=%s env_file=%s",
+        "scanner config: source=%s config=%s env_file=%s cwd=%s "
+        "global_limiter=%s allow_env=%s state_path=%s "
+        "universe_mode=%s top_n=%s symbols=%s",
+        source,
+        config_path,
+        ENV_PATH,
+        Path.cwd(),
+        "ON" if settings.global_bybit_rate_limiter_enabled else "OFF",
+        "ALLOWED" if settings.global_bybit_rate_limiter_allow_env else "DENIED",
+        settings.global_limiter_state_path,
         settings.scanner_universe.mode,
         settings.scanner_universe.top_n,
         list(settings.symbols),
-        Path.cwd(),
-        CONFIG_PATH,
-        ENV_PATH,
     )
     return settings
 
