@@ -67,15 +67,47 @@ class ScannerConfigError(ValueError):
 
 
 def _is_absolute_config_path(value: str) -> bool:
-    """True for POSIX *and* Windows absolute paths, False for relative ones.
+    """True only for a path that is absolute **on the running OS**.
 
-    Both pure path flavours are consulted so the check is identical on the
-    Linux production host and on a Windows development machine: ``/srv/x``
-    (POSIX), ``C:\\srv\\x`` / ``C:/srv/x`` (drive) and ``\\\\host\\share\\x``
-    (UNC) are absolute, while ``config.json`` and ``C:config.json`` are not.
+    ``Path`` is the native flavour (``WindowsPath`` on Windows, ``PosixPath``
+    on Linux) and it is the very same class ``resolve_scanner_config_path()``
+    builds the override from, so the predicate and the resulting path can
+    never disagree — which is exactly what the previous pure-flavour check
+    got wrong: ``PurePosixPath(...) or PureWindowsPath(...)`` accepted a
+    Windows drive/UNC path on Linux while the native ``Path`` constructed
+    from it was *relative*, i.e. silently anchored to the WorkingDirectory.
+
+    Consequences, by design:
+
+    * Linux accepts ``/srv/trad_bot/x.json`` and **rejects** ``C:\\srv\\x``,
+      ``C:/srv/x`` and ``\\\\host\\share\\x`` — those are not POSIX-absolute;
+    * Windows accepts ``C:\\srv\\x``, ``C:/srv/x`` and UNC paths and
+      **rejects** drive-less ``/srv/x`` — it would resolve against the
+      current drive, i.e. it is WorkingDirectory-dependent too;
+    * each host keeps accepting its own legitimate absolute forms.
+
     ``pathlib`` never touches the filesystem or the WorkingDirectory here.
     """
-    return PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute()
+    return Path(value).is_absolute()
+
+
+def _foreign_absolute_hint(value: str) -> str:
+    """Explain a rejection when the value is absolute only for the other OS.
+
+    ``issubclass(Path, PurePosixPath)`` identifies the native flavour
+    without hard-coding ``os.name``, so the hint stays correct for the real
+    host and for the flavour-swapped regression tests.
+    """
+    native_is_posix = issubclass(Path, PurePosixPath)
+    foreign = PureWindowsPath if native_is_posix else PurePosixPath
+    if not foreign(value).is_absolute():
+        return ""
+    flavour = "Windows" if native_is_posix else "POSIX"
+    return (
+        f"; it is absolute for {flavour} but not for this OS, where native "
+        f"Path({value!r}) is relative and would depend on the "
+        "WorkingDirectory"
+    )
 
 
 def resolve_scanner_config_path(
@@ -105,8 +137,9 @@ def resolve_scanner_config_path(
         )
     if not _is_absolute_config_path(value):
         raise ScannerConfigError(
-            f"{SCANNER_CONFIG_ENV} must be an absolute path, got {value!r}; "
-            "relative paths would depend on the process WorkingDirectory"
+            f"{SCANNER_CONFIG_ENV} must be an absolute path for this OS, "
+            f"got {value!r}; relative paths would depend on the process "
+            f"WorkingDirectory{_foreign_absolute_hint(value)}"
         )
 
     path = Path(value)

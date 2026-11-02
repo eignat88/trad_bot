@@ -37,6 +37,7 @@ Validation runs in `resolve_scanner_config_path()` **before**
 | variable absent | `DEFAULT` source, historical behaviour |
 | empty / whitespace-only value | `ScannerConfigError` |
 | relative path (`config.json`, `./x.json`, `C:x.json`) | `ScannerConfigError` |
+| absolute only for the other OS (`C:\srv\…` / `\\host\share\…` on Linux, `/srv/…` on Windows) | `ScannerConfigError` |
 | path does not exist | `ScannerConfigError` — **no fallback** to `config.yaml` |
 | path is a directory | `ScannerConfigError` |
 | not readable by the service user | `ScannerConfigError` |
@@ -47,10 +48,22 @@ Validation runs in `resolve_scanner_config_path()` **before**
 `load_settings()` error contract is preserved while the message now names
 the failing source and path.
 
-Accepted absolute forms are checked with `PurePosixPath` **and**
-`PureWindowsPath`, so `/srv/trad_bot/scanner_canary.json` (Linux),
-`C:\srv\…` / `C:/srv/…` and UNC paths are absolute on both platforms, while
-the process WorkingDirectory is never consulted.
+Accepted absolute forms are evaluated with the **native `Path` flavour of
+**the running OS** — the very same class the override is constructed from —
+so the validation and the path that is later opened can never disagree:
+
+* **Linux/POSIX** accepts `/srv/trad_bot/scanner_canary.json` and
+  **rejects** `C:\srv\…`, `C:/srv\…` and `\\host\share\…`: they are not
+  POSIX-absolute, and accepting them would produce a *relative* `Path`
+  anchored to the WorkingDirectory.
+* **Windows** accepts `C:\srv\…`, `C:/srv\…` and UNC paths and
+  **rejects** drive-less `/srv/…`: it would resolve against the current
+  drive, i.e. it is WorkingDirectory-dependent for the same reason.
+
+In both cases the process WorkingDirectory is never consulted, and a value
+that is absolute only for the other OS is called out explicitly in the
+`ScannerConfigError` message. Each host keeps accepting its own legitimate
+absolute forms.
 
 ## 3. Startup logging
 
@@ -135,13 +148,50 @@ passwords and `.env` contents are never logged (regression-tested).
    Environment=SCANNER_CONFIG_PATH=/opt/trad_bot/scanner_canary.json
    ```
 
-   Then `sudo systemctl daemon-reload && sudo systemctl restart trad-bot-scanner`.
+   Note the restart moment first — step 5 uses it to prove that no other
+   consumer was restarted:
 
-5. **Confirm isolation.** `journalctl -u trad-bot-scanner -n 50` must show
-   `source=OVERRIDE`, `global_limiter=ON`; `journalctl -u trad-bot-paper`
-   (and Research/HTF/Analytics) must show `source=DEFAULT`,
-   `global_limiter=OFF`. Paper, Research, HTF and Analytics must **not** be
-   restarted for this canary.
+   ```bash
+   CANARY_START=$(date -u +%s)
+   sudo systemctl daemon-reload && sudo systemctl restart trad-bot-scanner
+   ```
+
+5. **Confirm isolation — Scanner is the only restarted consumer.**
+
+   a. The Scanner picked up the override:
+
+      ```bash
+      journalctl -u trad-bot-scanner --since "@${CANARY_START}" -n 200 \
+        | grep -E 'source=OVERRIDE|global_limiter=ON'
+      ```
+
+   b. Paper, Research, HTF and Analytics were **not** restarted during the
+      canary window: every start timestamp must predate `CANARY_START` and
+      every PID must be unchanged. Do **not** grep their journals for
+      `source=DEFAULT` / `global_limiter=OFF` — those fields belong to
+      `scanner_runner.py`'s startup line and are never emitted by the other
+      consumers, so their absence proves nothing.
+
+      ```bash
+      for u in trad-bot-paper trad-bot-research-evaluator \
+               trad-bot-htf-baseline-short-observer trad-bot-analytics; do
+        printf '%-46s active-since=%s pid=%s\n' "$u" \
+          "$(systemctl show -p ActiveEnterTimestamp --value "$u")" \
+          "$(systemctl show -p MainPID --value "$u")"
+      done
+      ```
+
+   c. They still read the shared configuration, where the limiter is off,
+      and nothing except the Scanner drop-in references the override:
+
+      ```bash
+      grep -n 'global_bybit_rate_limiter_enabled' /opt/trad_bot/config.yaml
+      # expected: ... "global_bybit_rate_limiter_enabled": false
+
+      grep -rl 'SCANNER_CONFIG_PATH' /etc/systemd/system/
+      # expected: only
+      #   /etc/systemd/system/trad-bot-scanner.service.d/issue231-scanner-canary.conf
+      ```
 
 6. **Observe** the shared limiter state file
    `/var/lib/trad_bot/state/global_bybit_limiter_v1.json` and the existing
@@ -181,4 +231,4 @@ fixing or removing `SCANNER_CONFIG_PATH` restores the previous behaviour.
   `BybitClient`, token bucket, breaker, fairness, retry accounting,
   frozen ME R V3, systemd units, `.env`, or the database.
 * Regression coverage: `tests/test_issue231_scanner_config_path_v1.py`
-  (27 cases) plus the existing Issue #231 R1/R2/R3 suites.
+  (32 cases) plus the existing Issue #231 R1/R2/R3 suites.

@@ -19,10 +19,15 @@ Contract under test (maps 1:1 to the requirements):
    Bybit request.
 5. CWD INDEPENDENCE — resolution never consults the process
    WorkingDirectory.
-6. ISOLATION — only ``scanner_runner.py`` reads ``SCANNER_CONFIG_PATH``;
+6. OS-NATIVE ABSOLUTE PATHS — the absolute check uses the native ``Path``
+   flavour of the running OS, so Windows drive/UNC paths are rejected on
+   POSIX and drive-less POSIX paths are rejected on Windows; a
+   foreign-flavour value can never degrade into a relative path anchored
+   to the WorkingDirectory.
+7. ISOLATION — only ``scanner_runner.py`` reads ``SCANNER_CONFIG_PATH``;
    Paper/Research/HTF/Analytics keep the shared config, where the global
    Bybit rate limiter stays default-off.
-7. LOGGING — startup logs name the source, path, limiter state, ENV
+8. LOGGING — startup logs name the source, path, limiter state, ENV
    permission and shared-state path, and never leak secrets.
 """
 from __future__ import annotations
@@ -31,7 +36,7 @@ import dataclasses
 import json
 import logging
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 
@@ -44,6 +49,7 @@ from scanner_runner import (
     CONFIG_SOURCE_OVERRIDE,
     SCANNER_CONFIG_ENV,
     ScannerConfigError,
+    _is_absolute_config_path,
     resolve_scanner_config_path,
 )
 
@@ -233,6 +239,99 @@ def test_relative_override_fails_closed(tmp_path, monkeypatch, value):
     monkeypatch.setenv(SCANNER_CONFIG_ENV, value)
     with pytest.raises(ScannerConfigError, match="absolute"):
         resolve_scanner_config_path()
+
+
+# =================================== OS-native absolute path contract (PR #242)
+#: Absolute only on a Windows host (drive + UNC forms).
+WINDOWS_ABSOLUTE_PATHS = [
+    r"C:\srv\trad_bot\scanner_canary.json",
+    "C:/srv/trad_bot/scanner_canary.json",
+    r"\\server\share\scanner_canary.json",
+]
+#: Absolute only on a POSIX host — rejected by Windows, where a drive-less
+#: ``/srv/x`` resolves against the current drive (WorkingDirectory-dependent).
+POSIX_ABSOLUTE_PATHS = ["/srv/trad_bot/scanner_canary.json"]
+#: Relative on every OS.
+RELATIVE_PATHS = [
+    "config.json",
+    "./scanner_canary.json",
+    "configs/scanner_canary.json",
+    "C:scanner_canary.json",
+]
+
+#: On this host: the flavour that is absolute elsewhere but not here.
+if os.name == "nt":
+    FOREIGN_ABSOLUTE_PATHS = POSIX_ABSOLUTE_PATHS
+else:
+    FOREIGN_ABSOLUTE_PATHS = WINDOWS_ABSOLUTE_PATHS
+
+
+def test_absolute_check_is_exactly_native_path_is_absolute():
+    """The predicate must equal ``Path(value).is_absolute()``.
+
+    Regression for the blocking PR #242 finding: the previous
+    ``PurePosixPath(...) or PureWindowsPath(...)`` check disagreed with the
+    native ``Path`` actually built from the value, so a foreign-flavour
+    path passed validation and then became a *relative* path anchored to
+    the WorkingDirectory.
+    """
+    for value in WINDOWS_ABSOLUTE_PATHS + POSIX_ABSOLUTE_PATHS + RELATIVE_PATHS:
+        assert _is_absolute_config_path(value) == Path(value).is_absolute(), value
+
+
+@pytest.mark.parametrize("value", FOREIGN_ABSOLUTE_PATHS)
+def test_foreign_absolute_path_rejected_on_this_os(value, monkeypatch):
+    """A path absolute only for the OTHER OS fails before any filesystem I/O."""
+    assert not _is_absolute_config_path(value)
+    monkeypatch.setenv(SCANNER_CONFIG_ENV, value)
+    with pytest.raises(ScannerConfigError, match="absolute"):
+        resolve_scanner_config_path()
+
+
+def test_windows_paths_rejected_when_running_on_posix(monkeypatch):
+    """Simulate the Linux host: native flavour is ``PurePosixPath``.
+
+    Proves the production (Linux) rule on any development machine: Windows
+    drive and UNC paths are rejected instead of degrading to a relative
+    ``PosixPath``.
+    """
+    monkeypatch.setattr(scanner_runner, "Path", PurePosixPath)
+    for value in WINDOWS_ABSOLUTE_PATHS:
+        assert not _is_absolute_config_path(value)
+        with pytest.raises(ScannerConfigError, match="absolute"):
+            scanner_runner.resolve_scanner_config_path(
+                {SCANNER_CONFIG_ENV: value}
+            )
+
+
+def test_posix_paths_rejected_when_running_on_windows(monkeypatch):
+    """Simulate the Windows host: native flavour is ``PureWindowsPath``.
+
+    Drive-less POSIX paths would resolve against the current drive there,
+    so they must be rejected as WorkingDirectory-dependent.
+    """
+    monkeypatch.setattr(scanner_runner, "Path", PureWindowsPath)
+    for value in POSIX_ABSOLUTE_PATHS:
+        assert not _is_absolute_config_path(value)
+        with pytest.raises(ScannerConfigError, match="absolute"):
+            scanner_runner.resolve_scanner_config_path(
+                {SCANNER_CONFIG_ENV: value}
+            )
+
+
+def test_accepted_override_is_native_absolute(tmp_path, monkeypatch):
+    """Legitimate native absolute paths keep working, unchanged."""
+    override = _write_config(tmp_path / "scanner_canary.json", _canary_payload())
+    monkeypatch.setenv(SCANNER_CONFIG_ENV, str(override))
+
+    path, source = resolve_scanner_config_path()
+    assert source == CONFIG_SOURCE_OVERRIDE
+    assert isinstance(path, Path)          # native flavour, never a foreign pure path
+    assert path.is_absolute()
+    assert path == Path(str(override))     # identical to what will be opened
+    # the DEFAULT source is native-absolute too (cwd-independent by design)
+    assert isinstance(scanner_runner.CONFIG_PATH, Path)
+    assert scanner_runner.CONFIG_PATH.is_absolute()
 
 
 def test_malformed_json_override_fails_closed(tmp_path, monkeypatch):
