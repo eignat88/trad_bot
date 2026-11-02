@@ -105,6 +105,19 @@ def main() -> None:
             )
         )
 
+        # A write-enabled SRR evaluator MUST use the authoritative activation
+        # boundary before scanning candidates or fetching historical candles.
+        # Dry-run behavior remains unchanged when the writer is disabled.
+        from app.research.srr_short_evaluator_activation_wiring_v1 import (
+            resolve_srr_evaluator_activation_boundary,
+        )
+
+        srr_eval_boundary = resolve_srr_evaluator_activation_boundary(
+            db_repo._conn,
+            writer_enabled=srr_writer_cfg.enabled,
+            activation_ts=srr_writer_cfg.activation_ts or None,
+        )
+
         # Only the SRR-specific evaluator can leave dry-run mode. All other
         # prospective experiments remain on the unchanged observe-only path.
         srr_eval = SrrShortExecutionRExpansionProspectiveEvaluator(
@@ -112,6 +125,7 @@ def main() -> None:
             candle_source=BybitHistoricalCandleSource(client),
             dry_run=not srr_writer_cfg.enabled,
             write_outcomes=srr_writer.write if srr_writer is not None else None,
+            activation_boundary=srr_eval_boundary,
         )
 
         prospective_eval = ProspectiveOOSEvaluator(
