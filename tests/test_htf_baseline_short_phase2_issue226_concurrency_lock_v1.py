@@ -71,7 +71,7 @@ WORKER = textwrap.dedent("""
             return self.now
         def _resolve_asof(self, ms):
             return ms
-        def _fetch_page(self, symbol, start, end, *, window_end, attempts):
+        def _fetch_page(self, symbol, start, end, *, window_end):
             if slow_s:
                 time.sleep(slow_s)
             return ([[str(t), '10', '11', '9', '10', '1']
@@ -143,7 +143,7 @@ class GenUpstream:
     def _resolve_asof(self, ms):
         return ms
 
-    def _fetch_page(self, symbol, start, end, *, window_end, attempts):
+    def _fetch_page(self, symbol, start, end, *, window_end):
         self.page_calls += 1
         if self.hook is not None:
             self.hook()
