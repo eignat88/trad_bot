@@ -92,3 +92,62 @@ def test_incomplete_interval_not_cached():
         assert source.cycle_request_metrics["cache_hits"] == 0
     finally:
         source.end_cycle()
+
+
+def test_fetch_errors_never_enter_cache():
+    class FailingBybit(FakeBybit):
+        def _public_get(self, endpoint, **kwargs):
+            self.calls.append((kwargs["symbol"], kwargs["end"], kwargs["limit"]))
+            raise RuntimeError("offline-fake-provider-error")
+
+    from app.research.srr_short_execution_r_expansion_prospective_evaluator import SOURCE_FETCH_ERROR
+
+    fake = FailingBybit()
+    source = BybitHistoricalCandleSource(fake)
+    source.begin_cycle()
+    try:
+        first = source.fetch_5m_candles("ZROUSDT", 250 * STEP, 449 * STEP, 451 * STEP)
+        second = source.fetch_5m_candles("ZROUSDT", 250 * STEP, 449 * STEP, 451 * STEP)
+        assert first.status == second.status == SOURCE_FETCH_ERROR
+        assert len(fake.calls) == 2
+        assert source.cycle_request_metrics["cache_hits"] == 0
+    finally:
+        source.end_cycle()
+
+
+def test_conflicting_duplicate_candles_never_enter_cache():
+    class ConflictingBybit(FakeBybit):
+        def _public_get(self, endpoint, **kwargs):
+            result = super()._public_get(endpoint, **kwargs)
+            if result["result"]["list"]:
+                duplicate = list(result["result"]["list"][0])
+                duplicate[2] = "103"
+                result["result"]["list"].insert(0, duplicate)
+            return result
+
+    from app.research.srr_short_execution_r_expansion_prospective_evaluator import SOURCE_CONFLICTING_CANDLES
+
+    fake = ConflictingBybit()
+    source = BybitHistoricalCandleSource(fake)
+    source.begin_cycle()
+    try:
+        first = source.fetch_5m_candles("ZROUSDT", 250 * STEP, 449 * STEP, 451 * STEP)
+        second = source.fetch_5m_candles("ZROUSDT", 250 * STEP, 449 * STEP, 451 * STEP)
+        assert first.status == second.status == SOURCE_CONFLICTING_CANDLES
+        assert len(fake.calls) == 2
+        assert source.cycle_request_metrics["cache_hits"] == 0
+    finally:
+        source.end_cycle()
+
+
+def test_page_cache_memory_is_bounded():
+    source = BybitHistoricalCandleSource(FakeBybit(n=3))
+    source._cycle_page_limit = 1
+    source.begin_cycle()
+    try:
+        for end in (0, STEP, 2 * STEP):
+            assert source.fetch_5m_candles("ZROUSDT", end, end, 4 * STEP).ok
+        assert len(source._cycle_pages) <= 1
+    finally:
+        source.end_cycle()
+        assert source._cycle_pages is None
