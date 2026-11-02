@@ -18,7 +18,7 @@ class FakeHTTP:
         self.windows = []
 
     def fetch(self, symbol, start_ms, end_ms, *,
-              window_end, attempts):
+              window_end):
         self.pages += 1
         self.windows.append((start_ms, end_ms))
 
