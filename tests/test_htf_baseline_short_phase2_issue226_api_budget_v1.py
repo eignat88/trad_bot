@@ -59,11 +59,17 @@ class CountingClient:
         if endpoint == "/v5/market/time":
             self.time_requests += 1
             return {"retCode": 0, "result": {}, "time": self.server_time_ms}
-        self.kline_requests += 1
-        if self.fail_next > 0:
-            self.fail_next -= 1
-            self.retry_attempts += 1
-            raise RuntimeError("transient transport failure")
+        # Model the #229 transport layer, NOT retries in the candle source.
+        # Each _public_get makes at most 3 wire attempts for this page.
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            self.kline_requests += 1
+            if self.fail_next > 0:
+                self.fail_next -= 1
+                self.retry_attempts += 1
+                if attempt == MAX_ATTEMPTS:
+                    raise RuntimeError("transport attempt budget exhausted")
+                continue
+            break
         start, end = int(params["start"]), int(params["end"])
         rows = []
         for ts in range(start, end + BAR, BAR):
