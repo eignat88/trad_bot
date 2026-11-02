@@ -33,7 +33,7 @@ class FakeUpstream:
         return [Candle(BAR*i,10,11,9,10,1) for i in range(89,101)]
     def _fetch_server_time_ms(self):return self.now
     def _resolve_asof(self,ms):return ms
-    def _fetch_page(self,symbol,start,end,*,window_end,attempts):
+    def _fetch_page(self,symbol,start,end,*,window_end):
         self.calls+=1
         return [[str(t), '10', '11', '9', '10', '1'] for t in range(start,end+BAR,BAR)],self.now
     def _merge_rows(self,symbol,rows,start,end,asof,by_open,unclosed):
