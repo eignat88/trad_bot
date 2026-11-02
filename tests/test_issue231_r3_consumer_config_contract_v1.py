@@ -31,7 +31,8 @@ import app.config as config_module
 import app.exchange.bybit_client as bybit_client_module
 import app.research.htf_baseline_short_phase2_observer_runner_v1 as observer
 import app.research.me_short_a_forward_outcome_runtime_runner_v1 as outcome_runner
-from app.config import LimiterConfig, Settings
+from app.config import Settings
+from app.exchange.global_rate_limiter import LimiterConfig
 from app.exchange.bybit_client import BybitClient as RealBybitClient
 
 #: every field of the shared limiter contract (activation flags + parameters)
