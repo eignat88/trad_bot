@@ -360,8 +360,7 @@ class IncrementalPhase2CandleSource:
             while cursor <= end_open:
                 page_end = min(end_open, cursor + (self.max_incremental_bars - 1)*BAR_MS)
                 rows, returned_server_ms = self.upstream._fetch_page(
-                    symbol, cursor, page_end, window_end=end_open,
-                    attempts=self.upstream.max_attempts)
+                    symbol, cursor, page_end, window_end=end_open)
                 pages += 1
                 if pages > page_budget:
                     raise CacheIntegrityError('recovery page budget exceeded')
