@@ -583,6 +583,118 @@ def _release_fh(fh: Any) -> None:
         pass
 
 
+# ------------------------------------------- multi-UID file open helpers
+# Issue 231 R2 multi-user persistence fix (D1-D4). The lock, witness and
+# state files are shared by every service user (tradbot,
+# tradbot-analytics) that runs with the same configuration. Contract:
+#   * never follow a symlink (O_NOFOLLOW where the platform has it);
+#   * never publish a file weaker than 0o660 — creation is private
+#     (0o600, umask can only strip bits) and the shared rights are set
+#     with fchmod on OUR OWN fd before publication (umask-proof);
+#   * never chmod a file this process did not create (no implicit
+#     migration of a foreign 0o600/0o644 leftover).
+_SHARED_FILE_MODE = 0o660      # group rw — the shared service group
+_PRIVATE_FILE_MODE = 0o600     # creation mode: private under any umask
+#: POSIX-only; 0 on Windows keeps the documented single-user behaviour
+#: (symlink following there — see docs/issue231_r2_limiter_config_contract_v1.md).
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _publish_shared_mode(fd: int) -> None:
+    """Apply 0o660 to a file THIS process just created with O_EXCL.
+
+    ``os.open(mode=...)`` is masked by the process umask (0o660 under
+    umask 022 yields 0o640), so the shared rights are applied with
+    ``fchmod`` on our own fd: no path re-resolution (TOCTOU-free) and
+    never applied to a file we did not create. No-op where ``os.fchmod``
+    does not exist (Windows: POSIX mode bits are not access control).
+    """
+    if os.name == "posix" and hasattr(os, "fchmod"):
+        os.fchmod(fd, _SHARED_FILE_MODE)
+
+
+def _open_existing_rw(path: str) -> Any:
+    """Open an EXISTING file O_RDWR — no create, never follow a symlink.
+
+    A symlink fails with ``ELOOP`` (fail-closed) and a missing file with
+    ``ENOENT``; the file's own mode/owner are never modified.
+    """
+    fd = os.open(path, os.O_RDWR | _O_NOFOLLOW)
+    try:
+        return os.fdopen(fd, "r+b")
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def _open_shared_rw(path: str) -> Any:
+    """Open-or-create an O_RDWR handle that never follows a symlink.
+
+    Safe publication strategy (Issue 231 R2 multi-user D1/D2):
+      1. ``O_CREAT|O_EXCL`` — winning the create proves nobody could have
+         planted this path; the creation mode ``0o600`` is private under
+         ANY umask (never world-open, never briefly group-open), then
+         ``fchmod(0o660)`` publishes the shared rights on our own fd;
+      2. ``EEXIST`` — open the EXISTING file via :func:`_open_existing_rw`
+         (``O_NOFOLLOW``: a symlink fails with ``ELOOP``): its mode/owner
+         are preserved forever — no implicit chmod migration — and the
+         lock inode is never replaced, so flock mutual exclusion between
+         two UIDs stays intact;
+      3. a raced unlink (``ENOENT``) retries the bounded loop.
+
+    Raises ``OSError`` (``EACCES``/``EPERM``/``ELOOP``/…) for the caller
+    to map onto its existing fail-closed error codes.
+    """
+    last: OSError | None = None
+    for _ in range(3):
+        try:
+            fd = os.open(path,
+                         os.O_RDWR | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
+                         _PRIVATE_FILE_MODE)
+        except FileExistsError:
+            try:
+                return _open_existing_rw(path)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:     # raced unlink → retry
+                    last = exc
+                    continue
+                raise
+        except OSError as exc:
+            last = exc
+            break
+        try:
+            _publish_shared_mode(fd)
+            return os.fdopen(fd, "r+b")
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+    if last is not None:
+        raise last
+    raise OSError(errno.ENOENT, "shared file vanished while opening", path)
+
+
+def _read_state_text(path: str) -> str:
+    """Read the state file WITHOUT following a symlink (O_NOFOLLOW, D4)."""
+    fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW)
+    try:
+        fh = os.fdopen(fd, encoding="utf-8")
+    except Exception:
+        # fdopen failed before taking ownership of the handle.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    with fh:
+        return fh.read()
+
+
 class _FileLock:
     """Non-blocking flock loop with a real-time timeout (FAIL_CLOSED).
 
@@ -600,7 +712,10 @@ class _FileLock:
 
     def __enter__(self) -> "_FileLock":
         try:
-            self._fh = open(self._path, "a+")
+            # Multi-UID: create-if-missing at 0o660 (umask-proof, private
+            # until published) or open the EXISTING file without create and
+            # without following a symlink (Issue 231 R2 multi-user D2/D4).
+            self._fh = _open_shared_rw(self._path)
         except OSError as exc:
             raise LimiterUnavailableError("lock_unavailable") from exc
         deadline = time.monotonic() + self._timeout_s
@@ -778,15 +893,21 @@ class GlobalBybitRateLimiter:
     def _hold_witness(self, name: str) -> Any:
         path = self._witness_path(name)
         try:
-            fh = open(path, "a+")
+            # Multi-UID (D2/D4): same safe open as the lock file — create
+            # privately + publish 0o660, or open the existing file without
+            # create and without following a symlink.
+            fh = _open_shared_rw(path)
+        except OSError as exc:
+            raise LimiterUnavailableError("witness_failed") from exc
+        try:
             _try_lock(fh)
-            return fh
         except OSError as exc:
             try:
-                fh.close()          # type: ignore[has-type]
-            except Exception:
+                fh.close()
+            except OSError:
                 pass
             raise LimiterUnavailableError("witness_failed") from exc
+        return fh
 
     def _release_witness(self, gid: str) -> None:
         fh = self._witnesses.pop(gid, None)
@@ -803,27 +924,46 @@ class GlobalBybitRateLimiter:
 
     def _witness_alive(self, name: str) -> bool:
         """True when SOMEONE (possibly this process) holds the witness lock.
-        Open WITHOUT create: a missing witness is not proof of liveness —
-        but for probe resolution the probe record always stores a witness
-        that was created before persistence, so 'missing' means removed ⇒
-        not held."""
+
+        Open WITHOUT create and WITHOUT following a symlink (O_NOFOLLOW).
+        Failure semantics — Issue 231 R2 multi-user D2/D3:
+
+        * ``FileNotFoundError`` → ``False``: the EXISTING contract — the
+          probe record always stores a witness created before
+          persistence, so a missing file means removed ⇒ not held;
+        * ANY other error (``EACCES``/``EPERM``/``ELOOP``/…) → ``True``:
+          the observation is UNDEFINED (another UID may hold the lock and
+          this user simply cannot open the file) and must never read as
+          "released" — fail closed, the probe slot stays blocked, no
+          second recovery probe is admitted.
+        """
         path = self._witness_path(name)
         try:
-            fh = open(path, "r+b")
-        except OSError:
+            fd = os.open(path, os.O_RDWR | _O_NOFOLLOW)
+        except FileNotFoundError:
             return False
+        except OSError:
+            return True          # undefined → fail-closed: treat as held
+        try:
+            fh = os.fdopen(fd, "r+b")
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return True          # undefined → fail-closed: treat as held
         try:
             try:
                 _try_lock(fh)
-            except OSError as exc:
-                if _is_lock_conflict(exc):
-                    return True
-                return False
+            except OSError:
+                # Contended lock → held by someone; ANY other lock error
+                # is also UNDEFINED → fail closed (never "released").
+                return True
             try:
                 _unlock(fh)
             except OSError:
                 pass
-            return False
+            return False         # opened + lockable by us → nobody holds
         finally:
             try:
                 fh.close()
@@ -836,8 +976,9 @@ class GlobalBybitRateLimiter:
 
     def _load(self, write: bool) -> dict[str, Any]:
         try:
-            with open(self.state_path, encoding="utf-8") as fh:
-                raw = fh.read()
+            # O_NOFOLLOW (D4): a symlinked state path fails closed here
+            # (ELOOP → read_failed) instead of reading through the link.
+            raw = _read_state_text(self.state_path)
         except FileNotFoundError:
             if write:
                 return _default_state(self.config, self.clock.wall(),
@@ -860,7 +1001,16 @@ class GlobalBybitRateLimiter:
         st["checksum"] = _checksum(st)
         payload = json.dumps(st, sort_keys=True, separators=(",", ":"))
         try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = os.open(tmp,
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
+                         _PRIVATE_FILE_MODE)
+            # D1: publish group rights on OUR OWN brand-new file BEFORE the
+            # atomic replace makes it visible under its final name.
+            # fchmod is umask-proof and never touches a foreign file (no
+            # implicit chmod migration); the GROUP comes from the setgid
+            # shared directory (documented multi-user contract), so every
+            # update preserves 0660 + the shared group for all UIDs.
+            _publish_shared_mode(fd)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(payload)
                 fh.flush()
@@ -1872,7 +2022,11 @@ class GlobalBybitRateLimiter:
             # this path (that is exactly how two lock inodes for one grant
             # would appear when racing another pruner's unlink).
             try:
-                fh = open(path, "r+b")
+                # No create, no symlink following (D4): a prune must never
+                # mint a new inode for this path (that is exactly how two
+                # lock inodes for one grant would appear when racing
+                # another pruner's unlink) nor lock through a planted link.
+                fh = _open_existing_rw(path)
             except OSError:
                 continue                      # already gone → nothing to do
             try:

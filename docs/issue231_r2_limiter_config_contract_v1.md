@@ -97,11 +97,64 @@ Strictness notes:
   verifies that an already-existing parent directory (and an existing
   state file) is writable by the current service user; a non-writable
   location fails at load time instead of at first runtime transaction. A
-  not-yet-existing directory is accepted (created on first acquire) — for
-  multi-user deployments pre-create it group-writable for all service
-  users. On POSIX a world-writable parent is logged as a warning.
+  not-yet-existing directory is accepted (created on first acquire).
+* **World-writable directory ⇒ rejected.** On POSIX an enabled limiter
+  refuses to start when the state directory has the world-write bit set
+  (any local account could tamper with the shared bucket).
+* **Symlinked state file ⇒ rejected** at load time; at runtime every
+  state/lock/witness open uses `O_NOFOLLOW`, so a planted symlink fails
+  closed (`ELOOP`) instead of being followed. (Windows has no
+  `O_NOFOLLOW`: symlink following there remains a documented
+  single-user-platform limitation.)
 * When the limiter is **disabled**, no path probing happens at all
   (default-off keeps the zero-I/O contract).
+
+### 3.1 Multi-user deployment scheme (POSIX, e.g. tradbot + tradbot-analytics)
+
+The persistence layer supports ONE shared `state_path` for several
+service users with these **operator-provided** prerequisites (this patch
+documents them; it performs **no** user/group/systemd/directory changes
+itself):
+
+```sh
+# 1. one shared group holding both service users
+groupadd tradbot
+usermod -aG tradbot tradbot-analytics
+
+# 2. a group-owned SETGID directory (2770): every file created inside
+#    inherits the tradbot group, so ownership flaps between writers
+#    without ever losing group access
+install -d -o tradbot -g tradbot -m 2770 /var/lib/trad_bot/state
+
+# 3. identical ABSOLUTE state path in every consumer's config.yaml
+#    "global_limiter_state_path": "/var/lib/trad_bot/state/global_bybit_limiter_v1.json"
+
+# 4. one-time migration of leftovers created by older builds (deploy
+#    step — NOT performed automatically: the code never chmods a file it
+#    did not create)
+chgrp tradbot /var/lib/trad_bot/state/global_bybit_limiter_v1*
+chmod 660  /var/lib/trad_bot/state/global_bybit_limiter_v1*
+```
+
+Rights contract enforced by the code (no umask assumptions):
+
+| File | Created by | Mode after publication | Notes |
+|------|------------|------------------------|-------|
+| `*.json` (state) | `O_CREAT\|O_EXCL` private `0600`, `fchmod(0660)` **before** the atomic `os.replace` | `0660` | every update preserves mode `0660` + the setgid-inherited group; a foreign existing file is **never** re-moded (no implicit migration) |
+| `*.json.lock` | same create-then-publish strategy | `0660` | existing lock inode is opened without create → flock mutual exclusion across UIDs; never replaced |
+| `*.witness` | same | `0660` | `FileNotFoundError` ⇒ “not held” (existing contract); `EACCES`/`EPERM`/`ELOOP` ⇒ **treated as held** (fail-closed, no second recovery probe) |
+
+* `UMask=002` in the service units is recommended but **not relied
+  upon** — shared rights are applied with `fchmod` on the creating
+  process's own descriptor (umask cannot weaken them).
+* Failure behaviour stays fail-closed: `lock_unavailable`,
+  `witness_failed`, `read_failed`, `write_failed` → `STATE_UNAVAILABLE`
+  deny → `BybitRateLimitError (not sent)` with **zero HTTP attempts and
+  no fallback** to the process-local limiter.
+* Startup ordering caveat (residual, fail-closed): if both services start
+  simultaneously and one observes the other's file during the
+  microsecond private-`0600` window, that first request is denied
+  (`lock_unavailable`) and succeeds on the next attempt.
 
 ## 4. Failure behavior
 
@@ -125,3 +178,12 @@ wrong types, ranges (G/B/TTL/breaker/registry/…), production-absolute and
 cwd-independence of the state path, shared-path writability, and
 no-unexpected-HTTP assertions. R1's `tests/test_issue231_strict_limiter_flag_v1.py`
 remains unchanged and must keep passing.
+
+`tests/test_issue231_r2_multi_user_persistence_v1.py` — multi-user
+persistence contract (§3.1): `0660` group-shared modes after creation and
+after every atomic `os.replace`, umask `022`/`002` independence,
+`EACCES`/`EPERM` fault injection (fail-closed deny, no second recovery
+probe), `FileNotFoundError` witness contract, symlink rejection for
+state/lock/witness, world-writable directory rejection at load, zero-HTTP
+no-fallback on persistence errors, and a root-gated Linux integration
+with two distinct UIDs in an isolated temporary tree.

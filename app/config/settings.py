@@ -705,11 +705,16 @@ def _verify_limiter_state_path_access(configured_path: str) -> None:
       would fail at runtime — fail-fast here instead);
     * an existing state file must be writable by this process;
     * a not-yet-existing directory is accepted: it is created on first
-      acquire. For multi-user deployments pre-create it group-writable
-      (e.g. ``install -d -g trad_bot -m 0770 /var/lib/trad_bot/state``)
-      so every service user can share the bucket;
-    * on POSIX a world-writable parent is surfaced as a warning (another
-      account could tamper with the shared bucket).
+      acquire. For multi-user deployments pre-create it group-owned with
+      the setgid bit (e.g. ``install -d -g tradbot -m 2770
+      /var/lib/trad_bot/state``) so every service user shares the bucket
+      and every newly created file inherits the shared group;
+    * on POSIX a world-writable parent is REJECTED (Issue 231 R2
+      multi-user D5): any local account could tamper with the shared
+      bucket, so an enabled limiter refuses to start there;
+    * a symlinked state file is REJECTED (Issue 231 R2 path safety): the
+      runtime opens use ``O_NOFOLLOW`` anyway, but the contract fails
+      fast here with an explicit message.
 
     Called ONLY when the limiter is enabled: default-off configurations
     keep the zero-I/O contract and are never probed.
@@ -730,11 +735,20 @@ def _verify_limiter_state_path_access(configured_path: str) -> None:
                 "can share the limiter state"
             )
         if os.name == "posix" and (parent.stat().st_mode & 0o002):
-            logger.warning(
-                "global_limiter_state_path directory %s is world-writable; "
-                "any local account could tamper with the shared limiter "
-                "state", parent)
+            raise ValueError(
+                "global_limiter_state_path directory "
+                f"{parent} is world-writable — the enabled limiter would "
+                "expose lock/state/witness files to untrusted local "
+                "accounts; use a group-owned setgid directory (e.g. "
+                "install -d -g tradbot -m 2770 ...) instead"
+            )
     state_file = Path(resolved)
+    if os.path.islink(state_file):
+        raise ValueError(
+            f"global_limiter_state_path {state_file} is a symlink — "
+            "refusing to follow it (Issue 231 R2 path safety); point "
+            "the path at a regular file inside the shared directory"
+        )
     if state_file.exists() and not os.access(state_file, os.W_OK):
         raise ValueError(
             f"global_limiter_state_path file {state_file} exists but is "
