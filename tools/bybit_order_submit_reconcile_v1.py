@@ -41,24 +41,42 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root
 
 
-def _load_settings(config: str):
-    from app.config import Settings, load_settings
+def _load_settings(config: str, *, required: bool):
+    """Resolve settings through the common R2 config contract.
+
+    Issue 231 R3: the silent ``Settings()`` fallback is gone — an absent
+    config is never replaced by implicit defaults. The exchange-touching
+    ``--reconcile`` mode REQUIRES the config (fail-closed
+    FileNotFoundError); the offline modes (``--list`` /
+    ``--manual-resolution``) load it only when present and otherwise
+    proceed without Bybit credentials, limiter parameters or contract
+    fields at all.
+    """
+    from app.config import load_settings
 
     path = Path(config)
     if path.exists():
         return load_settings(path)
-    return Settings()
+    if required:
+        raise FileNotFoundError(
+            f"required configuration {path} not found — --reconcile never "
+            "falls back to default Settings()")
+    return None
 
 
 def _guard(settings, journal: str | None):
     from app.exchange import retry_budget
 
+    # settings is None only for offline modes without a config file: no
+    # implicit defaults are invented — the journal path comes from
+    # --journal or the guard's own constant default.
+    configured = ""
+    if settings is not None:
+        configured = retry_budget.str_setting(
+            settings, "bybit_order_submit_journal_path", "")
     guard = retry_budget.get_order_guard()
     guard.configure(
-        journal
-        or retry_budget.str_setting(
-            settings, "bybit_order_submit_journal_path", "")
-        or retry_budget.ORDER_JOURNAL_DEFAULT_PATH)
+        journal or configured or retry_budget.ORDER_JOURNAL_DEFAULT_PATH)
     return guard
 
 
@@ -94,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
                              "manual decision")
     args = parser.parse_args(argv)
 
-    settings = _load_settings(args.config)
+    settings = _load_settings(args.config, required=args.reconcile)
     guard = _guard(settings, args.journal)
 
     if args.list:

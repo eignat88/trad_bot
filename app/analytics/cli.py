@@ -16,21 +16,34 @@ logger = logging.getLogger(__name__)
 
 
 def load_analytics_settings(env_file: Optional[str] = None) -> Settings:
-    """Load analytics settings from environment only, not from .env file.
-    
-    This function is designed for systemd execution where:
+    """Load analytics settings: env-owned values plus the shared R2 contract.
+
+    Analytics-owned settings (DB, Bybit keys, analytics_* parameters) come
+    from the environment only, not from a .env file:
+
     - Environment variables are provided by /etc/trad-bot/analytics.env
-    - The production .env file is NOT accessible
+    - The analytics-owned values are captured BEFORE any config contract
+      resolution, so they stay authoritative
     - ANALYTICS_ENABLED must be checked before any DB/API initialization
-    
+
+    Issue 231 R3: the shared limiter contract fields (two-factor
+    activation, strict validation, shared state_path/G/B) are resolved
+    through the common ``load_settings()`` path so analytics joins the
+    same limiter bucket as every other consumer. A broken or unreadable
+    config fails closed (raises, never falls back to defaults).
+    Deployment precondition: the analytics service user needs read access
+    to config.yaml — and to .env when ENV activation is used — exactly
+    like every other consumer of the contract.
+
     Args:
         env_file: Optional path to .env file (default: None, don't read any .env)
-        
+
     Returns:
         Settings object with analytics configuration
-        
+
     Raises:
         SystemExit: If ANALYTICS_ENABLED is false or invalid
+        ValueError/OSError: If the shared config contract cannot be resolved
     """
     # Parse ANALYTICS_ENABLED first (fail-fast)
     analytics_enabled_str = os.getenv("ANALYTICS_ENABLED", "false")
@@ -112,6 +125,23 @@ def load_analytics_settings(env_file: Optional[str] = None) -> Settings:
         "position_monitor_interval": 10,
     }
     
+    # Issue 231 R3: overlay the SHARED limiter contract resolved by the
+    # common R2 path (two-factor activation, strict validation, shared
+    # state_path and G/B parameters) so analytics joins the same bucket as
+    # every other consumer. The analytics ENV values captured above stay
+    # authoritative — only contract fields are copied from the contract.
+    # A broken or unreadable config fails closed: load_settings() raises
+    # and this error is deliberately NOT swallowed by the guard below.
+    from dataclasses import fields as _dataclass_fields
+
+    from app.config import load_settings
+
+    contract = load_settings()
+    for _field in _dataclass_fields(Settings):
+        if _field.name.startswith(
+                ("global_limiter_", "global_bybit_rate_limiter_")):
+            env_settings[_field.name] = getattr(contract, _field.name)
+
     # Create Settings object
     try:
         settings = Settings(**env_settings)
