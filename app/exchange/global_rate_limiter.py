@@ -1000,6 +1000,12 @@ class GlobalBybitRateLimiter:
         st["wall_ts"] = self.clock.wall()
         st["checksum"] = _checksum(st)
         payload = json.dumps(st, sort_keys=True, separators=(",", ":"))
+        # Ownership of the raw descriptor is ours from os.open() and
+        # passes to the file object ONLY when os.fdopen() returns; until
+        # that transfer every failure (fchmod/fdopen) must close it exactly
+        # once — and never again afterwards (no double close). Issue 231 R2
+        # / Codex P2: the fchmod path previously leaked the fd.
+        fd: int | None = None
         try:
             fd = os.open(tmp,
                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
@@ -1011,13 +1017,22 @@ class GlobalBybitRateLimiter:
             # shared directory (documented multi-user contract), so every
             # update preserves 0660 + the shared group for all UIDs.
             _publish_shared_mode(fd)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh = os.fdopen(fd, "w", encoding="utf-8")
+            fd = None                    # ownership transferred to fh
+            with fh:
                 fh.write(payload)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self.state_path)
             _fsync_dir(directory)
         except Exception as exc:                     # noqa: BLE001
+            if fd is not None:
+                # Failed BEFORE the ownership transfer (fchmod/fdopen):
+                # fh never exists, so this is the one and only close.
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             try:
                 os.remove(tmp)
             except OSError:

@@ -202,6 +202,23 @@ def _inject_open_error(monkeypatch, predicate, exc_factory):
     monkeypatch.setattr(gr_module.os, "open", _open)
 
 
+def _open_fd_count() -> int:
+    """Number of file descriptors currently open in THIS process."""
+    if os.path.isdir("/proc/self/fd"):
+        # The listdir dirfd itself shows up in the listing on BOTH sides —
+        # a constant offset that cancels out in the before/after compare.
+        return len(os.listdir("/proc/self/fd"))
+    # Non-Linux POSIX fallback: probe the descriptor table.
+    count = 0
+    for fd in range(1024):
+        try:
+            os.fstat(fd)
+        except OSError:
+            continue
+        count += 1
+    return count
+
+
 # ============================ 1. D1 — state/lock file modes (POSIX)
 @_POSIX_ONLY
 def test_state_and_lock_group_shared_after_every_replace(tmp_path):
@@ -371,6 +388,54 @@ def test_state_write_eacces_denies_state_unavailable(tmp_path, monkeypatch):
     assert out.result is GrantResult.STATE_UNAVAILABLE
     assert out.reason == "write_failed"
     assert not Path(lim.config.state_path).exists()   # nothing published
+
+
+# ============================ 2b. P2 (PR #239) — fchmod failure fd leak
+@_POSIX_ONLY
+def test_repeated_fchmod_failures_do_not_leak_fds(tmp_path, monkeypatch):
+    """Codex P2: ``_write_state`` opens the O_EXCL tmp fd and must close
+    it when fchmod (``_publish_shared_mode``) or ``os.fdopen`` fails BEFORE
+    ownership of the descriptor passes to the file object.
+
+    Fault injection: every ``os.fchmod`` call fails with EPERM, over and
+    over. Each ``acquire()`` must stay FAIL_CLOSED
+    (``STATE_UNAVAILABLE`` / ``write_failed``), no orphaned tmp file may
+    remain, and the process's open-descriptor count must NOT grow — the
+    pre-fix code leaked exactly one fd per failed publication.
+    """
+    lim = _fast_limiter(tmp_path)
+    # Warm-up WITHOUT injection: creates the lock + state files through the
+    # real fchmod, so inside the injected loop only the state-tmp
+    # publication (O_EXCL tmp → fchmod → fdopen) can hit the fault.
+    out = _grant(lim)
+    assert lim.record_result(out.grant_id, "P0", "OK",
+                             epoch=out.epoch) == "APPLIED"
+
+    fchmod_calls = {"n": 0}
+
+    def _failing_fchmod(fd, mode):
+        fchmod_calls["n"] += 1
+        raise OSError(errno.EPERM, "injected fchmod failure")
+
+    monkeypatch.setattr(gr_module.os, "fchmod", _failing_fchmod)
+
+    attempts = 25
+    before = _open_fd_count()
+    for _ in range(attempts):
+        res = lim.acquire("P0", deadline=lim.clock.mono() + 3.0)
+        assert res.granted is False
+        assert res.result is GrantResult.STATE_UNAVAILABLE
+        assert res.reason == "write_failed"
+    after = _open_fd_count()
+
+    assert fchmod_calls["n"] >= attempts, "fchmod injection never fired"
+    assert after <= before, (
+        f"fd leak: {before} descriptors open before, {after} after "
+        f"{attempts} injected fchmod failures")
+    # every failed publication still cleaned up its O_EXCL tmp file …
+    assert not [p for p in tmp_path.iterdir() if ".json.tmp." in p.name]
+    # … and the durable state from the warm-up was never replaced
+    assert Path(lim.config.state_path).exists()
 
 
 # ============================ 3. D4 — symlink rejection (POSIX)
