@@ -1,0 +1,31 @@
+name: PR248 SRR Activation Wiring Regression
+
+on:
+  pull_request:
+    paths:
+      - 'app/research/srr_short_evaluator_activation_wiring_v1.py'
+      - 'app/research/evaluator_runner.py'
+      - 'tests/test_srr_short_evaluator_activation_wiring_v1.py'
+      - '.github/workflows/pr248-srr-activation-wiring-regression.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: SRR activation (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pytest
+      - name: Activation wiring and frozen routing tests
+        run: python -m pytest -q -p no:cacheprovider tests/test_srr_short_evaluator_activation_wiring_v1.py tests/test_srr_short_prospective_evaluator_policy_routing_v1.py --tb=short
