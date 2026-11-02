@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import os
 import json
+import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -128,6 +132,39 @@ class Settings:
     # Issue 231 R1: STRICT boolean — load_settings() accepts only literal
     # true/false (missing → False); strings/numbers/null raise ValueError.
     global_bybit_rate_limiter_enabled: bool = False
+    # Issue 231 R2 — DETERMINISTIC CONFIG CONTRACT for
+    # GLOBAL_BYBIT_RATE_LIMITER_V1. Activation precedence (documented,
+    # fail-closed, tested by tests/test_issue231_r2_config_contract_v1.py):
+    #   1. ENV GLOBAL_BYBIT_RATE_LIMITER_ENABLED — participates ONLY when
+    #      the config file explicitly grants permission with
+    #      "global_bybit_rate_limiter_allow_env": true (two-factor gate).
+    #      Without that permission the ENV variable is not a configuration
+    #      source at all: it is ignored for activation (warning logged).
+    #   2. config.yaml "global_bybit_rate_limiter_enabled" — strict bool.
+    #   3. Built-in default False (default-off preserved).
+    # The permission flag is config-file-only: it can never be granted
+    # from the environment.
+    global_bybit_rate_limiter_allow_env: bool = False
+    # Every global_limiter_* key below is actually consumed by
+    # LimiterConfig.from_settings(); the defaults mirror the core
+    # LimiterConfig defaults one-to-one (drift guarded by tests):
+    #   wrong types / out-of-range values are rejected with an explicit
+    #   ValueError inside load_settings() — before any BybitClient exists
+    #   and before any HTTP request could be issued.
+    global_limiter_state_path: str = "var/state/global_bybit_limiter_v1.json"
+    global_limiter_g_rps: float = 8.0            # G > 0 (req/s sustained)
+    global_limiter_burst: float = 12.0           # B >= 1 (bucket capacity)
+    global_limiter_lock_timeout_s: float = 5.0
+    global_limiter_demand_ttl_s: float = 120.0
+    global_limiter_breaker_cooldowns_s: tuple[float, ...] = (5.0, 30.0, 120.0)
+    global_limiter_recovery_success_target: int = 20
+    global_limiter_probe_lease_s: float = 30.0
+    global_limiter_registry_capacity: int = 8192  # >= ceil(2*G*max_lifetime)
+    global_limiter_max_lifetime_s: float = 60.0
+    global_limiter_max_wait_s: float = 30.0
+    global_limiter_pending_liveness_ttl_s: float = 15.0
+    global_limiter_record_retry_attempts: int = 3
+    global_limiter_record_retry_backoff_s: float = 0.05
     scanner_workers: int = 5
     scan_interval: int = 300
     # OOS evaluator interval in scanner cycles (default 12 = every 60 minutes
@@ -555,6 +592,171 @@ def parse_strict_bool_flag(value: Any, name: str) -> bool:
     )
 
 
+def parse_strict_number(value: Any, name: str, *, integer: bool = False) -> float | int:
+    """Strict interpretation of a numeric limiter parameter (Issue 231 R2).
+
+    Only JSON/YAML numbers (``int`` / ``float``, never ``bool``) are
+    accepted. Strings (``"8"``), booleans (``True`` is an ``int``
+    subclass!), ``null`` and containers raise an explicit configuration
+    ``ValueError`` instead of being coerced. NaN / Infinity are rejected
+    (``json.loads`` accepts them literally, and they silently poison every
+    comparison). With ``integer=True`` the value must be a whole number:
+    integral floats (``20.0``) are normalised to ``int``, fractional floats
+    (``20.5``) are rejected.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"{name} must be a number (JSON/YAML int or float); "
+            f"got {type(value).__name__} {value!r}. "
+            "Booleans, strings, null and other types are rejected instead "
+            "of being coerced."
+        )
+    try:
+        finite = math.isfinite(value)
+    except (OverflowError, ValueError):        # absurdly large int
+        finite = False
+    if not finite:
+        raise ValueError(
+            f"{name} must be a finite number; got {value!r} "
+            "(NaN/Infinity are rejected)."
+        )
+    if integer:
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError(
+                f"{name} must be a whole number; got {value!r}."
+            )
+        return int(value)
+    return float(value)
+
+
+def parse_strict_number_sequence(value: Any, name: str) -> tuple[float, ...]:
+    """Strict list/tuple of numbers (Issue 231 R2, breaker cooldowns).
+
+    A bare string would otherwise be iterated character-by-character and a
+    single number would silently become a one-element sequence.
+    """
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(
+            f"{name} must be a list of numbers; "
+            f"got {type(value).__name__} {value!r}."
+        )
+    if not value:
+        raise ValueError(f"{name} must contain at least one element.")
+    return tuple(
+        parse_strict_number(item, f"{name}[{index}]")
+        for index, item in enumerate(value)
+    )
+
+
+def parse_strict_text(value: Any, name: str) -> str:
+    """Strict non-empty string path/text parameter (Issue 231 R2).
+
+    ``os.PathLike`` values are normalised to ``str``; everything else and
+    empty/whitespace-only strings (an empty state path would silently mean
+    "the process WorkingDirectory") raise an explicit configuration error.
+    """
+    if isinstance(value, os.PathLike):
+        value = os.fspath(value)
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{name} must be a string; "
+            f"got {type(value).__name__} {value!r}."
+        )
+    if not value.strip() or "\x00" in value:
+        raise ValueError(
+            f"{name} must be a non-empty string without NUL bytes; "
+            f"got {value!r}."
+        )
+    return value
+
+
+#: Stable anchor for relative limiter state paths (Issue 231 R2): the
+#: repository root derived from THIS module's location — deliberately NOT
+#: ``os.getcwd()``. Every process resolves the same shared state file no
+#: matter which WorkingDirectory it was started from. Production (live
+#: trading) must still configure an explicitly absolute path.
+_LIMITER_STATE_ANCHOR = Path(__file__).resolve().parents[2]
+
+
+def resolve_limiter_state_path(path: str) -> str:
+    """Anchor a limiter state path deterministically (Issue 231 R2).
+
+    Absolute paths are normalised lexically; relative paths are joined to
+    the repository root and normalised — the process WorkingDirectory is
+    never consulted, so the result is identical across processes, users
+    and ``chdir``. Purely lexical (no filesystem access): safe to call
+    while the limiter is disabled.
+    """
+    normalised = os.path.normpath(parse_strict_text(path, "global_limiter_state_path"))
+    if os.path.isabs(normalised):
+        return normalised
+    return os.path.normpath(os.path.join(str(_LIMITER_STATE_ANCHOR), normalised))
+
+
+def _verify_limiter_state_path_access(configured_path: str) -> None:
+    """Shared-state access verification for an ENABLED limiter (Issue 231 R2).
+
+    The cross-process state file is shared by every service user that runs
+    with the same configuration, so the resolved directory must be usable
+    by the current service account:
+
+    * the parent directory, when it already exists, must be a directory and
+      writable by this process (otherwise the first shared transaction
+      would fail at runtime — fail-fast here instead);
+    * an existing state file must be writable by this process;
+    * a not-yet-existing directory is accepted: it is created on first
+      acquire. For multi-user deployments pre-create it group-owned with
+      the setgid bit (e.g. ``install -d -g tradbot -m 2770
+      /var/lib/trad_bot/state``) so every service user shares the bucket
+      and every newly created file inherits the shared group;
+    * on POSIX a world-writable parent is REJECTED (Issue 231 R2
+      multi-user D5): any local account could tamper with the shared
+      bucket, so an enabled limiter refuses to start there;
+    * a symlinked state file is REJECTED (Issue 231 R2 path safety): the
+      runtime opens use ``O_NOFOLLOW`` anyway, but the contract fails
+      fast here with an explicit message.
+
+    Called ONLY when the limiter is enabled: default-off configurations
+    keep the zero-I/O contract and are never probed.
+    """
+    resolved = resolve_limiter_state_path(configured_path)
+    parent = Path(resolved).parent
+    if parent.exists():
+        if not parent.is_dir():
+            raise ValueError(
+                "global_limiter_state_path parent "
+                f"{parent} exists but is not a directory"
+            )
+        if not os.access(parent, os.W_OK):
+            raise ValueError(
+                "global_limiter_state_path directory "
+                f"{parent} is not writable by this user — pre-create a "
+                "shared (group-writable) directory so all service users "
+                "can share the limiter state"
+            )
+        if os.name == "posix" and (parent.stat().st_mode & 0o002):
+            raise ValueError(
+                "global_limiter_state_path directory "
+                f"{parent} is world-writable — the enabled limiter would "
+                "expose lock/state/witness files to untrusted local "
+                "accounts; use a group-owned setgid directory (e.g. "
+                "install -d -g tradbot -m 2770 ...) instead"
+            )
+    state_file = Path(resolved)
+    if os.path.islink(state_file):
+        raise ValueError(
+            f"global_limiter_state_path {state_file} is a symlink — "
+            "refusing to follow it (Issue 231 R2 path safety); point "
+            "the path at a regular file inside the shared directory"
+        )
+    if state_file.exists() and not os.access(state_file, os.W_OK):
+        raise ValueError(
+            f"global_limiter_state_path file {state_file} exists but is "
+            "not writable by this user — fix the ownership/permissions so "
+            "all service users can share the limiter state"
+        )
+
+
 def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env") -> Settings:
     _load_dotenv(Path(env_file))
     raw: dict[str, Any] = {}
@@ -636,15 +838,48 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
             dca_values = {"enabled": _parse_bool_env(dca_enabled_env, "DCA_ENABLED")}
             dca_source = "env"
             values["dca"] = DCASettings(**dca_values)
-    # GLOBAL_BYBIT_RATE_LIMITER_V1 (Issue 231 R1): STRICT boolean gate.
-    # Missing flag → False (default-off); only literal JSON/YAML booleans
-    # are accepted; strings/numbers/null raise an explicit configuration
-    # error instead of being coerced (bool("false") would silently enable
-    # the shared limiter). No other limiter parameter is touched here.
-    values["global_bybit_rate_limiter_enabled"] = parse_strict_bool_flag(
+    # --- GLOBAL_BYBIT_RATE_LIMITER_V1 activation contract (Issue 231 R2) ---
+    # Deterministic precedence, documented and fail-closed:
+    #   1. ENV GLOBAL_BYBIT_RATE_LIMITER_ENABLED participates ONLY when the
+    #      config file explicitly grants permission with
+    #      "global_bybit_rate_limiter_allow_env": true (two-factor gate).
+    #      Without that permission the ENV variable is not a configuration
+    #      source: it is ignored for activation (a warning is logged) — a
+    #      stray ENV value can never switch the limiter on by itself, and
+    #      can never break startup either.
+    #   2. config.yaml "global_bybit_rate_limiter_enabled" — STRICT bool
+    #      (Issue 231 R1 preserved): only literal true/false; strings,
+    #      numbers and null raise an explicit configuration error. A
+    #      config-file type error is ALWAYS fatal, even when the permitted
+    #      ENV value would take precedence.
+    #   3. Built-in default False (default-off preserved).
+    # The permission flag itself is config-file-only and strict-boolean:
+    # it can never be granted from the environment.
+    allow_env = parse_strict_bool_flag(
+        raw.get("global_bybit_rate_limiter_allow_env", False),
+        "global_bybit_rate_limiter_allow_env",
+    )
+    values["global_bybit_rate_limiter_allow_env"] = allow_env
+    yaml_enabled = parse_strict_bool_flag(
         values.get("global_bybit_rate_limiter_enabled", False),
         "global_bybit_rate_limiter_enabled",
     )
+    env_enabled_raw = os.getenv("GLOBAL_BYBIT_RATE_LIMITER_ENABLED")
+    if env_enabled_raw is not None and allow_env:
+        # Two-factor activation satisfied: the explicit ENV value decides
+        # and takes precedence over config.yaml (ENV > YAML > default).
+        values["global_bybit_rate_limiter_enabled"] = _parse_bool_env(
+            env_enabled_raw, "GLOBAL_BYBIT_RATE_LIMITER_ENABLED")
+    else:
+        if env_enabled_raw is not None:
+            logger.warning(
+                "GLOBAL_BYBIT_RATE_LIMITER_ENABLED=%r is set but "
+                "global_bybit_rate_limiter_allow_env is not true in the "
+                "config file — ENV activation is ignored (the limiter "
+                "follows config.yaml/default)",
+                env_enabled_raw,
+            )
+        values["global_bybit_rate_limiter_enabled"] = yaml_enabled
     settings = Settings(**values)
     # Expose the DCA config source via module-level variable.
     # Used by paper_runner for startup logging.
@@ -762,4 +997,19 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         raise ValueError("dca.stop_reference must be 'initial_entry'")
     if dca.max_dca_count < 0:
         raise ValueError("dca.max_dca_count must be non-negative")
+    # --- Issue 231 R2: validate the whole limiter config contract HERE ---
+    # Wrong types, out-of-range G/B/TTL/breaker values and an unsafe shared
+    # state path fail startup with an explicit ValueError at settings-load
+    # time — before any BybitClient is constructed, before any shared-state
+    # file is opened and before any HTTP request could be issued
+    # (fail-closed, zero network side effects). LimiterConfig.from_settings
+    # is the single source of truth for the parameter contract; the access
+    # check below runs only for an ENABLED limiter (default-off keeps the
+    # zero-I/O contract). The import is lazy to avoid a module import cycle
+    # (global_rate_limiter imports this module).
+    from app.exchange.global_rate_limiter import LimiterConfig
+
+    LimiterConfig.from_settings(settings)
+    if settings.global_bybit_rate_limiter_enabled:
+        _verify_limiter_state_path_access(settings.global_limiter_state_path)
     return settings

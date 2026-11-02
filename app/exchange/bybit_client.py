@@ -444,6 +444,13 @@ class BybitClient:
         ``bool("false")`` is ``True``, so coercion could silently switch
         the shared limiter on. Fail-closed: the error propagates and the
         request path never proceeds on a misconfigured flag.
+
+        Issue 231 R2 (two-factor activation): this flag is the RESOLVED
+        activation bit produced by ``load_settings()`` — the ENV variable
+        ``GLOBAL_BYBIT_RATE_LIMITER_ENABLED`` may only set it when the
+        config file grants ``global_bybit_rate_limiter_allow_env: true``.
+        Consumers below therefore never re-read the environment: an
+        unauthorized ENV value cannot reach this gate.
         """
         return parse_strict_bool_flag(
             getattr(self.settings,
