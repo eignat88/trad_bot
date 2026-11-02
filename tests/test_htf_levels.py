@@ -52,3 +52,49 @@ def test_liquidity_reversal_skips_unavailable_htf_levels(caplog):
     )
     assert LiquidityReversalScanner().scan(ctx) == []
     assert "HTF levels unavailable" in caplog.text
+
+
+def test_context_omits_unused_4h_fetch_and_retains_required_inputs():
+    client = FakeClient()
+    ctx = build_market_context(client, "BTCUSDT", Settings())
+
+    assert client.intervals == ["5", "15", "60", "D"]
+    assert ctx.candles_4h == ()
+    assert len(ctx.candles_5m) == 200
+    assert len(ctx.candles_15m) == 200
+    assert len(ctx.candles_1h) == 200
+    assert ctx.indicators.ema200 == 200.5
+    assert ctx.market_regime == "TREND_UP"
+    assert (ctx.levels.previous_day_high, ctx.levels.previous_day_low) == (108, 104)
+    assert (ctx.levels.previous_week_high, ctx.levels.previous_week_low) == (109, 101)
+
+
+def test_unused_4h_failure_cannot_block_market_context():
+    class No4HClient(FakeClient):
+        def get_klines(self, symbol, interval, limit):
+            if interval == "240":
+                raise RuntimeError("4h endpoint unavailable")
+            return super().get_klines(symbol, interval, limit)
+
+    client = No4HClient()
+    ctx = build_market_context(client, "BTCUSDT", Settings())
+    assert ctx.candles_4h == ()
+    assert client.intervals == ["5", "15", "60", "D"]
+
+
+def test_required_timeframe_fetch_failure_still_propagates():
+    import pytest
+
+    class FailingClient(FakeClient):
+        def __init__(self, failure_interval):
+            super().__init__()
+            self.failure_interval = failure_interval
+
+        def get_klines(self, symbol, interval, limit):
+            if interval == self.failure_interval:
+                raise RuntimeError(f"failed required interval {interval}")
+            return super().get_klines(symbol, interval, limit)
+
+    for interval in ("5", "15", "60", "D"):
+        with pytest.raises(RuntimeError, match=f"failed required interval {interval}"):
+            build_market_context(FailingClient(interval), "BTCUSDT", Settings())
