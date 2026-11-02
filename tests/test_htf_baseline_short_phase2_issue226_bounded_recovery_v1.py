@@ -63,7 +63,7 @@ class FakeUpstream:
     def _resolve_asof(self, ms):
         return ms
 
-    def _fetch_page(self, symbol, start, end, *, window_end, attempts):
+    def _fetch_page(self, symbol, start, end, *, window_end):
         self.page_calls += 1
         self.page_calls_by_symbol[symbol] = self.page_calls_by_symbol.get(symbol, 0) + 1
         if self.page_calls in self.fail_on_page_call:
