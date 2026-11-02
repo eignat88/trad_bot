@@ -390,6 +390,23 @@ class BybitHistoricalCandleSource:
             raise ValueError("Bybit historical source requires a client")
         self._client = client
         self._page_limit = max(1, min(int(page_limit), 200))
+        # Opt-in per-cycle only; None preserves original direct fetch behavior.
+        self._cycle_pages: dict[tuple[str, int, int, int], tuple[tuple[Any, ...], ...]] | None = None
+        self._cycle_page_limit = 512
+        self._cycle_cache_hits = 0
+        self._cycle_http_calls = 0
+
+    def begin_cycle(self) -> None:
+        self._cycle_pages = {}
+        self._cycle_cache_hits = 0
+        self._cycle_http_calls = 0
+
+    def end_cycle(self) -> None:
+        self._cycle_pages = None
+
+    @property
+    def cycle_request_metrics(self) -> dict[str, int]:
+        return {"cache_hits": self._cycle_cache_hits, "http_calls": self._cycle_http_calls}
 
     def fetch_5m_candles(
         self,
@@ -410,20 +427,31 @@ class BybitHistoricalCandleSource:
         )
         pages = 0
         max_pages = 100
+        closed_boundary = -1 if evaluation_asof_ms is None else (evaluation_asof_ms // CANDLE_MS - 1) * CANDLE_MS
+        staged_pages: dict[tuple[str, int, int, int], tuple[tuple[Any, ...], ...]] = {}
         try:
             while page_end >= start_ms and pages < max_pages:
                 pages += 1
-                payload = self._client._public_get(
-                "/v5/market/kline",
-                category="linear",
-                symbol=symbol,
-                interval="5",
-                limit=self._page_limit,
-                end=page_end,
-                )
+                page_key = (symbol, self._page_limit, page_end, closed_boundary)
+                cached_rows = self._cycle_pages.get(page_key) if self._cycle_pages is not None else None
+                if cached_rows is None:
+                    payload = self._client._public_get(
+                        "/v5/market/kline",
+                        category="linear",
+                        symbol=symbol,
+                        interval="5",
+                        limit=self._page_limit,
+                        end=page_end,
+                    )
+                    self._cycle_http_calls += 1
+                    raw_rows = tuple(tuple(row) for row in payload["result"]["list"])
+                    staged_pages[page_key] = raw_rows
+                else:
+                    self._cycle_cache_hits += 1
+                    raw_rows = cached_rows
                 candles = [
-                Candle(int(r[0]), *(float(value) for value in r[1:6]))
-                for r in payload["result"]["list"]
+                    Candle(int(r[0]), *(float(value) for value in r[1:6]))
+                    for r in raw_rows
                 ]
                 page = [
                     candle for candle in candles
@@ -451,7 +479,7 @@ class BybitHistoricalCandleSource:
                 diagnostics={"symbol": symbol, "error": str(exc)},
             )
 
-        return validate_source_result(
+        result = validate_source_result(
             HistoricalCandleSourceResult(
                 status=SOURCE_VALIDATED,
                 candles=tuple(collected),
@@ -463,6 +491,12 @@ class BybitHistoricalCandleSource:
             required_close_ms=end_ms,
             evaluation_asof_ms=evaluation_asof_ms,
         )
+        if result.status == SOURCE_VALIDATED and self._cycle_pages is not None:
+            for key, rows in staged_pages.items():
+                if len(self._cycle_pages) >= self._cycle_page_limit:
+                    break
+                self._cycle_pages.setdefault(key, rows)
+        return result
 
 
 class HistoricalArchiveCandleSource:
@@ -832,6 +866,17 @@ class SrrShortExecutionRExpansionProspectiveEvaluator:
             cursor.close()
 
         asof_ms = self._current_asof_ms()
+        cycle_source = self._candle_source
+        if isinstance(cycle_source, BybitHistoricalCandleSource):
+            cycle_source.begin_cycle()
+        try:
+            return self._process_cycle_rows(rows, asof_ms, stats)
+        finally:
+            if isinstance(cycle_source, BybitHistoricalCandleSource):
+                logger.info("SRR cycle candle request metrics: %s", cycle_source.cycle_request_metrics)
+                cycle_source.end_cycle()
+
+    def _process_cycle_rows(self, rows: Sequence[Any], asof_ms: int, stats: dict[str, Any]) -> dict[str, Any]:
         for row in rows:
             obs = {
                 "observation_id": row[0],
