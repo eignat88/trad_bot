@@ -78,8 +78,8 @@ passwords and `.env` contents are never logged (regression-tested).
    never the minimal illustration JSON:
 
    ```bash
-   sudo -u tradbot cp /opt/trad_bot/config.yaml /opt/trad_bot/scanner_canary.json
-   sudo -u tradbot chmod 640 /opt/trad_bot/scanner_canary.json
+   sudo install -o tradbot -g tradbot -m 0640 /opt/trad_bot/config.yaml /opt/trad_bot/scanner_canary.json
+   # Owner and permissions are set by install
    ```
 
    Then edit **only** these three keys inside `scanner_canary.json`:
@@ -127,7 +127,7 @@ passwords and `.env` contents are never logged (regression-tested).
    unit (drop-in — the base unit file is unchanged):
 
    ```bash
-   sudo systemctl edit trad-bot-scanner
+   sudo systemctl edit --drop-in=issue231-scanner-canary.conf trad-bot-scanner.service
    ```
 
    ```ini
@@ -153,10 +153,10 @@ Rollback is a Scanner-only, configuration-only operation — no code revert,
 no DB change, no data migration.
 
 ```bash
-sudo systemctl edit --delete-unit-env trad-bot-scanner   # or delete the drop-in
+sudo rm /etc/systemd/system/trad-bot-scanner.service.d/issue231-scanner-canary.conf
 sudo systemctl daemon-reload
 sudo systemctl restart trad-bot-scanner
-sudo rm -f /opt/trad_bot/scanner_canary.json             # optional
+# Optional cleanup only after confirming Scanner is DEFAULT/OFF
 ```
 
 Expected after rollback:
