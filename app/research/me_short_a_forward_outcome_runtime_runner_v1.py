@@ -154,6 +154,22 @@ def connect_readonly(env: dict[str, str] | None = None) -> Any:
 
 # ── runtime assembly ──────────────────────────────────────────────────
 
+def _build_bybit_client() -> Any:
+    """Build the read-only Bybit client from the shared R2 config contract.
+
+    Issue 231 R3: the ``--candle-source bybit`` branch resolves settings via
+    ``load_settings()`` (two-factor activation, strict validation, shared
+    state_path and G/B parameters) instead of implicit default Settings(),
+    so this outcome runtime joins the same limiter bucket as every other
+    consumer. The runtime protocol itself (identity, read-only session,
+    registry) is untouched.
+    """
+    from app.config import load_settings
+    from app.exchange.bybit_client import BybitClient
+
+    return BybitClient(load_settings())
+
+
 def build_runtime(
     conn: Any,
     args: argparse.Namespace,
@@ -177,10 +193,7 @@ def build_runtime(
             "runtime registry identity mismatch: " + "; ".join(problems))
 
     if args.candle_source == "bybit":
-        from app.config import Settings
-        from app.exchange.bybit_client import BybitClient
-
-        client = BybitClient(Settings())
+        client = _build_bybit_client()
         candle_source = BybitClosedCandleSource(client)
     else:  # pragma: no cover - offline replay path
         raise RuntimeError(

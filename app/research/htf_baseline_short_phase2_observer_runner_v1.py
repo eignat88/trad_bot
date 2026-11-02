@@ -1105,7 +1105,10 @@ def build_candle_source(args, config: RunnerConfig):
             raise NotRunnableError("--data-dir is required for --candle-source csv")
         return FileCandleSource(args.data_dir)
     if source_kind == "bybit":
-        from app.config import Settings
+        # Issue 231 R3: resolve the shared R2 config contract (two-factor
+        # activation, strict validation, shared state_path/G/B) instead of
+        # implicit default Settings() — this branch joins the shared bucket.
+        from app.config import load_settings
         from app.exchange.bybit_client import BybitClient
 
         explicit_history = getattr(args, "bybit_min_history_bars", None)
@@ -1117,7 +1120,7 @@ def build_candle_source(args, config: RunnerConfig):
             config.warmup_bars + DEFAULT_HTF_HISTORY_HOURS * 12 + CANONICAL_WINDOW,
         )
         return BybitPhase2CandleSource(
-            BybitClient(Settings()),
+            BybitClient(load_settings()),
             evaluation_asof_ms=getattr(args, "evaluation_asof_ms", None),
             page_limit=int(getattr(args, "bybit_page_limit", BYBIT_DEFAULT_PAGE_LIMIT)),
             max_pages=int(getattr(args, "bybit_max_pages", BYBIT_DEFAULT_MAX_PAGES)),
