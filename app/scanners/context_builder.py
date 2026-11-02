@@ -66,7 +66,9 @@ def build_market_context(
     candles_5m = client.get_klines(symbol, "5", 200)
     candles_15m = client.get_klines(symbol, "15", 200)
     candles_1h = client.get_klines(symbol, "60", 200)
-    candles_4h = client.get_klines(symbol, "240", 200)
+    # No active Scanner consumer reads 4H OHLCV; preserve the context field.
+    # Avoid an unnecessary Bybit request and a failure point for the symbol.
+    candles_4h = ()
     candles_1d = client.get_klines(symbol, "D", 8)
     indicators = _build_indicators(candles_1h)
     levels = _find_levels(candles_1d)
