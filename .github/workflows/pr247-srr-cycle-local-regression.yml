@@ -1,0 +1,32 @@
+name: PR247 SRR Cycle Local Regression
+
+on:
+  pull_request:
+    paths:
+      - 'app/research/srr_short_execution_r_expansion_prospective_evaluator.py'
+      - 'tests/test_srr_cycle_local_closed_candle_reuse_v1.py'
+      - '.github/workflows/pr247-srr-cycle-local-regression.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: SRR regression (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+    matrix:
+      os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install test dependencies
+        run: python -m pip install -r requirements.txt pytest
+      - name: Issue 246 targeted tests
+        run: python -m pytest -q -p no:cacheprovider tests/test_srr_cycle_local_closed_candle_reuse_v1.py --tb=short
+      - name: SRR existing policy regression
+        run: python -m pytest -q -p no:cacheprovider tests/test_srr_short_prospective_evaluator_policy_routing_v1.py tests/test_srr_short_timeout_candle_policy_v1.py --tb=short
