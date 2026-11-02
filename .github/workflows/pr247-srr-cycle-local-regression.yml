@@ -28,5 +28,23 @@ jobs:
         run: python -m pip install -r requirements.txt pytest
       - name: Issue 246 targeted tests
         run: python -m pytest -q -p no:cacheprovider tests/test_srr_cycle_local_closed_candle_reuse_v1.py --tb=short
-      - name: SRR existing policy regression
-        run: python -m pytest -q -p no:cacheprovider tests/test_srr_short_prospective_evaluator_policy_routing_v1.py tests/test_srr_short_timeout_candle_policy_v1.py --tb=short
+      - name: SRR self-contained policy regression (historical fixture tests tracked separately)
+        run: python -m pytest -q -p no:cacheprovider tests/test_srr_short_prospective_evaluator_policy_routing_v1.py tests/test_srr_short_timeout_candle_policy_v1.py -k "not TestHistoricalFixtures" --tb=short
+      - name: Record historical snapshot availability
+        shell: bash
+        run: |
+          fixture="audit_db/srr_short_r_expansion_candle_path_integrity_audit_v1_20261008/srr_short_r_expansion_snapshot_clean_utf8.csv"
+          if [ -f "$fixture" ]; then
+            echo "HISTORICAL_FIXTURE_PRESENT"
+          else
+            echo "::warning::HISTORICAL_REPLAY_NOT_EXECUTED: missing tracked fixture $fixture"
+          fi
+      - name: SRR historical fixture regression (when provenance file available)
+        shell: bash
+        run: |
+          fixture="audit_db/srr_short_r_expansion_candle_path_integrity_audit_v1_20261008/srr_short_r_expansion_snapshot_clean_utf8.csv"
+          if [ -f "$fixture" ]; then
+            python -m pytest -q -p no:cacheprovider tests/test_srr_short_timeout_candle_policy_v1.py -k TestHistoricalFixtures --tb=short
+          else
+            echo "HISTORICAL_REPLAY_BLOCKED_MISSING_FIXTURE — not counted as PASS"
+          fi
