@@ -22,6 +22,11 @@ Contracts implemented here
 * **Durable state** — crash-safe init, checksum-validated JSON state,
   atomic replace (temp O_EXCL → fsync file → rename → fsync parent dir),
   corrupt state → FAIL_CLOSED, clock-jump protection, safe restart.
+  Clock jumps are classified by the wall-vs-monotonic divergence
+  (skew = Δwall − Δmono, cap ``clock_step_cap_s``): a normal idle gap
+  (scanner cycle, restart downtime) advances both clocks together and
+  never re-arms an OPEN cooldown, while a real clock step keeps the
+  original fail-closed no-credit / cooldown-re-arm behavior.
 * **FAIL_CLOSED** — when enabled, every unavailable-state condition surfaces
   as ``GrantResult.STATE_UNAVAILABLE`` (or ``False`` from ``prepare_send``);
   there is no degraded local fallback mode.
@@ -236,6 +241,11 @@ class LimiterConfig:
     breaker_cooldowns_s: tuple[float, ...] = DEFAULT_COOLDOWNS_S
     recovery_success_target: int = RECOVERY_SUCCESS_TARGET
     probe_lease_s: float = 30.0
+    #: Max tolerated wall-vs-monotonic divergence before a wall movement
+    #: is classified as a genuine clock step (Issue #253 follow-up). A
+    #: normal idle gap of any length has ≈0 divergence, so only a real
+    #: clock discontinuity ever reaches the no-credit / cooldown-re-arm
+    #: path in ``_refresh``.
     clock_step_cap_s: float = 30.0
     registry_capacity: int = 8192
     max_lifetime_s: float = 60.0
@@ -855,12 +865,23 @@ def _validate(doc: Any) -> dict[str, Any]:
     return doc
 
 
-def _default_state(cfg: LimiterConfig, wall: float, boot: str) -> dict[str, Any]:
+def _default_state(cfg: LimiterConfig, wall: float, boot: str,
+                   mono: float | None = None) -> dict[str, Any]:
     return {
         "schema": STATE_SCHEMA,
         "checksum": "",
         "wall_ts": wall,
         "last_wall": wall,
+        # Issue #253 (recovery cooldown vs normal idle): monotonic baseline
+        # PAIRED with ``last_wall`` — both are always persisted together so
+        # ``_refresh`` can classify a wall delta against real elapsed time
+        # (skew = Δwall − Δmono) instead of guessing from the wall alone.
+        # ``None`` only for states written before this fix (or by a legacy
+        # 3-arg caller): ``_refresh`` then falls back to the original
+        # wall-only step heuristic for that one refresh and adopts the
+        # baseline. Optional on purpose: schema stays 1 and the state file
+        # remains readable/writable in BOTH directions (rollback-safe).
+        "last_mono": mono,
         "boot_id": boot,
         "epoch": 1,
         "epoch_start_wall": wall,
@@ -1036,9 +1057,9 @@ class GlobalBybitRateLimiter:
         except FileNotFoundError:
             if write:
                 return _default_state(self.config, self.clock.wall(),
-                                      current_boot_id())
+                                      current_boot_id(), self.clock.mono())
             return _default_state(self.config, self.clock.wall(),
-                                  current_boot_id())
+                                  current_boot_id(), self.clock.mono())
         except OSError as exc:
             raise LimiterUnavailableError("read_failed") from exc
         try:
@@ -1178,25 +1199,64 @@ class GlobalBybitRateLimiter:
             self._leaked.discard(rid)
         cfg = self.config
         wall = self.clock.wall()
+        mono = self.clock.mono()
         boot = current_boot_id()
         br = st["breaker"]
         dirty = False
 
         # --- clock rules (R2 §6 / Phase 3 §2): never mint extra tokens.
+        #
+        # Issue #253 follow-up (OPEN cooldown wrongly extended after a
+        # NORMAL idle): the step cap classifies the DIVERGENCE between the
+        # wall clock and the monotonic clock — skew = Δwall − Δmono —
+        # instead of the raw wall delta. A normal idle gap (scanner cycle
+        # ≈ 300 s between cycles, service restart after downtime)
+        # advances BOTH clocks together (skew ≈ 0): it is ordinary
+        # elapsed time, is credited up to the burst ceiling, and NEVER
+        # touches an OPEN cooldown. Only a genuine wall-clock
+        # discontinuity (NTP step, VM clock set — the wall moved while
+        # the monotonic source did not) can exceed the cap; it keeps the
+        # original fail-closed behavior: re-baseline WITHOUT credit and
+        # never shorten — in fact re-arm — an OPEN cooldown. The
+        # monotonic baseline (``last_mono``) travels in the shared state
+        # next to ``last_wall`` and both are always persisted together,
+        # so the classification survives restarts and stays consistent
+        # across processes (the monotonic source is system-wide per boot;
+        # ``boot_id`` still guards reboots).
         if st["boot_id"] != boot:
             # reboot: re-baseline, no credit for the gap; counters survive.
             st["boot_id"] = boot
             st["last_wall"] = wall
+            st["last_mono"] = mono
             dirty = True
             delta = 0.0
         else:
-            delta = wall - st["last_wall"]
-            if delta < 0:
-                delta = 0.0                          # backward: freeze credit
-            elif delta > cfg.clock_step_cap_s:
-                # forward jump: re-baseline WITHOUT credit; never shorten
-                # an open cooldown.
+            last_wall = float(st.get("last_wall", wall))
+            d_wall = wall - last_wall
+            last_mono = st.get("last_mono")
+            if not isinstance(last_mono, (int, float)) or \
+                    isinstance(last_mono, bool):
+                # Legacy state written before this fix: no monotonic
+                # baseline exists to compare against, so the ORIGINAL
+                # wall-only heuristic decides this ONE refresh — a wall
+                # step above the cap keeps its fail-closed cooldown
+                # extension (never weakened at the upgrade boundary).
+                # The baseline is adopted below, so every later refresh
+                # uses the divergence rule.
+                step = ("backward" if d_wall < 0.0 else
+                        "forward" if d_wall > cfg.clock_step_cap_s else
+                        "normal")
+            else:
+                skew = d_wall - (mono - float(last_mono))
+                step = ("forward" if skew > cfg.clock_step_cap_s else
+                        "backward" if skew < -cfg.clock_step_cap_s else
+                        "normal")
+            if step == "forward":
+                # forward discontinuity: re-baseline WITHOUT credit; never
+                # shorten an open cooldown (re-arm it fail-closed so the
+                # jump cannot masquerade as elapsed cooldown time).
                 st["last_wall"] = wall
+                st["last_mono"] = mono
                 dirty = True
                 delta = 0.0
                 if br["state"] == BKR_OPEN:
@@ -1204,20 +1264,40 @@ class GlobalBybitRateLimiter:
                         br["cooldown_until_wall"],
                         wall + cfg.cooldown_for(br["level"]))
                     dirty = True
-            elif delta > 0:
-                credit = cfg.g_rps * delta
-                applied = min(credit, max(0.0, cfg.burst - st["tokens"]))
-                st["tokens"] += applied
-                st["refill_total"] += applied
+            elif step == "backward":
+                # backward discontinuity: freeze this interval's credit
+                # and re-baseline BOTH clocks together — re-baselining
+                # only one of them desynchronizes the persisted pair and
+                # would make the NEXT refresh misclassify ordinary time
+                # as a jump.
                 st["last_wall"] = wall
-                # Credit is NEVER persisted on its own: it is fully
-                # re-derivable from the persisted (last_wall, tokens) pair
-                # in every later transaction, and persisting it on each
-                # poll would turn a read poll into a durable write (an
-                # fsync convoy under cross-process contention). The next
-                # grant / drop / trip persists it together with its own
-                # mutation; crash re-derivation loses nothing (forward
-                # jumps and reboots deliberately discard credit).
+                st["last_mono"] = mono
+                dirty = True
+                delta = 0.0
+            else:
+                # Normal interval (idle or active): both clocks moved
+                # together — credit real elapsed time (bounded by the
+                # burst ceiling); an OPEN cooldown is never touched here.
+                delta = d_wall
+                if delta < 0:
+                    delta = 0.0                  # sub-cap slew: freeze credit
+                elif delta > 0:
+                    credit = cfg.g_rps * delta
+                    applied = min(credit, max(0.0, cfg.burst - st["tokens"]))
+                    st["tokens"] += applied
+                    st["refill_total"] += applied
+                    st["last_wall"] = wall
+                    # Credit is NEVER persisted on its own: it is fully
+                    # re-derivable from the persisted
+                    # (last_wall, last_mono, tokens) triple in every
+                    # later transaction, and persisting it on each poll
+                    # would turn a poll into a durable write (an fsync
+                    # convoy under cross-process contention). The next
+                    # grant / drop / trip persists it together with its
+                    # own mutation; crash re-derivation loses nothing
+                    # (forward discontinuities and reboots deliberately
+                    # discard credit).
+                st["last_mono"] = mono
 
         # --- pending registry prune (TTL / foreign boot / dead owner).
         # Owner-PID pruning is tri-state (D3): only PROVABLY DEAD pids
