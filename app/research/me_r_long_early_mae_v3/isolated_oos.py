@@ -148,9 +148,19 @@ def once(client=None):
     symbols = configured_symbols()
 
     if client is None:
-        from app.config import Settings
+        from pathlib import Path
+
+        from app.config import load_settings
         from app.exchange.bybit_client import BybitClient
-        client = BybitClient(Settings())
+        # Issue #253: resolve the SAME settings contract as every other
+        # Bybit consumer (anchored at this release root, never cwd) instead
+        # of built-in defaults. With no config file present the result is
+        # identical to Settings(); with one present, the shared rate-limiter
+        # activation/parameters follow it — this systemd collector can no
+        # longer be a silent default-off bypass of the shared API budget.
+        root = Path(__file__).resolve().parents[3]
+        client = BybitClient(load_settings(path=root / "config.yaml",
+                                           env_file=root / ".env"))
 
     connection = connect()
     try:
@@ -215,9 +225,15 @@ def market_preflight(client=None):
     validate_identity()
     symbols = configured_symbols()
     if client is None:
-        from app.config import Settings
+        from pathlib import Path
+
+        from app.config import load_settings
         from app.exchange.bybit_client import BybitClient
-        client = BybitClient(Settings())
+        # Same Issue #253 settings contract as once() (see there): the
+        # read-only preflight must not be a default-off bypass either.
+        root = Path(__file__).resolve().parents[3]
+        client = BybitClient(load_settings(path=root / "config.yaml",
+                                           env_file=root / ".env"))
     results = {}
     for symbol in symbols:
         context, completed = collect_context(client, symbol)

@@ -663,8 +663,23 @@ class BybitClient:
             if self._limiter_enabled():
                 try:
                     shared = self._shared_limiter()
+                    # Issue #253 (max_wait_s contract): the configured
+                    # ``global_limiter_max_wait_s`` is an UPPER BOUND for
+                    # EVERY caller, not only for ``deadline=None``. Without
+                    # this min() the GET path's retry deadline (60 s by
+                    # default) silently extends a shared-limiter wait to 60 s
+                    # while the documented contract says 30 s — a divergence
+                    # that both stalls the caller and hides the configured
+                    # figure from operators. Read from the resolved settings
+                    # so the bound holds for any limiter implementation.
+                    max_wait_s = float(getattr(
+                        self.settings, "global_limiter_max_wait_s", 0.0) or 0.0)
+                    acquire_deadline = deadline_at
+                    if max_wait_s > 0:
+                        acquire_deadline = min(deadline_at,
+                                               t_start + max_wait_s)
                     grant = shared.acquire(
-                        priority, deadline=deadline_at,
+                        priority, deadline=acquire_deadline,
                         logical_request_id=logical_request_id)
                 except Exception as _limiter_exc:
                     rec("BYBIT_API_SKIP",

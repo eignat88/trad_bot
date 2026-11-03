@@ -133,6 +133,35 @@ RECOVERY_SUCCESS_TARGET = 20
 DEFAULT_STATE_PATH = "var/state/global_bybit_limiter_v1.json"
 STATE_SCHEMA = 1
 
+#: Issue #253 (BYBIT_SHARED_LIMITER_ALL_CONSUMERS_ALIGNMENT_V1) — the
+#: LimiterConfig fields that shape the SHARED budget/accounting semantics of
+#: one state file. Two processes that open the SAME state path with
+#: different values for any of these would silently disagree about the
+#: budget (refill rate, burst, priority shares, breaker ladder, registry
+#: bounds, wait horizon), i.e. one of them would run an unobserved
+#: off-contract budget. Every such mismatch is detected from the durable
+#: ``config_fingerprint`` persisted with the state and fail-closes.
+#:
+#: Deliberately EXCLUDED (process-local knobs that cannot make two shared
+#: budgets disagree): ``enabled``, ``state_path``, ``lock_timeout_s``,
+#: ``min_poll_s``, ``max_poll_s``, ``loop_iter_cap``, ``record_retry_*``.
+SHARED_SEMANTIC_FIELDS: tuple[str, ...] = (
+    "g_rps",
+    "burst",
+    "weights",
+    "credit_k_s",
+    "breaker_cooldowns_s",
+    "recovery_success_target",
+    "probe_lease_s",
+    "clock_step_cap_s",
+    "registry_capacity",
+    "max_lifetime_s",
+    "max_wait_s",
+    "demand_ttl_s",
+    "pending_liveness_ttl_s",
+    "pending_capacity",
+)
+
 BKR_CLOSED = "CLOSED"
 BKR_OPEN = "OPEN"
 BKR_RECOVERY = "RECOVERY"
@@ -296,6 +325,27 @@ class LimiterConfig:
         first trip → ``cooldowns[0]`` = 5 s, 2 → 30 s, 3+ → 120 s)."""
         idx = min(max(int(level) - 1, 0), len(self.breaker_cooldowns_s) - 1)
         return float(self.breaker_cooldowns_s[idx])
+
+    @property
+    def fingerprint(self) -> str:
+        """Durable identity of the SHARED budget semantics (Issue #253).
+
+        SHA-256 over a canonical JSON of :data:`SHARED_SEMANTIC_FIELDS`. It
+        is persisted with the shared state file (``config_fingerprint``) so
+        a process that opens an existing state with INCOMPATIBLE parameters
+        fails closed instead of silently running a different budget against
+        the same bucket. ``enabled``/``state_path`` are excluded: the state
+        file only exists for an enabled limiter and one file == one path.
+        """
+        payload: dict[str, Any] = {}
+        for name in SHARED_SEMANTIC_FIELDS:
+            value = getattr(self, name)
+            if isinstance(value, tuple):
+                value = list(value)
+            payload[name] = value
+        canonical = json.dumps(payload, sort_keys=True,
+                               separators=(",", ":"), default=str)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @classmethod
     def from_settings(cls, settings: Any = None) -> "LimiterConfig":
@@ -819,6 +869,10 @@ def _default_state(cfg: LimiterConfig, wall: float, boot: str) -> dict[str, Any]
         "total_grants": 0,
         "epoch_grants": 0,
         "refill_total": 0.0,
+        # Issue #253: the SHARED parameter identity travels with the state so
+        # an incompatible consumer fail-closes instead of running a second,
+        # off-contract budget against the same bucket.
+        "config_fingerprint": cfg.fingerprint,
         "usage_by_priority": {p: 0 for p in PRIORITY_ORDER},
         "pending": {},
         "grants": {},
@@ -991,7 +1045,35 @@ class GlobalBybitRateLimiter:
             doc = json.loads(raw)
         except ValueError as exc:
             raise LimiterUnavailableError("corrupt_state") from exc
-        return _validate(doc)
+        doc = _validate(doc)
+        self._check_config_fingerprint(doc, write=write)
+        return doc
+
+    def _check_config_fingerprint(self, doc: dict[str, Any],
+                                  *, write: bool) -> None:
+        """Issue #253 — shared-parameter identity guard (fail-closed).
+
+        * **mismatch** (state written by a consumer configured with
+          different shared parameters) -> ``config_mismatch``: the
+          transaction aborts BEFORE any mutation, so an off-contract
+          consumer can neither read nor extend the bucket. ``BybitClient``
+          surfaces it as ``STATE_UNAVAILABLE: config_mismatch`` /
+          ``BYBIT_API_SKIP`` — never a silent bypass, never a second budget.
+        * **absent** (state written before Issue #253) -> the CURRENT
+          contract is adopted on the next WRITE transaction only, so a
+          read-only snapshot stays non-mutating (F4). The first writer after
+          the upgrade pins the fingerprint; a later, differently-configured
+          consumer then fails closed against it.
+        """
+        expected = self.config.fingerprint
+        stored = doc.get("config_fingerprint")
+        if stored is None:
+            if write:
+                doc["config_fingerprint"] = expected
+                self._set_dirty()
+            return
+        if not isinstance(stored, str) or stored != expected:
+            raise LimiterUnavailableError("config_mismatch")
 
     def _write_state(self, st: dict[str, Any]) -> None:
         directory = os.path.dirname(self.state_path) or "."

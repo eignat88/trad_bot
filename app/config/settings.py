@@ -165,6 +165,16 @@ class Settings:
     global_limiter_pending_liveness_ttl_s: float = 15.0
     global_limiter_record_retry_attempts: int = 3
     global_limiter_record_retry_backoff_s: float = 0.05
+    # Issue #253 (BYBIT_SHARED_LIMITER_ALL_CONSUMERS_ALIGNMENT_V1) — optional
+    # path to the CANONICAL shared-limiter parameter contract (a JSON file).
+    # Activation flags are NEVER part of that contract: enabling the limiter
+    # stays a per-consumer decision so a staged rollout remains possible.
+    # When set, load_settings() merges the contract's global_limiter_* values
+    # into these settings and REJECTS any config file that disagrees with it
+    # (LimiterContractError -> startup abort, no silent override, no silent
+    # fallback to limiter-OFF). Empty (default) = legacy Issue #231 behaviour.
+    # A relative path is anchored at the repository root, never at cwd.
+    global_limiter_contract_path: str = ""
     scanner_workers: int = 5
     scan_interval: int = 300
     # OOS evaluator interval in scanner cycles (default 12 = every 60 minutes
@@ -880,6 +890,15 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
                 env_enabled_raw,
             )
         values["global_bybit_rate_limiter_enabled"] = yaml_enabled
+    # --- Issue #253: shared-limiter PARAMETER contract alignment ----------
+    # Runs AFTER the activation block (activation can never come from the
+    # contract) and BEFORE Settings() is built, so a contract/config
+    # disagreement aborts startup here — before any BybitClient exists and
+    # before any shared-state file is opened. Lazy import: limiter_contract
+    # pulls in the limiter core, which imports this module.
+    from app.config.limiter_contract import apply_limiter_contract
+
+    apply_limiter_contract(values, raw)
     settings = Settings(**values)
     # Expose the DCA config source via module-level variable.
     # Used by paper_runner for startup logging.

@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.models import Candle
-from app.config.settings import Settings
+from app.config.settings import load_settings
 from app.exchange.bybit_client import BybitClient
 from app.research.htf_keylevel_baseline_short_causal_observer_v1 import (
     BAR_MS, HTF_MS, detect_causal_baseline_short,
@@ -162,7 +162,12 @@ def main() -> None:
     if end > int(datetime.now(timezone.utc).timestamp()*1000)-BAR_MS:
         p.error("End must be in the past")
     # The source expects inclusive last candle open; require all bars fully closed.
-    source = BybitHistoricalCandleSource(BybitClient(Settings()))
+    # Issue #253: resolve the shared settings contract (repository-root
+    # anchored) instead of built-in defaults — a manual replay tool must not
+    # be a silent default-off bypass of the shared Bybit request budget.
+    _root = Path(__file__).resolve().parents[2]
+    source = BybitHistoricalCandleSource(BybitClient(load_settings(
+        path=_root / "config.yaml", env_file=_root / ".env")))
     result = source.fetch_5m_candles(a.symbol, start, end-BAR_MS, evaluation_asof_ms=end)
     if result.status != SOURCE_VALIDATED:
         raise SystemExit(f"FETCH_BLOCKED status={result.status} reason={result.reason_code} diagnostics={result.diagnostics}")
