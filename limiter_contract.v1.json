@@ -1,0 +1,17 @@
+{
+  "_comment": "BYBIT_SHARED_LIMITER_ALL_CONSUMERS_ALIGNMENT_V1 (Issue #253) — CANONICAL, git-versioned parameters for the shared Bybit rate limiter. Activate a consumer by adding {\"global_limiter_contract_path\": \"<path to this file>\", \"global_bybit_rate_limiter_enabled\": true} to THAT consumer's config file. Activation is never carried by this file (staged rollout stays per-consumer). A relative global_limiter_state_path is anchored at the repository root, never at the process cwd. Production deployments ship their own copy with the absolute state path /var/lib/trad_bot/state/global_bybit_limiter_v1.json and point global_limiter_contract_path at it. This file is never mutated at runtime.",
+  "global_limiter_state_path": "var/state/global_bybit_limiter_v1.json",
+  "global_limiter_g_rps": 8.0,
+  "global_limiter_burst": 12.0,
+  "global_limiter_max_wait_s": 30.0,
+  "global_limiter_breaker_cooldowns_s": [5.0, 30.0, 120.0],
+  "global_limiter_recovery_success_target": 20,
+  "global_limiter_lock_timeout_s": 5.0,
+  "global_limiter_demand_ttl_s": 120.0,
+  "global_limiter_pending_liveness_ttl_s": 15.0,
+  "global_limiter_probe_lease_s": 30.0,
+  "global_limiter_registry_capacity": 8192,
+  "global_limiter_max_lifetime_s": 60.0,
+  "global_limiter_record_retry_attempts": 3,
+  "global_limiter_record_retry_backoff_s": 0.05
+}

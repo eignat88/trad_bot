@@ -14,15 +14,25 @@ from datetime import datetime, timezone
 # Permit direct execution from tools/research without external PYTHONPATH.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from app.config import Settings
+from app.config import load_settings
 from app.exchange.bybit_client import BybitClient
 
 LIMIT = 50
 MIN_TURNOVER_USDT_24H = 10_000_000
 
+#: Issue #253: this manual snapshot tool resolves the SAME settings contract
+#: as every runtime Bybit consumer (anchored at the repository root, never
+#: cwd) instead of built-in defaults, so it can no longer be a silent
+#: default-off bypass of the shared API request budget.
+_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _settings():
+    return load_settings(path=_ROOT / "config.yaml", env_file=_ROOT / ".env")
+
 
 def main() -> None:
-    instruments = BybitClient(Settings()).get_liquid_instruments(
+    instruments = BybitClient(_settings()).get_liquid_instruments(
         top_n=LIMIT,
         min_turnover_24h=MIN_TURNOVER_USDT_24H,
         quote_coin="USDT",

@@ -388,11 +388,17 @@ def main(argv: list[str] | None = None, *, client_factory=None) -> int:
         return EXIT_NOT_RUNNABLE
 
     if client_factory is None:
-        from app.config import Settings
+        from app.config import load_settings
         from app.exchange.bybit_client import BybitClient
 
+        # Issue #253: resolve the shared settings contract (repository-root
+        # anchored, never cwd) instead of built-in defaults, so this dry-run
+        # tool is not a silent default-off bypass of the shared Bybit budget.
+        _root = Path(__file__).resolve().parents[2]
+
         def client_factory():
-            return CountingClient(BybitClient(Settings()))
+            return CountingClient(BybitClient(load_settings(
+                path=_root / "config.yaml", env_file=_root / ".env")))
 
     report: dict = {
         "tool": "HTF_BASELINE_SHORT_PHASE2_BYBIT_LIVE_DRY_RUN_V1",

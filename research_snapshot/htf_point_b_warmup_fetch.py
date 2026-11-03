@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import csv
 import json
@@ -7,6 +7,16 @@ from pathlib import Path
 from time import sleep
 
 import requests
+
+# Issue #253 — MANAGED OFFLINE FETCH PATH: this one-shot historical fetcher
+# is NOT a runtime service, but it does open its own Bybit HTTP connection,
+# so it must not be an unclassified bypass of the shared request budget.
+# ``guarded_bybit_attempt`` is a no-op while the shared limiter is
+# default-off (byte-identical legacy behaviour) and, when enabled, gates
+# EVERY page through acquire -> prepare_send -> send -> record_result at P3.
+# A deny RAISES before the request is sent: the run stops with
+# WARMUP-incomplete state instead of silently producing a partial dataset.
+from app.exchange.offline_limiter import guarded_bybit_attempt
 
 OUT = Path(r"D:\py_pro\trad_bot\research_snapshot\htf_point_b_warmup_14d")
 
@@ -41,22 +51,30 @@ def fetch_page(symbol: str, end_ms: int):
         "end": end_ms,
     }
 
-    r = requests.get(URL, params=params, timeout=30)
-    r.raise_for_status()
+    with guarded_bybit_attempt("/v5/market/kline") as attempt:
+        r = requests.get(URL, params=params, timeout=30)
+        r.raise_for_status()
 
-    payload = r.json()
+        payload = r.json()
 
-    if payload.get("retCode") != 0:
-        raise RuntimeError(
-            f"{symbol}: {payload.get('retCode')} {payload.get('retMsg')}"
-        )
+        if payload.get("retCode") != 0:
+            # retCode 10006 = "Too many visits" (rate limit): record it as
+            # RATE_LIMIT so shared-limiter breaker accounting sees the real
+            # provider signal instead of a generic error.
+            attempt.outcome = (
+                "RATE_LIMIT" if payload.get("retCode") == 10006 else "ERROR"
+            )
+            raise RuntimeError(
+                f"{symbol}: {payload.get('retCode')} {payload.get('retMsg')}"
+            )
 
-    rows = [
-        (int(x[0]), *[float(v) for v in x[1:6]])
-        for x in payload["result"]["list"]
-    ]
+        rows = [
+            (int(x[0]), *[float(v) for v in x[1:6]])
+            for x in payload["result"]["list"]
+        ]
 
-    rows.sort(key=lambda x: x[0])
+        rows.sort(key=lambda x: x[0])
+        attempt.outcome = "OK"
     return rows
 
 

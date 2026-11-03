@@ -11,6 +11,16 @@ from time import sleep
 sys.path.insert(0, r"D:\py_pro\trad_bot")
 import requests
 
+# Issue #253 — MANAGED OFFLINE FETCH PATH (see app/exchange/offline_limiter):
+# this one-shot historical fetcher opens its own Bybit HTTP connection, so it
+# is routed through the shared request budget instead of being an
+# unclassified bypass. No-op while the limiter is default-off (legacy
+# behaviour preserved); when enabled every page is gated at P3 and a deny
+# RAISES before the request is sent — the per-symbol FAILED/`next_end_ms`
+# checkpoint then keeps the dataset resumable without ever marking a
+# partially fetched range complete.
+from app.exchange.offline_limiter import guarded_bybit_attempt
+
 OUT = Path(r"D:\py_pro\trad_bot\research_snapshot\htf_point_b_30d")
 URL = "https://api.bybit.com/v5/market/kline"
 START_MS = int(datetime(2026, 9, 5, tzinfo=timezone.utc).timestamp() * 1000)
@@ -73,13 +83,20 @@ def save_rows(symbol: str, rows: dict[int, tuple]) -> None:
 
 def fetch_page(symbol: str, end_ms: int) -> list[tuple[int, float, float, float, float, float]]:
     params = {"category": "linear", "symbol": symbol, "interval": "5", "limit": 1000, "end": end_ms}
-    response = requests.get(URL, params=params, timeout=30)
-    response.raise_for_status()
-    payload = response.json()
-    if payload.get("retCode") != 0:
-        raise RuntimeError(payload.get("retMsg"))
-    rows = [(int(r[0]), *[float(x) for x in r[1:6]]) for r in payload["result"]["list"]]
-    rows.sort(key=lambda row: row[0])
+    with guarded_bybit_attempt("/v5/market/kline") as attempt:
+        response = requests.get(URL, params=params, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("retCode") != 0:
+            # retCode 10006 = "Too many visits" -> shared-limiter RATE_LIMIT
+            # accounting; anything else is a plain error.
+            attempt.outcome = (
+                "RATE_LIMIT" if payload.get("retCode") == 10006 else "ERROR"
+            )
+            raise RuntimeError(payload.get("retMsg"))
+        rows = [(int(r[0]), *[float(x) for x in r[1:6]]) for r in payload["result"]["list"]]
+        rows.sort(key=lambda row: row[0])
+        attempt.outcome = "OK"
     return rows
 
 
