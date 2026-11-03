@@ -113,6 +113,21 @@ def _map_exception(exc: BaseException) -> str:
         return "AUTH"
     if isinstance(exc, (BybitTimeoutError, TimeoutError, socket.timeout)):
         return "TIMEOUT"
+    # Historical fetchers use requests, not urllib.
+    # Keep requests optional for other consumers.
+    try:
+        from requests.exceptions import HTTPError as RequestsHTTPError
+    except ImportError:
+        RequestsHTTPError = None
+
+    if RequestsHTTPError is not None and isinstance(exc, RequestsHTTPError):
+        response = getattr(exc, "response", None)
+        return (
+            "RATE_LIMIT"
+            if response is not None and response.status_code == 429
+            else "ERROR"
+        )
+
     if isinstance(exc, HTTPError):
         # A raised HTTP status: 429 is the rate-limit class, everything
         # else is a plain error (same delivery-independent rule as
