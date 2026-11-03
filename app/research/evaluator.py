@@ -23,6 +23,15 @@ from typing import Any
 
 from app.exchange.bybit_client import BybitClient
 from app.models import Candle
+from app.research.candle_coverage_guard_v1 import (
+    SOURCE_INCOMPLETE_COVERAGE,
+    datetime_to_ms,
+    fetch_candles_for_evaluation,
+    fetch_status_stats_key,
+    record_coverage_block,
+    record_finalization_block,
+    validate_candle_coverage,
+)
 from app.research.constants import HORIZONS
 from app.research.repository import ResearchRepository
 
@@ -247,6 +256,19 @@ class ResearchEvaluator:
 
     Idempotent: running multiple times does not create duplicates.
     Each horizon is evaluated at most once per signal.
+
+    Fail-closed candle coverage (Issue #244)::
+
+        INCOMPLETE CANDLE COVERAGE
+            -> NO EVALUATION WRITE
+            -> NO FINALIZATION
+
+    A horizon is written only after its exact ``[signal_time,
+    signal_time + horizon)`` 5-minute candle path has been proven complete
+    (first and last required candle present, no gaps, no duplicate or
+    off-grid timestamps, every required candle closed, valid OHLC).
+    ``is_final`` additionally requires a proven TP/SL window.  A blocked
+    horizon stays pending and is re-evaluated on a later cycle.
     """
 
     def __init__(self, conn: Any, client: BybitClient) -> None:
@@ -254,22 +276,42 @@ class ResearchEvaluator:
         self.client = client
         self._repo = ResearchRepository(conn)
         self._running = False
+        # Classified outcome of the most recent candle fetch (structured
+        # diagnostics: SOURCE_FETCH_ERROR vs SOURCE_INCOMPLETE_COVERAGE).
+        self._last_fetch_result: Any = None
 
     # ── candle fetch ──────────────────────────────────────────
 
     def _get_candles_for_symbol(
         self, symbol: str, from_time: datetime, to_time: datetime,
     ) -> list[Candle]:
-        """Fetch 5m candles covering [from_time, to_time]."""
-        try:
-            start_ms = int((from_time - timedelta(minutes=5)).timestamp() * 1000)
-            end_ms = int(to_time.timestamp() * 1000)
-            needed = min((end_ms - start_ms) // 300_000 + 10, 1000)
-            candles = self.client.get_klines(symbol, "5", needed)
-            return [c for c in candles if start_ms <= c.timestamp <= end_ms]
-        except Exception:
-            logger.exception("research evaluator: failed to fetch candles for %s", symbol)
+        """Fetch 5m candles covering [from_time, to_time].
+
+        Fail-closed wrapper around ``fetch_candles_for_evaluation``:
+
+        * only a ``SOURCE_VALIDATED`` fetch yields candles — an API/limiter
+          error, a truncated pagination or an empty response yields ``[]``,
+          so a caller can never evaluate against a partial window;
+        * windows larger than one Bybit page (1000 candles) are read through
+          the existing bounded ``BybitClient.get_klines_range`` pagination
+          (same retry budget and shared limiter as every other request) —
+          the latest-N response is never silently truncated and then treated
+          as complete;
+        * the classified status is kept on ``self._last_fetch_result`` for
+          the caller's structured diagnostics and logging.
+        """
+        result = fetch_candles_for_evaluation(
+            self.client, symbol, from_time, to_time,
+        )
+        self._last_fetch_result = result
+        if not result.ok:
+            logger.warning(
+                "research evaluator: candle source %s for %s (%s) — "
+                "evaluation deferred, no outcome write",
+                result.status, symbol, result.reason_code,
+            )
             return []
+        return list(result.candles)
 
     # ── single-signal evaluation ──────────────────────────────
 
@@ -296,6 +338,7 @@ class ResearchEvaluator:
             risk_1r = entry_price * 0.01  # fallback: 1% of entry
 
         signal_ts = int(signal_time.timestamp() * 1000)
+        asof_ms = datetime_to_ms(now)
         post_candles = [c for c in all_candles if c.timestamp > signal_ts]
 
         # Determine direction from features or default to LONG
@@ -311,6 +354,28 @@ class ResearchEvaluator:
             if sig.get(eval_field) is not None:
                 continue
             if not _is_horizon_mature(signal_time, minutes, now):
+                continue
+
+            # Fail-closed (Issue #244): prove the exact candle path for this
+            # horizon BEFORE computing anything.  Maturity alone is never
+            # proof that the price path is complete.
+            horizon_cutoff_ms = int(
+                (signal_time + timedelta(minutes=minutes)).timestamp() * 1000
+            )
+            coverage = validate_candle_coverage(
+                all_candles,
+                signal_ms=signal_ts,
+                cutoff_ms=horizon_cutoff_ms,
+                asof_ms=asof_ms,
+                scope=f"HORIZON_{label}",
+            )
+            if not coverage.ok:
+                record_coverage_block(stats, coverage, horizon=label)
+                logger.warning(
+                    "research evaluation: signal %d horizon %s deferred "
+                    "(%s/%s) — no evaluated_* write",
+                    signal_id, label, coverage.status, coverage.reason_code,
+                )
                 continue
 
             # MFE/MAE in %
@@ -345,19 +410,40 @@ class ResearchEvaluator:
         )
 
         if all_done and not sig.get("is_final") and invalidation_price is not None:
-            # TP/SL at the longest horizon (240m)
-            if is_short:
-                tp_sl = _check_short_tp_sl(
-                    post_candles, entry_price, invalidation_price, target_1,
-                    240, signal_time,
+            # Fail-closed (Issue #244): the TP/SL verdict is only trustworthy
+            # when the full 240m path is proven.  Horizon maturity (or a
+            # previously stored evaluated_* mark) is not proof by itself.
+            tpsl_cutoff_ms = int(
+                (signal_time + timedelta(minutes=240)).timestamp() * 1000
+            )
+            coverage = validate_candle_coverage(
+                all_candles,
+                signal_ms=signal_ts,
+                cutoff_ms=tpsl_cutoff_ms,
+                asof_ms=asof_ms,
+                scope="TPSL_240M",
+            )
+            if not coverage.ok:
+                record_finalization_block(stats, coverage)
+                logger.warning(
+                    "research evaluation: signal %d finalization deferred "
+                    "(%s/%s) — is_final stays false",
+                    signal_id, coverage.status, coverage.reason_code,
                 )
             else:
-                tp_sl = _check_long_tp_sl(
-                    post_candles, entry_price, invalidation_price, target_1,
-                    240, signal_time,
-                )
-            updates.update(tp_sl)
-            updates["is_final"] = True
+                # TP/SL at the longest horizon (240m)
+                if is_short:
+                    tp_sl = _check_short_tp_sl(
+                        post_candles, entry_price, invalidation_price, target_1,
+                        240, signal_time,
+                    )
+                else:
+                    tp_sl = _check_long_tp_sl(
+                        post_candles, entry_price, invalidation_price, target_1,
+                        240, signal_time,
+                    )
+                updates.update(tp_sl)
+                updates["is_final"] = True
 
         if not updates:
             return
@@ -412,6 +498,15 @@ class ResearchEvaluator:
             "outcomes_updated": 0,
             "finalized": 0,
             "errors": 0,
+            # Issue #244 structured diagnostics (in-memory only; no schema).
+            "source_blocked": {
+                "source_fetch_error": 0,
+                "source_incomplete": 0,
+                "source_not_yet_available": 0,
+            },
+            "coverage_blocked": {},
+            "horizons_pending": {h: 0 for h, _ in HORIZONS},
+            "finalization_blocked": 0,
         }
 
         for symbol, signals in by_symbol.items():
@@ -419,6 +514,16 @@ class ResearchEvaluator:
             oldest = min(s["signal_time"] for s in signals)
             candles = self._get_candles_for_symbol(symbol, oldest, now)
             if not candles:
+                # Fail-closed: no candles without a SOURCE_VALIDATED fetch.
+                # The signals stay eligible (retry) and no outcome is touched.
+                result = getattr(self, "_last_fetch_result", None)
+                if result is not None and not result.ok:
+                    status_key = fetch_status_stats_key(result.status)
+                else:
+                    status_key = fetch_status_stats_key(SOURCE_INCOMPLETE_COVERAGE)
+                stats["source_blocked"][status_key] = (
+                    stats["source_blocked"].get(status_key, 0) + len(signals)
+                )
                 stats["errors"] += len(signals)
                 continue
             for s in signals:
@@ -431,11 +536,14 @@ class ResearchEvaluator:
         stats["end_time"] = datetime.now(timezone.utc).isoformat()
         logger.info(
             "research evaluation [%s]: checked=%d symbols=%d created=%d updated=%d "
-            "finalized=%d errors=%d",
+            "finalized=%d errors=%d source_blocked=%s coverage_blocked=%s "
+            "finalization_blocked=%d",
             experiment_id,
             stats["signals_checked"], stats["symbols_processed"],
             stats["outcomes_created"], stats["outcomes_updated"],
             stats["finalized"], stats["errors"],
+            stats["source_blocked"], stats["coverage_blocked"],
+            stats["finalization_blocked"],
         )
         return stats
 

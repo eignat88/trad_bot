@@ -11,10 +11,15 @@ SIGNAL_TIME = datetime(2026, 10, 1, 10, 0, tzinfo=timezone.utc)
 
 
 def _candles(high=105.0, low=95.0, close=100.0):
+    # Issue #244 (fail-closed candle coverage): the evaluator writes nothing
+    # unless every required candle of the evaluated window is present,
+    # grid-aligned and closed at `now`.  The60m window
+    # (SIGNAL_TIME, SIGNAL_TIME + 60m) therefore needs the complete
+    # 10:05..10:55 path — all12 candles are closed at now = 11:00.
     return [SimpleNamespace(
-        timestamp=int((SIGNAL_TIME + timedelta(minutes=5)).timestamp() * 1000),
+        timestamp=int((SIGNAL_TIME + timedelta(minutes=5 + 5 * i)).timestamp() * 1000),
         high=high, low=low, close=close,
-    )]
+    ) for i in range(12)]
 
 
 def _effective_tuple(obs):
