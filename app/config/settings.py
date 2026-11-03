@@ -21,6 +21,23 @@ class ScannerUniverseSettings:
     top_n: int = 50
     min_turnover_24h: float = 10_000_000.0
     min_volume_24h: float = 0.0
+    # --- Issue #253 (BYBIT_SCANNER_STARTUP_BREAKER_OPEN_RECOVERY_V1) -----
+    # Bounded startup recovery for the FIRST dynamic-universe fetch, which
+    # happens before the database repository and the runner lock exist.
+    # A TEMPORARY shared-limiter denial (open breaker, saturated bucket)
+    # waits and retries instead of escaping main() into a systemd restart
+    # loop (production 2026-11-03, release 54201c0 / PR #255). The wait
+    # doubles from ``startup_retry_interval_s`` up to
+    # ``startup_retry_max_interval_s`` and is always polled in short chunks,
+    # so SIGTERM/SIGINT stops it promptly; there is never a busy loop.
+    # ``startup_retry_max_attempts`` bounds the total number of attempts:
+    # 0 (default) = keep waiting until a shutdown signal arrives.
+    # PERMANENT failures (authentication, configuration, shared-limiter
+    # state failures, an empty universe) are never retried and never bypass
+    # the limiter — see scanner_runner.initialize_scanner_universe().
+    startup_retry_interval_s: float = 10.0
+    startup_retry_max_interval_s: float = 60.0
+    startup_retry_max_attempts: int = 0
 
 
 @dataclass(frozen=True)
@@ -923,6 +940,20 @@ def load_settings(path: str | Path = "config.yaml", env_file: str | Path = ".env
         raise ValueError("scanner_universe.top_n must be positive")
     if universe.min_turnover_24h < 0 or universe.min_volume_24h < 0:
         raise ValueError("scanner universe liquidity thresholds cannot be negative")
+    # Issue #253 startup recovery: the retry schedule is validated HERE, at
+    # settings-load time, so an invalid value aborts startup before any
+    # BybitClient exists — never mid-recovery (fail-closed, no HTTP).
+    if universe.startup_retry_interval_s <= 0:
+        raise ValueError("scanner_universe.startup_retry_interval_s must be positive")
+    if (universe.startup_retry_max_interval_s
+            < universe.startup_retry_interval_s):
+        raise ValueError(
+            "scanner_universe.startup_retry_max_interval_s must be >= "
+            "scanner_universe.startup_retry_interval_s")
+    if universe.startup_retry_max_attempts < 0:
+        raise ValueError(
+            "scanner_universe.startup_retry_max_attempts must be >= 0 "
+            "(0 = retry until a shutdown signal arrives)")
     if settings.bybit_timeout <= 0 or settings.bybit_max_attempts <= 0:
         raise ValueError("Bybit timeout and max attempts must be positive")
     if not 1 <= settings.db_port <= 65535:
