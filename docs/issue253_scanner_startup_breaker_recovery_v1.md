@@ -64,7 +64,8 @@ repository/observer is constructed while a deny is still being waited out.
 ### 2.2 Temporary vs. permanent classification
 
 Temporary (retried) — only denials a bounded wait can legitimately outlive,
-matched on the exact fail-closed wordings `BybitClient` emits today:
+matched on the exact fail-closed wordings `BybitClient` and
+`retry_budget.RateLimitBreaker` emit today:
 
 | marker | why it is temporary |
 |---|---|
@@ -72,6 +73,7 @@ matched on the exact fail-closed wordings `BybitClient` emits today:
 | `deferred by shared rate limiter (SKIPPED` | healthy bucket/attention queue did not refill inside *this* acquire's deadline |
 | `limiter grant revoked before send` | another process tripped the breaker (fresh epoch); the new cooldown expires |
 | `Rate limited on ` | the client's own rate-limit budget (HTTP 429 / breaker gate) refills |
+| `request deferred: rate-limit cooldown open (` | **process-local** `RateLimitBreaker` cooldown after an HTTP 429 / Bybit retCode 10006 (Codex P2): a bounded `bybit_rate_limit_cooldown_s` window with a positive remaining time — it expires by construction |
 
 Permanent (never retried, propagated unchanged → process exits exactly as
 before this PR):
@@ -87,9 +89,11 @@ before this PR):
 * **unknown future wordings** — fail-closed default: not retried.
 
 The classification lives in `is_temporary_startup_limiter_denial()`; the
-unit test `test_temporary_denial_classification_contract` pins both lists,
-and the two end-to-end tests drive the REAL client deny path, so a wording
-change in `BybitClient` breaks them loudly.
+unit test `test_temporary_denial_classification_contract` pins both lists —
+including the process-local gate messages taken from the REAL
+`RateLimitBreaker.gate()` — and the end-to-end tests drive the REAL client
+deny path, so a wording change in `BybitClient` or `retry_budget` breaks
+them loudly.
 
 ### 2.3 Bounded, configurable schedule (no busy loop)
 
@@ -125,7 +129,7 @@ change in `BybitClient` breaks them loudly.
 |---|---|
 | `app/config/settings.py` | 3 new `ScannerUniverseSettings` fields + `load_settings()` validation |
 | `scanner_runner.py` | `initialize_scanner_universe()`, `wait_before_startup_retry()`, `_startup_sleep()`, `is_temporary_startup_limiter_denial()`, `main()` startup wiring |
-| `tests/test_issue253_scanner_startup_breaker_recovery_v1.py` | new — 21 deterministic regressions |
+| `tests/test_issue253_scanner_startup_breaker_recovery_v1.py` | new — 23 deterministic regressions (incl. the Codex P2 HTTP 429/10006 → process-local cooldown sequence) |
 | `docs/issue253_scanner_startup_breaker_recovery_v1.md` | this document |
 
 Untouched: `app/exchange/global_rate_limiter.py`, `app/exchange/bybit_client.py`,
@@ -142,18 +146,29 @@ timestamps, checkpoints, capture lineage, systemd/deploy files.
 | permanent startup failure | `test_permanent_startup_failure_is_never_retried[auth/api_error/limiter_unavailable/state_unavailable/empty_universe]`, `test_temporary_denial_classification_contract` |
 | no DB/OOS side effects before successful initialization | `test_main_shutdown_during_recovery_leaves_no_side_effects`, `test_main_recovers_from_breaker_open_then_initializes_database`, `test_main_orders_universe_recovery_before_database_and_lock` |
 | config contract | `test_startup_retry_knobs_default_and_load`, `test_invalid_startup_retry_knobs_fail_closed[…]`, `test_static_universe_passes_through_without_any_client_call` |
+| HTTP 429/retCode 10006 → process-local cooldown → wait → recovery (Codex P2) | `test_http429_local_cooldown_defers_then_recovers[http_429/retcode_10006]` (REAL client classification trips the REAL `RateLimitBreaker`; the gate's REAL `request deferred: rate-limit cooldown open …` denial is logged, classified temporary, waited out with bounded poll chunks and zero HTTP from the deferred attempt, then the discovered universe is returned) and `test_temporary_denial_classification_contract` (both real gate defer paths pinned against the permanent list) |
 
 ## 5. Validation results
 
+Freshness note: the scanner/config/limiter-contract, shared-limiter-core and
+full-suite numbers date from the original PR commit `54c9cb2` (`0abe781` +
+docs-only); the **Codex P2 follow-up round** (this document's classification
+row + 2 new tests) re-ran only the two targeted groups, as the review
+instructed (no full suite, no worktree).
+
 * New suite: `pytest tests/test_issue253_scanner_startup_breaker_recovery_v1.py`
-  → **21 passed** (6.6 s; the only real sleeps are the two end-to-end
-  recovery tests waiting out a 2 s breaker cooldown).
-* Issue #253 limiter safety suites
-  (`test_issue253_limiter_deny_propagation_v1.py`,
-  `test_issue253_limiter_idle_vs_clock_jump_v1.py`,
-  `test_issue253_requests_http429_v1.py`,
-  `test_issue253_shared_limiter_alignment_v1.py`,
-  `test_issue253_shared_limiter_mp_v1.py`) → **56 passed**.
+  → **23 passed** (7.0 s; the only real sleeps are the two end-to-end
+  recovery tests waiting out a 2 s shared-breaker cooldown — the Codex P2
+  sequence keeps the process-local cooldown fully injected by fast-forwarding
+  it with `RateLimitBreaker.reset()`).
+* Codex P2 follow-up round, exactly the two targeted groups:
+  * startup recovery suite → **23 passed** (7.02 s);
+  * Issue #253 limiter safety suites
+    (`test_issue253_limiter_deny_propagation_v1.py`,
+    `test_issue253_limiter_idle_vs_clock_jump_v1.py`,
+    `test_issue253_requests_http429_v1.py`,
+    `test_issue253_shared_limiter_alignment_v1.py`,
+    `test_issue253_shared_limiter_mp_v1.py`) → **56 passed** (13.99 s).
 * Scanner / config / limiter contract suites (`test_scanner_runtime.py`,
   `test_issue231_scanner_config_path_v1.py`,
   `test_db_transaction_recovery.py`,
@@ -173,7 +188,9 @@ timestamps, checkpoints, capture lineage, systemd/deploy files.
   * the 173 errors are identical in both runs (PostgreSQL/pg8000 fixtures —
     no database in this environment), as are the 71 pre-existing failures
     (DB-fixture / Windows-only / environment areas);
-  * all **21 new tests pass** in the full run;
+  * all **21 new tests pass** in the full run (the suite has 23 tests since
+    the P2 follow-up; those 2 were added afterwards and are covered by the
+    targeted run above);
   * the only delta is **3 additional failures**, all *Phase-2 scope gates*
     that compare the working tree against `origin/main` and are by design
     red for any PR outside the HTF Phase-2 surface:
@@ -213,8 +230,9 @@ timestamps, checkpoints, capture lineage, systemd/deploy files.
 
 * With the default `startup_retry_max_attempts = 0`, a Scanner facing a
   permanently OPEN breaker **stays alive and waits** (warning every attempt:
-  `scanner startup universe deferred by the shared Bybit limiter (attempt
-  N): … — retrying in Xs`) instead of crash-looping. Set
+  `scanner startup universe deferred by a Bybit rate limiter (shared or
+  process-local, attempt N): … — retrying in Xs`) instead of crash-looping.
+  Set
   `startup_retry_max_attempts` to bound that if process-level restart is
   preferred.
 * `systemctl stop` / SIGINT during recovery exits within ≤ 1 s, before the

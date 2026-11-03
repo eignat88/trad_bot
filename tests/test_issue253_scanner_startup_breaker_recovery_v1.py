@@ -18,6 +18,7 @@ through its public acquire/record_result API — never a stub.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -25,6 +26,7 @@ import pytest
 
 import scanner_runner
 from app.config import ScannerUniverseSettings, Settings
+from app.exchange import retry_budget
 from app.exchange.bybit_client import (
     BybitAuthError,
     BybitClient,
@@ -73,8 +75,9 @@ class _JsonResponse:
 
     status = 200
 
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: dict, status: int = 200) -> None:
         self._payload = payload
+        self.status = status          # instance attr shadows the default
 
     def raise_for_status(self):
         return None
@@ -88,12 +91,18 @@ class _RecordingSession:
 
     A limiter deny must leave ``calls`` EMPTY — any URL here proves the
     request escaped the FAIL_CLOSED gate.
+
+    ``instruments_script`` optionally dictates the answer of the FIRST N
+    ``/v5/market/instruments-info`` requests (e.g. ``{"status": 429}`` for
+    an HTTP 429 or ``{"retCode": 10006}`` for the Bybit rate-limit
+    envelope); once the script is exhausted the healthy payload is served.
     """
 
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.events: list[tuple[str, str]] = []
         self.blocked = True
+        self.instruments_script: list[dict] = []
 
     def get(self, url, params=None, timeout=None, headers=None):
         self.calls.append(url)
@@ -101,8 +110,12 @@ class _RecordingSession:
         if self.blocked:
             raise AssertionError(f"HTTP attempted despite limiter deny: {url}")
         if url.endswith("/v5/market/instruments-info"):
+            scripted = (
+                self.instruments_script.pop(0)
+                if self.instruments_script else {})
             return _JsonResponse({
-                "retCode": 0, "retMsg": "OK",
+                "retCode": int(scripted.get("retCode", 0)),
+                "retMsg": scripted.get("retMsg", "OK"),
                 "result": {
                     "list": [{
                         "symbol": "BTCUSDT", "status": "Trading",
@@ -111,7 +124,7 @@ class _RecordingSession:
                     }],
                     "nextPageCursor": "",
                 },
-            })
+            }, status=int(scripted.get("status", 200)))
         if url.endswith("/v5/market/tickers"):
             return _JsonResponse({
                 "retCode": 0, "retMsg": "OK",
@@ -152,7 +165,14 @@ class _Bomb:
         raise AssertionError(f"{self.name} must not run in this path")
 
 
-def _startup_settings(tmp_path: Path, **universe_overrides) -> Settings:
+def _startup_settings(
+    tmp_path: Path,
+    *,
+    shared_limiter: bool = True,
+    rate_limit_cooldown_s: float = 0.0,
+    breaker_max_wait_s: float | None = None,
+    **universe_overrides,
+) -> Settings:
     """Dynamic-universe Settings with the shared limiter genuinely ON.
 
     The 0.2 s acquire budget vs. a 2.0 s breaker cooldown reproduces the
@@ -160,6 +180,11 @@ def _startup_settings(tmp_path: Path, **universe_overrides) -> Settings:
     with a wide margin around the (real, fsync-bound) trip→attempt gap, while
     the cooldown still expires within a couple of injected waits so the
     RECOVERY probe is admitted quickly.
+
+    ``shared_limiter=False`` isolates the PROCESS-LOCAL RateLimitBreaker
+    (Codex P2); ``rate_limit_cooldown_s`` / ``breaker_max_wait_s`` shape the
+    process-local cooldown and its bounded gate wait for the HTTP 429 →
+    deferral regression.
     """
     universe = dict(
         mode="dynamic",
@@ -168,20 +193,25 @@ def _startup_settings(tmp_path: Path, **universe_overrides) -> Settings:
         startup_retry_max_attempts=0,
     )
     universe.update(universe_overrides)
-    return Settings(
-        scanner_universe=ScannerUniverseSettings(**universe),
-        global_bybit_rate_limiter_enabled=True,
-        global_limiter_state_path=str(tmp_path / "shared_state.json"),
-        global_limiter_breaker_cooldowns_s=(2.0, 4.0, 8.0),
-        global_limiter_recovery_success_target=1,
-        global_limiter_max_wait_s=0.2,
+    bybit = dict(
         bybit_timeout=2,
         bybit_max_attempts=1,
         bybit_retry_backoff=0.0,
         bybit_rate_limit_max_retries=0,
         bybit_rate_limit_retry_backoff=0.0,
-        bybit_rate_limit_cooldown_s=0.0,
+        bybit_rate_limit_cooldown_s=rate_limit_cooldown_s,
         bybit_retry_deadline_s=5.0,
+    )
+    if breaker_max_wait_s is not None:
+        bybit["bybit_breaker_max_wait_s"] = breaker_max_wait_s
+    return Settings(
+        scanner_universe=ScannerUniverseSettings(**universe),
+        global_bybit_rate_limiter_enabled=shared_limiter,
+        global_limiter_state_path=str(tmp_path / "shared_state.json"),
+        global_limiter_breaker_cooldowns_s=(2.0, 4.0, 8.0),
+        global_limiter_recovery_success_target=1,
+        global_limiter_max_wait_s=0.2,
+        **bybit,
     )
 
 
@@ -246,6 +276,79 @@ def test_breaker_open_waits_then_recovers_and_initializes_universe(tmp_path):
     assert sum(sleeps) >= settings.scanner_universe.startup_retry_interval_s
     # exactly two requests, both AFTER the breaker recovered:
     assert len(session.calls) == 2
+
+
+# ===========================================================================
+# 1b. HTTP 429 / retCode 10006 → PROCESS-LOCAL cooldown → defer → recover
+#      (Codex review P2 — the RateLimitBreaker.gate() deferral wording)
+# ===========================================================================
+@pytest.mark.parametrize("first_response", [
+    {"status": 429},
+    {"retCode": 10006, "retMsg": "too many visits"},
+], ids=["http_429", "retcode_10006"])
+def test_http429_local_cooldown_defers_then_recovers(tmp_path, caplog,
+                                                     first_response):
+    """The exact P2 sequence: first answer rate-limits the process, the NEXT
+    startup attempt is denied by the PROCESS-LOCAL ``RateLimitBreaker``
+    (``request deferred: rate-limit cooldown open …``) — recognized as
+    temporary → bounded wait → cooldown expiry → successful recovery with
+    the discovered universe.
+
+    The deferral wording and type are the REAL ones: the cooldown is opened
+    by the client's own HTTP 429 / retCode 10006 classification and the
+    message is raised by ``RateLimitBreaker.gate()`` (via
+    ``raise_bybit_rate_limit_deferred``).  With the marker missing this test
+    fails by escalating ``BybitRateLimitError`` out of startup (the P2 bug);
+    with the marker too broad the permanent-error tests fail instead.
+    """
+    settings = _startup_settings(
+        tmp_path,
+        shared_limiter=False,        # isolate the PROCESS-LOCAL breaker
+        rate_limit_cooldown_s=5.0,   # open for the defer; never really waited
+        breaker_max_wait_s=0.0,      # bounded wait cannot cover → fail closed
+        startup_retry_interval_s=1.0,
+        startup_retry_max_interval_s=4.0,
+        startup_retry_max_attempts=10,
+    )
+    session = _RecordingSession()
+    session.instruments_script = [dict(first_response)]
+    session.blocked = False          # the network answers: first a rate limit
+    client = BybitClient(settings, session)
+    caplog.set_level(logging.WARNING, logger="scanner_runner")
+
+    waits: list[float] = []
+
+    def fake_sleep(step: float) -> None:
+        waits.append(step)
+        if len(waits) == 2:
+            # Second wait sequence = the gate deferral is being waited out.
+            # The deferred attempt must have sent NOTHING (fail-closed) …
+            assert len(session.calls) == 1, (
+                "a gate-deferred attempt must send no HTTP")
+            # … and here the real cooldown expires (fast-forward — the same
+            # state change as `bybit_rate_limit_cooldown_s` elapsing).
+            retry_budget.get_breaker().reset()
+
+    universe = scanner_runner.initialize_scanner_universe(
+        client, settings, sleep=fake_sleep)
+
+    # two denials happened: the 429/10006 trip (wait 1.0) and the
+    # process-local gate deferral (wait 2.0 = two 1.0 poll chunks):
+    assert waits == [1.0, 1.0, 1.0]
+    assert all(0 < chunk <= scanner_runner.STARTUP_RETRY_POLL_S
+               for chunk in waits), "bounded, positive chunks — no busy loop"
+    # the REAL deferral wording was classified temporary (it was waited out
+    # instead of terminating startup):
+    assert any("rate-limit cooldown open" in record.getMessage()
+               for record in caplog.records), (
+        "the RateLimitBreaker.gate() deferral must reach the recovery log")
+    # recovery: the DISCOVERED universe, exactly 3 requests total
+    # (rate-limited attempt + instruments + tickers):
+    assert universe is not None
+    assert [row["symbol"] for row in universe] == ["BTCUSDT"]
+    assert universe[0]["rank"] == 1
+    assert session.instruments_script == []      # the rate limit was served
+    assert len(session.calls) == 3
 
 
 # ===========================================================================
@@ -423,6 +526,26 @@ def test_permanent_startup_failure_is_never_retried(tmp_path, build_exc):
 
 def test_temporary_denial_classification_contract():
     """Only denials a bounded wait can outlive are classified temporary."""
+    # Codex P2: the PROCESS-LOCAL gate's type + text are taken from the
+    # REAL RateLimitBreaker.gate() implementations (never retyped), both
+    # defer paths — P3 immediate deferral, and a bounded wait that cannot
+    # cover the remaining cooldown.
+    gate_messages: list[BybitRateLimitError] = []
+    breaker = retry_budget.RateLimitBreaker()
+    breaker.trip(5.0)
+    with pytest.raises(BybitRateLimitError) as p3:
+        breaker.gate(retry_budget.PRIORITY_P3, max_wait_s=30.0,
+                     sleep=lambda s: pytest.fail("P3 must defer, not wait"))
+    gate_messages.append(p3.value)
+    with pytest.raises(BybitRateLimitError) as p2:
+        breaker.gate(retry_budget.PRIORITY_P2, max_wait_s=0.0,
+                     sleep=lambda s: pytest.fail(
+                         "an uncovered cooldown must fail closed, not sleep"))
+    gate_messages.append(p2.value)
+    assert all(
+        "request deferred: rate-limit cooldown open (" in str(exc)
+        for exc in gate_messages), gate_messages
+
     temporary = [
         BybitRateLimitError(
             "X: deferred by shared rate limiter (BREAKER_OPEN: "
@@ -436,6 +559,7 @@ def test_temporary_denial_classification_contract():
         BybitRateLimitError(
             "X: Rate limited on /v5/market/tickers after 3 attempt(s) "
             "(storm guard: retry share capped)"),
+        *gate_messages,                       # process-local cooldown (P2)
     ]
     permanent = [
         BybitAuthError("HTTP 401"),

@@ -292,18 +292,26 @@ STARTUP_RETRY_POLL_S = 1.0
 #: directly and the recovery loop must never degenerate into a busy loop.
 STARTUP_RETRY_MIN_INTERVAL_S = 0.5
 
-#: Secret-free message markers of a TEMPORARY shared-limiter denial: the
-#: limiter itself is healthy and simply not granting right now (breaker
-#: cooldown not yet due, bucket not refilled inside the acquire deadline,
-#: epoch moved by another process's rate-limit trip, or the client's own
-#: rate-limit budget expiring on HTTP 429).  These are the exact wordings
-#: of BybitClient's fail-closed deny branches; the regression suite drives
-#: the REAL client deny path, so a wording change there breaks it.
+#: Secret-free message markers of a TEMPORARY limiter denial: the limiter
+#: itself is healthy and simply not granting right now (breaker cooldown not
+#: yet due, bucket not refilled inside the acquire deadline, epoch moved by
+#: another process's rate-limit trip, or the client's own rate-limit budget
+#: expiring on HTTP 429).  These are the exact wordings of BybitClient's
+#: fail-closed deny branches (plus the process-local breaker below); the
+#: regression suite drives the REAL client deny path, so a wording change
+#: there breaks it loudly.
 TEMPORARY_STARTUP_LIMITER_DENIAL_MARKERS: tuple[str, ...] = (
     "deferred by shared rate limiter (BREAKER_OPEN",
     "deferred by shared rate limiter (SKIPPED",
     "limiter grant revoked before send",
     "Rate limited on ",
+    # Codex review P2: the PROCESS-LOCAL RateLimitBreaker cooldown opened by
+    # an HTTP 429 / Bybit retCode 10006 (retry_budget.RateLimitBreaker.gate
+    # -> raise_bybit_rate_limit_deferred).  The message carries a positive
+    # remaining time — the cooldown expires by construction — and the bounded
+    # wait of gate() has already failed to cover it, so startup may wait and
+    # retry instead of terminating.
+    "request deferred: rate-limit cooldown open (",
 )
 
 
@@ -313,7 +321,10 @@ def is_temporary_startup_limiter_denial(exc: BaseException) -> bool:
     Temporary by construction: breaker cooldowns (5/30/120 s) expire, an
     ``SKIPPED`` acquire means only that the shared bucket did not refill
     inside the caller's deadline, a revoked grant means another process
-    tripped the breaker (fresh epoch) and the rate-limit budget refills.
+    tripped the breaker (fresh epoch), the rate-limit budget refills, and
+    the PROCESS-LOCAL ``RateLimitBreaker`` cooldown (HTTP 429 / Bybit
+    retCode 10006) is a bounded ``bybit_rate_limit_cooldown_s`` window that
+    closes by itself.
 
     Everything else is permanent for startup purposes and must fail fast:
     ``BybitAuthError`` (bad key / permission), a limiter that could not
@@ -418,8 +429,9 @@ def initialize_scanner_universe(
                     "attempt(s): %s", attempt, exc)
                 raise
             logger.warning(
-                "scanner startup universe deferred by the shared Bybit "
-                "limiter (attempt %d%s): %s — retrying in %.1fs",
+                "scanner startup universe deferred by a Bybit rate limiter "
+                "(shared or process-local, attempt %d%s): %s — retrying in "
+                "%.1fs",
                 attempt,
                 (f"/{max_attempts}" if max_attempts else ""),
                 exc, delay_s)
