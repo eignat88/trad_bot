@@ -11,14 +11,14 @@ import signal
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from app.config import Settings, load_settings
 from app.db.repository import ScannerRepository
-from app.exchange.bybit_client import BybitClient
+from app.exchange.bybit_client import BybitClient, BybitRateLimitError
 from app.scanners.context_builder import build_market_context
 from app.scanners.direction_gate import ScannerDirectionGatePolicy
 from app.scanners.expectancy_filter import ExpectancyFilter, load_expectancy
@@ -264,6 +264,171 @@ def get_scanner_universe(
         raise RuntimeError("Static scanner universe is empty")
     return [{"symbol": symbol, "rank": rank}
             for rank, symbol in enumerate(symbols, start=1)]
+
+
+# --- Issue #253: BYBIT_SCANNER_STARTUP_BREAKER_OPEN_RECOVERY_V1 ----------
+#
+# The dynamic-universe refresh is the FIRST Bybit call of the process and
+# runs BEFORE the database repository and the runner lock exist (the
+# startup invariant of main()).  With the shared limiter enabled a
+# BREAKER_OPEN deny raised there used to escape main() as an unhandled
+# BybitRateLimitError, so systemd restarted Scanner in a loop (production
+# 2026-11-03, release 54201c0 / PR #255:
+# ``breaker_cooldown_exceeds_deadline`` on /v5/market/instruments-info).
+#
+# initialize_scanner_universe() waits and retries ONLY the denials a
+# bounded wait can legitimately outlive.  Everything else — authentication,
+# configuration, a shared-limiter state failure, an empty universe — is
+# re-raised unchanged: never retried, never bypassed, never replaced with
+# fabricated/stale symbols (FAIL_CLOSED preserved).
+
+#: Poll granularity of the startup recovery wait: SIGTERM/SIGINT is
+#: honoured at this latency, so the wait is never one unbounded sleep that
+#: could outlive a shutdown request by minutes.
+STARTUP_RETRY_POLL_S = 1.0
+
+#: Hard floor of the wait between two startup attempts.  load_settings()
+#: rejects a non-positive interval already, but Settings can be built
+#: directly and the recovery loop must never degenerate into a busy loop.
+STARTUP_RETRY_MIN_INTERVAL_S = 0.5
+
+#: Secret-free message markers of a TEMPORARY shared-limiter denial: the
+#: limiter itself is healthy and simply not granting right now (breaker
+#: cooldown not yet due, bucket not refilled inside the acquire deadline,
+#: epoch moved by another process's rate-limit trip, or the client's own
+#: rate-limit budget expiring on HTTP 429).  These are the exact wordings
+#: of BybitClient's fail-closed deny branches; the regression suite drives
+#: the REAL client deny path, so a wording change there breaks it.
+TEMPORARY_STARTUP_LIMITER_DENIAL_MARKERS: tuple[str, ...] = (
+    "deferred by shared rate limiter (BREAKER_OPEN",
+    "deferred by shared rate limiter (SKIPPED",
+    "limiter grant revoked before send",
+    "Rate limited on ",
+)
+
+
+def is_temporary_startup_limiter_denial(exc: BaseException) -> bool:
+    """True only when a bounded wait can legitimately outlive ``exc``.
+
+    Temporary by construction: breaker cooldowns (5/30/120 s) expire, an
+    ``SKIPPED`` acquire means only that the shared bucket did not refill
+    inside the caller's deadline, a revoked grant means another process
+    tripped the breaker (fresh epoch) and the rate-limit budget refills.
+
+    Everything else is permanent for startup purposes and must fail fast:
+    ``BybitAuthError`` (bad key / permission), a limiter that could not
+    even open its shared state (``shared rate limiter unavailable`` —
+    corrupt state, config mismatch, write/lock failure), a
+    ``STATE_UNAVAILABLE`` deny, and any non-limiter error (empty universe,
+    malformed payload, config validation).  Unknown future wordings
+    default to NOT temporary — fail-closed: never retry what is not known
+    to be temporary.
+    """
+    if not isinstance(exc, BybitRateLimitError):
+        return False
+    message = str(exc)
+    return any(marker in message
+               for marker in TEMPORARY_STARTUP_LIMITER_DENIAL_MARKERS)
+
+
+def _startup_sleep(seconds: float) -> None:
+    """The real wait used by the startup recovery loop.
+
+    A single indirection point: tests can replace the wait without touching
+    the process-wide ``time.sleep`` (and without ever waiting in CI).
+    """
+    time.sleep(seconds)
+
+
+def wait_before_startup_retry(
+    delay_s: float,
+    *,
+    sleep: Callable[[float], Any] | None = None,
+    poll_s: float = STARTUP_RETRY_POLL_S,
+) -> bool:
+    """Wait ``delay_s`` seconds in short polls; ``False`` if SHUTDOWN hit.
+
+    Returns True only when the full delay elapsed with no shutdown signal
+    (the caller may retry); False means SIGTERM/SIGINT arrived while
+    waiting and startup must stop cleanly.  Every sleep is positive and
+    bounded by ``poll_s``, so the wait can neither busy-loop nor block a
+    shutdown signal for longer than one poll.
+    """
+    if sleep is None:
+        sleep = _startup_sleep
+    remaining = float(delay_s)
+    while remaining > 0:
+        if SHUTDOWN:
+            return False
+        step = min(poll_s, remaining)
+        sleep(step)
+        remaining -= step
+    return not SHUTDOWN
+
+
+def initialize_scanner_universe(
+    client: BybitClient,
+    settings: Settings,
+    *,
+    sleep: Callable[[float], Any] | None = None,
+) -> list[dict[str, Any]] | None:
+    """Return the startup universe, waiting out temporary limiter denials.
+
+    Contract (Issue #253, BYBIT_SCANNER_STARTUP_BREAKER_OPEN_RECOVERY_V1):
+
+    * **temporary shared-limiter denial** → bounded, configurable backoff:
+      ``startup_retry_interval_s`` doubling up to
+      ``startup_retry_max_interval_s``, at most
+      ``startup_retry_max_attempts`` attempts (0 = keep waiting until a
+      shutdown signal), every wait polled in ``STARTUP_RETRY_POLL_S``
+      chunks — no busy loop, no bypass of the limiter (a denied attempt
+      sends no HTTP request at all);
+    * **SIGTERM/SIGINT during a wait** → returns ``None`` so main() can
+      exit BEFORE any database / runner-lock / trading / OOS side effect
+      exists;
+    * **permanent error** (authentication, configuration, shared-limiter
+      state failure, empty universe) → re-raised unchanged after the very
+      first attempt: never retried, never swallowed;
+    * **success** → the universe exactly as discovered — never fabricated,
+      stale or partial.
+    """
+    universe_settings = settings.scanner_universe
+    interval_s = max(
+        STARTUP_RETRY_MIN_INTERVAL_S,
+        float(universe_settings.startup_retry_interval_s),
+    )
+    max_interval_s = max(
+        interval_s, float(universe_settings.startup_retry_max_interval_s))
+    max_attempts = max(0, int(universe_settings.startup_retry_max_attempts))
+    if SHUTDOWN:
+        return None
+
+    attempt = 0
+    delay_s = interval_s
+    while True:
+        attempt += 1
+        try:
+            return get_scanner_universe(client, settings)
+        except BybitRateLimitError as exc:
+            if not is_temporary_startup_limiter_denial(exc):
+                raise                  # permanent: fail closed, never retried
+            if 0 < max_attempts <= attempt:
+                logger.error(
+                    "scanner startup universe recovery gave up after %d "
+                    "attempt(s): %s", attempt, exc)
+                raise
+            logger.warning(
+                "scanner startup universe deferred by the shared Bybit "
+                "limiter (attempt %d%s): %s — retrying in %.1fs",
+                attempt,
+                (f"/{max_attempts}" if max_attempts else ""),
+                exc, delay_s)
+            if not wait_before_startup_retry(delay_s, sleep=sleep):
+                logger.info(
+                    "scanner startup stopped by shutdown signal during "
+                    "universe recovery (attempt %d)", attempt)
+                return None
+            delay_s = min(delay_s * 2.0, max_interval_s)
 
 
 def seconds_until_next_cycle(started_at: float, interval: int, now: float) -> float:
@@ -1460,7 +1625,17 @@ def main() -> None:
 
     settings = _load_runner_settings()
     client = BybitClient(settings)
-    universe = get_scanner_universe(client, settings)
+    # Issue #253: the startup universe may be deferred by the SHARED limiter
+    # (open breaker).  Wait it out here — still BEFORE the database and the
+    # runner lock exist — instead of letting BybitRateLimitError escape and
+    # crash-loop under systemd.  ``None`` means SIGTERM/SIGINT arrived while
+    # waiting: exit cleanly with NO database/OOS/trading side effect.
+    universe = initialize_scanner_universe(client, settings)
+    if universe is None:
+        logger.info(
+            "scanner startup stopped by shutdown signal before database "
+            "initialization")
+        return
     symbols = [str(item["symbol"]) for item in universe]
 
     repository = ScannerRepository(
