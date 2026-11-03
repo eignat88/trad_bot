@@ -193,7 +193,15 @@ def guarded_bybit_attempt(
     try:
         yield attempt
     except BaseException as exc:
-        attempt.outcome = _map_exception(exc)
+        # Preserve an EXPLICIT caller classification: a fetcher that has
+        # already seen Bybit ``retCode == 10006`` sets ``outcome =
+        # "RATE_LIMIT"`` and then raises to stop the page loop. Overwriting
+        # that with the generic mapping of the wrapper's own RuntimeError
+        # would record provider throttling as a plain ERROR and the shared
+        # breaker would never see the rate limit. Only an UNCLASSIFIED
+        # attempt (still the default "OK") is mapped from the exception.
+        if attempt.outcome == "OK":
+            attempt.outcome = _map_exception(exc)
         raise
     finally:
         outcome = attempt.outcome

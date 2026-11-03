@@ -674,10 +674,20 @@ class BybitClient:
                     # so the bound holds for any limiter implementation.
                     max_wait_s = float(getattr(
                         self.settings, "global_limiter_max_wait_s", 0.0) or 0.0)
+                    # ``deadline_at`` is None when the caller disabled the
+                    # retry deadline (``bybit_retry_deadline_s <= 0``) — a
+                    # supported configuration. min(None, float) would raise
+                    # TypeError, which this handler converts into a
+                    # BybitRateLimitError and would break EVERY budgeted GET,
+                    # so the configured limiter wait alone bounds the acquire
+                    # in that case.
                     acquire_deadline = deadline_at
                     if max_wait_s > 0:
-                        acquire_deadline = min(deadline_at,
-                                               t_start + max_wait_s)
+                        acquire_deadline = (
+                            min(deadline_at, t_start + max_wait_s)
+                            if deadline_at is not None
+                            else t_start + max_wait_s
+                        )
                     grant = shared.acquire(
                         priority, deadline=acquire_deadline,
                         logical_request_id=logical_request_id)

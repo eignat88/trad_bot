@@ -635,6 +635,60 @@ def test_contract_bound_get_grants_one_per_http_attempt(tmp_path,
     assert [r[0] for r in spy.records] == spy.prepared
 
 
+def test_zero_retry_deadline_still_bounds_acquire_by_max_wait(tmp_path,
+                                                              telemetry_env):
+    """``bybit_retry_deadline_s = 0`` is supported and must not break the gate.
+
+    With the retry deadline disabled ``deadline_at`` is ``None``; a bare
+    ``min(None, float)`` raises ``TypeError``, which the gate's own handler
+    converts into ``BybitRateLimitError`` — i.e. EVERY budgeted GET would
+    fail before a single HTTP attempt. The configured
+    ``global_limiter_max_wait_s`` must bound the acquire on its own.
+    """
+    session = ScriptedSession([_OkResponse()])
+    settings = _enabled_settings(tmp_path, bybit_retry_deadline_s=0.0,
+                                 global_limiter_max_wait_s=7.0)
+    client = BybitClient(settings, session)
+    real = client._shared_limiter()
+    spy = _SpyLimiter(real)
+    client._shared_limiter_obj = spy
+
+    assert client.get_klines("BTCUSDT") == []      # no BybitRateLimitError
+    assert len(spy.acquires) == 1
+    _priority, deadline, _lid = spy.acquires[0]
+    assert deadline is not None                    # bounded, never None
+    assert deadline <= time.monotonic() + 7.0 + 1.0
+    assert len(session.calls) == 1                 # the request WAS sent
+    assert [r[2] for r in spy.records] == ["OK"]
+
+
+def test_offline_gate_preserves_explicit_caller_rate_limit(tmp_path):
+    """A caller that classifies Bybit ``retCode 10006`` itself must win.
+
+    The fetchers set ``attempt.outcome = "RATE_LIMIT"`` and then raise to
+    stop their page loop. If the guard overwrote that with the generic
+    mapping of their own ``RuntimeError``, provider throttling would be
+    recorded as a plain ERROR and the shared breaker would never trip —
+    other consumers would keep sending during a throttle.
+    """
+    from app.exchange.offline_limiter import guarded_bybit_attempt
+
+    state = tmp_path / "shared_state.json"
+    settings = Settings(global_bybit_rate_limiter_enabled=True,
+                        global_limiter_state_path=str(state),
+                        global_limiter_breaker_cooldowns_s=(1.0, 2.0, 3.0))
+
+    with pytest.raises(RuntimeError, match="page fetch aborted"):
+        with guarded_bybit_attempt("/v5/market/kline", settings=settings) as a:
+            a.outcome = "RATE_LIMIT"               # caller saw retCode 10006
+            raise RuntimeError("page fetch aborted")
+
+    raw = json.loads(state.read_text(encoding="utf-8"))
+    assert [v["outcome"] for v in raw["grants"].values()] == ["RATE_LIMIT"]
+    # ...and a recorded rate limit legitimately trips the shared breaker
+    assert raw["breaker"]["state"] in ("OPEN", "RECOVERY")
+
+
 def test_contract_bound_post_acquires_once_before_send(tmp_path,
                                                        telemetry_env):
     """POST /v5/order/create: one P0 grant, one prepare_send, one record."""

@@ -119,6 +119,29 @@ New `app/config/limiter_contract.py` + optional settings key
   behaviour is byte-identical to Issue #231 (default-off regression tests
   untouched), so this PR is safe to merge before any activation GO.
 
+**No silent bypass (verified, not assumed):**
+
+* the contract can only *supply parameters*; `global_bybit_rate_limiter_enabled`
+  and `global_bybit_rate_limiter_allow_env` are rejected if present, and the
+  contract merge runs *after* the two-factor activation block, so activation
+  still comes exclusively from config-file/ENV (`settings.py:868-901`);
+* **parameters have no ENV path at all**: the only limiter ENV read in the
+  codebase is `GLOBAL_BYBIT_RATE_LIMITER_ENABLED` (`settings.py:877`); a grep
+  for `GLOBAL_LIMITER_*` returns nothing, so an environment cannot silently
+  override a contract value;
+* `app/analytics/cli.py:139-143` — the one entrypoint that *builds* its own
+  `Settings` — explicitly copies every `global_limiter_*` /
+  `global_bybit_rate_limiter_*` field from `load_settings()`, i.e. it joins
+  the contract rather than bypassing it;
+* the remaining `Settings()` call inside `BybitClient` (`bybit_client.py:423`)
+  feeds only the **process-local** `_RateLimiter(rps=bybit_rate_limit_rps)`,
+  not the shared gate — it cannot bypass the shared budget;
+* grep for `BybitClient(Settings())` in production code returns **0** matches
+  after this PR;
+* a missing/unreadable/unknown-key/forbidden-key contract fails
+  `load_settings()` before any `BybitClient` exists, and a parameter mismatch
+  against an existing state file fails closed with `config_mismatch`.
+
 ## 4. Changed files
 
 **New**
@@ -128,12 +151,14 @@ New `app/config/limiter_contract.py` + optional settings key
 | `app/config/limiter_contract.py` | canonical contract load/validate/merge, `LimiterContractError` |
 | `app/exchange/offline_limiter.py` | managed offline gate (`guarded_bybit_attempt`) for non-`BybitClient` HTTP |
 | `limiter_contract.v1.json` | shipped, git-versioned reference contract (inert on its own) |
-| `tests/test_issue253_shared_limiter_alignment_v1.py` | 31 deterministic tests |
+| `tests/test_issue253_shared_limiter_alignment_v1.py` | 33 deterministic tests |
 | `tests/test_issue253_shared_limiter_mp_v1.py` | 3 multiprocess tests |
+| `tests/test_issue253_limiter_deny_propagation_v1.py` | 10 end-to-end deny-propagation tests (5 real entrypoints) |
 | `docs/issue253_bybit_consumer_inventory_v1.md` | Stage A inventory |
 | `docs/issue253_oos_limiter_safety_analysis_v1.md` | Stage E OOS/latency safety |
 | `docs/issue253_bybit_api_quota_model_v1.md` | Stage F quota model + observability |
 | `docs/issue253_staged_rollout_rollback_runbook_v1.md` | staged rollout, rollback, ≥60 min runbook |
+| `docs/issue253_followup_candle_coverage_issue_draft_v1.md` | draft of the SEPARATE coverage issue (not implemented here) |
 | `docs/issue253_pull_request_body_v1.md` | this document |
 
 **Modified**
@@ -163,8 +188,9 @@ no:cacheprovider`, Windows host.
 **New Issue #253 tests**
 
 ```
-pytest -q -p no:cacheprovider tests/test_issue253_shared_limiter_alignment_v1.py tests/test_issue253_shared_limiter_mp_v1.py
-→ 34 passed
+pytest -q -p no:cacheprovider tests/test_issue253_shared_limiter_alignment_v1.py \
+  tests/test_issue253_shared_limiter_mp_v1.py tests/test_issue253_limiter_deny_propagation_v1.py
+→ 46 passed   (33 + 3 + 10)
 ```
 
 Covered: contract alignment across 3 independent configs; config/state-path
@@ -178,10 +204,30 @@ equality rules; **3-consumer shared budget** (exactly `burst` grants then
 denial); burst-ceiling invariant `total_grants ≤ burst + refill_total`; GET
 retry = one grant per attempt; POST = single P0 grant; REVOKED path; offline
 gate no-op / outcome mapping / deny-before-send / fail-closed / repo-anchored
-settings; source-level `if not candles` guard in all five generic
-evaluators; shipped reference contract validity; multiprocess shared state
-identity, single accounting point, bucket invariant, drifted-config
-fail-closed with byte-identical state, no second state/lock file.
+settings / **caller-set `RATE_LIMIT` outcome is never clobbered**; zero
+`bybit_retry_deadline_s` still bounds the acquire by `max_wait_s`; source-level
+`if not candles` guard in all five generic evaluators; shipped reference
+contract validity; multiprocess shared state identity, single accounting
+point, bucket invariant, drifted-config fail-closed with byte-identical
+state, no second state/lock file; and the **10 end-to-end deny-propagation
+tests** in §7 (deny → no HTTP → no outcome/checkpoint/trade advancement →
+recovery) on all five real entrypoints.
+
+**Review findings fixed in this PR (2 × Codex P2, both real):**
+
+1. `min(deadline_at, t_start + max_wait_s)` raised `TypeError` when
+   `bybit_retry_deadline_s = 0` (a supported setting — `settings.py:944`
+   only forbids *negative*), which the gate converted into
+   `BybitRateLimitError` and would have failed **every** budgeted GET.
+   Fixed: with a disabled retry deadline the configured
+   `global_limiter_max_wait_s` alone bounds the acquire.
+   Regression: `test_zero_retry_deadline_still_bounds_acquire_by_max_wait`.
+2. `guarded_bybit_attempt` overwrote an **explicit** caller classification
+   (`attempt.outcome = "RATE_LIMIT"` before raising on Bybit `retCode 10006`)
+   with the generic mapping of the wrapper's own `RuntimeError`, recording
+   provider throttling as a plain `ERROR` so the shared breaker would never
+   trip. Fixed: only an unclassified (`"OK"`) attempt is mapped.
+   Regression: `test_offline_gate_preserves_explicit_caller_rate_limit`.
 
 **Regression suites (Stage G)**
 
@@ -189,9 +235,13 @@ fail-closed with byte-identical state, no second state/lock file.
 pytest -q -p no:cacheprovider tests/test_issue231_*.py tests/test_global_bybit_*.py \
   tests/test_issue253_*.py tests/test_bybit_*.py tests/test_scanner_*.py tests/test_paper_*.py \
   tests/test_htf_baseline_short_phase2_*.py tests/test_prospective_*.py tests/test_shadow_cli.py \
-  tests/test_srr_*.py tests/test_me_short_a_forward_outcome_*.py
-→ 42 failed, 1958 passed, 65 skipped, 22 errors
+  tests/test_srr_*.py
+→ 42 failed, 1950 passed, 65 skipped, 22 errors   (96 files)
 ```
+
+Identical failure/error set to the pre-review run (**64 entries, byte-for-byte
+the same list**) — the review fixes and the 13 added tests introduced **zero**
+new failures.
 
 **Baseline for comparison** (pristine `origin/main` @ `ce51f2a` in a
 separate worktree, same interpreter, same flags):
@@ -212,17 +262,33 @@ scope* guardrails:
 | `test_htf_baseline_short_phase2_isolation_v1::test_no_tracked_file_modified_against_base` | FAIL (new) | Its allowlist is the **HTF Phase-2 surface**; Issue #253 legitimately modifies 9 files outside it (`settings.py`, `bybit_client.py`, `global_rate_limiter.py`, `isolated_oos.py`, 2× `research_snapshot`, 3× `tools/research`). It diffs `merge-base(HEAD, origin/main)` → red for **any** non-Phase-2 branch and self-heals on merge. Broadening that allowlist would permanently whitelist `app/config/settings.py` for the Phase-2 workstream — the control itself says *"do not broaden the allowlist"* — and Issue #253 has no authority to weaken an HTF Phase-2 isolation control. **Left untouched deliberately.** |
 | `test_htf_baseline_short_phase2_systemd_bybit_wiring_v1::test_scanner_paper_evaluator_settings_unchanged` | FAIL (new) | Same branch-scope guard: forbids any changed path matching `scanner\|paper\|live\|evaluator\|config.yaml\|app/trading\|app/execution`. The single offender is `tools/research/htf_baseline_short_phase2_bybit_live_dry_run_v1.py`, matched only because its filename contains `live`; the edit is the required bypass removal. Same precedent and same deliberate non-change. |
 
-Full-suite run on this branch (same flags as the baseline):
+**Why CI is green on these two:** `.github/workflows/main-pr-safety.yml`
+classifies every PR three ways (`NO_PHASE2` / `MIXED_WITH_PHASE2` /
+`PHASE2_ONLY`) against the frozen Phase-2 governed surface. This PR touches
+`app/exchange/*`, `app/config/*`, `docs/*`, `tests/*` (not governed) **and**
+`tools/research/htf_baseline_short_phase2_bybit_live_dry_run_v1.py`
+(governed) → it classifies as **`MIXED_WITH_PHASE2`**, where the workflow
+explicitly `--deselect`s exactly those two confinement tests and instead runs
+the frozen-invariant + HTF causal/parity/closed-bar regression. That routing
+itself is verified on every run by
+`tests/test_htf_baseline_short_phase2_scope_routing_v1.py` (wired
+unconditionally), which also fails if the workflow's governed-surface list
+drifts from the isolation test's lists. Observed on PR #254: **Main PR
+Safety = success**, **Bybit retry budget regression (offline) = success**,
+**Offline V3 tests and frozen universe = success**.
+
+Full-suite run on this branch (same flags as the baseline, re-run **after**
+the review fixes):
 
 ```
 pytest -q -p no:cacheprovider --tb=no --continue-on-collection-errors
-→ 71 failed, 5468 passed, 75 skipped, 1 warning, 173 errors
+→ 71 failed, 5480 passed, 75 skipped, 1 warning, 173 errors
 ```
 
 Full-suite diff against the pristine baseline (`71 failed, 5434 passed, 75
 skipped, 173 errors`) — **244 failing/erroring entries on both sides**:
 
-* **+34 passed** = exactly the new Issue #253 tests;
+* **+46 passed** = exactly the new Issue #253 tests (33 + 3 + 10);
 * **2 new failures** = the two Phase-2 branch-scope guardrails above;
 * **2 baseline failures now pass** (they failed on the pristine tree too and
   are order/cwd-sensitive):
@@ -276,10 +342,33 @@ From `docs/issue253_oos_limiter_safety_analysis_v1.md`:
   `app/shadow/evaluator.py`, `app/shadow/srr_research_evaluator.py`,
   `app/shadow/v2d_evaluator.py`) guard `if not candles: … continue` before
   any finalization; this is now asserted by a source-level test.
+* **End-to-end deny propagation, proven on the real entrypoints**
+  (`tests/test_issue253_limiter_deny_propagation_v1.py`, 10 tests, all green,
+  deterministic — real `BybitClient` + real `GlobalBybitRateLimiter` whose
+  breaker is genuinely tripped through `acquire`/`record_result`, and a
+  session that FAILS the test if any HTTP attempt escapes):
+
+  | Entry | Deny behaviour (file:line) | Advancement on deny |
+  |---|---|---|
+  | Scanner | `get_scanner_universe` unwrapped → aborts before any run (`scanner_runner.py:250`, `:1463`); per-symbol `build_market_context` deny caught at `:971-983` → `save_error(MARKET_DATA_ERROR)` → `continue` | no `save_setup`, no signal, no outcome; run finishes `PARTIAL` (`:1652-1659`) |
+  | Research (prospective) | `_get_candles` swallows → `[]` (`prospective_evaluator.py:209-211`) → guard `:484-486` | `finalized = 0`, **zero** outcome SQL (asserted) |
+  | Research (generic) | `_get_candles_for_symbol` swallows → `[]` (`evaluator.py:270-272`) → guard `:421-423` | no outcome write |
+  | HTF V1 observer | deny **translated** to `BybitCandleSourceError(RATE_LIMITED)` (`bybit_candle_source_v1.py:425-433`) → `SOURCE_BLOCKED` + `continue` (`observer_runner_v1.py:723-736`) | `_advance_cursor` is only callable from `process_symbol_bars`, which only runs after the handler (asserted) |
+  | SRR evaluator | `_get_candles_for_symbol` swallows → `[]` (`srr_research_evaluator.py:140-142`) → guard `:370-372` | `_save_outcome_partial` never called (asserted by a spy that fails the test) |
+  | Paper | never fetches candles; `_get_prices` swallows → `{}` (`paper_runner.py:289-291`) | `check_entries` skips `price is None` (`engine.py:292-294`) → **no trade recorded** (asserted) |
+
+  Recovery is asserted too: after the breaker cooldown the *same*
+  entrypoint sends exactly one HTTP request again.
 * **Pre-existing risk (not introduced by this issue, not fixed here):** a
   non-empty but non-covering latest-N window (~1000 bars ≈ 3.47 days) can
   still finalize `is_final=True` with all-false TP/SL defaults, and observers
   drop events on deny with only an in-memory `rate_limit_drops` counter.
+  **Raised as a SEPARATE issue** — draft in
+  `docs/issue253_followup_candle_coverage_issue_draft_v1.md` — because
+  fixing it changes OOS finalization/coverage policy and needs its own
+  operator decision. It is byte-identical on `main` and on this branch
+  (no dependency, no regression), but it means "no new denials" must never
+  be read as OOS-coverage proof.
 * Forward-only, gap-permanent consumers are exactly the OOS-sensitive ones:
   `isolated_oos.py` and the ME SHORT A forward runtime.
 * **Deliberately not wired:** `app/research/candle_coverage_guard_v1.py` is
