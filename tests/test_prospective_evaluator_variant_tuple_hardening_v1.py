@@ -16,9 +16,11 @@ def _candles(high=105.0, low=95.0, close=100.0):
     # grid-aligned and closed at `now`.  The60m window
     # (SIGNAL_TIME, SIGNAL_TIME + 60m) therefore needs the complete
     # 10:05..10:55 path — all12 candles are closed at now = 11:00.
+    # Issue #244 P2-2: the coverage guard also requires a finite `open`
+    # (NaN/absent prices are rejected), so the fixture carries the full OHLC.
     return [SimpleNamespace(
         timestamp=int((SIGNAL_TIME + timedelta(minutes=5 + 5 * i)).timestamp() * 1000),
-        high=high, low=low, close=close,
+        open=100.0, high=high, low=low, close=close,
     ) for i in range(12)]
 
 

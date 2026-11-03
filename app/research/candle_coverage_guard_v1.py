@@ -20,9 +20,12 @@ evaluation path:
 
 2. *Is the candle path for this exact evaluation window complete?*
    ``validate_candle_coverage`` verifies the required 5-minute path for one
-   ``[signal_time, cutoff)`` window: first required candle present, no gaps,
-   no duplicate timestamps, correct 5-minute spacing, all required candles
-   closed at evaluation time, and OHLC sanity.
+   ``[signal_time, cutoff)`` window: the required opens are the **absolute
+   UTC 5-minute grid** points inside the window (never the provider's own
+   first timestamp), the first required candle is present, no gaps, no
+   duplicate timestamps, no off-grid opens (a response shifted to
+   10:01/10:06/10:11 is rejected), all required candles closed at evaluation
+   time, and every OHLC value finite.
 
 Status naming is reused from the existing frozen SRR route
 (``app.research.srr_short_execution_r_expansion_prospective_evaluator``) so
@@ -159,7 +162,7 @@ def candle_is_closed(open_ms: int, asof_ms: int, interval_ms: int = CANDLE_MS) -
 def _finite(value: Any) -> bool:
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
     return math.isfinite(number)
 
@@ -190,14 +193,24 @@ def validate_candle_coverage(
     the range the existing evaluator formulas scan (they skip candles with
     ``timestamp <= signal_time`` and stop at ``timestamp >= cutoff``).
 
-    The required path is anchored on the first observed candle inside the
-    window and must then continue every ``interval_ms`` until ``cutoff_ms``:
+    The required path is anchored on the **absolute UTC grid** derived from
+    ``signal_ms`` —
+    ``first_required_open = (signal_ms // interval_ms + 1) * interval_ms`` —
+    never on the first timestamp of the provider response, so a consistently
+    shifted response (10:01/10:06/10:11) cannot define its own anchor
+    (review P2-1):
 
-    * a first observed candle further than one interval after the signal means
-      the FIRST required candle is missing (T2);
-    * any missing anchor step is a gap (T3);
-    * the anchor step just below ``cutoff_ms`` must exist (T4);
-    * duplicates, off-spacing candles and invalid OHLC reject the window;
+    * an observed open off the absolute grid is rejected outright
+      (``CANDLE_TIMESTAMP_OFF_GRID``);
+    * a first observed open later than the first grid open means the FIRST
+      required candle is missing (T2);
+    * any missing grid open is a gap (T3);
+    * the grid open just below ``cutoff_ms`` must exist (T4);
+    * duplicates, off-anchor candles and invalid OHLC reject the window;
+    * every price must be a finite number: NaN / +Infinity / -Infinity (or a
+      missing field) in ``open``/``close`` — and in ``high``/``low`` — is
+      ``INVALID_OHLC`` (review P2-2); such values must never reach
+      MFE/MAE/return/TP-SL math;
     * a required candle that has not closed yet yields
       ``SOURCE_NOT_YET_AVAILABLE`` instead of a false negative (T12).
 
@@ -215,13 +228,18 @@ def validate_candle_coverage(
         "checked_at": checked_at_iso(),
     }
 
+    # P2-1: the required opens are absolute grid points of the evaluation
+    # window, computed from the signal — never from the provider response.
+    first_required_open = (int(signal_ms) // interval_ms + 1) * interval_ms
+    base["first_required_open_ms"] = first_required_open
+
     if cutoff_ms <= signal_ms:
         return CandleCoverageResult(
             SOURCE_VALIDATED, "WINDOW_EMPTY", base,
         )
-    if cutoff_ms - signal_ms <= interval_ms:
-        # No provider candle can fall strictly inside this window: under the
-        # 5-minute anchor the first candidate equals or passes the cutoff.
+    if first_required_open >= cutoff_ms:
+        # No grid open falls strictly inside (signal, cutoff): there is no
+        # provider candle the formulas could read in this window.
         return CandleCoverageResult(
             SOURCE_VALIDATED, "WINDOW_WITHOUT_REQUIRED_CANDLE", base,
         )
@@ -265,22 +283,40 @@ def validate_candle_coverage(
         )
 
     present = set(counts)
+
+    # P2-1: every observed open must sit on the absolute UTC grid.  A
+    # response whose timestamps are all shifted by a non-multiple of the
+    # interval (10:01/10:06/10:11) is rejected instead of validating
+    # against its own shifted anchor.
+    off_grid = sorted(t for t in present if t % interval_ms != 0)
+    if off_grid:
+        return CandleCoverageResult(
+            SOURCE_INCOMPLETE_COVERAGE,
+            "CANDLE_TIMESTAMP_OFF_GRID",
+            {
+                **base,
+                "off_grid_open_time_ms": off_grid[:10],
+                "off_grid_count": len(off_grid),
+                "present_count": len(present),
+                "available_range": [min(present), max(present)],
+            },
+        )
+
     first_open = min(present)
-    if first_open > signal_ms + interval_ms:
-        # The earliest possible required candle (anchor) is absent.
+    if first_open > first_required_open:
+        # The earliest required grid candle (anchor) is absent.
         return CandleCoverageResult(
             SOURCE_INCOMPLETE_COVERAGE,
             "FIRST_REQUIRED_CANDLE_MISSING",
             {
                 **base,
                 "first_present_open_ms": first_open,
-                "first_required_open_ms_max": signal_ms + interval_ms,
                 "present_count": len(present),
                 "available_range": [first_open, max(present)],
             },
         )
 
-    full_expected = list(range(first_open, cutoff_ms, interval_ms))
+    full_expected = list(range(first_required_open, cutoff_ms, interval_ms))
     expected = full_expected if demand_closed else [
         t for t in full_expected if candle_is_closed(t, asof_ms, interval_ms)
     ]
@@ -345,23 +381,27 @@ def validate_candle_coverage(
         ts = _candle_ts(candle) or 0
         high = getattr(candle, "high", None)
         low = getattr(candle, "low", None)
-        if not _finite(high) or not _finite(low):
+        open_ = getattr(candle, "open", None)
+        close_ = getattr(candle, "close", None)
+        # P2-2: every price of the candle must be a finite number.
+        # NaN / +Infinity / -Infinity — and a missing field — are rejected
+        # here so they can never reach MFE/MAE/return/TP-SL math.
+        if not (
+            _finite(high)
+            and _finite(low)
+            and _finite(open_)
+            and _finite(close_)
+        ):
             invalid_ohlc.append(ts)
             continue
         high_f, low_f = float(high), float(low)
+        open_f, close_f = float(open_), float(close_)
         if low_f > high_f:
             invalid_ohlc.append(ts)
             continue
-        open_ = getattr(candle, "open", None)
-        close_ = getattr(candle, "close", None)
-        if open_ is not None and _finite(open_):
-            if high_f < float(open_) or low_f > float(open_):
-                invalid_ohlc.append(ts)
-                continue
-        if close_ is not None and _finite(close_):
-            if high_f < float(close_) or low_f > float(close_):
-                invalid_ohlc.append(ts)
-                continue
+        if not (low_f <= open_f <= high_f and low_f <= close_f <= high_f):
+            invalid_ohlc.append(ts)
+            continue
 
     if invalid_ohlc:
         return CandleCoverageResult(

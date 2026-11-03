@@ -1039,6 +1039,287 @@ def test_t15_eligibility_sql_excludes_finalized_rows():
 
 
 # ══════════════════════════════════════════════════════════════════
+# Review P2-1 — required path anchored on the ABSOLUTE UTC grid
+# ══════════════════════════════════════════════════════════════════
+
+_FIELD_PARAM = {"open": "open_", "close": "close", "high": "high", "low": "low"}
+
+
+def shifted_path(signal: datetime, horizon_minutes: int = 240, *,
+                 shift_minutes: int = 1) -> list[Candle]:
+    """A complete-looking path whose opens are shifted off the UTC grid.
+
+    ``shift_minutes=1`` reproduces the review example 10:01/10:06/10:11;
+    ``shift_minutes=5`` keeps every open on-grid but moves the whole series,
+    so the FIRST required candle disappears.
+    """
+    signal_ms = ms(signal)
+    cutoff_ms = ms(signal + timedelta(minutes=horizon_minutes))
+    shift = shift_minutes * 60_000
+    return [
+        candle(t + shift)
+        for t in required_opens(signal_ms, cutoff_ms)
+        if signal_ms < t + shift < cutoff_ms
+    ]
+
+
+def corrupt(candles: list[Candle], offset_minutes: int, field: str,
+            value: float, *, signal: datetime = SIGNAL) -> list[Candle]:
+    """Complete path with one candle's price replaced by ``value``."""
+    target = ms(signal) + offset_minutes * 60_000
+    param = _FIELD_PARAM[field]
+    return [
+        candle(c.timestamp, **{param: value}) if c.timestamp == target else c
+        for c in candles
+    ]
+
+
+@pytest.mark.parametrize("harness", HARNESSES, ids=lambda h: h.name)
+def test_p2_1_off_grid_shifted_path_is_rejected(harness):
+    """10:01/10:06/10:11 must never validate against its own anchor."""
+    candles = shifted_path(SIGNAL, 240, shift_minutes=1)
+
+    result = harness.evaluate(candles, NOW_FULL)
+
+    assert result.writes == [], "shifted opens must not be evaluated"
+    assert result.stats["coverage_blocked"].get("CANDLE_TIMESTAMP_OFF_GRID")
+    assert result.finalized() is False
+    for label, _ in HORIZONS:
+        assert not result.evaluated(label), f"{label} must stay pending"
+
+
+@pytest.mark.parametrize("harness", HARNESSES, ids=lambda h: h.name)
+def test_p2_1_interval_shifted_path_is_rejected(harness):
+    """On-grid but shifted series: the FIRST required candle is missing."""
+    candles = shifted_path(SIGNAL, 240, shift_minutes=5)
+
+    result = harness.evaluate(candles, NOW_FULL)
+
+    assert result.writes == []
+    assert result.stats["coverage_blocked"].get("FIRST_REQUIRED_CANDLE_MISSING")
+    assert result.finalized() is False
+
+
+def test_p2_1_guard_anchor_is_the_absolute_grid():
+    signal_ms = ms(SIGNAL)
+    shifted = [candle(signal_ms + (1 + 5 * i) * 60_000) for i in range(5)]
+
+    result = guard.validate_candle_coverage(
+        shifted,
+        signal_ms=signal_ms,
+        cutoff_ms=signal_ms + 30 * 60_000,
+        asof_ms=ms(SIGNAL + timedelta(minutes=40)),
+    )
+
+    assert result.status == guard.SOURCE_INCOMPLETE_COVERAGE
+    assert result.reason_code == "CANDLE_TIMESTAMP_OFF_GRID"
+    assert result.diagnostics["first_required_open_ms"] == signal_ms + INTERVAL_MS
+    assert result.diagnostics["off_grid_count"] == 5
+
+
+def test_p2_1_guard_absolute_anchor_accepts_genuine_path():
+    """The absolute anchor must not reject a genuine complete path."""
+    candles = full_path(SIGNAL, 60)
+
+    result = guard.validate_candle_coverage(
+        candles,
+        signal_ms=ms(SIGNAL),
+        cutoff_ms=ms(SIGNAL) + 60 * 60_000,
+        asof_ms=ms(SIGNAL + timedelta(minutes=65)),
+    )
+
+    assert result.ok
+    assert result.diagnostics["first_required_open_ms"] == ms(SIGNAL) + INTERVAL_MS
+    assert result.diagnostics["required_range"][0] == ms(SIGNAL) + INTERVAL_MS
+
+
+@pytest.mark.parametrize("cycle_cls", CYCLE_HARNESSES,
+                         ids=lambda c: c.__name__)
+def test_p2_1_cycle_rejects_shifted_source(cycle_cls):
+    signal_time = cycle_signal_time()
+    cycle = cycle_cls(signal_time)
+    candles = shifted_path(signal_time, 240, shift_minutes=1)
+
+    result = cycle.run(FakeBybitClient(candles))
+
+    assert result.writes == []
+    assert result.stats["coverage_blocked"].get("CANDLE_TIMESTAMP_OFF_GRID")
+    assert result.stats["finalized"] == 0
+    assert result.stats["errors"] == 0, "coverage block is not a fetch error"
+    assert cycle.eligible_count == 1, "signal must stay retry-eligible"
+
+
+# ══════════════════════════════════════════════════════════════════
+# Review P2-2 — NaN / ±Infinity prices fail closed
+# ══════════════════════════════════════════════════════════════════
+
+NON_FINITE_VALUES = [float("nan"), float("inf"), float("-inf")]
+
+
+@pytest.mark.parametrize("harness", HARNESSES, ids=lambda h: h.name)
+@pytest.mark.parametrize("field", ["open", "close"])
+@pytest.mark.parametrize("value", NON_FINITE_VALUES,
+                         ids=["nan", "pos_inf", "neg_inf"])
+def test_p2_2_non_finite_price_blocks_every_horizon(harness, field, value):
+    # Corrupt the FIRST required candle: every window contains it, so no
+    # evaluated_*_at and no is_final may be written at all.
+    candles = corrupt(full_path(SIGNAL, 240), 5, field, value)
+
+    result = harness.evaluate(candles, NOW_FULL)
+
+    assert result.writes == [], f"{field}={value!r} must not be evaluated"
+    assert result.stats["coverage_blocked"].get("INVALID_OHLC")
+    assert result.finalized() is False
+    for label, _ in HORIZONS:
+        assert not result.evaluated(label)
+
+
+@pytest.mark.parametrize("harness", HARNESSES, ids=lambda h: h.name)
+@pytest.mark.parametrize("value", NON_FINITE_VALUES,
+                         ids=["nan", "pos_inf", "neg_inf"])
+def test_p2_2_non_finite_price_blocks_finalization(harness, value):
+    # Corrupt a candle that only the 240m/TP-SL window reads: the shorter
+    # proven horizons stay, but the final verdict must not be produced.
+    candles = corrupt(full_path(SIGNAL, 240), 120, "close", value)
+
+    result = harness.evaluate(candles, NOW_FULL)
+
+    for label in ("15m", "30m", "60m", "120m"):
+        assert result.evaluated(label), f"{label} window is unaffected"
+    assert not result.evaluated("240m")
+    assert result.finalized() is False
+    assert not any("tp_hit" in w for w in result.writes)
+    assert not any("sl_hit" in w for w in result.writes)
+    assert result.stats["coverage_blocked"].get("INVALID_OHLC")
+
+
+def test_p2_2_guard_rejects_every_non_finite_field():
+    signal_ms = ms(SIGNAL)
+    for field in ("open", "high", "low", "close"):
+        for value in NON_FINITE_VALUES:
+            candles = corrupt(full_path(SIGNAL, 60), 30, field, value)
+            result = guard.validate_candle_coverage(
+                candles,
+                signal_ms=signal_ms,
+                cutoff_ms=signal_ms + 60 * 60_000,
+                asof_ms=ms(SIGNAL + timedelta(minutes=65)),
+            )
+            assert result.status == guard.SOURCE_INCOMPLETE_COVERAGE, (
+                f"{field}={value!r} must be rejected")
+            assert result.reason_code == "INVALID_OHLC"
+
+
+@pytest.mark.parametrize("cycle_cls", CYCLE_HARNESSES,
+                         ids=lambda c: c.__name__)
+def test_p2_2_cycle_rejects_non_finite_source(cycle_cls):
+    signal_time = cycle_signal_time()
+    cycle = cycle_cls(signal_time)
+    candles = corrupt(full_path(signal_time, 240), 5, "close",
+                      float("nan"), signal=signal_time)
+
+    result = cycle.run(FakeBybitClient(candles))
+
+    assert result.writes == []
+    assert result.stats["coverage_blocked"].get("INVALID_OHLC")
+    assert result.stats["finalized"] == 0
+    assert result.stats["errors"] == 0, "coverage block is not a fetch error"
+    assert cycle.eligible_count == 1, "signal must stay retry-eligible"
+
+
+# ══════════════════════════════════════════════════════════════════
+# ASOF / cutoff boundary + false-finalization protection
+# ══════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("harness", HARNESSES, ids=lambda h: h.name)
+def test_asof_boundary_evaluates_exactly_at_horizon_cutoff(harness):
+    candles = [candle(ms(SIGNAL) + 5 * 60_000), candle(ms(SIGNAL) + 10 * 60_000)]
+    cutoff = SIGNAL + timedelta(minutes=15)
+
+    # One millisecond before the cutoff the horizon is not mature yet.
+    early = harness.evaluate(candles, cutoff - timedelta(milliseconds=1))
+    assert early.writes == []
+
+    # Exactly at the cutoff: mature, and the last required candle (10:10,
+    # closing at 10:15) satisfies open+5m <= asof — the rule is inclusive.
+    at_cutoff = harness.evaluate(candles, cutoff)
+    assert at_cutoff.evaluated("15m")
+    assert at_cutoff.write["mfe_15m"] == pytest.approx(EXP_MFE)
+    assert at_cutoff.stats["coverage_blocked"] == {}
+    assert at_cutoff.finalized() is False, "later horizons are not mature"
+
+
+@pytest.mark.parametrize("harness", HARNESSES, ids=lambda h: h.name)
+def test_cutoff_boundary_candle_outside_window_is_not_read(harness):
+    # The candle opening exactly at the cutoff belongs to the next window:
+    # the frozen formulas never read it, so its corrupt value must not block
+    # — and, symmetrically, can never influence the result (no lookahead).
+    candles = [
+        candle(ms(SIGNAL) + 5 * 60_000),
+        candle(ms(SIGNAL) + 10 * 60_000),
+        candle(ms(SIGNAL) + 15 * 60_000, close=float("nan")),
+    ]
+    boundary = SIGNAL + timedelta(minutes=15)
+
+    result = harness.evaluate(candles, boundary)
+
+    assert result.evaluated("15m")
+    assert result.write["mfe_15m"] == pytest.approx(EXP_MFE)
+    assert result.stats["coverage_blocked"] == {}
+    assert result.finalized() is False
+
+
+@pytest.mark.parametrize("harness", HARNESSES, ids=lambda h: h.name)
+def test_finalization_gate_blocks_invalid_tpsl_window(harness):
+    # Every horizon already proven (stored marks), but the TP/SL window
+    # itself is corrupt: stored marks alone must never finalize the row.
+    marks = {f: NOW_FULL for f in ALL_EVALUATED_FIELDS}
+    candles = corrupt(full_path(SIGNAL, 240), 120, "close", float("nan"))
+
+    result = harness.evaluate(candles, NOW_FULL, **marks, is_final=False)
+
+    assert result.writes == [], "no write when the TP/SL window is invalid"
+    assert result.finalized() is False
+    assert result.stats["finalization_blocked"] == 1
+    assert result.stats["coverage_blocked"].get("INVALID_OHLC")
+
+
+@pytest.mark.parametrize("harness", HARNESSES, ids=lambda h: h.name)
+def test_finalization_gate_blocks_incomplete_tpsl_path(harness):
+    # Same, with a plain gap: stored horizon marks are not proof of the
+    # final path, so is_final must stay false (no false finalization).
+    marks = {f: NOW_FULL for f in ALL_EVALUATED_FIELDS}
+    candles = drop(full_path(SIGNAL, 240), offset_minutes=90)
+
+    result = harness.evaluate(candles, NOW_FULL, **marks, is_final=False)
+
+    assert result.writes == []
+    assert result.finalized() is False
+    assert result.stats["finalization_blocked"] == 1
+    assert result.stats["coverage_blocked"].get("CANDLE_GAP")
+
+
+@pytest.mark.parametrize("cycle_cls", CYCLE_HARNESSES,
+                         ids=lambda c: c.__name__)
+def test_cycle_never_finalizes_from_incomplete_path(cycle_cls):
+    """End-to-end: a truncated source never produces is_final (T03/T13)."""
+    signal_time = cycle_signal_time()
+    cycle = cycle_cls(signal_time)
+    # Tail truncated at signal+90m: early horizons provable, 240m is not.
+    candles = drop(full_path(signal_time, 240), offset_minutes=90,
+                   signal=signal_time)
+
+    result = cycle.run(FakeBybitClient(candles))
+
+    assert result.finalized() is False
+    assert not any(w.get("is_final") for w in result.writes)
+    assert not any("tp_hit" in w for w in result.writes)
+    assert result.stats["finalized"] == 0
+    assert result.stats["coverage_blocked"].get("CANDLE_GAP")
+    assert cycle.eligible_count == 1
+
+
+# ══════════════════════════════════════════════════════════════════
 # Guard contract + shared diagnostics helpers
 # ══════════════════════════════════════════════════════════════════
 
