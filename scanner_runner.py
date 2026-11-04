@@ -28,6 +28,7 @@ from app.scanners.context_builder import build_market_context
 from app.scanners.cycle_completion_v1 import (
     CYCLE_COMPLETION_EVENT,
     CYCLE_COMPLETION_SCANNER,
+    RUN_STATUS_FAILED,
     CycleCompletionReport,
     STAGE_MARKET_DATA,
     STAGE_SCAN,
@@ -1681,20 +1682,61 @@ def run_scan_cycle(
     # SCANNER_AC7 Phase A: persist one diagnostic row for every INCOMPLETE
     # cycle (complete cycles keep their historical single SETUP_DETECTED
     # stream — no new write, no new API call). dds.scanner_event.event_type
-    # has no CHECK constraint, so this needs NO migration.
-    if not report.is_complete:
+    # has no CHECK constraint, so this needs NO migration. The flag stops
+    # main()'s abort path from writing a second row for the same cycle.
+    if not report.is_complete and not report.event_persisted:
         try:
             repository.save_event(
                 CYCLE_COMPLETION_EVENT, CYCLE_COMPLETION_SCANNER, "",
                 run_id=run_id,
                 payload=report.to_payload(),
             )
+            report.event_persisted = True
         except Exception:
             # Diagnostics are observational: never let a reporting failure
             # break the cycle it reports on.
             logger.warning("CYCLE_COMPLETION event persist failed", exc_info=True)
 
     return total_found, scanned, failed
+
+
+def report_aborted_cycle(
+    repository: ScannerRepository,
+    report: CycleCompletionReport,
+    cycle: int,
+    run_id: int | None,
+) -> None:
+    """Diagnostics for a cycle that died inside ``main()`` (review P2).
+
+    Contract: this helper NEVER raises, NEVER touches
+    ``dds.scanner_run.status`` (the caller has already written ``FAILED``)
+    and can never mask the original cycle exception — every statement is
+    guarded individually. It only logs what the cycle had processed so far
+    and, when the cycle had started, persists one ``CYCLE_COMPLETION`` row
+    marked ``aborted`` with ``run_status=FAILED``.
+    """
+    if not (report.expected_symbols or report.processed or report.outcomes):
+        return
+    try:
+        logger.warning(
+            "cycle #%d aborted: %s", cycle,
+            report.log_summary(run_status=RUN_STATUS_FAILED),
+        )
+    except Exception:
+        logger.debug("aborted cycle summary failed", exc_info=True)
+    if report.event_persisted:
+        # run_scan_cycle already wrote this cycle's row — no duplicates.
+        return
+    try:
+        repository.save_event(
+            CYCLE_COMPLETION_EVENT, CYCLE_COMPLETION_SCANNER, "",
+            run_id=run_id,
+            payload=report.to_payload(
+                aborted=True, run_status=RUN_STATUS_FAILED),
+        )
+        report.event_persisted = True
+    except Exception:
+        logger.debug("aborted cycle event persist failed", exc_info=True)
 
 
 def main() -> None:
@@ -1875,11 +1917,12 @@ def main() -> None:
         # ------------------------------------------------------------------
         # Phase 3: Scan cycle — the actual instrument processing
         # ------------------------------------------------------------------
+        # SCANNER_AC7 Phase A: structured completion facts for THIS cycle
+        # (expected/processed/failed/skipped symbols + reasons + transport
+        # fact). Created OUTSIDE the try so the abort path below can always
+        # report what had been processed before the cycle died.
+        report = CycleCompletionReport()
         try:
-            # SCANNER_AC7 Phase A: structured completion facts for THIS cycle
-            # (expected/processed/failed/skipped symbols + reasons) — filled in
-            # by the scan pass through the optional out-parameter below.
-            report = CycleCompletionReport()
             total, scanned, failed = run_scan_cycle(
                 client, orchestrator, repository, symbols, run_id, settings,
                 expectancy_filter=expectancy_filter,
@@ -1927,10 +1970,13 @@ def main() -> None:
             logger.info(
                 "cycle #%d done: %d/%d symbols | status=%s | "
                 "completion_status=%s | failed=%d skipped=%d | "
+                "rate_limit_response=%d limiter_pre_send_skip=%d | "
                 "%d setups | %d active signals | scan=%.2fs total=%.2fs",
                 cycle, scanned, len(symbols), report.run_status,
                 report.completion_status,
                 len(report.failed_symbols), len(report.skipped_symbols),
+                len(report.rate_limit_response_symbols),
+                len(report.limiter_pre_send_skip_symbols),
                 total, active_signals,
                 t_run_finished - t_run_started, elapsed,
             )
@@ -1964,6 +2010,13 @@ def main() -> None:
                 except Exception:
                     logger.warning("could not record failed run status")
                     repository.reconnect()
+            # SCANNER_AC7 Phase A (review P2): diagnostics of the ABORTED
+            # cycle. The FAILED status above is written FIRST and the helper
+            # cannot change it; the original exception was already logged by
+            # logger.exception; and the helper itself never raises, so a
+            # diagnostic failure can neither mask the original error nor
+            # change how the Scanner finishes.
+            report_aborted_cycle(repository, report, cycle, run_id)
 
         # Sleep in small intervals to respond to shutdown
         delay = seconds_until_next_cycle(

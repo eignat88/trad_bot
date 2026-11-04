@@ -45,11 +45,19 @@ from app.scanners.cycle_completion_v1 import (
     ERROR_MARKET_DATA,
     ERROR_RATE_LIMIT_SKIP,
     ERROR_SCAN,
+    REQUEST_STATE_PRE_SEND_SKIP,
+    REQUEST_STATE_RATE_LIMIT_RESPONSE,
+    REQUEST_STATE_UNKNOWN,
+    REQUEST_STATES,
     RUN_STATUS_COMPLETED,
+    RUN_STATUS_FAILED,
     RUN_STATUS_PARTIAL,
     SCHEMA,
+    TELEMETRY_LIMITER_SKIP,
+    TELEMETRY_RATE_LIMIT,
     CycleCompletionReport,
     classify_symbol_failure,
+    parse_rate_limit_denial,
     parse_rate_limit_message,
 )
 
@@ -82,7 +90,12 @@ class _Repository:
         self.events: list[dict] = []
         self.setups: list = []
         self.run_stats: list[tuple[str, dict]] = []
+        self.finished: list[dict] = []
         self._use_pg = False
+
+    def finish_run(self, run_id, **kwargs):
+        """Records the status main() wrote to dds.scanner_run."""
+        self.finished.append({"run_id": run_id, **kwargs})
 
     def save_error(self, *, symbol, scanner_name, error_type, error_message,
                    run_id=None, retry_count=0):
@@ -328,11 +341,22 @@ def test_partial_cycle_46_of_50_records_four_rate_limit_skips():
     assert by_symbol["XAGUSDT"].reason == "rate-limit retry cap"
     assert by_symbol["SPCXUSDT"].result == "RATE_LIMIT"
     assert by_symbol["SPCXUSDT"].reason == "process_local_cooldown:2.00s"
+    # P1: the transport fact is told apart per skip, not from the exception
+    # type. T3/T4 = pre-send, T1 = a real Bybit answer, T6 = unknown.
+    assert by_symbol["DOGEUSDT"].request_state == REQUEST_STATE_PRE_SEND_SKIP
+    assert by_symbol["ENAUSDT"].request_state == REQUEST_STATE_PRE_SEND_SKIP
+    assert by_symbol["XAGUSDT"].request_state == REQUEST_STATE_RATE_LIMIT_RESPONSE
+    assert by_symbol["SPCXUSDT"].request_state == REQUEST_STATE_UNKNOWN
+    # P2: telemetry_result is never fabricated.
+    assert by_symbol["DOGEUSDT"].telemetry_result == TELEMETRY_LIMITER_SKIP
+    assert by_symbol["ENAUSDT"].telemetry_result == TELEMETRY_LIMITER_SKIP
+    assert by_symbol["XAGUSDT"].telemetry_result == TELEMETRY_RATE_LIMIT
+    assert by_symbol["SPCXUSDT"].telemetry_result is None
     for outcome in report.skips:
         assert outcome.error_type == ERROR_RATE_LIMIT_SKIP
         assert outcome.category == CATEGORY_SKIPPED
         assert outcome.rate_limit is True
-        assert outcome.telemetry_result == "BYBIT_API_SKIP"
+        assert outcome.request_state in REQUEST_STATES
 
     # dds.scanner_error rows: one per skip, typed as a rate-limit skip.
     assert len(repo.errors) == 4
@@ -353,6 +377,20 @@ def test_partial_cycle_46_of_50_records_four_rate_limit_skips():
     assert sorted(payload["unprocessed_symbols"]) == sorted(skips)
     assert payload["scan_error_count"] == 0
     assert all(o["reason"] for o in payload["outcomes"])
+    # P1: payload carries the transport fact, aggregated and per symbol.
+    assert payload["rate_limit_response_count"] == 1
+    assert payload["limiter_pre_send_skip_count"] == 2
+    assert payload["request_state_unknown_count"] == 1
+    assert payload["rate_limit_response_symbols"] == ["XAGUSDT"]
+    assert sorted(payload["limiter_pre_send_skip_symbols"]) == [
+        "DOGEUSDT", "ENAUSDT"]
+    assert payload["request_state_unknown_symbols"] == ["SPCXUSDT"]
+    states = {o["symbol"]: o["request_state"] for o in payload["outcomes"]}
+    assert states["XAGUSDT"] == REQUEST_STATE_RATE_LIMIT_RESPONSE
+    assert states["SPCXUSDT"] == REQUEST_STATE_UNKNOWN
+    telemetry = {o["symbol"]: o["telemetry_result"] for o in payload["outcomes"]}
+    assert telemetry["XAGUSDT"] == TELEMETRY_RATE_LIMIT
+    assert telemetry["SPCXUSDT"] is None
     json.dumps(payload)
 
     # save_run_stat compatibility: per-scanner symbols_scanned == 46.
@@ -414,7 +452,9 @@ def test_partial_cycle_44_of_50_real_bybit_10006_is_structured(monkeypatch):
         assert outcome.ret_code == 10006
         assert outcome.result == "RATE_LIMIT"
         assert outcome.reason == "rate-limit retry cap"
-        assert outcome.telemetry_result == "RATE_LIMIT"
+        assert outcome.telemetry_result == TELEMETRY_RATE_LIMIT
+        # T1 (review P1): the request WAS sent — Bybit itself answered.
+        assert outcome.request_state == REQUEST_STATE_RATE_LIMIT_RESPONSE
         assert outcome.error_type == ERROR_RATE_LIMIT_SKIP
         assert "Rate limited on /v5/market/kline" in outcome.message
 
@@ -428,6 +468,12 @@ def test_partial_cycle_44_of_50_real_bybit_10006_is_structured(monkeypatch):
     assert payload["skipped_count"] == 6
     assert sorted(payload["skipped_symbols"]) == sorted(skip)
     assert all(o["ret_code"] == 10006 for o in payload["outcomes"])
+    # P1: all six were real responses, none was a pre-send limiter deny.
+    assert payload["rate_limit_response_count"] == 6
+    assert payload["limiter_pre_send_skip_count"] == 0
+    assert payload["request_state_unknown_count"] == 0
+    assert all(o["request_state"] == REQUEST_STATE_RATE_LIMIT_RESPONSE
+               for o in payload["outcomes"])
     json.dumps(payload)
 
     # AC9 / Phase A scope: exactly one attempt per skipped symbol (the 5m
@@ -515,8 +561,11 @@ def test_breaker_open_deny_is_recorded_as_bybit_api_skip_with_queue_wait(
     assert all(o.result == "BREAKER_OPEN" for o in report.skips)
     assert all(o.reason == "breaker_cooldown_exceeds_deadline"
                for o in report.skips)
-    assert all(o.telemetry_result == "BYBIT_API_SKIP" for o in report.skips)
+    assert all(o.telemetry_result == TELEMETRY_LIMITER_SKIP for o in report.skips)
     assert all(isinstance(o.queue_wait_ms, int) for o in report.skips)
+    # T3 (review P1): the deny provably never reached the wire.
+    assert all(o.request_state == REQUEST_STATE_PRE_SEND_SKIP
+               for o in report.skips)
     assert len(repo.errors) == 50
     assert {e["error_type"] for e in repo.errors} == {ERROR_RATE_LIMIT_SKIP}
 
@@ -524,10 +573,16 @@ def test_breaker_open_deny_is_recorded_as_bybit_api_skip_with_queue_wait(
     assert payload["completion_status"] == COMPLETION_FAILED
     assert payload["run_status"] == RUN_STATUS_PARTIAL
     assert payload["skipped_count"] == 50
-    assert all(o["telemetry_result"] == "BYBIT_API_SKIP"
+    assert all(o["telemetry_result"] == TELEMETRY_LIMITER_SKIP
+               for o in payload["outcomes"])
+    assert all(o["request_state"] == REQUEST_STATE_PRE_SEND_SKIP
                for o in payload["outcomes"])
     assert all(isinstance(o["queue_wait_ms"], int)
                for o in payload["outcomes"])
+    assert payload["limiter_pre_send_skip_count"] == 50
+    assert payload["rate_limit_response_count"] == 0
+    assert payload["request_state_unknown_count"] == 0
+    assert sorted(payload["limiter_pre_send_skip_symbols"]) == sorted(SYMBOLS)
     json.dumps(payload)
 
     # Deny path never reaches the network — and Phase A added no request.
@@ -662,6 +717,45 @@ def test_schema_and_run_status_vocabulary_are_untouched():
     assert "status='COMPLETE'" not in source
 
 
+def test_scanner_error_error_type_has_no_filtered_consumer():
+    """Review P2 (compatibility): ``RATE_LIMIT_SKIP`` cannot drop a metric.
+
+    Audit of every ``dds.scanner_error`` consumer:
+
+    * ``mart/002_scanner_overview`` counts ALL rows (``COUNT(*)``);
+    * ``mart/008_scanner_health`` counts ALL rows (1h/24h windows) and takes
+      ``MAX(created_at)``;
+    * ``system-health{,-v2}`` Grafana panels SELECT ``error_type`` as a
+      column — they never filter on it;
+    * ``sql/research/me_short_a_source_intake_diagnostics_v1`` filters on a
+      different literal (``ME_SHORT_A_SOURCE_INTAKE_ERROR``);
+    * Python only INSERTs (``ScannerRepository.save_error``) — no reader.
+
+    So renaming a limiter denial from ``MARKET_DATA_ERROR`` to
+    ``RATE_LIMIT_SKIP`` keeps the row count identical (exactly one row per
+    source failure) and only changes the label shown for those rows. This
+    test keeps the "no filtered consumer" property true.
+    """
+    offenders: list[str] = []
+    for root in ("sql", "monitoring"):
+        for path in sorted((ROOT / root).rglob("*")):
+            if path.suffix not in {".sql", ".json"}:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for literal in ("MARKET_DATA_ERROR", "RATE_LIMIT_SKIP"):
+                if literal in text:
+                    offenders.append(f"{path.relative_to(ROOT)}:{literal}")
+    assert offenders == [], f"error_type literal used by a consumer: {offenders}"
+    # the counting marts must not gain a type filter later on either
+    for mart in ("002_scanner_overview.sql", "008_scanner_health.sql"):
+        text = (ROOT / "sql" / "mart" / mart).read_text(encoding="utf-8")
+        assert "error_type" not in text, mart
+    # no Python reader over dds.scanner_error exists
+    for path in (ROOT / "app").rglob("*.py"):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        assert "FROM DDS.SCANNER_ERROR" not in text.upper(), path
+
+
 def test_main_logs_completion_status_and_uses_the_preserved_run_status():
     source = (ROOT / "scanner_runner.py").read_text(encoding="utf-8")
     main_src = source[source.index("def main()"):]
@@ -706,3 +800,227 @@ def test_run_scan_cycle_contract_is_unchanged():
     ]
     assert [a.arg for a in node.args.kwonlyargs] == ["report"]
     assert node.args.kw_defaults[-1] is not None      # report defaults to None
+
+
+# ======================================= review SCANNER_AC7_PHASE_A fixes
+# (P1 response-vs-pre-send, P2 telemetry / error_type / abort path)
+
+
+class _Status429Session:
+    """Every public GET answers HTTP 429 — a rate limit with no body."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def get(self, url, params=None, timeout=None, headers=None):
+        params = dict(params or {})
+        self.calls.append((url, params.get("symbol"), params.get("interval")))
+        return _Status429Response()
+
+
+class _Status429Response:
+    status = 429
+    reason = "Too Many Requests"
+    headers = None
+
+    def raise_for_status(self):       # never reached: 429 branches first
+        raise AssertionError("the 429 branch must run before raise_for_status")
+
+    def json(self):                   # never reached either
+        raise AssertionError("HTTP 429 carries no body")
+
+
+def test_t2_http_429_is_rate_limit_response_without_ret_code(monkeypatch):
+    """T2: an HTTP 429 IS a sent request — and it has no body ``retCode``."""
+    monkeypatch.setattr(
+        BybitClient, "_global_limiter", _RateLimiter(rps=1_000_000.0))
+    settings = Settings(
+        scanner_workers=8, bybit_timeout=2, bybit_max_attempts=3,
+        bybit_retry_backoff=0.0, bybit_rate_limit_max_retries=0,
+        bybit_rate_limit_retry_backoff=0.0, bybit_rate_limit_cooldown_s=0.0,
+    )
+    session = _Status429Session()
+    client = BybitClient(settings, session)
+    repo = _Repository()
+    report = CycleCompletionReport()
+
+    total, scanned, failed = scanner_runner.run_scan_cycle(
+        client, _Orchestrator(), repo, SYMBOLS, RUN_ID, settings,
+        report=report)
+
+    assert (total, scanned, failed) == (0, 0, 50)
+    assert report.completion_status == COMPLETION_FAILED
+    for outcome in report.skips:
+        assert outcome.request_state == REQUEST_STATE_RATE_LIMIT_RESPONSE
+        assert outcome.telemetry_result == TELEMETRY_RATE_LIMIT
+        assert outcome.result == TELEMETRY_RATE_LIMIT
+        assert outcome.ret_code is None            # 429 has no body retCode
+        assert "Rate limited on" in outcome.message
+    payload = _payload_of(repo)
+    assert payload["rate_limit_response_count"] == 50
+    assert payload["limiter_pre_send_skip_count"] == 0
+    # exactly one attempt per symbol: no retry, no recovery pass
+    assert len(session.calls) == 50
+
+
+def test_t4_t5_pre_send_messages_are_limiter_pre_send_skip():
+    """T4/T5: shared-limiter refusals are proven NOT to have been sent."""
+    deadline = classify_symbol_failure("ENAUSDT", BybitRateLimitError(
+        "ENAUSDT: /v5/market/kline deferred by shared rate limiter "
+        "(SKIPPED: deadline) — not sent (fail-closed)"))
+    assert deadline.request_state == REQUEST_STATE_PRE_SEND_SKIP
+    assert deadline.telemetry_result == TELEMETRY_LIMITER_SKIP
+    assert (deadline.result, deadline.reason) == ("SKIPPED", "deadline")
+
+    revoked = classify_symbol_failure("XAGUSDT", BybitRateLimitError(
+        "XAGUSDT: /v5/market/kline limiter grant revoked before send "
+        "(epoch moved) — not sent (fail-closed)"))
+    assert revoked.request_state == REQUEST_STATE_PRE_SEND_SKIP
+    assert revoked.telemetry_result == TELEMETRY_LIMITER_SKIP
+    assert (revoked.result, revoked.reason) == ("REVOKED", "grant_revoked")
+
+    unavailable = classify_symbol_failure("SPCXUSDT", BybitRateLimitError(
+        "SPCXUSDT: /v5/market/kline shared rate limiter unavailable "
+        "(TimeoutError) — not sent (fail-closed)"))
+    assert unavailable.request_state == REQUEST_STATE_PRE_SEND_SKIP
+    assert unavailable.telemetry_result == TELEMETRY_LIMITER_SKIP
+    assert unavailable.result == "LIMITER_UNAVAILABLE"
+
+    # structured attributes alone are enough (no message parsing needed)
+    structured = classify_symbol_failure("DOGEUSDT", BybitRateLimitError(
+        "any message", limiter_result="BREAKER_OPEN",
+        limiter_reason="breaker_cooldown_exceeds_deadline"))
+    assert structured.request_state == REQUEST_STATE_PRE_SEND_SKIP
+    assert structured.telemetry_result == TELEMETRY_LIMITER_SKIP
+
+    # a real Bybit answer parsed out of the message is the OPPOSITE story
+    response = classify_symbol_failure("XAGUSDT", BybitRateLimitError(
+        "XAGUSDT: Rate limited on /v5/market/kline after 2 attempt(s) "
+        "(rate-limit retry cap)"))
+    assert response.request_state == REQUEST_STATE_RATE_LIMIT_RESPONSE
+    assert response.telemetry_result == TELEMETRY_RATE_LIMIT
+    assert response.ret_code is None
+
+
+def test_t6_local_cooldown_is_unknown_without_invented_telemetry():
+    """T6: the process-local cooldown proves neither story — no guessing."""
+    outcome = classify_symbol_failure("SPCXUSDT", BybitRateLimitError(
+        "request deferred: rate-limit cooldown open (12.34s remaining)"))
+    assert outcome.rate_limit is True
+    assert outcome.category == CATEGORY_SKIPPED
+    assert outcome.request_state == REQUEST_STATE_UNKNOWN
+    assert outcome.telemetry_result is None      # never a fabricated skip
+    assert outcome.reason == "process_local_cooldown:12.34s"
+
+
+def test_t7_legacy_error_keeps_every_field_unknown():
+    """T7: a pre-Phase-A BybitRateLimitError carries no facts — none appear."""
+    legacy = classify_symbol_failure(
+        "OLDUSDT", BybitRateLimitError("OLDUSDT: some unrecognised wording"))
+    assert legacy.rate_limit is True
+    assert legacy.category == CATEGORY_SKIPPED
+    assert legacy.result == TELEMETRY_RATE_LIMIT
+    assert legacy.reason is None
+    assert legacy.request_state == REQUEST_STATE_UNKNOWN
+    assert legacy.telemetry_result is None
+    assert legacy.queue_wait_ms is None
+    assert legacy.ret_code is None
+
+    # an ordinary failure has no transport state at all
+    plain = classify_symbol_failure("XUSDT", ConnectionError("boom"))
+    assert plain.rate_limit is False
+    assert plain.request_state is None
+    assert plain.telemetry_result is None
+    assert plain.error_type == ERROR_MARKET_DATA
+
+
+def test_t11_abort_path_keeps_failed_status_and_cannot_mask(
+        caplog, monkeypatch):
+    """T11: the abort diagnostics never touch run status, never raise."""
+    caplog.set_level("WARNING")
+    report = CycleCompletionReport()
+    report.expected_symbols = 50
+    report.record_processed("DOGEUSDT")
+    report.record_outcome(classify_symbol_failure("ENAUSDT", BybitRateLimitError(
+        "ENAUSDT: /v5/market/kline deferred by shared rate limiter "
+        "(BREAKER_OPEN: breaker_cooldown_exceeds_deadline) — not sent "
+        "(fail-closed)")))
+
+    repo = _Repository()
+    scanner_runner.report_aborted_cycle(repo, report, cycle=175, run_id=RUN_ID)
+
+    # the helper must not finish/write the run row — main() already did
+    assert repo.finished == []
+    assert repo.errors == []                      # no double error rows
+    events = repo.cycle_completion_events()
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["aborted"] is True
+    assert payload["run_status"] == RUN_STATUS_FAILED    # status is FAILED
+    assert payload["completion_status"] == COMPLETION_PARTIAL
+    assert payload["processed_symbols"] == 1
+    assert payload["limiter_pre_send_skip_count"] == 1
+    assert "cycle #175 aborted" in caplog.text
+    assert "run_status=FAILED" in caplog.text
+    json.dumps(payload)
+
+    # at most ONE diagnostic row per cycle, even if the helper runs again
+    scanner_runner.report_aborted_cycle(repo, report, cycle=175, run_id=RUN_ID)
+    assert len(repo.cycle_completion_events()) == 1
+
+    # a cycle that never started produces no diagnostic row at all
+    untouched = _Repository()
+    scanner_runner.report_aborted_cycle(
+        untouched, CycleCompletionReport(), cycle=176, run_id=None)
+    assert untouched.cycle_completion_events() == []
+    assert untouched.finished == []
+
+    # a broken diagnostics store must not raise out of the helper
+    class _BrokenEventRepo(_Repository):
+        def save_event(self, *args, **kwargs):
+            raise RuntimeError("diagnostics storage unavailable")
+
+    broken = _BrokenEventRepo()
+    scanner_runner.report_aborted_cycle(broken, report, cycle=177, run_id=None)
+    assert broken.finished == []
+
+
+def test_t11_main_writes_failed_before_abort_diagnostics():
+    """Ordering guard: original exception → FAILED row → diagnostics."""
+    source = (ROOT / "scanner_runner.py").read_text(encoding="utf-8")
+    main_src = source[source.index("def main()"):]
+    exception_at = main_src.index('logger.exception("cycle #%d failed"')
+    failed_at = main_src.index('status="FAILED", error_count=1')
+    diagnostics_at = main_src.index(
+        "report_aborted_cycle(repository, report, cycle, run_id)")
+    assert exception_at < failed_at < diagnostics_at
+    # the report object exists before the try, so it is always bound here
+    assert main_src.index("report = CycleCompletionReport()") < exception_at
+    # the helper itself swallows its own failures
+    helper_src = source[
+        source.index("def report_aborted_cycle("): source.index("def main()")]
+    assert helper_src.count("except Exception") >= 2
+    assert "finish_run" not in helper_src          # never touches status
+
+
+def test_t12_diagnostic_save_failure_never_changes_the_cycle_result():
+    """T12: a failing CYCLE_COMPLETION write cannot alter the cycle."""
+    class _BrokenEventRepo(_Repository):
+        def save_event(self, *args, **kwargs):
+            raise RuntimeError("diagnostics storage unavailable")
+
+    skip = {"DOGEUSDT": _deny_error(
+        "DOGEUSDT", "BREAKER_OPEN: breaker_cooldown_exceeds_deadline")}
+    symbols = ["DOGEUSDT", *[s for s in SYMBOLS if s != "DOGEUSDT"]]
+    repo = _BrokenEventRepo()
+    total, scanned, failed, repo, report = _run_cycle(
+        symbols=symbols, build=_build_with(skip), repo=repo)
+
+    assert (total, scanned, failed) == (0, 49, 1)
+    assert report.completion_status == COMPLETION_PARTIAL
+    assert report.run_status == RUN_STATUS_PARTIAL
+    # the regular writes still happened: errors + per-scanner run stats
+    assert len(repo.errors) == 1
+    assert repo.errors[0]["error_type"] == ERROR_RATE_LIMIT_SKIP
+    assert repo.run_stats[0][1]["symbols_scanned"] == 49
+    assert repo.finished == []
