@@ -215,3 +215,81 @@ def test_f1_defaults_are_safe_and_documented():
     assert mod.CAPTURE_LATENCY_ENV in text
     assert "latency:TIMEOUT" in text
     assert "worker" in text
+    # The cycle charge covers the FULL capture incl. DB finalization.
+    assert "and the DB finalization" in text
+
+
+# ── Codex review follow-ups (fix commit) ────────────────────────────────
+
+
+def test_coverage_sql_never_counts_pending_in_numerator():
+    """F3: PENDING is excluded from EVERY coverage numerator (docs)."""
+    text = doc_norm()
+    # The old unfiltered numerator is gone for good.
+    assert "COUNT(e.observation_id) AS captured," not in text
+    # captured_finalized and coverage_pct filter PENDING out explicitly...
+    assert text.count(
+        "FILTER (WHERE e.feasibility_status <> 'PENDING')") >= 2
+    # ...and the eligible numerator states the exclusion too.
+    assert ("FILTER (WHERE eligible_for_execution_stats AND "
+            "feasibility_status <> 'PENDING') AS eligible") in text
+    # PENDING always has its own bucket/column.
+    assert "AS pending_separate" in text
+    assert "AS stuck_pending" in text
+    assert "THEN 'PENDING'" in text
+    assert "PENDING is NEVER part of any numerator" in text
+    assert ("PENDING is its own bucket and is never merged into ELIGIBLE"
+            in text)
+    # The runbook carries no numerator of its own that could count PENDING.
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    assert "COUNT(e.observation_id)" not in runbook
+    assert "PENDING" in runbook
+
+
+def test_f4_verdicts_are_mutually_exclusive():
+    """Codex F4: straddling CI => INCONCLUSIVE, never NO-GO; one verdict."""
+    text = doc_norm()
+    raw = DOC.read_text(encoding="utf-8")
+    # Verdict precedence contract, verbatim from the doc.
+    assert ("mutually exclusive, decided in order, first match wins"
+            in text)
+    assert "§12.5 INCONCLUSIVE is evaluated FIRST" in text
+    assert "an uncertain result is INCONCLUSIVE, never NO-GO" in text
+    assert ("§12.4 NO-GO is evaluated only when §12.5 did not match"
+            in text)
+    assert ("§12.3 GO is evaluated only when neither §12.5 nor §12.4 "
+            "matched") in text
+    assert "A given sample therefore has exactly one verdict" in text
+    # NO-GO is gated behind §12.5 and its CI condition excludes straddles.
+    assert "Applies only when §12.5 did not match" in text
+    assert "can never reach this branch" in text
+    assert "Evaluated FIRST — before §12.4 (NO-GO) and §12.3 (GO)" in text
+    # The old ambiguous condition (straddle also matching NO-GO) is gone.
+    assert "95% CI lower bound ≤ 0" not in text
+    for heading in ("### 12.3 GO", "### 12.4 NO-GO", "### 12.5 INCONCLUSIVE"):
+        assert heading in raw
+
+    # Scenario matrix: the documented precedence, encoded literally —
+    # every input state maps to EXACTLY ONE verdict.
+    def classify(ci_lower, ci_upper, *, complete=True, floors_ok=True,
+                 criteria_ok=True):
+        # 1) INCONCLUSIVE first: incomplete evidence or straddling CI.
+        if not complete or not floors_ok or ci_lower <= 0 < ci_upper:
+            return "INCONCLUSIVE"
+        # 2) NO-GO only with complete, statistically resolved evidence.
+        if ci_upper <= 0 or not criteria_ok:
+            return "NO-GO"
+        # 3) GO only when neither branch above matched.
+        return "GO"
+
+    assert classify(-0.10, 0.30) == "INCONCLUSIVE"  # straddle, point <= 0
+    assert classify(-0.05, 0.02) == "INCONCLUSIVE"  # straddle around 0
+    assert classify(-0.40, -0.10) == "NO-GO"        # CI entirely <= 0
+    assert classify(0.10, 0.40) == "GO"
+    assert classify(0.10, 0.40, floors_ok=False) == "INCONCLUSIVE"
+    assert classify(0.10, 0.40, complete=False) == "INCONCLUSIVE"
+    assert classify(0.10, 0.40, criteria_ok=False) == "NO-GO"
+    # A straddling CI with a negative point estimate can never be NO-GO;
+    # only a CI fully at/below zero reaches the NO-GO branch.
+    assert classify(-0.30, -0.01) == "NO-GO"   # upper <= 0: resolved negative
+    assert classify(-0.30, 0.01) == "INCONCLUSIVE"  # straddle wins

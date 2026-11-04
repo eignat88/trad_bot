@@ -115,6 +115,9 @@ class FakeCursor:
             time.sleep(self.conn.claim_sleep_s)
             self.rowcount = 0 if self.conn.claim_conflict else 1
         elif up.startswith("UPDATE RESEARCH.SRR_SHORT_FILL_FEASIBILITY_V1"):
+            # artificial DB finalization latency: must be charged to the
+            # F1 cycle budget just like the quote phase.
+            time.sleep(self.conn.finalize_sleep_s)
             if self.conn.finalize_error is not None:
                 raise self.conn.finalize_error
             self.conn.finalize_params = params
@@ -134,7 +137,8 @@ class FakeConnection:
                  observations=None, duplicate_exists=False,
                  duplicate_observation_ids=(), claim_conflict=False,
                  finalize_rowcount=1, finalize_error=None,
-                 claim_sleep_s=0.0, coverage_error=None):
+                 claim_sleep_s=0.0, coverage_error=None,
+                 finalize_sleep_s=0.0):
         if activation_row is _DEFAULT:  # resolved per test, not at import
             activation_row = ("RUNNING", ACTIVATION)
         self.activation_row = activation_row
@@ -147,6 +151,7 @@ class FakeConnection:
         self.finalize_rowcount = finalize_rowcount
         self.finalize_error = finalize_error
         self.claim_sleep_s = claim_sleep_s
+        self.finalize_sleep_s = finalize_sleep_s
         self.coverage_error = coverage_error
         self.finalize_params = None
         self.statements = []
@@ -1281,6 +1286,35 @@ def test_cycle_latency_budget_denies_before_claim_and_api(monkeypatch):
         observation_ids=[2], signal_time=signal_b)) is True
     assert len(db.claim_inserts) == 2
     assert len(client.orderbook_calls) == 2
+
+
+def test_finalize_delay_is_charged_to_the_cycle_latency_budget(monkeypatch):
+    # Codex F1: the cycle charge must cover the FULL capture wall-clock,
+    # including the DB finalization — a slow finalize must consume the
+    # window and fail-close the NEXT capture.
+    monkeypatch.setenv("SRR_SHORT_FILL_MAX_CYCLE_LATENCY_MS", "1000")
+    monkeypatch.setenv("SRR_SHORT_FILL_MAX_CAPTURE_MS", "800")
+    signal_b = SIGNAL + timedelta(seconds=1)
+    observations = {
+        1: obs_row(signal_time=SIGNAL),
+        2: obs_row(obs_id=2, signal_time=signal_b),
+    }
+    db = FakeConnection(observations=observations, finalize_sleep_s=0.55)
+    client = good_client()
+
+    started = time.monotonic()
+    assert mod.capture(db, client, **capture_kwargs(
+        observation_ids=[1])) is True
+    assert time.monotonic() - started >= 0.55  # the delay really happened
+    # ~550ms of DB finalization charged -> only ~450ms remain < 800ms.
+    assert mod.capture(db, client, **capture_kwargs(
+        observation_ids=[2], signal_time=signal_b)) is False
+    assert len(db.claim_inserts) == 1        # second event never reserved
+    assert len(client.orderbook_calls) == 1  # and never reached Bybit
+    assert len(db.coverage_inserts) == 1
+    assert db.coverage_rows[0][4] == "LATENCY_BUDGET_DENIED"
+    assert mod.stats()["latency_denied"] == 1
+    assert mod.stats()["budget_denied"] == 0  # refusal precedes the budget
 
 
 def test_capture_latency_config_must_fit_the_cycle_window(monkeypatch):

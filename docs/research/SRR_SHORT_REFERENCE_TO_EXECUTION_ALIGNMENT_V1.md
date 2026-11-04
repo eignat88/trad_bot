@@ -331,8 +331,10 @@ row-level verdict reflects the SMALL scenario.
 * **Pre-flight, fail-closed:** before the claim and before the API budget
   a capture is refused unless one full `max_capture_ms` window still fits
   in the cycle budget (`latency_denied`, coverage row
-  `LATENCY_BUDGET_DENIED`). The whole capture elapsed time (dup-check,
-  claim, quote fetch) is then charged to the cycle window.
+  `LATENCY_BUDGET_DENIED`). The whole capture wall-clock (dup-check,
+  claim, quote fetch **and the DB finalization** — charged on every
+  path, including exceptions) is then credited to the cycle window when
+  the capture returns.
 * **Bounded quote worker:** the instrument lookup, limiter wait, retries
   and HTTP run in a worker thread; the scanner thread `join`s with the
   `max_capture_ms` timeout. On timeout the claim is finalized as
@@ -407,7 +409,10 @@ SELECT symbol,
            AS finalized_captures,
        COUNT(*) FILTER (WHERE feasibility_status = 'PENDING')
            AS stuck_pending,
-       COUNT(*) FILTER (WHERE eligible_for_execution_stats) AS eligible
+       COUNT(*) FILTER (WHERE eligible_for_execution_stats
+                         AND feasibility_status <> 'PENDING') AS eligible
+           -- belt-and-braces: PENDING can never be eligible (DB CHECK),
+           -- but the numerator states the exclusion explicitly
 FROM research.srr_short_fill_feasibility_v1
 GROUP BY symbol ORDER BY eligible DESC;
 
@@ -416,6 +421,9 @@ GROUP BY symbol ORDER BY eligible DESC;
 -- source), NEVER capture rows: a missing event can only DECREASE
 -- measured coverage. Precedence: an evidence row always overrides a
 -- coverage row for the same observation_id.
+-- PENDING is NEVER part of any numerator: stuck claims get their own
+-- column (pending_separate / stuck_pending) and are excluded from
+-- captured_finalized, eligible and coverage_pct everywhere below.
 WITH source AS (
     SELECT o.observation_id, o.symbol, o.signal_time
     FROM research.prospective_observation o
@@ -427,21 +435,30 @@ WITH source AS (
       AND o.signal_time > a.activation_ts
 )
 SELECT COUNT(*) AS denominator,
-       COUNT(e.observation_id) AS captured,
        COUNT(e.observation_id)
-           FILTER (WHERE e.eligible_for_execution_stats) AS eligible,
+           FILTER (WHERE e.feasibility_status <> 'PENDING')
+           AS captured_finalized,
+       COUNT(e.observation_id)
+           FILTER (WHERE e.feasibility_status = 'PENDING')
+           AS pending_separate,
+       COUNT(e.observation_id)
+           FILTER (WHERE e.feasibility_status <> 'PENDING'
+                     AND e.eligible_for_execution_stats) AS eligible,
        COUNT(c.observation_id) AS denied_accounted,
        COUNT(*) FILTER (WHERE e.observation_id IS NULL
                          AND c.observation_id IS NULL) AS unaccounted,
-       ROUND(100.0 * COUNT(e.observation_id) / COUNT(*), 2)
-           AS coverage_pct
+       ROUND(100.0 * COUNT(e.observation_id)
+             FILTER (WHERE e.feasibility_status <> 'PENDING')
+             / COUNT(*), 2) AS coverage_pct
 FROM source s
 LEFT JOIN research.srr_short_fill_feasibility_v1 e
        USING (observation_id)
 LEFT JOIN research.srr_short_fill_coverage_v1 c
        USING (observation_id);
 
--- Per-event disposition (every source event must be explainable):
+-- Per-event disposition (every source event must be explainable).
+-- PENDING is its own bucket and is never merged into ELIGIBLE or into
+-- any coverage numerator:
 WITH source AS (
     SELECT o.observation_id, o.symbol, o.signal_time
     FROM research.prospective_observation o
@@ -606,7 +623,25 @@ unchanged, frozen costs 0.21% / 0.31%, single-counted — Section 6).
   stays untouched; an "executable" number may only come from the Stage-2
   recomputation itself.
 
+**Verdict precedence — GO / NO-GO / INCONCLUSIVE are mutually exclusive,
+decided in order, first match wins:**
+
+1. **§12.5 INCONCLUSIVE is evaluated FIRST.** Incomplete evidence —
+   missing Stage-2 / bootstrap / coverage inputs, unmet minimum floors,
+   a running window — or a bootstrap CI that **straddles zero
+   (`lower ≤ 0 < upper`)** ends the decision: an uncertain result is
+   **INCONCLUSIVE, never NO-GO**, even when the point estimate is ≤ 0.
+2. **§12.4 NO-GO is evaluated only when §12.5 did not match** — the
+   evidence is complete and statistically resolved against the contour.
+3. **§12.3 GO is evaluated only when neither §12.5 nor §12.4 matched.**
+
+A given sample therefore has exactly one verdict; no condition may place
+the same sample in two branches.
+
 ### 12.3 GO — requires ALL of the following
+
+Evaluated only when §12.5 (INCONCLUSIVE) and §12.4 (NO-GO) did not
+match; every condition below must hold:
 
 1. **Net E[R] > 0** after execution-aligned trajectory recomputation,
    NORMAL cost class, on the full eligible sample (no exclusions beyond
@@ -645,9 +680,15 @@ unchanged, frozen costs 0.21% / 0.31%, single-counted — Section 6).
 
 ### 12.4 NO-GO — if ANY of the following holds
 
-* execution-aligned Net E[R] ≤ 0 (NORMAL), or its 95% CI upper bound ≤ 0;
+Applies only when §12.5 did not match (evidence complete and both
+cluster CIs resolved away from zero), and ANY of the following holds:
+
+* execution-aligned Net E[R] ≤ 0 (NORMAL) with both cluster CIs
+  excluding zero — a significant negative, not an uncertain one;
 * Net PF ≤ 1;
-* day-cluster **or** symbol-cluster bootstrap 95% CI lower bound ≤ 0;
+* day-cluster **or** symbol-cluster bootstrap 95% CI entirely at or
+  below zero (upper bound ≤ 0) — a CI that straddles zero was already
+  classified INCONCLUSIVE by §12.5 and can never reach this branch;
 * catastrophic day or symbol concentration detected (any leave-one-out
   sign flip, or a > 50% PnL share — Section 12.3.4);
 * any coverage/quality threshold of Section 12.3.6 violated **after the
@@ -659,10 +700,14 @@ unchanged, frozen costs 0.21% / 0.31%, single-counted — Section 6).
 
 ### 12.5 INCONCLUSIVE — the only verdict while evidence is incomplete
 
+Evaluated FIRST — before §12.4 (NO-GO) and §12.3 (GO):
+
 * any sample floor not yet reached (`minimum_n` / `minimum_symbols` /
   `minimum_oos_days`) or the observation window is still running —
   `before_sample_gates = INCONCLUSIVE_CONTINUE_OOS`;
-* either bootstrap CI straddles zero (lower ≤ 0 < upper);
+* either bootstrap CI straddles zero (lower ≤ 0 < upper) — **an uncertain
+  result is INCONCLUSIVE, never NO-GO**, even when the point estimate is
+  ≤ 0;
 * any required analysis input is missing (Stage-2 recomputation not run,
   bootstrap not run, coverage denominator not computed).
 

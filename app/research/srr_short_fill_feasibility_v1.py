@@ -956,8 +956,18 @@ def capture(conn, client, *, scanner_name, direction, symbol, signal_time,
                 _record_coverage(conn, [obs], "POLICY_DENIED",
                                  "pre_activation_boundary")
                 continue
-            if _capture_one(conn, client, obs, activation_ts, config):
-                captured_any = True
+            # F1: charge the FULL wall-clock of this capture — dup-check,
+            # claim, quote worker AND the DB finalization — to the cycle's
+            # cumulative latency budget, on EVERY path (return or
+            # exception), so a slow finalize can never hide from the
+            # pre-flight of the next capture.
+            capture_started = time.monotonic()
+            try:
+                if _capture_one(conn, client, obs, activation_ts, config):
+                    captured_any = True
+            finally:
+                _BUDGET.add_cycle_latency(
+                    int((time.monotonic() - capture_started) * 1000))
         return captured_any
     except Exception:
         try:
@@ -1110,13 +1120,11 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
 
     # 6f. Bounded quote fetch (F1): instrument lookup, limiter wait, retries
     #     and HTTP all happen inside the worker; this thread waits at most
-    #     config.max_capture_ms. The whole capture (dup-check, claim,
-    #     fetch) is then charged to the cycle's cumulative latency budget.
+    #     config.max_capture_ms. The FULL wall-clock of the capture —
+    #     including the DB finalization below — is charged to the cycle
+    #     budget by capture() when this function returns (every path).
     quote = _fetch_quote_phase(client, obs["symbol"],
                                timeout_s=config.max_capture_ms / 1000.0)
-    _BUDGET.add_cycle_latency(int(
-        (datetime.now(timezone.utc) - capture_started_at)
-        .total_seconds() * 1000))
 
     capture_finished_at = datetime.now(timezone.utc)
     api_request_ms = int(
@@ -1182,7 +1190,11 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
     payload["source_diagnostics"]["latency"] = {
         "quote_phase_ms": quote["waited_ms"],
         "worker_timed_out": bool(quote["timed_out"]),
-        "cycle_latency_ms": _BUDGET.cycle_latency_ms,
+        # Budget state including THIS capture through the quote phase; the
+        # cycle charge (capture()) additionally includes DB finalization.
+        "cycle_latency_ms": _BUDGET.cycle_latency_ms + int(
+            (datetime.now(timezone.utc) - capture_started_at)
+            .total_seconds() * 1000),
         "max_capture_ms": config.max_capture_ms,
         "max_cycle_latency_ms": config.max_cycle_latency_ms,
     }
