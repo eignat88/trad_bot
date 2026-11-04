@@ -20,6 +20,20 @@ from app.config import Settings, load_settings
 from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient, BybitRateLimitError
 from app.scanners.context_builder import build_market_context
+# --- SCANNER_AC7 Phase A: structured cycle-completion diagnostics ----------
+# Observability only: classify which symbols a cycle really processed, which
+# it failed on and which it SKIPPED because Bybit/limiter denied the request
+# (10006, BYBIT_API_SKIP, BREAKER_OPEN, deadline). No recovery, no extra API
+# request, no change to symbols_scanned semantics or to the DB vocabulary.
+from app.scanners.cycle_completion_v1 import (
+    CYCLE_COMPLETION_EVENT,
+    CYCLE_COMPLETION_SCANNER,
+    RUN_STATUS_FAILED,
+    CycleCompletionReport,
+    STAGE_MARKET_DATA,
+    STAGE_SCAN,
+    classify_symbol_failure,
+)
 from app.scanners.direction_gate import ScannerDirectionGatePolicy
 from app.scanners.expectancy_filter import ExpectancyFilter, load_expectancy
 from app.scanners.funnel_diagnostics import flush_and_persist_all
@@ -1058,9 +1072,23 @@ def run_scan_cycle(
     prospective_obs: ProspectiveOOSObserver | None = None,
     me_early_mae_v2_pipeline: Any = None,
     me_capture_spool: Any | None = None,
+    *,
+    report: CycleCompletionReport | None = None,
 ) -> tuple[int, int, int]:
-    """Returns (total_found, scanned, failed)."""
+    """Returns (total_found, scanned, failed).
+
+    Contract (SCANNER_AC7 Phase A, unchanged): the 3-tuple, the meaning of
+    ``scanned`` (symbols whose MarketContext was built) and every
+    ``save_run_stat`` / ``save_setup`` / ``save_error`` call stay exactly as
+    before. ``report`` is an OPTIONAL out-parameter: when given, it is filled
+    with the structured completion facts (expected / processed / failed /
+    skipped symbols and their reasons) for this cycle.
+    """
     settings = settings or _load_runner_settings()
+    # SCANNER_AC7 Phase A: one completion report per cycle. A caller may pass
+    # its own instance (main() logs and persists it afterwards).
+    report = report if report is not None else CycleCompletionReport()
+    report.expected_symbols = len(symbols)
     total_found = 0
     scanned = 0
     failed = 0
@@ -1148,15 +1176,33 @@ def run_scan_cycle(
             try:
                 ctx = future.result()
                 scanned += 1
-            except Exception:
+                report.record_processed(symbol)
+            except Exception as exc:
                 logger.exception("market data failed for %s", symbol)
                 failed += 1
-                repository.save_error(
-                    symbol=symbol, scanner_name="ALL",
-                    run_id=run_id,
-                    error_type="MARKET_DATA_ERROR",
-                    error_message=str(sys.exc_info()[1]),
-                )
+                # SCANNER_AC7 Phase A: a rate-limit SKIP (Bybit 10006,
+                # BYBIT_API_SKIP, BREAKER_OPEN, deadline) means the symbol
+                # received NO data at all and is recorded separately from an
+                # ordinary market-data failure. Behaviour of ``failed`` and of
+                # the 3-tuple return is unchanged; ``MARKET_DATA_ERROR`` below
+                # keeps its historical value for every non-limiter failure.
+                outcome = classify_symbol_failure(
+                    symbol, exc, stage=STAGE_MARKET_DATA)
+                report.record_outcome(outcome)
+                if outcome.rate_limit:
+                    repository.save_error(
+                        symbol=symbol, scanner_name="ALL",
+                        run_id=run_id,
+                        error_type="RATE_LIMIT_SKIP",
+                        error_message=str(exc),
+                    )
+                else:
+                    repository.save_error(
+                        symbol=symbol, scanner_name="ALL",
+                        run_id=run_id,
+                        error_type="MARKET_DATA_ERROR",
+                        error_message=str(exc),
+                    )
                 continue
 
             try:
@@ -1604,14 +1650,20 @@ def run_scan_cycle(
                         symbol, len(candidates), best.direction,
                         best.scanner_name, best.score,
                     )
-            except Exception:
+            except Exception as exc:
                 logger.exception("scan failed for %s", symbol)
                 failed += 1
+                # SCANNER_AC7 Phase A: the market context WAS built (the
+                # symbol stays in ``processed``/``symbols_scanned``), only
+                # the analysis failed — the historical SCAN_ERROR row is
+                # unchanged, the report additionally explains the cause.
+                report.record_outcome(
+                    classify_symbol_failure(symbol, exc, stage=STAGE_SCAN))
                 repository.save_error(
                     symbol=symbol, scanner_name="SCANNER",
                     run_id=run_id,
                     error_type="SCAN_ERROR",
-                    error_message=str(sys.exc_info()[1]),
+                    error_message=str(exc),
                 )
 
     for scanner_name, values in run_stats.items():
@@ -1627,7 +1679,64 @@ def run_scan_cycle(
             except Exception:
                 logger.debug("FVG lifecycle summary logging failed", exc_info=True)
 
+    # SCANNER_AC7 Phase A: persist one diagnostic row for every INCOMPLETE
+    # cycle (complete cycles keep their historical single SETUP_DETECTED
+    # stream — no new write, no new API call). dds.scanner_event.event_type
+    # has no CHECK constraint, so this needs NO migration. The flag stops
+    # main()'s abort path from writing a second row for the same cycle.
+    if not report.is_complete and not report.event_persisted:
+        try:
+            repository.save_event(
+                CYCLE_COMPLETION_EVENT, CYCLE_COMPLETION_SCANNER, "",
+                run_id=run_id,
+                payload=report.to_payload(),
+            )
+            report.event_persisted = True
+        except Exception:
+            # Diagnostics are observational: never let a reporting failure
+            # break the cycle it reports on.
+            logger.warning("CYCLE_COMPLETION event persist failed", exc_info=True)
+
     return total_found, scanned, failed
+
+
+def report_aborted_cycle(
+    repository: ScannerRepository,
+    report: CycleCompletionReport,
+    cycle: int,
+    run_id: int | None,
+) -> None:
+    """Diagnostics for a cycle that died inside ``main()`` (review P2).
+
+    Contract: this helper NEVER raises, NEVER touches
+    ``dds.scanner_run.status`` (the caller has already written ``FAILED``)
+    and can never mask the original cycle exception — every statement is
+    guarded individually. It only logs what the cycle had processed so far
+    and, when the cycle had started, persists one ``CYCLE_COMPLETION`` row
+    marked ``aborted`` with ``run_status=FAILED``.
+    """
+    if not (report.expected_symbols or report.processed or report.outcomes):
+        return
+    try:
+        logger.warning(
+            "cycle #%d aborted: %s", cycle,
+            report.log_summary(run_status=RUN_STATUS_FAILED),
+        )
+    except Exception:
+        logger.debug("aborted cycle summary failed", exc_info=True)
+    if report.event_persisted:
+        # run_scan_cycle already wrote this cycle's row — no duplicates.
+        return
+    try:
+        repository.save_event(
+            CYCLE_COMPLETION_EVENT, CYCLE_COMPLETION_SCANNER, "",
+            run_id=run_id,
+            payload=report.to_payload(
+                aborted=True, run_status=RUN_STATUS_FAILED),
+        )
+        report.event_persisted = True
+    except Exception:
+        logger.debug("aborted cycle event persist failed", exc_info=True)
 
 
 def main() -> None:
@@ -1808,6 +1917,11 @@ def main() -> None:
         # ------------------------------------------------------------------
         # Phase 3: Scan cycle — the actual instrument processing
         # ------------------------------------------------------------------
+        # SCANNER_AC7 Phase A: structured completion facts for THIS cycle
+        # (expected/processed/failed/skipped symbols + reasons + transport
+        # fact). Created OUTSIDE the try so the abort path below can always
+        # report what had been processed before the cycle died.
+        report = CycleCompletionReport()
         try:
             total, scanned, failed = run_scan_cycle(
                 client, orchestrator, repository, symbols, run_id, settings,
@@ -1815,6 +1929,7 @@ def main() -> None:
                 prospective_obs=prospective_obs,
                 me_early_mae_v2_pipeline=me_early_mae_v2_pipeline,
                 me_capture_spool=me_capture_spool,
+                report=report,
             )
 
             # -- SIGNAL_FUNNEL_DIAGNOSTICS_V1: flush counters to DB --
@@ -1842,16 +1957,36 @@ def main() -> None:
                 symbols_failed=failed,
                 setups_found=total,
                 error_count=failed,
-                status="COMPLETED" if failed == 0 else "PARTIAL",
+                # SCANNER_AC7 Phase A: the dds.scanner_run.status vocabulary is
+                # UNCHANGED (COMPLETED/PARTIAL/FAILED CHECK + every SQL mart);
+                # report.run_status reproduces the historical mapping
+                # byte-for-byte ("COMPLETED" if failed == 0 else "PARTIAL").
+                # The richer completion_status (COMPLETE/PARTIAL/FAILED) is
+                # logged below and persisted in the CYCLE_COMPLETION payload.
+                status=report.run_status,
             )
 
             t_run_finished = time.monotonic()
             logger.info(
-                "cycle #%d done: %d/%d symbols | %d setups | %d active signals | "
-                "scan=%.2fs total=%.2fs",
-                cycle, scanned, len(symbols), total, active_signals,
+                "cycle #%d done: %d/%d symbols | status=%s | "
+                "completion_status=%s | failed=%d skipped=%d | "
+                "rate_limit_response=%d limiter_pre_send_skip=%d | "
+                "%d setups | %d active signals | scan=%.2fs total=%.2fs",
+                cycle, scanned, len(symbols), report.run_status,
+                report.completion_status,
+                len(report.failed_symbols), len(report.skipped_symbols),
+                len(report.rate_limit_response_symbols),
+                len(report.limiter_pre_send_skip_symbols),
+                total, active_signals,
                 t_run_finished - t_run_started, elapsed,
             )
+            if not report.is_complete:
+                # Explicit, greppable evidence of an incomplete cycle: which
+                # symbols were dropped, why, and how long the limiter made us
+                # wait (SCANNER_AC7 AC2/AC3/AC4 — never a silent "done").
+                logger.warning(
+                    "cycle #%d incomplete: %s", cycle, report.log_summary(),
+                )
 
             # Refresh expectancy filter every 10 cycles
             if expectancy_filter is not None and cycle % 10 == 0:
@@ -1875,6 +2010,13 @@ def main() -> None:
                 except Exception:
                     logger.warning("could not record failed run status")
                     repository.reconnect()
+            # SCANNER_AC7 Phase A (review P2): diagnostics of the ABORTED
+            # cycle. The FAILED status above is written FIRST and the helper
+            # cannot change it; the original exception was already logged by
+            # logger.exception; and the helper itself never raises, so a
+            # diagnostic failure can neither mask the original error nor
+            # change how the Scanner finishes.
+            report_aborted_cycle(repository, report, cycle, run_id)
 
         # Sleep in small intervals to respond to shutdown
         delay = seconds_until_next_cycle(
