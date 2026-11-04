@@ -18,6 +18,15 @@ from typing import Any
 
 from app.exchange.bybit_client import BybitClient
 from app.models import Candle
+from app.research.candle_coverage_guard_v1 import (
+    SOURCE_INCOMPLETE_COVERAGE,
+    datetime_to_ms,
+    fetch_candles_for_evaluation,
+    fetch_status_stats_key,
+    record_coverage_block,
+    record_finalization_block,
+    validate_candle_coverage,
+)
 from app.research.constants import HORIZONS
 
 logger = logging.getLogger(__name__)
@@ -131,7 +140,21 @@ def _check_tp_sl(
 
 
 class ProspectiveOOSEvaluator:
-    """Multi-horizon evaluator for prospective OOS experiments."""
+    """Multi-horizon evaluator for prospective OOS experiments.
+
+    Fail-closed candle coverage (Issue #244)::
+
+        INCOMPLETE CANDLE COVERAGE
+            -> NO EVALUATION WRITE
+            -> NO FINALIZATION
+
+    Each horizon is written only after its exact ``[signal_time,
+    signal_time + horizon)`` 5-minute candle path is proven complete and
+    closed; ``is_final`` additionally requires a proven TP/SL window
+    (``frozen_max_hold``, 240m by default).  Blocked horizons stay pending
+    and are re-evaluated on a later cycle; previously confirmed results and
+    finalized rows are never rewritten.
+    """
 
     def __init__(self, conn: Any, client: BybitClient, repo: Any = None,
                  srr_policy_router: Any | None = None) -> None:
@@ -142,6 +165,9 @@ class ProspectiveOOSEvaluator:
         # SRR execution-R expansion experiment; all other experiments retain
         # the existing prospective evaluator path unchanged.
         self._srr_policy_router = srr_policy_router
+        # Classified outcome of the most recent candle fetch (structured
+        # diagnostics: SOURCE_FETCH_ERROR vs SOURCE_INCOMPLETE_COVERAGE).
+        self._last_fetch_result: Any = None
 
     # Maximum fallback horizon for TP/SL checking when no frozen_max_hold is set.
     _DEFAULT_MAX_HOLD_MINUTES = 240
@@ -200,15 +226,29 @@ class ProspectiveOOSEvaluator:
         return "ORDER_FIRST"
 
     def _get_candles(self, symbol: str, from_time: datetime, to_time: datetime) -> list[Candle]:
-        try:
-            start_ms = int((from_time - timedelta(minutes=5)).timestamp() * 1000)
-            end_ms = int(to_time.timestamp() * 1000)
-            needed = min((end_ms - start_ms) // 300_000 + 10, 1000)
-            candles = self.client.get_klines(symbol, "5", needed)
-            return [c for c in candles if start_ms <= c.timestamp <= end_ms]
-        except Exception:
-            logger.exception("prospective evaluator: failed to fetch candles for %s", symbol)
+        """Fetch 5m candles covering [from_time, to_time] — fail-closed.
+
+        Only a ``SOURCE_VALIDATED`` fetch yields candles: an API/limiter
+        error, a truncated pagination or an empty response yields ``[]``, so
+        a non-empty-but-incomplete window can never reach an evaluation
+        write.  Windows larger than one Bybit page (1000 candles) are read
+        through the bounded ``BybitClient.get_klines_range`` pagination
+        (same retry budget and shared limiter) instead of a silently
+        truncated latest-N response.  The classified status is kept on
+        ``self._last_fetch_result`` for the cycle's structured diagnostics.
+        """
+        result = fetch_candles_for_evaluation(
+            self.client, symbol, from_time, to_time,
+        )
+        self._last_fetch_result = result
+        if not result.ok:
+            logger.warning(
+                "prospective evaluator: candle source %s for %s (%s) — "
+                "evaluation deferred, no outcome write",
+                result.status, symbol, result.reason_code,
+            )
             return []
+        return list(result.candles)
 
     def evaluate_observation(
         self, obs: dict, all_candles: list[Candle], now: datetime, stats: dict,
@@ -245,6 +285,7 @@ class ProspectiveOOSEvaluator:
             risk_1r = entry_price * 0.01
 
         signal_ts = int(signal_time.timestamp() * 1000)
+        asof_ms = datetime_to_ms(now)
         post_candles = [c for c in all_candles if c.timestamp > signal_ts]
 
         # Extract frozen_max_hold from observation features.
@@ -261,6 +302,28 @@ class ProspectiveOOSEvaluator:
             if obs.get(eval_field) is not None:
                 continue
             if not _is_mature(signal_time, minutes, now):
+                continue
+
+            # Fail-closed (Issue #244): prove the exact candle path for this
+            # horizon BEFORE computing anything.  Maturity alone is never
+            # proof that the price path is complete.
+            horizon_cutoff_ms = int(
+                (signal_time + timedelta(minutes=minutes)).timestamp() * 1000
+            )
+            coverage = validate_candle_coverage(
+                all_candles,
+                signal_ms=signal_ts,
+                cutoff_ms=horizon_cutoff_ms,
+                asof_ms=asof_ms,
+                scope=f"HORIZON_{label}",
+            )
+            if not coverage.ok:
+                record_coverage_block(stats, coverage, horizon=label)
+                logger.warning(
+                    "prospective evaluation: observation %d horizon %s deferred "
+                    "(%s/%s) — no evaluated_* write",
+                    obs_id, label, coverage.status, coverage.reason_code,
+                )
                 continue
 
             mfe_pct, mae_pct = _calculate_mfe_mae(
@@ -296,13 +359,34 @@ class ProspectiveOOSEvaluator:
             for h, _ in HORIZONS
         )
         if all_done and not obs.get("is_final"):
-            tp_sl = _check_tp_sl(
-                post_candles, entry_price, stop_price, target_price,
-                frozen_max_hold, signal_time, is_short,
-                intrabar_policy=self._get_frozen_intrabar_policy(obs),
+            # Fail-closed (Issue #244): the TP/SL verdict is only trustworthy
+            # when the whole frozen hold window is proven closed.  Horizon
+            # maturity (or a previously stored evaluated_* mark) is not proof.
+            tpsl_cutoff_ms = int(
+                (signal_time + timedelta(minutes=frozen_max_hold)).timestamp() * 1000
             )
-            updates.update(tp_sl)
-            updates["is_final"] = True
+            coverage = validate_candle_coverage(
+                all_candles,
+                signal_ms=signal_ts,
+                cutoff_ms=tpsl_cutoff_ms,
+                asof_ms=asof_ms,
+                scope="TPSL_FROZEN_HOLD",
+            )
+            if not coverage.ok:
+                record_finalization_block(stats, coverage)
+                logger.warning(
+                    "prospective evaluation: observation %d finalization deferred "
+                    "(%s/%s) — is_final stays false",
+                    obs_id, coverage.status, coverage.reason_code,
+                )
+            else:
+                tp_sl = _check_tp_sl(
+                    post_candles, entry_price, stop_price, target_price,
+                    frozen_max_hold, signal_time, is_short,
+                    intrabar_policy=self._get_frozen_intrabar_policy(obs),
+                )
+                updates.update(tp_sl)
+                updates["is_final"] = True
 
         if not updates:
             return
@@ -469,6 +553,15 @@ class ProspectiveOOSEvaluator:
             "horizons_updated": {h: 0 for h, _ in HORIZONS},
             "finalized": 0,
             "errors": 0,
+            # Issue #244 structured diagnostics (in-memory only; no schema).
+            "source_blocked": {
+                "source_fetch_error": 0,
+                "source_incomplete": 0,
+                "source_not_yet_available": 0,
+            },
+            "coverage_blocked": {},
+            "horizons_pending": {h: 0 for h, _ in HORIZONS},
+            "finalization_blocked": 0,
         }
 
         by_symbol: dict[str, list] = {}
@@ -482,6 +575,17 @@ class ProspectiveOOSEvaluator:
             oldest = min(r[2] for r in rows)
             candles = self._get_candles(symbol, oldest, now)
             if not candles:
+                # Fail-closed: no candles without a SOURCE_VALIDATED fetch.
+                # The observations stay eligible (retry) and no outcome row
+                # is touched.
+                result = getattr(self, "_last_fetch_result", None)
+                if result is not None and not result.ok:
+                    status_key = fetch_status_stats_key(result.status)
+                else:
+                    status_key = fetch_status_stats_key(SOURCE_INCOMPLETE_COVERAGE)
+                stats["source_blocked"][status_key] = (
+                    stats["source_blocked"].get(status_key, 0) + len(rows)
+                )
                 stats["errors"] += len(rows)
                 continue
             for row in rows:
@@ -503,6 +607,16 @@ class ProspectiveOOSEvaluator:
                 except Exception:
                     stats["errors"] += 1
                     logger.exception("prospective evaluator: error for obs %d", row[0])
+
+        if stats["finalization_blocked"] or stats["coverage_blocked"] or any(
+            stats["source_blocked"].values()
+        ):
+            logger.warning(
+                "prospective evaluation [%s]: fail-closed deferrals — "
+                "source_blocked=%s coverage_blocked=%s finalization_blocked=%d",
+                experiment_id, stats["source_blocked"], stats["coverage_blocked"],
+                stats["finalization_blocked"],
+            )
 
         return stats
 

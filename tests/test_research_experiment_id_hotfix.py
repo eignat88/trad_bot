@@ -170,8 +170,20 @@ class TestEvaluatorUsesExperimentId:
             "is_final": False,
         }
 
-        # Mock candles — return empty to skip MFE/MAE calc
-        # but still trigger finalization attempt
+        # Fail-closed candle coverage (Issue #244): _evaluate_signal writes
+        # nothing without a proven candle path, so give it the complete,
+        # closed 5-minute path of the 240m window — otherwise the assertion
+        # below would pass vacuously with no upsert at all.
+        from app.models import Candle
+        signal_ms = int(signal_time.timestamp() * 1000)
+        tpsl_cutoff_ms = int((signal_time + timedelta(minutes=240)).timestamp() * 1000)
+        first_required_ms = (signal_ms // 300_000 + 1) * 300_000
+        candles = [
+            Candle(timestamp=ts, open=100.0, high=101.0, low=99.0,
+                   close=100.5, volume=1.0)
+            for ts in range(first_required_ms, tpsl_cutoff_ms, 300_000)
+        ]
+
         stats = {
             "horizons_updated": {"15m": 0, "30m": 0, "60m": 0, "120m": 0, "240m": 0},
             "outcomes_created": 0,
@@ -180,10 +192,11 @@ class TestEvaluatorUsesExperimentId:
             "errors": 0,
         }
 
-        evaluator._evaluate_signal(sig, [], now, stats)
+        evaluator._evaluate_signal(sig, candles, now, stats)
 
-        # If any upsert was called, verify experiment_id
-        if mock_repo.upsert_outcome.called:
-            call_kwargs = mock_repo.upsert_outcome.call_args[1]
-            assert call_kwargs.get("experiment_id") == "TPV2_GENERIC_V1", \
-                f"experiment_id should be TPV2_GENERIC_V1, got {call_kwargs.get('experiment_id')}"
+        # The upsert must happen (complete path proven) and carry the id.
+        assert mock_repo.upsert_outcome.called, (
+            "complete candle path must produce an outcome upsert")
+        call_kwargs = mock_repo.upsert_outcome.call_args[1]
+        assert call_kwargs.get("experiment_id") == "TPV2_GENERIC_V1", \
+            f"experiment_id should be TPV2_GENERIC_V1, got {call_kwargs.get('experiment_id')}"

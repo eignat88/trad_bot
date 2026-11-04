@@ -18,6 +18,28 @@ def _candle(offset_minutes: int, high: float, low: float, close: float, open_: f
     return Candle(timestamp=timestamp, open=open_ or high, high=high, low=low, close=close, volume=1.0)
 
 
+def _complete_path(high: float = 102.0, low: float = 101.0, close: float = 101.0,
+                   open_: float | None = None) -> list[Candle]:
+    """Complete, closed, grid-aligned 5-minute path for (FIX_TS, FIX_TS + 240m).
+
+    Issue #244 (fail-closed generic candle coverage): ``capture_evaluation``
+    re-runs the production evaluator, which now writes NOTHING unless every
+    required candle of the evaluated window is present, on the 5-minute grid
+    and closed.  FIX_TS is 13:04:55, so the required opens are exactly
+    13:05..17:00 (48 candles); the17:00 candle is still open at the
+    evaluator's ASOF time (17:04:55) and is therefore excluded from the
+    240m horizon — horizons15m..120m are fully covered.
+    """
+    first = datetime(2026, 10, 7, 13, 5, tzinfo=timezone.utc)
+    return [
+        Candle(
+            timestamp=int((first + timedelta(minutes=5 * i)).timestamp() * 1000),
+            open=open_ or high, high=high, low=low, close=close, volume=1.0,
+        )
+        for i in range(48)
+    ]
+
+
 def _observation(**overrides):
     row = {
         "experiment_id": analysis.B_EXPERIMENT,
@@ -118,7 +140,7 @@ def test_h1_h2_comparison_orientation():
 
 
 def test_synthetic_h1_matches_stored_and_h2_does_not():
-    candles = [_candle(30, 102.0, 101.0, 101.0)]
+    candles = _complete_path(high=102.0, low=101.0, close=101.0, open_=102.0)
     outcome = analysis.capture_evaluation(_observation(), candles).updates
     comparison = analysis.compare_historical_hypotheses(_observation(), outcome, candles)
     assert comparison["H1"]["exact"] is True
@@ -215,6 +237,6 @@ def test_ambiguous_candle_policy_is_authoritative():
 
 
 def test_capture_evaluation_preserves_corrected_parameter_mapping():
-    captured = analysis.capture_evaluation(_observation(), [_candle(5, 105.0, 95.0, 100.0)])
+    captured = analysis.capture_evaluation(_observation(), _complete_path())
     assert captured.updates["observation_id"] == 1
     assert captured.updates["experiment_id"] == analysis.B_EXPERIMENT
