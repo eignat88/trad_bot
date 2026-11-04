@@ -34,16 +34,20 @@ def table_body() -> str:
     return match.group(1)
 
 
-def test_migration_082_is_the_only_srr_short_fill_migration():
+def test_srr_short_fill_migrations_are_exactly_082_and_083():
     files = sorted(p.name for p in
                    (ROOT / "sql" / "migrations").glob("*srr_short_fill*"))
-    assert files == ["082_srr_short_fill_feasibility_v1.sql"]
+    assert files == ["082_srr_short_fill_feasibility_v1.sql",
+                     "083_srr_short_fill_coverage_v1.sql"]
 
 
 def test_migration_number_is_next_and_not_taken():
     numbers = sorted(int(p.name.split("_")[0]) for p in
                      (ROOT / "sql" / "migrations").glob("[0-9][0-9][0-9]_*.sql"))
-    assert numbers[-1] == 82  # 082 is the highest, never reuses an old number
+    # F3 hardening added 083 (coverage ledger); it is the highest number
+    # and appears exactly once — never reuses an old number either.
+    assert numbers[-1] == 83
+    assert numbers.count(83) == 1
     assert numbers.count(82) == 1
 
 
@@ -216,18 +220,19 @@ def test_capture_column_contracts_match_table():
     module_sql = MODULE.read_text(encoding="utf-8")
     body = table_body()
 
+    # Anchor BOTH parts on the claim INSERT itself: the module now also
+    # contains a coverage-ledger INSERT (F3) whose VALUES must not be
+    # mistaken for the evidence-table claim.
     claim = re.search(
         r"INSERT INTO research\.srr_short_fill_feasibility_v1\s*\((.*?)\)\s*"
-        r"VALUES",
+        r"VALUES\s*(\(.*?\))",
         module_sql, re.S)
     assert claim is not None
     claim_columns = [c.strip() for c in claim.group(1).split(",")]
     for column in claim_columns:
         assert re.search(rf"\b{re.escape(column)}\b", body), \
             f"claim column missing from table: {column}"
-    placeholders = re.search(r"VALUES (\(.*?\))", module_sql, re.S)
-    assert placeholders is not None
-    assert placeholders.group(1).count("%s") == len(claim_columns)
+    assert claim.group(2).count("%s") == len(claim_columns)
     assert "ON CONFLICT DO NOTHING" in module_sql  # atomic claim/reservation
 
     # Finalize contract: every column in _FINALIZE_COLUMNS exists and the
