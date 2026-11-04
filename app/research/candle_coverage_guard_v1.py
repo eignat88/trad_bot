@@ -24,8 +24,11 @@ evaluation path:
    UTC 5-minute grid** points inside the window (never the provider's own
    first timestamp), the first required candle is present, no gaps, no
    duplicate timestamps, no off-grid opens (a response shifted to
-   10:01/10:06/10:11 is rejected), all required candles closed at evaluation
-   time, and every OHLC value finite.
+   10:01/10:06/10:11 is rejected), the **used path is strictly ascending**
+   (every open after the signal, in array order — the evaluator formulas
+   read arrival order, so a shuffled array is rejected, never sorted
+   silently), all required candles closed at evaluation time, and every OHLC
+   value finite.
 
 Status naming is reused from the existing frozen SRR route
 (``app.research.srr_short_execution_r_expansion_prospective_evaluator``) so
@@ -207,6 +210,13 @@ def validate_candle_coverage(
     * any missing grid open is a gap (T3);
     * the grid open just below ``cutoff_ms`` must exist (T4);
     * duplicates, off-anchor candles and invalid OHLC reject the window;
+    * the **used path** — every candle after ``signal_ms`` in array order —
+      must be strictly ascending.  The evaluator formulas consume candles in
+      arrival order (``return_at_horizon`` and the TP/SL first-hit sequence
+      both stop at the first candle ``>= cutoff``), so a shuffled array is
+      rejected with ``CANDLE_ORDER_INVALID`` and is never sorted silently
+      (review P2-3); candles before the signal are filtered out by the
+      formulas and are therefore not part of the used path;
     * every price must be a finite number: NaN / +Infinity / -Infinity (or a
       missing field) in ``open``/``close`` — and in ``high``/``low`` — is
       ``INVALID_OHLC`` (review P2-2); such values must never reach
@@ -279,6 +289,34 @@ def validate_candle_coverage(
                 **base,
                 "duplicate_open_time_ms": duplicates[:10],
                 "duplicate_count": len(duplicates),
+            },
+        )
+
+    # P2-3: the evaluator formulas consume candles in ARRIVAL order —
+    # return_at_horizon and the TP/SL first-hit sequence both stop at the
+    # first candle >= cutoff — so the USED path (every candle after the
+    # signal, exactly what those loops iterate) must be strictly ascending.
+    # Never sorted silently: an unordered source fails closed instead of
+    # silently producing a wrong return tail or a wrong TP/SL verdict.
+    prev_ts: int | None = None
+    order_violations: list[int] = []
+    for candle in candles or ():
+        ts = _candle_ts(candle)
+        if ts is None or ts <= signal_ms:
+            # Pre-signal candles are filtered out by every formula and are
+            # not part of the used path.
+            continue
+        if prev_ts is not None and ts <= prev_ts:
+            order_violations.append(ts)
+        prev_ts = ts
+    if order_violations:
+        return CandleCoverageResult(
+            SOURCE_INCOMPLETE_COVERAGE,
+            "CANDLE_ORDER_INVALID",
+            {
+                **base,
+                "order_violation_open_time_ms": order_violations[:10],
+                "order_violation_count": len(order_violations),
             },
         )
 

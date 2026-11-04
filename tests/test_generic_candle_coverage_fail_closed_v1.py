@@ -479,11 +479,16 @@ class FakeBybitClient:
     forming bar, like the real client).  ``get_klines_range`` honours the
     explicit [start_ms, end_ms] bounds and the bounded page budget — it
     RAISES rather than silently truncating.
+
+    ``sort=False`` keeps the candles exactly in arrival order, modelling a
+    source that returns an unordered array (P2-3).
     """
 
     def __init__(self, candles, *, now: datetime | None = None,
-                 error: Exception | None = None, range_slice: int = 0) -> None:
-        self.candles = sorted(candles, key=lambda c: c.timestamp)
+                 error: Exception | None = None, range_slice: int = 0,
+                 sort: bool = True) -> None:
+        self.candles = (sorted(candles, key=lambda c: c.timestamp)
+                        if sort else list(candles))
         self.now = now
         self.error = error
         self.range_slice = range_slice
@@ -1388,3 +1393,174 @@ def test_stats_recording_helpers_are_schema_free():
     assert stats["coverage_blocked"]["CANDLE_GAP"] == 2
     assert stats["horizons_pending"]["60m"] == 1
     assert stats["finalization_blocked"] == 1
+
+
+# ══════════════════════════════════════════════════════════════════
+# Review P2-3 — strictly ascending arrival order (no silent sorting)
+# ══════════════════════════════════════════════════════════════════
+
+
+def swap_candles(candles: list[Candle], offset_a: int, offset_b: int,
+                 *, signal: datetime = SIGNAL) -> list[Candle]:
+    """Return the path with the two candles at the given offsets swapped.
+
+    All timestamps stay present — only their arrival order changes — so an
+    ordering violation is the ONLY reason a rejection may report.
+    """
+    a = ms(signal) + offset_a * 60_000
+    b = ms(signal) + offset_b * 60_000
+    out = list(candles)
+    ia = next(i for i, c in enumerate(out) if c.timestamp == a)
+    ib = next(i for i, c in enumerate(out) if c.timestamp == b)
+    out[ia], out[ib] = out[ib], out[ia]
+    return out
+
+
+def tp_sl_path(signal: datetime = SIGNAL, *, shuffle: bool = False) -> list[Candle]:
+    """Complete path with a TP candle at +30m and an SL candle at +45m.
+
+    Chronologically the TP (low 97.0 <= target 97.5) comes BEFORE the SL
+    (high 103.0 >= stop 102.5).  With ``shuffle=True`` the SL candle is
+    placed before the TP candle in the array, so arrival order and
+    chronological order disagree — exactly the case where a silent sort (or
+    none) would flip the frozen TP/SL verdict.
+    """
+    out: list[Candle] = []
+    for c in full_path(signal, 240):
+        if c.timestamp == ms(signal) + 30 * 60_000:
+            out.append(candle(c.timestamp, low=97.0))    # TP: low <= 97.5
+        elif c.timestamp == ms(signal) + 45 * 60_000:
+            out.append(candle(c.timestamp, high=103.0))  # SL: high >= 102.5
+        else:
+            out.append(c)
+    if shuffle:
+        return swap_candles(out, 30, 45, signal=signal)
+    return out
+
+
+@pytest.mark.parametrize("harness", HARNESSES, ids=lambda h: h.name)
+def test_p2_3_shuffled_complete_path_is_rejected(harness):
+    # Every candle present, on-grid and closed — only ARRIVAL order is wrong.
+    candles = swap_candles(full_path(SIGNAL, 240), 60, 65)
+
+    result = harness.evaluate(candles, NOW_FULL)
+
+    assert result.writes == [], "an unordered path must not be evaluated"
+    assert result.stats["coverage_blocked"].get("CANDLE_ORDER_INVALID")
+    assert result.finalized() is False
+    for label, _ in HORIZONS:
+        assert not result.evaluated(label), f"{label} must stay pending"
+
+
+@pytest.mark.parametrize("harness", HARNESSES, ids=lambda h: h.name)
+def test_p2_3_tp_sl_arrival_order_violation_writes_no_verdict(harness):
+    # TP is chronologically first but the SL candle precedes it in the
+    # array: arrival order must never decide the verdict — no write at all.
+    candles = tp_sl_path(SIGNAL, shuffle=True)
+
+    result = harness.evaluate(candles, NOW_FULL)
+
+    assert result.writes == [], "arrival order must not decide TP/SL"
+    assert result.stats["coverage_blocked"].get("CANDLE_ORDER_INVALID")
+    for label, _ in HORIZONS:
+        assert not result.evaluated(label)
+    assert not any("tp_hit" in w for w in result.writes)
+    assert not any("sl_hit" in w for w in result.writes)
+    assert result.finalized() is False
+
+
+@pytest.mark.parametrize("harness", HARNESSES, ids=lambda h: h.name)
+def test_p2_3_ascending_tp_sl_path_keeps_frozen_policy(harness):
+    # The identical candles in correct chronological order: the frozen
+    # TP/SL policy still produces its normal verdict (TP first at 30m).
+    candles = tp_sl_path(SIGNAL, shuffle=False)
+
+    result = harness.evaluate(candles, NOW_FULL)
+
+    assert result.write is not None
+    assert result.write["tp_hit"] is True
+    assert result.write["sl_hit"] is True
+    assert result.write["time_to_tp"] == pytest.approx(30.0)
+    assert result.write["time_to_sl"] == pytest.approx(45.0)
+    assert result.write["tp_before_sl"] is True
+    assert result.write["sl_before_tp"] is False
+    assert result.stats["coverage_blocked"] == {}
+    assert result.finalized() is True
+
+
+@pytest.mark.parametrize("harness", HARNESSES, ids=lambda h: h.name)
+def test_p2_3_ascending_path_result_unchanged(harness):
+    # A genuine ascending path must evaluate exactly as before the order
+    # check existed: full reference parity and no coverage block recorded.
+    candles = full_path(SIGNAL, 240)
+
+    result = harness.evaluate(candles, NOW_FULL)
+
+    assert result.write is not None
+    assert result.stats["coverage_blocked"] == {}
+    for label, _minutes in HORIZONS:
+        ref_mfe, ref_mae = harness.reference_mfe(candles, _minutes)
+        assert result.write[f"mfe_{label}"] == pytest.approx(EXP_MFE)
+        assert result.write[f"mae_{label}"] == pytest.approx(EXP_MAE)
+        assert result.write[f"mfe_{label}"] == pytest.approx(ref_mfe)
+        assert result.write[f"mae_{label}"] == pytest.approx(ref_mae)
+        assert result.write[f"return_at_{label}"] == pytest.approx(EXP_RETURN)
+    assert result.write.get("tp_hit") is False
+    assert result.finalized() is True
+
+
+def test_p2_3_guard_detects_order_violation_outside_window():
+    # The 15m window path itself is complete and ordered, but a later
+    # candle precedes it in the array: the formulas iterate arrival order
+    # and would break early on that candle — the guard must still reject.
+    signal_ms = ms(SIGNAL)
+    candles = [
+        candle(signal_ms + 60 * 60_000),
+        candle(signal_ms + 5 * 60_000),
+        candle(signal_ms + 10 * 60_000),
+    ]
+
+    result = guard.validate_candle_coverage(
+        candles,
+        signal_ms=signal_ms,
+        cutoff_ms=signal_ms + 15 * 60_000,
+        asof_ms=ms(SIGNAL + timedelta(minutes=20)),
+    )
+
+    assert result.status == guard.SOURCE_INCOMPLETE_COVERAGE
+    assert result.reason_code == "CANDLE_ORDER_INVALID"
+    assert result.diagnostics["order_violation_count"] >= 1
+
+
+def test_p2_3_guard_scope_is_the_used_path():
+    # Candles before the signal are filtered out by every formula, so their
+    # position must not block an otherwise valid window.
+    signal_ms = ms(SIGNAL)
+    candles = full_path(SIGNAL, 60) + [candle(signal_ms - 5 * 60_000)]
+
+    result = guard.validate_candle_coverage(
+        candles,
+        signal_ms=signal_ms,
+        cutoff_ms=signal_ms + 60 * 60_000,
+        asof_ms=ms(SIGNAL + timedelta(minutes=65)),
+    )
+
+    assert result.ok, result.reason_code
+
+
+@pytest.mark.parametrize("cycle_cls", CYCLE_HARNESSES,
+                         ids=lambda c: c.__name__)
+def test_p2_3_cycle_rejects_unordered_source(cycle_cls):
+    signal_time = cycle_signal_time()
+    cycle = cycle_cls(signal_time)
+    candles = swap_candles(full_path(signal_time, 240), 60, 65,
+                           signal=signal_time)
+
+    # sort=False: the fake source hands over the shuffled array verbatim.
+    result = cycle.run(FakeBybitClient(candles, sort=False))
+
+    assert result.writes == []
+    assert result.stats["coverage_blocked"].get("CANDLE_ORDER_INVALID")
+    assert result.stats["finalized"] == 0
+    assert result.stats["errors"] == 0, "coverage block is not a fetch error"
+    assert cycle.eligible_count == 1, "signal must stay retry-eligible"
