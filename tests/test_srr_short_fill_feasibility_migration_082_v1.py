@@ -179,7 +179,8 @@ def test_timings_and_quality_columns_exist():
     body = table_body()
     for column in ("signal_time", "captured_at", "capture_started_at",
                    "capture_finished_at", "book_time_ms", "book_age_ms",
-                   "signal_to_capture_ms", "api_request_ms",
+                   "signal_to_capture_ms", "signal_to_quote_ms",
+                   "api_request_ms",
                    "bid", "ask", "spread_bps", "reference_to_bid_bps",
                    "depth_bid_10bps_usdt", "requested_notional_usdt",
                    "requested_qty", "executable_qty", "min_order_qty",
@@ -195,6 +196,20 @@ def test_timings_and_quality_columns_exist():
                    "execution_r", "variant_stop", "variant_target"):
         assert re.search(rf"\b{column}\b", body), f"missing column {column}"
     assert "CHECK (capture_finished_at >= capture_started_at)" in body
+
+
+def test_full_quote_latency_is_enforced_by_db_checks():
+    """P1 contract: eligibility requires the FULL signal->quote latency."""
+    body = table_body()
+    assert re.search(r"\bsignal_to_quote_ms\s+bigint\b", body)
+    # full latency always contains the capture-start delay
+    assert re.search(
+        r"CHECK \(signal_to_quote_ms IS NULL\s+OR\s+"
+        r"signal_to_quote_ms >= signal_to_capture_ms\)", body)
+    # a row without its full latency can never be eligible
+    assert re.search(
+        r"CHECK \(eligible_for_execution_stats = false\s+OR\s+"
+        r"signal_to_quote_ms IS NOT NULL\)", body)
 
 
 def test_capture_column_contracts_match_table():

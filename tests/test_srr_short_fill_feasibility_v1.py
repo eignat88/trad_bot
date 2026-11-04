@@ -10,6 +10,7 @@ PostgreSQL, and no real trading orders are possible anywhere in this module
 (read-only public market endpoints only).
 """
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -101,6 +102,9 @@ class FakeCursor:
                 self.conn.duplicate_observation_ids
             self._rows = [(1,)] if exists else []
         elif up.startswith("INSERT INTO RESEARCH.SRR_SHORT_FILL_FEASIBILITY_V1"):
+            # artificial DB claim latency: sits inside the signal->quote
+            # window (before the Bybit request) like a real slow commit
+            time.sleep(self.conn.claim_sleep_s)
             self.rowcount = 0 if self.conn.claim_conflict else 1
         elif up.startswith("UPDATE RESEARCH.SRR_SHORT_FILL_FEASIBILITY_V1"):
             if self.conn.finalize_error is not None:
@@ -121,7 +125,8 @@ class FakeConnection:
     def __init__(self, activation_row=_DEFAULT,
                  observations=None, duplicate_exists=False,
                  duplicate_observation_ids=(), claim_conflict=False,
-                 finalize_rowcount=1, finalize_error=None):
+                 finalize_rowcount=1, finalize_error=None,
+                 claim_sleep_s=0.0):
         if activation_row is _DEFAULT:  # resolved per test, not at import
             activation_row = ("RUNNING", ACTIVATION)
         self.activation_row = activation_row
@@ -133,6 +138,7 @@ class FakeConnection:
         self.claim_conflict = claim_conflict
         self.finalize_rowcount = finalize_rowcount
         self.finalize_error = finalize_error
+        self.claim_sleep_s = claim_sleep_s
         self.finalize_params = None
         self.statements = []
         self.commits = 0
@@ -164,20 +170,30 @@ class FakeConnection:
 
 
 class FakeClient:
-    """Orderbook + instruments-info replay; optionally raise on orderbook."""
+    """Orderbook + instruments-info replay; optionally raise on orderbook.
 
-    def __init__(self, book=None, instruments=None, book_error=None):
+    ``book_delay_s`` / ``instruments_delay_s`` inject artificial latency
+    (limiter wait + HTTP round trip) into each leg of the quote path so
+    tests can drive the FULL signal->quote delay window.
+    """
+
+    def __init__(self, book=None, instruments=None, book_error=None,
+                 book_delay_s=0.0, instruments_delay_s=0.0):
         self.book = book
         self.instruments = instruments
         self.book_error = book_error
+        self.book_delay_s = book_delay_s
+        self.instruments_delay_s = instruments_delay_s
         self.calls = []
 
     def _public_get(self, endpoint, **params):
         self.calls.append((endpoint, params))
         if endpoint.endswith("/orderbook"):
+            time.sleep(self.book_delay_s)
             if self.book_error is not None:
                 raise self.book_error
             return self.book or {}
+        time.sleep(self.instruments_delay_s)
         return self.instruments if self.instruments is not None else \
             {"result": {"list": []}}
 
@@ -735,7 +751,95 @@ def test_signal_to_quote_delay_is_measured_independently(monkeypatch):
     row = finalize_row(db)
     assert row["book_age_ms"] is not None and row["book_age_ms"] < 10000
     assert row["signal_to_capture_ms"] >= 600000
+    assert row["signal_to_quote_ms"] >= 600000
+    assert row["signal_to_quote_ms"] >= row["signal_to_capture_ms"]
     assert row["quote_quality_status"] == "DELAYED"
+    assert row["eligible_for_execution_stats"] is False
+
+
+# ── P1: FULL signal->quote latency gates eligibility ─────────────────────
+# The delay window runs from signal_time to the instant the orderbook HTTP
+# response arrives, so it MUST contain the DB claim commit, the instrument
+# lookup, the limiter wait and the request itself. A quote arriving outside
+# SRR_SHORT_FILL_MAX_QUOTE_DELAY_MS is DELAYED -> never eligible, even when
+# the capture started promptly.
+
+
+def test_late_quote_from_slow_http_is_never_eligible(monkeypatch):
+    monkeypatch.setenv("SRR_SHORT_FILL_MAX_QUOTE_DELAY_MS", "150")
+    signal = datetime.now(timezone.utc)  # prompt signal: start delay ~0 ms
+    db = FakeConnection(observations={1: obs_row(signal_time=signal)})
+    client = good_client(book_delay_s=0.30)  # limiter wait + HTTP: 300 ms
+    assert mod.capture(db, client,
+                       **capture_kwargs(signal_time=signal)) is True
+    row = finalize_row(db)
+    # The capture STARTED within the limit ...
+    assert row["signal_to_capture_ms"] <= 150
+    # ... but the quote arrived far outside it.
+    assert row["signal_to_quote_ms"] >= 300
+    assert row["signal_to_quote_ms"] >= row["signal_to_capture_ms"]
+    assert row["quote_quality_status"] == "DELAYED"
+    assert row["feasibility_status"] == "OK"  # book itself is perfect
+    assert row["eligible_for_execution_stats"] is False
+    # Transaction independence inside the delay window: the statement
+    # sequence brackets the API wait (claim INSERT -> 300 ms of Bybit only
+    # -> finalize UPDATE); commits = claim-then-finalize, i.e. exactly the
+    # two-phase contract with no DB activity during the quote latency.
+    heads = [s[0].lstrip().split()[0].upper() for s in db.statements]
+    assert heads == ["SELECT", "SELECT", "SELECT", "INSERT", "UPDATE"]
+    assert db.commits == 2  # claim (before API) + finalize (after quote)
+
+
+def test_instrument_lookup_latency_counts_toward_quote_delay(monkeypatch):
+    monkeypatch.setenv("SRR_SHORT_FILL_MAX_QUOTE_DELAY_MS", "150")
+    signal = datetime.now(timezone.utc)
+    db = FakeConnection(observations={1: obs_row(signal_time=signal)})
+    client = good_client(instruments_delay_s=0.12, book_delay_s=0.12)
+    assert mod.capture(db, client,
+                       **capture_kwargs(signal_time=signal)) is True
+    row = finalize_row(db)
+    assert row["signal_to_capture_ms"] <= 150      # prompt start
+    assert row["signal_to_quote_ms"] >= 240        # both legs counted
+    assert row["quote_quality_status"] == "DELAYED"
+    assert row["eligible_for_execution_stats"] is False
+
+
+def test_db_claim_latency_counts_toward_quote_delay(monkeypatch):
+    monkeypatch.setenv("SRR_SHORT_FILL_MAX_QUOTE_DELAY_MS", "150")
+    signal = datetime.now(timezone.utc)
+    db = FakeConnection(observations={1: obs_row(signal_time=signal)},
+                        claim_sleep_s=0.20)
+    client = good_client()
+    assert mod.capture(db, client,
+                       **capture_kwargs(signal_time=signal)) is True
+    row = finalize_row(db)
+    assert row["signal_to_capture_ms"] <= 150      # start before the claim
+    assert row["signal_to_quote_ms"] >= 200        # claim inside the window
+    assert row["quote_quality_status"] == "DELAYED"
+    assert row["eligible_for_execution_stats"] is False
+
+
+def test_fresh_quote_records_full_signal_to_quote_delay():
+    db = FakeConnection()
+    client = good_client()
+    assert mod.capture(db, client, **capture_kwargs()) is True
+    row = finalize_row(db)
+    assert row["quote_quality_status"] == "FRESH"
+    assert row["feasibility_status"] == "OK"
+    assert row["eligible_for_execution_stats"] is True
+    # SIGNAL is ~1 s old (fixture); the full latency contains the
+    # capture-start delay and never shrinks below it.
+    assert row["signal_to_capture_ms"] >= 900
+    assert row["signal_to_quote_ms"] >= row["signal_to_capture_ms"] >= 900
+
+
+def test_error_path_has_no_signal_to_quote():
+    db = FakeConnection()
+    client = good_client(book_error=RuntimeError("boom"))
+    assert mod.capture(db, client, **capture_kwargs()) is True
+    row = finalize_row(db)
+    assert row["signal_to_quote_ms"] is None  # no quote was received
+    assert row["quote_quality_status"] == "NO_QUOTE"
     assert row["eligible_for_execution_stats"] is False
 
 
@@ -768,6 +872,8 @@ def test_timings_and_capture_timestamps_are_stored():
     assert row["book_time_ms"] is not None
     assert row["book_age_ms"] is not None
     assert row["signal_to_capture_ms"] >= 0
+    assert isinstance(row["signal_to_quote_ms"], int)
+    assert row["signal_to_quote_ms"] >= row["signal_to_capture_ms"]
 
 
 # ── eligibility: depth / constraints ─────────────────────────────────────

@@ -698,6 +698,7 @@ _FINALIZE_COLUMNS = (
     "book_time_ms",
     "book_age_ms",
     "signal_to_capture_ms",
+    "signal_to_quote_ms",
     "api_request_ms",
     "bid",
     "ask",
@@ -921,6 +922,11 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
     book: dict = {}
     book_error: BaseException | None = None
     constraints, constraints_error = None, None
+    # Sampled the instant the HTTP response carrying the relevant book
+    # arrives: AFTER the DB claim commit, the instrument lookup, the
+    # limiter wait and the request itself. Everything between signal_time
+    # and this stamp is the quote's real latency.
+    quote_received_at: datetime | None = None
     now_ms = int(time.time() * 1000)
     try:
         constraints, constraints_error = instrument_constraints(client,
@@ -928,6 +934,7 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
         book = client._public_get(
             ORDERBOOK_ENDPOINT, category="linear", symbol=obs["symbol"],
             limit=50)
+        quote_received_at = datetime.now(timezone.utc)
         now_ms = int(time.time() * 1000)
         snapshot = calculate_snapshot(
             obs["reference_price"], obs["structural_r"], book,
@@ -940,18 +947,26 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
     capture_finished_at = datetime.now(timezone.utc)
     api_request_ms = int(
         (capture_finished_at - capture_started_at).total_seconds() * 1000)
+    # P1: full signal->quote latency (claim + instrument lookup + limiter
+    # wait + HTTP); None only when no book reached us at all. This is the
+    # value that gates FRESH/DELAYED - a late quote is never eligible.
+    signal_to_quote_ms = (
+        int((quote_received_at - obs["signal_time"]).total_seconds() * 1000)
+        if quote_received_at is not None else None)
     if snapshot is None:
         reason = (f"orderbook:{type(book_error).__name__}"
                   if book_error is not None else "orderbook:UNKNOWN")
         payload = _error_payload(
-            obs, capture_finished_at, signal_to_capture_ms, api_request_ms,
-            reason, constraints, constraints_error, config)
+            obs, capture_finished_at, signal_to_capture_ms,
+            signal_to_quote_ms, api_request_ms, reason, constraints,
+            constraints_error, config)
         status = "ERROR"
         quality = "NO_QUOTE"
     else:
         payload = _snapshot_payload(
             obs, snapshot, capture_finished_at, signal_to_capture_ms,
-            api_request_ms, config, constraints, constraints_error, book)
+            signal_to_quote_ms, api_request_ms, config, constraints,
+            constraints_error, book)
         status = snapshot["status"]
         quality = payload["quote_quality_status"]
 
@@ -972,9 +987,9 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
         LOG.info(
             "SRR fill capture stored with non-eligible status: symbol=%s "
             "observation_id=%s feasibility=%s quote_quality=%s "
-            "signal_to_capture_ms=%d",
+            "signal_to_capture_ms=%d signal_to_quote_ms=%s",
             obs["symbol"], obs["observation_id"], status, quality,
-            signal_to_capture_ms)
+            signal_to_capture_ms, signal_to_quote_ms)
     return True
 
 
@@ -1004,9 +1019,17 @@ def _common_diagnostics(obs, config, constraints_known) -> dict:
     }
 
 
-def _quote_quality(snapshot: dict, signal_to_capture_ms: int,
+def _quote_quality(snapshot: dict, signal_to_quote_ms: int | None,
                    config: RuntimeConfig) -> str:
-    """Classify quote quality; book failures outrank the delay verdict."""
+    """Classify quote quality; book failures outrank the delay verdict.
+
+    ``signal_to_quote_ms`` is the FULL latency from the SRR signal to the
+    actual orderbook receipt (DB claim commit + instrument lookup + limiter
+    wait + HTTP round trip), not merely the capture start. A quote that
+    arrives outside ``SRR_SHORT_FILL_MAX_QUOTE_DELAY_MS`` is DELAYED even
+    when the capture started promptly, and DELAYED is never eligible for
+    execution statistics. A missing latency stamp fails closed to DELAYED.
+    """
     status = snapshot.get("status")
     if status in ("INVALID_BOOK",):
         return "INVALID_BOOK"
@@ -1014,13 +1037,14 @@ def _quote_quality(snapshot: dict, signal_to_capture_ms: int,
         return "STALE_BOOK"
     if status == "FUTURE_BOOK":
         return "FUTURE_BOOK"
-    if signal_to_capture_ms > config.quote_delay_limit_ms:
+    if (signal_to_quote_ms is None
+            or not 0 <= signal_to_quote_ms <= config.quote_delay_limit_ms):
         return "DELAYED"
     return "FRESH"
 
 
 def _error_payload(obs, capture_finished_at, signal_to_capture_ms,
-                   api_request_ms, reason, constraints,
+                   signal_to_quote_ms, api_request_ms, reason, constraints,
                    constraints_error, config) -> dict:
     constraints_block = {
         "known": constraints is not None,
@@ -1037,6 +1061,7 @@ def _error_payload(obs, capture_finished_at, signal_to_capture_ms,
         "book_time_ms": None,
         "book_age_ms": None,
         "signal_to_capture_ms": signal_to_capture_ms,
+        "signal_to_quote_ms": signal_to_quote_ms,
         "api_request_ms": api_request_ms,
         "bid": None, "ask": None, "spread_bps": None,
         "reference_to_bid_bps": None, "depth_bid_10bps_usdt": None,
@@ -1059,9 +1084,10 @@ def _error_payload(obs, capture_finished_at, signal_to_capture_ms,
 
 
 def _snapshot_payload(obs, snapshot, capture_finished_at,
-                      signal_to_capture_ms, api_request_ms, config,
+                      signal_to_capture_ms, signal_to_quote_ms,
+                      api_request_ms, config,
                       constraints, constraints_error, book) -> dict:
-    quality = _quote_quality(snapshot, signal_to_capture_ms, config)
+    quality = _quote_quality(snapshot, signal_to_quote_ms, config)
     constraints_block = snapshot.get("constraints") or {
         "known": constraints is not None,
         "min_order_qty": (constraints or {}).get("min_order_qty"),
@@ -1084,7 +1110,8 @@ def _snapshot_payload(obs, snapshot, capture_finished_at,
                           "orderbook_calls": 1}
     diagnostics["delay_verdict"] = (
         "WITHIN_LIMIT"
-        if signal_to_capture_ms <= config.quote_delay_limit_ms
+        if (signal_to_quote_ms is not None
+            and signal_to_quote_ms <= config.quote_delay_limit_ms)
         else "EXCEEDED_LIMIT")
     diagnostics["constraints_lookup_error"] = constraints_error
     return {
@@ -1093,6 +1120,7 @@ def _snapshot_payload(obs, snapshot, capture_finished_at,
         "book_time_ms": snapshot.get("book_time_ms"),
         "book_age_ms": snapshot.get("book_age_ms"),
         "signal_to_capture_ms": signal_to_capture_ms,
+        "signal_to_quote_ms": signal_to_quote_ms,
         "api_request_ms": api_request_ms,
         "bid": snapshot.get("bid"),
         "ask": snapshot.get("ask"),

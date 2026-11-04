@@ -204,6 +204,7 @@ CREATE TABLE IF NOT EXISTS research.srr_short_fill_feasibility_v1 (
   book_time_ms bigint,
   book_age_ms bigint,
   signal_to_capture_ms bigint,
+  signal_to_quote_ms bigint,
   api_request_ms bigint,
   bid numeric, ask numeric,
   spread_bps numeric,
@@ -240,6 +241,13 @@ CREATE TABLE IF NOT EXISTS research.srr_short_fill_feasibility_v1 (
   claimed_at timestamptz NOT NULL DEFAULT NOW(),
   CHECK (signal_time > activation_ts),
   CHECK (capture_finished_at >= capture_started_at),
+  -- Full signal->quote latency (DB claim + instrument lookup + limiter
+  -- wait + HTTP) always contains the capture-start delay; a row without
+  -- its full latency can never enter execution statistics.
+  CHECK (signal_to_quote_ms IS NULL
+      OR signal_to_quote_ms >= signal_to_capture_ms),
+  CHECK (eligible_for_execution_stats = false
+      OR signal_to_quote_ms IS NOT NULL),
   -- Only a genuinely fresh, valid, depth-feasible snapshot may enter
   -- eligible execution statistics. Constraints-known is enforced by the
   -- runtime (constraints are not a column-level fact of the book itself)
@@ -256,6 +264,8 @@ COMMENT ON COLUMN research.srr_short_fill_feasibility_v1.observation_id
   IS 'Exactly one SRR SHORT prospective observation id (research.prospective_observation); unique per research run';
 COMMENT ON COLUMN research.srr_short_fill_feasibility_v1.signal_to_capture_ms
   IS 'Delay from signal generation to the START of the quote request; independent of book_age_ms';
+COMMENT ON COLUMN research.srr_short_fill_feasibility_v1.signal_to_quote_ms
+  IS 'FULL delay from signal generation to actual orderbook receipt (includes DB claim, instrument lookup, limiter wait and HTTP); NULL when no quote was received; gates FRESH vs DELAYED';
 COMMENT ON COLUMN research.srr_short_fill_feasibility_v1.book_age_ms
   IS 'Exchange orderbook timestamp age at capture time; freshness of the book, NOT of the signal-time alignment';
 COMMENT ON COLUMN research.srr_short_fill_feasibility_v1.observed_cost_r

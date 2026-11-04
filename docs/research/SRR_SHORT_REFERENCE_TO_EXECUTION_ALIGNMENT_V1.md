@@ -202,7 +202,10 @@ Columns (grouped):
   `signal_time`, `activation_ts`, `reference_price`, `invalidation_price`,
   `structural_r`, `execution_r`, `variant_stop`, `variant_target`.
 * **Timing:** `captured_at`, `capture_started_at`, `capture_finished_at`,
-  `book_time_ms`, `book_age_ms`, `signal_to_capture_ms`, `api_request_ms`.
+  `book_time_ms`, `book_age_ms`, `signal_to_capture_ms`,
+  `signal_to_quote_ms` (full signal→orderbook-receipt latency: DB claim +
+  instrument lookup + limiter wait + HTTP — the value that gates
+  `FRESH`/`DELAYED`), `api_request_ms`.
 * **Quote:** `bid`, `ask`, `spread_bps`, `reference_to_bid_bps`,
   `depth_bid_10bps_usdt`.
 * **Scenarios:** `requested_notional_usdt`, `requested_qty`, `executable_qty`,
@@ -266,12 +269,12 @@ extra_r  = cost_r − 0.0021 × reference / execution_R  # vs frozen NORMAL
 
 | Value | Meaning |
 |---|---|
-| `FRESH` | `signal_to_capture_ms ≤ SRR_SHORT_FILL_MAX_QUOTE_DELAY_MS` and the book itself is valid |
-| `DELAYED` | quote valid but the signal→request delay budget was exceeded |
+| `FRESH` | `signal_to_quote_ms ≤ SRR_SHORT_FILL_MAX_QUOTE_DELAY_MS` — the **full** latency from the SRR signal to the orderbook receipt (DB claim commit + instrument lookup + limiter wait + HTTP) — and the book itself is valid |
+| `DELAYED` | quote valid but the full signal→quote latency budget was exceeded; a late quote is never eligible, even when the capture started promptly |
 | `STALE_BOOK` | book older than 10 s at capture |
 | `FUTURE_BOOK` | book timestamp more than 1 s in the future |
 | `INVALID_BOOK` | missing/crossed/zero bid or ask |
-| `NO_QUOTE` | the request failed entirely |
+| `NO_QUOTE` | the request failed entirely (`signal_to_quote_ms IS NULL`) |
 
 `feasibility_status` (base scenario = SMALL 100 USDT, mirrors onto the row):
 `PENDING`, `OK`, `INSUFFICIENT_DEPTH`, `STALE_BOOK`, `FUTURE_BOOK`,
@@ -283,11 +286,14 @@ extra_r  = cost_r − 0.0021 × reference / execution_R  # vs frozen NORMAL
 * `feasibility_status = 'OK'`,
 * exchange constraints **known** (`constraints.known = true`).
 
-A fresh book alone never proves signal-time alignment: `book_age_ms` and
-`signal_to_capture_ms` are recorded separately, and `DELAYED` rows are stored
-but excluded from execution statistics. Unknown instrument constraints are
-never "confirmed executable"; insufficient depth never gets an artificial
-price (`estimated_fill = NULL`).
+A fresh book alone never proves signal-time alignment: `book_age_ms`,
+`signal_to_capture_ms` (capture start) and `signal_to_quote_ms` (full
+latency to receipt) are recorded separately, and only the full latency
+gates `FRESH` — so a quote that waited out the claim, the instrument
+lookup, the limiter or the HTTP round trip beyond the budget is stored as
+`DELAYED` and excluded from execution statistics. Unknown instrument
+constraints are never "confirmed executable"; insufficient depth never
+gets an artificial price (`estimated_fill = NULL`).
 
 Per-scenario detail (SMALL/MEDIUM/LARGE) lives in `scenario_results`; the
 row-level verdict reflects the SMALL scenario.
@@ -316,17 +322,23 @@ row-level verdict reflects the SMALL scenario.
 
 **Scanner latency estimate:** a successful capture costs 1 orderbook GET +
 (at most) 1 instruments GET ≈ 1 round-trip each (orderbook ≈ 100–300 ms
-typical), synchronous in the cycle. Worst case is bounded by the shared
-client deadline (60 s) only during persistent transport failure, and the
-per-cycle budget caps how often that can happen (default ≤ 5, hard ≤ 20 per
-cycle). Every capture stores `api_request_ms`, so the real latency
-distribution is measured from the first activated row onward. If the
-measured `api_request_ms` + `signal_to_capture_ms` profile shows the
-synchronous capture pushing cycle latency beyond the scanner interval or
-systematically delaying quotes past the delay budget, the sanctioned
-alternative is a bounded dedicated worker with the SAME reservation-first
-contract; it may not be introduced with a delayed quote substituted for a
-missing signal-time snapshot.
+typical), synchronous in the cycle. Worst case **per logical GET** is
+bounded by the shared client deadline (`bybit_retry_deadline_s`, default
+60 s + bounded backoff); a capture makes up to 2 GETs (instruments on
+cache miss + orderbook), so under persistent transport failure one cycle
+can add ≈ `budget × ~125 s` (default 5 ≈ 10 min, hard cap 20 ≈ 40 min).
+A cumulative per-cycle latency break (abort the cycle's remaining captures
+once their wall-time budget is spent) is a documented **pre-activation**
+requirement (review finding F1), not implemented in this PR. Every capture
+stores `api_request_ms`, `signal_to_capture_ms` and
+`signal_to_quote_ms`, so the real latency distribution — including the DB
+claim, instrument lookup, limiter wait and HTTP — is measured from the
+first activated row onward. If the measured `api_request_ms` +
+`signal_to_quote_ms` profile shows the synchronous capture pushing cycle
+latency beyond the scanner interval or systematically delaying quotes past
+the delay budget, the sanctioned alternative is a bounded dedicated worker
+with the SAME reservation-first contract; it may not be introduced with a
+delayed quote substituted for a missing signal-time snapshot.
 
 ---
 
@@ -524,17 +536,20 @@ Stopping is always safe: no trading object depends on this contour.
 
 ## 16. Test evidence
 
-* `tests/test_srr_short_fill_feasibility_v1.py` — 76 offline tests: flag off,
+* `tests/test_srr_short_fill_feasibility_v1.py` — 81 offline tests: flag off,
   missing/mismatched activation, pre-activation boundary, wrong
   experiment/direction/scanner/symbol/geometry, multiple observation ids,
   duplicate event, concurrent claim, scanner restart, PostgreSQL failure,
   finalize failure, Bybit failure / rate-limit / timeout, empty / stale /
-  future / crossed book, future signal_time, delayed quote, insufficient
-  depth, unknown constraints, quantity rounding, min notional, no partial
-  fill, `execution_R` normalization, no double counting, budget limits,
-  wrapper routing/isolation/ordering, no order-submission surface.
-* `tests/test_srr_short_fill_feasibility_migration_082_v1.py` — 14 static
+  future / crossed book, future signal_time, delayed quote by capture start
+  AND by full signal→quote latency (artificial delays on the DB claim, the
+  instrument lookup and the HTTP leg — a late quote is never eligible),
+  insufficient depth, unknown constraints, quantity rounding, min notional,
+  no partial fill, `execution_R` normalization, no double counting, budget
+  limits, wrapper routing/isolation/ordering, no order-submission surface.
+* `tests/test_srr_short_fill_feasibility_migration_082_v1.py` — 15 static
   contract tests for migration 082 (DISABLED seed, immutability triggers,
-  append-only evidence, status enums, column contracts, no trading object).
+  append-only evidence, status enums, column contracts incl.
+  `signal_to_quote_ms` and its full-latency CHECKs, no trading object).
 * All tests use mock Bybit clients and fake connections — no network, no
   PostgreSQL, no real orders.
