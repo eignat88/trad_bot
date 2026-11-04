@@ -645,6 +645,35 @@ def _observe_prospective_with_fill(client, prospective_obs, **kwargs):
             )
         except Exception:
             logger.exception("ME fill feasibility capture error; scanner unaffected")
+    # Issue #259 — SRR_SHORT_REFERENCE_TO_EXECUTION_ALIGNMENT_V1:
+    # independent, observe-only, fail-closed capture of the signal-time
+    # Bybit book for NEW SRR SHORT prospective observations. It runs strictly
+    # AFTER ``observe()`` committed its own transaction (never inside it),
+    # reuses the observer's dedicated connection only for its own short
+    # research transactions, is DISABLED by default (feature flag + DB
+    # activation record both required) and cannot route, block or delay any
+    # order: every error is swallowed here exactly like the ME capture above.
+    if (
+        ids
+        and os.environ.get("SRR_SHORT_FILL_CAPTURE_ENABLED") == "1"
+        and kwargs.get("scanner_name") == "SUPPORT_RESISTANCE_REACTION"
+        and kwargs.get("direction") == "SHORT"
+    ):
+        try:
+            import app.research.srr_short_fill_feasibility_v1 as srr_fill_mod
+            srr_fill_mod.capture(
+                getattr(prospective_obs, "_conn", None), client,
+                scanner_name=kwargs["scanner_name"],
+                direction=kwargs["direction"],
+                symbol=kwargs["symbol"],
+                signal_time=kwargs["signal_time"],
+                reference_price=kwargs["reference_price"],
+                invalidation_price=kwargs["invalidation_price"],
+                observation_ids=ids,
+            )
+        except Exception:
+            logger.exception(
+                "SRR SHORT fill capture error; scanner unaffected")
     return ids
 
 
@@ -1085,6 +1114,14 @@ def run_scan_cycle(
     skipped symbols and their reasons) for this cycle.
     """
     settings = settings or _load_runner_settings()
+    # Issue #259 (research-only): reset the per-cycle API budget of the
+    # SRR SHORT fill capture. In-memory counter only — no DB, no network,
+    # no activation state, never raises into the cycle.
+    try:
+        from app.research.srr_short_fill_feasibility_v1 import begin_capture_cycle
+        begin_capture_cycle()
+    except Exception:
+        logger.debug("SRR fill capture budget reset failed", exc_info=True)
     # SCANNER_AC7 Phase A: one completion report per cycle. A caller may pass
     # its own instance (main() logs and persists it afterwards).
     report = report if report is not None else CycleCompletionReport()
