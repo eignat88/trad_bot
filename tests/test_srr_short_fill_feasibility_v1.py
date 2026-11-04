@@ -55,6 +55,8 @@ def _env(monkeypatch):
     monkeypatch.delenv("SRR_SHORT_FILL_EXPECTED_ACTIVATION_TS", raising=False)
     monkeypatch.delenv("SRR_SHORT_FILL_MAX_PER_CYCLE", raising=False)
     monkeypatch.delenv("SRR_SHORT_FILL_MAX_PER_RUN", raising=False)
+    monkeypatch.delenv("SRR_SHORT_FILL_MAX_CYCLE_LATENCY_MS", raising=False)
+    monkeypatch.delenv("SRR_SHORT_FILL_MAX_CAPTURE_MS", raising=False)
     mod.reset_stats()
     mod.reset_budget()
     mod.clear_static_identity_cache()
@@ -101,6 +103,12 @@ class FakeCursor:
             exists = self.conn.duplicate_exists or params[1] in \
                 self.conn.duplicate_observation_ids
             self._rows = [(1,)] if exists else []
+        elif up.startswith("INSERT INTO RESEARCH.SRR_SHORT_FILL_COVERAGE_V1"):
+            # F3 coverage ledger: one row per non-capturing attempt.
+            if self.conn.coverage_error is not None:
+                raise self.conn.coverage_error
+            self.conn.coverage_rows.append(params)
+            self.rowcount = 1
         elif up.startswith("INSERT INTO RESEARCH.SRR_SHORT_FILL_FEASIBILITY_V1"):
             # artificial DB claim latency: sits inside the signal->quote
             # window (before the Bybit request) like a real slow commit
@@ -126,7 +134,7 @@ class FakeConnection:
                  observations=None, duplicate_exists=False,
                  duplicate_observation_ids=(), claim_conflict=False,
                  finalize_rowcount=1, finalize_error=None,
-                 claim_sleep_s=0.0):
+                 claim_sleep_s=0.0, coverage_error=None):
         if activation_row is _DEFAULT:  # resolved per test, not at import
             activation_row = ("RUNNING", ACTIVATION)
         self.activation_row = activation_row
@@ -139,10 +147,12 @@ class FakeConnection:
         self.finalize_rowcount = finalize_rowcount
         self.finalize_error = finalize_error
         self.claim_sleep_s = claim_sleep_s
+        self.coverage_error = coverage_error
         self.finalize_params = None
         self.statements = []
         self.commits = 0
         self.rollbacks = 0
+        self.coverage_rows = []
 
     def cursor(self):
         return FakeCursor(self)
@@ -157,6 +167,18 @@ class FakeConnection:
     def inserts(self):
         return [s for s in self.statements
                 if s[0].lstrip().upper().startswith("INSERT")]
+
+    @property
+    def claim_inserts(self):
+        """Claim INSERTs into the evidence table only."""
+        return [s for s in self.inserts
+                if "SRR_SHORT_FILL_FEASIBILITY_V1" in s[0].upper()]
+
+    @property
+    def coverage_inserts(self):
+        """F3 coverage-ledger INSERTs only."""
+        return [s for s in self.inserts
+                if "SRR_SHORT_FILL_COVERAGE_V1" in s[0].upper()]
 
     @property
     def updates(self):
@@ -301,8 +323,13 @@ def test_missing_quote_delay_config_fails_closed(monkeypatch):
     monkeypatch.delenv("SRR_SHORT_FILL_MAX_QUOTE_DELAY_MS", raising=False)
     db, client = FakeConnection(), good_client()
     assert mod.capture(db, client, **capture_kwargs()) is False
-    assert db.statements == []
+    # F3: the resolved source event is recorded as a policy denial —
+    # never silently lost from the coverage denominator.
     assert client.calls == []
+    assert len(db.statements) == 2      # resolve SELECT + coverage INSERT
+    assert len(db.claim_inserts) == 0
+    assert len(db.coverage_inserts) == 1
+    assert db.coverage_rows[0][4] == "POLICY_DENIED"
     assert mod.stats()["config_denied"] == 1
 
 
@@ -311,7 +338,9 @@ def test_invalid_quote_delay_config_fails_closed(monkeypatch, value):
     monkeypatch.setenv("SRR_SHORT_FILL_MAX_QUOTE_DELAY_MS", value)
     db, client = FakeConnection(), good_client()
     assert mod.capture(db, client, **capture_kwargs()) is False
-    assert db.statements == []
+    assert len(db.claim_inserts) == 0
+    assert len(db.coverage_inserts) == 1
+    assert db.coverage_rows[0][4] == "POLICY_DENIED"
     assert mod.stats()["config_denied"] == 1
 
 
@@ -320,7 +349,9 @@ def test_invalid_api_budget_config_fails_closed(monkeypatch, value):
     monkeypatch.setenv("SRR_SHORT_FILL_MAX_PER_CYCLE", value)
     db, client = FakeConnection(), good_client()
     assert mod.capture(db, client, **capture_kwargs()) is False
-    assert db.statements == []
+    assert len(db.claim_inserts) == 0
+    assert len(db.coverage_inserts) == 1
+    assert db.coverage_rows[0][4] == "POLICY_DENIED"
     assert mod.stats()["config_denied"] == 1
 
 
@@ -329,7 +360,10 @@ def test_expected_activation_ts_must_match_db(monkeypatch):
                        (ACTIVATION + timedelta(hours=1)).isoformat())
     db, client = FakeConnection(), good_client()
     assert mod.capture(db, client, **capture_kwargs()) is False
-    assert db.inserts == []
+    assert db.claim_inserts == []
+    assert len(db.coverage_inserts) == 1
+    assert db.coverage_rows[0][4] == "POLICY_DENIED"
+    assert db.coverage_rows[0][5] == "activation_ts_mismatch"
     assert client.calls == []
     assert mod.stats()["config_denied"] == 1
 
@@ -339,13 +373,16 @@ def test_expected_activation_ts_must_match_db(monkeypatch):
         ACTIVATION.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
     db2, client2 = FakeConnection(), good_client()
     assert mod.capture(db2, client2, **capture_kwargs()) is True
+    assert db2.coverage_rows == []     # accepted: no coverage row needed
 
 
 def test_malformed_expected_activation_ts_fails_closed(monkeypatch):
     monkeypatch.setenv("SRR_SHORT_FILL_EXPECTED_ACTIVATION_TS", "not-a-date")
     db, client = FakeConnection(), good_client()
     assert mod.capture(db, client, **capture_kwargs()) is False
-    assert db.inserts == []
+    assert db.claim_inserts == []
+    assert len(db.coverage_inserts) == 1
+    assert db.coverage_rows[0][4] == "POLICY_DENIED"
     assert mod.stats()["config_denied"] == 1
 
 
@@ -363,7 +400,11 @@ def test_activation_gates_fail_closed(activation_row):
     db = FakeConnection(activation_row=activation_row)
     client = good_client()
     assert mod.capture(db, client, **capture_kwargs()) is False
-    assert db.inserts == []
+    assert db.claim_inserts == []
+    # F3: the policy rejection is persisted, not silent.
+    assert len(db.coverage_inserts) == 1
+    assert db.coverage_rows[0][4] == "POLICY_DENIED"
+    assert db.coverage_rows[0][5] == "activation"
     assert client.calls == []  # no market data requested when gate is closed
     assert mod.stats()["activation_denied"] == 1
 
@@ -380,7 +421,8 @@ def test_activation_record_is_read_only_for_runtime():
 
 
 def test_strict_signal_time_boundary(monkeypatch):
-    # Exactly at the boundary and before it: refused, no reservation.
+    # Exactly at the boundary and before it: refused, no reservation —
+    # but the policy rejection IS recorded in the coverage ledger (F3).
     for index, signal in enumerate(
             (ACTIVATION, ACTIVATION - timedelta(microseconds=1),
              ACTIVATION - timedelta(days=1))):
@@ -388,7 +430,10 @@ def test_strict_signal_time_boundary(monkeypatch):
         client = good_client()
         assert mod.capture(db, client,
                            **capture_kwargs(signal_time=signal)) is False
-        assert db.inserts == []
+        assert db.claim_inserts == []
+        assert len(db.coverage_inserts) == 1
+        assert db.coverage_rows[0][4] == "POLICY_DENIED"
+        assert db.coverage_rows[0][5] == "pre_activation_boundary"
         assert client.calls == []
         assert mod.stats()["pre_activation_denied"] == index + 1
 
@@ -399,7 +444,8 @@ def test_strict_signal_time_boundary(monkeypatch):
     client = good_client()
     assert mod.capture(db, client,
                        **capture_kwargs(signal_time=after)) is True
-    assert len(db.inserts) == 1
+    assert len(db.claim_inserts) == 1
+    assert db.coverage_rows == []
 
 
 def test_activation_read_failure_rolls_back():
@@ -519,7 +565,10 @@ def test_duplicate_event_skips_before_any_api_call():
     db = FakeConnection(duplicate_exists=True)
     client = good_client()
     assert mod.capture(db, client, **capture_kwargs()) is False
-    assert db.inserts == []
+    assert db.claim_inserts == []
+    # F3: the replay is accounted as a DUPLICATE disposition.
+    assert len(db.coverage_inserts) == 1
+    assert db.coverage_rows[0][4] == "DUPLICATE"
     assert client.calls == []  # dedup happens before budget and market data
     assert mod.stats()["duplicate_skipped"] == 1
 
@@ -529,7 +578,9 @@ def test_concurrent_duplicate_claim_makes_no_second_api_call():
     db = FakeConnection(claim_conflict=True)
     client = good_client()
     assert mod.capture(db, client, **capture_kwargs()) is False
-    assert len(db.inserts) == 1
+    assert len(db.claim_inserts) == 1      # the lost claim attempt itself
+    assert len(db.coverage_inserts) == 1   # F3: CLAIM_RACE_LOST recorded
+    assert db.coverage_rows[0][4] == "CLAIM_RACE_LOST"
     assert client.calls == []  # reservation lost -> no Bybit request
     assert mod.stats()["duplicate_skipped"] == 1
 
@@ -537,14 +588,16 @@ def test_concurrent_duplicate_claim_makes_no_second_api_call():
 def test_scanner_restart_replay_is_idempotent():
     first = FakeConnection()
     assert mod.capture(first, good_client(), **capture_kwargs()) is True
-    key = first.inserts[0][1][0]
+    key = first.claim_inserts[0][1][0]
 
     # "Restart": fresh counters/budget, same deterministic identity.
     mod.reset_budget()
     second = FakeConnection(duplicate_exists=True)
     assert mod.capture(second, good_client(), **capture_kwargs()) is False
-    assert second.inserts == []
-    assert second.commits == 0
+    assert second.claim_inserts == []
+    # The replay attempt still commits exactly once: the coverage row.
+    assert len(second.coverage_inserts) == 1
+    assert second.commits == 1
 
     # Deterministic event_key for identical identity inputs.
     obs = {"observation_id": 1, "symbol": "BTCUSDT", "signal_time": SIGNAL,
@@ -588,7 +641,11 @@ def test_cycle_api_budget_is_enforced_and_reset(monkeypatch):
     assert mod.capture(db, client,
                        **capture_kwargs(observation_ids=[2],
                                         signal_time=signal_b)) is False
-    assert len(db.inserts) == 1
+    assert len(db.claim_inserts) == 1
+    # F3: the budget refusal is persisted, not silent.
+    assert len(db.coverage_inserts) == 1
+    assert db.coverage_rows[0][4] == "API_BUDGET_DENIED"
+    assert db.coverage_rows[0][5] == "API_BUDGET_CYCLE_EXHAUSTED"
     assert len(client.orderbook_calls) == 1
     assert mod.stats()["budget_denied"] == 1
 
@@ -596,7 +653,7 @@ def test_cycle_api_budget_is_enforced_and_reset(monkeypatch):
     mod.begin_capture_cycle()
     assert mod.capture(db, client, **capture_kwargs(
         observation_ids=[2], signal_time=signal_b)) is True
-    assert len(db.inserts) == 2
+    assert len(db.claim_inserts) == 2
     assert len(client.orderbook_calls) == 2
 
 
@@ -614,7 +671,10 @@ def test_run_api_budget_bounds_the_whole_process(monkeypatch):
     mod.begin_capture_cycle()  # cycle reset must NOT reset the run counter
     assert mod.capture(db, client, **capture_kwargs(
         observation_ids=[2], signal_time=signal_b)) is False
-    assert len(db.inserts) == 1
+    assert len(db.claim_inserts) == 1
+    assert len(db.coverage_inserts) == 1   # F3: run-budget denial recorded
+    assert db.coverage_rows[0][4] == "API_BUDGET_DENIED"
+    assert db.coverage_rows[0][5] == "API_BUDGET_RUN_EXHAUSTED"
     assert mod.stats()["budget_denied"] == 1
 
 
@@ -1183,3 +1243,162 @@ def test_capture_never_raises(monkeypatch):
     db.cursor = MagicMock(side_effect=MemoryError("simulated"))
     result = mod.capture(db, good_client(), **capture_kwargs())
     assert result is False
+
+
+# ── F1: cumulative per-cycle latency protection ─────────────────────────
+
+
+def test_cycle_latency_budget_denies_before_claim_and_api(monkeypatch):
+    monkeypatch.setenv("SRR_SHORT_FILL_MAX_CYCLE_LATENCY_MS", "1000")
+    monkeypatch.setenv("SRR_SHORT_FILL_MAX_CAPTURE_MS", "800")
+    signal_b = SIGNAL + timedelta(seconds=1)
+    observations = {
+        1: obs_row(signal_time=SIGNAL),
+        2: obs_row(obs_id=2, signal_time=signal_b),
+    }
+    db = FakeConnection(observations=observations)
+    client = good_client(book_delay_s=0.35)  # burns ~350ms of the window
+
+    # First capture: the 0.35s quote wait fits the 800ms per-capture
+    # window ... and is charged to the 1000ms cycle budget.
+    assert mod.capture(db, client, **capture_kwargs(
+        observation_ids=[1])) is True
+    # Second capture: <800ms remain -> fail-closed BEFORE the claim,
+    # BEFORE the API budget and BEFORE any Bybit request.
+    assert mod.capture(db, client, **capture_kwargs(
+        observation_ids=[2], signal_time=signal_b)) is False
+    assert len(db.claim_inserts) == 1        # second event never reserved
+    assert len(client.orderbook_calls) == 1  # and never reached Bybit
+    assert len(db.coverage_inserts) == 1     # F3 disposition recorded
+    assert db.coverage_rows[0][4] == "LATENCY_BUDGET_DENIED"
+    assert db.coverage_rows[0][5].startswith("remaining_ms=")
+    assert mod.stats()["latency_denied"] == 1
+    assert mod.stats()["budget_denied"] == 0  # refusal precedes the budget
+
+    # The window resets with the next scanner cycle (run_scan_cycle hook).
+    mod.begin_capture_cycle()
+    assert mod.capture(db, client, **capture_kwargs(
+        observation_ids=[2], signal_time=signal_b)) is True
+    assert len(db.claim_inserts) == 2
+    assert len(client.orderbook_calls) == 2
+
+
+def test_capture_latency_config_must_fit_the_cycle_window(monkeypatch):
+    # A per-capture window larger than the cycle window would make every
+    # capture impossible -> config error (fail-closed), never silent gaps.
+    monkeypatch.setenv("SRR_SHORT_FILL_MAX_CYCLE_LATENCY_MS", "500")
+    monkeypatch.setenv("SRR_SHORT_FILL_MAX_CAPTURE_MS", "1000")
+    db, client = FakeConnection(), good_client()
+    assert mod.capture(db, client, **capture_kwargs()) is False
+    assert client.calls == []
+    assert len(db.claim_inserts) == 0
+    assert len(db.coverage_inserts) == 1
+    assert db.coverage_rows[0][4] == "POLICY_DENIED"
+    assert db.coverage_rows[0][5] == "config"
+    assert mod.stats()["config_denied"] == 1
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "abc"])
+def test_non_positive_latency_config_fails_closed(monkeypatch, value):
+    monkeypatch.setenv("SRR_SHORT_FILL_MAX_CYCLE_LATENCY_MS", value)
+    db, client = FakeConnection(), good_client()
+    assert mod.capture(db, client, **capture_kwargs()) is False
+    assert client.calls == []
+    assert len(db.claim_inserts) == 0
+    assert mod.stats()["config_denied"] == 1
+
+
+def test_worker_timeout_bounds_scanner_wait_and_fails_closed(monkeypatch):
+    monkeypatch.setenv("SRR_SHORT_FILL_MAX_CYCLE_LATENCY_MS", "5000")
+    monkeypatch.setenv("SRR_SHORT_FILL_MAX_CAPTURE_MS", "300")
+    # Unique symbol: the orphaned worker may still finish (and populate
+    # the instrument cache) after this test; it must never collide.
+    db = FakeConnection(observations={1: obs_row(symbol="SLOWUSDT")})
+    client = good_client(book_delay_s=1.0)  # 10x slower than the 300ms cap
+    kwargs = capture_kwargs(symbol="SLOWUSDT")
+
+    started = time.monotonic()
+    assert mod.capture(db, client, **kwargs) is True
+    waited_s = time.monotonic() - started
+    # The scanner thread is bounded by the join timeout, NOT by book_delay.
+    assert waited_s < 0.9
+
+    row = finalize_row(db)
+    assert row["feasibility_status"] == "ERROR"
+    assert row["failure_reason"] == "latency:TIMEOUT"
+    assert row["quote_quality_status"] == "NO_QUOTE"
+    assert row["eligible_for_execution_stats"] is False
+    assert row["signal_to_quote_ms"] is None  # a late quote is no evidence
+    diagnostics = json_field(row, "source_diagnostics")
+    assert diagnostics["latency"]["worker_timed_out"] is True
+    assert diagnostics["latency"]["quote_phase_ms"] >= 300
+    assert diagnostics["latency"]["cycle_latency_ms"] >= 300
+    assert mod.stats()["captured"] == 1
+    assert mod.stats()["latency_denied"] == 0
+
+
+def test_successful_capture_records_latency_diagnostics():
+    db = FakeConnection()
+    client = good_client()
+    assert mod.capture(db, client, **capture_kwargs()) is True
+    latency = json_field(finalize_row(db), "source_diagnostics")["latency"]
+    assert latency["worker_timed_out"] is False
+    assert latency["quote_phase_ms"] >= 0
+    assert latency["max_capture_ms"] == mod.DEFAULT_MAX_CAPTURE_MS
+    assert latency["max_cycle_latency_ms"] == mod.DEFAULT_MAX_CYCLE_LATENCY_MS
+    assert 0 <= latency["cycle_latency_ms"] < mod.DEFAULT_MAX_CYCLE_LATENCY_MS
+
+
+# ── F3: persistent coverage accounting ──────────────────────────────────
+
+
+def test_coverage_rows_carry_frozen_source_identity():
+    db = FakeConnection(activation_row=("COMPLETED", ACTIVATION))
+    client = good_client()
+    assert mod.capture(db, client, **capture_kwargs()) is False
+    assert len(db.coverage_rows) == 1
+    (obs_id, experiment_id, symbol, signal_time,
+     disposition, reason) = db.coverage_rows[0]
+    assert obs_id == 1
+    assert experiment_id == mod.EXPERIMENT_ID
+    assert symbol == "BTCUSDT"
+    assert signal_time == SIGNAL
+    assert disposition == "POLICY_DENIED"
+    assert reason == "activation"
+
+
+def test_coverage_write_failure_never_breaks_capture():
+    db = FakeConnection(activation_row=("DISABLED", None),
+                        coverage_error=RuntimeError("coverage down"))
+    client = good_client()
+    assert mod.capture(db, client, **capture_kwargs()) is False
+    assert mod.stats()["activation_denied"] == 1
+    assert mod.stats()["coverage_write_failed"] == 1
+    assert client.calls == []  # capture decision unchanged by audit failure
+
+
+def test_unresolved_ids_get_no_coverage_row():
+    # An id that is not a frozen SRR SHORT source event is not part of the
+    # coverage denominator either — no row, no inflation, no ghost data.
+    observations = {1: obs_row(experiment_id="OTHER_EXPERIMENT_V1")}
+    db = FakeConnection(observations=observations)
+    client = good_client()
+    assert mod.capture(db, client,
+                       **capture_kwargs(observation_ids=[1])) is False
+    assert db.coverage_rows == []
+    assert db.claim_inserts == []
+    assert mod.stats()["identity_denied"] == 1
+
+
+def test_coverage_dispositions_are_first_write_wins():
+    # A denied attempt writes a disposition; a later replay that still
+    # finds no evidence must not create a second row (PK conflict).
+    db = FakeConnection(activation_row=("DISABLED", None))
+    assert mod.capture(db, good_client(), **capture_kwargs()) is False
+    assert len(db.coverage_rows) == 1
+
+    # Simulate the DB-level ON CONFLICT DO NOTHING for the same id.
+    sql, params = db.coverage_inserts[0]
+    assert "ON CONFLICT (observation_id) DO NOTHING" in sql
+    assert params[0] == 1
+    assert params[4] in mod.COVERAGE_DISPOSITIONS

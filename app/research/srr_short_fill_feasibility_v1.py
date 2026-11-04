@@ -71,6 +71,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -109,11 +110,18 @@ EXPECTED_ACTIVATION_ENV = "SRR_SHORT_FILL_EXPECTED_ACTIVATION_TS"  # optional
 QUOTE_DELAY_LIMIT_ENV = "SRR_SHORT_FILL_MAX_QUOTE_DELAY_MS"        # required
 MAX_PER_CYCLE_ENV = "SRR_SHORT_FILL_MAX_PER_CYCLE"
 MAX_PER_RUN_ENV = "SRR_SHORT_FILL_MAX_PER_RUN"
+# F1: cumulative wall-clock protection for the synchronous scanner cycle.
+CYCLE_LATENCY_ENV = "SRR_SHORT_FILL_MAX_CYCLE_LATENCY_MS"
+CAPTURE_LATENCY_ENV = "SRR_SHORT_FILL_MAX_CAPTURE_MS"
 
 DEFAULT_MAX_PER_CYCLE = 5
 DEFAULT_MAX_PER_RUN = 200
 HARD_MAX_PER_CYCLE = 20      # configuration can never exceed these caps
 HARD_MAX_PER_RUN = 2000
+DEFAULT_MAX_CYCLE_LATENCY_MS = 5000   # per scanner cycle, all captures
+DEFAULT_MAX_CAPTURE_MS = 2000         # per single capture (worker join bound)
+HARD_MAX_CYCLE_LATENCY_MS = 60000
+HARD_MAX_CAPTURE_MS = 60000
 
 # Exchange instrument constraints are static enough to cache per symbol.
 _INSTRUMENT_CACHE_TTL_S = 3600.0
@@ -146,11 +154,13 @@ _STATS: dict[str, int] = {
     "pre_activation_denied": 0,
     "duplicate_skipped": 0,
     "budget_denied": 0,
+    "latency_denied": 0,
     "timing_denied": 0,
     "claimed": 0,
     "captured": 0,
     "capture_errors": 0,
     "finalize_failed": 0,
+    "coverage_write_failed": 0,
 }
 
 
@@ -169,29 +179,50 @@ def reset_stats() -> None:
 
 
 class _Budget:
-    """Process-local API budget for additional Bybit orderbook calls."""
+    """Process-local API + latency budget (single-threaded by contract:
+    capture runs exclusively from the main scan loop, so plain ``+=`` is
+    safe and no lock is taken).
+
+    ``cycle_latency_ms`` is the F1 cumulative wall-clock protection: every
+    completed capture adds its measured elapsed time; a new capture is
+    refused while less than one full ``max_capture_ms`` window remains.
+    """
 
     def __init__(self) -> None:
         self.cycle_used = 0
         self.run_used = 0
+        self.cycle_latency_ms = 0
         self._denied_logged = False
 
     def begin_cycle(self) -> None:
         self.cycle_used = 0
+        self.cycle_latency_ms = 0
         self._denied_logged = False
 
     def snapshot(self) -> dict:
         return {
             "cycle_used": self.cycle_used,
             "run_used": self.run_used,
+            "cycle_latency_ms": self.cycle_latency_ms,
         }
+
+    def latency_slot_available(self, max_capture_ms: int,
+                               cycle_limit_ms: int) -> tuple[bool, int]:
+        """Fail-closed pre-flight: a full capture window must still fit."""
+        remaining = cycle_limit_ms - self.cycle_latency_ms
+        return remaining >= max_capture_ms, remaining
+
+    def add_cycle_latency(self, elapsed_ms: int) -> None:
+        if elapsed_ms > 0:
+            self.cycle_latency_ms += int(elapsed_ms)
 
 
 _BUDGET = _Budget()
 
 
 def begin_capture_cycle() -> None:
-    """Reset the per-scanner-cycle portion of the API budget.
+    """Reset the per-scanner-cycle portions of the budget (API slots AND
+    the F1 cumulative latency window).
 
     Called once at the top of ``run_scan_cycle``. Pure in-memory operation:
     it never touches the database, the network, or the activation state.
@@ -381,6 +412,8 @@ def clear_static_identity_cache() -> None:
 class RuntimeConfig:
     quote_delay_limit_ms: int
     expected_activation_ts: datetime | None
+    max_cycle_latency_ms: int
+    max_capture_ms: int
 
 
 def _load_runtime_config() -> RuntimeConfig:
@@ -413,6 +446,25 @@ def _load_runtime_config() -> RuntimeConfig:
     _read_limit(MAX_PER_CYCLE_ENV, DEFAULT_MAX_PER_CYCLE, HARD_MAX_PER_CYCLE)
     _read_limit(MAX_PER_RUN_ENV, DEFAULT_MAX_PER_RUN, HARD_MAX_PER_RUN)
 
+    # F1 latency protection: both windows are positive integers, the hard
+    # caps clamp them, and a per-capture window larger than the per-cycle
+    # window would make every capture impossible -> config error instead.
+    cycle_latency_ms = _read_limit(CYCLE_LATENCY_ENV,
+                                   DEFAULT_MAX_CYCLE_LATENCY_MS,
+                                   HARD_MAX_CYCLE_LATENCY_MS)
+    max_capture_ms = _read_limit(CAPTURE_LATENCY_ENV,
+                                 DEFAULT_MAX_CAPTURE_MS,
+                                 HARD_MAX_CAPTURE_MS)
+    if cycle_latency_ms <= 0 or max_capture_ms <= 0:
+        raise SrrFillConfigError(
+            f"{CYCLE_LATENCY_ENV} and {CAPTURE_LATENCY_ENV} must be "
+            f"positive integers (ms); got cycle={cycle_latency_ms} "
+            f"capture={max_capture_ms}")
+    if max_capture_ms > cycle_latency_ms:
+        raise SrrFillConfigError(
+            f"{CAPTURE_LATENCY_ENV} ({max_capture_ms} ms) must not exceed "
+            f"{CYCLE_LATENCY_ENV} ({cycle_latency_ms} ms)")
+
     expected = None
     raw_expected = os.environ.get(EXPECTED_ACTIVATION_ENV)
     if raw_expected is not None and str(raw_expected).strip():
@@ -426,6 +478,8 @@ def _load_runtime_config() -> RuntimeConfig:
     return RuntimeConfig(
         quote_delay_limit_ms=delay_limit,
         expected_activation_ts=expected,
+        max_cycle_latency_ms=cycle_latency_ms,
+        max_capture_ms=max_capture_ms,
     )
 
 
@@ -754,15 +808,78 @@ def _finalize_row(conn, event_key: str, payload: dict) -> bool:
         cursor.close()
 
 
+# ── F3: persistent coverage accounting ──────────────────────────────────
+# One row per prospective source event whose attempt did NOT produce an
+# evidence row. The coverage DENOMINATOR always comes from the independent
+# prospective source (research.prospective_observation), never from these
+# rows or from capture rows — a missing row can only DECREASE measured
+# coverage, never inflate it.
+COVERAGE_DISPOSITIONS = (
+    "POLICY_DENIED",          # flag-adjacent policy/config/activation/boundary
+    "API_BUDGET_DENIED",      # per-cycle or per-run API budget exhausted
+    "LATENCY_BUDGET_DENIED",  # F1 cumulative/per-capture window exhausted
+    "DUPLICATE",              # evidence row already exists (replay)
+    "CLAIM_RACE_LOST",        # concurrent claimant owns this event
+)
+
+
+def _record_coverage(conn, observations, disposition: str,
+                     reason: str | None) -> None:
+    """Persist a non-capturing attempt (F3). Never raises.
+
+    First disposition wins (``ON CONFLICT DO NOTHING``); a later successful
+    capture is represented by the evidence row itself, which takes
+    precedence in analysis. A failed coverage write only bumps a counter:
+    it must never affect the scanner or the capture decision.
+    """
+    rows = list(observations or ())
+    if not rows or disposition not in COVERAGE_DISPOSITIONS:
+        return
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        for obs in rows:
+            cursor.execute(
+                """INSERT INTO research.srr_short_fill_coverage_v1
+                (observation_id, experiment_id, symbol, signal_time,
+                 disposition, reason)
+                VALUES (%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (observation_id) DO NOTHING""",
+                (
+                    obs["observation_id"], EXPERIMENT_ID, obs["symbol"],
+                    obs["signal_time"], disposition, reason,
+                ),
+            )
+        conn.commit()
+    except Exception:
+        _STATS["coverage_write_failed"] += 1
+        LOG.warning(
+            "SRR coverage record failed (capture decision unchanged)",
+            exc_info=True)
+        try:
+            conn.rollback()
+        except Exception:
+            LOG.debug("SRR coverage rollback failed", exc_info=True)
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+
 def capture(conn, client, *, scanner_name, direction, symbol, signal_time,
             reference_price, invalidation_price, observation_ids):
     """Capture one signal-time quote for each confirmed SRR SHORT event.
 
     Returns ``True`` only when this call reserved AND finalized a new row.
-    Every refusal (flag, identity, activation, pre-activation boundary,
-    duplicate, API budget) is a silent, side-effect-free ``False``; every
-    internal error is swallowed with rollback + logging so the scanner and
-    the prospective observer are never affected.
+    Refusals that happen AFTER the observation ids were resolved (policy,
+    activation, boundary, latency budget, API budget, duplicate, lost
+    claim race) are persisted into ``research.srr_short_fill_coverage_v1``
+    (F3 coverage accounting) before returning ``False``; flag/identity
+    refusals and clock anomalies predate resolution and are only counted
+    in-process. Every internal error is swallowed with rollback + logging
+    so the scanner and the prospective observer are never affected.
     """
     _STATS["attempts"] += 1
     # 1. Explicit feature flag — cheapest gate first, no DB, no network.
@@ -787,22 +904,36 @@ def capture(conn, client, *, scanner_name, direction, symbol, signal_time,
         return False
 
     try:
-        # 3. Runtime configuration (fail-closed on any inconsistency).
+        # 3. Confirm which observation ids really are SRR SHORT events —
+        #    BEFORE any policy gate so a rejected source event can still be
+        #    recorded in the coverage table (denominator stays honest).
+        observations = _resolve_observations(
+            conn, observation_ids, symbol=symbol,
+            expected_signal_time=signal_time,
+            expected_reference=reference_price)
+        if not observations:
+            _STATS["identity_denied"] += 1
+            return False
+
+        # 4. Runtime configuration (fail-closed on any inconsistency).
         try:
             config = _load_runtime_config()
         except SrrFillConfigError:
             LOG.warning("SRR fill capture refused: configuration invalid",
                         exc_info=True)
             _STATS["config_denied"] += 1
+            _record_coverage(conn, observations, "POLICY_DENIED", "config")
             return False
 
-        # 4. Authoritative DB activation (read-only; never written here).
+        # 5. Authoritative DB activation (read-only; never written here).
         try:
             activation_ts = _load_activation(conn)
         except SrrFillActivationError:
             LOG.debug("SRR fill capture refused: activation not granted",
                       exc_info=True)
             _STATS["activation_denied"] += 1
+            _record_coverage(conn, observations, "POLICY_DENIED",
+                             "activation")
             return False
         if config.expected_activation_ts is not None \
                 and config.expected_activation_ts != activation_ts:
@@ -813,15 +944,8 @@ def capture(conn, client, *, scanner_name, direction, symbol, signal_time,
                 activation_ts.isoformat(),
             )
             _STATS["config_denied"] += 1
-            return False
-
-        # 5. Confirm which observation ids really are SRR SHORT events.
-        observations = _resolve_observations(
-            conn, observation_ids, symbol=symbol,
-            expected_signal_time=signal_time,
-            expected_reference=reference_price)
-        if not observations:
-            _STATS["identity_denied"] += 1
+            _record_coverage(conn, observations, "POLICY_DENIED",
+                             "activation_ts_mismatch")
             return False
 
         captured_any = False
@@ -829,6 +953,8 @@ def capture(conn, client, *, scanner_name, direction, symbol, signal_time,
             # 6. Strict prospective boundary: signal_time > activation_ts.
             if obs["signal_time"] <= activation_ts:
                 _STATS["pre_activation_denied"] += 1
+                _record_coverage(conn, [obs], "POLICY_DENIED",
+                                 "pre_activation_boundary")
                 continue
             if _capture_one(conn, client, obs, activation_ts, config):
                 captured_any = True
@@ -843,6 +969,51 @@ def capture(conn, client, *, scanner_name, direction, symbol, signal_time,
             "SRR fill capture failed closed; scanner and observations "
             "unaffected; no orders")
         return False
+
+
+def _fetch_quote_phase(client, symbol: str, timeout_s: float) -> dict:
+    """Instrument lookup + orderbook GET inside a bounded worker (F1).
+
+    The scanner-facing thread waits at most ``timeout_s`` (``join``
+    bound), so a hung request can never stall the cycle beyond the
+    configured per-capture latency budget. The worker NEVER touches the
+    database — the research connection stays single-threaded — and it uses
+    the same budgeted, rate-limited client as before: no limiter bypass,
+    no extra retry layer. After a join timeout the orphaned worker may
+    still finish in the background (bounded by the client's own retry
+    deadline); its result is discarded and the claim is finalized as
+    ERROR, so a late quote can never become evidence.
+    """
+    result: dict = {
+        "done": False, "book": None, "constraints": None,
+        "constraints_error": None, "received_at": None, "error": None,
+        "waited_ms": 0, "timed_out": False,
+    }
+
+    def _run() -> None:
+        try:
+            constraints, constraints_error = instrument_constraints(
+                client, symbol)
+            book = client._public_get(
+                ORDERBOOK_ENDPOINT, category="linear", symbol=symbol,
+                limit=50)
+            result.update(
+                book=book, constraints=constraints,
+                constraints_error=constraints_error,
+                received_at=datetime.now(timezone.utc))
+        except BaseException as exc:  # noqa: BLE001 — recorded, never raised
+            result["error"] = exc
+        finally:
+            result["done"] = True
+
+    thread = threading.Thread(target=_run, name="srr-fill-quote",
+                              daemon=True)
+    started = time.monotonic()
+    thread.start()
+    thread.join(timeout_s)
+    result["waited_ms"] = int((time.monotonic() - started) * 1000)
+    result["timed_out"] = not result["done"]
+    return result
 
 
 def _capture_one(conn, client, obs: dict, activation_ts: datetime,
@@ -860,6 +1031,7 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
         )
         if cursor.fetchone():
             _STATS["duplicate_skipped"] += 1
+            _record_coverage(conn, [obs], "DUPLICATE", "evidence_exists")
             return False
     finally:
         cursor.close()
@@ -878,12 +1050,29 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
             obs["symbol"], obs["observation_id"], signal_to_capture_ms)
         return False
 
-    # 6c. Explicit API budget: predictable refusal, counted for coverage.
-    allowed, _reason = _try_consume_budget()
-    if not allowed:
+    # 6c. F1 latency pre-flight: one full per-capture window must still fit
+    #     into the cycle's cumulative wall-clock budget. Fail-closed BEFORE
+    #     the API budget and before any claim or network request.
+    fits, remaining_ms = _BUDGET.latency_slot_available(
+        config.max_capture_ms, config.max_cycle_latency_ms)
+    if not fits:
+        _STATS["latency_denied"] += 1
+        LOG.info(
+            "SRR fill capture skipped: per-cycle latency budget exhausted "
+            "(used=%dms remaining=%dms < capture max %dms); coverage loss "
+            "recorded", _BUDGET.cycle_latency_ms, remaining_ms,
+            config.max_capture_ms)
+        _record_coverage(conn, [obs], "LATENCY_BUDGET_DENIED",
+                         f"remaining_ms={remaining_ms}")
         return False
 
-    # 6d. Atomic claim/reservation, committed BEFORE any Bybit request so
+    # 6d. Explicit API budget: predictable refusal, counted for coverage.
+    allowed, budget_reason = _try_consume_budget()
+    if not allowed:
+        _record_coverage(conn, [obs], "API_BUDGET_DENIED", budget_reason)
+        return False
+
+    # 6e. Atomic claim/reservation, committed BEFORE any Bybit request so
     #     a concurrent duplicate can never produce a second orderbook call.
     cursor = conn.cursor()
     try:
@@ -915,34 +1104,19 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
         # Concurrent claimant owns this event; it will (or did) fetch the
         # book. No Bybit request is made here.
         _STATS["duplicate_skipped"] += 1
+        _record_coverage(conn, [obs], "CLAIM_RACE_LOST", "claim_conflict")
         return False
     _STATS["claimed"] += 1
 
-    # 6e. Research-only quote capture through the shared budgeted client.
-    book: dict = {}
-    book_error: BaseException | None = None
-    constraints, constraints_error = None, None
-    # Sampled the instant the HTTP response carrying the relevant book
-    # arrives: AFTER the DB claim commit, the instrument lookup, the
-    # limiter wait and the request itself. Everything between signal_time
-    # and this stamp is the quote's real latency.
-    quote_received_at: datetime | None = None
-    now_ms = int(time.time() * 1000)
-    try:
-        constraints, constraints_error = instrument_constraints(client,
-                                                                obs["symbol"])
-        book = client._public_get(
-            ORDERBOOK_ENDPOINT, category="linear", symbol=obs["symbol"],
-            limit=50)
-        quote_received_at = datetime.now(timezone.utc)
-        now_ms = int(time.time() * 1000)
-        snapshot = calculate_snapshot(
-            obs["reference_price"], obs["structural_r"], book,
-            constraints=constraints, constraints_error=constraints_error,
-            now_ms=now_ms)
-    except Exception as exc:  # noqa: BLE001 — any failure is recorded, never raised
-        book_error = exc
-        snapshot = None
+    # 6f. Bounded quote fetch (F1): instrument lookup, limiter wait, retries
+    #     and HTTP all happen inside the worker; this thread waits at most
+    #     config.max_capture_ms. The whole capture (dup-check, claim,
+    #     fetch) is then charged to the cycle's cumulative latency budget.
+    quote = _fetch_quote_phase(client, obs["symbol"],
+                               timeout_s=config.max_capture_ms / 1000.0)
+    _BUDGET.add_cycle_latency(int(
+        (datetime.now(timezone.utc) - capture_started_at)
+        .total_seconds() * 1000))
 
     capture_finished_at = datetime.now(timezone.utc)
     api_request_ms = int(
@@ -950,12 +1124,46 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
     # P1: full signal->quote latency (claim + instrument lookup + limiter
     # wait + HTTP); None only when no book reached us at all. This is the
     # value that gates FRESH/DELAYED - a late quote is never eligible.
+    quote_received_at = quote["received_at"]
     signal_to_quote_ms = (
         int((quote_received_at - obs["signal_time"]).total_seconds() * 1000)
         if quote_received_at is not None else None)
+    constraints = quote["constraints"]
+    constraints_error = quote["constraints_error"]
+
+    snapshot = None
+    book_error: BaseException | None = None
+    if quote["timed_out"]:
+        # Join bound expired: fail closed. The orphaned worker's result is
+        # discarded - a late quote can never be stored as evidence.
+        book_error = TimeoutError(
+            f"capture latency budget {config.max_capture_ms}ms exceeded")
+        LOG.warning(
+            "SRR fill capture hit the per-capture latency bound: symbol=%s "
+            "observation_id=%s waited_ms=%d max_capture_ms=%d",
+            obs["symbol"], obs["observation_id"], quote["waited_ms"],
+            config.max_capture_ms)
+    elif quote["error"] is not None:
+        book_error = quote["error"]
+    else:
+        try:
+            now_ms = (int(quote_received_at.timestamp() * 1000)
+                      if quote_received_at is not None
+                      else int(time.time() * 1000))
+            snapshot = calculate_snapshot(
+                obs["reference_price"], obs["structural_r"], quote["book"],
+                constraints=constraints, constraints_error=constraints_error,
+                now_ms=now_ms)
+        except Exception as exc:  # noqa: BLE001 — recorded, never raised
+            book_error = exc
+
     if snapshot is None:
-        reason = (f"orderbook:{type(book_error).__name__}"
-                  if book_error is not None else "orderbook:UNKNOWN")
+        if quote["timed_out"]:
+            reason = "latency:TIMEOUT"
+        elif book_error is not None:
+            reason = f"orderbook:{type(book_error).__name__}"
+        else:
+            reason = "orderbook:UNKNOWN"
         payload = _error_payload(
             obs, capture_finished_at, signal_to_capture_ms,
             signal_to_quote_ms, api_request_ms, reason, constraints,
@@ -966,9 +1174,18 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
         payload = _snapshot_payload(
             obs, snapshot, capture_finished_at, signal_to_capture_ms,
             signal_to_quote_ms, api_request_ms, config, constraints,
-            constraints_error, book)
+            constraints_error, quote["book"])
         status = snapshot["status"]
         quality = payload["quote_quality_status"]
+
+    # F1 evidence: what this capture cost and how much room was left.
+    payload["source_diagnostics"]["latency"] = {
+        "quote_phase_ms": quote["waited_ms"],
+        "worker_timed_out": bool(quote["timed_out"]),
+        "cycle_latency_ms": _BUDGET.cycle_latency_ms,
+        "max_capture_ms": config.max_capture_ms,
+        "max_cycle_latency_ms": config.max_cycle_latency_ms,
+    }
 
     if not _finalize_row(conn, event_key, payload):
         _STATS["finalize_failed"] += 1

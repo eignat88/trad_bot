@@ -320,24 +320,48 @@ row-level verdict reflects the SMALL scenario.
   `feasibility_status='ERROR'`, `quote_quality_status='NO_QUOTE'` and a
   typed `failure_reason` — never retried automatically, never raised.
 
-**Scanner latency estimate:** a successful capture costs 1 orderbook GET +
-(at most) 1 instruments GET ≈ 1 round-trip each (orderbook ≈ 100–300 ms
-typical), synchronous in the cycle. Worst case **per logical GET** is
-bounded by the shared client deadline (`bybit_retry_deadline_s`, default
-60 s + bounded backoff); a capture makes up to 2 GETs (instruments on
-cache miss + orderbook), so under persistent transport failure one cycle
-can add ≈ `budget × ~125 s` (default 5 ≈ 10 min, hard cap 20 ≈ 40 min).
-A cumulative per-cycle latency break (abort the cycle's remaining captures
-once their wall-time budget is spent) is a documented **pre-activation**
-requirement (review finding F1), not implemented in this PR. Every capture
-stores `api_request_ms`, `signal_to_capture_ms` and
+**F1 — cumulative per-cycle latency protection (implemented):**
+
+* `SRR_SHORT_FILL_MAX_CYCLE_LATENCY_MS` (default 5000, hard cap 60000):
+  cumulative wall-clock window for ALL captures of one scanner cycle,
+  reset by `begin_capture_cycle()` at the top of `run_scan_cycle`.
+* `SRR_SHORT_FILL_MAX_CAPTURE_MS` (default 2000, hard cap 60000, must be
+  ≤ the cycle window or the config fails closed): the maximum time the
+  scanner thread may wait for ONE capture.
+* **Pre-flight, fail-closed:** before the claim and before the API budget
+  a capture is refused unless one full `max_capture_ms` window still fits
+  in the cycle budget (`latency_denied`, coverage row
+  `LATENCY_BUDGET_DENIED`). The whole capture elapsed time (dup-check,
+  claim, quote fetch) is then charged to the cycle window.
+* **Bounded quote worker:** the instrument lookup, limiter wait, retries
+  and HTTP run in a worker thread; the scanner thread `join`s with the
+  `max_capture_ms` timeout. On timeout the claim is finalized as
+  `feasibility_status='ERROR'`, `failure_reason='latency:TIMEOUT'`, and
+  the orphan's result is **discarded** — a late quote can never become
+  evidence. The worker never touches the database (the research
+  connection stays single-threaded) and uses the same budgeted,
+  rate-limited client — no limiter bypass, no extra retry layer.
+* Honest limits of the guarantee: the join bound guarantees **scanner-facing
+  latency**; the DB claim/finalize steps are not join-bounded (normally
+  milliseconds); an orphaned request may still occupy the shared
+  client/limiter until the client's own retry deadline (Bybit request
+  volume does not grow — the same ≤ 2 GETs are made, just possibly out of
+  band). Per-capture evidence is stored in
+  `source_diagnostics['latency']` (`quote_phase_ms`, `worker_timed_out`,
+  `cycle_latency_ms`, both configured bounds).
+
+**Scanner latency estimate (post-F1):** the synchronous wait added to a
+cycle is bounded by ≈ `max_cycle_latency_ms` (plus ms-level DB overhead),
+regardless of how slow Bybit is — a hung request can no longer stretch a
+cycle by `budget × ~125 s` as before F1. Typical successful capture is
+still 1 orderbook GET + (at most) 1 instruments GET ≈ 100–300 ms.
+Every capture stores `api_request_ms`, `signal_to_capture_ms` and
 `signal_to_quote_ms`, so the real latency distribution — including the DB
 claim, instrument lookup, limiter wait and HTTP — is measured from the
-first activated row onward. If the measured `api_request_ms` +
-`signal_to_quote_ms` profile shows the synchronous capture pushing cycle
-latency beyond the scanner interval or systematically delaying quotes past
-the delay budget, the sanctioned alternative is a bounded dedicated worker
-with the SAME reservation-first contract; it may not be introduced with a
+first activated row onward. If the measured profile still shows the
+synchronous capture pushing cycle latency beyond the scanner interval,
+the sanctioned alternative is a fully asynchronous dedicated worker with
+the SAME reservation-first contract; it may not be introduced with a
 delayed quote substituted for a missing signal-time snapshot.
 
 ---
@@ -387,6 +411,76 @@ SELECT symbol,
 FROM research.srr_short_fill_feasibility_v1
 GROUP BY symbol ORDER BY eligible DESC;
 
+-- ── F3: coverage with the INDEPENDENT denominator ──────────────────────
+-- The denominator is research.prospective_observation (the prospective
+-- source), NEVER capture rows: a missing event can only DECREASE
+-- measured coverage. Precedence: an evidence row always overrides a
+-- coverage row for the same observation_id.
+WITH source AS (
+    SELECT o.observation_id, o.symbol, o.signal_time
+    FROM research.prospective_observation o
+    JOIN research.srr_short_fill_activation_v1 a
+      ON a.experiment_id = 'SRR_SHORT_REFERENCE_TO_EXECUTION_ALIGNMENT_V1'
+    WHERE o.experiment_id =
+          'SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1'
+      AND o.direction = 'SHORT'
+      AND o.signal_time > a.activation_ts
+)
+SELECT COUNT(*) AS denominator,
+       COUNT(e.observation_id) AS captured,
+       COUNT(e.observation_id)
+           FILTER (WHERE e.eligible_for_execution_stats) AS eligible,
+       COUNT(c.observation_id) AS denied_accounted,
+       COUNT(*) FILTER (WHERE e.observation_id IS NULL
+                         AND c.observation_id IS NULL) AS unaccounted,
+       ROUND(100.0 * COUNT(e.observation_id) / COUNT(*), 2)
+           AS coverage_pct
+FROM source s
+LEFT JOIN research.srr_short_fill_feasibility_v1 e
+       USING (observation_id)
+LEFT JOIN research.srr_short_fill_coverage_v1 c
+       USING (observation_id);
+
+-- Per-event disposition (every source event must be explainable):
+WITH source AS (
+    SELECT o.observation_id, o.symbol, o.signal_time
+    FROM research.prospective_observation o
+    JOIN research.srr_short_fill_activation_v1 a
+      ON a.experiment_id = 'SRR_SHORT_REFERENCE_TO_EXECUTION_ALIGNMENT_V1'
+    WHERE o.experiment_id =
+          'SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1'
+      AND o.direction = 'SHORT'
+      AND o.signal_time > a.activation_ts
+)
+SELECT CASE
+           WHEN e.observation_id IS NOT NULL AND e.feasibility_status = 'PENDING'
+               THEN 'PENDING'
+           WHEN e.observation_id IS NOT NULL AND e.eligible_for_execution_stats
+               THEN 'ELIGIBLE'
+           WHEN e.observation_id IS NOT NULL THEN 'CAPTURED_NOT_ELIGIBLE'
+           WHEN c.observation_id IS NOT NULL THEN c.disposition
+           ELSE 'UNACCOUNTED'
+       END AS disposition,
+       COUNT(*)
+FROM source s
+LEFT JOIN research.srr_short_fill_feasibility_v1 e USING (observation_id)
+LEFT JOIN research.srr_short_fill_coverage_v1 c USING (observation_id)
+GROUP BY 1 ORDER BY 2 DESC;
+
+-- Coverage dispositions with reasons (API / latency / policy / duplicates)
+SELECT disposition, reason, COUNT(*)
+FROM research.srr_short_fill_coverage_v1
+GROUP BY 1, 2 ORDER BY 3 DESC;
+
+-- F1 latency evidence: per-capture cost and worker timeouts
+SELECT source_diagnostics->'latency'->>'worker_timed_out' AS timed_out,
+       COUNT(*),
+       percentile_disc(0.5) WITHIN GROUP
+           (ORDER BY (source_diagnostics->'latency'->>'quote_phase_ms')::int)
+           AS median_quote_phase_ms
+FROM research.srr_short_fill_feasibility_v1
+GROUP BY 1;
+
 -- API budget pressure (from diagnostics)
 SELECT source_diagnostics->'budget' AS budget_at_capture, COUNT(*)
 FROM research.srr_short_fill_feasibility_v1
@@ -426,14 +520,21 @@ SELECT COUNT(*) FROM research.prospective_observation;      -- only INSERTs
 
 ## 11. Safe activation order (operator-only, never automatic)
 
-1. Deploy the code + apply migration `082` (source-controlled; **not applied
-   by this PR**). Confirm the seed row:
+> Step-by-step operator checklist, safe configuration values and the
+> monitoring/rollback queries are consolidated in
+> `docs/research/SRR_SHORT_FILL_ACTIVATION_RUNBOOK_V1.md`.
+
+1. Deploy the code + apply migrations `082` (evidence/activation) and
+   `083` (F3 coverage ledger) (source-controlled; **not applied by this
+   PR**). Confirm the seed row:
    `SELECT … FROM research.srr_short_fill_activation_v1;` → `DISABLED`.
 2. Keep `SRR_SHORT_FILL_CAPTURE_ENABLED` **unset** in the Scanner service.
 3. Fix the forward-protocol parameters (Section 12) EXPLICITLY: choose
    `SRR_SHORT_FILL_MAX_QUOTE_DELAY_MS`, `SRR_SHORT_FILL_MAX_PER_CYCLE`,
-   `SRR_SHORT_FILL_MAX_PER_RUN` and the expected activation timestamp; they
-   are deliberately not hardcoded by this PR.
+   `SRR_SHORT_FILL_MAX_PER_RUN`, `SRR_SHORT_FILL_MAX_CYCLE_LATENCY_MS`,
+   `SRR_SHORT_FILL_MAX_CAPTURE_MS` (must be ≤ the cycle window) and the
+   expected activation timestamp; they are deliberately not hardcoded by
+   this PR.
 4. Freeze the boundary in one reviewed statement:
 
    ```sql
@@ -446,42 +547,145 @@ SELECT COUNT(*) FROM research.prospective_observation;      -- only INSERTs
    ```
 
    The trigger guarantees `activation_ts` can never change afterwards.
-5. Set the runtime env (flag + delay budget + expected timestamp) and restart
-   ONLY the Scanner service. There is no code path that activates capture on
-   deploy.
-6. Verify with the Section 10 queries after the first captures.
+5. Set the runtime env (flag + delay/latency budgets + expected
+   timestamp) and restart ONLY the Scanner service. There is no code path
+   that activates capture on deploy.
+6. Verify with the Section 10 queries after the first captures (evidence
+   volume, coverage denominator, F1 latency diagnostics).
 
 ---
 
-## 12. Forward protocol (proposed thresholds — operator fixes them at activation, not this PR)
+## 12. Forward protocol — frozen GO / NO-GO / INCONCLUSIVE criteria (F4)
 
-These are protocol parameters; this PR deliberately does not write them into
-production configuration. Proposed starting values below are a *proposal*
-for the operator to adopt/adjust and record in `notes`:
+This section is the **frozen decision protocol** for Issue #259. It is a
+**strict superset** of the registry's `validation_criteria`
+(`app/research/prospective_registry.json`, frozen entry of the source
+prospective validation
+`SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1` — the
+contour itself is a research sub-question and is intentionally not
+registered): every frozen criterion below
+appears verbatim and none may be dropped, weakened or reinterpreted at
+activation. The operator may only **tighten** thresholds and must record
+any tightened value in the activation record's `notes`.
 
-| Parameter | Proposed value |
-|---|---|
-| Minimum eligible sample | ≥ 300 eligible captures (matches the frozen `minimum_n`) |
-| Minimum observation window | ≥ 30 calendar days of post-activation signals |
-| Minimum coverage | ≥ 70% of created SRR SHORT observations captured; eligible share ≥ 60% of captures |
-| Minimum symbol breadth | ≥ 30 distinct symbols with ≥ 1 eligible capture |
-| Signal→quote delay budget | `SRR_SHORT_FILL_MAX_QUOTE_DELAY_MS` ≤ 5000 ms (median `signal_to_capture_ms` must be ≤ half of it) |
-| API budget | per-cycle ≤ 5, per-run ≥ 1000 (coverage accounting must show budget denials < 5% of events) |
+Protocol parameters (delay budget, API/latency budgets, exact window
+length) remain operator-fixed at activation as before — the decision
+criteria themselves do not change with them.
 
-Decision rule (applied only to rows with
-`eligible_for_execution_stats = true`, Stage 2 trajectory recomputation):
+### 12.1 Frozen registry criteria (verbatim — all must hold)
 
-* **GO** — execution-aligned Net E[R] > 0 with day-cluster bootstrap 95% CI
-  lower bound > 0, under NORMAL costs, on the full eligible sample, with
-  every coverage/quality threshold above satisfied.
-* **NO-GO** — execution-aligned Net E[R] ≤ 0, or its 95% CI upper bound ≤ 0,
-  or the positive result only survives excluding a majority of symbols, or
-  any coverage threshold is violated after the full window.
-* **INCONCLUSIVE** — sample/window/coverage thresholds not yet reached, or
-  the CI straddles zero: continue observing, do not change any verdict.
+From `validation_criteria.normal_cost_requires` (NORMAL cost class,
+0.21% round-trip, `primary_scenario: NORMAL_COST`):
+
+* `Net E[R] > 0`
+* `Net PF > 1`
+* `bootstrap 95% CI lower bound > 0`
+* `no catastrophic day or symbol concentration`
+
+From `validation_criteria.elevated_cost_treatment` (mandatory
+sensitivity, ELEVATED cost class, 0.31% round-trip): *"mandatory
+sensitivity; negative elevated results are reported as execution
+fragility and are not represented as cost robustness"*.
+
+Frozen sample floors: `minimum_n = 300` eligible observations,
+`minimum_symbols = 30` distinct symbols, `minimum_oos_days = 14` OOS
+days. `before_sample_gates = INCONCLUSIVE_CONTINUE_OOS`: before these
+floors are reached the only legal verdict is INCONCLUSIVE.
+
+### 12.2 Stage 2 precondition — execution-aligned trajectory recomputation
+
+All Net E[R] / Net PF numbers in this protocol are computed by the
+Stage-2 execution-aligned trajectory recomputation over rows with
+`eligible_for_execution_stats = true`: the whole trajectory is replayed
+against the captured signal-time quotes using the frozen geometry
+(`execution_R = 2.0 × structural_R`, `variant_stop`/`variant_target`
+unchanged, frozen costs 0.21% / 0.31%, single-counted — Section 6).
+
+* **FORBIDDEN: computing executable Net R by subtracting extra costs from
+  the frozen Net R.** The frozen result (Normal Net E[R] = +0.064721R)
+  stays untouched; an "executable" number may only come from the Stage-2
+  recomputation itself.
+
+### 12.3 GO — requires ALL of the following
+
+1. **Net E[R] > 0** after execution-aligned trajectory recomputation,
+   NORMAL cost class, on the full eligible sample (no exclusions beyond
+   pre-registered data-quality rules).
+2. **Net PF > 1** on the same recomputation.
+3. **Bootstrap confidence:** day-cluster bootstrap 95% CI lower bound >
+   0 **AND** symbol-cluster bootstrap 95% CI lower bound > 0 — two
+   independent cluster bootstraps (≥ 10,000 resamples, fixed seed,
+   reported with the standard error). This is the operational form of the
+   frozen `bootstrap 95% CI lower bound > 0`.
+4. **Concentration:** `no catastrophic day or symbol concentration` —
+   operationally: leave-one-day-out Net E[R] stays > 0 for every day AND
+   leave-one-symbol-out Net E[R] stays > 0 for every symbol, AND no single
+   day / single symbol accounts for > 50% of gross positive PnL.
+5. **Sample floors:** eligible n ≥ `minimum_n = 300`, distinct symbols ≥
+   `minimum_symbols = 30`, OOS days ≥ `minimum_oos_days = 14` (the
+   recommended observation window remains ≥ 30 calendar days; the
+   operator may fix a larger window at activation, never a smaller one).
+6. **Coverage and quote quality** (Section 10 denominator — never capture
+   rows alone): coverage ≥ 70% of created SRR SHORT observations;
+   eligible share ≥ 60% of captures; API-budget denials < 5% of source
+   events; F1 latency-budget denials < 5% of source events; unaccounted
+   events (no evidence row, no coverage row) ≤ 5% of the denominator and
+   individually explained; median `signal_to_capture_ms` ≤ half the
+   configured delay budget (recommended `SRR_SHORT_FILL_MAX_QUOTE_DELAY_MS`
+   ≤ 5000 ms); every `PENDING` claim reported separately. To make the
+   denial thresholds achievable, activation must fix
+   `SRR_SHORT_FILL_MAX_PER_RUN` ≥ 1000 and `SRR_SHORT_FILL_MAX_PER_CYCLE`
+   ≤ 5 (or record an explicit, justified override of these two budget
+   recommendations in the activation record's `notes`).
+7. **Elevated-cost sensitivity** computed on the same sample and reported
+   per the frozen treatment: if elevated Net E[R] ≤ 0, the GO record
+   carries the mandatory execution-fragility disclosure (negative elevated
+   results are reported as execution fragility and are not represented as
+   cost robustness) and the claim is explicitly limited to NORMAL costs.
+
+### 12.4 NO-GO — if ANY of the following holds
+
+* execution-aligned Net E[R] ≤ 0 (NORMAL), or its 95% CI upper bound ≤ 0;
+* Net PF ≤ 1;
+* day-cluster **or** symbol-cluster bootstrap 95% CI lower bound ≤ 0;
+* catastrophic day or symbol concentration detected (any leave-one-out
+  sign flip, or a > 50% PnL share — Section 12.3.4);
+* any coverage/quality threshold of Section 12.3.6 violated **after the
+  full observation window**;
+* the positive result only survives excluding a majority of symbols;
+* an elevated-cost sensitivity result is negative **and** anyone would
+  otherwise present the outcome as cost-robust (frozen treatment: report
+  as execution fragility — never as cost robustness).
+
+### 12.5 INCONCLUSIVE — the only verdict while evidence is incomplete
+
+* any sample floor not yet reached (`minimum_n` / `minimum_symbols` /
+  `minimum_oos_days`) or the observation window is still running —
+  `before_sample_gates = INCONCLUSIVE_CONTINUE_OOS`;
+* either bootstrap CI straddles zero (lower ≤ 0 < upper);
+* any required analysis input is missing (Stage-2 recomputation not run,
+  bootstrap not run, coverage denominator not computed).
+
+INCONCLUSIVE means: continue observing, change nothing, promote nothing —
+never upgrade to GO by waiting alone, never downgrade to NO-GO by
+impatience.
+
+### 12.6 Forbidden shortcuts
+
+* **FORBIDDEN: computing executable Net R by subtracting extra costs from
+  the frozen Net R** (repeated deliberately — this is the central
+  Stage-2 integrity rule).
+* No frozen criterion may be dropped, weakened, double-counted or traded
+  against another; operators may only tighten thresholds at activation.
+* No verdict may be computed from capture rows alone — the coverage
+  denominator is always `research.prospective_observation` (Section 10).
+* `PENDING` rows never count as captures, eligible rows or coverage.
+* No post-hoc sample surgery: no day, symbol or horizon may be excluded
+  except by pre-registered data-quality rules fixed at activation.
 
 Until a GO is recorded: **`RESEARCH_POSITIVE / EXECUTION_UNVALIDATED /
-PAPER_LIVE_NO_GO`**.
+PAPER_LIVE_NO_GO`** — and even a GO covers research executability only;
+Paper/Live remain a separate operator decision.
 
 ---
 
@@ -496,7 +700,12 @@ Stop capture (set the flag to 0 / `status='CANCELLED'`) if any occurs:
    `CYCLE_COMPLETION` rows pre/post activation);
 5. any doubt about identity integrity (rows whose `observation_id` cannot be
    re-joined to `research.prospective_observation`);
-6. any write outside the two new tables is detected in an audit.
+6. any write outside the three new tables (`082` activation + evidence,
+   `083` coverage) is detected in an audit;
+7. F1 latency-budget denials exceed 20% of source events for 3
+   consecutive days, or `worker_timed_out` rows exceed 10% of captures;
+8. `coverage_write_failed` keeps growing (the coverage ledger is part of
+   the evidence chain — a broken ledger must not run unobserved).
 
 Stopping is always safe: no trading object depends on this contour.
 
@@ -522,21 +731,28 @@ Stopping is always safe: no trading object depends on this contour.
 ## 15. Remaining risks / requirements before activation
 
 * Stage 2 (execution-aligned trajectory recomputation) does not exist yet —
-  without it no executable Net R can be claimed.
-* Synchronous capture adds up to (budget per cycle) × (1–2 public GETs) to
-  the cycle; must be observed via `api_request_ms` after activation.
-* Delay-budget and coverage thresholds must be fixed by the operator at
-  activation (deliberately absent from production config).
+  without it no executable Net R can be claimed (F4 §12.2 forbids every
+  shortcut around it).
+* Scanner impact of synchronous capture is now **bounded** by F1
+  (`≈ MAX_CYCLE_LATENCY_MS` per cycle) but still must be observed via
+  `api_request_ms` / `source_diagnostics.latency` after activation; an
+  orphaned request may linger in the shared client until its retry
+  deadline (no extra Bybit volume, see §8).
+* Delay-budget, API and latency thresholds must be fixed by the operator
+  at activation (deliberately absent from production config) — see the
+  runbook.
 * `PENDING` claim rows after a crash need an operator follow-up (documented,
   not auto-retried by design).
-* Migration `082` must be applied through the normal reviewed migration
-  path on each environment; it is NOT applied by this PR.
+* The F3 coverage ledger depends on writes succeeding on denial paths;
+  `coverage_write_failed` is monitored (stop condition §13.8).
+* Migrations `082` and `083` must be applied through the normal reviewed
+  migration path on each environment; they are NOT applied by this PR.
 
 ---
 
 ## 16. Test evidence
 
-* `tests/test_srr_short_fill_feasibility_v1.py` — 81 offline tests: flag off,
+* `tests/test_srr_short_fill_feasibility_v1.py` — 92 offline tests: flag off,
   missing/mismatched activation, pre-activation boundary, wrong
   experiment/direction/scanner/symbol/geometry, multiple observation ids,
   duplicate event, concurrent claim, scanner restart, PostgreSQL failure,
@@ -546,10 +762,24 @@ Stopping is always safe: no trading object depends on this contour.
   instrument lookup and the HTTP leg — a late quote is never eligible),
   insufficient depth, unknown constraints, quantity rounding, min notional,
   no partial fill, `execution_R` normalization, no double counting, budget
-  limits, wrapper routing/isolation/ordering, no order-submission surface.
+  limits, wrapper routing/isolation/ordering, no order-submission surface,
+  plus F1 (cumulative cycle latency pre-flight with artificial delays,
+  bounded worker timeout `latency:TIMEOUT`, config validation, latency
+  diagnostics) and F3 (coverage rows for policy / API budget / latency
+  budget / duplicate / lost-claim dispositions, identity of ledger rows,
+  ledger failure isolation, first-write-wins).
 * `tests/test_srr_short_fill_feasibility_migration_082_v1.py` — 15 static
   contract tests for migration 082 (DISABLED seed, immutability triggers,
   append-only evidence, status enums, column contracts incl.
-  `signal_to_quote_ms` and its full-latency CHECKs, no trading object).
+  `signal_to_quote_ms` and its full-latency CHECKs, no trading object),
+  updated for the additive 083 + coverage-INSERT contract.
+* `tests/test_srr_short_fill_pre_activation_hardening_v1.py` — 9 static
+  contract tests: migration 083 (transactional/additive-only, FK to the
+  independent prospective source, disposition enum in sync with the
+  module, no trading surface), F4 §12 superset of the frozen registry
+  `validation_criteria` (verbatim criteria, elevated treatment,
+  minimum floors, both cluster bootstraps, coverage/quality thresholds,
+  the forbidden frozen-Net-R shortcut) and the activation runbook
+  (every runtime flag + status line + zero-extra-Bybit-call claim).
 * All tests use mock Bybit clients and fake connections — no network, no
   PostgreSQL, no real orders.
