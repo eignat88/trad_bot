@@ -47,7 +47,67 @@ class BybitRateLimitError(BybitError):
     breaker cooldown defers the request (P3), or when the retry-storm guard
     suppresses a retry. Callers must treat it as a counted drop — never as a
     signal to retry at another layer (Issue #229).
+
+    SCANNER_AC7 (Phase A — observability only): every raise site that KNOWS
+    the structured context attaches it as keyword-only attributes so a
+    consumer can record *why* a request was dropped without re-parsing
+    free text:
+
+    ``limiter_result``
+        ``BREAKER_OPEN`` / ``SKIPPED`` / ``STATE_UNAVAILABLE`` / ``REVOKED``
+        (shared-limiter ``GrantResult``) or ``RATE_LIMIT`` (Bybit's own
+        rate-limit answer, e.g. ``retCode=10006`` / HTTP 429);
+    ``limiter_reason``
+        the limiter's reason code (``breaker_cooldown_exceeds_deadline``,
+        ``deadline``, ...) or the client's deny reason;
+    ``queue_wait_ms``
+        time ``acquire`` spent waiting for a token / breaker cooldown, when
+        a shared grant was involved;
+    ``ret_code``
+        Bybit ``retCode`` of the response that exhausted the budget;
+    ``telemetry_result``
+        the ``BYBIT_API_CALL`` ``result=`` label recorded for this same
+        failure (``BYBIT_API_SKIP`` / ``RATE_LIMIT``) — the join key into
+        the raw telemetry log.
+
+    Defaults stay ``None``: the exception's message, type and behaviour are
+    byte-for-byte unchanged, so every existing handler keeps working.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        limiter_result: str | None = None,
+        limiter_reason: str | None = None,
+        queue_wait_ms: int | None = None,
+        ret_code: int | None = None,
+        telemetry_result: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.limiter_result = limiter_result
+        self.limiter_reason = limiter_reason
+        self.queue_wait_ms = queue_wait_ms
+        self.ret_code = ret_code
+        self.telemetry_result = telemetry_result
+
+    @property
+    def limiter_label(self) -> str:
+        """Secret-free ``limiter=... reason=... queue_wait_ms=...`` summary.
+
+        Mirrors the wording of the ``BYBIT_API_SKIP`` telemetry record so an
+        operator can match a consumer-side skip against the raw log line.
+        """
+        parts: list[str] = []
+        if self.limiter_result:
+            parts.append(f"limiter={self.limiter_result}")
+        if self.limiter_reason:
+            parts.append(f"reason={self.limiter_reason}")
+        if self.queue_wait_ms is not None:
+            parts.append(f"queue_wait_ms={self.queue_wait_ms}")
+        if self.ret_code is not None:
+            parts.append(f"ret_code={self.ret_code}")
+        return " ".join(parts)
 
 
 class BybitOrderUncertainError(BybitError):
@@ -633,6 +693,13 @@ class BybitClient:
         timeout_retries_used = 0
         last_class: str | None = None
         last_error: BaseException | None = None
+        # SCANNER_AC7 (Phase A — observability only): retCode of the last
+        # Bybit rate-limit RESPONSE seen by this logical request (10006, or
+        # None for HTTP 429 which carries no body). It is only surfaced on
+        # the terminal BybitRateLimitError so a consumer can record WHICH
+        # code produced the skip; it never affects classification, budget,
+        # backoff or the number of attempts.
+        last_rl_ret_code: int | None = None
 
         def send_once(retry_reason: str, attempt_timeout: float):
             """One HTTP attempt + exactly one telemetry record (Issue #228)."""
@@ -697,27 +764,47 @@ class BybitClient:
                     raise BybitRateLimitError(
                         f"{symbol}: {endpoint} shared rate limiter unavailable "
                         f"({type(_limiter_exc).__name__}) — not sent "
-                        "(fail-closed)") from _limiter_exc
+                        "(fail-closed)",
+                        limiter_result="LIMITER_UNAVAILABLE",
+                        limiter_reason=f"limiter_error:{type(_limiter_exc).__name__}",
+                        telemetry_result="BYBIT_API_SKIP",
+                    ) from _limiter_exc
                 if not grant.granted:
                     rec("BYBIT_API_SKIP", ret_msg=_limiter_skip_label(grant))
                     raise BybitRateLimitError(
                         f"{symbol}: {endpoint} deferred by shared rate limiter "
                         f"({grant.result.value}"
                         + (f": {grant.reason}" if grant.reason else "")
-                        + ") — not sent (fail-closed)")
+                        + ") — not sent (fail-closed)",
+                        # SCANNER_AC7 Phase A: structured copy of the exact
+                        # BYBIT_API_SKIP telemetry label (result/reason/wait).
+                        limiter_result=grant.result.value,
+                        limiter_reason=grant.reason or None,
+                        queue_wait_ms=grant.waited_ms,
+                        telemetry_result="BYBIT_API_SKIP",
+                    )
                 if not shared.prepare_send(grant.grant_id):
                     shared.record_result(grant.grant_id, priority, "REVOKED")
                     rec("BYBIT_API_SKIP",
                         ret_msg="limiter grant revoked before send")
                     raise BybitRateLimitError(
                         f"{symbol}: {endpoint} limiter grant revoked before "
-                        "send (epoch moved) — not sent (fail-closed)")
+                        "send (epoch moved) — not sent (fail-closed)",
+                        limiter_result="REVOKED",
+                        limiter_reason="grant_revoked",
+                        queue_wait_ms=grant.waited_ms,
+                        telemetry_result="BYBIT_API_SKIP",
+                    )
                 # The queue wait is excluded from the HTTP-attempt duration.
                 t_start = time.monotonic()
 
             sends_made += 1          # an actual HTTP attempt is about to go out
 
             def attempt_once():
+                # SCANNER_AC7 Phase A: remember the retCode of the last
+                # rate-limit RESPONSE (bound in _budgeted_get, see above).
+                nonlocal last_rl_ret_code
+
                 def send():
                     if not signed:
                         return self.session.get(
@@ -750,6 +837,7 @@ class BybitClient:
                     if status == 429:
                         rec("RATE_LIMIT", response=exc,
                             ret_msg=_http_failure_label(exc))
+                        last_rl_ret_code = None  # HTTP 429 has no body retCode
                         return None, retry_budget.CLASS_RATE_LIMIT, None
                     rec("ERROR", response=exc, ret_msg=_http_failure_label(exc))
                     raise _http_status_error(status) from exc
@@ -767,6 +855,7 @@ class BybitClient:
                     # retryable within the budget/caps, unlike other HTTP errors.
                     rec("RATE_LIMIT", response=response,
                         ret_msg=_http_failure_label(response))
+                    last_rl_ret_code = None  # HTTP 429 has no body retCode
                     return None, retry_budget.CLASS_RATE_LIMIT, None
                 try:
                     response.raise_for_status()
@@ -811,6 +900,9 @@ class BybitClient:
                 if classification == retry_budget.CLASS_RATE_LIMIT:
                     rec("RATE_LIMIT", response=response,
                         ret_msg=ret_msg, ret_code=ret_code)
+                    # SCANNER_AC7 Phase A: retain the Bybit code (10006) for
+                    # the terminal error — observability only.
+                    last_rl_ret_code = ret_code
                     return None, retry_budget.CLASS_RATE_LIMIT, None
                 # API_ERROR / ACCESS_DENIED: fail-closed, NO retry (Issue #229).
                 rec("ERROR", response=response, ret_msg=ret_msg, ret_code=ret_code)
@@ -844,7 +936,15 @@ class BybitClient:
             if last_class == retry_budget.CLASS_RATE_LIMIT:
                 raise BybitRateLimitError(
                     f"{symbol}: Rate limited on {endpoint} after "
-                    f"{sends_made} attempt(s) ({reason})")
+                    f"{sends_made} attempt(s) ({reason})",
+                    # SCANNER_AC7 Phase A: the terminal rate-limit denial
+                    # carries the Bybit retCode (10006) seen in the last
+                    # response plus the telemetry result recorded for it.
+                    limiter_result="RATE_LIMIT",
+                    limiter_reason=reason,
+                    ret_code=last_rl_ret_code,
+                    telemetry_result="RATE_LIMIT",
+                )
             if reason == "attempt budget":
                 # legacy concise message, preserved byte-for-bit
                 raise BybitTimeoutError(
