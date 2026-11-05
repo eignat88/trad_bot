@@ -342,6 +342,18 @@ def test_instrument_constraints_parsing_and_cache():
     assert err == "instruments_info:RuntimeError"
 
 
+def test_instrument_constraints_forwards_the_caller_deadline():
+    # SRR quote capture passes its remaining monotonic budget into the
+    # lookup so it can never outlive the capture window; the ME A capture
+    # (no deadline) keeps calling exactly as before.
+    client = FakeClient(instruments=LINEAR_INSTRUMENT)
+    instrument_constraints(client, "BTCUSDT", deadline_s=1.5)
+    assert client.calls[0][1].get("deadline_s") == 1.5
+
+    instrument_constraints(client, "ETHUSDT")
+    assert "deadline_s" not in client.calls[1][1]   # default path unchanged
+
+
 # Actual Bybit v5 linear instruments-info shape: minimum notional lives in
 # lotSizeFilter.minNotionalValue (not minNotional / minOrderAmt).
 LINEAR_INSTRUMENT = {"result": {"list": [{

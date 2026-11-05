@@ -570,11 +570,25 @@ class BybitClient:
         }
 
     def _public_get(
-        self, endpoint: str, *, retry_priority: str | None = None, **params: Any
+        self, endpoint: str, *, retry_priority: str | None = None,
+        deadline_s: float | None = None, **params: Any
     ) -> dict[str, Any]:
-        """One BUDGETED logical GET request (BYBIT_RETRY_BUDGET_HARDENING_V1)."""
+        """One BUDGETED logical GET request (BYBIT_RETRY_BUDGET_HARDENING_V1).
+
+        ``deadline_s`` (optional, default ``None``) tightens the monotonic
+        retry envelope for THIS logical request: the effective deadline is
+        ``min(bybit_retry_deadline_s, deadline_s)`` measured from this
+        call. It can only SHORTEN the existing envelope — never extend it
+        — and it applies even when the global retry deadline is disabled.
+        Every blocking step below (breaker gate, shared-limiter acquire,
+        per-attempt HTTP timeout, retry backoff) re-checks the same
+        ``deadline_at``, so no new attempt starts past the caller's
+        budget. Omitting it keeps the historical behaviour byte-for-byte
+        for every existing caller (SRR quote capture, ME A/B/C, HTF, VC).
+        """
         return self._budgeted_get(
-            endpoint, signed=False, retry_priority=retry_priority, **params)
+            endpoint, signed=False, retry_priority=retry_priority,
+            caller_deadline_s=deadline_s, **params)
 
     def _private_get(
         self, endpoint: str, *, retry_priority: str | None = None, **params: Any
@@ -599,7 +613,8 @@ class BybitClient:
 
     def _budgeted_get(
         self, endpoint: str, *, signed: bool = False,
-        retry_priority: str | None = None, **params: Any
+        retry_priority: str | None = None,
+        caller_deadline_s: float | None = None, **params: Any
     ) -> dict[str, Any]:
         """One BUDGETED logical GET request (BYBIT_RETRY_BUDGET_HARDENING_V1).
 
@@ -686,6 +701,19 @@ class BybitClient:
         interval = params.get("interval", "")
         limit = params.get("limit", 0)
         deadline_at = (time.monotonic() + deadline_s) if deadline_s > 0 else None
+        # SRR_SHORT_FILL_LATE_WORKER_AND_API_BUDGET_HARDENING_V1: an optional
+        # caller budget (the quote capture's single monotonic deadline) may
+        # only SHORTEN the envelope — min() guarantees no caller can extend
+        # the global retry deadline, and the caller bound applies even when
+        # the global deadline is disabled (deadline_at is None). From here
+        # every consumer of ``deadline_at`` (breaker gate, limiter acquire,
+        # per-attempt timeout, retry send) enforces the caller budget too.
+        if caller_deadline_s is not None:
+            caller_deadline_at = time.monotonic() + max(0.0, caller_deadline_s)
+            deadline_at = (
+                caller_deadline_at if deadline_at is None
+                else min(deadline_at, caller_deadline_at)
+            )
 
         attempt_index = 0
         sends_made = 0

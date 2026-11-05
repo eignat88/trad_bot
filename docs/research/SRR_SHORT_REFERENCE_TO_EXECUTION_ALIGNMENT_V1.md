@@ -335,22 +335,55 @@ row-level verdict reflects the SMALL scenario.
   claim, quote fetch **and the DB finalization** — charged on every
   path, including exceptions) is then credited to the cycle window when
   the capture returns.
-* **Bounded quote worker:** the instrument lookup, limiter wait, retries
-  and HTTP run in a worker thread; the scanner thread `join`s with the
-  `max_capture_ms` timeout. On timeout the claim is finalized as
-  `feasibility_status='ERROR'`, `failure_reason='latency:TIMEOUT'`, and
-  the orphan's result is **discarded** — a late quote can never become
-  evidence. The worker never touches the database (the research
-  connection stays single-threaded) and uses the same budgeted,
-  rate-limited client — no limiter bypass, no extra retry layer.
+* **Bounded quote worker + single monotonic deadline (F1/F2):** the
+  instrument lookup, limiter wait, retries and HTTP run in a worker
+  thread; the scanner thread `join`s until the capture's single monotonic
+  deadline (`capture start + max_capture_ms`). The deadline propagates
+  into EVERY leg: the worker checks it before the instrument lookup,
+  before the orderbook request and before any retry, and passes the
+  remaining budget into `BybitClient._public_get(deadline_s=...)`, which
+  re-checks it after each blocking wait (breaker gate, shared-limiter
+  acquire) and clamps the per-attempt HTTP timeout to the remainder —
+  **after the deadline no NEW Bybit request is ever started**
+  (`failure_reason='deadline:EXCEEDED'` when the worker refuses;
+  `latency:TIMEOUT` when the join bound expires or a quote is recorded
+  late). On timeout the claim is finalized as
+  `feasibility_status='ERROR'` and the orphan's result is **discarded** —
+  evidence additionally requires the quote to have been RECORDED on or
+  before the deadline, so a worker finishing a microsecond late can never
+  turn into evidence. `thread.join()` is explicitly NOT treated as a
+  cancellation mechanism.
+* **Worker ceiling (F2):** at most `SRR_SHORT_FILL_MAX_QUOTE_WORKERS`
+  (default 3, hard cap 10) live quote workers exist at any moment — the
+  main scan thread is the only adder, workers deregister themselves in
+  `finally`, and finished threads are pruned. Past the ceiling a capture
+  is DENIED **before its claim** (`API_BUDGET_DENIED` /
+  `WORKER_CAPACITY_EXHAUSTED` in the coverage ledger,
+  `stats()["worker_capacity_denied"]`) — no queue and no unbounded
+  thread accumulation, even while requests hang.
+* The worker never touches the database (the research connection stays
+  single-threaded) and uses the same budgeted, rate-limited client — no
+  limiter bypass, no extra retry layer, no second rate limiter.
+* **Separate latency telemetry** in `source_diagnostics['latency']`:
+  `signal_to_capture_ms`, `quote_phase_ms`, `instrument_lookup_ms`,
+  `orderbook_http_ms`, `capture_total_ms`, `deadline_remaining_ms`,
+  `worker_active_count`, `worker_capacity_denied_count`,
+  `worker_timed_out`, `cycle_latency_ms` and the configured bounds;
+  `limiter_wait_ms` is `null` with `limiter_wait_source: "unknown"`
+  (the shared limiter exposes no per-acquire wait on the success path —
+  an explicit NULL, never a guessed value).
+* **Failure taxonomy stays separated:** `deadline:EXCEEDED` (no new
+  request after the deadline), `latency:TIMEOUT` (join bound / late
+  quote), `limiter:<RESULT>` (fail-closed shared-limiter refusal),
+  `orderbook:<Exc>` (Bybit/transport error), `worker:CAPACITY_DENIED`
+  (post-claim spawn defense), plus the coverage-only denials for
+  API/cycle budget and worker capacity (all pre-claim).
 * Honest limits of the guarantee: the join bound guarantees **scanner-facing
   latency**; the DB claim/finalize steps are not join-bounded (normally
-  milliseconds); an orphaned request may still occupy the shared
-  client/limiter until the client's own retry deadline (Bybit request
-  volume does not grow — the same ≤ 2 GETs are made, just possibly out of
-  band). Per-capture evidence is stored in
-  `source_diagnostics['latency']` (`quote_phase_ms`, `worker_timed_out`,
-  `cycle_latency_ms`, both configured bounds).
+  milliseconds); an in-flight request started BEFORE the deadline is
+  bounded by the client's per-attempt timeout clamped to the remaining
+  budget, and the worker issues nothing further after the deadline —
+  Bybit request volume never grows (the same ≤ 2 GETs per capture).
 
 **Scanner latency estimate (post-F1):** the synchronous wait added to a
 cycle is bounded by ≈ `max_cycle_latency_ms` (plus ms-level DB overhead),
@@ -780,9 +813,9 @@ Stopping is always safe: no trading object depends on this contour.
   shortcut around it).
 * Scanner impact of synchronous capture is now **bounded** by F1
   (`≈ MAX_CYCLE_LATENCY_MS` per cycle) but still must be observed via
-  `api_request_ms` / `source_diagnostics.latency` after activation; an
-  orphaned request may linger in the shared client until its retry
-  deadline (no extra Bybit volume, see §8).
+  `api_request_ms` / `source_diagnostics.latency` after activation; a
+  quote worker never starts a new request after its deadline, and at
+  most `MAX_QUOTE_WORKERS` live workers exist at any moment (§8).
 * Delay-budget, API and latency thresholds must be fixed by the operator
   at activation (deliberately absent from production config) — see the
   runbook.
@@ -797,7 +830,7 @@ Stopping is always safe: no trading object depends on this contour.
 
 ## 16. Test evidence
 
-* `tests/test_srr_short_fill_feasibility_v1.py` — 92 offline tests: flag off,
+* `tests/test_srr_short_fill_feasibility_v1.py` — 102 offline tests: flag off,
   missing/mismatched activation, pre-activation boundary, wrong
   experiment/direction/scanner/symbol/geometry, multiple observation ids,
   duplicate event, concurrent claim, scanner restart, PostgreSQL failure,
@@ -812,19 +845,36 @@ Stopping is always safe: no trading object depends on this contour.
   bounded worker timeout `latency:TIMEOUT`, config validation, latency
   diagnostics) and F3 (coverage rows for policy / API budget / latency
   budget / duplicate / lost-claim dispositions, identity of ledger rows,
-  ledger failure isolation, first-write-wins).
+  ledger failure isolation, first-write-wins), plus
+  SRR_SHORT_FILL_LATE_WORKER_AND_API_BUDGET_HARDENING_V1 (instrument
+  lookup hang with no post-deadline orderbook, deadline expiring between
+  the two legs, shared-limiter refusal separated as `limiter:<RESULT>`,
+  worker-ceiling denial pre-claim with coverage accounting, late answer
+  that never touches the DB or the finalized ERROR row, expired-deadline
+  and spawn-ceiling unit tests, worker-ceiling config validation, split
+  latency diagnostics incl. `limiter_wait_ms: null`/`unknown` and the
+  propagated `deadline_s` on every request).
 * `tests/test_srr_short_fill_feasibility_migration_082_v1.py` — 15 static
   contract tests for migration 082 (DISABLED seed, immutability triggers,
   append-only evidence, status enums, column contracts incl.
   `signal_to_quote_ms` and its full-latency CHECKs, no trading object),
   updated for the additive 083 + coverage-INSERT contract.
-* `tests/test_srr_short_fill_pre_activation_hardening_v1.py` — 9 static
+* `tests/test_srr_short_fill_pre_activation_hardening_v1.py` — 11 static
   contract tests: migration 083 (transactional/additive-only, FK to the
   independent prospective source, disposition enum in sync with the
   module, no trading surface), F4 §12 superset of the frozen registry
   `validation_criteria` (verbatim criteria, elevated treatment,
   minimum floors, both cluster bootstraps, coverage/quality thresholds,
-  the forbidden frozen-Net-R shortcut) and the activation runbook
+  the forbidden frozen-Net-R shortcut), F4 verdict mutual exclusivity
+  (straddling CI ⇒ INCONCLUSIVE never NO-GO + scenario matrix), F3
+  PENDING-excluded coverage SQL, and the activation runbook
   (every runtime flag + status line + zero-extra-Bybit-call claim).
+* `tests/test_bybit_retry_budget_r4_v1.py` — 64 tests incl. 3 new
+  deadline-propagation contracts: a caller `deadline_s` shortens the
+  retry envelope, can NEVER extend the global one, and applies even
+  when the global retry deadline is disabled.
+* `tests/test_me_short_a_fill_feasibility_v1.py` — 37 tests incl. the
+  instrument-constraints deadline forwarding (SRR quote capture) with
+  the ME A default path byte-for-byte unchanged.
 * All tests use mock Bybit clients and fake connections — no network, no
   PostgreSQL, no real orders.

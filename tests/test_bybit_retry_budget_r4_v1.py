@@ -844,6 +844,51 @@ def test_deadline_still_fails_closed_on_429_retry(monkeypatch):
     assert clock.now > 1000.0                     # backoff waited on the clock
 
 
+def test_caller_deadline_shortens_the_retry_envelope(monkeypatch):
+    """SRR_SHORT_FILL_LATE_WORKER_AND_API_BUDGET_HARDENING_V1: a caller may
+    pass a TIGHTER monotonic deadline — a retry that does not fit the CALLER
+    budget is refused BEFORE the send although the global 60s deadline
+    would still allow it (deadline_s is propagated everywhere)."""
+    clock = _install_fake_clock(monkeypatch)
+    session = ScriptedSession([http_error(429), FakeResponse()])
+    client = make_client(session, bybit_rate_limit_retry_backoff=5.0,
+                         bybit_retry_deadline_s=60.0)
+    with pytest.raises(BybitError, match="deadline"):
+        client._public_get("/v5/market/orderbook", category="linear",
+                           symbol="BTCUSDT", limit=50, deadline_s=1.0)
+    assert len(session.calls) == 1                # the retry never left
+    assert clock.now > 1000.0                     # backoff waited on the clock
+
+
+def test_caller_deadline_never_extends_the_global_envelope(monkeypatch):
+    """min() semantics: a caller asking for MORE time than the global retry
+    deadline still gets the global (shorter) envelope — deadline_s can only
+    shorten, never extend, the existing bound."""
+    _install_fake_clock(monkeypatch)
+    session = ScriptedSession([http_error(429), FakeResponse()])
+    client = make_client(session, bybit_rate_limit_retry_backoff=5.0,
+                         bybit_retry_deadline_s=1.0)
+    with pytest.raises(BybitError, match="deadline"):
+        client._public_get("/v5/market/orderbook", category="linear",
+                           symbol="BTCUSDT", limit=50, deadline_s=60.0)
+    assert len(session.calls) == 1                # the GLOBAL 1.0s governs
+
+
+def test_caller_deadline_applies_when_global_deadline_is_disabled(
+        monkeypatch):
+    """The caller budget applies even when ``bybit_retry_deadline_s<=0``
+    disabled the global envelope — the quote capture is bounded either way."""
+    clock = _install_fake_clock(monkeypatch)
+    session = ScriptedSession([http_error(429), FakeResponse()])
+    client = make_client(session, bybit_rate_limit_retry_backoff=5.0,
+                         bybit_retry_deadline_s=0.0)   # global disabled
+    with pytest.raises(BybitError, match="deadline"):
+        client._public_get("/v5/market/orderbook", category="linear",
+                           symbol="BTCUSDT", limit=50, deadline_s=1.0)
+    assert len(session.calls) == 1
+    assert clock.now > 1000.0
+
+
 def test_post_http_error_429_never_retried_and_keeps_block(tmp_path, caplog):
     """R4-5: a throttled POST is NEVER retried and has an INDETERMINATE
     outcome — the durable block is kept (fail-closed)."""
