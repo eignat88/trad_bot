@@ -113,6 +113,11 @@ MAX_PER_RUN_ENV = "SRR_SHORT_FILL_MAX_PER_RUN"
 # F1: cumulative wall-clock protection for the synchronous scanner cycle.
 CYCLE_LATENCY_ENV = "SRR_SHORT_FILL_MAX_CYCLE_LATENCY_MS"
 CAPTURE_LATENCY_ENV = "SRR_SHORT_FILL_MAX_CAPTURE_MS"
+# F2: bounded quote workers — at most this many capture worker threads may
+# exist at any moment; beyond the ceiling new captures are DENIED before
+# their claim (coverage API_BUDGET_DENIED / WORKER_CAPACITY_EXHAUSTED)
+# instead of leaking unbounded daemon threads against the shared client.
+WORKERS_ENV = "SRR_SHORT_FILL_MAX_QUOTE_WORKERS"
 
 DEFAULT_MAX_PER_CYCLE = 5
 DEFAULT_MAX_PER_RUN = 200
@@ -122,6 +127,8 @@ DEFAULT_MAX_CYCLE_LATENCY_MS = 5000   # per scanner cycle, all captures
 DEFAULT_MAX_CAPTURE_MS = 2000         # per single capture (worker join bound)
 HARD_MAX_CYCLE_LATENCY_MS = 60000
 HARD_MAX_CAPTURE_MS = 60000
+DEFAULT_MAX_QUOTE_WORKERS = 3         # concurrent quote workers (ceiling)
+HARD_MAX_QUOTE_WORKERS = 10
 
 # Exchange instrument constraints are static enough to cache per symbol.
 _INSTRUMENT_CACHE_TTL_S = 3600.0
@@ -155,6 +162,8 @@ _STATS: dict[str, int] = {
     "duplicate_skipped": 0,
     "budget_denied": 0,
     "latency_denied": 0,
+    "worker_capacity_denied": 0,   # F2: worker ceiling reached (pre-claim)
+    "deadline_refused": 0,         # F1: worker skipped a new Bybit request
     "timing_denied": 0,
     "claimed": 0,
     "captured": 0,
@@ -414,6 +423,10 @@ class RuntimeConfig:
     expected_activation_ts: datetime | None
     max_cycle_latency_ms: int
     max_capture_ms: int
+    # F2: concurrency ceiling for the capture quote workers. A capture that
+    # finds the ceiling reached is denied BEFORE its claim and accounted in
+    # the coverage ledger — no queue, no unbounded thread accumulation.
+    max_quote_workers: int
 
 
 def _load_runtime_config() -> RuntimeConfig:
@@ -465,6 +478,16 @@ def _load_runtime_config() -> RuntimeConfig:
             f"{CAPTURE_LATENCY_ENV} ({max_capture_ms} ms) must not exceed "
             f"{CYCLE_LATENCY_ENV} ({cycle_latency_ms} ms)")
 
+    # F2 worker ceiling: a positive integer, hard-clamped. A capture that
+    # cannot get a worker slot is denied BEFORE its claim and accounted in
+    # the coverage ledger (API_BUDGET_DENIED / WORKER_CAPACITY_EXHAUSTED).
+    max_quote_workers = _read_limit(WORKERS_ENV, DEFAULT_MAX_QUOTE_WORKERS,
+                                    HARD_MAX_QUOTE_WORKERS)
+    if max_quote_workers < 1:
+        raise SrrFillConfigError(
+            f"{WORKERS_ENV} must be a positive integer (>= 1), "
+            f"got {max_quote_workers}")
+
     expected = None
     raw_expected = os.environ.get(EXPECTED_ACTIVATION_ENV)
     if raw_expected is not None and str(raw_expected).strip():
@@ -480,6 +503,7 @@ def _load_runtime_config() -> RuntimeConfig:
         expected_activation_ts=expected,
         max_cycle_latency_ms=cycle_latency_ms,
         max_capture_ms=max_capture_ms,
+        max_quote_workers=max_quote_workers,
     )
 
 
@@ -981,48 +1005,186 @@ def capture(conn, client, *, scanner_name, direction, symbol, signal_time,
         return False
 
 
-def _fetch_quote_phase(client, symbol: str, timeout_s: float) -> dict:
-    """Instrument lookup + orderbook GET inside a bounded worker (F1).
+# ── F1/F2: single monotonic deadline + bounded quote workers ────────────
+# ``thread.join(timeout)`` only bounds how long the scanner thread WAITS —
+# it is NOT a cancellation: a worker that outlives its capture keeps
+# running. Two mechanisms replace that assumption:
+#
+#   1. DEADLINE PROPAGATION — every live worker carries the capture's
+#      single monotonic ``deadline_at``. The worker checks it before
+#      EVERY potentially blocking step (instrument lookup, limiter wait
+#      inside the client, orderbook send) and passes the remaining budget
+#      into the client, which re-checks it after each wait and before each
+#      HTTP attempt (per-attempt timeout clamped to the remainder). No new
+#      Bybit request ever starts after the deadline; an already in-flight
+#      request is bounded by the real network timeout.
+#   2. BOUNDED CONCURRENCY — at most ``max_quote_workers`` worker threads
+#      exist at any moment. The main scan thread is the ONLY adder
+#      (single-threaded capture contract); workers remove themselves in
+#      ``finally``. Past the ceiling a capture is denied BEFORE its claim
+#      and accounted in the coverage ledger — there is no queue and no
+#      unbounded accumulation, even while requests hang.
+_WORKERS_LOCK = threading.Lock()
+_ACTIVE_WORKERS: set[threading.Thread] = set()
 
-    The scanner-facing thread waits at most ``timeout_s`` (``join``
+
+def _prune_workers_locked() -> None:
+    for worker in [w for w in _ACTIVE_WORKERS if not w.is_alive()]:
+        _ACTIVE_WORKERS.discard(worker)
+
+
+def active_worker_count() -> int:
+    """Live quote workers (finished threads pruned first). Monitoring."""
+    with _WORKERS_LOCK:
+        _prune_workers_locked()
+        return len(_ACTIVE_WORKERS)
+
+
+def _quote_worker_capacity_available(max_workers: int) -> bool:
+    with _WORKERS_LOCK:
+        _prune_workers_locked()
+        return len(_ACTIVE_WORKERS) < max_workers
+
+
+def _failure_reason_for(exc: BaseException) -> str:
+    """F3 refusal taxonomy: shared-limiter denial vs Bybit vs transport.
+
+    The client attaches ``limiter_result`` to every fail-closed shared
+    limiter refusal (``DENIED`` / ``LIMITER_UNAVAILABLE`` / ...); surfacing
+    it here separates "the shared limiter said no" from a plain Bybit or
+    transport error without changing the client contract.
+    """
+    limiter_result = getattr(exc, "limiter_result", None)
+    if limiter_result:
+        return f"limiter:{limiter_result}"
+    return f"orderbook:{type(exc).__name__}"
+
+
+def _fetch_quote_phase(
+    client: Any,
+    symbol: str,
+    *,
+    deadline_at: float,
+    max_workers: int,
+) -> dict:
+    """Instrument lookup + orderbook GET inside a bounded worker (F1/F2).
+
+    ``deadline_at`` is the capture's single monotonic deadline (capture
+    start + ``max_capture_ms``); ``max_workers`` is the live-worker
+    ceiling. The scanner thread waits at most until ``deadline_at`` (join
     bound), so a hung request can never stall the cycle beyond the
-    configured per-capture latency budget. The worker NEVER touches the
-    database — the research connection stays single-threaded — and it uses
-    the same budgeted, rate-limited client as before: no limiter bypass,
-    no extra retry layer. After a join timeout the orphaned worker may
-    still finish in the background (bounded by the client's own retry
-    deadline); its result is discarded and the claim is finalized as
-    ERROR, so a late quote can never become evidence.
+    configured per-capture latency budget. Evidence additionally requires
+    the quote to have been RECORDED on or before ``deadline_at`` — a
+    worker finishing a microsecond late (or still running) is a timeout,
+    which closes the join/finish race deterministically. The worker NEVER
+    touches the database — the research connection stays single-threaded
+    — and it uses the same budgeted, rate-limited client as before: no
+    limiter bypass, no extra retry layer, no separate rate limiter.
+    A late orphan's result is discarded by the claim finalization and the
+    worker exits without ever issuing a post-deadline request, so a late
+    quote can never become evidence.
     """
     result: dict = {
         "done": False, "book": None, "constraints": None,
         "constraints_error": None, "received_at": None, "error": None,
         "waited_ms": 0, "timed_out": False,
+        "received_mono": None, "finished_mono": None,
+        "instrument_lookup_ms": None, "orderbook_http_ms": None,
+        "deadline_refused": False, "worker_capacity_denied": False,
+        "worker_active_count": 0,
     }
+    started = time.monotonic()
+
+    # F1: never spawn a worker that is already past its deadline.
+    if time.monotonic() >= deadline_at:
+        result["deadline_refused"] = True
+        result["timed_out"] = True
+        with _WORKERS_LOCK:
+            _STATS["deadline_refused"] += 1
+        return result
 
     def _run() -> None:
         try:
+            # F1: no NEW Bybit request once the deadline has passed.
+            if time.monotonic() >= deadline_at:
+                result["deadline_refused"] = True
+                with _WORKERS_LOCK:
+                    _STATS["deadline_refused"] += 1
+                return
+            lookup_started = time.monotonic()
+            # Codex P2 (PR #263): the capture's ABSOLUTE monotonic deadline
+            # is forwarded VERBATIM to both legs (instrument lookup and,
+            # below, the orderbook) — nested calls min()-clamp the same
+            # immutable anchor, so the common budget can never be re-anchored
+            # (and thereby extended) between the two requests.
             constraints, constraints_error = instrument_constraints(
-                client, symbol)
+                client, symbol, deadline_at=deadline_at)
+            result["constraints"] = constraints
+            result["constraints_error"] = constraints_error
+            result["instrument_lookup_ms"] = int(
+                (time.monotonic() - lookup_started) * 1000)
+            if time.monotonic() >= deadline_at:
+                # The lookup outlived the capture window (slow limiter or
+                # HTTP): the orderbook request is NOT issued.
+                result["deadline_refused"] = True
+                with _WORKERS_LOCK:
+                    _STATS["deadline_refused"] += 1
+                return
+            request_started = time.monotonic()
             book = client._public_get(
                 ORDERBOOK_ENDPOINT, category="linear", symbol=symbol,
-                limit=50)
-            result.update(
-                book=book, constraints=constraints,
-                constraints_error=constraints_error,
-                received_at=datetime.now(timezone.utc))
+                limit=50,
+                caller_deadline_at=deadline_at)
+            result["orderbook_http_ms"] = int(
+                (time.monotonic() - request_started) * 1000)
+            result["book"] = book
+            result["received_at"] = datetime.now(timezone.utc)
+            # Monotonic stamp decides evidence: received AFTER the
+            # deadline is a timeout even if the thread finishes later.
+            result["received_mono"] = time.monotonic()
         except BaseException as exc:  # noqa: BLE001 — recorded, never raised
             result["error"] = exc
         finally:
+            # Completion stamp (BEFORE done): a genuine worker error that
+            # arrived in time is an API failure, not a latency timeout.
+            result["finished_mono"] = time.monotonic()
             result["done"] = True
+            with _WORKERS_LOCK:
+                _ACTIVE_WORKERS.discard(thread)
 
     thread = threading.Thread(target=_run, name="srr-fill-quote",
                               daemon=True)
-    started = time.monotonic()
+    with _WORKERS_LOCK:
+        _prune_workers_locked()
+        if len(_ACTIVE_WORKERS) >= max_workers:
+            # F2: the ceiling is reached — deny BEFORE spawn (the caller
+            # has already checked pre-claim; this is the fail-closed
+            # defense for the post-claim spawn itself). No queue.
+            result["worker_capacity_denied"] = True
+            result["worker_active_count"] = len(_ACTIVE_WORKERS)
+            result["timed_out"] = True
+            return result
+        _ACTIVE_WORKERS.add(thread)
+        result["worker_active_count"] = len(_ACTIVE_WORKERS)
     thread.start()
-    thread.join(timeout_s)
+    thread.join(max(0.0, deadline_at - time.monotonic()))
     result["waited_ms"] = int((time.monotonic() - started) * 1000)
-    result["timed_out"] = not result["done"]
+    # Race-free classification:
+    #   * evidence requires the quote RECORDED on or before the deadline
+    #     (never "the thread happened to finish");
+    #   * a worker that refused past the deadline is a timeout;
+    #   * a worker error that FINISHED in time is a genuine API failure
+    #     (orderbook/limiter taxonomy), never reclassified as latency.
+    if not result["done"]:
+        on_time = False
+    elif result["received_mono"] is not None:
+        on_time = result["received_mono"] <= deadline_at
+    elif result["deadline_refused"]:
+        on_time = False
+    else:
+        on_time = (result.get("finished_mono") is not None
+                   and result["finished_mono"] <= deadline_at)
+    result["timed_out"] = not on_time
     return result
 
 
@@ -1050,6 +1212,11 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
     #     a clock/identity anomaly, never a valid signal-time quote. Fail
     #     closed BEFORE the budget and before any network request.
     capture_started_at = datetime.now(timezone.utc)
+    # F1: the capture's single monotonic deadline covers the WHOLE
+    # sequence — dup-check, claim, instrument lookup, limiter wait,
+    # orderbook, retry/backoff — and is propagated into the quote worker.
+    capture_started_mono = time.monotonic()
+    deadline_at = capture_started_mono + config.max_capture_ms / 1000.0
     signal_to_capture_ms = int(
         (capture_started_at - obs["signal_time"]).total_seconds() * 1000)
     if signal_to_capture_ms < 0:
@@ -1074,6 +1241,21 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
             config.max_capture_ms)
         _record_coverage(conn, [obs], "LATENCY_BUDGET_DENIED",
                          f"remaining_ms={remaining_ms}")
+        return False
+
+    # 6c2. F2 worker ceiling: refuse BEFORE the claim when no quote-worker
+    #      slot is free (orphans from earlier timeouts still hold theirs).
+    #      The event stays accounted in the coverage ledger, no thread and
+    #      no HTTP call is started, and the API budget slot is NOT spent.
+    if not _quote_worker_capacity_available(config.max_quote_workers):
+        _STATS["worker_capacity_denied"] += 1
+        active = active_worker_count()
+        LOG.info(
+            "SRR fill capture skipped: quote worker capacity exhausted "
+            "(%d/%d active); coverage loss recorded",
+            active, config.max_quote_workers)
+        _record_coverage(conn, [obs], "API_BUDGET_DENIED",
+                         "WORKER_CAPACITY_EXHAUSTED")
         return False
 
     # 6d. Explicit API budget: predictable refusal, counted for coverage.
@@ -1118,13 +1300,16 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
         return False
     _STATS["claimed"] += 1
 
-    # 6f. Bounded quote fetch (F1): instrument lookup, limiter wait, retries
-    #     and HTTP all happen inside the worker; this thread waits at most
-    #     config.max_capture_ms. The FULL wall-clock of the capture —
-    #     including the DB finalization below — is charged to the cycle
-    #     budget by capture() when this function returns (every path).
+    # 6f. Bounded quote fetch (F1/F2): the worker carries the single
+    #     monotonic deadline — instrument lookup, limiter wait, retries
+    #     and HTTP are all deadline-bounded inside it — and the number of
+    #     live workers is capped; this thread waits at most until the
+    #     deadline. The FULL wall-clock of the capture — including the DB
+    #     finalization below — is charged to the cycle budget by
+    #     capture() when this function returns (every path).
     quote = _fetch_quote_phase(client, obs["symbol"],
-                               timeout_s=config.max_capture_ms / 1000.0)
+                               deadline_at=deadline_at,
+                               max_workers=config.max_quote_workers)
 
     capture_finished_at = datetime.now(timezone.utc)
     api_request_ms = int(
@@ -1142,15 +1327,19 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
     snapshot = None
     book_error: BaseException | None = None
     if quote["timed_out"]:
-        # Join bound expired: fail closed. The orphaned worker's result is
-        # discarded - a late quote can never be stored as evidence.
+        # Deadline/worker-ceiling miss: fail closed. The orphaned worker's
+        # result is discarded - a late quote can never be stored as
+        # evidence, and the worker itself never starts a NEW request past
+        # the deadline (it exits instead).
         book_error = TimeoutError(
             f"capture latency budget {config.max_capture_ms}ms exceeded")
         LOG.warning(
             "SRR fill capture hit the per-capture latency bound: symbol=%s "
-            "observation_id=%s waited_ms=%d max_capture_ms=%d",
+            "observation_id=%s waited_ms=%d max_capture_ms=%d "
+            "deadline_refused=%s worker_capacity_denied=%s",
             obs["symbol"], obs["observation_id"], quote["waited_ms"],
-            config.max_capture_ms)
+            config.max_capture_ms, quote.get("deadline_refused"),
+            quote.get("worker_capacity_denied"))
     elif quote["error"] is not None:
         book_error = quote["error"]
     else:
@@ -1166,10 +1355,21 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
             book_error = exc
 
     if snapshot is None:
-        if quote["timed_out"]:
+        if quote.get("worker_capacity_denied"):
+            # Unreachable in practice (checked pre-claim at 6c2); the
+            # claim exists, so the row is finalized with an explicit
+            # reason instead of vanishing (F4).
+            reason = "worker:CAPACITY_DENIED"
+        elif quote.get("deadline_refused"):
+            # The worker refused to START a new Bybit request past the
+            # deadline — stricter than a plain join timeout.
+            reason = "deadline:EXCEEDED"
+        elif quote["timed_out"]:
             reason = "latency:TIMEOUT"
         elif book_error is not None:
-            reason = f"orderbook:{type(book_error).__name__}"
+            # F3 taxonomy: a shared-limiter refusal carries its own
+            # limiter_result and never masquerades as a Bybit error.
+            reason = _failure_reason_for(book_error)
         else:
             reason = "orderbook:UNKNOWN"
         payload = _error_payload(
@@ -1186,10 +1386,25 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
         status = snapshot["status"]
         quality = payload["quote_quality_status"]
 
-    # F1 evidence: what this capture cost and how much room was left.
+    # F1/F3 evidence: what this capture cost, how much room was left and
+    # how the quote phase was bounded (separate telemetry per component).
+    now_mono = time.monotonic()
     payload["source_diagnostics"]["latency"] = {
+        "signal_to_capture_ms": signal_to_capture_ms,
         "quote_phase_ms": quote["waited_ms"],
+        "capture_total_ms": int((now_mono - capture_started_mono) * 1000),
+        # Negative once the deadline passed: the budget LEFT when this row
+        # was built (the DB finalization is charged to the cycle budget).
+        "deadline_remaining_ms": int((deadline_at - now_mono) * 1000),
         "worker_timed_out": bool(quote["timed_out"]),
+        "instrument_lookup_ms": quote["instrument_lookup_ms"],
+        "orderbook_http_ms": quote["orderbook_http_ms"],
+        # F3: the shared limiter exposes no per-acquire wait on the success
+        # path — recorded as NULL/UNKNOWN, never a guessed value.
+        "limiter_wait_ms": None,
+        "limiter_wait_source": "unknown",
+        "worker_active_count": quote["worker_active_count"],
+        "worker_capacity_denied_count": _STATS["worker_capacity_denied"],
         # Budget state including THIS capture through the quote phase; the
         # cycle charge (capture()) additionally includes DB finalization.
         "cycle_latency_ms": _BUDGET.cycle_latency_ms + int(
@@ -1197,6 +1412,7 @@ def _capture_one(conn, client, obs: dict, activation_ts: datetime,
             .total_seconds() * 1000),
         "max_capture_ms": config.max_capture_ms,
         "max_cycle_latency_ms": config.max_cycle_latency_ms,
+        "max_quote_workers": config.max_quote_workers,
     }
 
     if not _finalize_row(conn, event_key, payload):

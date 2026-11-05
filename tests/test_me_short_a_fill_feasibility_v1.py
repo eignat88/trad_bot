@@ -342,6 +342,39 @@ def test_instrument_constraints_parsing_and_cache():
     assert err == "instruments_info:RuntimeError"
 
 
+def test_instrument_constraints_forwards_the_caller_deadline():
+    # SRR quote capture passes its remaining monotonic budget into the
+    # lookup so it can never outlive the capture window; the ME A capture
+    # (no deadline) keeps calling exactly as before.
+    client = FakeClient(instruments=LINEAR_INSTRUMENT)
+    instrument_constraints(client, "BTCUSDT", deadline_s=1.5)
+    assert client.calls[0][1].get("deadline_s") == 1.5
+
+    instrument_constraints(client, "ETHUSDT")
+    assert "deadline_s" not in client.calls[1][1]   # default path unchanged
+
+
+def test_instrument_constraints_forwards_the_immutable_absolute_deadline():
+    # Codex P2 (PR #263): the capture's ABSOLUTE monotonic deadline is
+    # forwarded VERBATIM as caller_deadline_at — the nested lookup never
+    # re-anchors (and thereby never extends) the enclosing budget; when
+    # given it takes precedence over the relative deadline_s, and the
+    # plain call carries neither key.
+    client = FakeClient(instruments=LINEAR_INSTRUMENT)
+    instrument_constraints(client, "BTCUSDT", deadline_at=1002.0)
+    assert client.calls[0][1].get("caller_deadline_at") == 1002.0
+    assert "deadline_s" not in client.calls[0][1]   # absolute wins cleanly
+
+    instrument_constraints(client, "ETHUSDT", deadline_s=1.5,
+                           deadline_at=1002.0)
+    assert client.calls[1][1].get("caller_deadline_at") == 1002.0
+    assert "deadline_s" not in client.calls[1][1]
+
+    instrument_constraints(client, "BNBUSDT")
+    assert "caller_deadline_at" not in client.calls[2][1]  # default unchanged
+    assert "deadline_s" not in client.calls[2][1]
+
+
 # Actual Bybit v5 linear instruments-info shape: minimum notional lives in
 # lotSizeFilter.minNotionalValue (not minNotional / minOrderAmt).
 LINEAR_INSTRUMENT = {"result": {"list": [{

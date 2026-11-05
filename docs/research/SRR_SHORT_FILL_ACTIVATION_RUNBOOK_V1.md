@@ -26,6 +26,7 @@
 | `SRR_SHORT_FILL_MAX_PER_RUN` | no | `200` | `2000` | `≥ 1000` (F4 §12.3.6) |
 | `SRR_SHORT_FILL_MAX_CYCLE_LATENCY_MS` (F1) | no | `5000` | `60000` | `5000` |
 | `SRR_SHORT_FILL_MAX_CAPTURE_MS` (F1) | no | `2000` | `60000` | `2000` (must be ≤ cycle window) |
+| `SRR_SHORT_FILL_MAX_QUOTE_WORKERS` (F2) | no | `3` | `10` | `3` (live quote-worker ceiling) |
 | `SRR_SHORT_FILL_EXPECTED_ACTIVATION_TS` | recommended | unset | — | exact ISO-8601 of the chosen `activation_ts` |
 
 Rules enforced by the module itself (any violation → capture refuses,
@@ -33,13 +34,23 @@ Rules enforced by the module itself (any violation → capture refuses,
 
 * delay budget must be a positive integer when armed;
 * `MAX_CAPTURE_MS ≤ MAX_CYCLE_LATENCY_MS`, both positive;
+* `MAX_QUOTE_WORKERS ≥ 1` (a capture that finds the ceiling reached is
+  denied BEFORE its claim: coverage `API_BUDGET_DENIED` /
+  `WORKER_CAPACITY_EXHAUSTED`, `stats()["worker_capacity_denied"]`);
 * `MAX_PER_*` values are clamped to their hard caps;
 * expected activation timestamp must parse and match the DB record.
 
 Shared client settings (unchanged, no bypass): `bybit_retry_deadline_s`
 (default 60 s) and the global Bybit rate limiter — SRR capture uses the
 same budgeted `_public_get` as everything else (≤ 2 GETs per accepted
-event: instruments on cache miss + orderbook).
+event: instruments on cache miss + orderbook). The capture additionally
+passes its own IMMUTABLE absolute monotonic deadline as
+`caller_deadline_at` (anchored at `_budgeted_get()` entry, forwarded
+verbatim through the instrument lookup and the orderbook leg so nested
+calls never re-anchor it), which only SHORTENS that envelope (min
+semantics): after the capture deadline the worker starts no new Bybit
+request, and a fail-closed shared-limiter refusal is recorded as
+`limiter:<RESULT>` in `failure_reason`.
 
 ## 2. Pre-activation checklist (all must pass)
 
@@ -102,7 +113,14 @@ A5. Arm: set `SRR_SHORT_FILL_CAPTURE_ENABLED=1` (+ delay budget, latency
 ## 5. Ongoing monitoring and stops
 
 * Monitoring cadence: daily during the first week (coverage, latency,
-  budget pressure, stuck `PENDING` claims).
+  budget pressure, stuck `PENDING` claims, worker health).
+* Worker/deadline health (from `source_diagnostics.latency` and
+  `stats()`): `worker_active_count` must stay ≤
+  `MAX_QUOTE_WORKERS`, `worker_capacity_denied_count` and
+  `deadline:EXCEEDED` rows should be rare, `limiter_wait_ms` stays
+  `null`/`unknown` (never guessed), and `instrument_lookup_ms` /
+  `orderbook_http_ms` / `capture_total_ms` / `deadline_remaining_ms`
+  give the split latency picture.
 * Stop conditions: doc §13 (budget/latency denials, ERROR rate, cycle
   effects, identity doubt, out-of-scope writes, coverage ledger
   failures).

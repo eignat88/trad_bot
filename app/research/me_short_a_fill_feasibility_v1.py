@@ -127,7 +127,8 @@ def _first_decimal(mapping, keys):
     return None
 
 
-def instrument_constraints(client, symbol, *, now=None):
+def instrument_constraints(client, symbol, *, now=None, deadline_s=None,
+                           deadline_at=None):
     """Return ``(constraints_dict | None, error | None)`` for a linear symbol.
 
     Fail-open on the lookup itself (quote capture must survive a flaky
@@ -139,6 +140,17 @@ def instrument_constraints(client, symbol, *, now=None):
     missing/empty spec is reported as ``None`` with a lookup error so
     ``constraints_known=false`` exclusion semantics apply. The linear API
     exposes the minimum notional as ``lotSizeFilter.minNotionalValue``.
+
+    ``deadline_s`` (optional) is the caller's remaining monotonic budget
+    (SRR quote capture, SRR_SHORT_FILL_LATE_WORKER_AND_API_BUDGET_HARDENING_V1):
+    it is forwarded to the budgeted client so the lookup itself can never
+    outlive the capture window. Default ``None`` keeps the ME A capture
+    behaviour unchanged.
+
+    ``deadline_at`` (optional, Codex P2 PR #263) is the caller's ABSOLUTE
+    monotonic deadline: forwarded verbatim as ``caller_deadline_at`` so the
+    enclosing capture's anchor is never re-computed (never extended) by this
+    nested call. When given it takes precedence over ``deadline_s``.
     """
     now_s = time.time() if now is None else float(now)
     cached = _INSTRUMENT_CACHE.get(symbol)
@@ -147,8 +159,12 @@ def instrument_constraints(client, symbol, *, now=None):
     constraints = None
     error = None
     try:
-        payload = client._public_get(
-            INSTRUMENTS_ENDPOINT, category="linear", symbol=symbol)
+        params = {"category": "linear", "symbol": symbol}
+        if deadline_at is not None:
+            params["caller_deadline_at"] = deadline_at
+        elif deadline_s is not None:
+            params["deadline_s"] = deadline_s
+        payload = client._public_get(INSTRUMENTS_ENDPOINT, **params)
         rows = (payload.get("result") or {}).get("list") or []
         lot = rows[0].get("lotSizeFilter") if rows else None
         if not isinstance(lot, dict) or not lot:

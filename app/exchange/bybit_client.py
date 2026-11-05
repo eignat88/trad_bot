@@ -570,11 +570,36 @@ class BybitClient:
         }
 
     def _public_get(
-        self, endpoint: str, *, retry_priority: str | None = None, **params: Any
+        self, endpoint: str, *, retry_priority: str | None = None,
+        deadline_s: float | None = None,
+        caller_deadline_at: float | None = None, **params: Any
     ) -> dict[str, Any]:
-        """One BUDGETED logical GET request (BYBIT_RETRY_BUDGET_HARDENING_V1)."""
+        """One BUDGETED logical GET request (BYBIT_RETRY_BUDGET_HARDENING_V1).
+
+        ``deadline_s`` (optional, default ``None``) tightens the monotonic
+        retry envelope for THIS logical request: the effective deadline is
+        ``min(bybit_retry_deadline_s, deadline_s)`` measured from this
+        call. It can only SHORTEN the existing envelope — never extend it
+        — and it applies even when the global retry deadline is disabled.
+
+        ``caller_deadline_at`` (optional, default ``None``) is the
+        enclosing capture's ABSOLUTE monotonic deadline (SRR quote phase,
+        Codex P2 PR #263): forwarded verbatim into ``_budgeted_get`` and
+        min()-clamped there, so nested calls (instrument lookup →
+        orderbook) share ONE immutable anchor and can never re-anchor —
+        and thereby never extend — the original budget.
+
+        Every blocking step below (breaker gate, shared-limiter acquire,
+        request setup, per-attempt HTTP timeout, retry backoff) re-checks
+        the same anchored ``deadline_at``, so no new attempt starts past
+        the caller's budget. Omitting both keeps the historical behaviour
+        byte-for-byte for every existing caller (SRR quote capture, ME
+        A/B/C, HTF, VC).
+        """
         return self._budgeted_get(
-            endpoint, signed=False, retry_priority=retry_priority, **params)
+            endpoint, signed=False, retry_priority=retry_priority,
+            caller_deadline_s=deadline_s,
+            caller_deadline_at=caller_deadline_at, **params)
 
     def _private_get(
         self, endpoint: str, *, retry_priority: str | None = None, **params: Any
@@ -599,7 +624,9 @@ class BybitClient:
 
     def _budgeted_get(
         self, endpoint: str, *, signed: bool = False,
-        retry_priority: str | None = None, **params: Any
+        retry_priority: str | None = None,
+        caller_deadline_s: float | None = None,
+        caller_deadline_at: float | None = None, **params: Any
     ) -> dict[str, Any]:
         """One BUDGETED logical GET request (BYBIT_RETRY_BUDGET_HARDENING_V1).
 
@@ -643,6 +670,33 @@ class BybitClient:
         one ``logical_request_id`` with strictly increasing ``attempt_index``
         and ``retry_reason`` in {none, timeout, rate_limit}.
         """
+        # Codex P2 (PR #263 — "anchor the caller deadline before request
+        # setup"): the monotonic clock is sampled at function ENTRY and the
+        # ABSOLUTE deadline is fixed from that sample BEFORE any potentially
+        # blocking setup below (settings reads, limiter/breaker/storm
+        # construction, telemetry, _resolve_caller) — preparation time is
+        # therefore CHARGED to the budget instead of silently extending it.
+        # ``caller_deadline_at`` is the enclosing capture's IMMUTABLE
+        # monotonic deadline (SRR quote phase) passed through verbatim:
+        # min() can only SHORTEN the envelope and no nested call re-anchors
+        # it. ``caller_deadline_s`` (historical relative callers) is
+        # anchored from the SAME entry sample.
+        anchor_mono = time.monotonic()
+        deadline_s = retry_budget.float_setting(
+            self.settings, "bybit_retry_deadline_s", 60.0)
+        deadline_at = (anchor_mono + deadline_s) if deadline_s > 0 else None
+        if caller_deadline_at is not None:
+            deadline_at = (
+                caller_deadline_at if deadline_at is None
+                else min(deadline_at, caller_deadline_at)
+            )
+        if caller_deadline_s is not None:
+            caller_relative_at = anchor_mono + max(0.0, caller_deadline_s)
+            deadline_at = (
+                caller_relative_at if deadline_at is None
+                else min(deadline_at, caller_relative_at)
+            )
+
         budget = max(1, min(
             retry_budget.int_setting(self.settings, "bybit_max_attempts", 3),
             retry_budget.HARD_MAX_ATTEMPTS,
@@ -657,8 +711,6 @@ class BybitClient:
             self.settings, "bybit_rate_limit_cooldown_s", 2.0)
         max_wait_s = retry_budget.float_setting(
             self.settings, "bybit_breaker_max_wait_s", 30.0)
-        deadline_s = retry_budget.float_setting(
-            self.settings, "bybit_retry_deadline_s", 60.0)
 
         priority = retry_budget.resolve_priority(retry_priority, endpoint)
         rl_retry_cap = min(retry_budget.rl_retry_cap(priority), rl_max_retries)
@@ -685,7 +737,11 @@ class BybitClient:
         symbol = params.get("symbol", endpoint)
         interval = params.get("interval", "")
         limit = params.get("limit", 0)
-        deadline_at = (time.monotonic() + deadline_s) if deadline_s > 0 else None
+        # The absolute deadline was anchored at function ENTRY (see the
+        # anchor block above): every consumer below — breaker gate, limiter
+        # acquire, per-attempt timeout, the pre-send checks — enforces the
+        # SAME immutable deadline, caller budget included. Nothing here
+        # re-samples the clock for ``deadline_at``.
 
         attempt_index = 0
         sends_made = 0
@@ -720,6 +776,30 @@ class BybitClient:
                     ret_code=ret_code,
                     retry_reason=retry_reason,
                 )
+
+            def _deny_expired_before_send() -> None:
+                """Fail closed on an expired ABSOLUTE deadline (Codex P2).
+
+                Called AFTER the blocking shared-limiter ``acquire`` /
+                ``prepare_send`` and directly before the HTTP send: no
+                request leaves, the already-acquired grant (if any) is
+                finalized exactly once as ``NOT_SENT`` (the same
+                pre-send denial contract as the order path), telemetry
+                keeps its ``BYBIT_API_SKIP`` record, and the denial
+                follows the existing ``retry deadline exceeded``
+                exception contract (backward compatible).
+                """
+                if shared is not None and grant is not None:
+                    try:
+                        shared.record_result(grant.grant_id, priority,
+                                             "NOT_SENT")
+                    except Exception:  # never mask the denial
+                        logger.warning(
+                            "%s: shared limiter record_result failed on %s "
+                            "(outcome=NOT_SENT)", symbol, endpoint)
+                rec("BYBIT_API_SKIP",
+                    ret_msg="deadline exceeded before send")
+                deny("retry deadline exceeded")
 
             # --- Phase 4: shared cross-process limiter gate (default-off) ---
             # acquire → prepare_send BEFORE the attempt, record_result after.
@@ -783,6 +863,13 @@ class BybitClient:
                         queue_wait_ms=grant.waited_ms,
                         telemetry_result="BYBIT_API_SKIP",
                     )
+                # Codex P2 (PR #263 discussion r4479576051): re-check the
+                # absolute deadline right AFTER the blocking acquire and
+                # BEFORE preparing the send — an expired budget never
+                # reaches prepare_send, let alone HTTP.
+                if (deadline_at is not None
+                        and time.monotonic() >= deadline_at):
+                    _deny_expired_before_send()
                 if not shared.prepare_send(grant.grant_id):
                     shared.record_result(grant.grant_id, priority, "REVOKED")
                     rec("BYBIT_API_SKIP",
@@ -797,6 +884,20 @@ class BybitClient:
                     )
                 # The queue wait is excluded from the HTTP-attempt duration.
                 t_start = time.monotonic()
+
+            # Codex P2 (PR #263 discussion r4479576051): FINAL re-check of
+            # the absolute deadline immediately before the HTTP send —
+            # after the blocking shared-limiter acquire + prepare_send —
+            # and the transport timeout is recomputed from the ACTUALLY
+            # remaining time, never the pre-acquire figure. Without this,
+            # an acquire/prepare_send that consumed the caller budget
+            # would still emit HTTP with the stale attempt_timeout and
+            # outlive the caller's capture window.
+            if deadline_at is not None:
+                remaining_s = deadline_at - time.monotonic()
+                if remaining_s <= 0:
+                    _deny_expired_before_send()
+                attempt_timeout = min(attempt_timeout, remaining_s)
 
             sends_made += 1          # an actual HTTP attempt is about to go out
 
@@ -931,6 +1032,26 @@ class BybitClient:
                             "%s: shared limiter record_result failed on %s "
                             "(outcome=%s)", symbol, endpoint, limiter_outcome)
 
+        def record_skip(ret_msg: str) -> None:
+            """Secret-free ``BYBIT_API_SKIP`` telemetry for a pre-send denial.
+
+            Emitted when the anchored deadline expired BEFORE the first
+            HTTP attempt (request setup consumed the budget — Codex P2
+            PR #263) so the skip stays observable in telemetry. Fail-open
+            by contract, like every other telemetry record: it can never
+            alter the request outcome.
+            """
+            _record_attempt(
+                telemetry, response=None,
+                endpoint=endpoint, caller=caller, symbol=symbol,
+                interval=interval, limit=limit,
+                duration_ms=(time.monotonic() - anchor_mono) * 1000,
+                result="BYBIT_API_SKIP", ret_msg=ret_msg,
+                logical_request_id=logical_request_id,
+                attempt_index=attempt_index, total_attempts=budget,
+                retry_reason=retry_reason,
+            )
+
         def deny(reason: str) -> None:
             """Fail closed: no further attempt (budget/cap/guard/deadline)."""
             if last_class == retry_budget.CLASS_RATE_LIMIT:
@@ -986,6 +1107,11 @@ class BybitClient:
             if deadline_at is not None:
                 remaining_s = deadline_at - time.monotonic()
                 if remaining_s <= 0:
+                    # Codex P2 (PR #263): the budget was consumed by
+                    # request SETUP after the entry anchor (telemetry,
+                    # _resolve_caller, ...) — refuse BEFORE the send and
+                    # keep the skip observable; no HTTP leaves.
+                    record_skip("deadline exceeded before send")
                     deny("retry deadline exceeded")
                 attempt_timeout = min(attempt_timeout, remaining_s)
 

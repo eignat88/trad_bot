@@ -10,6 +10,7 @@ PostgreSQL, and no real trading orders are possible anywhere in this module
 (read-only public market endpoints only).
 """
 import json
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -57,11 +58,16 @@ def _env(monkeypatch):
     monkeypatch.delenv("SRR_SHORT_FILL_MAX_PER_RUN", raising=False)
     monkeypatch.delenv("SRR_SHORT_FILL_MAX_CYCLE_LATENCY_MS", raising=False)
     monkeypatch.delenv("SRR_SHORT_FILL_MAX_CAPTURE_MS", raising=False)
+    monkeypatch.delenv("SRR_SHORT_FILL_MAX_QUOTE_WORKERS", raising=False)
+    with mod._WORKERS_LOCK:            # isolate live quote workers per test
+        mod._ACTIVE_WORKERS.clear()
     mod.reset_stats()
     mod.reset_budget()
     mod.clear_static_identity_cache()
     me_mod._INSTRUMENT_CACHE.clear()
     yield
+    with mod._WORKERS_LOCK:
+        mod._ACTIVE_WORKERS.clear()
     mod.reset_stats()
     mod.reset_budget()
     mod.clear_static_identity_cache()
@@ -202,24 +208,44 @@ class FakeClient:
     ``book_delay_s`` / ``instruments_delay_s`` inject artificial latency
     (limiter wait + HTTP round trip) into each leg of the quote path so
     tests can drive the FULL signal->quote delay window.
+
+    ``book_block_event`` / ``instruments_block_event`` make a leg HANG
+    until the test releases it (late-worker scenarios: a request that
+    outlives the capture deadline). ``limiter_error`` raises before any
+    book work, mimicking a fail-closed shared-limiter refusal.
     """
 
     def __init__(self, book=None, instruments=None, book_error=None,
-                 book_delay_s=0.0, instruments_delay_s=0.0):
+                 book_delay_s=0.0, instruments_delay_s=0.0,
+                 book_block_event=None, instruments_block_event=None,
+                 limiter_error=None):
         self.book = book
         self.instruments = instruments
         self.book_error = book_error
         self.book_delay_s = book_delay_s
         self.instruments_delay_s = instruments_delay_s
+        self.book_block_event = book_block_event
+        self.instruments_block_event = instruments_block_event
+        self.limiter_error = limiter_error
         self.calls = []
+        self.call_mons = []            # monotonic stamp per issued leg
 
     def _public_get(self, endpoint, **params):
         self.calls.append((endpoint, params))
+        self.call_mons.append(time.monotonic())
         if endpoint.endswith("/orderbook"):
+            if self.book_block_event is not None:
+                # Controlled hang (bounded safety so a broken test cannot
+                # leak an immortal thread): released by the test itself.
+                self.book_block_event.wait(timeout=10.0)
             time.sleep(self.book_delay_s)
             if self.book_error is not None:
                 raise self.book_error
+            if self.limiter_error is not None:
+                raise self.limiter_error
             return self.book or {}
+        if self.instruments_block_event is not None:
+            self.instruments_block_event.wait(timeout=10.0)
         time.sleep(self.instruments_delay_s)
         return self.instruments if self.instruments is not None else \
             {"result": {"list": []}}
@@ -1436,3 +1462,245 @@ def test_coverage_dispositions_are_first_write_wins():
     assert "ON CONFLICT (observation_id) DO NOTHING" in sql
     assert params[0] == 1
     assert params[4] in mod.COVERAGE_DISPOSITIONS
+
+
+# ── SRR_SHORT_FILL_LATE_WORKER_AND_API_BUDGET_HARDENING_V1 ──────────────
+# Scenarios: instrument hang, limiter hold, deadline between legs, late
+# HTTP, no-new-request-after-deadline, bounded workers, capacity coverage,
+# duplicate idempotency, late answer never evidence, fresh capture, scanner
+# isolation (see the wrapper tests above) — all with controlled blocking
+# and fake time, never a real Bybit call.
+
+
+def wait_no_workers(timeout_s=5.0):
+    """Drain every quote worker (poll the bounded registry)."""
+    deadline = time.monotonic() + timeout_s
+    while mod.active_worker_count() > 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert mod.active_worker_count() == 0, "quote worker leaked"
+
+
+def test_instrument_lookup_hang_never_issues_orderbook_after_deadline(
+        monkeypatch):
+    # Scenario 1+5: instrument_constraints() hangs past the capture
+    # deadline. The scanner returns at the deadline, and once released the
+    # worker must EXIT without starting a new (orderbook) Bybit request.
+    monkeypatch.setenv(mod.CAPTURE_LATENCY_ENV, "300")
+    monkeypatch.setenv(mod.CYCLE_LATENCY_ENV, "5000")
+    block = threading.Event()
+    client = good_client(instruments_block_event=block)
+    db = FakeConnection(observations={1: obs_row()})
+    try:
+        started = time.monotonic()
+        out = mod.capture(db, client, **capture_kwargs())
+        elapsed = time.monotonic() - started
+    finally:
+        block.set()  # release the orphan AFTER the capture returned
+    wait_no_workers()                        # it exits, never re-requests
+    assert out is True                       # claim finalized as ERROR
+    assert elapsed < 1.5                     # bounded by the 300ms window
+    assert client.orderbook_calls == []      # NO request after the deadline
+    assert len(client.calls) == 1            # only the instruments attempt
+    assert finalize_row(db)["failure_reason"] == "latency:TIMEOUT"
+    assert db.claim_inserts and db.updates    # claim existed -> finalized
+    assert mod.stats()["deadline_refused"] == 1
+    assert mod.stats()["worker_capacity_denied"] == 0
+
+
+def test_deadline_expires_between_instrument_and_orderbook(monkeypatch):
+    # Scenario 2+3 (a limiter-held/slow instruments leg): the lookup
+    # returns AFTER the deadline — the orderbook request must never start.
+    monkeypatch.setenv(mod.CAPTURE_LATENCY_ENV, "300")
+    monkeypatch.setenv(mod.CYCLE_LATENCY_ENV, "5000")
+    client = good_client(instruments_delay_s=0.45)   # > the 300ms window
+    db = FakeConnection(observations={1: obs_row()})
+    out = mod.capture(db, client, **capture_kwargs())
+    wait_no_workers()                        # the lookup returns, then exits
+    assert out is True                       # claim finalized as ERROR
+    assert len(client.calls) == 1            # instruments only
+    assert client.orderbook_calls == []      # never issued post-deadline
+    assert finalize_row(db)["failure_reason"] == "latency:TIMEOUT"
+    assert mod.stats()["deadline_refused"] == 1
+
+
+def test_instrument_to_orderbook_sequence_shares_one_absolute_budget():
+    # Codex P2 (PR #263): the instrument lookup and the orderbook leg
+    # carry the SAME immutable absolute deadline sampled at capture start
+    # — a slow lookup (0.15s here) does NOT re-anchor (extend) the budget
+    # for the orderbook leg: both legs see the identical anchor value and
+    # the anchor predates both sends.
+    client = good_client(instruments_delay_s=0.15, book_delay_s=0.15)
+    db = FakeConnection(observations={1: obs_row()})
+    assert mod.capture(db, client, **capture_kwargs()) is True
+    wait_no_workers()
+    assert len(client.calls) == 2               # lookup then orderbook
+    lookup_deadline = client.calls[0][1].get("caller_deadline_at")
+    book_deadline = client.calls[1][1].get("caller_deadline_at")
+    assert isinstance(lookup_deadline, float)
+    assert isinstance(book_deadline, float)
+    assert lookup_deadline == book_deadline     # ONE anchor, never re-anchored
+    # Sampled at capture start: from the orderbook's send time the
+    # remaining budget is strictly BELOW the full 2000ms ceiling (the
+    # 0.15s lookup was charged, not added back).
+    assert book_deadline < client.call_mons[1] + 2.0
+
+
+def test_shared_limiter_refusal_is_separated_from_bybit_errors():
+    # F3 taxonomy: a fail-closed shared-limiter refusal carries
+    # limiter_result and never masquerades as a plain Bybit error.
+    client = good_client(limiter_error=BybitRateLimitError(
+        "deferred by shared rate limiter (DENIED)",
+        limiter_result="DENIED", limiter_reason="deadline"))
+    db = FakeConnection(observations={1: obs_row()})
+    assert mod.capture(db, client, **capture_kwargs()) is True
+    row = finalize_row(db)
+    assert row["feasibility_status"] == "ERROR"
+    assert row["failure_reason"] == "limiter:DENIED"
+
+
+def test_worker_capacity_exhaustion_denied_with_coverage(monkeypatch):
+    # Scenario 6+7: sequential timeouts leave live orphans; the ceiling
+    # (1 worker here) refuses the NEXT capture BEFORE its claim — no HTTP,
+    # no queue, workers never exceed the cap — and the refusal is
+    # accounted in the coverage ledger instead of vanishing.
+    monkeypatch.setenv(mod.CAPTURE_LATENCY_ENV, "250")
+    monkeypatch.setenv(mod.CYCLE_LATENCY_ENV, "5000")
+    monkeypatch.setenv(mod.WORKERS_ENV, "1")
+    block = threading.Event()
+    client = good_client(book_block_event=block)
+    observations = {i: obs_row(obs_id=i) for i in (1, 2, 3)}
+    db = FakeConnection(observations=observations)
+    try:
+        # Capture 1: hangs in the orderbook -> ERROR row, the orphan
+        # holds the single worker slot.
+        assert mod.capture(db, client,
+                           **capture_kwargs(observation_ids=[1])) is True
+        assert mod.active_worker_count() == 1
+        assert len(client.calls) == 2         # instruments + orderbook
+
+        # Capture 2: ceiling reached -> denied pre-claim, no new HTTP.
+        out2 = mod.capture(db, client,
+                           **capture_kwargs(observation_ids=[2]))
+        assert out2 is False
+        assert mod.active_worker_count() == 1  # still only the orphan
+        assert len(client.calls) == 2          # NO third request
+        assert len(db.claim_inserts) == 1      # obs2 never claimed
+        assert mod.stats()["worker_capacity_denied"] == 1
+        assert len(db.coverage_rows) == 1
+        obs_id, _exp, _sym, _st, disposition, reason = db.coverage_rows[0]
+        assert (obs_id, disposition, reason) == (
+            2, "API_BUDGET_DENIED", "WORKER_CAPACITY_EXHAUSTED")
+    finally:
+        block.set()
+    wait_no_workers()                          # slot released on completion
+
+    # Capture 3: capacity free again -> a normal capture succeeds.
+    assert mod.capture(db, client,
+                       **capture_kwargs(observation_ids=[2])) is True
+    assert mod.active_worker_count() == 0
+    row = finalize_row(db)
+    assert row["feasibility_status"] == "OK"
+    assert row["quote_quality_status"] == "FRESH"
+
+
+def test_late_orderbook_response_never_becomes_evidence(monkeypatch):
+    # Scenario 4+9: the orderbook hangs, the capture times out, and the
+    # worker's LATE answer must not change the finalized ERROR row and
+    # must never touch the database.
+    monkeypatch.setenv(mod.CAPTURE_LATENCY_ENV, "250")
+    block = threading.Event()
+    client = good_client(book_block_event=block)
+    db = FakeConnection(observations={1: obs_row()})
+    assert mod.capture(db, client, **capture_kwargs()) is True
+    row_before = finalize_row(db)
+    assert row_before["feasibility_status"] == "ERROR"
+    assert row_before["failure_reason"] == "latency:TIMEOUT"
+    statements_before = len(db.statements)
+
+    block.set()                                # the late answer arrives
+    wait_no_workers()
+    assert len(db.statements) == statements_before  # worker: zero DB writes
+    assert finalize_row(db) == row_before           # row stays finalized
+    assert mod.stats()["captured"] == 1
+
+
+def test_expired_deadline_never_spawns_a_worker():
+    # Scenario 5 (unit): with the deadline already passed the quote phase
+    # refuses WITHOUT spawning a thread and WITHOUT any Bybit request.
+    client = good_client()
+    before = mod.active_worker_count()
+    out = mod._fetch_quote_phase(client, "BTCUSDT",
+                                 deadline_at=time.monotonic() - 0.001,
+                                 max_workers=3)
+    assert out["deadline_refused"] is True
+    assert out["worker_capacity_denied"] is False
+    assert out["timed_out"] is True
+    assert client.calls == []
+    assert mod.active_worker_count() == before
+    assert mod.stats()["deadline_refused"] == 1
+
+
+def test_quote_worker_spawn_is_denied_at_capacity_without_queue():
+    # Defense-in-depth (unit): the post-claim spawn gate refuses at the
+    # ceiling instead of queueing — no unbounded accumulation even with
+    # hanging requests.
+    client = good_client()
+    before = mod.active_worker_count()
+    out = mod._fetch_quote_phase(client, "BTCUSDT",
+                                 deadline_at=time.monotonic() + 5.0,
+                                 max_workers=0)
+    assert out["worker_capacity_denied"] is True
+    assert out["worker_active_count"] == 0
+    assert client.calls == []
+    assert mod.active_worker_count() == before
+
+
+def test_worker_ceiling_config_is_validated(monkeypatch):
+    monkeypatch.setenv(mod.QUOTE_DELAY_LIMIT_ENV, "5000")
+    monkeypatch.setenv(mod.WORKERS_ENV, "0")
+    with pytest.raises(mod.SrrFillConfigError,
+                       match="SRR_SHORT_FILL_MAX_QUOTE_WORKERS"):
+        mod._load_runtime_config()
+    monkeypatch.setenv(mod.WORKERS_ENV, "999")
+    assert mod._load_runtime_config().max_quote_workers == \
+        mod.HARD_MAX_QUOTE_WORKERS
+    monkeypatch.delenv(mod.WORKERS_ENV)
+    assert mod._load_runtime_config().max_quote_workers == \
+        mod.DEFAULT_MAX_QUOTE_WORKERS
+
+
+def test_latency_diagnostics_are_split_per_component():
+    # F3: separate telemetry per component; unmeasurable components are
+    # explicit NULL/UNKNOWN, never guessed; the deadline is visible in
+    # every request the capture issued.
+    client = good_client(instruments_delay_s=0.03, book_delay_s=0.03)
+    db = FakeConnection(observations={1: obs_row()})
+    assert mod.capture(db, client, **capture_kwargs()) is True
+    diag = json_field(finalize_row(db), "source_diagnostics")["latency"]
+    assert isinstance(diag["signal_to_capture_ms"], int)
+    assert isinstance(diag["capture_total_ms"], int)
+    assert diag["capture_total_ms"] >= 60      # 30ms + 30ms injected legs
+    assert isinstance(diag["deadline_remaining_ms"], int)
+    assert diag["deadline_remaining_ms"] <= 2000
+    assert isinstance(diag["quote_phase_ms"], int)
+    assert isinstance(diag["instrument_lookup_ms"], int)
+    assert diag["instrument_lookup_ms"] >= 30
+    assert isinstance(diag["orderbook_http_ms"], int)
+    assert diag["orderbook_http_ms"] >= 30
+    assert diag["limiter_wait_ms"] is None           # never a guessed value
+    assert diag["limiter_wait_source"] == "unknown"
+    assert diag["worker_active_count"] == 1
+    assert diag["worker_capacity_denied_count"] == 0
+    assert diag["max_quote_workers"] >= 1
+    # F1/Codex P2: the capture's ONE immutable absolute monotonic deadline
+    # was propagated into BOTH legs — verbatim, never re-anchored, so the
+    # instrument lookup cannot extend the budget of the orderbook (or the
+    # other way around), and no leg may grant more than the 2000ms ceiling
+    # counted from its own send time.
+    assert len(client.calls) == 2
+    deadlines = [params.get("caller_deadline_at")
+                 for _endpoint, params in client.calls]
+    assert all(isinstance(d, float) for d in deadlines)
+    assert deadlines[0] == deadlines[1]        # ONE anchor, no re-extension
+    for deadline, call_mono in zip(deadlines, client.call_mons):
+        assert deadline <= call_mono + 2.0     # never beyond the ceiling
