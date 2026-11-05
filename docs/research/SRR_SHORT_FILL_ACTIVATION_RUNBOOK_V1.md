@@ -44,10 +44,13 @@ Shared client settings (unchanged, no bypass): `bybit_retry_deadline_s`
 (default 60 s) and the global Bybit rate limiter — SRR capture uses the
 same budgeted `_public_get` as everything else (≤ 2 GETs per accepted
 event: instruments on cache miss + orderbook). The capture additionally
-passes its own remaining budget as `deadline_s`, which only SHORTENS
-that envelope (min semantics): after the capture deadline the worker
-starts no new Bybit request, and a fail-closed shared-limiter refusal is
-recorded as `limiter:<RESULT>` in `failure_reason`.
+passes its own IMMUTABLE absolute monotonic deadline as
+`caller_deadline_at` (anchored at `_budgeted_get()` entry, forwarded
+verbatim through the instrument lookup and the orderbook leg so nested
+calls never re-anchor it), which only SHORTENS that envelope (min
+semantics): after the capture deadline the worker starts no new Bybit
+request, and a fail-closed shared-limiter refusal is recorded as
+`limiter:<RESULT>` in `failure_reason`.
 
 ## 2. Pre-activation checklist (all must pass)
 

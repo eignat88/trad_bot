@@ -1125,3 +1125,93 @@ def test_normal_get_with_shared_limiter_sends_with_recomputed_timeout(
     assert clock.now + transport_timeout <= 1002.0 + 1e-9
     assert shared.recorded == [
         ("grant-p2-1", shared.acquired_priority, "OK")]
+
+
+# ----------------------------------------------------------------------
+# Codex P2 follow-up (PR #263 — "anchor the caller deadline before request
+# setup"): the absolute deadline is fixed at _budgeted_get() ENTRY, so
+# setup time is CHARGED to the budget and can expire it BEFORE any HTTP.
+# ----------------------------------------------------------------------
+def test_request_setup_burning_the_budget_sends_no_http(monkeypatch, caplog):
+    """Setup (telemetry preparation) burns 2.5s against a 2.0s budget:
+    the entry-anchored deadline has already expired at the pre-send gate
+    — ZERO HTTP, a BYBIT_API_SKIP telemetry record, the existing
+    ``retry deadline exceeded`` denial contract."""
+    clock = _install_fake_clock(monkeypatch)
+    real_telemetry = bybit_client_module._get_telemetry
+
+    def slow_telemetry():
+        clock.sleep(2.5)
+        return real_telemetry()
+
+    monkeypatch.setattr(bybit_client_module, "_get_telemetry",
+                        slow_telemetry)
+    session = ScriptedSession([FakeResponse()])
+    client = make_client(session, bybit_timeout=5)
+
+    with pytest.raises(BybitTimeoutError, match="retry deadline exceeded"):
+        client._public_get("/v5/market/orderbook", category="linear",
+                           symbol="BTCUSDT", limit=50, deadline_s=2.0)
+
+    assert session.calls == []                  # ZERO HTTP
+    skips = [line for line in attempt_lines(caplog)
+             if field(line, "result") == "BYBIT_API_SKIP"]
+    assert skips, "BYBIT_API_SKIP telemetry record missing"
+    assert "deadline exceeded before send" in skips[0]
+
+
+def test_deadline_expires_during_caller_resolution_sends_no_http(
+        monkeypatch):
+    """``_resolve_caller()`` runs AFTER the entry anchor: burning it past
+    the IMMUTABLE absolute deadline (1002.0 vs a 2.5s burn from 1000.0)
+    denies before the send — ZERO HTTP, no grant to finalize."""
+    clock = _install_fake_clock(monkeypatch)
+    real_resolve = bybit_client_module._resolve_caller
+
+    def slow_resolve():
+        clock.sleep(2.5)
+        return real_resolve()
+
+    monkeypatch.setattr(bybit_client_module, "_resolve_caller",
+                        slow_resolve)
+    session = ScriptedSession([FakeResponse()])
+    client = make_client(session, bybit_timeout=5)
+
+    with pytest.raises(BybitTimeoutError, match="retry deadline exceeded"):
+        client._public_get("/v5/market/orderbook", category="linear",
+                           symbol="BTCUSDT", limit=50,
+                           caller_deadline_at=1002.0)
+
+    assert session.calls == []                  # ZERO HTTP
+
+
+def test_normal_get_completes_within_the_original_absolute_deadline(
+        monkeypatch):
+    """Happy path: setup burns 0.5s of the immutable 1002.0 anchor — the
+    GET succeeds with the transport timeout recomputed from the ACTUALLY
+    remaining 1.5s (setup charged, never re-anchored) and finishes inside
+    the original absolute deadline."""
+    clock = _install_fake_clock(monkeypatch)
+    real_resolve = bybit_client_module._resolve_caller
+
+    def slow_resolve():
+        clock.sleep(0.5)
+        return real_resolve()
+
+    monkeypatch.setattr(bybit_client_module, "_resolve_caller",
+                        slow_resolve)
+    payload = {"retCode": 0, "retMsg": "OK", "result": {"list": ["k"]}}
+    session = ScriptedSession([FakeResponse(payload)])
+    client = make_client(session, bybit_timeout=5)
+
+    result = client._public_get("/v5/market/orderbook", category="linear",
+                                symbol="BTCUSDT", limit=50,
+                                caller_deadline_at=1002.0)
+
+    assert result == payload
+    assert len(session.calls) == 1
+    transport_timeout = session.calls[0][3]
+    # the 0.5s of setup was charged: remaining 1.5s, NOT a fresh 2.0s
+    assert transport_timeout == pytest.approx(1.5, abs=1e-6)
+    assert clock.now + transport_timeout <= 1002.0 + 1e-9
+    assert clock.now <= 1002.0                  # finished within the anchor

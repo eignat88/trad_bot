@@ -340,10 +340,15 @@ row-level verdict reflects the SMALL scenario.
   thread; the scanner thread `join`s until the capture's single monotonic
   deadline (`capture start + max_capture_ms`). The deadline propagates
   into EVERY leg: the worker checks it before the instrument lookup,
-  before the orderbook request and before any retry, and passes the
-  remaining budget into `BybitClient._public_get(deadline_s=...)`, which
-  re-checks it after each blocking wait (breaker gate, shared-limiter
-  acquire) and clamps the per-attempt HTTP timeout to the remainder —
+  before the orderbook request and before any retry, and passes the SAME
+  immutable absolute monotonic deadline into
+  `BybitClient._public_get(caller_deadline_at=...)` (via
+  `instrument_constraints(deadline_at=...)` for the lookup), which
+  anchors it at `_budgeted_get()` ENTRY — before the limiter/telemetry/
+  `_resolve_caller()` setup, so setup time is charged to the budget —
+  re-checks it after the shared-limiter acquire/prepare_send and
+  immediately before the HTTP send, and clamps the per-attempt HTTP
+  timeout to the ACTUALLY remaining time —
   **after the deadline no NEW Bybit request is ever started**
   (`failure_reason='deadline:EXCEEDED'` when the worker refuses;
   `latency:TIMEOUT` when the join bound expires or a quote is recorded
@@ -830,7 +835,7 @@ Stopping is always safe: no trading object depends on this contour.
 
 ## 16. Test evidence
 
-* `tests/test_srr_short_fill_feasibility_v1.py` — 102 offline tests: flag off,
+* `tests/test_srr_short_fill_feasibility_v1.py` — 103 offline tests: flag off,
   missing/mismatched activation, pre-activation boundary, wrong
   experiment/direction/scanner/symbol/geometry, multiple observation ids,
   duplicate event, concurrent claim, scanner restart, PostgreSQL failure,
@@ -853,7 +858,9 @@ Stopping is always safe: no trading object depends on this contour.
   that never touches the DB or the finalized ERROR row, expired-deadline
   and spawn-ceiling unit tests, worker-ceiling config validation, split
   latency diagnostics incl. `limiter_wait_ms: null`/`unknown` and the
-  propagated `deadline_s` on every request).
+  immutable absolute `caller_deadline_at` propagated to BOTH legs (the
+  instrument→orderbook sequence shares ONE anchor — never re-extended),
+  plus the instrument→orderbook no-extension sequence test).
 * `tests/test_srr_short_fill_feasibility_migration_082_v1.py` — 15 static
   contract tests for migration 082 (DISABLED seed, immutability triggers,
   append-only evidence, status enums, column contracts incl.
@@ -869,12 +876,20 @@ Stopping is always safe: no trading object depends on this contour.
   (straddling CI ⇒ INCONCLUSIVE never NO-GO + scenario matrix), F3
   PENDING-excluded coverage SQL, and the activation runbook
   (every runtime flag + status line + zero-extra-Bybit-call claim).
-* `tests/test_bybit_retry_budget_r4_v1.py` — 64 tests incl. 3 new
+* `tests/test_bybit_retry_budget_r4_v1.py` — 70 tests incl. 6
   deadline-propagation contracts: a caller `deadline_s` shortens the
   retry envelope, can NEVER extend the global one, and applies even
-  when the global retry deadline is disabled.
-* `tests/test_me_short_a_fill_feasibility_v1.py` — 37 tests incl. the
-  instrument-constraints deadline forwarding (SRR quote capture) with
-  the ME A default path byte-for-byte unchanged.
+  when the global retry deadline is disabled — plus the Codex P2
+  (PR #263) anchor set: request setup / `_resolve_caller()` burning the
+  budget ⇒ 0 HTTP with `BYBIT_API_SKIP` telemetry, shared-limiter
+  acquire / prepare_send expiry ⇒ 0 HTTP with exactly one `NOT_SENT`
+  grant finalization, and a normal GET charged the setup time against
+  the ORIGINAL absolute deadline (transport timeout = actually-remaining
+  time).
+* `tests/test_me_short_a_fill_feasibility_v1.py` — 38 tests incl. the
+  instrument-constraints deadline forwarding (SRR quote capture) — both
+  the relative `deadline_s` and the immutable absolute
+  `caller_deadline_at` — with the ME A default path byte-for-byte
+  unchanged.
 * All tests use mock Bybit clients and fake connections — no network, no
   PostgreSQL, no real orders.

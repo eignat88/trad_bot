@@ -228,9 +228,11 @@ class FakeClient:
         self.instruments_block_event = instruments_block_event
         self.limiter_error = limiter_error
         self.calls = []
+        self.call_mons = []            # monotonic stamp per issued leg
 
     def _public_get(self, endpoint, **params):
         self.calls.append((endpoint, params))
+        self.call_mons.append(time.monotonic())
         if endpoint.endswith("/orderbook"):
             if self.book_block_event is not None:
                 # Controlled hang (bounded safety so a broken test cannot
@@ -1521,6 +1523,28 @@ def test_deadline_expires_between_instrument_and_orderbook(monkeypatch):
     assert mod.stats()["deadline_refused"] == 1
 
 
+def test_instrument_to_orderbook_sequence_shares_one_absolute_budget():
+    # Codex P2 (PR #263): the instrument lookup and the orderbook leg
+    # carry the SAME immutable absolute deadline sampled at capture start
+    # — a slow lookup (0.15s here) does NOT re-anchor (extend) the budget
+    # for the orderbook leg: both legs see the identical anchor value and
+    # the anchor predates both sends.
+    client = good_client(instruments_delay_s=0.15, book_delay_s=0.15)
+    db = FakeConnection(observations={1: obs_row()})
+    assert mod.capture(db, client, **capture_kwargs()) is True
+    wait_no_workers()
+    assert len(client.calls) == 2               # lookup then orderbook
+    lookup_deadline = client.calls[0][1].get("caller_deadline_at")
+    book_deadline = client.calls[1][1].get("caller_deadline_at")
+    assert isinstance(lookup_deadline, float)
+    assert isinstance(book_deadline, float)
+    assert lookup_deadline == book_deadline     # ONE anchor, never re-anchored
+    # Sampled at capture start: from the orderbook's send time the
+    # remaining budget is strictly BELOW the full 2000ms ceiling (the
+    # 0.15s lookup was charged, not added back).
+    assert book_deadline < client.call_mons[1] + 2.0
+
+
 def test_shared_limiter_refusal_is_separated_from_bybit_errors():
     # F3 taxonomy: a fail-closed shared-limiter refusal carries
     # limiter_result and never masquerades as a plain Bybit error.
@@ -1668,8 +1692,15 @@ def test_latency_diagnostics_are_split_per_component():
     assert diag["worker_active_count"] == 1
     assert diag["worker_capacity_denied_count"] == 0
     assert diag["max_quote_workers"] >= 1
-    # F1: the single monotonic deadline was propagated into BOTH legs.
+    # F1/Codex P2: the capture's ONE immutable absolute monotonic deadline
+    # was propagated into BOTH legs — verbatim, never re-anchored, so the
+    # instrument lookup cannot extend the budget of the orderbook (or the
+    # other way around), and no leg may grant more than the 2000ms ceiling
+    # counted from its own send time.
     assert len(client.calls) == 2
-    for _endpoint, params in client.calls:
-        assert isinstance(params.get("deadline_s"), float)
-        assert 0.0 < params["deadline_s"] <= 2.0
+    deadlines = [params.get("caller_deadline_at")
+                 for _endpoint, params in client.calls]
+    assert all(isinstance(d, float) for d in deadlines)
+    assert deadlines[0] == deadlines[1]        # ONE anchor, no re-extension
+    for deadline, call_mono in zip(deadlines, client.call_mons):
+        assert deadline <= call_mono + 2.0     # never beyond the ceiling

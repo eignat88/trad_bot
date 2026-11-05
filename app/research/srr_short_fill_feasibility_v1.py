@@ -1112,9 +1112,13 @@ def _fetch_quote_phase(
                     _STATS["deadline_refused"] += 1
                 return
             lookup_started = time.monotonic()
+            # Codex P2 (PR #263): the capture's ABSOLUTE monotonic deadline
+            # is forwarded VERBATIM to both legs (instrument lookup and,
+            # below, the orderbook) — nested calls min()-clamp the same
+            # immutable anchor, so the common budget can never be re-anchored
+            # (and thereby extended) between the two requests.
             constraints, constraints_error = instrument_constraints(
-                client, symbol,
-                deadline_s=max(0.0, deadline_at - lookup_started))
+                client, symbol, deadline_at=deadline_at)
             result["constraints"] = constraints
             result["constraints_error"] = constraints_error
             result["instrument_lookup_ms"] = int(
@@ -1130,7 +1134,7 @@ def _fetch_quote_phase(
             book = client._public_get(
                 ORDERBOOK_ENDPOINT, category="linear", symbol=symbol,
                 limit=50,
-                deadline_s=max(0.0, deadline_at - request_started))
+                caller_deadline_at=deadline_at)
             result["orderbook_http_ms"] = int(
                 (time.monotonic() - request_started) * 1000)
             result["book"] = book
