@@ -32,6 +32,7 @@ from app.scanners.cycle_completion_v1 import (
     CycleCompletionReport,
     STAGE_MARKET_DATA,
     STAGE_SCAN,
+    classify_me_capture_failure,
     classify_symbol_failure,
 )
 from app.scanners.direction_gate import ScannerDirectionGatePolicy
@@ -1288,7 +1289,7 @@ def run_scan_cycle(
                     ):
                         try:
                             me_capture_spool.enqueue(c)
-                        except Exception:
+                        except Exception as exc:
                             logger.critical(
                                 "ME CLEAN CAPTURE LOSS RISK: enqueue failed "
                                 "symbol=%s version=%s",
@@ -1296,6 +1297,14 @@ def run_scan_cycle(
                                 exc_info=True,
                             )
                             failed += 1
+                            # Issue #261: the loss must be visible in the
+                            # cycle report — ``failed`` alone left
+                            # ``run_status=COMPLETED`` + no CYCLE_COMPLETION
+                            # row. Recorded as ME_CAPTURE_ERROR (its own
+                            # class: not MARKET_DATA_ERROR / RATE_LIMIT_SKIP
+                            # / SCAN_ERROR), which makes the cycle PARTIAL.
+                            report.record_outcome(
+                                classify_me_capture_failure(c.symbol, exc))
 
                     repository.save_setup(c, run_id=run_id)
                     repository.save_event(
@@ -1389,7 +1398,7 @@ def run_scan_cycle(
                     ):
                         try:
                             me_capture_spool.enqueue(obs_c)
-                        except Exception:
+                        except Exception as exc:
                             logger.critical(
                                 "ME CLEAN CAPTURE LOSS RISK: enqueue failed "
                                 "symbol=%s version=%s",
@@ -1397,6 +1406,12 @@ def run_scan_cycle(
                                 exc_info=True,
                             )
                             failed += 1
+                            # Issue #261: OBSERVE_ONLY branch — same
+                            # accounting as the regular-candidate branch, so
+                            # an enqueue loss here is PARTIAL too and never
+                            # a silent ``failed`` bump under COMPLETED.
+                            report.record_outcome(
+                                classify_me_capture_failure(obs_c.symbol, exc))
 
                     try:
                         repository.save_setup(obs_c, run_id=run_id)
