@@ -154,7 +154,10 @@ class ShadowSignalRepository:
 
         A signal is eligible when:
         - It has no outcome row (brand new), OR
-        - It has an outcome row with at least one un-evaluated mature horizon
+        - It has an outcome row with at least one un-evaluated mature horizon, OR
+        - It has a NON-final outcome whose horizon marks are all present but
+          whose finalization gate was blocked (fail-closed retry until the
+          frozen verdict path is proven).  Finalized rows never match.
         """
         if not self._conn:
             return []
@@ -185,6 +188,17 @@ class ShadowSignalRepository:
                     OR (o.evaluated_240m_at IS NULL AND s.signal_time <= now() - interval '240 minutes')
                     OR (o.evaluated_eod_at IS NULL
                         AND s.signal_time < date_trunc('day', now()))
+                    -- Fail-closed finalization retry (FR-06): a non-final
+                    -- row whose horizon marks are ALL present but whose
+                    -- finalization gate was blocked stays eligible until
+                    -- the frozen verdict path is proven.  Finalized rows
+                    -- (is_final = TRUE) never match this branch.
+                    OR (o.evaluated_15m_at IS NOT NULL
+                        AND o.evaluated_30m_at IS NOT NULL
+                        AND o.evaluated_60m_at IS NOT NULL
+                        AND o.evaluated_120m_at IS NOT NULL
+                        AND o.evaluated_240m_at IS NOT NULL
+                        AND o.evaluated_eod_at IS NOT NULL)
                  ))
               )
             ORDER BY s.signal_time ASC

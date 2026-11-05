@@ -8,7 +8,25 @@ For each horizon computes:
   - MFE_R / MAE_R (normalised to 1R = abs(entry - stop))
   - TP hit / SL hit / TP-before-SL / SL-before-TP
 
-Uses the existing 5m candle fetch via BybitClient.
+Candle source: the shared ``app.research.candle_coverage_guard_v1`` (ISSUE244,
+``OOS_GENERIC_CANDLE_COVERAGE_FAIL_CLOSED_V1``) — no silent 1000-candle
+truncation, bounded pagination for large windows, classified source statuses
+(``SOURCE_VALIDATED`` / ``SOURCE_FETCH_ERROR`` / ``SOURCE_INCOMPLETE_COVERAGE``
+/ ``SOURCE_NOT_YET_AVAILABLE``) and NO fallback request after a Global Limiter
+deny.
+
+Fail-closed contract (ISSUE244)::
+
+    INCOMPLETE CANDLE COVERAGE
+        -> NO evaluated_*_at WRITE
+        -> NO is_final
+
+Before every ``evaluated_<horizon>_at`` mark the complete closed 5m candle path
+of ``[signal_time, signal_time + horizon)`` is proven; before ``is_final=True``
+the full TP/SL path to 240m is proven separately.  An unproven horizon writes
+nothing, stays pending and is re-evaluated on the next cycle; previously
+finalized outcomes are never rewritten automatically.
+
 No lookahead: only candles within [signal_time, signal_time + horizon) are used.
 """
 from __future__ import annotations
@@ -22,6 +40,19 @@ from typing import Any
 
 from app.exchange.bybit_client import BybitClient
 from app.models import Candle
+from app.research.candle_coverage_guard_v1 import (
+    DIAGNOSTIC_BLOCK_EVENTS,
+    DIAGNOSTIC_EVENT_FIELDS,
+    MAX_DIAGNOSTIC_EVENTS,
+    SOURCE_INCOMPLETE_COVERAGE,
+    datetime_to_ms,
+    fetch_candles_for_evaluation,
+    fetch_status_stats_key,
+    record_block_event,
+    record_coverage_block,
+    record_finalization_block,
+    validate_candle_coverage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +65,53 @@ HORIZONS: list[tuple[str, int]] = [
     ("120m", 120),
     ("240m", 240),
 ]
+
+# TP/SL verdict window: the frozen SRR checker scans 240 minutes.
+TPSL_WINDOW_MINUTES = 240
+
+# ── diagnostics contract (ISSUE244) ────────────────────────────────
+#
+# Structured, in-memory diagnostics ONLY.  The event vocabulary
+# (``DIAGNOSTIC_BLOCK_EVENTS`` / ``DIAGNOSTIC_EVENT_FIELDS`` /
+# ``MAX_DIAGNOSTIC_EVENTS``) and the bounded recorder
+# (``record_block_event``) are owned by the shared guard
+# ``app.research.candle_coverage_guard_v1`` and re-exported here because
+# they are part of this evaluator's module contract.  Reason codes are
+# byte-stable: the agreed vocabulary for a FUTURE persistence marker on
+# ``dds.srr_research_outcome``.  Persisting them (e.g. a nullable
+# ``block_reason``/``source_status`` column) requires a separately agreed
+# schema and its own PostgreSQL migration PR — until that agreement exists
+# this evaluator writes NO diagnostic column and runs NO DML beyond the
+# frozen outcome upsert.
+
+
+def _record_block_event(
+    stats: dict[str, Any],
+    *,
+    event: str,
+    status: str,
+    reason_code: str,
+    horizon: str | None = None,
+    signal_id: int | None = None,
+    symbol: str | None = None,
+    experiment_id: str = EXPERIMENT_ID,
+) -> None:
+    """Append one structured fail-closed block event to the cycle stats.
+
+    Thin delegate to the shared guard recorder: this module keeps its own
+    experiment default while the counters stay exact and the event list
+    stays bounded (``MAX_DIAGNOSTIC_EVENTS``).
+    """
+    record_block_event(
+        stats,
+        event=event,
+        status=status,
+        reason_code=reason_code,
+        horizon=horizon,
+        signal_id=signal_id,
+        symbol=symbol,
+        experiment_id=experiment_id,
+    )
 
 
 def _calculate_long_mfe_mae(
@@ -118,33 +196,75 @@ def _check_long_target_sl(
 
 
 class SRRResearchEvaluator:
-    """Multi-horizon incremental evaluator for SRR research signals."""
+    """Multi-horizon incremental evaluator for SRR research signals.
+
+    Fail-closed candle coverage (ISSUE244)::
+
+        INCOMPLETE CANDLE COVERAGE
+            -> NO evaluated_*_at WRITE
+            -> NO is_final
+
+    A horizon mark is written only after its exact ``[signal_time,
+    signal_time + horizon)`` 5-minute candle path has been proven complete
+    (first and last required candle present, no gaps, duplicates, off-grid or
+    unordered timestamps, every required candle closed, valid OHLC).
+    ``is_final`` additionally requires a proven 240m TP/SL path.  A blocked
+    horizon stays pending and is re-evaluated on a later cycle.
+    """
 
     def __init__(self, conn: Any, client: BybitClient) -> None:
         self._conn = conn
         self.client = client
         self._running = False
+        # Classified outcome of the most recent candle fetch (structured
+        # diagnostics: SOURCE_FETCH_ERROR vs SOURCE_INCOMPLETE_COVERAGE).
+        self._last_fetch_result: Any = None
 
     # ── candle fetch ──────────────────────────────────────────
 
     def _get_candles_for_symbol(
         self, symbol: str, from_time: datetime, to_time: datetime,
     ) -> list[Candle]:
-        """Fetch 5m candles covering [from_time, to_time]."""
-        try:
-            start_ms = int((from_time - timedelta(minutes=5)).timestamp() * 1000)
-            end_ms = int(to_time.timestamp() * 1000)
-            needed = min((end_ms - start_ms) // 300_000 + 10, 1000)
-            candles = self.client.get_klines(symbol, "5", needed)
-            return [c for c in candles if start_ms <= c.timestamp <= end_ms]
-        except Exception:
-            logger.exception("Failed to fetch candles for %s", symbol)
+        """Fetch 5m candles covering [from_time, to_time].
+
+        Fail-closed wrapper around ``fetch_candles_for_evaluation``
+        (ISSUE244):
+
+        * only a ``SOURCE_VALIDATED`` fetch yields candles — an API/limiter
+          error, a truncated pagination or an empty response yields ``[]``,
+          so a caller can never evaluate against a partial window;
+        * windows larger than one Bybit page (1000 candles) are read through
+          the bounded ``BybitClient.get_klines_range`` pagination (same retry
+          budget and shared limiter as every other request) — the latest-N
+          response is never silently truncated and then treated as complete;
+        * after a Global Limiter deny there is NO fallback request: the
+          classified failure is returned as-is and retried on a later cycle;
+        * the classified status is kept on ``self._last_fetch_result`` for
+          the caller's structured diagnostics and logging.
+        """
+        result = fetch_candles_for_evaluation(
+            self.client, symbol, from_time, to_time,
+        )
+        self._last_fetch_result = result
+        if not result.ok:
+            logger.warning(
+                "srr evaluation: candle source %s for %s (%s) — "
+                "evaluation deferred, no outcome write",
+                result.status, symbol, result.reason_code,
+            )
             return []
+        return list(result.candles)
 
     # ── eligible signals query ────────────────────────────────
 
     def get_eligible_signals(self, limit: int = 5000) -> list[dict]:
-        """Get signals needing at least one horizon evaluation."""
+        """Get signals needing at least one horizon evaluation.
+
+        Also re-selects NON-final rows whose horizon marks are all present
+        but whose finalization gate was blocked, so a blocked verdict stays
+        retry-eligible until the frozen TP/SL path is proven (FR-06).
+        Finalized rows are never selected.
+        """
         if not self._conn:
             return []
 
@@ -171,6 +291,18 @@ class SRRResearchEvaluator:
                     OR (o.evaluated_60m_at IS NULL AND s.signal_time <= now() - interval '60 minutes')
                     OR (o.evaluated_120m_at IS NULL AND s.signal_time <= now() - interval '120 minutes')
                     OR (o.evaluated_240m_at IS NULL AND s.signal_time <= now() - interval '240 minutes')
+                    -- Fail-closed finalization retry (FR-06): a non-final
+                    -- row whose horizon marks are ALL present but whose
+                    -- finalization gate was blocked stays eligible until
+                    -- the frozen TP/SL path is proven.  Rows without a
+                    -- target can never finalize (frozen rule) and stay
+                    -- dormant; finalized rows never match this branch.
+                    OR (o.evaluated_15m_at IS NOT NULL
+                        AND o.evaluated_30m_at IS NOT NULL
+                        AND o.evaluated_60m_at IS NOT NULL
+                        AND o.evaluated_120m_at IS NOT NULL
+                        AND o.evaluated_240m_at IS NOT NULL
+                        AND s.target_1 IS NOT NULL)
                  ))
               )
             ORDER BY s.signal_time ASC
@@ -216,6 +348,7 @@ class SRRResearchEvaluator:
             risk_1r = entry_price * 0.01  # fallback: 1% of entry
 
         signal_ts = int(signal_time.timestamp() * 1000)
+        asof_ms = datetime_to_ms(now)
         post_candles = [c for c in all_candles if c.timestamp > signal_ts]
 
         updates: dict[str, Any] = {}
@@ -226,6 +359,41 @@ class SRRResearchEvaluator:
             if sig.get(eval_field) is not None:
                 continue
             if not (now >= signal_time + timedelta(minutes=minutes)):
+                continue
+
+            # Fail-closed (ISSUE244): prove the exact candle path for this
+            # horizon BEFORE computing anything.  Maturity alone is never
+            # proof that the price path is complete.
+            horizon_cutoff_ms = int(
+                (signal_time + timedelta(minutes=minutes)).timestamp() * 1000
+            )
+            coverage = validate_candle_coverage(
+                all_candles,
+                signal_ms=signal_ts,
+                cutoff_ms=horizon_cutoff_ms,
+                asof_ms=asof_ms,
+                scope=f"HORIZON_{label}",
+            )
+            if not coverage.ok:
+                record_coverage_block(stats, coverage, horizon=label)
+                _record_block_event(
+                    stats,
+                    event="coverage_blocked",
+                    status=coverage.status,
+                    reason_code=coverage.reason_code,
+                    horizon=label,
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    experiment_id=sig.get("experiment_id", EXPERIMENT_ID),
+                )
+                logger.warning(
+                    "srr evaluation: signal_id=%d symbol=%s horizon=%s "
+                    "blocked status=%s reason_code=%s experiment_id=%s "
+                    "— no evaluated_*_at write",
+                    signal_id, symbol, label,
+                    coverage.status, coverage.reason_code,
+                    sig.get("experiment_id", EXPERIMENT_ID),
+                )
                 continue
 
             # MFE/MAE in %
@@ -250,13 +418,48 @@ class SRRResearchEvaluator:
         )
 
         if all_done and not sig.get("is_final") and target_1 is not None:
-            # Check TP/SL at the longest horizon (240m)
-            target_flags = _check_long_target_sl(
-                post_candles, entry_price, invalidation_price, target_1,
-                240, signal_time,
+            # Fail-closed (ISSUE244): the TP/SL verdict is only trustworthy
+            # when the full 240m path is proven.  Stored horizon marks (or
+            # maturity) are not proof by itself.
+            tpsl_cutoff_ms = int(
+                (signal_time + timedelta(minutes=TPSL_WINDOW_MINUTES)).timestamp()
+                * 1000
             )
-            updates.update(target_flags)
-            updates["is_final"] = True
+            coverage = validate_candle_coverage(
+                all_candles,
+                signal_ms=signal_ts,
+                cutoff_ms=tpsl_cutoff_ms,
+                asof_ms=asof_ms,
+                scope="TPSL_240M",
+            )
+            if not coverage.ok:
+                record_finalization_block(stats, coverage)
+                _record_block_event(
+                    stats,
+                    event="finalization_blocked",
+                    status=coverage.status,
+                    reason_code=coverage.reason_code,
+                    horizon="240m",
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    experiment_id=sig.get("experiment_id", EXPERIMENT_ID),
+                )
+                logger.warning(
+                    "srr evaluation: signal_id=%d symbol=%s finalization "
+                    "blocked status=%s reason_code=%s experiment_id=%s "
+                    "— is_final stays false",
+                    signal_id, symbol,
+                    coverage.status, coverage.reason_code,
+                    sig.get("experiment_id", EXPERIMENT_ID),
+                )
+            else:
+                # Check TP/SL at the longest horizon (240m)
+                target_flags = _check_long_target_sl(
+                    post_candles, entry_price, invalidation_price, target_1,
+                    TPSL_WINDOW_MINUTES, signal_time,
+                )
+                updates.update(target_flags)
+                updates["is_final"] = True
 
         if not updates:
             return
@@ -353,6 +556,7 @@ class SRRResearchEvaluator:
             by_symbol.setdefault(s["symbol"], []).append(s)
 
         stats: dict[str, Any] = {
+            "experiment_id": EXPERIMENT_ID,
             "start_time": now.isoformat(),
             "signals_checked": len(eligible),
             "symbols_processed": 0,
@@ -361,6 +565,15 @@ class SRRResearchEvaluator:
             "outcomes_updated": 0,
             "finalized": 0,
             "errors": 0,
+            # ISSUE244 structured diagnostics (in-memory only; no schema).
+            "source_blocked": {
+                "source_fetch_error": 0,
+                "source_incomplete": 0,
+                "source_not_yet_available": 0,
+            },
+            "coverage_blocked": {},
+            "horizons_pending": {h: 0 for h, _ in HORIZONS},
+            "finalization_blocked": 0,
         }
 
         for symbol, signals in by_symbol.items():
@@ -368,7 +581,37 @@ class SRRResearchEvaluator:
             oldest = min(s["signal_time"] for s in signals)
             candles = self._get_candles_for_symbol(symbol, oldest, now)
             if not candles:
+                # Fail-closed: no candles without a SOURCE_VALIDATED fetch.
+                # The signals stay eligible (retry) and no outcome is touched.
+                result = getattr(self, "_last_fetch_result", None)
+                if result is not None and not result.ok:
+                    status = result.status
+                    status_key = fetch_status_stats_key(status)
+                    reason_code = result.reason_code
+                else:
+                    status = SOURCE_INCOMPLETE_COVERAGE
+                    status_key = fetch_status_stats_key(status)
+                    reason_code = "NO_CANDLES_IN_WINDOW"
+                stats["source_blocked"][status_key] = (
+                    stats["source_blocked"].get(status_key, 0) + len(signals)
+                )
                 stats["errors"] += len(signals)
+                for s in signals:
+                    _record_block_event(
+                        stats,
+                        event="source_blocked",
+                        status=status,
+                        reason_code=reason_code,
+                        horizon=None,
+                        signal_id=s.get("signal_id"),
+                        symbol=symbol,
+                    )
+                logger.warning(
+                    "srr evaluation: symbol=%s source_blocked=%d "
+                    "status=%s reason_code=%s experiment_id=%s "
+                    "— no outcome write, signals stay retry-eligible",
+                    symbol, len(signals), status, reason_code, EXPERIMENT_ID,
+                )
                 continue
             for s in signals:
                 try:
@@ -380,12 +623,27 @@ class SRRResearchEvaluator:
         stats["end_time"] = datetime.now(timezone.utc).isoformat()
         logger.info(
             "SRR research evaluation: checked=%d symbols=%d created=%d updated=%d "
-            "finalized=%d errors=%d",
+            "finalized=%d errors=%d source_blocked=%s coverage_blocked=%s "
+            "finalization_blocked=%d",
             stats["signals_checked"], stats["symbols_processed"],
             stats["outcomes_created"], stats["outcomes_updated"],
             stats["finalized"], stats["errors"],
+            stats["source_blocked"], stats["coverage_blocked"],
+            stats["finalization_blocked"],
         )
         logger.info("Horizons: %s", stats["horizons_updated"])
+        if stats["coverage_blocked"] or stats["finalization_blocked"] or any(
+            stats["source_blocked"].values()
+        ):
+            logger.warning(
+                "SRR research evaluation fail-closed blocks: "
+                "experiment_id=%s source_blocked=%s coverage_blocked=%s "
+                "horizons_pending=%s finalization_blocked=%d events=%d",
+                EXPERIMENT_ID, stats["source_blocked"],
+                stats["coverage_blocked"], stats["horizons_pending"],
+                stats["finalization_blocked"],
+                len(stats.get("diagnostics", [])),
+            )
         return stats
 
     # ── lifecycle ─────────────────────────────────────────────
@@ -467,6 +725,10 @@ def main() -> None:
         print(f"Outcomes updated:   {summary['outcomes_updated']}")
         print(f"Finalized:          {summary['finalized']}")
         print(f"Errors:             {summary['errors']}")
+        print(f"Source blocked:     {summary['source_blocked']}")
+        print(f"Coverage blocked:   {summary['coverage_blocked']}")
+        print(f"Horizons pending:   {summary['horizons_pending']}")
+        print(f"Finalization blocked: {summary['finalization_blocked']}")
         print("=" * 80)
     else:
         evaluator.start(interval_seconds=args.interval_seconds)
