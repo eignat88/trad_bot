@@ -35,8 +35,11 @@ from __future__ import annotations
 import ast
 import csv
 import json
+import os
 import re
+import shutil
 import socket
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -149,6 +152,22 @@ def write_signals(path: Path, rows: list[dict[str, str]]) -> Path:
 
 def normalize(sql: str) -> str:
     return " ".join(re.sub(r"--[^\n]*", " ", sql).split())
+
+
+# psql's accepted form of the client-side export meta-command, as a
+# COMPLETE SINGLE PHYSICAL LINE (PR #265 discussion_r4485115250):
+#     \copy ( <SELECT …> ) TO '<file>' WITH CSV HEADER
+# `.` never crosses a newline here (no DOTALL): a multi-line \copy is
+# rejected by construction, which is exactly what `psql -f` requires.
+PSQL_COPY_ONE_LINE = re.compile(
+    r"^\\copy\s*\(\s*(?P<inner>SELECT\b.*?)\s*\)\s*TO\s*"
+    r"'(?P<file>[^']+)'\s+WITH\s+CSV\s+HEADER$")
+
+
+def copy_physical_lines(text: str) -> list[str]:
+    """Raw physical lines of *text* that begin a \\copy command."""
+    return [line for line in text.splitlines()
+            if line.lstrip().startswith("\\copy")]
 
 
 def parse_sql_file(text: str) -> tuple[list[str], dict[str, str]]:
@@ -510,18 +529,30 @@ def test_a12_sql_file_matches_embedded_sql_constants():
         assert normalize(block) == normalize(audit.SQL_STATEMENTS[name]), name
         audit.assert_read_only(block)
 
+    # EVERY \copy in the file must be one COMPLETE physical line: psql -f
+    # executes backslash meta-commands per line and does not reliably
+    # parse multi-line ones (PR #265 discussion_r4485115250).  The check
+    # uses the strict single-line grammar — no re.DOTALL leniency.
+    copy_lines = copy_physical_lines(text)
+    assert len(copy_lines) == 2, "exactly the two documented exports"
+    for line in copy_lines:
+        assert line == line.strip(), "no leading whitespace before \\copy"
+        assert PSQL_COPY_ONE_LINE.fullmatch(line), (
+            "each \\copy must be a complete single physical line: "
+            "\\copy (SELECT ...) TO '<file>' WITH CSV HEADER")
+
     # the export blocks are client-side \copy commands wrapping the same
     # SELECTs that the Python module embeds
     for name, filename in (
         ("SQL_OUTCOMES_EXPORT", "srr_coverage_outcomes.csv"),
         ("SQL_SIGNALS_EXPORT", "srr_coverage_signals.csv"),
     ):
-        match = re.search(
-            r"\\copy\s*\((.*)\)\s*TO\s+'([^']+)'\s+WITH\s+CSV\s+HEADER",
-            blocks[name], re.DOTALL)
-        assert match, f"{name}: documented \\copy export command missing"
-        inner, target = match.group(1), match.group(2)
-        assert target == filename
+        block = blocks[name]
+        assert "\n" not in block, f"{name}: \\copy must not span lines"
+        match = PSQL_COPY_ONE_LINE.fullmatch(block)
+        assert match, f"{name}: not a valid single-line psql \\copy command"
+        assert match.group("file") == filename
+        inner = match.group("inner")
         assert normalize(inner) == normalize(audit.SQL_STATEMENTS[name])
         audit.assert_read_only(inner)
 
@@ -534,6 +565,96 @@ def test_a12_sql_file_matches_embedded_sql_constants():
     assert "NEVER store" in text or "never store" in text
     assert "NEVER reads" in text or "never reads" in text
     assert "experiment_id = 'SRR_LONG_OUTCOME_V1'" in text
+
+
+# ── regression: each export must be a complete single-line \copy ────
+
+
+@pytest.mark.parametrize("name,filename,columns", [
+    ("SQL_OUTCOMES_EXPORT", "srr_coverage_outcomes.csv",
+     list(audit.OUTCOME_COLUMNS)),
+    ("SQL_SIGNALS_EXPORT", "srr_coverage_signals.csv",
+     list(audit.SIGNAL_COLUMNS)),
+])
+def test_a12_copy_export_is_one_complete_psql_line(name, filename, columns):
+    """Regression for https://github.com/eignat88/trad_bot/pull/265
+    #discussion_r4485115250: both CSV exports must be single physical
+    lines so `psql -f` executes them, with the READ-ONLY SELECT, the
+    column names and their order untouched."""
+    text = SQL_FILE.read_text(encoding="utf-8")
+
+    carriers = [line for line in copy_physical_lines(text)
+                if f"'{filename}'" in line]
+    assert len(carriers) == 1, (
+        f"{name}: the complete \\copy command carrying '{filename}' must "
+        "occupy exactly one physical line")
+    line = carriers[0]
+    assert line == line.strip(), "no leading whitespace before \\copy"
+
+    match = PSQL_COPY_ONE_LINE.fullmatch(line)
+    assert match, f"{name}: not valid single-line psql syntax: {line[:80]}"
+    assert match.group("file") == filename
+
+    inner = match.group("inner")
+    audit.assert_read_only(inner)                       # READ-ONLY kept
+    assert normalize(inner) == normalize(audit.SQL_STATEMENTS[name])
+    assert export_columns(inner) == columns             # names + order kept
+
+    # no other physical line may start an export command
+    starts = copy_physical_lines(text)
+    assert len(starts) == 2, "exactly two \\copy commands in the file"
+
+
+def test_a12_copy_grammar_rejects_the_old_multi_line_form():
+    """The strict grammar must REJECT the pre-fix multi-line \\copy —
+    this is the direct regression for discussion_r4485115250 (the old
+    A12 accepted it only through re.DOTALL)."""
+    old_form = ("\\copy (\n"
+                "SELECT signal_id\n"
+                "FROM dds.srr_research_signal\n"
+                ") TO 'srr_coverage_signals.csv' WITH CSV HEADER")
+
+    assert PSQL_COPY_ONE_LINE.fullmatch(old_form) is None
+    starts = copy_physical_lines(old_form)
+    assert starts == ["\\copy ("]
+    assert PSQL_COPY_ONE_LINE.fullmatch(starts[0]) is None, (
+        "a \\copy line that does not carry its complete command must fail")
+
+
+@pytest.mark.skipif(shutil.which("psql") is None,
+                    reason="psql is not installed on this machine")
+def test_a12_psql_f_smoke_executes_both_exports(tmp_path, monkeypatch):
+    """Optional REAL smoke test: run `psql -f` on an ISOLATED test DB.
+
+    Requires ``SRR_AUDIT_TEST_DSN`` pointing at a disposable test
+    database (the DSN must contain 'test'); production PostgreSQL is
+    never a valid target.  Automatically skipped when psql or the DSN
+    is absent — the always-on single-line syntax checks above are the
+    offline equivalent.
+    """
+    dsn = os.environ.get("SRR_AUDIT_TEST_DSN", "").strip()
+    if not dsn:
+        pytest.skip("SRR_AUDIT_TEST_DSN not set (isolated test DB only)")
+    assert "test" in dsn.lower(), (
+        "SRR_AUDIT_TEST_DSN must point at an isolated TEST database")
+
+    monkeypatch.chdir(tmp_path)   # \copy writes client-side into cwd
+    proc = subprocess.run(
+        [shutil.which("psql"), dsn, "-v", "ON_ERROR_STOP=1",
+         "-f", str(SQL_FILE)],
+        capture_output=True, text=True, timeout=180)
+    assert proc.returncode == 0, (
+        f"psql -f failed:\nstdout={proc.stdout}\nstderr={proc.stderr}")
+
+    for filename, columns in (
+        ("srr_coverage_outcomes.csv", list(audit.OUTCOME_COLUMNS)),
+        ("srr_coverage_signals.csv", list(audit.SIGNAL_COLUMNS)),
+    ):
+        exported = tmp_path / filename
+        assert exported.exists(), f"{filename} was not exported"
+        header = exported.read_text(encoding="utf-8").splitlines()[0]
+        assert header.replace('"', "").split(",") == columns, (
+            f"{filename}: CSV header must match the agreed column order")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -663,7 +784,7 @@ def test_a15_sql_file_contains_no_dml_ddl():
         assert match.start() > 0 and code[match.start() - 1] == "\\", (
             "server-side COPY is forbidden; only client-side \\copy")
     copy_commands = list(re.finditer(
-        r"\\copy\b(.*?)WITH\s+CSV\s+HEADER", code, re.S | re.I))
+        r"\\copy\b(.*?)WITH\s+CSV\s+HEADER", code, re.I))
     assert len(copy_commands) == 2
     for command in copy_commands:
         segment = command.group(1)

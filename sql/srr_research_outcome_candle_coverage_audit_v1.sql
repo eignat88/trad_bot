@@ -11,6 +11,11 @@
 --   * the two export commands are psql CLIENT meta-commands (\copy): they
 --     write a local CSV file on the machine running psql and NEVER store
 --     data inside PostgreSQL;
+--   * each \copy command is written as ONE COMPLETE PHYSICAL LINE —
+--     `psql -f` executes backslash meta-commands per line, so a
+--     multi-line \copy is not reliably parsed (PR #265
+--     discussion_r4485115250).  The four aggregate SELECTs below are
+--     ordinary SQL and may span lines freely;
 --   * this file is executed only when an operator runs it manually
 --     (psql -f ...).  The Python audit module
 --     (tools/research/srr_research_outcome_candle_coverage_audit_v1.py)
@@ -79,39 +84,11 @@ WHERE o.experiment_id = 'SRR_LONG_OUTCOME_V1'
 ;
 
 -- name: SQL_OUTCOMES_EXPORT
--- outcomes.csv export: client-side file write (17 columns, order fixed
--- by OUTCOME_COLUMNS in the Python module).
-\copy (
-SELECT
-    o.signal_id,
-    o.experiment_id,
-    o.symbol,
-    s.signal_time,
-    o.is_final,
-    o.evaluated_15m_at,
-    o.evaluated_30m_at,
-    o.evaluated_60m_at,
-    o.evaluated_120m_at,
-    o.evaluated_240m_at,
-    o.mfe_15m,
-    o.mfe_30m,
-    o.mfe_60m,
-    o.mfe_120m,
-    o.mfe_240m,
-    o.created_at,
-    o.updated_at
-FROM dds.srr_research_outcome o
-JOIN dds.srr_research_signal s ON s.signal_id = o.signal_id
-WHERE o.experiment_id = 'SRR_LONG_OUTCOME_V1'
-ORDER BY s.signal_time, o.signal_id
-) TO 'srr_coverage_outcomes.csv' WITH CSV HEADER
+-- outcomes.csv export: ONE physical line, psql client-side file write
+-- (17 columns, order fixed by OUTCOME_COLUMNS in the Python module).
+\copy (SELECT o.signal_id, o.experiment_id, o.symbol, s.signal_time, o.is_final, o.evaluated_15m_at, o.evaluated_30m_at, o.evaluated_60m_at, o.evaluated_120m_at, o.evaluated_240m_at, o.mfe_15m, o.mfe_30m, o.mfe_60m, o.mfe_120m, o.mfe_240m, o.created_at, o.updated_at FROM dds.srr_research_outcome o JOIN dds.srr_research_signal s ON s.signal_id = o.signal_id WHERE o.experiment_id = 'SRR_LONG_OUTCOME_V1' ORDER BY s.signal_time, o.signal_id) TO 'srr_coverage_outcomes.csv' WITH CSV HEADER
 
 -- name: SQL_SIGNALS_EXPORT
--- signals.csv export: client-side file write (4 columns, order fixed by
--- SIGNAL_COLUMNS in the Python module).
-\copy (
-SELECT signal_id, experiment_id, symbol, signal_time
-FROM dds.srr_research_signal
-WHERE experiment_id = 'SRR_LONG_OUTCOME_V1'
-ORDER BY signal_time, signal_id
-) TO 'srr_coverage_signals.csv' WITH CSV HEADER
+-- signals.csv export: ONE physical line, psql client-side file write
+-- (4 columns, order fixed by SIGNAL_COLUMNS in the Python module).
+\copy (SELECT signal_id, experiment_id, symbol, signal_time FROM dds.srr_research_signal WHERE experiment_id = 'SRR_LONG_OUTCOME_V1' ORDER BY signal_time, signal_id) TO 'srr_coverage_signals.csv' WITH CSV HEADER
