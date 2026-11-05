@@ -163,7 +163,13 @@ class V2DRepository:
 
         A signal is eligible when:
         - It has no outcome row (brand new), OR
-        - It has an outcome row with at least one un-evaluated mature horizon
+        - It has an outcome row with at least one un-evaluated mature horizon, OR
+        - It has a NON-final outcome whose horizon marks are all present but
+          whose finalization gate was blocked — the frozen V2_D target-flag
+          verdict scans every closed candle to the evaluation ASOF, so its
+          window can be incomplete even when all 240m marks are proven; the
+          row stays retry-eligible until the path is proven (FR-06).
+          Finalized rows never match.
         """
         if not self._conn:
             return []
@@ -192,6 +198,16 @@ class V2DRepository:
                     OR (o.evaluated_60m_at IS NULL AND s.signal_time <= now() - interval '60 minutes')
                     OR (o.evaluated_120m_at IS NULL AND s.signal_time <= now() - interval '120 minutes')
                     OR (o.evaluated_240m_at IS NULL AND s.signal_time <= now() - interval '240 minutes')
+                    -- Fail-closed finalization retry (FR-06): all horizon
+                    -- marks present but the finalization gate was blocked
+                    -- (gap after 240m in the to-ASOF verdict window) —
+                    -- keep retrying until the frozen path is proven.
+                    -- Finalized rows (is_final = TRUE) never match.
+                    OR (o.evaluated_15m_at IS NOT NULL
+                        AND o.evaluated_30m_at IS NOT NULL
+                        AND o.evaluated_60m_at IS NOT NULL
+                        AND o.evaluated_120m_at IS NOT NULL
+                        AND o.evaluated_240m_at IS NOT NULL)
                  ))
               )
             ORDER BY s.signal_time ASC

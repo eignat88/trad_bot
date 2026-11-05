@@ -109,7 +109,14 @@ class TestShadowSignalEvaluator:
 
     def test_evaluate_signal_incremental(self, evaluator, mock_client):
         """Test incremental signal evaluation via run_evaluation_cycle."""
-        signal_time = datetime.now(timezone.utc) - timedelta(minutes=20)
+        # Grid-aligned signal 20m ago: the coverage guard proves the
+        # absolute UTC 5m path, so the fixture must sit on that grid
+        # (complete-path fixture, same approach as PR #257).
+        now = datetime.now(timezone.utc)
+        grid_now = now.replace(second=0, microsecond=0) - timedelta(
+            minutes=now.minute % 5,
+        )
+        signal_time = grid_now - timedelta(minutes=20)
 
         # Mock repo to return eligible signal
         mock_repo = evaluator.repo
@@ -130,7 +137,8 @@ class TestShadowSignalEvaluator:
             }
         ]
 
-        # Mock client to return candles AFTER signal time
+        # Mock client to return candles AFTER signal time (grid-aligned,
+        # covering the complete closed path of the matured 15m window)
         signal_ts = int(signal_time.timestamp() * 1000)
         mock_client.get_klines.return_value = [
             Candle(

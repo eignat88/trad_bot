@@ -702,3 +702,70 @@ def record_finalization_block(
     stats["finalization_blocked"] = stats.get("finalization_blocked", 0) + 1
     blocked = stats.setdefault("coverage_blocked", {})
     blocked[coverage.reason_code] = blocked.get(coverage.reason_code, 0) + 1
+
+
+# ── structured block diagnostics (shared by the shadow evaluators) ────
+#
+# Structured, in-memory diagnostics ONLY.  The reason-code vocabulary is
+# owned by this module and byte-stable: it is the agreed set for a FUTURE
+# persistence marker.  Persisting it (e.g. a nullable ``block_reason``
+# column) requires a separately agreed schema and its own PostgreSQL
+# migration PR — until that agreement exists every consumer writes NO
+# diagnostic column and runs NO DML beyond the frozen outcome upsert.
+
+# Event kinds a consumer may record.
+DIAGNOSTIC_BLOCK_EVENTS = (
+    "source_blocked",
+    "coverage_blocked",
+    "finalization_blocked",
+)
+
+# Fields of one structured block event: reason_code + signal_id + symbol +
+# experiment_id are mandatory.
+DIAGNOSTIC_EVENT_FIELDS = (
+    "event",
+    "reason_code",
+    "status",
+    "horizon",
+    "signal_id",
+    "symbol",
+    "experiment_id",
+    "detected_at",
+)
+
+# Per-cycle cap for the event LIST; the counters stay exact.
+MAX_DIAGNOSTIC_EVENTS = 500
+
+
+def record_block_event(
+    stats: dict[str, Any],
+    *,
+    event: str,
+    status: str,
+    reason_code: str,
+    horizon: str | None = None,
+    signal_id: int | None = None,
+    symbol: str | None = None,
+    experiment_id: str | None = None,
+) -> None:
+    """Append one structured fail-closed block event to the cycle stats.
+
+    Counters (``source_blocked`` / ``coverage_blocked`` / ``horizons_pending``
+    / ``finalization_blocked``) are always exact; the event list is bounded
+    per cycle (``MAX_DIAGNOSTIC_EVENTS``) so diagnostics can never become
+    unbounded memory — overflow increments ``diagnostics_truncated``.
+    """
+    events = stats.setdefault("diagnostics", [])
+    if len(events) >= MAX_DIAGNOSTIC_EVENTS:
+        stats["diagnostics_truncated"] = stats.get("diagnostics_truncated", 0) + 1
+        return
+    events.append({
+        "event": event,
+        "reason_code": reason_code,
+        "status": status,
+        "horizon": horizon,
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "experiment_id": experiment_id,
+        "detected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    })

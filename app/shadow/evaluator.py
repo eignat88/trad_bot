@@ -9,6 +9,25 @@ EOD semantics (half-open interval):
 No lookahead: when evaluating a horizon, only candles within
 [signal_time, signal_time + horizon) are used.
 EOD uses [signal_time, next UTC midnight).
+
+Candle source: the shared ``app.research.candle_coverage_guard_v1`` — no
+silent 1000-candle truncation, bounded pagination for large windows,
+classified source statuses (``SOURCE_VALIDATED`` / ``SOURCE_FETCH_ERROR`` /
+``SOURCE_INCOMPLETE_COVERAGE`` / ``SOURCE_NOT_YET_AVAILABLE``) and NO
+fallback request after a Global Limiter deny.
+
+Fail-closed contract (OOS_SHADOW_CANDLE_COVERAGE_FAIL_CLOSED_V1)::
+
+    INCOMPLETE CANDLE COVERAGE
+        -> NO evaluated_*_at WRITE
+        -> NO is_final
+
+Before every ``evaluated_<horizon>_at`` mark the complete closed 5m candle
+path of ``[signal_time, signal_time + horizon)`` (EOD:
+``[signal_time, next UTC midnight)``) is proven; before ``is_final=True``
+the frozen target-flag window to EOD is proven separately.  An unproven
+horizon writes nothing, stays pending and is re-evaluated on the next cycle;
+previously finalized outcomes are never rewritten automatically.
 """
 from __future__ import annotations
 
@@ -25,9 +44,22 @@ from app.config import load_settings
 from app.db.repository import ScannerRepository
 from app.exchange.bybit_client import BybitClient
 from app.models import Candle
+from app.research.candle_coverage_guard_v1 import (
+    SOURCE_INCOMPLETE_COVERAGE,
+    datetime_to_ms,
+    fetch_candles_for_evaluation,
+    fetch_status_stats_key,
+    record_block_event,
+    record_coverage_block,
+    record_finalization_block,
+    validate_candle_coverage,
+)
 from app.shadow.repository import ShadowSignalRepository
 
 logger = logging.getLogger(__name__)
+
+# Must match the experiment_id hardcoded in ShadowSignalRepository's upsert.
+EXPERIMENT_ID = "ATR_WICK_REJECTION_SHORT_V1"
 
 # Horizon definitions: (name, minutes)
 HORIZONS: list[tuple[str, int]] = [
@@ -178,16 +210,32 @@ class ShadowSignalEvaluator:
     def _get_candles_for_symbol(
         self, symbol: str, from_time: datetime, to_time: datetime,
     ) -> list[Candle]:
-        """Fetch 5m candles for *symbol* covering [from_time, to_time]."""
-        try:
-            start_ms = int((from_time - timedelta(minutes=5)).timestamp() * 1000)
-            end_ms = int(to_time.timestamp() * 1000)
-            needed = min((end_ms - start_ms) // 300_000 + 10, 1000)
-            candles = self.client.get_klines(symbol, "5", needed)
-            return [c for c in candles if start_ms <= c.timestamp <= end_ms]
-        except Exception:
-            logger.exception("Failed to fetch candles for %s", symbol)
+        """Fetch the PROVEN closed 5m path for *symbol* covering the window.
+
+        Delegates to the shared guard ``fetch_candles_for_evaluation``:
+
+        * only closed, grid-aligned candles are returned (a forming candle
+          never reaches MFE/MAE or target-flag math);
+        * windows needing more than one page are paginated through the
+          client's bounded ``get_klines_range`` when available — a window
+          larger than one page is NEVER silently truncated to the latest
+          1000 candles and treated as complete;
+        * a failed / limiter-denied / truncated fetch returns ``[]`` with
+          the classified status on ``self._last_fetch_result`` so the cycle
+          can fail closed (no outcome write) instead of guessing.
+        """
+        result = fetch_candles_for_evaluation(
+            self.client, symbol, from_time, to_time,
+        )
+        self._last_fetch_result = result
+        if not result.ok:
+            logger.warning(
+                "shadow evaluation: candle source %s for %s (%s) — "
+                "evaluation deferred, no outcome write",
+                result.status, symbol, result.reason_code,
+            )
             return []
+        return list(result.candles)
 
     # ── single-signal incremental evaluation ──────────────────
 
@@ -202,6 +250,10 @@ class ShadowSignalEvaluator:
 
         EOD uses half-open interval [signal_time, next UTC midnight).
         Target flags at finalization are also capped to EOD boundary.
+
+        Fail-closed: every horizon write and the finalization write are
+        gated by ``validate_candle_coverage`` on the exact window the frozen
+        formulas read — an unproven window writes nothing and stays pending.
         """
         signal_time: datetime = sig["signal_time"]
         signal_price: float = sig["signal_price"]
@@ -211,10 +263,12 @@ class ShadowSignalEvaluator:
 
         # Post-signal candles for time-horizon calculations
         signal_ts = int(signal_time.timestamp() * 1000)
+        asof_ms = datetime_to_ms(now)
         post_candles = [c for c in all_candles if c.timestamp > signal_ts]
 
         # EOD boundary for this signal
         eod_excl = _get_eod_exclusive(signal_time)
+        eod_excl_ms = int(eod_excl.timestamp() * 1000)
 
         updates: dict[str, Any] = {}
 
@@ -226,6 +280,40 @@ class ShadowSignalEvaluator:
             if not _is_horizon_mature(signal_time, minutes, now):
                 continue
 
+            # Fail-closed: prove the exact closed candle path of
+            # [signal_time, signal_time + horizon) BEFORE computing.
+            # Maturity alone is never proof that the price path is complete.
+            horizon_cutoff_ms = int(
+                (signal_time + timedelta(minutes=minutes)).timestamp() * 1000
+            )
+            coverage = validate_candle_coverage(
+                all_candles,
+                signal_ms=signal_ts,
+                cutoff_ms=horizon_cutoff_ms,
+                asof_ms=asof_ms,
+                scope=f"HORIZON_{label}",
+            )
+            if not coverage.ok:
+                record_coverage_block(stats, coverage, horizon=label)
+                record_block_event(
+                    stats,
+                    event="coverage_blocked",
+                    status=coverage.status,
+                    reason_code=coverage.reason_code,
+                    horizon=label,
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    experiment_id=EXPERIMENT_ID,
+                )
+                logger.warning(
+                    "shadow evaluation: signal_id=%d symbol=%s horizon=%s "
+                    "blocked status=%s reason_code=%s experiment_id=%s "
+                    "— no evaluated_*_at write",
+                    signal_id, symbol, label,
+                    coverage.status, coverage.reason_code, EXPERIMENT_ID,
+                )
+                continue
+
             mfe, mae = _calculate_mfe_mae_for_window(
                 post_candles, signal_price, minutes, signal_time,
             )
@@ -235,13 +323,41 @@ class ShadowSignalEvaluator:
 
         # EOD — half-open interval capped at next UTC midnight
         if sig.get("evaluated_eod_at") is None and _is_eod_mature(signal_time, now):
-            mfe, mae = _calculate_mfe_mae_for_window(
-                post_candles, signal_price, None, signal_time,
-                eod_exclusive=eod_excl,
+            # Fail-closed: the EOD window must be fully proven as well.
+            coverage = validate_candle_coverage(
+                all_candles,
+                signal_ms=signal_ts,
+                cutoff_ms=eod_excl_ms,
+                asof_ms=asof_ms,
+                scope="HORIZON_EOD",
             )
-            updates["mfe_eod"] = mfe
-            updates["mae_eod"] = mae
-            updates["evaluated_eod_at"] = now
+            if not coverage.ok:
+                record_coverage_block(stats, coverage, horizon="eod")
+                record_block_event(
+                    stats,
+                    event="coverage_blocked",
+                    status=coverage.status,
+                    reason_code=coverage.reason_code,
+                    horizon="eod",
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    experiment_id=EXPERIMENT_ID,
+                )
+                logger.warning(
+                    "shadow evaluation: signal_id=%d symbol=%s horizon=eod "
+                    "blocked status=%s reason_code=%s experiment_id=%s "
+                    "— no evaluated_eod_at write",
+                    signal_id, symbol,
+                    coverage.status, coverage.reason_code, EXPERIMENT_ID,
+                )
+            else:
+                mfe, mae = _calculate_mfe_mae_for_window(
+                    post_candles, signal_price, None, signal_time,
+                    eod_exclusive=eod_excl,
+                )
+                updates["mfe_eod"] = mfe
+                updates["mae_eod"] = mae
+                updates["evaluated_eod_at"] = now
 
         # finalization — effective state = sig OR updates
         all_done = all(
@@ -253,12 +369,42 @@ class ShadowSignalEvaluator:
         )
 
         if all_done and not sig.get("is_final"):
-            # Target flags capped to EOD boundary
-            target_flags = _check_target_achievement(
-                post_candles, signal_price, eod_exclusive=eod_excl,
+            # Fail-closed (FR-04): the frozen target-flag verdict reads
+            # exactly [signal_time, EOD) — stored horizon marks alone are
+            # not proof that THIS window is complete.
+            coverage = validate_candle_coverage(
+                all_candles,
+                signal_ms=signal_ts,
+                cutoff_ms=eod_excl_ms,
+                asof_ms=asof_ms,
+                scope="TARGET_FLAGS_EOD",
             )
-            updates.update(target_flags)
-            updates["is_final"] = True
+            if not coverage.ok:
+                record_finalization_block(stats, coverage)
+                record_block_event(
+                    stats,
+                    event="finalization_blocked",
+                    status=coverage.status,
+                    reason_code=coverage.reason_code,
+                    horizon="eod",
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    experiment_id=EXPERIMENT_ID,
+                )
+                logger.warning(
+                    "shadow evaluation: signal_id=%d symbol=%s finalization "
+                    "blocked status=%s reason_code=%s experiment_id=%s "
+                    "— is_final stays false",
+                    signal_id, symbol,
+                    coverage.status, coverage.reason_code, EXPERIMENT_ID,
+                )
+            else:
+                # Target flags capped to EOD boundary
+                target_flags = _check_target_achievement(
+                    post_candles, signal_price, eod_exclusive=eod_excl,
+                )
+                updates.update(target_flags)
+                updates["is_final"] = True
 
         if not updates:
             return
@@ -305,6 +451,15 @@ class ShadowSignalEvaluator:
             "outcomes_updated": 0,
             "finalized": 0,
             "errors": 0,
+            # Fail-closed diagnostics (in-memory only; NO schema change).
+            "source_blocked": {
+                "source_fetch_error": 0,
+                "source_incomplete": 0,
+                "source_not_yet_available": 0,
+            },
+            "coverage_blocked": {},
+            "horizons_pending": {h: 0 for h, _ in HORIZONS} | {"eod": 0},
+            "finalization_blocked": 0,
         }
 
         for symbol, signals in by_symbol.items():
@@ -312,7 +467,38 @@ class ShadowSignalEvaluator:
             oldest = min(s["signal_time"] for s in signals)
             candles = self._get_candles_for_symbol(symbol, oldest, now)
             if not candles:
+                # Fail-closed: no candles without a SOURCE_VALIDATED fetch.
+                # The signals stay eligible (retry) and no outcome is touched.
+                result = getattr(self, "_last_fetch_result", None)
+                if result is not None and not result.ok:
+                    status = result.status
+                    status_key = fetch_status_stats_key(status)
+                    reason_code = result.reason_code
+                else:
+                    status = SOURCE_INCOMPLETE_COVERAGE
+                    status_key = fetch_status_stats_key(status)
+                    reason_code = "NO_CANDLES_IN_WINDOW"
+                stats["source_blocked"][status_key] = (
+                    stats["source_blocked"].get(status_key, 0) + len(signals)
+                )
                 stats["errors"] += len(signals)
+                for s in signals:
+                    record_block_event(
+                        stats,
+                        event="source_blocked",
+                        status=status,
+                        reason_code=reason_code,
+                        horizon=None,
+                        signal_id=s.get("signal_id"),
+                        symbol=symbol,
+                        experiment_id=EXPERIMENT_ID,
+                    )
+                logger.warning(
+                    "shadow evaluation: symbol=%s source_blocked=%d "
+                    "status=%s reason_code=%s experiment_id=%s "
+                    "— no outcome write, signals stay retry-eligible",
+                    symbol, len(signals), status, reason_code, EXPERIMENT_ID,
+                )
                 continue
             for s in signals:
                 try:
@@ -324,12 +510,27 @@ class ShadowSignalEvaluator:
         stats["end_time"] = datetime.now(timezone.utc).isoformat()
         logger.info(
             "Shadow evaluation: checked=%d symbols=%d created=%d updated=%d "
-            "finalized=%d errors=%d",
+            "finalized=%d errors=%d source_blocked=%s coverage_blocked=%s "
+            "finalization_blocked=%d",
             stats["signals_checked"], stats["symbols_processed"],
             stats["outcomes_created"], stats["outcomes_updated"],
             stats["finalized"], stats["errors"],
+            stats["source_blocked"], stats["coverage_blocked"],
+            stats["finalization_blocked"],
         )
         logger.info("Horizons: %s", stats["horizons_updated"])
+        if stats["coverage_blocked"] or stats["finalization_blocked"] or any(
+            stats["source_blocked"].values()
+        ):
+            logger.warning(
+                "Shadow evaluation fail-closed blocks: experiment_id=%s "
+                "source_blocked=%s coverage_blocked=%s horizons_pending=%s "
+                "finalization_blocked=%d events=%d",
+                EXPERIMENT_ID, stats["source_blocked"],
+                stats["coverage_blocked"], stats["horizons_pending"],
+                stats["finalization_blocked"],
+                len(stats.get("diagnostics", [])),
+            )
         return stats
 
     # ── lifecycle ─────────────────────────────────────────────
@@ -399,6 +600,11 @@ def main() -> None:
         print(f"Outcomes updated:   {summary['outcomes_updated']}")
         print(f"Finalized:          {summary['finalized']}")
         print(f"Errors:             {summary['errors']}")
+        # Fail-closed diagnostics (present since the coverage guard; .get()
+        # keeps this CLI working with summaries produced by older callers).
+        print(f"Source blocked:     {summary.get('source_blocked')}")
+        print(f"Coverage blocked:   {summary.get('coverage_blocked')}")
+        print(f"Finalization blocked: {summary.get('finalization_blocked')}")
         print("=" * 80)
     else:
         evaluator.start(interval_seconds=args.interval_seconds)

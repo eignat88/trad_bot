@@ -282,7 +282,14 @@ class TestV2DEvaluatorCompatibility:
         mock_client = MagicMock()
         mock_repo = MagicMock()
 
-        signal_time = datetime.now(timezone.utc) - timedelta(minutes=20)
+        # Grid-aligned signal 20m ago: the coverage guard proves the
+        # absolute UTC 5m path, so the fixture must sit on that grid
+        # (complete-path fixture, same approach as PR #257).
+        now_dt = datetime.now(timezone.utc)
+        grid_now = now_dt.replace(second=0, microsecond=0) - timedelta(
+            minutes=now_dt.minute % 5,
+        )
+        signal_time = grid_now - timedelta(minutes=20)
         signal_ts = int(signal_time.timestamp() * 1000)
 
         mock_repo.get_eligible_signals.return_value = [
