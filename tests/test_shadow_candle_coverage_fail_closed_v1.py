@@ -449,9 +449,18 @@ def cycle_signal(spec: Spec) -> datetime:
 
 
 def old_cycle_signal(spec: Spec) -> datetime:
-    """Grid-aligned signal 4 days ago: the fetch window exceeds one page."""
-    floor = int(datetime.now(UTC).timestamp()) // 300 * 300
-    return datetime.fromtimestamp(floor - 4 * 24 * 3600, UTC)
+    """Grid-aligned signal four days ago at 12:00 UTC.
+
+    The fixed 12:00 anchor keeps V1's EOD verdict window at a constant 144
+    candles (12:00 → next midnight) no matter when the suite runs — a
+    signal carrying the wall clock's time-of-day would shrink that window
+    to minutes near midnight and make the T08/T09 truncation premise
+    (range_keep=60 must cut the EOD window) time-of-day dependent.  The
+    four-day distance keeps the fetch window above the 1000-bar cap for
+    both evaluators at any hour.
+    """
+    return (datetime.now(UTC) - timedelta(days=4)).replace(
+        hour=12, minute=0, second=0, microsecond=0, tzinfo=UTC)
 
 
 def cycle_candles(spec: Spec, signal_time: datetime) -> list[Candle]:

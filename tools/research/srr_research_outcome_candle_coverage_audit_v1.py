@@ -16,18 +16,31 @@ coverage.  This audit classifies every historical outcome into:
 * unverified outcomes with the explicit ``COVERAGE_UNVERIFIED`` label.
 
 No row is ever modified by this tool: the classification lives in the report
-and the optional JSON export only.  The optional
-``COVERAGE_PROVEN_BY_GUARDED_EVALUATOR`` label can only appear for rows whose
-marks are at/after ``--guarded-from`` (the guarded evaluator rollout), which
-requires a separate operator GO — it is 0 until then.
+and the optional JSON export only.  Coverage labels:
 
-Export (read-only, from the repository root, see
-``sql/srr_research_outcome_candle_coverage_audit_v1.sql``)::
+* ``COVERAGE_UNVERIFIED`` — candle-path completeness is NOT confirmed;
+* ``COVERAGE_DEFECT`` — a checkable data invariant is PROVEN violated by the
+  export itself (finalized row missing a mark, an early mark, a mark whose
+  MFE stayed NULL);
+* ``COVERAGE_PROVEN_BY_GUARDED_EVALUATOR`` — explicit, per-record evidence
+  that the guarded evaluator validated THIS row (``--guard-proof-ids``,
+  sourced from the guarded evaluator's structured logs).  A rollout
+  timestamp (``--guarded-from``) alone is NEVER treated as proof: it only
+  scopes which horizons count as pre-rollout for the legacy thresholds.
+
+Export (read-only, from the repository root; see
+``sql/srr_research_outcome_candle_coverage_audit_v1.sql`` for the
+equivalent statements and the documented ``\\copy`` CSV commands)::
 
     psql "$CONN" -c "\\copy (SELECT ... ) TO 'srr_coverage_outcomes.csv'
           WITH CSV HEADER"
     psql "$CONN" -c "\\copy (SELECT ... ) TO 'srr_coverage_signals.csv'
           WITH CSV HEADER"
+
+Print the six READ-ONLY statements without any input CSV (exit 0)::
+
+    python -m tools.research.srr_research_outcome_candle_coverage_audit_v1 \
+        --print-sql
 
 Analyze::
 
@@ -60,10 +73,23 @@ HORIZONS = tuple(HORIZON_MINUTES)
 LEGACY_FETCH_CAP = 1000
 CANDLE_INTERVAL_MIN = 5
 
-# age_min >= 4950  -> the legacy request formula exceeds the 1000-bar cap
-#                     (the +10 margin may still have covered the window).
-# age_min >= 5000  -> the 1000 newest bars cannot contain the first required
-#                     candle (signal+5m): the window head was definitely cut.
+# Terminology (historical-risk interpretation, P1 review):
+#   age_min >= 4950  -> RISK FACTOR: the legacy request formula would exceed
+#                       the 1000-bar cap (the +10 margin may still have
+#                       covered the window).  Crossing this threshold does
+#                       NOT prove an MFE/MAE or TP/SL error.
+#   age_min >= 5000  -> TRUNCATION INDICATOR: the 1000 newest bars cannot
+#                       contain the first required candle (signal+5m), so
+#                       the window head was plausibly cut.  Still not proof:
+#                       the export carries no candle history.
+# Conversely, staying below the thresholds does NOT prove historical
+# completeness either.  These flags mark rows for a SEPARATE review
+# decision, never an automatic repair.
+# The legacy evaluator fetched once per symbol per cycle over the whole
+# batch window (oldest signal of the batch -> cycle time); the export has
+# no cycle/batch identifiers, so the exact legacy request window of an
+# individual outcome cannot be reconstructed — the thresholds are applied
+# to the individual evaluation lag as an approximation (see report §7).
 LATE_EVAL_RISK_MIN = 4950        # 82h30m
 LATE_EVAL_TRUNCATED_MIN = 5000   # 83h20m
 
@@ -79,13 +105,56 @@ FLAG_EARLY_MARK = "EARLY_MARK"
 FLAG_LATE_EVAL_RISK = "LATE_EVAL_RISK_ZONE"
 FLAG_LATE_EVAL_TRUNCATED = "LATE_EVAL_TRUNCATED"
 
-DEFECT_FLAGS = frozenset({
-    FLAG_FINALIZED_MISSING_MARK,
-    FLAG_NULL_MARK_VALUE,
-    FLAG_EARLY_MARK,
-    FLAG_LATE_EVAL_RISK,
-    FLAG_LATE_EVAL_TRUNCATED,
+# Flags emitted as ``<base>_<horizon>`` (e.g. ``NULL_MARK_VALUE_240m``).
+HORIZON_SCOPED_FLAGS = frozenset({
+    FLAG_EARLY_MARK, FLAG_NULL_MARK_VALUE,
+    FLAG_LATE_EVAL_RISK, FLAG_LATE_EVAL_TRUNCATED,
 })
+BASE_FLAGS = HORIZON_SCOPED_FLAGS | {
+    FLAG_FINALIZED_MISSING_MARK, FLAG_FINALIZED_BY_LEGACY,
+}
+# Proven violations of checkable data invariants (derivable from the export
+# alone) — ONLY these justify COVERAGE_DEFECT / reconstruction.
+PROVEN_DEFECT_FLAGS = frozenset({
+    FLAG_FINALIZED_MISSING_MARK, FLAG_NULL_MARK_VALUE, FLAG_EARLY_MARK,
+})
+# Legacy latest-N risk indicators — a lag alone is NOT proof of damage.
+LEGACY_RISK_FLAGS = frozenset({FLAG_LATE_EVAL_RISK, FLAG_LATE_EVAL_TRUNCATED})
+# Rows whose window MAY have been incomplete (risk factor or proven gap).
+POTENTIALLY_INCOMPLETE_FLAGS = LEGACY_RISK_FLAGS | {FLAG_NULL_MARK_VALUE}
+
+
+def match_flag(flag: str, base: str) -> bool:
+    """True when *flag* is *base* or ``<base>_<horizon>`` with a VALID horizon.
+
+    The single recognition mechanism used by ``classify()``,
+    ``AuditResult`` properties, totals, Markdown and JSON — an arbitrary
+    ``startswith()`` without a horizon check would mis-count (P2-01).
+    """
+    if flag == base:
+        return True
+    if base not in HORIZON_SCOPED_FLAGS:
+        return False
+    prefix = f"{base}_"
+    return flag.startswith(prefix) and flag[len(prefix):] in HORIZON_MINUTES
+
+
+def flag_base(flag: str) -> str | None:
+    for base in sorted(BASE_FLAGS, key=len, reverse=True):
+        if match_flag(flag, base):
+            return base
+    return None
+
+
+def flag_horizon(flag: str) -> str | None:
+    base = flag_base(flag)
+    if base is None or base not in HORIZON_SCOPED_FLAGS:
+        return None
+    return flag[len(base) + 1:]
+
+
+def has_any_flag(flags: Iterable[str], bases: Iterable[str]) -> bool:
+    return any(match_flag(flag, base) for flag in flags for base in bases)
 
 OUTCOME_COLUMNS = (
     "signal_id", "experiment_id", "symbol", "signal_time", "is_final",
@@ -334,7 +403,9 @@ class RowVerdict:
         return self.row.symbol
 
     def has_flag(self, flag: str) -> bool:
-        return flag in self.flags
+        """Match the base flag OR its horizon-suffixed form (e.g. both
+        ``LATE_EVAL_RISK_ZONE`` and ``LATE_EVAL_RISK_ZONE_60m``)."""
+        return any(match_flag(f, flag) for f in self.flags)
 
 
 @dataclass
@@ -357,8 +428,7 @@ class AuditResult:
     @property
     def potentially_incomplete(self) -> list[RowVerdict]:
         return [v for v in self.verdicts
-                if any(f in {FLAG_LATE_EVAL_RISK, FLAG_LATE_EVAL_TRUNCATED,
-                             FLAG_NULL_MARK_VALUE} for f in v.flags)]
+                if has_any_flag(v.flags, POTENTIALLY_INCOMPLETE_FLAGS)]
 
     @property
     def reconstruction_required(self) -> list[RowVerdict]:
@@ -384,16 +454,30 @@ def classify(
     truncated_min: float = LATE_EVAL_TRUNCATED_MIN,
     generated_at: datetime | None = None,
     inputs: dict[str, str] | None = None,
+    guard_proof: Iterable[int] | None = None,
 ) -> AuditResult:
-    """Classify historical outcomes.  Pure: no I/O, no DB, no writes."""
+    """Classify historical outcomes.  Pure: no I/O, no DB, no writes.
+
+    Coverage semantics:
+
+    * ``COVERAGE_DEFECT`` — ONLY a proven violation of a checkable data
+      invariant (missing mark on a finalized row, early mark, mark whose MFE
+      stayed NULL).  A late-evaluation lag alone never proves damage;
+    * ``COVERAGE_PROVEN_BY_GUARDED_EVALUATOR`` — ONLY for signal ids listed
+      in *guard_proof* (explicit per-record evidence that the guarded
+      evaluator validated that row).  ``guarded_from`` scopes the legacy
+      thresholds per horizon (P2-02) but is NEVER proof by itself;
+    * ``COVERAGE_UNVERIFIED`` — everything else.
+    """
     rows = list(rows)
     verdicts: list[RowVerdict] = []
+    proof_ids = {int(x) for x in (guard_proof or ())}
 
     for row in rows:
         verdict = RowVerdict(row=row)
         ages: list[float] = []
 
-        # ── structural checks (provable from the export alone) ──
+        # ── structural checks (provable from the export alone, ALL periods) ──
         if row.is_final and any(row.marks[h] is None for h in HORIZONS):
             verdict.flags.append(FLAG_FINALIZED_MISSING_MARK)
         for horizon in HORIZONS:
@@ -411,18 +495,25 @@ def classify(
                 verdict.flags.append(f"{FLAG_NULL_MARK_VALUE}_{horizon}")
             age_min = (mark - row.signal_time).total_seconds() / 60.0
             ages.append(age_min)
-            if age_min >= truncated_min:
-                verdict.flags.append(f"{FLAG_LATE_EVAL_TRUNCATED}_{horizon}")
-            elif age_min >= risk_min:
-                verdict.flags.append(f"{FLAG_LATE_EVAL_RISK}_{horizon}")
+            # Legacy latest-N thresholds apply ONLY to horizons evaluated
+            # BEFORE the guarded rollout: a post-rollout evaluation went
+            # through the coverage guard, so signal age alone must not
+            # produce a legacy truncation flag (P2-02).  Each horizon of a
+            # row is evaluated independently (marks may straddle the
+            # rollout boundary).
+            if guarded_from is None or mark < guarded_from:
+                if age_min >= truncated_min:
+                    verdict.flags.append(f"{FLAG_LATE_EVAL_TRUNCATED}_{horizon}")
+                elif age_min >= risk_min:
+                    verdict.flags.append(f"{FLAG_LATE_EVAL_RISK}_{horizon}")
         verdict.max_age_minutes = max(ages) if ages else None
         verdict.late_horizons = sorted({
-            f.rsplit("_", 1)[-1]
-            for f in verdict.flags
-            if f.startswith((FLAG_LATE_EVAL_RISK, FLAG_LATE_EVAL_TRUNCATED))
-        })
+            h for f in verdict.flags
+            for h in [flag_horizon(f)]
+            if h is not None and flag_base(f) in LEGACY_RISK_FLAGS
+        }, key=lambda h: HORIZON_MINUTES[h])
 
-        # ── rollout attribution ──
+        # ── rollout attribution (which finalization is legacy) ──
         marks = [row.marks[h] for h in HORIZONS if row.marks[h] is not None]
         guarded = (
             bool(marks)
@@ -433,21 +524,20 @@ def classify(
             if guarded and guarded_from is not None and (
                 row.updated_at is None or row.updated_at >= guarded_from
             ):
-                pass  # finalized by the guarded evaluator — proven below
+                pass  # finalized by the guarded evaluator — not legacy
             else:
                 verdict.flags.append(FLAG_FINALIZED_BY_LEGACY)
 
-        has_defect = any(f in DEFECT_FLAGS or f.rsplit("_", 1)[0] in {
-            FLAG_EARLY_MARK, FLAG_NULL_MARK_VALUE,
-            FLAG_LATE_EVAL_RISK, FLAG_LATE_EVAL_TRUNCATED,
-        } for f in verdict.flags)
-        verdict.reconstruction_required = has_defect
+        # ── coverage status ──
+        proven_defect = has_any_flag(verdict.flags, PROVEN_DEFECT_FLAGS)
+        legacy_risk = has_any_flag(verdict.flags, LEGACY_RISK_FLAGS)
+        verdict.reconstruction_required = proven_defect or legacy_risk
 
-        if has_defect:
+        if proven_defect:
             verdict.coverage_status = COVERAGE_DEFECT
-        elif not marks:
-            verdict.coverage_status = COVERAGE_UNVERIFIED
-        elif guarded:
+        elif row.signal_id in proof_ids:
+            # Explicit per-record guard evidence only — a rollout
+            # timestamp alone never reaches this branch (Defect 3).
             verdict.coverage_status = COVERAGE_PROVEN_BY_GUARDED_EVALUATOR
         else:
             verdict.coverage_status = COVERAGE_UNVERIFIED
@@ -467,28 +557,21 @@ def classify(
             if v.has_flag(FLAG_FINALIZED_MISSING_MARK)),
         "early_marks": sum(
             1 for v in verdicts
-            if any(f.startswith(f"{FLAG_EARLY_MARK}_") for f in v.flags)),
+            if has_any_flag(v.flags, (FLAG_EARLY_MARK,))),
         "null_mark_values": sum(
             1 for v in verdicts
-            if any(f.startswith(f"{FLAG_NULL_MARK_VALUE}_")
-                   for f in v.flags)),
+            if has_any_flag(v.flags, (FLAG_NULL_MARK_VALUE,))),
         "late_eval_risk": sum(
             1 for v in verdicts
-            if any(f.startswith(f"{FLAG_LATE_EVAL_RISK}_") for f in v.flags)),
+            if has_any_flag(v.flags, (FLAG_LATE_EVAL_RISK,))),
         "late_eval_truncated": sum(
             1 for v in verdicts
-            if any(f.startswith(f"{FLAG_LATE_EVAL_TRUNCATED}_")
-                   for f in v.flags)),
+            if has_any_flag(v.flags, (FLAG_LATE_EVAL_TRUNCATED,))),
         "finalized_by_legacy": sum(
             1 for v in verdicts if v.has_flag(FLAG_FINALIZED_BY_LEGACY)),
         "potentially_incomplete": sum(
             1 for v in verdicts
-            if any(f in {FLAG_LATE_EVAL_RISK, FLAG_LATE_EVAL_TRUNCATED,
-                         FLAG_NULL_MARK_VALUE} or
-                   f.startswith((f"{FLAG_LATE_EVAL_RISK}_",
-                                 f"{FLAG_LATE_EVAL_TRUNCATED}_",
-                                 f"{FLAG_NULL_MARK_VALUE}_"))
-                   for f in v.flags)),
+            if has_any_flag(v.flags, POTENTIALLY_INCOMPLETE_FLAGS)),
         "reconstruction_required": sum(
             1 for v in verdicts if v.reconstruction_required),
         "coverage_unverified": sum(
@@ -516,6 +599,11 @@ def classify(
             "late_eval_risk_min": risk_min,
             "late_eval_truncated_min": truncated_min,
             "guarded_from": guarded_from.isoformat() if guarded_from else None,
+            "guard_proof_ids": sorted(proof_ids),
+            "legacy_threshold_scope": (
+                "pre_rollout_horizons_only" if guarded_from is not None
+                else "all_horizons_no_rollout_timestamp"
+            ),
         },
         totals=totals,
         verdicts=verdicts,
@@ -610,12 +698,28 @@ def render_markdown(result: AuditResult, *, max_rows: int = 40) -> str:
 
     add("## 3. Potentially incomplete candle windows")
     add("")
-    add(f"Count: **{t['potentially_incomplete']}**.  These rows were "
-        "evaluated when the legacy `min((end−start)/5m + 10, 1000)` latest-N "
-        "fetch had hit the 1000-bar cap (evaluated ≥ "
-        f"{p['late_eval_risk_min']} min after the signal), so the oldest part "
-        "of the window may have been cut; `NULL_MARK_VALUE` rows are proven "
-        "incomplete paths (the frozen formula found no candle at all).")
+    add(f"Count: **{t['potentially_incomplete']}**.  Risk classification, "
+        "not a damage verdict:")
+    add("")
+    add(f"- `LATE_EVAL_RISK_ZONE_<horizon>` — the horizon was evaluated ≥ "
+        f"{p['late_eval_risk_min']} min after the signal: a RISK FACTOR that "
+        "the legacy `min((end−start)/5m + 10, 1000)` latest-N fetch exceeded "
+        "its 1000-bar cap (the +10 margin may still have covered the window).")
+    add(f"- `LATE_EVAL_TRUNCATED_<horizon>` — evaluated ≥ "
+        f"{p['late_eval_truncated_min']} min after the signal: an indicator "
+        "that the 1000 newest bars could not contain the first required "
+        "candle, so the window head was plausibly cut.")
+    add("- `NULL_MARK_VALUE_<horizon>` — a mark with NULL MFE: the frozen "
+        "formula found no candle in the window at all (a proven incomplete "
+        "path).")
+    add("")
+    add("A late-evaluation lag ALONE does not prove an MFE/MAE or TP/SL "
+        "error, and the absence of these flags does NOT prove historical "
+        "candle completeness — the export contains no candle history.  "
+        "Legacy thresholds are applied per horizon to horizons evaluated "
+        "BEFORE `--guarded-from` only (post-rollout horizons went through "
+        "the coverage guard).  See §7 for the legacy per-symbol batch-fetch "
+        "limitation.")
     add("")
     incomplete = result.potentially_incomplete
     if incomplete:
@@ -626,13 +730,14 @@ def render_markdown(result: AuditResult, *, max_rows: int = 40) -> str:
 
     add("## 4. Outcomes requiring a SEPARATE reconstruction")
     add("")
-    add(f"Count: **{t['reconstruction_required']}**.  Every defect-flagged "
-        "row (finalized missing marks, early marks, NULL mark values, "
-        "late-evaluated windows).  These rows must NOT be repaired, "
-        "backfilled or recalculated automatically: reconstruction is a "
-        "separate, explicitly approved change with its own tooling and "
+    add(f"Count: **{t['reconstruction_required']}**.  Rows with a PROVEN "
+        "structural defect (finalized missing marks, early marks, NULL mark "
+        "values) or a legacy truncation risk flag.  These rows must NOT be "
+        "repaired, backfilled or recalculated automatically: reconstruction "
+        "is a separate, explicitly approved change with its own tooling and "
         "review.  Rows here are excluded from clean OOS by decision, not by "
-        "silent modification.")
+        "silent modification — a risk flag alone is a review trigger, never "
+        "a proven error.")
     add("")
     required = result.reconstruction_required
     if required:
@@ -644,19 +749,23 @@ def render_markdown(result: AuditResult, *, max_rows: int = 40) -> str:
     add("## 5. COVERAGE_UNVERIFIED outcomes")
     add("")
     add(f"Count: **{t['coverage_unverified']}** "
-        f"(+ {t['coverage_defect']} rows labelled `{COVERAGE_DEFECT}` — also "
-        "unverified, with an additional proven/likely defect).")
+        f"(+ {t['coverage_defect']} rows labelled `{COVERAGE_DEFECT}` — a "
+        "proven violation of a checkable invariant, also unverified as to "
+        "their candle path).")
     add("")
     add("The legacy evaluator stored no coverage evidence, and the DB holds "
-        "no candle history: any row whose marks were written before the "
-        "guarded evaluator rollout is explicitly `COVERAGE_UNVERIFIED` — the "
-        "audit can neither confirm nor refute its candle path. "
+        "no candle history: any row without explicit per-record guard "
+        "evidence is explicitly `COVERAGE_UNVERIFIED` — the audit can "
+        "neither confirm nor refute its candle path. "
         "`COVERAGE_UNVERIFIED` outcomes are **not automatically included in "
         "clean OOS**; inclusion is a separate decision recorded outside this "
         "report. Rows labelled "
         f"`{COVERAGE_PROVEN_BY_GUARDED_EVALUATOR}` "
-        f"**{t['coverage_proven_guarded']}** (only possible after "
-        "`--guarded-from` is set to a real rollout GO timestamp).")
+        f"**{t['coverage_proven_guarded']}** — assigned ONLY from explicit "
+        "per-record evidence (`--guard-proof-ids`, sourced from the guarded "
+        "evaluator's structured logs).  A rollout timestamp "
+        "(`--guarded-from`) alone is NEVER treated as proof of candle-path "
+        "completeness for a specific outcome.")
     add("")
     unverified_ids = [v.signal_id for v in result.coverage_unverified]
     if unverified_ids:
@@ -691,10 +800,19 @@ def render_markdown(result: AuditResult, *, max_rows: int = 40) -> str:
         "mid-window provider gaps or symbols whose Bybit history starts "
         "after `signal_time` cannot be proven or refuted — that is exactly "
         "why every legacy row stays `COVERAGE_UNVERIFIED`.")
+    add("- **Limitation (legacy fetch grouping):** the legacy evaluator "
+        "fetched candles ONCE PER SYMBOL per cycle over the whole batch "
+        "window (oldest signal of that symbol's batch → cycle time), not "
+        "per outcome.  The export carries no cycle/batch identifiers, so "
+        "the exact legacy request window of an individual outcome cannot "
+        "be reconstructed; the age thresholds are applied to "
+        "`evaluated_*_at − signal_time` as an approximation.  Crossing "
+        "them is a risk indicator; staying below them does not prove the "
+        "window was complete.")
     add("- **Limitation:** `age at evaluation` is derived from "
         "`evaluated_*_at − signal_time`; clock steps on the VPS could skew "
         "it, so late-evaluated rows are labelled POTENTIALLY incomplete, "
-        "never proven.")
+        "never proven damaged.")
     add("")
     return "\n".join(lines)
 
@@ -741,8 +859,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="READ-ONLY SRR outcome candle-coverage audit "
                     "(offline over export CSVs; never touches a database)")
-    parser.add_argument("--outcomes", required=True,
-                        help="CSV exported with SQL_OUTCOMES_EXPORT")
+    parser.add_argument("--outcomes", default=None,
+                        help="CSV exported with SQL_OUTCOMES_EXPORT "
+                             "(required for analysis; NOT needed with "
+                             "--print-sql)")
     parser.add_argument("--signals", default=None,
                         help="optional CSV exported with SQL_SIGNALS_EXPORT")
     parser.add_argument("--report", default=None,
@@ -751,7 +871,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="optional full JSON classification output path")
     parser.add_argument("--guarded-from", default=None,
                         help="ISO timestamp of the guarded-evaluator rollout "
-                             "GO (marks at/after it can be proven)")
+                             "(scopes the legacy thresholds to pre-rollout "
+                             "horizons; NEVER proof of coverage by itself)")
+    parser.add_argument("--guard-proof-ids", default=None,
+                        help="comma-separated signal_ids with explicit "
+                             "per-record guard-validation evidence "
+                             "(guarded-evaluator structured logs) — the ONLY "
+                             "route to COVERAGE_PROVEN_BY_GUARDED_EVALUATOR")
     parser.add_argument("--late-risk-min", type=float,
                         default=LATE_EVAL_RISK_MIN)
     parser.add_argument("--late-truncated-min", type=float,
@@ -766,12 +892,28 @@ def main(argv: list[str] | None = None) -> int:
             print(f"-- {name}")
             print(assert_read_only(sql))
             print()
+        print("-- statements also stored in "
+              "sql/srr_research_outcome_candle_coverage_audit_v1.sql")
         return 0
+
+    if not args.outcomes:
+        parser.error(
+            "--outcomes is required for analysis (pass "
+            "srr_coverage_outcomes.csv exported per "
+            "sql/srr_research_outcome_candle_coverage_audit_v1.sql, or use "
+            "--print-sql to print the READ-ONLY SQL without any input)")
 
     outcomes_path = Path(args.outcomes)
     if not outcomes_path.exists():
         parser.error(f"outcomes export not found: {outcomes_path}")
     guarded_from = _ts(args.guarded_from) if args.guarded_from else None
+    guard_proof: list[int] | None = None
+    if args.guard_proof_ids:
+        try:
+            guard_proof = [int(x) for x in args.guard_proof_ids.split(",")
+                           if x.strip()]
+        except ValueError:
+            parser.error("--guard-proof-ids must be comma-separated integers")
 
     inputs = {outcomes_path.name: sha256_file(outcomes_path)}
     signals = None
@@ -790,6 +932,7 @@ def main(argv: list[str] | None = None) -> int:
         risk_min=args.late_risk_min,
         truncated_min=args.late_truncated_min,
         inputs=inputs,
+        guard_proof=guard_proof,
     )
 
     markdown = render_markdown(result, max_rows=args.max_detail)
