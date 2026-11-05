@@ -990,3 +990,138 @@ def _install_fake_clock(monkeypatch):
 
     monkeypatch.setattr(BybitClient, "_global_limiter", _NoopLimiter())
     return clock
+
+
+# ----------------------------------------------------------------------
+# Codex P2 (PR #263 discussion r4479576051): the ABSOLUTE caller deadline
+# is re-checked AFTER the blocking shared-limiter acquire + prepare_send,
+# immediately before the HTTP send; the transport timeout is recomputed
+# from the actually-remaining time. All three tests run on the fake clock
+# with a scripted shared limiter — no network, no real time, no orders.
+# ----------------------------------------------------------------------
+class _FakeSharedLimiter:
+    """Deterministic shared limiter double: burns the FAKE clock inside
+    ``acquire`` / ``prepare_send`` and records every ``record_result``
+    (the exactly-one-finalization contract)."""
+
+    def __init__(self, clock, acquire_s=0.0, prepare_send_s=0.0):
+        self.clock = clock
+        self.acquire_s = acquire_s
+        self.prepare_send_s = prepare_send_s
+        self.recorded: list = []          # (grant_id, priority, outcome)
+        self.prepare_calls = 0
+        self.acquired_priority = None
+        self.acquired_deadline = None
+
+    class _Grant:
+        granted = True
+        grant_id = "grant-p2-1"
+        reason = None
+        waited_ms = 0
+
+        def __init__(self):
+            # mirrors the real grant's public shape used on this path
+            self.result = type("_R", (), {"value": "OK"})()
+
+    def acquire(self, priority, deadline=None, logical_request_id=None):
+        self.clock.sleep(self.acquire_s)
+        self.acquired_priority = priority
+        self.acquired_deadline = deadline
+        grant = self._Grant()
+        grant.waited_ms = int(self.acquire_s * 1000)
+        return grant
+
+    def prepare_send(self, grant_id):
+        self.clock.sleep(self.prepare_send_s)
+        self.prepare_calls += 1
+        return True
+
+    def record_result(self, grant_id, priority, outcome):
+        self.recorded.append((grant_id, priority, outcome))
+        return True
+
+
+def _limiter_client(shared):
+    """Client with the shared limiter switched on and the scripted double
+    injected (the lazy builder would otherwise construct the real one)."""
+    session = ScriptedSession([FakeResponse()])
+    client = make_client(session, bybit_timeout=5,
+                         global_bybit_rate_limiter_enabled=True)
+    client._shared_limiter_obj = shared
+    return client, session
+
+
+def test_deadline_expires_during_acquire_and_prepare_send_sends_no_http(
+        monkeypatch, caplog):
+    """acquire=1.9s + prepare_send=0.2s against deadline_s=2.0: the final
+    pre-send re-check fires (2.1 >= 2.0), ZERO HTTP leaves, the acquired
+    grant is finalized exactly once as NOT_SENT, telemetry keeps
+    BYBIT_API_SKIP, and the denial follows the existing
+    ``retry deadline exceeded`` contract."""
+    clock = _install_fake_clock(monkeypatch)
+    shared = _FakeSharedLimiter(clock, acquire_s=1.9, prepare_send_s=0.2)
+    client, session = _limiter_client(shared)
+
+    with pytest.raises(BybitTimeoutError, match="retry deadline exceeded"):
+        client._public_get("/v5/market/orderbook", category="linear",
+                           symbol="BTCUSDT", limit=50, deadline_s=2.0)
+
+    assert session.calls == []                       # ZERO HTTP
+    assert clock.now >= 1002.0                       # deadline really passed
+    assert shared.prepare_calls == 1                 # post-acquire check ok
+    assert shared.acquired_deadline == 1002.0        # acquire honored budget
+    assert len(shared.recorded) == 1                 # exactly ONE finalization
+    grant_id, priority, outcome = shared.recorded[0]
+    assert grant_id == "grant-p2-1"
+    assert priority == shared.acquired_priority
+    assert outcome == "NOT_SENT"
+    skips = [line for line in attempt_lines(caplog)
+             if field(line, "result") == "BYBIT_API_SKIP"]
+    assert skips, "BYBIT_API_SKIP telemetry record missing"
+    assert "deadline exceeded before send" in skips[0]
+
+
+def test_deadline_expires_during_acquire_before_prepare_send(monkeypatch):
+    """acquire=2.5s alone exceeds deadline_s=2.0: the POST-acquire re-check
+    refuses BEFORE prepare_send — zero HTTP, prepare never called, the
+    grant is still finalized exactly once as NOT_SENT."""
+    clock = _install_fake_clock(monkeypatch)
+    shared = _FakeSharedLimiter(clock, acquire_s=2.5)
+    client, session = _limiter_client(shared)
+
+    with pytest.raises(BybitTimeoutError, match="retry deadline exceeded"):
+        client._public_get("/v5/market/orderbook", category="linear",
+                           symbol="BTCUSDT", limit=50, deadline_s=2.0)
+
+    assert session.calls == []                       # ZERO HTTP
+    assert shared.prepare_calls == 0                 # refused before prepare
+    assert shared.recorded == [
+        ("grant-p2-1", shared.acquired_priority, "NOT_SENT")]
+
+
+def test_normal_get_with_shared_limiter_sends_with_recomputed_timeout(
+        monkeypatch):
+    """Happy-path regression: acquire=0.05s + prepare_send=0.05s inside a
+    2.0s budget — the GET is sent with the transport timeout recomputed
+    from the ACTUALLY remaining time (1.9s, not the pre-acquire 2.0s) and
+    the grant is recorded OK exactly once."""
+    clock = _install_fake_clock(monkeypatch)
+    payload = {"retCode": 0, "retMsg": "OK", "result": {"list": ["k"]}}
+    shared = _FakeSharedLimiter(clock, acquire_s=0.05, prepare_send_s=0.05)
+    session = ScriptedSession([FakeResponse(payload)])
+    client = make_client(session, bybit_timeout=5,
+                         global_bybit_rate_limiter_enabled=True)
+    client._shared_limiter_obj = shared
+
+    result = client._public_get("/v5/market/orderbook", category="linear",
+                                symbol="BTCUSDT", limit=50, deadline_s=2.0)
+
+    assert result == payload
+    assert len(session.calls) == 1
+    transport_timeout = session.calls[0][3]
+    assert transport_timeout == pytest.approx(1.9, abs=1e-6)
+    # never outlives the budget: send start + transport <= deadline
+    # (1e-9 tolerance is float noise of 1002.0 - 1000.1, not headroom)
+    assert clock.now + transport_timeout <= 1002.0 + 1e-9
+    assert shared.recorded == [
+        ("grant-p2-1", shared.acquired_priority, "OK")]

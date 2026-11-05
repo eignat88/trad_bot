@@ -749,6 +749,30 @@ class BybitClient:
                     retry_reason=retry_reason,
                 )
 
+            def _deny_expired_before_send() -> None:
+                """Fail closed on an expired ABSOLUTE deadline (Codex P2).
+
+                Called AFTER the blocking shared-limiter ``acquire`` /
+                ``prepare_send`` and directly before the HTTP send: no
+                request leaves, the already-acquired grant (if any) is
+                finalized exactly once as ``NOT_SENT`` (the same
+                pre-send denial contract as the order path), telemetry
+                keeps its ``BYBIT_API_SKIP`` record, and the denial
+                follows the existing ``retry deadline exceeded``
+                exception contract (backward compatible).
+                """
+                if shared is not None and grant is not None:
+                    try:
+                        shared.record_result(grant.grant_id, priority,
+                                             "NOT_SENT")
+                    except Exception:  # never mask the denial
+                        logger.warning(
+                            "%s: shared limiter record_result failed on %s "
+                            "(outcome=NOT_SENT)", symbol, endpoint)
+                rec("BYBIT_API_SKIP",
+                    ret_msg="deadline exceeded before send")
+                deny("retry deadline exceeded")
+
             # --- Phase 4: shared cross-process limiter gate (default-off) ---
             # acquire → prepare_send BEFORE the attempt, record_result after.
             # Any limiter deny/error is FAIL_CLOSED: no HTTP attempt leaves
@@ -811,6 +835,13 @@ class BybitClient:
                         queue_wait_ms=grant.waited_ms,
                         telemetry_result="BYBIT_API_SKIP",
                     )
+                # Codex P2 (PR #263 discussion r4479576051): re-check the
+                # absolute deadline right AFTER the blocking acquire and
+                # BEFORE preparing the send — an expired budget never
+                # reaches prepare_send, let alone HTTP.
+                if (deadline_at is not None
+                        and time.monotonic() >= deadline_at):
+                    _deny_expired_before_send()
                 if not shared.prepare_send(grant.grant_id):
                     shared.record_result(grant.grant_id, priority, "REVOKED")
                     rec("BYBIT_API_SKIP",
@@ -825,6 +856,20 @@ class BybitClient:
                     )
                 # The queue wait is excluded from the HTTP-attempt duration.
                 t_start = time.monotonic()
+
+            # Codex P2 (PR #263 discussion r4479576051): FINAL re-check of
+            # the absolute deadline immediately before the HTTP send —
+            # after the blocking shared-limiter acquire + prepare_send —
+            # and the transport timeout is recomputed from the ACTUALLY
+            # remaining time, never the pre-acquire figure. Without this,
+            # an acquire/prepare_send that consumed the caller budget
+            # would still emit HTTP with the stale attempt_timeout and
+            # outlive the caller's capture window.
+            if deadline_at is not None:
+                remaining_s = deadline_at - time.monotonic()
+                if remaining_s <= 0:
+                    _deny_expired_before_send()
+                attempt_timeout = min(attempt_timeout, remaining_s)
 
             sends_made += 1          # an actual HTTP attempt is about to go out
 
