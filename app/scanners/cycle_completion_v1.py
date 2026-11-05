@@ -30,6 +30,12 @@ This module gives every cycle one explicit, structured completion report:
 ``scan_error_symbols``
     market data was fine but the scan itself raised — counted as *processed*
     exactly as before Phase A;
+``me_capture_error_symbols``
+    the symbol was scanned and its setup saved, but
+    ``me_capture_spool.enqueue()`` raised and the research-only capture was
+    lost (Issue #261) — counted as *processed*, classified
+    ``ME_CAPTURE_ERROR`` (never ``MARKET_DATA_ERROR`` / ``RATE_LIMIT_SKIP``
+    / ``SCAN_ERROR``) and it alone already makes the cycle ``PARTIAL``;
 ``completion_status``
     ``COMPLETE`` / ``PARTIAL`` / ``FAILED``.
 
@@ -106,6 +112,10 @@ RUN_STATUSES = ("RUNNING", "COMPLETED", "FAILED", "PARTIAL", "ABORTED")
 
 STAGE_MARKET_DATA = "MARKET_DATA"
 STAGE_SCAN = "SCAN"
+#: Issue #261: the symbol was scanned normally, but
+#: ``me_capture_spool.enqueue()`` raised afterwards — the ME research
+#: capture for that candidate was lost (trading setup is unaffected).
+STAGE_ME_CAPTURE = "ME_CAPTURE"
 
 CATEGORY_FAILED = "FAILED"
 CATEGORY_SKIPPED = "SKIPPED"
@@ -113,6 +123,12 @@ CATEGORY_SKIPPED = "SKIPPED"
 ERROR_MARKET_DATA = "MARKET_DATA_ERROR"
 ERROR_RATE_LIMIT_SKIP = "RATE_LIMIT_SKIP"
 ERROR_SCAN = "SCAN_ERROR"
+#: Issue #261: a ME capture enqueue failure is its OWN error class — it is
+#: deliberately neither ``MARKET_DATA_ERROR`` (market data was fine), nor
+#: ``RATE_LIMIT_SKIP`` (no Bybit/limiter request was involved), nor
+#: ``SCAN_ERROR`` (the analysis itself succeeded). It is a cycle-completion
+#: diagnostic only; no ``dds.scanner_error`` row is written for it.
+ERROR_ME_CAPTURE = "ME_CAPTURE_ERROR"
 
 #: ``dds.scanner_event.event_type`` of the per-cycle diagnostic row.
 CYCLE_COMPLETION_EVENT = "CYCLE_COMPLETION"
@@ -259,7 +275,7 @@ class SymbolOutcome:
     """Why exactly one symbol did not (or did not fully) contribute."""
 
     symbol: str
-    stage: str                    # STAGE_MARKET_DATA | STAGE_SCAN
+    stage: str                    # STAGE_MARKET_DATA | STAGE_SCAN | STAGE_ME_CAPTURE
     category: str                 # CATEGORY_FAILED | CATEGORY_SKIPPED
     error_type: str               # value written to dds.scanner_error
     rate_limit: bool = False
@@ -424,6 +440,36 @@ def classify_symbol_failure(
     )
 
 
+def classify_me_capture_failure(
+    symbol: str,
+    exc: BaseException,
+) -> SymbolOutcome:
+    """Classify an ``me_capture_spool.enqueue()`` failure (Issue #261).
+
+    The symbol WAS scanned and its setup WAS persisted — only the
+    research-only durable capture was lost, so the outcome:
+
+    * is ``stage=ME_CAPTURE`` (a stage of its own: not market data, not the
+      scan itself);
+    * is ``category=FAILED`` and ``error_type=ME_CAPTURE_ERROR`` — never
+      ``MARKET_DATA_ERROR``, ``RATE_LIMIT_SKIP`` or ``SCAN_ERROR``, whatever
+      the exception type is (``rate_limit`` stays ``False``);
+    * carries no limiter/transport context (``result``/``reason``/
+      ``request_state``/``telemetry_result`` keep their rate-limit
+      semantics and stay ``None``);
+    * keeps the full cause in ``message`` (exception class + text) so the
+      ``CYCLE_COMPLETION`` payload states why the capture was lost.
+    """
+    return SymbolOutcome(
+        symbol=symbol,
+        stage=STAGE_ME_CAPTURE,
+        category=CATEGORY_FAILED,
+        error_type=ERROR_ME_CAPTURE,
+        rate_limit=False,
+        message=_truncate(f"{type(exc).__name__}: {exc}"),
+    )
+
+
 # --------------------------------------------------------------------------
 # Per-cycle report
 # --------------------------------------------------------------------------
@@ -442,6 +488,12 @@ class CycleCompletionReport:
     skips: list[SymbolOutcome] = field(default_factory=list)
     #: market data was fine, the scan itself raised.
     scan_failures: list[SymbolOutcome] = field(default_factory=list)
+    #: ``me_capture_spool.enqueue()`` raised (Issue #261): the candidate was
+    #: scanned and saved, only the research-only capture was lost. Kept
+    #: apart from ``failures``/``skips``/``scan_failures`` so the existing
+    #: semantics of those three lists (and of ``failed_symbols`` /
+    #: ``skipped_symbols`` / ``scan_error_symbols``) stay untouched.
+    me_capture_failures: list[SymbolOutcome] = field(default_factory=list)
     #: ``True`` once this cycle's ``CYCLE_COMPLETION`` row was persisted —
     #: at most ONE diagnostic row per cycle, even when the cycle both
     #: finished ``run_scan_cycle`` and later died in ``main()``.
@@ -452,7 +504,9 @@ class CycleCompletionReport:
         self.processed.append(symbol)
 
     def record_outcome(self, outcome: SymbolOutcome) -> None:
-        if outcome.stage == STAGE_SCAN:
+        if outcome.stage == STAGE_ME_CAPTURE:
+            self.me_capture_failures.append(outcome)
+        elif outcome.stage == STAGE_SCAN:
             self.scan_failures.append(outcome)
         elif outcome.category == CATEGORY_SKIPPED:
             self.skips.append(outcome)
@@ -477,13 +531,40 @@ class CycleCompletionReport:
         return [o.symbol for o in self.scan_failures]
 
     @property
+    def me_capture_error_symbols(self) -> list[str]:
+        """Unique symbols that lost at least one ME capture enqueue.
+
+        De-duplicated on purpose: several candidates of the SAME symbol may
+        fail to enqueue in one cycle, and each failure counts once in
+        ``failed`` while the symbol list stays a symbol list.
+        """
+        return list(dict.fromkeys(o.symbol for o in self.me_capture_failures))
+
+    @property
     def unprocessed_symbols(self) -> list[str]:
         """Symbols that produced NO market-data result this cycle."""
         return self.failed_symbols + self.skipped_symbols
 
     @property
     def outcomes(self) -> list[SymbolOutcome]:
-        return [*self.failures, *self.skips, *self.scan_failures]
+        return [*self.failures, *self.skips, *self.scan_failures,
+                *self.me_capture_failures]
+
+    @property
+    def failed_total(self) -> int:
+        """Every counted failure of this cycle — parity with ``failed``.
+
+        Exactly the number ``run_scan_cycle`` increments its ``failed``
+        counter for (market-data failure **or** rate-limit skip + scan error
+        + ME capture enqueue failure), i.e. the value ``main()`` writes to
+        ``dds.scanner_run.symbols_failed`` / ``error_count``. Several
+        failures on the SAME symbol count several times here (that is how
+        ``failed`` counts), while the ``*_symbols`` lists stay per-symbol.
+        """
+        return (
+            len(self.failures) + len(self.skips) + len(self.scan_failures)
+            + len(self.me_capture_failures)
+        )
 
     # -- transport fact (review P1) ----------------------------------------
     def _state_symbols(self, state: str) -> list[str]:
@@ -510,17 +591,21 @@ class CycleCompletionReport:
         """``COMPLETE`` / ``PARTIAL`` / ``FAILED`` (issue §5.1).
 
         * ``COMPLETE`` — every expected symbol produced a market context and
-          nothing failed anywhere in the cycle;
+          nothing failed anywhere in the cycle (a lost ME capture enqueue
+          counts as a failure too — Issue #261: ``failed > 0`` must never
+          coexist with ``COMPLETED``);
         * ``FAILED``   — the cycle processed nothing at all (and there was
           something to process);
         * ``PARTIAL``  — anything in between, including a cycle that fetched
-          50/50 contexts but could not scan one of them.
+          50/50 contexts but could not scan one of them, or one whose only
+          problem was a ME capture enqueue failure.
 
         ``expected_symbols == 0`` is ``COMPLETE``: that is the historical
         ``failed == 0 → COMPLETED`` behaviour for an empty universe.
         """
         clean = (
             not self.failures and not self.skips and not self.scan_failures
+            and not self.me_capture_failures
             and self.processed_count == self.expected_symbols
         )
         if clean:
@@ -575,9 +660,15 @@ class CycleCompletionReport:
             "failed_count": len(self.failures),
             "skipped_count": len(self.skips),
             "scan_error_count": len(self.scan_failures),
+            # Issue #261: ME capture enqueue failures, in their own class.
+            "me_capture_error_count": len(self.me_capture_failures),
+            # Parity counter: == the third element of run_scan_cycle() ==
+            # dds.scanner_run.symbols_failed / error_count of this run.
+            "failed_total": self.failed_total,
             "failed_symbols": self.failed_symbols,
             "skipped_symbols": self.skipped_symbols,
             "scan_error_symbols": self.scan_error_symbols,
+            "me_capture_error_symbols": self.me_capture_error_symbols,
             "unprocessed_symbols": self.unprocessed_symbols,
             # Transport fact (review P1): which skips really reached Bybit.
             "rate_limit_response_count": len(self.rate_limit_response_symbols),
@@ -611,6 +702,7 @@ class CycleCompletionReport:
             f"failed={len(self.failures)}",
             f"skipped={len(self.skips)}",
             f"scan_errors={len(self.scan_failures)}",
+            f"me_capture_errors={len(self.me_capture_failures)}",
         ]
         if any(o.rate_limit for o in self.outcomes):
             # Review P1: response-vs-pre-send, side by side in the log.
@@ -629,4 +721,9 @@ class CycleCompletionReport:
         if self.scan_failures:
             parts.append(
                 "scan_errors=[" + ", ".join(o.label() for o in self.scan_failures) + "]")
+        if self.me_capture_failures:
+            parts.append(
+                "me_capture_failures=["
+                + ", ".join(o.label() for o in self.me_capture_failures)
+                + "]")
         return " ".join(parts)
