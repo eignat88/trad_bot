@@ -575,8 +575,8 @@ def render_markdown(result: AuditResult, *, max_rows: int = 40) -> str:
         f"{p['candle_interval_min']}m")
     add(f"- **Late-evaluation thresholds:** risk ≥ {p['late_eval_risk_min']}m, "
         f"truncated ≥ {p['late_eval_truncated_min']}m")
-    add(f"- **guarded_from:** {p['guarded_from'] or 'not set (guarded "
-        "evaluator not rolled out)'}")
+    guarded_from = p["guarded_from"] or "not set (guarded evaluator not rolled out)"
+    add(f"- **guarded_from:** {guarded_from}")
     add("")
 
     add("## 1. Snapshot totals")
