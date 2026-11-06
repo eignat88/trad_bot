@@ -216,6 +216,17 @@ def main(argv: list[str] | None = None) -> int:
         )
     except Exception:
         logger.debug("final snapshot failed", exc_info=True)
+    if contour.engine.durability_risk:
+        # Honest shutdown report (P1): never claim durable recovery for a
+        # terminal snapshot the database never accepted.
+        logger.critical(
+            "me inverse short shutdown with UNRESOLVED close durability risk: "
+            "%d terminal snapshot(s) exist only in process memory — recovery "
+            "is NOT guaranteed if PostgreSQL was unavailable before any "
+            "durable write succeeded: keys=%s",
+            len(contour.engine.unstaged_close_keys),
+            list(contour.engine.unstaged_close_keys),
+        )
     store.close()
     logger.info("me inverse short runner stopped")
     return 0

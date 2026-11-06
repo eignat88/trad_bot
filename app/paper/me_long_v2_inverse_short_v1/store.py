@@ -140,8 +140,11 @@ class InverseShortStore:
         """Durably stage the EXACT terminal snapshot BEFORE the status flip.
 
         Returns True when the snapshot is durable (outbox row written),
-        False when durability is degraded (no outbox yet) — the caller keeps
-        the in-process snapshot either way.
+        False when durability is degraded (outbox table absent, migration
+        086 not applied) — the caller keeps the in-process snapshot either
+        way.  An exception means the write did NOT commit: the engine must
+        retain the snapshot and retry staging BEFORE attempting the
+        terminal UPDATE on subsequent cycles (P1 contract).
         """
         raise NotImplementedError
 

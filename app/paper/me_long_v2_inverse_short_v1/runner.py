@@ -128,6 +128,9 @@ class InverseShortContour:
             "pending_events": len(self.engine.pending_events()),
             "open_positions": len(self.engine.open_positions),
             "pending_closes": len(self.engine.pending_closes),
+            # Fail-closed state (P1 durability risk / P2 accounting trust).
+            "durability_risk": self.engine.durability_risk,
+            "accounting_consistent": self.engine.accounting_consistent,
         }
 
 

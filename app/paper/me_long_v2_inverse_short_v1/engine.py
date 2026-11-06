@@ -20,6 +20,16 @@ Design constraints (all enforced, all testable):
 * **Fail-closed entries, fail-safe exits** — entries require a valid
   activation identity; exits (STOP / TP / TIMEOUT) always run so an open
   position can never be stranded.
+* **Durability-first closes (P1)** — the exact terminal snapshot is staged
+  into the durable outbox BEFORE the status flip; when staging fails it is
+  retried BEFORE the terminal UPDATE on every later cycle, the unresolved
+  risk is reported each cycle and new entries fail closed.  Recovery is
+  only ever claimed for snapshots PostgreSQL actually accepted.
+* **Deterministic accounting reconciliation (P2)** — the memory ledger is
+  always ``confirmed store balance + Σ per-position uncommitted deltas``:
+  a resync never overwrites realized PnL owned by other pending closes and
+  never books funding, exit fees or realized PnL twice; entries are
+  refused while the contour balance is not trustworthy.
 """
 from __future__ import annotations
 
@@ -79,14 +89,43 @@ class InverseShortPaperEngine:
         # Durable close protocol (P1-3): terminal snapshots whose status flip
         # is not confirmed yet.  Retried with IDENTICAL facts, never
         # re-evaluated by STOP/TP/TIMEOUT; a symbol with an unfinished close
-        # refuses new entries until the close is persisted.
+        # refuses new entries until the close is persisted.  MULTIPLE
+        # simultaneous pending closes are fully supported (one exact
+        # snapshot per position_key).
         self.pending_closes: dict[str, InverseShortPosition] = {}
-        # Keys resumed from the durable outbox at recovery — their realized
-        # PnL is not in the memory ledger yet and is synced AFTER the flush.
+        # Balance-recovery markers (P2): keys resumed from the durable outbox
+        # whose realized PnL is not in the memory ledger yet.  A marker is
+        # discarded ONLY after a balance reconciliation succeeds — a failed
+        # ``balance_components()`` read keeps the marker and retries on the
+        # next cycle, and new entries stay refused meanwhile.
         self._pending_from_store: set[str] = set()
+        # Unresolved close durability risk (P1): terminal snapshots that are
+        # NOT durable anywhere yet (outbox staging failed and the row is
+        # still OPEN).  While non-empty the engine fails closed — no new
+        # entries — and reports the risk every cycle; recovery is never
+        # claimed for a snapshot PostgreSQL never accepted.
+        self._unstaged_closes: set[str] = set()
+        # Outbox table absent (migration 086 not applied): staging can never
+        # succeed for these keys, so staging retries are skipped and the
+        # terminal row UPDATE is the only remaining durability (documented
+        # degraded rollout mode).  The risk stays reported until the row
+        # flip commits.
+        self._staging_unavailable: set[str] = set()
+        # Deterministic accounting reconciliation (P2): the CONFIRMED ledger
+        # balance (last successful store read) is kept strictly separate
+        # from the LOCAL UNCOMMITTED deltas — per-position accounting booked
+        # in memory but not yet committed to the store ledger.
+        #   balance == confirmed_balance + Σ uncommitted deltas
+        # so a resync can never overwrite realized PnL that belongs to other
+        # pending positions and never books any PnL twice.
+        self._uncommitted_deltas: dict[str, float] = {}
+        self._balance_trusted: bool = True
 
         components = store.balance_components()
-        self.balance = float(components.get("balance", settings.initial_balance))
+        self.confirmed_balance = float(
+            components.get("balance", settings.initial_balance)
+        )
+        self.balance = self.confirmed_balance
         self.initial_balance = float(
             components.get("initial_balance", settings.initial_balance)
         )
@@ -169,6 +208,41 @@ class InverseShortPaperEngine:
     def activated(self) -> bool:
         return (self.activation is not None) or (not self.require_activation)
 
+    # -- accounting / durability state (P1 + P2) -------------------------
+    @property
+    def unstaged_close_keys(self) -> tuple[str, ...]:
+        """Terminal snapshots that are not durable anywhere yet."""
+        return tuple(sorted(self._unstaged_closes))
+
+    @property
+    def durability_risk(self) -> bool:
+        """Unresolved durability risk: a retained terminal snapshot exists
+        only in process memory (staging never committed and the status
+        UPDATE has not committed either).  While True the engine fails
+        closed and reports the risk — recovery is NOT guaranteed if the
+        process terminates now."""
+        return bool(self._unstaged_closes)
+
+    @property
+    def uncommitted_deltas(self) -> dict[str, float]:
+        """Local uncommitted accounting deltas, per position_key."""
+        return dict(self._uncommitted_deltas)
+
+    @property
+    def accounting_consistent(self) -> bool:
+        """The contour balance is trustworthy (P2).
+
+        False while a balance-recovery marker is owed (realized PnL of a
+        recovered close not yet reconciled into the memory ledger) or after
+        a failed reconciliation — new entries are refused meanwhile.
+        """
+        return self._balance_trusted and not self._pending_from_store
+
+    @property
+    def balance_recovery_pending(self) -> tuple[str, ...]:
+        """Balance-recovery markers still owed (never dropped on a failed read)."""
+        return tuple(sorted(self._pending_from_store))
+
     def open_entries(self, prices: dict[str, float]) -> list[InverseShortPosition]:
         """Open SHORT positions for CAPTURED events at the first observed price."""
         opened: list[InverseShortPosition] = []
@@ -176,6 +250,28 @@ class InverseShortPaperEngine:
             logger.warning(
                 "me inverse short entries refused: contour is not activated "
                 "(protocol fingerprint / freeze_ts missing)"
+            )
+            return opened
+
+        # Fail-closed gates (P1 + P2): never trade on an unresolved close
+        # durability risk or on a balance that is not yet trustworthy.
+        # An owed balance recovery is retried here first (a successful
+        # resync unblocks entries within the same cycle).
+        self._retry_balance_recovery()
+        if self._unstaged_closes:
+            logger.error(
+                "me inverse short entries refused (fail closed): unresolved "
+                "close durability risk — %d terminal snapshot(s) not durably "
+                "staged; recovery is NOT guaranteed if the process terminates "
+                "before a durable write succeeds: keys=%s",
+                len(self._unstaged_closes), self.unstaged_close_keys,
+            )
+            return opened
+        if not self.accounting_consistent:
+            logger.warning(
+                "me inverse short entries refused (fail closed): contour "
+                "balance is not trustworthy (balance recovery pending or last "
+                "reconciliation failed)"
             )
             return opened
 
@@ -412,10 +508,22 @@ class InverseShortPaperEngine:
         try:
             self.store.update_position(position)
         except Exception:
+            # Local uncommitted delta: memory already deducted this cost, the
+            # store ledger has not.  The delta is settled automatically when
+            # a later update_position() for this key commits (it writes the
+            # CUMULATIVE funding_paid), so the cost is booked exactly once.
+            self._uncommitted_deltas[position.position_key] = (
+                self._uncommitted_deltas.get(position.position_key, 0.0) - cost
+            )
             logger.warning(
-                "me inverse short funding persistence failed (state kept in memory)",
+                "me inverse short funding persistence failed (state kept in "
+                "memory, tracked as an uncommitted delta)",
                 exc_info=True,
             )
+        else:
+            # The row now carries the cumulative funding — local and store
+            # accounting for this key agree again.
+            self._uncommitted_deltas.pop(position.position_key, None)
         logger.info(
             "me inverse short funding: %s periods=%d rate=%.6f%% cost=$%.4f",
             position.symbol, new_periods, funding_rate_percent, cost,
@@ -464,32 +572,66 @@ class InverseShortPaperEngine:
         position.closed_at = closed_at
         position.duration_sec = (closed_at - position.entered_at).total_seconds()
 
-        # ---- durable close protocol (P1-3) ----
+        # ---- durable close protocol (P1 / P1-3) ----
         # 1) Stage the EXACT terminal snapshot durably FIRST: the exit facts
-        #    survive a crash even if the status UPDATE below fails.
+        #    survive a crash even if the status UPDATE below fails.  When
+        #    staging fails the key is marked UNSTAGED: flush_pending_closes()
+        #    retries the staging BEFORE any terminal UPDATE on subsequent
+        #    cycles, entries fail closed, and the unresolved durability risk
+        #    is reported every cycle (recovery is never claimed for a
+        #    snapshot the database never accepted).
         staged = False
+        staging_degraded = False
         try:
             staged = bool(self.store.stage_close(position))
         except Exception:
             logger.warning(
                 "me inverse short close staging failed (in-process snapshot "
-                "retained): key=%s",
+                "retained; outbox staging will be retried before the terminal "
+                "UPDATE on subsequent cycles): key=%s",
                 position.position_key[:48],
                 exc_info=True,
             )
+        else:
+            staging_degraded = not staged
+        if staged:
+            self._unstaged_closes.discard(position.position_key)
+            self._staging_unavailable.discard(position.position_key)
+        else:
+            self._unstaged_closes.add(position.position_key)
+            if staging_degraded:
+                # stage_close() returns False only when the outbox table does
+                # not exist (migration 086 not applied): staging can never
+                # succeed, so retries are skipped — the terminal UPDATE below
+                # is the only durability left in this documented mode.
+                self._staging_unavailable.add(position.position_key)
         # 2) Flip the row to CLOSED.  On failure the terminal snapshot is
         #    retained and replayed byte-for-byte (same position_key, closed_at,
         #    exit_reason, exit_price, PnL and funding) by flush_pending_closes().
+        #    close_delta is EXACTLY the amount just booked into the memory
+        #    ledger; it becomes a local uncommitted delta until the store
+        #    ledger commits it (never booked twice).
+        close_delta = gross - exit_fee - exit_slippage_cost
         try:
             self.store.update_position(position)
         except Exception:
             self.pending_closes[position.position_key] = position
+            self._uncommitted_deltas[position.position_key] = (
+                self._uncommitted_deltas.get(position.position_key, 0.0)
+                + close_delta
+            )
             logger.exception(
                 "me inverse short close persistence failed; terminal snapshot "
-                "retained for retry (outbox staged=%s): key=%s reason=%s net=%.4f",
-                staged, position.position_key[:48], reason, net_pnl,
+                "retained for retry (outbox staged=%s, durability_risk=%s): "
+                "key=%s reason=%s net=%.4f",
+                staged, not staged, position.position_key[:48], reason, net_pnl,
             )
         else:
+            # The row now carries the FULL terminal accounting (cumulative
+            # funding + close facts): local and store agree for this key.
+            self._uncommitted_deltas.pop(position.position_key, None)
+            self._unstaged_closes.discard(position.position_key)
+            self._staging_unavailable.discard(position.position_key)
             if staged:
                 try:
                     self.store.clear_pending_close(position.position_key)
@@ -513,7 +655,7 @@ class InverseShortPaperEngine:
         return position
 
     # ------------------------------------------------------------------
-    # Durable close persistence (P1-3)
+    # Durable close persistence (P1) + accounting reconciliation (P2)
     # ------------------------------------------------------------------
     def flush_pending_closes(self) -> int:
         """Persist retained terminal closes with their ORIGINAL facts.
@@ -523,26 +665,56 @@ class InverseShortPaperEngine:
         exit_price, PnL and funding — is replayed unchanged, so a retry can
         never alter the exit record or book realized PnL twice.  A position
         with a pending close is NOT in ``open_positions``, so STOP/TP/TIMEOUT
-        can never re-evaluate it, and ``_pending_from_store`` guarantees the
-        recovered realized PnL is synced into the memory ledger exactly once.
+        can never re-evaluate it.
+
+        P1 ordering: for every UNSTAGED snapshot the outbox staging is
+        retried FIRST and the terminal UPDATE is only attempted once staging
+        committed (or the outbox table is absent — documented degraded mode).
+        P2: owed balance-recovery markers are retried after the flush and
+        are NEVER discarded on a failed read.
         """
         flushed = 0
         for position_key, snapshot in list(self.pending_closes.items()):
+            # -- P1: stage-before-update retry for unstaged snapshots ----
+            if position_key in self._unstaged_closes:
+                if position_key not in self._staging_unavailable:
+                    try:
+                        if bool(self.store.stage_close(snapshot)):
+                            self._unstaged_closes.discard(position_key)
+                        else:
+                            # Outbox table absent (migration 086): staging can
+                            # never succeed — fall through to the UPDATE.
+                            self._staging_unavailable.add(position_key)
+                    except Exception:
+                        logger.warning(
+                            "me inverse short close staging retry failed; "
+                            "terminal UPDATE deferred to a later cycle "
+                            "(exact snapshot retained in-process; recovery "
+                            "NOT yet guaranteed): key=%s",
+                            position_key[:48],
+                            exc_info=True,
+                        )
+                        continue
+                # Degraded mode (no outbox table): the terminal UPDATE is the
+                # only durability left — attempt it below.
             try:
                 self.store.update_position(snapshot)
             except Exception:
                 logger.warning(
                     "me inverse short close flush failed (terminal snapshot "
-                    "retained): key=%s reason=%s closed_at=%s net=%.4f",
+                    "retained): key=%s reason=%s closed_at=%s net=%.4f "
+                    "durability_risk=%s",
                     position_key[:48], snapshot.exit_reason,
                     snapshot.closed_at.isoformat() if snapshot.closed_at else None,
-                    snapshot.net_pnl,
+                    snapshot.net_pnl, position_key in self._unstaged_closes,
                     exc_info=True,
                 )
                 continue
+            # -- committed: the row now carries the exact terminal facts --
             self.pending_closes.pop(position_key, None)
-            was_from_store = position_key in self._pending_from_store
-            self._pending_from_store.discard(position_key)
+            self._uncommitted_deltas.pop(position_key, None)
+            self._unstaged_closes.discard(position_key)
+            self._staging_unavailable.discard(position_key)
             flushed += 1
             try:
                 self.store.clear_pending_close(position_key)
@@ -555,11 +727,6 @@ class InverseShortPaperEngine:
                     position_key[:48],
                     exc_info=True,
                 )
-            if was_from_store:
-                # Recovery path: the memory ledger was rebuilt from the still-
-                # OPEN row (realized PnL absent) — set it from the store now
-                # that the row is CLOSED.  SET, never add: no double count.
-                self._sync_balance_from_store()
             logger.info(
                 "me inverse short close flushed: key=%s reason=%s closed_at=%s "
                 "exit=%.6f net=%.4f",
@@ -567,27 +734,88 @@ class InverseShortPaperEngine:
                 snapshot.closed_at.isoformat() if snapshot.closed_at else None,
                 snapshot.exit_price or 0.0, snapshot.net_pnl,
             )
+        # P2: owed balance recovery is retried until it SUCCEEDS; the
+        # markers survive any failed read (entries stay refused meanwhile).
+        self._retry_balance_recovery()
+        if self._unstaged_closes:
+            logger.error(
+                "me inverse short UNRESOLVED close durability risk: %d terminal "
+                "snapshot(s) not durably staged (outbox write never committed). "
+                "Recovery is NOT guaranteed if the process terminates before a "
+                "durable write succeeds; new entries are refused (fail closed): "
+                "keys=%s",
+                len(self._unstaged_closes), self.unstaged_close_keys,
+            )
         return flushed
 
-    def _sync_balance_from_store(self) -> None:
-        """Set the memory ledger from the store (single source of truth)."""
+    def _retry_balance_recovery(self) -> None:
+        """Retry owed balance reconciliations (P2).
+
+        A marker is owed once its recovered close has been flushed into the
+        store row; it is discarded ONLY after a reconciliation succeeds, so
+        a failed ``balance_components()`` read can never silently drop the
+        recovered realized PnL.  A previously FAILED reconciliation is also
+        retried here until it succeeds (entries stay refused meanwhile).
+        """
+        owed = [
+            key for key in self._pending_from_store
+            if key not in self.pending_closes
+        ]
+        if not owed and self._balance_trusted:
+            return  # nothing to reconcile
+        if self.reconcile_balance():
+            for key in owed:
+                self._pending_from_store.discard(key)
+            if owed:
+                logger.info(
+                    "me inverse short balance recovery reconciled for %d close(s)",
+                    len(owed),
+                )
+
+    def reconcile_balance(self) -> bool:
+        """Deterministic ledger reconciliation (P2).
+
+        ``balance = confirmed_balance + Σ uncommitted_deltas``
+
+        * ``confirmed_balance`` — the CONFIRMED store ledger balance (last
+          successful ``balance_components()`` read: initial + closed net −
+          open costs, exactly as persisted);
+        * ``uncommitted_deltas`` — LOCAL uncommitted accounting per
+          position_key (close deltas and funding costs booked in memory but
+          not yet committed by the store).
+
+        Because the deltas are added back, a resync never overwrites
+        realized PnL that belongs to other pending positions, and it can be
+        retried at any time without recalculating any close or booking PnL
+        twice.  Returns False (keeping the memory ledger and all recovery
+        markers intact) when the store read fails.
+        """
         try:
             components = self.store.balance_components()
-            restored = float(
+            confirmed = float(
                 components.get("balance", self.settings.initial_balance)
             )
         except Exception:
+            self._balance_trusted = False
             logger.warning(
-                "me inverse short balance resync failed (memory ledger kept)",
+                "me inverse short balance reconciliation failed (memory ledger "
+                "kept; balance-recovery marker retained, new entries blocked "
+                "until a resync succeeds)",
                 exc_info=True,
             )
-            return
+            return False
+        self.confirmed_balance = confirmed
+        restored = confirmed + sum(self._uncommitted_deltas.values())
         if restored != self.balance:
             logger.info(
-                "me inverse short balance resync: $%.4f -> $%.4f",
-                self.balance, restored,
+                "me inverse short balance resync: $%.4f -> $%.4f "
+                "(confirmed=$%.4f uncommitted=%+.4f)",
+                self.balance, restored, confirmed,
+                sum(self._uncommitted_deltas.values()),
             )
         self.balance = restored
+        self._balance_trusted = True
+        return True
 
     # ------------------------------------------------------------------
     # Reporting (isolated accounting — nothing shared with Paper)
@@ -632,6 +860,16 @@ class InverseShortPaperEngine:
             "closed_net_pnl": round(summary["net_pnl"], 4),
             "open_positions": len(self.open_positions),
             "pending_closes": len(self.pending_closes),
+            # Accounting reconciliation state (P2): the confirmed ledger
+            # balance is reported separately from the local uncommitted
+            # accounting deltas still owned by pending/failed writes.
+            "confirmed_balance": round(self.confirmed_balance, 2),
+            "uncommitted_delta": round(sum(self._uncommitted_deltas.values()), 4),
+            "accounting_consistent": self.accounting_consistent,
+            # Unresolved close durability risk (P1): never claim durable
+            # recovery while a terminal snapshot is only in process memory.
+            "durability_risk": self.durability_risk,
+            "unstaged_closes": len(self._unstaged_closes),
             "gross_exposure_pct": round(
                 (gross_exposure / equity * 100.0) if equity else 0.0, 4,
             ),
