@@ -43,7 +43,10 @@ def test_migration_082_is_the_only_srr_short_fill_migration():
 def test_migration_number_is_next_and_not_taken():
     numbers = sorted(int(p.name.split("_")[0]) for p in
                      (ROOT / "sql" / "migrations").glob("[0-9][0-9][0-9]_*.sql"))
-    assert numbers[-1] == 82  # 082 is the highest, never reuses an old number
+    # 082 was the next free number after 081 and must never be reused;
+    # later migrations (084 paper execution-policy recovery, 085 inverse-short
+    # contour) continue strictly above it.
+    assert numbers[-1] >= 82  # 082 is taken, never reuses an old number
     assert numbers.count(82) == 1
 
 

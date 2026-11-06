@@ -816,6 +816,128 @@ def _capture_me_short_a_source(
         _report_error()
 
 
+# --- ME_LONG_V2_INVERSE_SHORT_V1 source capture --------------------------
+#
+# Independent prospective SHORT paper contour: captures the ORIGINAL
+# MOMENTUM_EXHAUSTION_REVERSE_LONG_V2 detector events at signal time,
+# INDEPENDENTLY of the trading direction gate and the expectancy filter
+# (both are untouched — this line runs on the pre-gate candidates the
+# orchestrator publishes under stats["_me_inverse_short_source_events"]).
+#
+# Fail-open by contract: every error is swallowed and must NEVER affect
+# scanner execution; persistence failures are sunk to dds.scanner_error as
+# ME_INVERSE_SHORT_SOURCE_CAPTURE_ERROR so a capture error can never become
+# a silent signal loss.  Capture itself is two-factor: the runtime flag
+# ME_INVERSE_SHORT_V1_ENABLED=1 AND a RUNNING activation row with the frozen
+# protocol fingerprint + freeze_ts are both required; without them the
+# status is a logged NOT_ACTIVE/PRE_FREEZE and nothing is written.
+
+_me_inverse_short_store = None
+_me_inverse_short_store_retry_at = 0.0
+
+
+def _get_me_inverse_short_store(repository: ScannerRepository):
+    """Dedicated pg8000 store for the contour's source-event ledger.
+
+    Independent from the scanner's main transaction and from every research
+    observer: contour commits/rollbacks can never touch a production
+    transaction (and vice versa).
+    """
+    global _me_inverse_short_store, _me_inverse_short_store_retry_at
+    if _me_inverse_short_store is not None:
+        return _me_inverse_short_store
+    now = time.monotonic()
+    if now - _me_inverse_short_store_retry_at < 60.0:
+        return None
+    try:
+        from app.paper.me_long_v2_inverse_short_v1.store import connect_pg_store
+
+        _me_inverse_short_store = connect_pg_store(
+            host=repository._host,
+            port=repository._port,
+            database=repository._database,
+            user=repository._user,
+            password=repository._password,
+            unix_sock=repository._unix_sock or None,
+        )
+        return _me_inverse_short_store
+    except Exception:
+        _me_inverse_short_store = None
+        _me_inverse_short_store_retry_at = now
+        logger.debug(
+            "ME_LONG_V2_INVERSE_SHORT_V1 source store unavailable", exc_info=True)
+        return None
+
+
+def _capture_me_inverse_short_source(
+    repository: ScannerRepository,
+    candidate: SetupCandidate,
+) -> None:
+    """Append ONE original V2 source event to the contour's event ledger.
+
+    Only ``MOMENTUM_EXHAUSTION_REVERSE_LONG_V2`` / ``LONG`` source candidates
+    qualify (the contour trades their inverse SHORT side).  Nothing is routed
+    back into the trading flow and no scanner decision is changed.  Fail-open:
+    the whole call is wrapped and must never raise into the scanner cycle.
+    """
+    if (
+        candidate.scanner_name != "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2"
+        or candidate.direction != "LONG"
+    ):
+        return
+
+    def _report_error(status: str) -> None:
+        """Separate source-capture error diagnostics; never silent."""
+        try:
+            repository.save_error(
+                symbol=candidate.symbol,
+                scanner_name=candidate.scanner_name,
+                error_type="ME_INVERSE_SHORT_SOURCE_CAPTURE_ERROR",
+                error_message=(
+                    f"status={status} signal_time={candidate.detected_at} "
+                    f"setup_id={candidate.setup_id}"),
+            )
+        except Exception:
+            logger.debug(
+                "ME inverse short source capture error sink failed", exc_info=True)
+
+    from app.paper.me_long_v2_inverse_short_v1.activation import is_runtime_enabled
+    if not is_runtime_enabled():
+        return  # no connection attempt, no write while the flag is off
+
+    try:
+        from app.paper.me_long_v2_inverse_short_v1.capture import (
+            CAPTURE_ERROR,
+            capture_with_status,
+        )
+        from app.paper.me_long_v2_inverse_short_v1.protocol import (
+            ROUTE_PRE_FILTER_SOURCE,
+        )
+
+        store = _get_me_inverse_short_store(repository)
+        if store is None:
+            raise RuntimeError("me inverse short source store unavailable")
+        status = capture_with_status(
+            store, candidate, capture_route=ROUTE_PRE_FILTER_SOURCE,
+        )
+        if status == CAPTURE_ERROR:
+            logger.error(
+                "ME_LONG_V2_INVERSE_SHORT_V1 source capture persistence error; "
+                "scanner unaffected symbol=%s signal_time=%s",
+                candidate.symbol, candidate.detected_at)
+            _report_error(status)
+        elif status in ("DISABLED", "NOT_ACTIVE", "PRE_FREEZE"):
+            logger.info(
+                "ME_LONG_V2_INVERSE_SHORT_V1 source capture status=%s symbol=%s",
+                status, candidate.symbol)
+    except Exception:
+        logger.exception(
+            "ME_LONG_V2_INVERSE_SHORT_V1 source capture failed; scanner unaffected "
+            "symbol=%s signal_time=%s",
+            candidate.symbol, candidate.detected_at)
+        _report_error("EXCEPTION")
+
+
 # --- Prospective OOS Observer -------------------------------------------
 
 _prospective_observer = None
@@ -1536,6 +1658,14 @@ def run_scan_cycle(
                                 me_candidate.symbol,
                                 me_candidate.setup_id,
                             )
+
+                # ME_LONG_V2_INVERSE_SHORT_V1 source intake: the ORIGINAL V2
+                # detector events, captured BEFORE the direction gate and the
+                # expectancy filter (both untouched). Fail-open.
+                for inv_candidate in symbol_stats.get(
+                    "_me_inverse_short_source_events", []
+                ):
+                    _capture_me_inverse_short_source(repository, inv_candidate)
 
                 # SRR LONG Research: capture every SRR LONG candidate for
                 # research outcome tracking (independent of paper trading).

@@ -37,6 +37,17 @@ def _get_sqlstate(exc: Exception) -> str | None:
 class ScannerRepository:
     """Dual-mode repository: PostgreSQL (pg8000) when available, JSONL fallback."""
 
+    # Cached capability probe result for the dds.paper_trade execution-policy
+    # columns (execution_policy / planned_exit_at from migration 038 and
+    # execution_policy_version from migration 084).
+    #   "UNCHECKED" → probe once on first use;
+    #   None        → probe failed / not PostgreSQL (legacy pre-084 path);
+    #   list        → the columns that actually exist.
+    # Fail-safe: when existence cannot be PROVEN, every read/write keeps its
+    # exact pre-084 behaviour, so a not-yet-migrated database can never break
+    # paper trading or restart recovery.
+    _paper_policy_columns: Any = "UNCHECKED"
+
     def __init__(
         self,
         host: str = "localhost",
@@ -1337,6 +1348,13 @@ class ScannerRepository:
         if not self._use_pg:
             return None
 
+        # Capability probe (cached): persist execution_policy_version only on
+        # a database where migration 084 has been applied — otherwise the
+        # INSERT keeps its exact pre-084 shape and nothing breaks.
+        include_policy_version = (
+            "execution_policy_version" in self.paper_trade_policy_columns()
+        )
+
         def _do():
             cursor = self._conn.cursor()
             existing_id = self.get_paper_trade_by_setup(str(trade.setup_id))
@@ -1348,29 +1366,36 @@ class ScannerRepository:
                 )
                 return None
 
+            columns = [
+                "setup_id", "symbol", "scanner_name", "direction", "score",
+                "entry_price", "entry_fee", "stop_price", "target_1", "target_2",
+                "entry_timeframe", "position_size", "risk_usdt", "balance_before",
+                "market_regime", "entry_market_price", "slippage", "status",
+                "entered_at", "execution_policy", "planned_exit_at",
+            ]
+            values: list[Any] = [
+                trade.setup_id, trade.symbol, trade.scanner_name,
+                trade.direction, trade.score, trade.entry_price,
+                trade.entry_fee, trade.stop_price, trade.target_1,
+                trade.target_2, trade.entry_timeframe, trade.position_size,
+                trade.risk_usdt, trade.balance_before, trade.market_regime,
+                trade.entry_market_price, trade.entry_slippage_cost,
+                "OPEN", trade.entered_at,
+                getattr(trade, 'execution_policy', 'DEFAULT'),
+                getattr(trade, 'planned_exit_at', None),
+            ]
+            if include_policy_version:
+                columns.append("execution_policy_version")
+                values.append(getattr(trade, 'execution_policy_version', '') or '')
+
+            placeholders = ", ".join("%s" for _ in columns)
             cursor.execute(
-                """
-                INSERT INTO dds.paper_trade (
-                    setup_id, symbol, scanner_name, direction, score,
-                    entry_price, entry_fee, stop_price, target_1, target_2,
-                    entry_timeframe, position_size, risk_usdt, balance_before, market_regime,
-                    entry_market_price, slippage, status, entered_at,
-                    execution_policy, planned_exit_at
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, 'OPEN', %s, %s, %s
-                ) RETURNING trade_id
+                f"""
+                INSERT INTO dds.paper_trade ({", ".join(columns)})
+                VALUES ({placeholders})
+                RETURNING trade_id
                 """,
-                (
-                    trade.setup_id, trade.symbol, trade.scanner_name,
-                    trade.direction, trade.score, trade.entry_price,
-                    trade.entry_fee, trade.stop_price, trade.target_1,
-                    trade.target_2, trade.entry_timeframe, trade.position_size,
-                    trade.risk_usdt, trade.balance_before, trade.market_regime,
-                    trade.entry_market_price, trade.entry_slippage_cost, trade.entered_at,
-                    getattr(trade, 'execution_policy', 'DEFAULT'),
-                    getattr(trade, 'planned_exit_at', None),
-                ),
+                tuple(values),
             )
             row = cursor.fetchone()
             cursor.execute(
@@ -1488,48 +1513,131 @@ class ScannerRepository:
             logger.exception("update_paper_trade_funding failed for trade_id=%s", trade_id)
             raise
 
+    def paper_trade_policy_columns(self) -> list[str]:
+        """Existing execution-policy columns of ``dds.paper_trade`` (cached).
+
+        Used by restart recovery and by ``save_paper_trade`` so that reading/
+        persisting ``execution_policy``, ``execution_policy_version`` and
+        ``planned_exit_at`` degrades safely to the legacy shape on a database
+        where migration 038/084 has not been applied yet (fails safe, never
+        fails closed on a write).  A failed probe is cached as ``None`` and
+        behaves like "no extra columns".
+        """
+        cached = self._paper_policy_columns
+        if cached != "UNCHECKED":
+            return list(cached or [])
+        if not self._use_pg:
+            self._paper_policy_columns = None
+            return []
+        expected = ("execution_policy", "execution_policy_version", "planned_exit_at")
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'dds' AND table_name = 'paper_trade' "
+                "AND column_name IN (%s, %s, %s)",
+                expected,
+            )
+            found = sorted({r[0] for r in cursor.fetchall()})
+            self._conn.commit()
+            self._paper_policy_columns = found
+            missing = [c for c in expected if c not in found]
+            if missing:
+                logger.warning(
+                    "dds.paper_trade is missing execution-policy column(s) %s — "
+                    "apply sql/migrations/038 and 084; paper recovery and "
+                    "policy persistence degrade to the pre-084 behaviour",
+                    missing,
+                )
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            self._paper_policy_columns = None
+            logger.warning(
+                "dds.paper_trade execution-policy column probe failed; "
+                "using legacy paper read/write shape", exc_info=True,
+            )
+            return []
+        return list(self._paper_policy_columns or [])
+
     def get_open_paper_trades(self) -> list[dict]:
-        """Load all OPEN paper trades (for engine restart recovery)."""
+        """Load all OPEN paper trades (for engine restart recovery).
+
+        Restores the execution-policy facts the engine needs after a restart:
+        ``execution_policy``, ``execution_policy_version`` and
+        ``planned_exit_at`` (when the columns exist — see
+        :meth:`paper_trade_policy_columns`), so a fixed-horizon trade keeps
+        its original policy and its original planned exit after recovery.
+        """
         if not self._use_pg:
             return []
+
+        policy_columns = [
+            c for c in (
+                "execution_policy", "execution_policy_version", "planned_exit_at",
+            )
+            if c in self.paper_trade_policy_columns()
+        ]
+        base_columns = [
+            "trade_id", "setup_id", "symbol", "scanner_name", "direction", "score",
+            "entry_price", "entry_fee", "stop_price", "target_1", "target_2",
+            "entry_timeframe", "position_size", "risk_usdt", "balance_before",
+            "market_regime", "funding_paid", "funding_periods", "entered_at",
+            "entry_market_price", "slippage", "mfe", "mae",
+        ]
+        selected = ", ".join(base_columns + policy_columns)
 
         def _do():
             cursor = self._conn.cursor()
             cursor.execute(
-                """
-                SELECT trade_id, setup_id, symbol, scanner_name, direction, score,
-                       entry_price, entry_fee, stop_price, target_1, target_2,
-                       entry_timeframe, position_size, risk_usdt, balance_before, market_regime,
-                       funding_paid, funding_periods, entered_at,
-                       entry_market_price, slippage, mfe, mae
+                f"""
+                SELECT {selected}
                 FROM dds.paper_trade
                 WHERE status = 'OPEN'
                 ORDER BY entered_at DESC
                 """
             )
             rows = cursor.fetchall()
-            return [
-                {
-                    "trade_id": r[0], "setup_id": r[1], "symbol": r[2],
-                    "scanner_name": r[3], "direction": r[4], "score": float(r[5]),
-                    "entry_price": float(r[6]), "entry_fee": float(r[7]),
-                    "stop_price": float(r[8]),
-                    "target_1": float(r[9]) if r[9] is not None else None,
-                    "target_2": float(r[10]) if r[10] is not None else None,
-                    "entry_timeframe": r[11],
-                    "position_size": float(r[12]), "risk_usdt": float(r[13]),
-                    "balance_before": float(r[14]),
-                    "market_regime": r[15],
-                    "funding_paid": float(r[16] or 0),
-                    "funding_periods": int(r[17] or 0),
-                    "entered_at": r[18],
-                    "entry_market_price": float(r[19] or r[6]),
-                    "slippage": float(r[20] or 0),
-                    "mfe": float(r[21] or 0),
-                    "mae": float(r[22] or 0),
-                }
-                for r in rows
-            ]
+            names = [d[0] for d in cursor.description] if cursor.description else []
+            results: list[dict] = []
+            for r in rows:
+                row = dict(zip(names, r))
+                results.append({
+                    "trade_id": row["trade_id"],
+                    "setup_id": row["setup_id"],
+                    "symbol": row["symbol"],
+                    "scanner_name": row["scanner_name"],
+                    "direction": row["direction"],
+                    "score": float(row["score"]),
+                    "entry_price": float(row["entry_price"]),
+                    "entry_fee": float(row["entry_fee"]),
+                    "stop_price": float(row["stop_price"]),
+                    "target_1": float(row["target_1"]) if row["target_1"] is not None else None,
+                    "target_2": float(row["target_2"]) if row["target_2"] is not None else None,
+                    "entry_timeframe": row["entry_timeframe"],
+                    "position_size": float(row["position_size"]),
+                    "risk_usdt": float(row["risk_usdt"]),
+                    "balance_before": float(row["balance_before"]),
+                    "market_regime": row["market_regime"],
+                    "funding_paid": float(row["funding_paid"] or 0),
+                    "funding_periods": int(row["funding_periods"] or 0),
+                    "entered_at": row["entered_at"],
+                    "entry_market_price": float(
+                        row["entry_market_price"] or row["entry_price"]
+                    ),
+                    "slippage": float(row["slippage"] or 0),
+                    "mfe": float(row["mfe"] or 0),
+                    "mae": float(row["mae"] or 0),
+                    # Execution-policy recovery (previously never read back):
+                    "execution_policy": str(row.get("execution_policy") or "DEFAULT"),
+                    "execution_policy_version": str(
+                        row.get("execution_policy_version") or ""
+                    ),
+                    "planned_exit_at": row.get("planned_exit_at"),
+                })
+            return results
 
         return self._with_retry(_do, label="get_open_paper_trades")
 
