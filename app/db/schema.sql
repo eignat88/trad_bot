@@ -784,7 +784,8 @@ ORDER BY total_pnl_usdt DESC;
 
 -- ============================================================
 -- ME_LONG_V2_INVERSE_SHORT_V1 — independent prospective SHORT
--- paper contour (mirrors sql/migrations/085_me_long_v2_inverse_short_v1.sql)
+-- paper contour (mirrors sql/migrations/085_me_long_v2_inverse_short_v1.sql
+-- + sql/migrations/086_me_long_v2_inverse_short_v1_close_outbox.sql)
 -- ============================================================
 -- Isolated contour derived from the ORIGINAL MOMENTUM_EXHAUSTION_REVERSE_LONG_V2
 -- events: TP 10% / SL 10% of the actual entry price, 7200-minute maximum
@@ -909,6 +910,21 @@ CREATE INDEX IF NOT EXISTS idx_me_inverse_short_v1_position_symbol
 CREATE INDEX IF NOT EXISTS idx_me_inverse_short_v1_position_deadline
     ON dds.me_long_v2_inverse_short_v1_position (deadline_at)
     WHERE status = 'OPEN';
+
+-- Durable close outbox (mirrors sql/migrations/086_me_long_v2_inverse_short_v1_close_outbox.sql):
+-- terminal snapshots staged BEFORE the position row flips to CLOSED, so a
+-- failed/restarted close replays its exact exit facts instead of losing them.
+CREATE TABLE IF NOT EXISTS dds.me_long_v2_inverse_short_v1_close_outbox (
+    position_key TEXT PRIMARY KEY
+        CHECK (position_key LIKE 'ME_LONG_V2_INVERSE_SHORT_V1:%'),
+    symbol TEXT NOT NULL CHECK (symbol <> ''),
+    exit_reason TEXT NOT NULL
+        CHECK (exit_reason IN
+               ('STOP_LOSS', 'STOP_LOSS_GAP', 'TAKE_PROFIT_1', 'TIMEOUT')),
+    closed_at TIMESTAMPTZ NOT NULL,
+    snapshot JSONB NOT NULL,
+    staged_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 -- NOTE: the BEFORE UPDATE immutability trigger for entered_at / deadline_at
 -- lives in sql/migrations/085_me_long_v2_inverse_short_v1.sql — its function

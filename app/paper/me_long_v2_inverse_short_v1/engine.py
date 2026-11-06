@@ -76,6 +76,14 @@ class InverseShortPaperEngine:
 
         # ISOLATION: never shared with PaperTradingEngine.
         self.open_positions: dict[str, InverseShortPosition] = {}
+        # Durable close protocol (P1-3): terminal snapshots whose status flip
+        # is not confirmed yet.  Retried with IDENTICAL facts, never
+        # re-evaluated by STOP/TP/TIMEOUT; a symbol with an unfinished close
+        # refuses new entries until the close is persisted.
+        self.pending_closes: dict[str, InverseShortPosition] = {}
+        # Keys resumed from the durable outbox at recovery — their realized
+        # PnL is not in the memory ledger yet and is synced AFTER the flush.
+        self._pending_from_store: set[str] = set()
 
         components = store.balance_components()
         self.balance = float(components.get("balance", settings.initial_balance))
@@ -88,9 +96,44 @@ class InverseShortPaperEngine:
     # Restart recovery
     # ------------------------------------------------------------------
     def _load_open_positions(self) -> None:
-        """Restore OPEN positions; ``entered_at``/``deadline_at`` verbatim."""
+        """Restore OPEN positions; ``entered_at``/``deadline_at`` verbatim.
+
+        Durable unfinished closes are resumed FIRST: their terminal snapshot
+        is exact, so those keys are excluded from the open-position algorithm
+        below — a recovered close is replayed as-is, never recomputed by
+        STOP/TP/TIMEOUT.
+        """
+        for snapshot in self.store.list_pending_closes():
+            if (
+                snapshot.direction != TRADE_DIRECTION
+                or snapshot.status != POSITION_STATUS_CLOSED
+                or snapshot.exit_reason not in CONTOUR_EXIT_REASONS
+                or snapshot.closed_at is None
+                or snapshot.deadline_at <= snapshot.entered_at
+            ):
+                logger.error(
+                    "me inverse short recovery refused invalid pending close: key=%s",
+                    str(snapshot.position_key)[:48],
+                )
+                continue
+            self.pending_closes[snapshot.position_key] = snapshot
+            self._pending_from_store.add(snapshot.position_key)
+        if self.pending_closes:
+            logger.warning(
+                "me inverse short recovery resumed %d unfinished close(s); "
+                "terminal facts replayed byte-for-byte, never recomputed",
+                len(self.pending_closes),
+            )
+
         restored = self.store.load_open_positions()
         for position in restored:
+            if position.position_key in self.pending_closes:
+                logger.warning(
+                    "me inverse short recovery: key=%s kept out of the exit "
+                    "algorithm (close persistence pending)",
+                    position.position_key[:48],
+                )
+                continue
             if position.direction != TRADE_DIRECTION:
                 logger.error(
                     "me inverse short recovery refused non-SHORT position: key=%s direction=%s",
@@ -170,6 +213,16 @@ class InverseShortPaperEngine:
         if self.store.has_position(position_key):
             # Cross-restart / duplicate-delivery guard: already traded.
             return None
+        for pending in self.pending_closes.values():
+            if pending.symbol == event.symbol:
+                # Close-persistence guard: while the previous position of this
+                # symbol has an unfinished close, no new position may open.
+                logger.warning(
+                    "me inverse short entry refused: unfinished close for "
+                    "symbol=%s (event=%s)",
+                    event.symbol, event.event_key[:16],
+                )
+                return None
 
         if self.require_activation and self.activation is not None:
             if not is_post_freeze(event.signal_time, self.activation.freeze_ts):
@@ -285,6 +338,10 @@ class InverseShortPaperEngine:
         bars: dict[str, dict[str, float]] | None = None,
     ) -> list[InverseShortPosition]:
         """Evaluate every open position; return positions closed this cycle."""
+        # First finish any unfinished close (P1-3): its terminal snapshot is
+        # replayed byte-for-byte and never re-evaluated below.
+        self.flush_pending_closes()
+
         closed: list[InverseShortPosition] = []
 
         for position_key, position in list(self.open_positions.items()):
@@ -407,15 +464,44 @@ class InverseShortPaperEngine:
         position.closed_at = closed_at
         position.duration_sec = (closed_at - position.entered_at).total_seconds()
 
+        # ---- durable close protocol (P1-3) ----
+        # 1) Stage the EXACT terminal snapshot durably FIRST: the exit facts
+        #    survive a crash even if the status UPDATE below fails.
+        staged = False
+        try:
+            staged = bool(self.store.stage_close(position))
+        except Exception:
+            logger.warning(
+                "me inverse short close staging failed (in-process snapshot "
+                "retained): key=%s",
+                position.position_key[:48],
+                exc_info=True,
+            )
+        # 2) Flip the row to CLOSED.  On failure the terminal snapshot is
+        #    retained and replayed byte-for-byte (same position_key, closed_at,
+        #    exit_reason, exit_price, PnL and funding) by flush_pending_closes().
         try:
             self.store.update_position(position)
         except Exception:
-            # Fail-safe: memory state is already terminal; persistence retried
-            # by the next update (duplicate UPDATE is idempotent).
+            self.pending_closes[position.position_key] = position
             logger.exception(
-                "me inverse short close persistence failed: key=%s reason=%s",
-                position.position_key[:48], reason,
+                "me inverse short close persistence failed; terminal snapshot "
+                "retained for retry (outbox staged=%s): key=%s reason=%s net=%.4f",
+                staged, position.position_key[:48], reason, net_pnl,
             )
+        else:
+            if staged:
+                try:
+                    self.store.clear_pending_close(position.position_key)
+                except Exception:
+                    # A lingering outbox row replays the IDENTICAL snapshot on
+                    # the next restart — idempotent, never changes the numbers.
+                    logger.debug(
+                        "me inverse short close outbox clear failed "
+                        "(idempotent replay active): key=%s",
+                        position.position_key[:48],
+                        exc_info=True,
+                    )
 
         logger.info(
             "me inverse short exit: symbol=%s reason=%s ref=%.6f fill=%.6f "
@@ -425,6 +511,83 @@ class InverseShortPaperEngine:
             position.funding_paid, net_pnl,
         )
         return position
+
+    # ------------------------------------------------------------------
+    # Durable close persistence (P1-3)
+    # ------------------------------------------------------------------
+    def flush_pending_closes(self) -> int:
+        """Persist retained terminal closes with their ORIGINAL facts.
+
+        Runs every cycle (and at recovery, before any exit evaluation).  The
+        retained snapshot object — position_key, closed_at, exit_reason,
+        exit_price, PnL and funding — is replayed unchanged, so a retry can
+        never alter the exit record or book realized PnL twice.  A position
+        with a pending close is NOT in ``open_positions``, so STOP/TP/TIMEOUT
+        can never re-evaluate it, and ``_pending_from_store`` guarantees the
+        recovered realized PnL is synced into the memory ledger exactly once.
+        """
+        flushed = 0
+        for position_key, snapshot in list(self.pending_closes.items()):
+            try:
+                self.store.update_position(snapshot)
+            except Exception:
+                logger.warning(
+                    "me inverse short close flush failed (terminal snapshot "
+                    "retained): key=%s reason=%s closed_at=%s net=%.4f",
+                    position_key[:48], snapshot.exit_reason,
+                    snapshot.closed_at.isoformat() if snapshot.closed_at else None,
+                    snapshot.net_pnl,
+                    exc_info=True,
+                )
+                continue
+            self.pending_closes.pop(position_key, None)
+            was_from_store = position_key in self._pending_from_store
+            self._pending_from_store.discard(position_key)
+            flushed += 1
+            try:
+                self.store.clear_pending_close(position_key)
+            except Exception:
+                # The outbox row (if any) survives: the next restart replays
+                # the IDENTICAL snapshot — idempotent, numbers unchanged.
+                logger.debug(
+                    "me inverse short close outbox clear failed (idempotent "
+                    "replay active): key=%s",
+                    position_key[:48],
+                    exc_info=True,
+                )
+            if was_from_store:
+                # Recovery path: the memory ledger was rebuilt from the still-
+                # OPEN row (realized PnL absent) — set it from the store now
+                # that the row is CLOSED.  SET, never add: no double count.
+                self._sync_balance_from_store()
+            logger.info(
+                "me inverse short close flushed: key=%s reason=%s closed_at=%s "
+                "exit=%.6f net=%.4f",
+                position_key[:48], snapshot.exit_reason,
+                snapshot.closed_at.isoformat() if snapshot.closed_at else None,
+                snapshot.exit_price or 0.0, snapshot.net_pnl,
+            )
+        return flushed
+
+    def _sync_balance_from_store(self) -> None:
+        """Set the memory ledger from the store (single source of truth)."""
+        try:
+            components = self.store.balance_components()
+            restored = float(
+                components.get("balance", self.settings.initial_balance)
+            )
+        except Exception:
+            logger.warning(
+                "me inverse short balance resync failed (memory ledger kept)",
+                exc_info=True,
+            )
+            return
+        if restored != self.balance:
+            logger.info(
+                "me inverse short balance resync: $%.4f -> $%.4f",
+                self.balance, restored,
+            )
+        self.balance = restored
 
     # ------------------------------------------------------------------
     # Reporting (isolated accounting — nothing shared with Paper)
@@ -468,6 +631,7 @@ class InverseShortPaperEngine:
             "closed_trades": int(summary["closed_trades"]),
             "closed_net_pnl": round(summary["net_pnl"], 4),
             "open_positions": len(self.open_positions),
+            "pending_closes": len(self.pending_closes),
             "gross_exposure_pct": round(
                 (gross_exposure / equity * 100.0) if equity else 0.0, 4,
             ),

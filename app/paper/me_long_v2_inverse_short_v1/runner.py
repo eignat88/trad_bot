@@ -127,6 +127,7 @@ class InverseShortContour:
             "equity": account["equity"],
             "pending_events": len(self.engine.pending_events()),
             "open_positions": len(self.engine.open_positions),
+            "pending_closes": len(self.engine.pending_closes),
         }
 
 

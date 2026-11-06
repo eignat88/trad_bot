@@ -15,6 +15,7 @@ Two implementations behind ONE small interface:
         dds.me_long_v2_inverse_short_v1_activation
         dds.me_long_v2_inverse_short_v1_event
         dds.me_long_v2_inverse_short_v1_position
+        dds.me_long_v2_inverse_short_v1_close_outbox   (durable close staging)
 
 Isolation invariants enforced here:
   * events are idempotent on ``event_key`` (``ON CONFLICT DO NOTHING``);
@@ -49,6 +50,10 @@ SCHEMA = "dds"
 EVENT_TABLE = f"{SCHEMA}.me_long_v2_inverse_short_v1_event"
 POSITION_TABLE = f"{SCHEMA}.me_long_v2_inverse_short_v1_position"
 ACTIVATION_TABLE = f"{SCHEMA}.me_long_v2_inverse_short_v1_activation"
+# Durable close outbox (P1-3): terminal snapshots staged BEFORE the position
+# row flips to CLOSED, so an exit can never lose its facts to a failed/lost
+# UPDATE or a restart.  Populated only while a close is being persisted.
+CLOSE_OUTBOX_TABLE = f"{SCHEMA}.me_long_v2_inverse_short_v1_close_outbox"
 
 # Honest save_event outcomes.
 SAVE_CAPTURED = "CAPTURED"
@@ -130,6 +135,24 @@ class InverseShortStore:
     def net_pnl_summary(self) -> dict[str, float]:
         raise NotImplementedError
 
+    # -- durable close outbox (P1-3) --------------------------------------
+    def stage_close(self, position: InverseShortPosition) -> bool:
+        """Durably stage the EXACT terminal snapshot BEFORE the status flip.
+
+        Returns True when the snapshot is durable (outbox row written),
+        False when durability is degraded (no outbox yet) — the caller keeps
+        the in-process snapshot either way.
+        """
+        raise NotImplementedError
+
+    def list_pending_closes(self) -> list[InverseShortPosition]:
+        """Terminal snapshots staged but not yet confirmed CLOSED."""
+        raise NotImplementedError
+
+    def clear_pending_close(self, position_key: str) -> None:
+        """Drop the staged snapshot after the status flip is confirmed."""
+        raise NotImplementedError
+
     def close(self) -> None:  # pragma: no cover - trivial
         return None
 
@@ -148,6 +171,8 @@ class InMemoryInverseShortStore(InverseShortStore):
         self._positions: dict[str, InverseShortPosition] = {}
         self.initial_balance = float(initial_balance)
         self.immutability_repairs = 0
+        # Durable-close mirror: terminal snapshots staged but not confirmed.
+        self._pending_closes: dict[str, InverseShortPosition] = {}
 
     # -- activation -------------------------------------------------------
     def set_activation(self, activation: ActivationRecord | None) -> None:
@@ -236,6 +261,27 @@ class InMemoryInverseShortStore(InverseShortStore):
             "net_pnl": net,
         }
 
+    # -- durable close outbox (P1-3) --------------------------------------
+    def stage_close(self, position: InverseShortPosition) -> bool:
+        """Stage the exact terminal snapshot (process-local durability)."""
+        if (
+            position.status != POSITION_STATUS_CLOSED
+            or not position.exit_reason
+            or position.closed_at is None
+        ):
+            raise ValueError("STAGE_CLOSE_NOT_TERMINAL")
+        self._pending_closes[position.position_key] = replace(position)
+        return True
+
+    def list_pending_closes(self) -> list[InverseShortPosition]:
+        return [
+            replace(self._pending_closes[key])
+            for key in sorted(self._pending_closes)
+        ]
+
+    def clear_pending_close(self, position_key: str) -> None:
+        self._pending_closes.pop(position_key, None)
+
 
 # ---------------------------------------------------------------------------
 # PostgreSQL implementation
@@ -284,7 +330,7 @@ INSERT_EVENT_SQL = f"""
 
 INSERT_POSITION_SQL = f"""
     INSERT INTO {POSITION_TABLE} ({", ".join(_POSITION_COLUMNS)})
-    VALUES {_POSITION_VALUES_SQL}
+    VALUES ({_POSITION_VALUES_SQL})
     ON CONFLICT (position_key) DO NOTHING
 """
 
@@ -318,10 +364,72 @@ MARK_EVENT_ENTERED_SQL = f"""
     WHERE event_key = %s AND status = %s
 """
 
+# Durable close outbox (P1-3): staged BEFORE the position row flips to
+# CLOSED.  Re-staging the same key is an idempotent overwrite (same terminal
+# facts), so a retry can never change the exit record.
+INSERT_CLOSE_OUTBOX_SQL = f"""
+    INSERT INTO {CLOSE_OUTBOX_TABLE}
+        (position_key, symbol, exit_reason, closed_at, snapshot)
+    VALUES (%s, %s, %s, %s, %s::jsonb)
+    ON CONFLICT (position_key) DO UPDATE SET
+        symbol = EXCLUDED.symbol,
+        exit_reason = EXCLUDED.exit_reason,
+        closed_at = EXCLUDED.closed_at,
+        snapshot = EXCLUDED.snapshot,
+        staged_at = now()
+"""
 
-def _rows_to_dicts(cursor: Any) -> list[dict[str, Any]]:
-    columns = [d[0] for d in (cursor.description or [])]
-    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+LIST_CLOSE_OUTBOX_SQL = f"""
+    SELECT position_key, snapshot
+    FROM {CLOSE_OUTBOX_TABLE}
+    ORDER BY staged_at, position_key
+"""
+
+DELETE_CLOSE_OUTBOX_SQL = f"""
+    DELETE FROM {CLOSE_OUTBOX_TABLE} WHERE position_key = %s
+"""
+
+
+def _is_missing_relation(exc: Exception) -> bool:
+    """PostgreSQL 42P01 (undefined table) — outbox migration not applied yet.
+
+    The close path must stay functional on a database that only has
+    migrations 084/085 (migration-safe rollout): durability degrades to the
+    in-process snapshot instead of failing the close.
+    """
+    if str(getattr(exc, "sqlstate", "") or "") == "42P01":
+        return True
+    text = str(exc).lower()
+    return "does not exist" in text and ("relation" in text or "table" in text)
+
+
+class _QueryResult:
+    """Materialized result of one statement.
+
+    The cursor is read (``description`` / rows / ``rowcount``) INSIDE
+    ``_execute`` before it is closed, so a caller can never observe a closed
+    cursor and a cursor can never leak (P1-1).
+    """
+
+    __slots__ = ("columns", "rows", "rowcount")
+
+    def __init__(self, columns: list[str], rows: list[tuple], rowcount: int) -> None:
+        self.columns = columns
+        self.rows = rows
+        self.rowcount = rowcount
+
+    def fetchone(self) -> tuple | None:
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self) -> list[tuple]:
+        return list(self.rows)
+
+    def fetchone_dict(self) -> dict[str, Any] | None:
+        row = self.fetchone()
+        return dict(zip(self.columns, row)) if row is not None else None
+
+    def fetchall_dicts(self) -> list[dict[str, Any]]:
+        return [dict(zip(self.columns, row)) for row in self.rows]
 
 
 class PgInverseShortStore(InverseShortStore):
@@ -351,30 +459,64 @@ class PgInverseShortStore(InverseShortStore):
         except Exception:  # pragma: no cover - defensive
             logger.debug("me inverse short store rollback failed", exc_info=True)
 
-    def _execute(self, sql: str, params: tuple | list = ()) -> Any:
+    def _execute(
+        self, sql: str, params: tuple | list = (), *, fetch: str = "all",
+    ) -> _QueryResult:
+        """Execute one statement and MATERIALIZE its results (P1-1).
+
+        ``description``, rows and ``rowcount`` are read inside the ``try``
+        block BEFORE the cursor is closed in ``finally`` — a result is never
+        read from a closed cursor, and every cursor is closed exactly once.
+        ``fetch``: ``"all"`` / ``"one"`` (SELECT paths) or ``"none"``
+        (INSERT/UPDATE/DELETE paths — only ``rowcount`` is kept).
+        """
         cursor = self._conn.cursor()
         try:
             cursor.execute(sql, params)
-            return cursor
+            description = cursor.description
+            columns = [d[0] for d in (description or [])]
+            if description is None:
+                rows: list[tuple] = []
+            elif fetch == "one":
+                row = cursor.fetchone()
+                rows = [row] if row is not None else []
+            elif fetch == "none":
+                rows = []
+            else:
+                rows = list(cursor.fetchall())
+            rowcount = int(getattr(cursor, "rowcount", 0) or 0)
+            return _QueryResult(columns=columns, rows=rows, rowcount=rowcount)
         finally:
             try:
                 cursor.close()
             except Exception:  # pragma: no cover - defensive
                 pass
 
-    # -- activation -------------------------------------------------------
-    def load_activation(self) -> ActivationRecord | None:
+    def _query(
+        self, sql: str, params: tuple | list = (), *, fetch: str = "all",
+    ) -> _QueryResult:
+        """Read helper: materialize, then promptly commit the read.
+
+        On failure the transaction is rolled back, so a failed read never
+        leaves the shared connection with a hanging/aborted transaction.
+        """
         try:
-            cursor = self._execute(
-                "SELECT experiment_id, status, protocol_fingerprint, freeze_ts "
-                f"FROM {ACTIVATION_TABLE} WHERE experiment_id = %s",
-                (self._experiment_id,),
-            )
-            row = cursor.fetchone()
+            result = self._execute(sql, params, fetch=fetch)
             self._conn.commit()
+            return result
         except Exception:
             self._rollback()
             raise
+
+    # -- activation -------------------------------------------------------
+    def load_activation(self) -> ActivationRecord | None:
+        result = self._query(
+            "SELECT experiment_id, status, protocol_fingerprint, freeze_ts "
+            f"FROM {ACTIVATION_TABLE} WHERE experiment_id = %s",
+            (self._experiment_id,),
+            fetch="one",
+        )
+        row = result.fetchone()
         if row is None:
             return None
         return ActivationRecord(
@@ -413,8 +555,8 @@ class PgInverseShortStore(InverseShortStore):
             self._experiment_id, self._expected_fingerprint,
         ]
         try:
-            cursor = self._execute(INSERT_EVENT_SQL, tuple(params))
-            inserted = cursor.rowcount == 1
+            result = self._execute(INSERT_EVENT_SQL, tuple(params), fetch="none")
+            inserted = result.rowcount == 1
             self._conn.commit()
         except Exception:
             self._rollback()
@@ -428,34 +570,33 @@ class PgInverseShortStore(InverseShortStore):
         return SAVE_NOT_ACTIVE
 
     def get_event(self, event_key: str) -> InverseShortEvent | None:
-        cursor = self._execute(
+        rows = self._query(
             "SELECT * FROM " + EVENT_TABLE + " WHERE event_key = %s",
             (event_key,),
-        )
-        rows = _rows_to_dicts(cursor)
-        self._conn.commit()
+        ).fetchall_dicts()
         return InverseShortEvent.from_dict(rows[0]) if rows else None
 
     def list_events(self, status: str | None = None) -> list[InverseShortEvent]:
         if status is None:
-            cursor = self._execute(
+            result = self._query(
                 "SELECT * FROM " + EVENT_TABLE + " ORDER BY signal_time, event_key",
             )
         else:
-            cursor = self._execute(
+            result = self._query(
                 "SELECT * FROM " + EVENT_TABLE +
                 " WHERE status = %s ORDER BY signal_time, event_key",
                 (status,),
             )
-        events = [InverseShortEvent.from_dict(r) for r in _rows_to_dicts(cursor)]
-        self._conn.commit()
-        return events
+        return [
+            InverseShortEvent.from_dict(r) for r in result.fetchall_dicts()
+        ]
 
     def mark_event_entered(self, event_key: str, position_key: str) -> None:
         try:
             self._execute(
                 MARK_EVENT_ENTERED_SQL,
                 (EVENT_STATUS_ENTERED, position_key, event_key, EVENT_STATUS_CAPTURED),
+                fetch="none",
             )
             self._conn.commit()
         except Exception:
@@ -469,10 +610,11 @@ class PgInverseShortStore(InverseShortStore):
 
     def save_position(self, position: InverseShortPosition) -> bool:
         try:
-            cursor = self._execute(
+            result = self._execute(
                 INSERT_POSITION_SQL, self._position_params(position),
+                fetch="none",
             )
-            inserted = cursor.rowcount == 1
+            inserted = result.rowcount == 1
             self._conn.commit()
             return inserted
         except Exception:
@@ -491,56 +633,58 @@ class PgInverseShortStore(InverseShortStore):
             position.position_key,
         )
         try:
-            self._execute(UPDATE_POSITION_SQL, params)
+            result = self._execute(UPDATE_POSITION_SQL, params, fetch="none")
+            updated = result.rowcount
             self._conn.commit()
         except Exception:
             self._rollback()
             raise
+        if updated == 0:
+            # A confirmed write MUST have matched the row: silently losing a
+            # close/funding update would corrupt the ledger.
+            raise RuntimeError(
+                f"POSITION_UPDATE_MATCHED_NO_ROWS:{position.position_key}"
+            )
 
     def load_open_positions(self) -> list[InverseShortPosition]:
-        cursor = self._execute(
+        rows = self._query(
             "SELECT * FROM " + POSITION_TABLE +
             " WHERE status = %s ORDER BY entered_at",
             (POSITION_STATUS_OPEN,),
-        )
-        rows = _rows_to_dicts(cursor)
-        self._conn.commit()
+        ).fetchall_dicts()
         return [InverseShortPosition.from_dict(r) for r in rows]
 
     def has_position(self, position_key: str) -> bool:
-        cursor = self._execute(
+        result = self._query(
             "SELECT 1 FROM " + POSITION_TABLE + " WHERE position_key = %s",
             (position_key,),
+            fetch="one",
         )
-        found = cursor.fetchone() is not None
-        self._conn.commit()
-        return found
+        return result.fetchone() is not None
 
     def list_positions(self, status: str | None = None) -> list[InverseShortPosition]:
         if status is None:
-            cursor = self._execute(
+            result = self._query(
                 "SELECT * FROM " + POSITION_TABLE + " ORDER BY entered_at",
             )
         else:
-            cursor = self._execute(
+            result = self._query(
                 "SELECT * FROM " + POSITION_TABLE +
                 " WHERE status = %s ORDER BY entered_at",
                 (status,),
             )
-        rows = _rows_to_dicts(cursor)
-        self._conn.commit()
-        return [InverseShortPosition.from_dict(r) for r in rows]
+        return [InverseShortPosition.from_dict(r) for r in result.fetchall_dicts()]
 
     def balance_components(self) -> dict[str, float]:
-        cursor = self._execute(
+        result = self._query(
             "SELECT "
             " COALESCE(SUM(CASE WHEN status = 'CLOSED' THEN net_pnl ELSE 0 END), 0),"
             " COALESCE(SUM(CASE WHEN status = 'OPEN' THEN "
             "   entry_fee + entry_slippage + funding_paid ELSE 0 END), 0)"
             f" FROM {POSITION_TABLE}",
+            fetch="one",
         )
-        row = cursor.fetchone() or (0.0, 0.0)
-        self._conn.commit()
+        row = result.fetchone() or (0.0, 0.0)
         closed_net = float(row[0] or 0.0)
         open_costs = float(row[1] or 0.0)
         return {
@@ -551,21 +695,85 @@ class PgInverseShortStore(InverseShortStore):
         }
 
     def net_pnl_summary(self) -> dict[str, float]:
-        cursor = self._execute(
+        result = self._query(
             "SELECT COUNT(*), "
             " COALESCE(SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END), 0),"
             " COALESCE(SUM(CASE WHEN net_pnl <= 0 THEN 1 ELSE 0 END), 0),"
             " COALESCE(SUM(net_pnl), 0)"
             f" FROM {POSITION_TABLE} WHERE status = 'CLOSED'",
+            fetch="one",
         )
-        row = cursor.fetchone() or (0, 0, 0, 0.0)
-        self._conn.commit()
+        row = result.fetchone() or (0, 0, 0, 0.0)
         return {
             "closed_trades": float(row[0] or 0),
             "wins": float(row[1] or 0),
             "losses": float(row[2] or 0),
             "net_pnl": float(row[3] or 0.0),
         }
+
+    # -- durable close outbox (P1-3) --------------------------------------
+    def stage_close(self, position: InverseShortPosition) -> bool:
+        if (
+            position.status != POSITION_STATUS_CLOSED
+            or not position.exit_reason
+            or position.closed_at is None
+        ):
+            raise ValueError("STAGE_CLOSE_NOT_TERMINAL")
+        snapshot = json.dumps(position.to_dict(), ensure_ascii=False)
+        params = (
+            position.position_key, position.symbol, position.exit_reason,
+            position.closed_at, snapshot,
+        )
+        try:
+            result = self._execute(INSERT_CLOSE_OUTBOX_SQL, params, fetch="none")
+            staged = result.rowcount == 1
+            self._conn.commit()
+            return staged
+        except Exception as exc:
+            self._rollback()
+            if _is_missing_relation(exc):
+                logger.warning(
+                    "me inverse short close outbox unavailable (migration 086 "
+                    "not applied): terminal close durability degraded to "
+                    "in-process retry: key=%s",
+                    position.position_key[:48],
+                )
+                return False
+            raise
+
+    def list_pending_closes(self) -> list[InverseShortPosition]:
+        try:
+            result = self._query(LIST_CLOSE_OUTBOX_SQL)
+        except Exception as exc:
+            if _is_missing_relation(exc):
+                logger.warning(
+                    "me inverse short close outbox table missing (migration 086 "
+                    "not applied): no durable closes to resume",
+                )
+                return []
+            raise
+        pending: list[InverseShortPosition] = []
+        for row in result.fetchall_dicts():
+            raw = row.get("snapshot")
+            try:
+                data = json.loads(raw) if isinstance(raw, str) else raw
+                pending.append(InverseShortPosition.from_dict(data))
+            except Exception:
+                logger.error(
+                    "me inverse short close outbox row unreadable: key=%s",
+                    str(row.get("position_key"))[:48], exc_info=True,
+                )
+        return pending
+
+    def clear_pending_close(self, position_key: str) -> None:
+        try:
+            self._execute(DELETE_CLOSE_OUTBOX_SQL, (position_key,), fetch="none")
+            self._conn.commit()
+        except Exception as exc:
+            self._rollback()
+            if _is_missing_relation(exc):
+                return  # degraded mode: nothing staged, nothing to clear
+            raise
 
     def close(self) -> None:
         try:
