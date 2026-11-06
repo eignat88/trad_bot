@@ -1,0 +1,605 @@
+"""Persistence for the ME_LONG_V2_INVERSE_SHORT_V1 prospective paper contour.
+
+Two implementations behind ONE small interface:
+
+``InverseShortStore`` / ``InMemoryInverseShortStore``
+    Process-local, transaction-free store used by unit tests and by the
+    pre-activation dry-run.  It enforces exactly the same invariants as the
+    PostgreSQL store (activation guard, idempotent event keys, immutable
+    ``entered_at`` / ``deadline_at``) so dry-run behaviour is representative.
+
+``PgInverseShortStore``
+    PostgreSQL implementation over a DEDICATED connection (never the scanner
+    or paper runner transaction), writing only to the contour's own tables:
+
+        dds.me_long_v2_inverse_short_v1_activation
+        dds.me_long_v2_inverse_short_v1_event
+        dds.me_long_v2_inverse_short_v1_position
+
+Isolation invariants enforced here:
+  * events are idempotent on ``event_key`` (``ON CONFLICT DO NOTHING``);
+  * positions are idempotent on the NAMESPACED ``position_key``;
+  * the position UPDATE statement never touches ``entered_at`` /
+    ``deadline_at`` (or any entry column) — restart recovery reads back the
+    original entry time and the original deadline verbatim.
+"""
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import replace
+from datetime import datetime, timezone
+from typing import Any, Iterable
+
+from .activation import evaluate_activation
+from .models import (
+    EVENT_STATUS_CAPTURED,
+    EVENT_STATUS_ENTERED,
+    ActivationRecord,
+    InverseShortEvent,
+    InverseShortPosition,
+    POSITION_STATUS_CLOSED,
+    POSITION_STATUS_OPEN,
+)
+from .protocol import EXPERIMENT_ID, protocol_fingerprint
+
+logger = logging.getLogger(__name__)
+
+SCHEMA = "dds"
+EVENT_TABLE = f"{SCHEMA}.me_long_v2_inverse_short_v1_event"
+POSITION_TABLE = f"{SCHEMA}.me_long_v2_inverse_short_v1_position"
+ACTIVATION_TABLE = f"{SCHEMA}.me_long_v2_inverse_short_v1_activation"
+
+# Honest save_event outcomes.
+SAVE_CAPTURED = "CAPTURED"
+SAVE_DUPLICATE = "DUPLICATE"
+SAVE_NOT_ACTIVE = "NOT_ACTIVE"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def contour_balance_components(
+    positions: Iterable[InverseShortPosition],
+    initial_balance: float,
+) -> dict[str, float]:
+    """Reconstruct the contour balance from its own append-only ledger.
+
+    ``balance = initial + Σ_closed net_pnl − Σ_open(entry costs + funding)``
+
+    Exact under the engine's accounting (entry costs are booked at entry,
+    funding at settlement, exit costs + gross at close), so a restart with no
+    account snapshot restores the same balance the process had before.
+    """
+    closed_net = 0.0
+    open_costs = 0.0
+    for position in positions:
+        if position.status == POSITION_STATUS_CLOSED:
+            closed_net += position.net_pnl
+        else:
+            open_costs += position.entry_fee + position.entry_slippage_cost
+            open_costs += position.funding_paid
+    return {
+        "initial_balance": float(initial_balance),
+        "closed_net_pnl": closed_net,
+        "open_costs": open_costs,
+        "balance": initial_balance + closed_net - open_costs,
+    }
+
+
+class InverseShortStore:
+    """Interface of the contour's persistence layer."""
+
+    # -- activation -------------------------------------------------------
+    def load_activation(self) -> ActivationRecord | None:
+        raise NotImplementedError
+
+    # -- events -----------------------------------------------------------
+    def save_event(self, event: InverseShortEvent) -> str:
+        raise NotImplementedError
+
+    def get_event(self, event_key: str) -> InverseShortEvent | None:
+        raise NotImplementedError
+
+    def list_events(self, status: str | None = None) -> list[InverseShortEvent]:
+        raise NotImplementedError
+
+    def mark_event_entered(self, event_key: str, position_key: str) -> None:
+        raise NotImplementedError
+
+    # -- positions --------------------------------------------------------
+    def save_position(self, position: InverseShortPosition) -> bool:
+        raise NotImplementedError
+
+    def update_position(self, position: InverseShortPosition) -> None:
+        raise NotImplementedError
+
+    def load_open_positions(self) -> list[InverseShortPosition]:
+        raise NotImplementedError
+
+    def has_position(self, position_key: str) -> bool:
+        raise NotImplementedError
+
+    def list_positions(self, status: str | None = None) -> list[InverseShortPosition]:
+        raise NotImplementedError
+
+    def balance_components(self) -> dict[str, float]:
+        raise NotImplementedError
+
+    def net_pnl_summary(self) -> dict[str, float]:
+        raise NotImplementedError
+
+    def close(self) -> None:  # pragma: no cover - trivial
+        return None
+
+
+class InMemoryInverseShortStore(InverseShortStore):
+    """Process-local store with the same invariants as the PG store."""
+
+    def __init__(
+        self,
+        activation: ActivationRecord | None = None,
+        *,
+        initial_balance: float = 10_000.0,
+    ) -> None:
+        self._activation = activation
+        self._events: dict[str, InverseShortEvent] = {}
+        self._positions: dict[str, InverseShortPosition] = {}
+        self.initial_balance = float(initial_balance)
+        self.immutability_repairs = 0
+
+    # -- activation -------------------------------------------------------
+    def set_activation(self, activation: ActivationRecord | None) -> None:
+        self._activation = activation
+
+    def load_activation(self) -> ActivationRecord | None:
+        return self._activation
+
+    # -- events -----------------------------------------------------------
+    def save_event(self, event: InverseShortEvent) -> str:
+        # Same atomic guard as the PG INSERT ... WHERE EXISTS clause.
+        active, _ = evaluate_activation(self._activation, enabled=True)
+        if active is None:
+            return SAVE_NOT_ACTIVE
+        if event.event_key in self._events:
+            return SAVE_DUPLICATE
+        self._events[event.event_key] = replace(event, lineage=dict(event.lineage))
+        return SAVE_CAPTURED
+
+    def get_event(self, event_key: str) -> InverseShortEvent | None:
+        return self._events.get(event_key)
+
+    def list_events(self, status: str | None = None) -> list[InverseShortEvent]:
+        events = list(self._events.values())
+        if status is not None:
+            events = [e for e in events if e.status == status]
+        return sorted(events, key=lambda e: (e.signal_time, e.event_key))
+
+    def mark_event_entered(self, event_key: str, position_key: str) -> None:
+        event = self._events.get(event_key)
+        if event is None:
+            raise KeyError(event_key)
+        event.status = EVENT_STATUS_ENTERED
+        event.position_key = position_key
+
+    # -- positions --------------------------------------------------------
+    def save_position(self, position: InverseShortPosition) -> bool:
+        if position.position_key in self._positions:
+            return False
+        self._positions[position.position_key] = replace(position)
+        return True
+
+    def update_position(self, position: InverseShortPosition) -> None:
+        stored = self._positions.get(position.position_key)
+        if stored is None:
+            raise KeyError(position.position_key)
+        # entered_at / deadline_at are IMMUTABLE: a divergence is repaired
+        # back to the stored values, never persisted forward.
+        if position.entered_at != stored.entered_at:
+            position.entered_at = stored.entered_at
+            self.immutability_repairs += 1
+        if position.deadline_at != stored.deadline_at:
+            position.deadline_at = stored.deadline_at
+            self.immutability_repairs += 1
+        self._positions[position.position_key] = replace(position)
+
+    def load_open_positions(self) -> list[InverseShortPosition]:
+        return [
+            replace(p) for p in self._positions.values()
+            if p.status == POSITION_STATUS_OPEN
+        ]
+
+    def has_position(self, position_key: str) -> bool:
+        return position_key in self._positions
+
+    def list_positions(self, status: str | None = None) -> list[InverseShortPosition]:
+        positions = [replace(p) for p in self._positions.values()]
+        if status is not None:
+            positions = [p for p in positions if p.status == status]
+        return sorted(positions, key=lambda p: p.entered_at)
+
+    def balance_components(self) -> dict[str, float]:
+        return contour_balance_components(
+            self._positions.values(), self.initial_balance,
+        )
+
+    def net_pnl_summary(self) -> dict[str, float]:
+        closed = [p for p in self._positions.values() if p.status == POSITION_STATUS_CLOSED]
+        net = sum(p.net_pnl for p in closed)
+        wins = sum(1 for p in closed if p.net_pnl > 0)
+        losses = sum(1 for p in closed if p.net_pnl <= 0)
+        return {
+            "closed_trades": float(len(closed)),
+            "wins": float(wins),
+            "losses": float(losses),
+            "net_pnl": net,
+        }
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL implementation
+# ---------------------------------------------------------------------------
+
+_EVENT_COLUMNS = (
+    "event_key", "strategy_id", "protocol_version", "protocol_hash",
+    "source_scanner", "source_scanner_version", "source_direction",
+    "source_setup_id", "symbol", "direction", "entry_timeframe",
+    "signal_time", "captured_at", "activation_freeze_ts",
+    "signal_candle_open_time", "source_reference_price",
+    "source_invalidation_price", "source_target_price", "source_target_2",
+    "source_score", "market_regime", "capture_route", "status",
+    "position_key", "lineage",
+)
+
+_POSITION_COLUMNS = (
+    "position_key", "event_key", "strategy_id", "symbol", "direction",
+    "source_scanner", "source_setup_id", "market_regime", "source_score",
+    "entry_market_price", "entry_price", "entry_fee", "entry_slippage",
+    "stop_price", "target_price", "position_size", "risk_usdt",
+    "balance_before", "entered_at", "deadline_at", "status",
+    "funding_paid", "funding_periods", "highest_since_entry",
+    "lowest_since_entry", "mfe", "mae", "exit_price", "exit_reason",
+    "exit_fee", "slippage", "gross_pnl", "net_pnl", "closed_at",
+    "duration_sec",
+)
+
+_EVENT_VALUES_SQL = ", ".join(
+    "%s::jsonb" if column == "lineage" else "%s" for column in _EVENT_COLUMNS
+)
+_POSITION_VALUES_SQL = ", ".join("%s" for _ in _POSITION_COLUMNS)
+
+INSERT_EVENT_SQL = f"""
+    INSERT INTO {EVENT_TABLE} ({", ".join(_EVENT_COLUMNS)})
+    SELECT {_EVENT_VALUES_SQL}
+    WHERE EXISTS (
+        SELECT 1 FROM {ACTIVATION_TABLE}
+        WHERE experiment_id = %s
+          AND status = 'RUNNING'
+          AND protocol_fingerprint = %s
+          AND freeze_ts IS NOT NULL
+    )
+    ON CONFLICT (event_key) DO NOTHING
+"""
+
+INSERT_POSITION_SQL = f"""
+    INSERT INTO {POSITION_TABLE} ({", ".join(_POSITION_COLUMNS)})
+    VALUES {_POSITION_VALUES_SQL}
+    ON CONFLICT (position_key) DO NOTHING
+"""
+
+# NOTE: entered_at / deadline_at and every entry column are deliberately
+# absent from the mutable column list — the original entry time and the
+# original deadline survive restarts untouched.
+UPDATE_POSITION_SQL = f"""
+    UPDATE {POSITION_TABLE} SET
+        funding_paid = %s,
+        funding_periods = %s,
+        highest_since_entry = %s,
+        lowest_since_entry = %s,
+        mfe = %s,
+        mae = %s,
+        status = %s,
+        exit_price = %s,
+        exit_reason = %s,
+        exit_fee = %s,
+        slippage = %s,
+        gross_pnl = %s,
+        net_pnl = %s,
+        closed_at = %s,
+        duration_sec = %s,
+        updated_at = now()
+    WHERE position_key = %s
+"""
+
+MARK_EVENT_ENTERED_SQL = f"""
+    UPDATE {EVENT_TABLE}
+    SET status = %s, position_key = %s, updated_at = now()
+    WHERE event_key = %s AND status = %s
+"""
+
+
+def _rows_to_dicts(cursor: Any) -> list[dict[str, Any]]:
+    columns = [d[0] for d in (cursor.description or [])]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+class PgInverseShortStore(InverseShortStore):
+    """PostgreSQL store over a dedicated connection.
+
+    All methods commit their own transaction and roll back on failure so the
+    shared connection is never left aborted.  Every write is idempotent.
+    """
+
+    def __init__(
+        self,
+        conn: Any,
+        *,
+        experiment_id: str = EXPERIMENT_ID,
+        initial_balance: float = 10_000.0,
+        expected_fingerprint: str | None = None,
+    ) -> None:
+        self._conn = conn
+        self._experiment_id = experiment_id
+        self.initial_balance = float(initial_balance)
+        self._expected_fingerprint = expected_fingerprint or protocol_fingerprint()
+
+    # -- helpers ----------------------------------------------------------
+    def _rollback(self) -> None:
+        try:
+            self._conn.rollback()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("me inverse short store rollback failed", exc_info=True)
+
+    def _execute(self, sql: str, params: tuple | list = ()) -> Any:
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(sql, params)
+            return cursor
+        finally:
+            try:
+                cursor.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    # -- activation -------------------------------------------------------
+    def load_activation(self) -> ActivationRecord | None:
+        try:
+            cursor = self._execute(
+                "SELECT experiment_id, status, protocol_fingerprint, freeze_ts "
+                f"FROM {ACTIVATION_TABLE} WHERE experiment_id = %s",
+                (self._experiment_id,),
+            )
+            row = cursor.fetchone()
+            self._conn.commit()
+        except Exception:
+            self._rollback()
+            raise
+        if row is None:
+            return None
+        return ActivationRecord(
+            experiment_id=row[0],
+            status=row[1],
+            protocol_fingerprint=row[2] or "",
+            freeze_ts=row[3],
+        )
+
+    # -- events -----------------------------------------------------------
+    def save_event(self, event: InverseShortEvent) -> str:
+        active, reason = evaluate_activation(
+            self.load_activation(), enabled=True,
+            expected_fingerprint=self._expected_fingerprint,
+        )
+        if active is None:
+            logger.debug("me inverse short event refused: %s", reason)
+            return SAVE_NOT_ACTIVE
+
+        row = event.to_dict()
+        lineage = json.dumps(row.pop("lineage") or {}, ensure_ascii=False)
+        params: list[Any] = [
+            row.get("event_key"), row.get("strategy_id"),
+            row.get("protocol_version"), row.get("protocol_hash"),
+            row.get("source_scanner"), row.get("source_scanner_version"),
+            row.get("source_direction"), row.get("source_setup_id"),
+            row.get("symbol"), row.get("direction"), row.get("entry_timeframe"),
+            row.get("signal_time"), row.get("captured_at"),
+            row.get("activation_freeze_ts"), row.get("signal_candle_open_time"),
+            row.get("source_reference_price"), row.get("source_invalidation_price"),
+            row.get("source_target_price"), row.get("source_target_2"),
+            row.get("source_score"), row.get("market_regime"),
+            row.get("capture_route"), row.get("status"), row.get("position_key"),
+            lineage,
+            # WHERE EXISTS guard:
+            self._experiment_id, self._expected_fingerprint,
+        ]
+        try:
+            cursor = self._execute(INSERT_EVENT_SQL, tuple(params))
+            inserted = cursor.rowcount == 1
+            self._conn.commit()
+        except Exception:
+            self._rollback()
+            logger.exception("me inverse short event insert failed")
+            raise
+        if inserted:
+            return SAVE_CAPTURED
+        # Guard failure (activation gone) vs. idempotent replay.
+        if self.get_event(event.event_key) is not None:
+            return SAVE_DUPLICATE
+        return SAVE_NOT_ACTIVE
+
+    def get_event(self, event_key: str) -> InverseShortEvent | None:
+        cursor = self._execute(
+            "SELECT * FROM " + EVENT_TABLE + " WHERE event_key = %s",
+            (event_key,),
+        )
+        rows = _rows_to_dicts(cursor)
+        self._conn.commit()
+        return InverseShortEvent.from_dict(rows[0]) if rows else None
+
+    def list_events(self, status: str | None = None) -> list[InverseShortEvent]:
+        if status is None:
+            cursor = self._execute(
+                "SELECT * FROM " + EVENT_TABLE + " ORDER BY signal_time, event_key",
+            )
+        else:
+            cursor = self._execute(
+                "SELECT * FROM " + EVENT_TABLE +
+                " WHERE status = %s ORDER BY signal_time, event_key",
+                (status,),
+            )
+        events = [InverseShortEvent.from_dict(r) for r in _rows_to_dicts(cursor)]
+        self._conn.commit()
+        return events
+
+    def mark_event_entered(self, event_key: str, position_key: str) -> None:
+        try:
+            self._execute(
+                MARK_EVENT_ENTERED_SQL,
+                (EVENT_STATUS_ENTERED, position_key, event_key, EVENT_STATUS_CAPTURED),
+            )
+            self._conn.commit()
+        except Exception:
+            self._rollback()
+            raise
+
+    # -- positions --------------------------------------------------------
+    def _position_params(self, position: InverseShortPosition) -> tuple:
+        row = position.to_dict()
+        return tuple(row.get(column) for column in _POSITION_COLUMNS)
+
+    def save_position(self, position: InverseShortPosition) -> bool:
+        try:
+            cursor = self._execute(
+                INSERT_POSITION_SQL, self._position_params(position),
+            )
+            inserted = cursor.rowcount == 1
+            self._conn.commit()
+            return inserted
+        except Exception:
+            self._rollback()
+            raise
+
+    def update_position(self, position: InverseShortPosition) -> None:
+        row = position.to_dict()
+        params = (
+            row.get("funding_paid"), row.get("funding_periods"),
+            row.get("highest_since_entry"), row.get("lowest_since_entry"),
+            row.get("mfe"), row.get("mae"), row.get("status"),
+            row.get("exit_price"), row.get("exit_reason"), row.get("exit_fee"),
+            row.get("slippage"), row.get("gross_pnl"), row.get("net_pnl"),
+            row.get("closed_at"), row.get("duration_sec"),
+            position.position_key,
+        )
+        try:
+            self._execute(UPDATE_POSITION_SQL, params)
+            self._conn.commit()
+        except Exception:
+            self._rollback()
+            raise
+
+    def load_open_positions(self) -> list[InverseShortPosition]:
+        cursor = self._execute(
+            "SELECT * FROM " + POSITION_TABLE +
+            " WHERE status = %s ORDER BY entered_at",
+            (POSITION_STATUS_OPEN,),
+        )
+        rows = _rows_to_dicts(cursor)
+        self._conn.commit()
+        return [InverseShortPosition.from_dict(r) for r in rows]
+
+    def has_position(self, position_key: str) -> bool:
+        cursor = self._execute(
+            "SELECT 1 FROM " + POSITION_TABLE + " WHERE position_key = %s",
+            (position_key,),
+        )
+        found = cursor.fetchone() is not None
+        self._conn.commit()
+        return found
+
+    def list_positions(self, status: str | None = None) -> list[InverseShortPosition]:
+        if status is None:
+            cursor = self._execute(
+                "SELECT * FROM " + POSITION_TABLE + " ORDER BY entered_at",
+            )
+        else:
+            cursor = self._execute(
+                "SELECT * FROM " + POSITION_TABLE +
+                " WHERE status = %s ORDER BY entered_at",
+                (status,),
+            )
+        rows = _rows_to_dicts(cursor)
+        self._conn.commit()
+        return [InverseShortPosition.from_dict(r) for r in rows]
+
+    def balance_components(self) -> dict[str, float]:
+        cursor = self._execute(
+            "SELECT "
+            " COALESCE(SUM(CASE WHEN status = 'CLOSED' THEN net_pnl ELSE 0 END), 0),"
+            " COALESCE(SUM(CASE WHEN status = 'OPEN' THEN "
+            "   entry_fee + entry_slippage + funding_paid ELSE 0 END), 0)"
+            f" FROM {POSITION_TABLE}",
+        )
+        row = cursor.fetchone() or (0.0, 0.0)
+        self._conn.commit()
+        closed_net = float(row[0] or 0.0)
+        open_costs = float(row[1] or 0.0)
+        return {
+            "initial_balance": self.initial_balance,
+            "closed_net_pnl": closed_net,
+            "open_costs": open_costs,
+            "balance": self.initial_balance + closed_net - open_costs,
+        }
+
+    def net_pnl_summary(self) -> dict[str, float]:
+        cursor = self._execute(
+            "SELECT COUNT(*), "
+            " COALESCE(SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END), 0),"
+            " COALESCE(SUM(CASE WHEN net_pnl <= 0 THEN 1 ELSE 0 END), 0),"
+            " COALESCE(SUM(net_pnl), 0)"
+            f" FROM {POSITION_TABLE} WHERE status = 'CLOSED'",
+        )
+        row = cursor.fetchone() or (0, 0, 0, 0.0)
+        self._conn.commit()
+        return {
+            "closed_trades": float(row[0] or 0),
+            "wins": float(row[1] or 0),
+            "losses": float(row[2] or 0),
+            "net_pnl": float(row[3] or 0.0),
+        }
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("me inverse short store close failed", exc_info=True)
+
+
+def connect_pg_store(
+    *,
+    host: str,
+    port: int,
+    database: str,
+    user: str,
+    password: str,
+    initial_balance: float = 10_000.0,
+    unix_sock: str | None = None,
+) -> PgInverseShortStore:
+    """Open a DEDICATED pg8000 connection for the contour.
+
+    The connection is never shared with the scanner/paper runners: contour
+    commits and rollbacks can never touch a production transaction.
+    """
+    import pg8000
+
+    kwargs: dict[str, Any] = {
+        "database": database,
+        "user": user,
+        "password": password,
+    }
+    if unix_sock:
+        kwargs["unix_sock"] = unix_sock
+    else:
+        kwargs["host"] = host
+        kwargs["port"] = port
+    conn = pg8000.connect(**kwargs)
+    return PgInverseShortStore(conn, initial_balance=initial_balance)
