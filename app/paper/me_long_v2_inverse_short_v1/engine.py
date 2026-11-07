@@ -314,6 +314,19 @@ class InverseShortPaperEngine:
                 "reconciliation failed)"
             )
             return opened
+        if self._dirty_funding:
+            # Fail-closed (review P2): until every retained funding write is
+            # actually confirmed by PostgreSQL, memory and the persisted
+            # ledger may still differ — no new entries until consistency is
+            # restored (the dirty retry runs before this gate each cycle).
+            logger.warning(
+                "me inverse short entries refused (fail closed): %d funding "
+                "write(s) not yet confirmed by PostgreSQL — waiting for "
+                "accounting consistency to be restored: keys=%s",
+                len(self._dirty_funding),
+                ", ".join(sorted(self._dirty_funding))[:200],
+            )
+            return opened
 
         max_positions = int(self.settings.max_open_positions)
         if len(self.open_positions) >= max_positions:
@@ -359,9 +372,6 @@ class InverseShortPaperEngine:
         position_key = build_position_key(event.event_key)
         if position_key in self.open_positions:
             return None  # duplicate delivery of the same source event
-        if self.store.has_position(position_key):
-            # Cross-restart / duplicate-delivery guard: already traded.
-            return None
         for pending in self.pending_closes.values():
             if pending.symbol == event.symbol:
                 # Close-persistence guard: while the previous position of this
@@ -372,6 +382,14 @@ class InverseShortPaperEngine:
                     event.symbol, event.event_key[:16],
                 )
                 return None
+        if self.store.has_position(position_key):
+            # Ambiguous COMMIT (review P1): the row EXISTS but this process
+            # never opened it in memory — an INSERT PostgreSQL COMMITTED
+            # while the acknowledgement was lost, or a duplicate delivery of
+            # an already-committed entry.  Never treat this as an automatic
+            # duplicate: verify and ADOPT the stored row instead (original
+            # entry facts verbatim, no second INSERT).
+            return self._adopt_stored_position(event, position_key)
 
         if self.require_activation and self.activation is not None:
             if not is_post_freeze(event.signal_time, self.activation.freeze_ts):
@@ -391,6 +409,14 @@ class InverseShortPaperEngine:
             return None
 
         if not self.store.save_position(position):
+            # Ambiguous COMMIT (review P1): ``ON CONFLICT DO NOTHING``
+            # returned rowcount=0 — the FIRST attempt may already be
+            # COMMITTED with a lost acknowledgement.  Never treat this
+            # result as an automatic duplicate: read the stored row back
+            # and verify it instead.
+            adopted = self._adopt_stored_position(event, position_key)
+            if adopted is not None:
+                return adopted
             logger.info(
                 "me inverse short duplicate position suppressed: key=%s symbol=%s",
                 position_key[:48], position.symbol,
@@ -416,6 +442,117 @@ class InverseShortPaperEngine:
             position.deadline_at.isoformat(), event.event_key[:16],
         )
         return position
+
+    def _entry_facts_match(
+        self, event: InverseShortEvent, stored: InverseShortPosition,
+    ) -> bool:
+        """Verify a committed row corresponds to THIS source event (P1).
+
+        The identity fields must match the source event exactly, and the
+        stored entry facts must be structurally the contour's own ORIGINAL
+        ones: valid SHORT geometry derived from the stored entry price and
+        the immutable ``deadline = entered_at + MAX_HOLD``.  Time- and
+        price-dependent fields are never re-derived here — the committed
+        row is authoritative.
+        """
+        if stored.event_key != event.event_key:
+            return False
+        if stored.direction != event.direction:
+            return False
+        if stored.direction != TRADE_DIRECTION:
+            return False
+        if stored.symbol != event.symbol:
+            return False
+        if stored.source_scanner != event.source_scanner:
+            return False
+        if stored.source_setup_id != event.source_setup_id:
+            return False
+        if not (stored.entry_price and stored.entry_price > 0):
+            return False
+        if not (stored.position_size and stored.position_size > 0):
+            return False
+        if stored.entered_at is None or stored.deadline_at is None:
+            return False
+        if stored.deadline_at != deadline_for(stored.entered_at):
+            return False
+        stop, target = short_geometry(stored.entry_price)
+        if stored.stop_price != stop or stored.target_price != target:
+            return False
+        return True
+
+    def _adopt_stored_position(
+        self, event: InverseShortEvent, position_key: str,
+    ) -> InverseShortPosition | None:
+        """Adopt an already-COMMITTED position row (review P1).
+
+        Reached when the store reports the row but this process never
+        opened it in memory — the signature of an ambiguous COMMIT: an
+        INSERT PostgreSQL applied while the acknowledgement was lost, or a
+        duplicate delivery of an already-committed entry.
+
+        The STORED row is the committed truth and is adopted VERBATIM:
+        original ``entered_at`` / ``deadline_at`` / entry price / STOP / TP
+        are never recomputed, entry fees are booked into the in-memory
+        ledger exactly ONCE (they were never booked for this key), no
+        second INSERT is issued, and the position enters ``open_positions``
+        immediately — so protective STOP/TP/TIMEOUT applies from the very
+        next cycle.  Every failure path stays fail-closed: nothing is
+        opened, booked or marked unless the committed row fully verifies.
+        """
+        if position_key in self.open_positions:
+            # Already adopted in this process — never book the fees twice.
+            return self.open_positions[position_key]
+        try:
+            stored = self.store.get_position(position_key)
+        except Exception:
+            logger.error(
+                "me inverse short adoption read failed (entry stays "
+                "fail-closed: nothing opened, nothing re-booked)",
+                exc_info=True,
+            )
+            return None
+        if stored is None:
+            return None  # row genuinely absent: nothing to adopt
+        if stored.status != POSITION_STATUS_OPEN:
+            logger.info(
+                "me inverse short duplicate position suppressed (already "
+                "closed): key=%s symbol=%s status=%s",
+                position_key[:48], stored.symbol, stored.status,
+            )
+            return None
+        if not self._entry_facts_match(event, stored):
+            logger.error(
+                "me inverse short adoption REFUSED: committed row does not "
+                "correspond to the source event (fail closed, nothing "
+                "opened): key=%s event_key=%s direction=%s symbol=%s",
+                position_key[:48], stored.event_key[:16], stored.direction,
+                stored.symbol,
+            )
+            return None
+        try:
+            self.store.mark_event_entered(event.event_key, position_key)
+        except Exception:
+            # Fail-open: has_position() keeps delivery idempotent next cycle.
+            logger.warning(
+                "me inverse short event mark-entered failed after adoption "
+                "(idempotent guard active)",
+                exc_info=True,
+            )
+        # Entry fees were NEVER booked in memory for this key (the original
+        # open failed before the booking): book them exactly once from the
+        # COMMITTED facts.  The persisted ledger already carries these
+        # costs, so memory and store agree immediately — no double booking.
+        self.balance -= stored.entry_fee + stored.entry_slippage_cost
+        self.open_positions[position_key] = stored
+        logger.warning(
+            "me inverse short ADOPTED committed position after an ambiguous "
+            "INSERT (no re-open, original entry facts kept, fees booked "
+            "once): key=%s symbol=%s entered_at=%s stop=%.6f target=%.6f",
+            position_key[:48], stored.symbol,
+            stored.entered_at.isoformat() if stored.entered_at else "?",
+            stored.stop_price, stored.target_price,
+        )
+        return stored
 
     def _build_position(
         self,
@@ -644,28 +781,59 @@ class InverseShortPaperEngine:
         try:
             self.store.update_position(position)
         except Exception:
-            # Local uncommitted delta: memory already deducted this cost, the
-            # store ledger has not.  The delta is settled automatically when
-            # a later update_position() for this key commits (it writes the
-            # CUMULATIVE funding_paid), so the cost is booked exactly once.
-            self._uncommitted_deltas[position.position_key] = (
-                self._uncommitted_deltas.get(position.position_key, 0.0) - cost
-            )
-            # DIRTY (review P2): freeze the EXACT funding snapshot so every
-            # later cycle retries it — independent of new intervals — without
-            # ever re-accruing or changing any value.
-            self._dirty_funding[position.position_key] = dataclasses.replace(
-                position,
-            )
-            logger.warning(
-                "me inverse short funding persistence failed (exact funding "
-                "snapshot retained in memory as DIRTY for retry on later "
-                "cycles; NOT durable until a write commits and never claimed "
-                "durable): key=%s funding_paid=%.6f periods=%d",
-                position.position_key[:48], position.funding_paid,
-                position.funding_periods_charged,
-                exc_info=True,
-            )
+            # Ambiguous COMMIT (review P2): PostgreSQL may have APPLIED this
+            # UPDATE with a lost acknowledgement.  Never assume the write
+            # failed — verify the CONFIRMED row first; only a REAL
+            # discrepancy with the store counts as not-applied.
+            confirmed = self._confirmed_funding(position)
+            if confirmed is not None and (
+                confirmed[0] == position.funding_paid
+                and confirmed[1] == position.funding_periods_charged
+            ):
+                # Confirmed APPLIED: the persisted ledger already carries
+                # this accrual.  The local delta would DOUBLE-subtract on
+                # the next reconciliation, so it is settled NOW — the state
+                # IS confirmed (the delta of an OPEN key is funding-only).
+                # No DIRTY snapshot is retained: nothing is left to retry,
+                # and no reconciliation marker survives an unconfirmed
+                # state — because this state is no longer unconfirmed.
+                self._uncommitted_deltas.pop(position.position_key, None)
+                self._dirty_funding.pop(position.position_key, None)
+                logger.warning(
+                    "me inverse short funding write CONFIRMED applied "
+                    "despite a lost acknowledgement (verified against "
+                    "PostgreSQL; delta settled, no dirty state retained, "
+                    "no double booking): key=%s funding_paid=%.6f periods=%d",
+                    position.position_key[:48], position.funding_paid,
+                    position.funding_periods_charged,
+                    exc_info=True,
+                )
+            else:
+                # Genuinely not applied — or UNVERIFIABLE while the store
+                # is unreachable (an unreadable state is never treated as
+                # confirmed): keep the exact snapshot as DIRTY and the
+                # local delta uncommitted until a write actually commits.
+                self._uncommitted_deltas[position.position_key] = (
+                    self._uncommitted_deltas.get(position.position_key, 0.0)
+                    - cost
+                )
+                # DIRTY (review P2): freeze the EXACT funding snapshot so
+                # every later cycle retries it — independent of new
+                # intervals — without ever re-accruing or changing any
+                # value.
+                self._dirty_funding[position.position_key] = (
+                    dataclasses.replace(position)
+                )
+                logger.warning(
+                    "me inverse short funding persistence failed (write NOT "
+                    "confirmed by PostgreSQL; exact funding snapshot "
+                    "retained in memory as DIRTY for retry on later cycles; "
+                    "NOT durable until a write commits and never claimed "
+                    "durable): key=%s funding_paid=%.6f periods=%d",
+                    position.position_key[:48], position.funding_paid,
+                    position.funding_periods_charged,
+                    exc_info=True,
+                )
         else:
             # The row now carries the cumulative funding — local and store
             # accounting for this key agree again.
@@ -675,6 +843,30 @@ class InverseShortPaperEngine:
             "me inverse short funding: %s periods=%d rate=%.6f%% cost=$%.4f",
             position.symbol, new_periods, rate, cost,
         )
+
+    def _confirmed_funding(
+        self, position: InverseShortPosition,
+    ) -> tuple[float, int] | None:
+        """Read the COMMITTED funding facts for this key (review P2).
+
+        Returns ``(funding_paid, funding_periods_charged)`` exactly as
+        persisted, or ``None`` whenever the state cannot be confirmed — an
+        unreadable row is NEVER treated as applied, and only an OPEN row
+        confirms (on a CLOSED row any delta belongs to the terminal close,
+        not to funding).
+        """
+        try:
+            stored = self.store.get_position(position.position_key)
+        except Exception:
+            logger.warning(
+                "me inverse short funding confirmation read failed (state "
+                "stays UNCONFIRMED: dirty snapshot and local delta retained)",
+                exc_info=True,
+            )
+            return None
+        if stored is None or stored.status != POSITION_STATUS_OPEN:
+            return None
+        return (stored.funding_paid, stored.funding_periods_charged)
 
     def _retry_dirty_funding(self) -> int:
         """Persist retained DIRTY funding snapshots (review P2).

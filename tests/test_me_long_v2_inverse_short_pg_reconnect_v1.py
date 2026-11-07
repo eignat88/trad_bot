@@ -27,6 +27,20 @@ The harness is a TRANSACTIONAL fake connection — mutations are staged per
 connection and applied only on ``commit`` (a dead socket takes its staged
 transaction with it), with scripted drops — driving the REAL
 ``PgInverseShortStore._with_reconnect`` / ``_reconnect`` code paths.
+
+Ambiguous-COMMIT extensions (review P4, consumed by
+``test_me_long_v2_inverse_short_ambiguous_commit_v1.py``):
+
+* ``commit_ack_lost`` / ``commit_ack_lost_on`` — the NEXT write commit of
+  the given statement kind APPLIES its transaction and then loses the
+  acknowledgement (socket dies after the server committed); reads (empty
+  transactions) never consume it;
+* ``fail_execute_match`` / ``fail_execute_times`` / ``fail_execute_skip`` —
+  inject a statement error into ONE statement kind, N times, after
+  skipping the first K matching statements (e.g. let the first funding
+  UPDATE through and fail only its retried twin);
+* staged mutations are TAGGED by statement kind so a targeted ambiguous
+  commit cannot be consumed by an unrelated write (e.g. an outbox flush).
 """
 from __future__ import annotations
 
@@ -114,9 +128,29 @@ SQL_POSITIONS_STATUS = _NORM(
 SQL_POSITIONS_ALL = _NORM(
     f"SELECT * FROM {POSITION_TABLE} ORDER BY entered_at",
 )
+SQL_GET_POSITION = _NORM(
+    f"SELECT * FROM {POSITION_TABLE} WHERE position_key = %s",
+)
 SQL_HAS_POSITION = _NORM(
     f"SELECT 1 FROM {POSITION_TABLE} WHERE position_key = %s",
 )
+
+
+def _tag_of(sql_norm: str) -> str:
+    """Statement kind of an already-normalized statement (staged txn tags)."""
+    if sql_norm == SQL_INSERT_POSITION:
+        return "INSERT_POSITION"
+    if sql_norm == SQL_UPDATE_POSITION:
+        return "UPDATE_POSITION"
+    if sql_norm == SQL_MARK_EVENT_ENTERED:
+        return "MARK_EVENT_ENTERED"
+    if sql_norm == SQL_INSERT_EVENT:
+        return "INSERT_EVENT"
+    if sql_norm == SQL_INSERT_OUTBOX:
+        return "STAGE_CLOSE"
+    if sql_norm == SQL_DELETE_OUTBOX:
+        return "CLEAR_CLOSE"
+    return "WRITE"
 
 # The mutable column order of UPDATE_POSITION_SQL (must stay in sync with
 # PgInverseShortStore.update_position).
@@ -217,10 +251,16 @@ class _FakeServer:
     * ``connect_failures``   — the next N connection attempts fail (even
                                while the server is up);
     * ``fail_execute_with``  — the next statement raises this error ONCE
-                               (SQL/constraint error injection);
+                               (SQL/constraint error injection), narrowed
+                               by ``fail_execute_match`` (SQL substring),
+                               ``fail_execute_times`` (N matching raises)
+                               and ``fail_execute_skip`` (K matches pass);
     * ``fail_commit_with``   — the next commit raises this error ONCE and
                                kills the socket (commit lost: the staged
                                transaction dies with it);
+    * ``commit_ack_lost`` / ``commit_ack_lost_on`` — AMBIGUOUS COMMIT: the
+      next write commit of that statement kind applies its transaction and
+      THEN loses the acknowledgement (applied, ack lost);
     * ``apply_log``          — every MUTATION actually applied to the
                                committed state, for exactly-once asserts.
     """
@@ -233,7 +273,23 @@ class _FakeServer:
         self.down = False
         self.connect_failures = 0
         self.fail_execute_with: BaseException | None = None
+        # Optional SQL substring the injected execute error must match
+        # (None = any statement).  Lets a test fail ONE statement kind
+        # (e.g. only the funding UPDATE) without touching reads.
+        self.fail_execute_match: str | None = None
+        # How many matching statements raise before the injection clears.
+        self.fail_execute_times = 1
+        # Matching statements to SKIP before the injection starts raising
+        # (e.g. let the FIRST funding UPDATE through, fail only its retry).
+        self.fail_execute_skip = 0
         self.fail_commit_with: BaseException | None = None
+        # Ambiguous COMMIT: the NEXT commit that carries writes APPLIES the
+        # transaction and then loses the acknowledgement (socket dies
+        # after the server committed).  Reads (empty transactions) never
+        # consume it; ``commit_ack_lost_on`` restricts it to one statement
+        # kind (e.g. only the position INSERT).
+        self.commit_ack_lost = False
+        self.commit_ack_lost_on: str | None = None
         self.connections: list[_FakeConnection] = []
         self.apply_log: list[tuple[str, str]] = []
         self.connect_attempts = 0
@@ -446,6 +502,11 @@ class _FakeServer:
             return (["?"], [(1,)] if params[0] in self.positions else [],
                     1 if params[0] in self.positions else 0, None)
 
+        if s == SQL_GET_POSITION:
+            row = self.positions.get(params[0])
+            rows = [tuple(row[c] for c in _POSITION_COLUMNS)] if row else []
+            return (list(_POSITION_COLUMNS), rows, len(rows), None)
+
         if ("COALESCE(SUM(CASE WHEN status = 'CLOSED' THEN net_pnl"
                 in s):
             closed_net = sum(
@@ -501,10 +562,21 @@ class _FakeConnection:
             # with the session — nothing was applied.
             self.broken = True
             raise exc
-        for mutation in self.staged:
+        staged = list(self.staged)
+        for _, mutation in staged:
             mutation()
         self.staged.clear()
         server.commit_count += 1
+        ack_targeted = (
+            server.commit_ack_lost_on is None
+            or any(tag == server.commit_ack_lost_on for tag, _ in staged)
+        )
+        if staged and ack_targeted and server.commit_ack_lost:
+            # Ambiguous COMMIT: the server APPLIED the transaction but the
+            # acknowledgement is lost with the dying socket.
+            server.commit_ack_lost = False
+            self.broken = True
+            raise server.connection_error()
 
     def rollback(self) -> None:
         self.staged.clear()
@@ -524,15 +596,25 @@ class _FakeCursor:
     def execute(self, sql: str, params: tuple | list = ()) -> None:
         self.conn._ensure_alive()
         server = self.conn.server
-        if server.fail_execute_with is not None:
-            exc = server.fail_execute_with
-            server.fail_execute_with = None
-            raise exc
+        s = " ".join(sql.split())
+        if server.fail_execute_with is not None and (
+            server.fail_execute_match is None
+            or server.fail_execute_match in s
+        ):
+            if server.fail_execute_skip > 0:
+                server.fail_execute_skip -= 1
+            elif server.fail_execute_times > 0:
+                server.fail_execute_times -= 1
+                exc = server.fail_execute_with
+                if server.fail_execute_times == 0:
+                    server.fail_execute_with = None
+                    server.fail_execute_match = None
+                raise exc
         columns, rows, rowcount, mutation = server.plan(
-            sql, tuple(params or ()),
+            s, tuple(params or ()),
         )
         if mutation is not None:
-            self.conn.staged.append(mutation)
+            self.conn.staged.append((_tag_of(s), mutation))
         self.description = [(c,) for c in columns] if columns else None
         self.rows = rows
         self.rowcount = rowcount

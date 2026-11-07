@@ -131,6 +131,18 @@ class InverseShortStore:
     def has_position(self, position_key: str) -> bool:
         raise NotImplementedError
 
+    def get_position(
+        self, position_key: str,
+    ) -> InverseShortPosition | None:
+        """Read ONE committed position row by key (review P1).
+
+        Used to resolve an ambiguous COMMIT: after an ``ON CONFLICT DO
+        NOTHING`` INSERT or a funding UPDATE whose acknowledgement was
+        lost, the stored row is the only authority on what PostgreSQL
+        actually applied.  Returns ``None`` when no row exists.
+        """
+        raise NotImplementedError
+
     def list_positions(self, status: str | None = None) -> list[InverseShortPosition]:
         raise NotImplementedError
 
@@ -250,6 +262,12 @@ class InMemoryInverseShortStore(InverseShortStore):
 
     def has_position(self, position_key: str) -> bool:
         return position_key in self._positions
+
+    def get_position(
+        self, position_key: str,
+    ) -> InverseShortPosition | None:
+        position = self._positions.get(position_key)
+        return replace(position) if position is not None else None
 
     def list_positions(self, status: str | None = None) -> list[InverseShortPosition]:
         positions = [replace(p) for p in self._positions.values()]
@@ -874,6 +892,19 @@ class PgInverseShortStore(InverseShortStore):
             fetch="one",
         )
         return result.fetchone() is not None
+
+    def get_position(
+        self, position_key: str,
+    ) -> InverseShortPosition | None:
+        result = self._query(
+            "SELECT * FROM " + POSITION_TABLE + " WHERE position_key = %s",
+            (position_key,),
+            fetch="one",
+        )
+        row = result.fetchone_dict()
+        if row is None:
+            return None
+        return InverseShortPosition.from_dict(row)
 
     def list_positions(self, status: str | None = None) -> list[InverseShortPosition]:
         if status is None:
