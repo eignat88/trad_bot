@@ -249,6 +249,20 @@ class ScannerOrchestrator:
                 if not self.dedup.contains_key(c):
                     unique.append(c)
 
+        # ── ME_LONG_V2_INVERSE_SHORT_V1 source capture (independent) ──
+        # The ORIGINAL MOMENTUM_EXHAUSTION_REVERSE_LONG_V2 detector events
+        # are published for the independent prospective SHORT contour BEFORE
+        # risk-geometry, direction-gate, regime and expectancy decisions, so
+        # the contour receives source events regardless of those trading
+        # filters — without changing the filters or their data.  The caller
+        # (scanner_runner) forwards these to the fail-open capture layer,
+        # which keys them by a stable event_key for idempotent delivery.
+        stats["_me_inverse_short_source_events"] = [
+            c for c in unique
+            if c.scanner_name == "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2"
+            and c.direction == "LONG"
+        ]
+
         valid: list[SetupCandidate] = []
         invalid_geometry_by_scanner: dict[str, int] = {}
         for c in unique:

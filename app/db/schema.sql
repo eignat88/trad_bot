@@ -657,6 +657,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_trade_setup
 ON dds.paper_trade (setup_id);
 
 -- ============================================================
+-- Execution policy round-trip (recovery) — migration 038 + 084
+-- ============================================================
+-- Restart recovery reads these columns back so a fixed-horizon trade keeps
+-- its execution_policy, execution_policy_version and original
+-- planned_exit_at after a restart.  Additive IF NOT EXISTS only: existing
+-- rows are never modified.
+ALTER TABLE dds.paper_trade
+    ADD COLUMN IF NOT EXISTS execution_policy TEXT NOT NULL DEFAULT 'DEFAULT';
+ALTER TABLE dds.paper_trade
+    ADD COLUMN IF NOT EXISTS planned_exit_at TIMESTAMPTZ;
+ALTER TABLE dds.paper_trade
+    ADD COLUMN IF NOT EXISTS execution_policy_version TEXT NOT NULL DEFAULT '';
+
+-- ============================================================
 -- PAPER_ACCOUNT: running account equity snapshots
 -- ============================================================
 CREATE TABLE IF NOT EXISTS dds.paper_account (
@@ -767,3 +781,151 @@ SELECT
 FROM dds.paper_trade
 GROUP BY scanner_name, direction
 ORDER BY total_pnl_usdt DESC;
+
+-- ============================================================
+-- ME_LONG_V2_INVERSE_SHORT_V1 — independent prospective SHORT
+-- paper contour (mirrors sql/migrations/085_me_long_v2_inverse_short_v1.sql
+-- + sql/migrations/086_me_long_v2_inverse_short_v1_close_outbox.sql)
+-- ============================================================
+-- Isolated contour derived from the ORIGINAL MOMENTUM_EXHAUSTION_REVERSE_LONG_V2
+-- events: TP 10% / SL 10% of the actual entry price, 7200-minute maximum
+-- hold, DCA/trailing/breakeven OFF, prospective-only, paper-only, no
+-- historical backfill.  Seeded READY_TO_START (fail-closed, NOT_DEPLOYED);
+-- a separate activation step freezes the protocol fingerprint + freeze_ts.
+-- Completely separate tables: no shared state with dds.paper_trade.
+CREATE TABLE IF NOT EXISTS dds.me_long_v2_inverse_short_v1_activation (
+    experiment_id TEXT PRIMARY KEY
+        CHECK (experiment_id = 'ME_LONG_V2_INVERSE_SHORT_V1'),
+    protocol_version TEXT NOT NULL DEFAULT 'ME_LONG_V2_INVERSE_SHORT_V1',
+    status TEXT NOT NULL DEFAULT 'READY_TO_START'
+        CHECK (status IN ('READY_TO_START', 'RUNNING', 'DRAINING', 'CANCELLED')),
+    protocol_fingerprint TEXT,
+    freeze_ts TIMESTAMPTZ,
+    notes TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (
+        (status = 'READY_TO_START' AND protocol_fingerprint IS NULL AND freeze_ts IS NULL)
+        OR (status <> 'READY_TO_START' AND protocol_fingerprint IS NOT NULL AND freeze_ts IS NOT NULL)
+    )
+);
+
+INSERT INTO dds.me_long_v2_inverse_short_v1_activation (experiment_id, status)
+VALUES ('ME_LONG_V2_INVERSE_SHORT_V1', 'READY_TO_START')
+ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS dds.me_long_v2_inverse_short_v1_event (
+    event_key TEXT PRIMARY KEY,
+    strategy_id TEXT NOT NULL DEFAULT 'ME_LONG_V2_INVERSE_SHORT_V1',
+    protocol_version TEXT NOT NULL,
+    protocol_hash TEXT NOT NULL,
+    source_scanner TEXT NOT NULL
+        CHECK (source_scanner = 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V2'),
+    source_scanner_version TEXT NOT NULL DEFAULT '',
+    source_direction TEXT NOT NULL CHECK (source_direction = 'LONG'),
+    source_setup_id TEXT NOT NULL DEFAULT '',
+    symbol TEXT NOT NULL CHECK (symbol <> ''),
+    direction TEXT NOT NULL DEFAULT 'SHORT' CHECK (direction = 'SHORT'),
+    entry_timeframe TEXT NOT NULL DEFAULT '5m',
+    signal_time TIMESTAMPTZ NOT NULL,
+    captured_at TIMESTAMPTZ NOT NULL,
+    activation_freeze_ts TIMESTAMPTZ NOT NULL,
+    signal_candle_open_time BIGINT NOT NULL CHECK (signal_candle_open_time > 0),
+    source_reference_price NUMERIC,
+    source_invalidation_price NUMERIC,
+    source_target_price NUMERIC,
+    source_target_2 NUMERIC,
+    source_score NUMERIC,
+    market_regime TEXT,
+    capture_route TEXT NOT NULL CHECK (capture_route IN ('PRE_FILTER_SOURCE')),
+    status TEXT NOT NULL DEFAULT 'CAPTURED' CHECK (status IN ('CAPTURED', 'ENTERED')),
+    position_key TEXT,
+    lineage JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (signal_time > activation_freeze_ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_me_inverse_short_v1_event_status
+    ON dds.me_long_v2_inverse_short_v1_event (status, signal_time);
+CREATE INDEX IF NOT EXISTS idx_me_inverse_short_v1_event_symbol
+    ON dds.me_long_v2_inverse_short_v1_event (symbol, status);
+CREATE INDEX IF NOT EXISTS idx_me_inverse_short_v1_event_source
+    ON dds.me_long_v2_inverse_short_v1_event (source_scanner, symbol, signal_candle_open_time);
+
+CREATE TABLE IF NOT EXISTS dds.me_long_v2_inverse_short_v1_position (
+    position_key TEXT PRIMARY KEY
+        CHECK (position_key LIKE 'ME_LONG_V2_INVERSE_SHORT_V1:%'),
+    event_key TEXT NOT NULL UNIQUE
+        REFERENCES dds.me_long_v2_inverse_short_v1_event (event_key),
+    strategy_id TEXT NOT NULL DEFAULT 'ME_LONG_V2_INVERSE_SHORT_V1',
+    symbol TEXT NOT NULL CHECK (symbol <> ''),
+    direction TEXT NOT NULL DEFAULT 'SHORT' CHECK (direction = 'SHORT'),
+    source_scanner TEXT NOT NULL DEFAULT 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V2',
+    source_setup_id TEXT NOT NULL DEFAULT '',
+    market_regime TEXT,
+    source_score NUMERIC,
+    entry_market_price NUMERIC NOT NULL CHECK (entry_market_price > 0),
+    entry_price NUMERIC NOT NULL CHECK (entry_price > 0),
+    entry_fee NUMERIC NOT NULL DEFAULT 0 CHECK (entry_fee >= 0),
+    entry_slippage NUMERIC NOT NULL DEFAULT 0 CHECK (entry_slippage >= 0),
+    stop_price NUMERIC NOT NULL CHECK (stop_price > 0),
+    target_price NUMERIC NOT NULL CHECK (target_price > 0),
+    position_size NUMERIC NOT NULL CHECK (position_size > 0),
+    risk_usdt NUMERIC NOT NULL DEFAULT 0,
+    balance_before NUMERIC NOT NULL,
+    entered_at TIMESTAMPTZ NOT NULL,
+    deadline_at TIMESTAMPTZ NOT NULL,
+    status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'CLOSED')),
+    funding_paid NUMERIC NOT NULL DEFAULT 0,
+    funding_periods INTEGER NOT NULL DEFAULT 0 CHECK (funding_periods >= 0),
+    highest_since_entry NUMERIC,
+    lowest_since_entry NUMERIC,
+    mfe NUMERIC NOT NULL DEFAULT 0,
+    mae NUMERIC NOT NULL DEFAULT 0,
+    exit_price NUMERIC,
+    exit_reason TEXT
+        CHECK (exit_reason IS NULL OR exit_reason IN
+               ('STOP_LOSS', 'STOP_LOSS_GAP', 'TAKE_PROFIT_1', 'TIMEOUT')),
+    exit_fee NUMERIC NOT NULL DEFAULT 0,
+    slippage NUMERIC NOT NULL DEFAULT 0,
+    gross_pnl NUMERIC NOT NULL DEFAULT 0,
+    net_pnl NUMERIC NOT NULL DEFAULT 0,
+    closed_at TIMESTAMPTZ,
+    duration_sec NUMERIC,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (deadline_at > entered_at),
+    CHECK (stop_price > entry_price AND target_price < entry_price),
+    CHECK (
+        (status = 'OPEN' AND exit_reason IS NULL AND closed_at IS NULL)
+        OR (status = 'CLOSED' AND exit_reason IS NOT NULL AND closed_at IS NOT NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_me_inverse_short_v1_position_status
+    ON dds.me_long_v2_inverse_short_v1_position (status, entered_at);
+CREATE INDEX IF NOT EXISTS idx_me_inverse_short_v1_position_symbol
+    ON dds.me_long_v2_inverse_short_v1_position (symbol, status);
+CREATE INDEX IF NOT EXISTS idx_me_inverse_short_v1_position_deadline
+    ON dds.me_long_v2_inverse_short_v1_position (deadline_at)
+    WHERE status = 'OPEN';
+
+-- Durable close outbox (mirrors sql/migrations/086_me_long_v2_inverse_short_v1_close_outbox.sql):
+-- terminal snapshots staged BEFORE the position row flips to CLOSED, so a
+-- failed/restarted close replays its exact exit facts instead of losing them.
+CREATE TABLE IF NOT EXISTS dds.me_long_v2_inverse_short_v1_close_outbox (
+    position_key TEXT PRIMARY KEY
+        CHECK (position_key LIKE 'ME_LONG_V2_INVERSE_SHORT_V1:%'),
+    symbol TEXT NOT NULL CHECK (symbol <> ''),
+    exit_reason TEXT NOT NULL
+        CHECK (exit_reason IN
+               ('STOP_LOSS', 'STOP_LOSS_GAP', 'TAKE_PROFIT_1', 'TIMEOUT')),
+    closed_at TIMESTAMPTZ NOT NULL,
+    snapshot JSONB NOT NULL,
+    staged_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- NOTE: the BEFORE UPDATE immutability trigger for entered_at / deadline_at
+-- lives in sql/migrations/085_me_long_v2_inverse_short_v1.sql — its function
+-- body cannot be applied by the semicolon-splitting bootstrap above.
