@@ -293,6 +293,11 @@ class ActivationRecord:
         return self.status == "RUNNING"
 
     @property
+    def is_draining(self) -> bool:
+        """RUNNING -> DRAINING: valid identity, EXIT_ONLY permissions."""
+        return self.status == "DRAINING"
+
+    @property
     def has_freeze(self) -> bool:
         return self.freeze_ts is not None
 

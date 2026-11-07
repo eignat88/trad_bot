@@ -79,6 +79,13 @@ def _get_prices(client: Any, symbols: set[str]) -> dict[str, float]:
 
 
 def _get_funding_rates(client: Any, symbols: set[str]) -> dict[str, float]:
+    """Observed funding rates only (review P2-1 tri-state contract).
+
+    A symbol is present ONLY when a rate was actually observed; a fetch
+    failure omits it entirely, so the engine sees ``None`` = UNKNOWN and
+    leaves those intervals unsettled — it NEVER substitutes a fabricated
+    or default zero rate.
+    """
     rates: dict[str, float] = {}
     for symbol in sorted(symbols):
         try:
@@ -152,11 +159,26 @@ def main(argv: list[str] | None = None) -> int:
             "me inverse short contour REFUSES to start: activation=%s "
             "(flag ME_INVERSE_SHORT_V1_ENABLED=1 + RUNNING activation row with "
             "the current protocol fingerprint + freeze_ts are both required; "
+            "DRAINING (EXIT_ONLY) is accepted as a valid identity; "
             "status: IMPLEMENTATION_REQUIRED / NOT_DEPLOYED)",
             contour.activation_reason,
         )
         store.close()
         return 2
+
+    if contour.exit_only:
+        # Review P2-2: a restart that reads DRAINING with a valid identity
+        # continues directly in EXIT_ONLY — it never returns to RUNNING and
+        # never re-opens entries; existing positions keep being managed.
+        logger.warning(
+            "me inverse short contour EXIT_ONLY (DRAINING): managing "
+            "EXISTING positions only — no new source captures, no new "
+            "entries; STOP/TP/TIMEOUT, funding reconciliation, outbox "
+            "replay and pending-close recovery continue. "
+            "fingerprint=%s freeze_ts=%s (never rewritten on restore)",
+            contour.activation.protocol_fingerprint[:16],
+            contour.activation.freeze_ts.isoformat(),
+        )
 
     logger.info(
         "me inverse short contour started: freeze_ts=%s fingerprint=%s "

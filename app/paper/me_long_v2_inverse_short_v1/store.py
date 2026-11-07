@@ -32,7 +32,11 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from .activation import evaluate_activation
+from .activation import (
+    PERMISSION_NEW_ENTRIES,
+    REASON_EXIT_ONLY,
+    evaluate_activation,
+)
 from .models import (
     EVENT_STATUS_CAPTURED,
     EVENT_STATUS_ENTERED,
@@ -189,6 +193,11 @@ class InMemoryInverseShortStore(InverseShortStore):
         # Same atomic guard as the PG INSERT ... WHERE EXISTS clause.
         active, _ = evaluate_activation(self._activation, enabled=True)
         if active is None:
+            return SAVE_NOT_ACTIVE
+        if not active.allows(PERMISSION_NEW_ENTRIES):
+            # EXIT_ONLY (DRAINING): no NEW source event rows, even when a
+            # caller bypasses capture_with_status (defence in depth).
+            logger.debug("me inverse short save_event refused: %s", REASON_EXIT_ONLY)
             return SAVE_NOT_ACTIVE
         if event.event_key in self._events:
             return SAVE_DUPLICATE
@@ -537,6 +546,11 @@ class PgInverseShortStore(InverseShortStore):
         )
         if active is None:
             logger.debug("me inverse short event refused: %s", reason)
+            return SAVE_NOT_ACTIVE
+        if not active.allows(PERMISSION_NEW_ENTRIES):
+            # EXIT_ONLY (DRAINING): no NEW source event rows, even when a
+            # caller bypasses capture_with_status (defence in depth).
+            logger.debug("me inverse short event refused: %s", REASON_EXIT_ONLY)
             return SAVE_NOT_ACTIVE
 
         row = event.to_dict()

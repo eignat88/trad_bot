@@ -35,6 +35,8 @@ from app.scanners.models import SetupCandidate
 
 from .activation import (
     ActivationIdentity,
+    PERMISSION_NEW_ENTRIES,
+    REASON_EXIT_ONLY,
     is_post_freeze,
     is_runtime_enabled,
     evaluate_activation,
@@ -222,6 +224,18 @@ def capture_with_status(
         logger.debug(
             "me inverse short capture refused: reason=%s scanner=%s symbol=%s",
             reason, candidate.scanner_name, candidate.symbol,
+        )
+        return CAPTURE_NOT_ACTIVE
+    if not activation.allows(PERMISSION_NEW_ENTRIES):
+        # EXIT_ONLY (DRAINING): MANAGE_EXISTING only — new source events are
+        # refused here, before any row is written and before any freeze
+        # boundary is evaluated.  This path never modifies fingerprint or
+        # freeze_ts (they stay byte-identical across drain/restart).
+        logger.info(
+            "me inverse short capture refused (EXIT_ONLY): new source events "
+            "are disabled while DRAINING; managing existing positions only: "
+            "scanner=%s symbol=%s reason=%s",
+            candidate.scanner_name, candidate.symbol, REASON_EXIT_ONLY,
         )
         return CAPTURE_NOT_ACTIVE
 

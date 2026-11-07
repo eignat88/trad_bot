@@ -34,12 +34,17 @@ Design constraints (all enforced, all testable):
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
 
 from app.config import Settings
 
-from .activation import ActivationIdentity, is_post_freeze
+from .activation import (
+    PERMISSION_NEW_ENTRIES,
+    ActivationIdentity,
+    is_post_freeze,
+)
 from .identity import position_key as build_position_key
 from .models import (
     EVENT_STATUS_CAPTURED,
@@ -120,6 +125,11 @@ class InverseShortPaperEngine:
         # pending positions and never books any PnL twice.
         self._uncommitted_deltas: dict[str, float] = {}
         self._balance_trusted: bool = True
+        # Funding rate UNKNOWN (review P2-1): keys with due-but-unsettled
+        # intervals while no rate was observed.  Tracked only for honest
+        # one-shot warning logs; the durable unsettled state itself lives on
+        # the position row (funding_periods_charged behind due_periods).
+        self._funding_unknown: set[str] = set()
 
         components = store.balance_components()
         self.confirmed_balance = float(
@@ -243,6 +253,16 @@ class InverseShortPaperEngine:
         """Balance-recovery markers still owed (never dropped on a failed read)."""
         return tuple(sorted(self._pending_from_store))
 
+    @property
+    def exit_only(self) -> bool:
+        """True while the activation identity is EXIT_ONLY (DRAINING).
+
+        MANAGE_EXISTING only: exits, funding reconciliation, outbox replay
+        and pending-close recovery continue; NEW_ENTRIES (new capture, new
+        entries, reuse of CAPTURED events) is refused.
+        """
+        return self.activation is not None and self.activation.exit_only
+
     def open_entries(self, prices: dict[str, float]) -> list[InverseShortPosition]:
         """Open SHORT positions for CAPTURED events at the first observed price."""
         opened: list[InverseShortPosition] = []
@@ -250,6 +270,18 @@ class InverseShortPaperEngine:
             logger.warning(
                 "me inverse short entries refused: contour is not activated "
                 "(protocol fingerprint / freeze_ts missing)"
+            )
+            return opened
+        if self.activation is not None and not self.activation.allows(
+            PERMISSION_NEW_ENTRIES,
+        ):
+            # EXIT_ONLY (DRAINING): CAPTURED events are never reused to open
+            # new trades — MANAGE_EXISTING only (review P2-2).
+            logger.info(
+                "me inverse short entries refused (EXIT_ONLY): activation is "
+                "DRAINING — managing existing positions only, no new entries "
+                "from %d CAPTURED event(s)",
+                len(self.pending_events()),
             )
             return opened
 
@@ -430,10 +462,16 @@ class InverseShortPaperEngine:
     def check_exits(
         self,
         prices: dict[str, float],
-        funding_rates_percent: dict[str, float] | None = None,
+        funding_rates_percent: dict[str, float | None] | None = None,
         bars: dict[str, dict[str, float]] | None = None,
     ) -> list[InverseShortPosition]:
-        """Evaluate every open position; return positions closed this cycle."""
+        """Evaluate every open position; return positions closed this cycle.
+
+        Funding (review P2-1): a MISSING rate is UNKNOWN, not a confirmed
+        zero — the per-symbol mapping simply has no entry (or an explicit
+        ``None``) for it and ``_apply_funding`` leaves those intervals
+        unsettled.  An UNKNOWN rate never blocks STOP/TP/TIMEOUT.
+        """
         # First finish any unfinished close (P1-3): its terminal snapshot is
         # replayed byte-for-byte and never re-evaluated below.
         self.flush_pending_closes()
@@ -446,7 +484,7 @@ class InverseShortPaperEngine:
                 # Missing market data: hold, never guess an exit fill.
                 continue
 
-            funding_rate = (funding_rates_percent or {}).get(position.symbol, 0.0)
+            funding_rate = (funding_rates_percent or {}).get(position.symbol)
             self._apply_funding(position, funding_rate)
 
             price = float(price)
@@ -485,26 +523,100 @@ class InverseShortPaperEngine:
         return closed
 
     def _apply_funding(
-        self, position: InverseShortPosition, funding_rate_percent: float,
+        self,
+        position: InverseShortPosition,
+        funding_rate_percent: float | None,
     ) -> None:
-        """Settle whole elapsed funding intervals (SHORT sign convention)."""
+        """Settle whole elapsed funding intervals (SHORT sign convention).
+
+        Funding rate is a strict TRI-STATE (review P2-1):
+
+          * ``None`` == **UNKNOWN** — no rate was observed for this symbol.
+            NO period is advanced, NO accrual happens and NO zero is
+            fabricated: the ``due - charged`` gap stays recorded on the
+            position row (``funding_periods_charged`` behind ``due``) and
+            survives restart until an actual rate is observed.
+          * ``0.0``   == a **confirmed zero** — the due periods settle as
+            an explicit zero exactly once (counter advances, balance is
+            unchanged).
+          * a finite number == an **observed rate** — the whole unsettled
+            backlog (``due - charged``) settles at that observed rate
+            EXACTLY ONCE (the counter advances atomically with the
+            accrual, so replay/restart can never double-book).
+
+        Settlement policy (EXPLICITLY FIXED — review P2-1 #4):
+          * a rate is only ever used for settlement when the feed actually
+            delivered it for the symbol; while the feed is down nothing is
+            booked and the obligation stays open (never a confirmed zero);
+          * a missing HISTORICAL rate is never silently invented or
+            fabricated: settlement happens only on the first rate actually
+            observed after recovery, for the entire backlog, once, and the
+            settlement log records rate + backlog;
+          * non-finite feed values (NaN/inf) are treated as UNKNOWN;
+          * a position that CLOSES during an outage keeps its exit facts
+            frozen: the unsettled gap (``due(closed_at) - charged``) stays
+            recorded on the closed row and is reported as an outstanding
+            obligation — it is NEVER retroactively booked (that would
+            rewrite realized PnL, review P2-1 #7).
+        """
         interval_seconds = float(self.settings.paper_funding_interval_hours) * 3600
         if interval_seconds <= 0:
             return
         elapsed = (self._clock() - position.entered_at).total_seconds()
+        if elapsed <= 0:
+            return
         due_periods = max(0, int(elapsed // interval_seconds))
         new_periods = due_periods - position.funding_periods_charged
         if new_periods <= 0:
+            self._funding_unknown.discard(position.position_key)
             return
 
+        # --- rate tri-state: UNKNOWN never advances the counter ------------
+        rate: float | None
+        try:
+            rate = float(funding_rate_percent) if funding_rate_percent is not None else None
+        except (TypeError, ValueError):
+            rate = None
+        if rate is not None and not math.isfinite(rate):
+            rate = None  # unusable feed value == UNKNOWN, never booked
+        if rate is None:
+            if position.position_key not in self._funding_unknown:
+                self._funding_unknown.add(position.position_key)
+                logger.warning(
+                    "me inverse short funding rate UNKNOWN; %d period(s) left "
+                    "unsettled (obligation preserved, NOTHING booked, no zero "
+                    "fabricated): symbol=%s due=%d charged=%d",
+                    new_periods, position.symbol, due_periods,
+                    position.funding_periods_charged,
+                )
+            else:
+                logger.debug(
+                    "me inverse short funding still UNKNOWN: symbol=%s "
+                    "unsettled=%d due=%d",
+                    position.symbol, new_periods, due_periods,
+                )
+            return
+
+        # --- observed rate (0.0 included): settle the backlog exactly once -
         notional = position.entry_price * position.position_size
-        signed_rate = float(funding_rate_percent) / 100.0
+        signed_rate = rate / 100.0
         cost = notional * signed_rate * new_periods
         if position.direction == "SHORT":
             cost = -cost
         position.funding_paid += cost
         position.funding_periods_charged = due_periods
         self.balance -= cost
+        self._funding_unknown.discard(position.position_key)
+        if new_periods > 1:
+            # Backlog settlement after an outage — logged with the EXACT
+            # policy so the substitution is explicit, never silent.
+            logger.info(
+                "me inverse short funding backlog settled at the first "
+                "observed rate after recovery (policy: entire unsettled "
+                "backlog, exactly once): symbol=%s backlog=%d rate=%.6f%% "
+                "cost=$%.4f",
+                position.symbol, new_periods, rate, cost,
+            )
         try:
             self.store.update_position(position)
         except Exception:
@@ -526,8 +638,59 @@ class InverseShortPaperEngine:
             self._uncommitted_deltas.pop(position.position_key, None)
         logger.info(
             "me inverse short funding: %s periods=%d rate=%.6f%% cost=$%.4f",
-            position.symbol, new_periods, funding_rate_percent, cost,
+            position.symbol, new_periods, rate, cost,
         )
+
+    def _due_funding_periods(self, position: InverseShortPosition) -> int:
+        """Whole funding intervals elapsed for this position.
+
+        OPEN positions are measured at the current clock; CLOSED positions
+        at their frozen ``closed_at`` (exit facts are never re-evaluated),
+        so the due count — and with it any unsettled gap — is reproducible
+        after a restart straight from the row.
+        """
+        interval_seconds = float(self.settings.paper_funding_interval_hours) * 3600
+        if interval_seconds <= 0:
+            return position.funding_periods_charged
+        reference = (
+            self._clock()
+            if position.status == POSITION_STATUS_OPEN
+            else position.closed_at
+        )
+        if reference is None:
+            return position.funding_periods_charged
+        elapsed = (reference - position.entered_at).total_seconds()
+        if elapsed <= 0:
+            return 0
+        return max(0, int(elapsed // interval_seconds))
+
+    def unsettled_funding_periods(self) -> int:
+        """Outstanding funding obligations: due-but-unsettled intervals.
+
+        OPEN positions are settleable — the backlog settles EXACTLY ONCE at
+        the first rate observed after recovery.  CLOSED positions keep their
+        exit facts frozen: the gap stays an explicitly recorded, reported
+        obligation (never a confirmed zero, never retroactively booked).
+        """
+        total = 0
+        for position in self.open_positions.values():
+            total += max(
+                0,
+                self._due_funding_periods(position)
+                - position.funding_periods_charged,
+            )
+        try:
+            for position in self.store.list_positions(status=POSITION_STATUS_CLOSED):
+                total += max(
+                    0,
+                    self._due_funding_periods(position)
+                    - position.funding_periods_charged,
+                )
+        except Exception:
+            logger.warning(
+                "me inverse short unsettled funding scan failed", exc_info=True,
+            )
+        return total
 
     def _close(
         self,
@@ -571,6 +734,24 @@ class InverseShortPaperEngine:
         position.net_pnl = net_pnl
         position.closed_at = closed_at
         position.duration_sec = (closed_at - position.entered_at).total_seconds()
+
+        # Funding obligation audit (review P2-1 #6): if the rate feed was
+        # down at exit, the due-but-unsettled intervals stay recorded on the
+        # row (funding_periods_charged < due) — never force-settled to a
+        # confirmed zero, never dropped, never retroactively booked (the
+        # exit facts above stay frozen).
+        unsettled = (
+            self._due_funding_periods(position) - position.funding_periods_charged
+        )
+        if unsettled > 0:
+            logger.warning(
+                "me inverse short close executed with %d UNSETTLED funding "
+                "period(s) (rate UNKNOWN at exit): obligation preserved on "
+                "the row and reported, NOT booked as zero; exit facts frozen: "
+                "key=%s reason=%s closed_at=%s",
+                unsettled, position.position_key[:48], reason,
+                closed_at.isoformat(),
+            )
 
         # ---- durable close protocol (P1 / P1-3) ----
         # 1) Stage the EXACT terminal snapshot durably FIRST: the exit facts
@@ -874,6 +1055,12 @@ class InverseShortPaperEngine:
                 (gross_exposure / equity * 100.0) if equity else 0.0, 4,
             ),
             "activated": self.activated,
+            # EXIT_ONLY (DRAINING) visibility (review P2-2) and the explicit
+            # outstanding funding obligation (review P2-1): due-but-unsettled
+            # intervals on OPEN (settleable) and CLOSED (frozen exit facts)
+            # positions alike — an UNKNOWN rate never becomes a silent zero.
+            "exit_only": self.exit_only,
+            "unsettled_funding_periods": self.unsettled_funding_periods(),
             "positions": [
                 {
                     "symbol": p.symbol,

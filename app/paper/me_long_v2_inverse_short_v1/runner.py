@@ -72,9 +72,9 @@ class InverseShortContour:
             activation=self.activation, require_activation=require_activation,
         )
         logger.info(
-            "me inverse short contour constructed: activated=%s reason=%s "
-            "open_positions=%d balance=%.2f",
-            self.activated, self.activation_reason,
+            "me inverse short contour constructed: activated=%s mode=%s "
+            "reason=%s open_positions=%d balance=%.2f",
+            self.activated, self.activation_mode, self.activation_reason,
             len(self.engine.open_positions), self.engine.balance,
         )
 
@@ -84,6 +84,23 @@ class InverseShortContour:
         if not self.require_activation:
             return True
         return self.activation is not None
+
+    @property
+    def exit_only(self) -> bool:
+        """True while DRAINING: MANAGE_EXISTING only, no NEW_ENTRIES.
+
+        A restart that reads a DRAINING row with a valid identity lands
+        directly in this mode — the contour never has to pass RUNNING again
+        (review P2-2).
+        """
+        return self.activation is not None and self.activation.exit_only
+
+    @property
+    def activation_mode(self) -> str:
+        """``FULL`` (RUNNING) / ``EXIT_ONLY`` (DRAINING) / ``NONE`` (no identity)."""
+        if self.activation is None:
+            return "NONE"
+        return self.activation.mode
 
     def refresh_activation(self) -> bool:
         """Re-read the activation row so a runtime change takes effect."""
@@ -99,16 +116,29 @@ class InverseShortContour:
     def run_cycle(
         self,
         prices: dict[str, float],
-        funding_rates_percent: dict[str, float] | None = None,
+        funding_rates_percent: dict[str, float | None] | None = None,
         bars: dict[str, dict[str, float]] | None = None,
     ) -> dict[str, Any]:
         """Exits first, then prospective entries.  Never raises on activation."""
         self.refresh_activation()
 
+        # MANAGE_EXISTING always runs (STOP/TP/TIMEOUT, funding
+        # reconciliation, outbox replay, pending-close recovery) — including
+        # EXIT_ONLY (DRAINING) and fail-closed states, so an open position
+        # is never stranded.
         closed = self.engine.check_exits(prices, funding_rates_percent, bars)
         opened: list[Any] = []
-        if self.activated:
+        if self.activated and not self.exit_only:
             opened = self.engine.open_entries(prices)
+        elif self.exit_only:
+            # NEW_ENTRIES refused: no new source capture, no new entries and
+            # no reuse of CAPTURED events (the engine gate refuses too —
+            # defence in depth).
+            logger.debug(
+                "me inverse short contour EXIT_ONLY: entries skipped, "
+                "managing %d existing position(s)",
+                len(self.engine.open_positions),
+            )
         else:
             logger.debug(
                 "me inverse short contour dormant: %s", self.activation_reason,
@@ -118,6 +148,7 @@ class InverseShortContour:
         return {
             "activated": self.activated,
             "activation_reason": self.activation_reason,
+            "exit_only": self.exit_only,
             "entries": len(opened),
             "exits": len(closed),
             "exit_reasons": [p.exit_reason for p in closed],
