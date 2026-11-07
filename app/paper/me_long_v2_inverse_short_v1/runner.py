@@ -145,6 +145,22 @@ class InverseShortContour:
             )
 
         account = self.engine.mark_to_market(prices)
+        # Review P1: a pending-events store failure must never abort the
+        # cycle result AFTER the exits ran — report it honestly instead.
+        # EXIT_ONLY (DRAINING) does not request prospective entry events at
+        # all, so no store read happens for them in that mode.
+        if self.exit_only:
+            pending_events_count = 0
+        else:
+            try:
+                pending_events_count = len(self.engine.pending_events())
+            except Exception:
+                pending_events_count = -1
+                logger.warning(
+                    "me inverse short pending entry events unavailable (store "
+                    "read failed); entries fail closed, exits of this cycle "
+                    "already ran and are unaffected", exc_info=True,
+                )
         return {
             "activated": self.activated,
             "activation_reason": self.activation_reason,
@@ -156,7 +172,8 @@ class InverseShortContour:
             "closed": closed,
             "balance": account["balance"],
             "equity": account["equity"],
-            "pending_events": len(self.engine.pending_events()),
+            "pending_events": pending_events_count,
+            "pending_events_unavailable": pending_events_count < 0,
             "open_positions": len(self.engine.open_positions),
             "pending_closes": len(self.engine.pending_closes),
             # Fail-closed state (P1 durability risk / P2 accounting trust).

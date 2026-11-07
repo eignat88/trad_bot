@@ -33,6 +33,7 @@ Design constraints (all enforced, all testable):
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 from datetime import datetime, timezone
@@ -130,6 +131,14 @@ class InverseShortPaperEngine:
         # one-shot warning logs; the durable unsettled state itself lives on
         # the position row (funding_periods_charged behind due_periods).
         self._funding_unknown: set[str] = set()
+        # DIRTY funding snapshots (review P2): an update_position() that
+        # failed after a funding accrual leaves the EXACT snapshot (funding_paid
+        # and funding_periods_charged frozen at failure time) in memory, keyed
+        # by position.  Every subsequent cycle retries writing it — even before
+        # another funding interval becomes due — and a retry NEVER re-accrues.
+        # In-memory only: a restart restores strictly the confirmed store rows
+        # and never claims durability for a write the database never accepted.
+        self._dirty_funding: dict[str, InverseShortPosition] = {}
 
         components = store.balance_components()
         self.confirmed_balance = float(
@@ -276,12 +285,11 @@ class InverseShortPaperEngine:
             PERMISSION_NEW_ENTRIES,
         ):
             # EXIT_ONLY (DRAINING): CAPTURED events are never reused to open
-            # new trades — MANAGE_EXISTING only (review P2-2).
+            # new trades — MANAGE_EXISTING only (review P2-2).  NOTE: no
+            # pending-entry event query happens in this mode at all (P1).
             logger.info(
                 "me inverse short entries refused (EXIT_ONLY): activation is "
-                "DRAINING — managing existing positions only, no new entries "
-                "from %d CAPTURED event(s)",
-                len(self.pending_events()),
+                "DRAINING — managing existing positions only, no new entries",
             )
             return opened
 
@@ -311,16 +319,29 @@ class InverseShortPaperEngine:
         if len(self.open_positions) >= max_positions:
             return opened
 
-        events = self.store.list_events(status=EVENT_STATUS_CAPTURED)
-        for event in events:
-            if len(self.open_positions) >= max_positions:
-                logger.info(
-                    "me inverse short entry cap reached (%d)", max_positions,
-                )
-                break
-            position = self._open_event(event, prices)
-            if position is not None:
-                opened.append(position)
+        # Review P1: a pending-events/store failure must NEVER propagate out
+        # of open_entries — entries simply fail closed for this cycle while
+        # the protective exits (already executed before this method in
+        # run_cycle) stay fully functional.
+        try:
+            events = self.store.list_events(status=EVENT_STATUS_CAPTURED)
+            for event in events:
+                if len(self.open_positions) >= max_positions:
+                    logger.info(
+                        "me inverse short entry cap reached (%d)", max_positions,
+                    )
+                    break
+                position = self._open_event(event, prices)
+                if position is not None:
+                    opened.append(position)
+        except Exception:
+            logger.error(
+                "me inverse short entries refused (fail closed): prospective "
+                "entry events unavailable (store read/write failed) — no "
+                "entry attempted this cycle; protective exits were evaluated "
+                "before this point and are unaffected",
+                exc_info=True,
+            )
         return opened
 
     def _open_event(
@@ -475,6 +496,9 @@ class InverseShortPaperEngine:
         # First finish any unfinished close (P1-3): its terminal snapshot is
         # replayed byte-for-byte and never re-evaluated below.
         self.flush_pending_closes()
+        # Then retry any DIRTY funding snapshot (P2): persisted even when no
+        # new funding interval has become due; a retry never re-accrues.
+        self._retry_dirty_funding()
 
         closed: list[InverseShortPosition] = []
 
@@ -627,19 +651,72 @@ class InverseShortPaperEngine:
             self._uncommitted_deltas[position.position_key] = (
                 self._uncommitted_deltas.get(position.position_key, 0.0) - cost
             )
+            # DIRTY (review P2): freeze the EXACT funding snapshot so every
+            # later cycle retries it — independent of new intervals — without
+            # ever re-accruing or changing any value.
+            self._dirty_funding[position.position_key] = dataclasses.replace(
+                position,
+            )
             logger.warning(
-                "me inverse short funding persistence failed (state kept in "
-                "memory, tracked as an uncommitted delta)",
+                "me inverse short funding persistence failed (exact funding "
+                "snapshot retained in memory as DIRTY for retry on later "
+                "cycles; NOT durable until a write commits and never claimed "
+                "durable): key=%s funding_paid=%.6f periods=%d",
+                position.position_key[:48], position.funding_paid,
+                position.funding_periods_charged,
                 exc_info=True,
             )
         else:
             # The row now carries the cumulative funding — local and store
             # accounting for this key agree again.
             self._uncommitted_deltas.pop(position.position_key, None)
+            self._dirty_funding.pop(position.position_key, None)
         logger.info(
             "me inverse short funding: %s periods=%d rate=%.6f%% cost=$%.4f",
             position.symbol, new_periods, rate, cost,
         )
+
+    def _retry_dirty_funding(self) -> int:
+        """Persist retained DIRTY funding snapshots (review P2).
+
+        Runs EVERY cycle — including cycles where no new funding interval
+        has become due.  The frozen snapshot (``funding_paid`` /
+        ``funding_periods_charged`` exactly as at failure time) is written
+        byte-for-byte, so a retry NEVER accrues anything twice and never
+        touches terminal close facts: keys with an unfinished close are
+        skipped, because their snapshot (funding included) is owned and
+        replayed by the pending-close/outbox mechanism.
+
+        On success the store row carries the cumulative funding again, so
+        the local uncommitted balance delta for that key is settled with it
+        (booked exactly once, never twice).
+        """
+        persisted = 0
+        for position_key, snapshot in list(self._dirty_funding.items()):
+            if position_key in self.pending_closes:
+                # Terminal close owns this key; an OPEN snapshot must never
+                # be written over a pending terminal snapshot.
+                continue
+            try:
+                self.store.update_position(snapshot)
+            except Exception:
+                logger.debug(
+                    "me inverse short dirty funding retry failed again "
+                    "(snapshot retained): key=%s funding_paid=%.6f periods=%d",
+                    position_key[:48], snapshot.funding_paid,
+                    snapshot.funding_periods_charged, exc_info=True,
+                )
+                continue
+            self._dirty_funding.pop(position_key, None)
+            self._uncommitted_deltas.pop(position_key, None)
+            persisted += 1
+            logger.info(
+                "me inverse short dirty funding snapshot persisted on retry: "
+                "key=%s funding_paid=%.6f periods=%d",
+                position_key[:48], snapshot.funding_paid,
+                snapshot.funding_periods_charged,
+            )
+        return persisted
 
     def _due_funding_periods(self, position: InverseShortPosition) -> int:
         """Whole funding intervals elapsed for this position.
@@ -811,6 +888,9 @@ class InverseShortPaperEngine:
             # The row now carries the FULL terminal accounting (cumulative
             # funding + close facts): local and store agree for this key.
             self._uncommitted_deltas.pop(position.position_key, None)
+            # The terminal write also commits any DIRTY funding snapshot
+            # (funding_paid rides along in the same row update).
+            self._dirty_funding.pop(position.position_key, None)
             self._unstaged_closes.discard(position.position_key)
             self._staging_unavailable.discard(position.position_key)
             if staged:
@@ -894,6 +974,9 @@ class InverseShortPaperEngine:
             # -- committed: the row now carries the exact terminal facts --
             self.pending_closes.pop(position_key, None)
             self._uncommitted_deltas.pop(position_key, None)
+            # The replayed terminal snapshot includes the cumulative funding,
+            # so any DIRTY funding marker for this key is now confirmed too.
+            self._dirty_funding.pop(position_key, None)
             self._unstaged_closes.discard(position_key)
             self._staging_unavailable.discard(position_key)
             flushed += 1
@@ -1051,6 +1134,10 @@ class InverseShortPaperEngine:
             # recovery while a terminal snapshot is only in process memory.
             "durability_risk": self.durability_risk,
             "unstaged_closes": len(self._unstaged_closes),
+            # DIRTY funding snapshots (P2): funding accreted in memory whose
+            # persistence write failed — retried every cycle, never claimed
+            # durable, never re-accrued.
+            "dirty_funding": len(self._dirty_funding),
             "gross_exposure_pct": round(
                 (gross_exposure / equity * 100.0) if equity else 0.0, 4,
             ),

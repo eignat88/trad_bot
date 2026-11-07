@@ -95,10 +95,51 @@ def _get_funding_rates(client: Any, symbols: set[str]) -> dict[str, float]:
     return rates
 
 
-def _contour_symbols(contour: InverseShortContour) -> set[str]:
-    symbols = {p.symbol for p in contour.engine.open_positions.values()}
-    symbols.update(e.symbol for e in contour.engine.pending_events())
-    return symbols
+def _open_position_symbols(contour: InverseShortContour) -> set[str]:
+    """Symbols of OPEN positions — in-memory only, never touches the store.
+
+    These symbols are REQUIRED to price STOP/TP/TIMEOUT exits, so they must
+    stay obtainable even while PostgreSQL is unavailable (review P1).
+    """
+    return {p.symbol for p in contour.engine.open_positions.values()}
+
+
+def _pending_entry_symbols(contour: InverseShortContour) -> set[str]:
+    """Symbols of prospective (CAPTURED) entry events — a store read.
+
+    On failure it returns an EMPTY set: new entries then fail closed for
+    this cycle (no prices are gathered for them, the engine refuses them
+    anyway), while the protective-exit prices are still fetched (review P1).
+    Never called in EXIT_ONLY mode.
+    """
+    try:
+        return {e.symbol for e in contour.engine.pending_events()}
+    except Exception:
+        logger.warning(
+            "me inverse short: pending entry events unavailable (store read "
+            "failed); new entries fail closed for this cycle — protective "
+            "exits are unaffected", exc_info=True,
+        )
+        return set()
+
+
+def _cycle_symbols(contour: InverseShortContour) -> tuple[set[str], set[str]]:
+    """``(symbols_to_price, open_position_symbols)`` for ONE cycle (review P1).
+
+    * The activation mode is refreshed FIRST so EXIT_ONLY (DRAINING) never
+      requests prospective entry events at all.
+    * Open-position symbols are always returned (in-memory), so price
+      loading — and therefore STOP/TP/TIMEOUT — survives any pending-events
+      store failure.
+    * A pending-events failure yields no entry symbols (fail closed for
+      entries) but never raises out of this function.
+    """
+    contour.refresh_activation()
+    open_symbols = _open_position_symbols(contour)
+    entry_symbols = (
+        set() if contour.exit_only else _pending_entry_symbols(contour)
+    )
+    return open_symbols | entry_symbols, open_symbols
 
 
 def run_dry_run_cli(settings: Settings) -> int:
@@ -201,9 +242,11 @@ def main(argv: list[str] | None = None) -> int:
         cycle += 1
         started = time.monotonic()
         try:
-            symbols = _contour_symbols(contour)
+            # Review P1: open-position and prospective-entry symbols are
+            # gathered separately — a pending-events store failure must not
+            # prevent price loading or the protective exits below.
+            symbols, open_symbols = _cycle_symbols(contour)
             prices = _get_prices(client, symbols)
-            open_symbols = {p.symbol for p in contour.engine.open_positions.values()}
             funding = _get_funding_rates(client, open_symbols)
             result = contour.run_cycle(prices, funding)
             if result["entries"] or result["exits"]:
