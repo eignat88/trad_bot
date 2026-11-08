@@ -961,6 +961,69 @@ class InverseShortPaperEngine:
             )
         return total
 
+    def _confirmed_close(self, snapshot: InverseShortPosition) -> bool | None:
+        """Verify an ambiguous terminal UPDATE outcome (review P2).
+
+        After a terminal COMMIT whose acknowledgement was lost, read the
+        stored row back by ``position_key`` and compare the first terminal
+        facts:
+
+        * ``True`` — PostgreSQL carries ``status=CLOSED`` and the EXACT
+          terminal facts of this snapshot (closed_at, exit_reason,
+          exit_price, fees, funding, gross/net PnL): the write was applied
+          despite the lost acknowledgement;
+        * ``False`` — the row is readable but differs (the write did NOT
+          apply);
+        * ``None`` — the outcome could not be verified at all (row missing
+          or the read failed).
+
+        An unreadable row is NEVER treated as applied: ``False`` and
+        ``None`` both keep the pending close + local delta and block new
+        entries until a reconciliation proves consistency.
+        """
+        try:
+            stored = self.store.get_position(snapshot.position_key)
+        except Exception:
+            logger.warning(
+                "me inverse short terminal write outcome UNVERIFIABLE "
+                "(stored position could not be read): key=%s",
+                snapshot.position_key[:48], exc_info=True,
+            )
+            return None
+        if stored is None:
+            logger.warning(
+                "me inverse short terminal write outcome UNVERIFIABLE "
+                "(stored position row is absent): key=%s",
+                snapshot.position_key[:48],
+            )
+            return None
+        if stored.status != POSITION_STATUS_CLOSED:
+            return False
+        mismatches = [
+            name for name, expected in (
+                ("closed_at", snapshot.closed_at),
+                ("exit_reason", snapshot.exit_reason),
+                ("exit_price", snapshot.exit_price),
+                ("entry_fee", snapshot.entry_fee),
+                ("exit_fee", snapshot.exit_fee),
+                ("slippage_cost", snapshot.slippage_cost),
+                ("funding_paid", snapshot.funding_paid),
+                ("funding_periods_charged", snapshot.funding_periods_charged),
+                ("gross_pnl", snapshot.gross_pnl),
+                ("net_pnl", snapshot.net_pnl),
+            )
+            if getattr(stored, name) != expected
+        ]
+        if mismatches:
+            logger.info(
+                "me inverse short terminal write NOT applied (stored row "
+                "differs from the snapshot): key=%s fields=%s",
+                snapshot.position_key[:48],
+                ",".join(mismatches)[:200],
+            )
+            return False
+        return True
+
     def _close(
         self,
         position: InverseShortPosition,
@@ -1062,21 +1125,48 @@ class InverseShortPaperEngine:
         #    ledger; it becomes a local uncommitted delta until the store
         #    ledger commits it (never booked twice).
         close_delta = gross - exit_fee - exit_slippage_cost
+        terminal_applied = False
         try:
             self.store.update_position(position)
+            terminal_applied = True
         except Exception:
-            self.pending_closes[position.position_key] = position
-            self._uncommitted_deltas[position.position_key] = (
-                self._uncommitted_deltas.get(position.position_key, 0.0)
-                + close_delta
-            )
-            logger.exception(
-                "me inverse short close persistence failed; terminal snapshot "
-                "retained for retry (outbox staged=%s, durability_risk=%s): "
-                "key=%s reason=%s net=%.4f",
-                staged, not staged, position.position_key[:48], reason, net_pnl,
-            )
-        else:
+            verdict = self._confirmed_close(position)
+            if verdict is True:
+                # AMBIGUOUS COMMIT (review P2): PostgreSQL APPLIED the
+                # terminal UPDATE but the acknowledgement was lost.  Settle
+                # the local state exactly like a confirmed commit: NO
+                # uncommitted close delta (the store ledger already carries
+                # this PnL — booking it again would double-count at the
+                # next reconcile_balance()) and NO pending close (nothing
+                # is left to replay).
+                terminal_applied = True
+                logger.warning(
+                    "me inverse short terminal close CONFIRMED applied "
+                    "despite a lost acknowledgement (no uncommitted close "
+                    "delta booked): key=%s reason=%s net=%.4f",
+                    position.position_key[:48], reason, net_pnl,
+                )
+            else:
+                # NOT applied, or the outcome could not be verified: keep
+                # the pending close + local delta (fail closed) and refuse
+                # NEW entries until a successful reconciliation proves the
+                # ledger consistent (review P2: never assume either way).
+                self.pending_closes[position.position_key] = position
+                self._uncommitted_deltas[position.position_key] = (
+                    self._uncommitted_deltas.get(position.position_key, 0.0)
+                    + close_delta
+                )
+                self._balance_trusted = False
+                logger.exception(
+                    "me inverse short close persistence failed (write NOT "
+                    "confirmed by PostgreSQL); terminal snapshot retained "
+                    "for retry and new entries blocked until a "
+                    "reconciliation succeeds (outbox staged=%s, "
+                    "durability_risk=%s): key=%s reason=%s net=%.4f",
+                    staged, not staged, position.position_key[:48], reason,
+                    net_pnl,
+                )
+        if terminal_applied:
             # The row now carries the FULL terminal accounting (cumulative
             # funding + close facts): local and store agree for this key.
             self._uncommitted_deltas.pop(position.position_key, None)
@@ -1153,17 +1243,37 @@ class InverseShortPaperEngine:
             try:
                 self.store.update_position(snapshot)
             except Exception:
-                logger.warning(
-                    "me inverse short close flush failed (terminal snapshot "
-                    "retained): key=%s reason=%s closed_at=%s net=%.4f "
-                    "durability_risk=%s",
-                    position_key[:48], snapshot.exit_reason,
-                    snapshot.closed_at.isoformat() if snapshot.closed_at else None,
-                    snapshot.net_pnl, position_key in self._unstaged_closes,
-                    exc_info=True,
-                )
-                continue
-            # -- committed: the row now carries the exact terminal facts --
+                if self._confirmed_close(snapshot) is True:
+                    # AMBIGUOUS COMMIT (review P2): the replayed terminal
+                    # UPDATE was applied although its acknowledgement was
+                    # lost — converge exactly like a committed replay (the
+                    # code below) instead of retaining a close the ledger
+                    # already carries.
+                    logger.warning(
+                        "me inverse short close flush CONFIRMED applied "
+                        "despite a lost acknowledgement: key=%s reason=%s "
+                        "net=%.4f",
+                        position_key[:48], snapshot.exit_reason,
+                        snapshot.net_pnl,
+                    )
+                else:
+                    # NOT confirmed: retain the snapshot + local delta and
+                    # refuse NEW entries until a reconciliation succeeds.
+                    self._balance_trusted = False
+                    logger.warning(
+                        "me inverse short close flush failed (terminal "
+                        "snapshot retained, write NOT confirmed by "
+                        "PostgreSQL; new entries blocked until a "
+                        "reconciliation succeeds): key=%s reason=%s "
+                        "closed_at=%s net=%.4f durability_risk=%s",
+                        position_key[:48], snapshot.exit_reason,
+                        snapshot.closed_at.isoformat() if snapshot.closed_at else None,
+                        snapshot.net_pnl, position_key in self._unstaged_closes,
+                        exc_info=True,
+                    )
+                    continue
+            # -- committed (or confirmed applied despite a lost ACK): the
+            #    row now carries the exact terminal facts --
             self.pending_closes.pop(position_key, None)
             self._uncommitted_deltas.pop(position_key, None)
             # The replayed terminal snapshot includes the cumulative funding,
