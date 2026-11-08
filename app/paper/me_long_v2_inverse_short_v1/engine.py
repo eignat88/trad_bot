@@ -492,12 +492,16 @@ class InverseShortPaperEngine:
 
         The STORED row is the committed truth and is adopted VERBATIM:
         original ``entered_at`` / ``deadline_at`` / entry price / STOP / TP
-        are never recomputed, entry fees are booked into the in-memory
-        ledger exactly ONCE (they were never booked for this key), no
-        second INSERT is issued, and the position enters ``open_positions``
-        immediately — so protective STOP/TP/TIMEOUT applies from the very
-        next cycle.  Every failure path stays fail-closed: nothing is
-        opened, booked or marked unless the committed row fully verifies.
+        are never recomputed, no second INSERT is issued, and the position
+        enters ``open_positions`` immediately — so protective
+        STOP/TP/TIMEOUT applies from the very next cycle.  Entry-cost
+        accounting goes through a FRESH ``reconcile_balance()`` (review
+        P2-2): the confirmed ledger already carries the committed row's
+        costs, so they are folded into the memory balance exactly once —
+        never re-subtracted by hand, never double-counted when a
+        reconciliation ran earlier.  Every failure path stays fail-closed:
+        nothing is opened, booked or marked unless the committed row fully
+        verifies AND the confirmed balance can be read.
         """
         if position_key in self.open_positions:
             # Already adopted in this process — never book the fees twice.
@@ -529,6 +533,29 @@ class InverseShortPaperEngine:
                 stored.symbol,
             )
             return None
+        # Review P2-2: entry accounting is reconciled against a FRESH
+        # confirmed ledger BEFORE anything is booked or marked.  A fresh
+        # balance_components() read already includes this committed row's
+        # entry costs (OPEN rows contribute entry_fee + entry_slippage),
+        # so re-subtracting them here would DOUBLE-COUNT whenever a
+        # reconciliation ran between the ambiguous COMMIT and this
+        # adoption — memory would already carry the costs through
+        # confirmed_balance.  reconcile_balance() re-establishes the
+        # deterministic invariant
+        #     memory_balance == confirmed_balance + Σ uncommitted_deltas
+        # instead of a manual fee subtraction, and it REFUSES the
+        # adoption while the confirmed balance cannot be read: nothing is
+        # opened, booked or marked, and the accounting-consistent gate
+        # keeps new entries blocked until a reconciliation succeeds.
+        if not self.reconcile_balance():
+            logger.warning(
+                "me inverse short adoption DEFERRED: confirmed balance "
+                "unreadable — entry costs NOT booked, position NOT opened, "
+                "new entries blocked until a reconciliation succeeds: "
+                "key=%s symbol=%s",
+                position_key[:48], stored.symbol,
+            )
+            return None
         try:
             self.store.mark_event_entered(event.event_key, position_key)
         except Exception:
@@ -538,16 +565,16 @@ class InverseShortPaperEngine:
                 "(idempotent guard active)",
                 exc_info=True,
             )
-        # Entry fees were NEVER booked in memory for this key (the original
-        # open failed before the booking): book them exactly once from the
-        # COMMITTED facts.  The persisted ledger already carries these
-        # costs, so memory and store agree immediately — no double booking.
-        self.balance -= stored.entry_fee + stored.entry_slippage_cost
+        # NO manual fee subtraction (review P2-2): the confirmed ledger
+        # carries the entry costs and reconcile_balance() just folded them
+        # into self.balance exactly once — booked never twice, and the
+        # invariant above holds from this moment on.
         self.open_positions[position_key] = stored
         logger.warning(
             "me inverse short ADOPTED committed position after an ambiguous "
-            "INSERT (no re-open, original entry facts kept, fees booked "
-            "once): key=%s symbol=%s entered_at=%s stop=%.6f target=%.6f",
+            "INSERT (no re-open, original entry facts kept, entry costs "
+            "taken from the confirmed ledger exactly once): "
+            "key=%s symbol=%s entered_at=%s stop=%.6f target=%.6f",
             position_key[:48], stored.symbol,
             stored.entered_at.isoformat() if stored.entered_at else "?",
             stored.stop_price, stored.target_price,
