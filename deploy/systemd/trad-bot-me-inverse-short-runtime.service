@@ -1,0 +1,70 @@
+[Unit]
+Description=ME_LONG_V2_INVERSE_SHORT_V1 isolated prospective paper runtime (Issue #268; activation OFF by default)
+Documentation=file:///opt/trad_bot_me_inverse_short_release/docs/me_inverse_short_v1_production_runtime_v1.md
+# Issue #268 — a STANDALONE service for the frozen PR #267 contour.
+# It never places real orders, never writes dds.paper_trade, and is fully
+# independent from the Scanner / Paper / Research Evaluator services
+# (no unit ordering, no shared process, no shared state beyond PostgreSQL).
+#
+# Activation is TWO-FACTOR and OFF by default: the env file ships
+# ME_INVERSE_SHORT_V1_ENABLED=0 and the activation row stays READY_TO_START
+# until a separately approved activation step runs. Starting this service
+# therefore performs NO captures, NO entries and NO writes beyond telemetry.
+After=network-online.target postgresql.service
+Wants=network-online.target
+# Separate release path (never the scanner's /opt/trad_bot_pr267_release):
+# this service may be installed, upgraded and rolled back on its own.
+ConditionPathExists=/opt/trad_bot_me_inverse_short_release/app/paper/me_long_v2_inverse_short_v1/production_runtime.py
+
+[Service]
+Type=simple
+User=tradbot
+Group=tradbot
+WorkingDirectory=/opt/trad_bot_me_inverse_short_release
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Mandatory, predictable environment file (no "-" prefix: a missing file
+# fails the start instead of silently running with default credentials).
+# It MUST set DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD and
+# ME_INVERSE_SHORT_V1_ENABLED=0 (activation stays OFF until approved).
+EnvironmentFile=/etc/trad-bot/me-inverse-short-runtime.env
+# Explicit Python environment of THIS release (no system interpreter).
+ExecStart=/opt/trad_bot_me_inverse_short_release/.venv/bin/python -m app.paper.me_long_v2_inverse_short_v1.production_runtime --interval 10
+# Exit-code contract of production_runtime: 0 = clean stop, 1 = fatal
+# (restart), 2 = usage, 3 = another instance already holds the lock.
+# Exit 3 needs operator action (a stray manual process), never a restart
+# loop — the same guard also applies to `systemctl start` while a manual
+# instance is running (the in-process lock file enforces one instance).
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=3
+
+# Graceful shutdown: SIGTERM finishes the CURRENT cycle (every durable
+# write it performs completes) and the process exits 0.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+# Writable runtime/log directories are prepared and verified BEFORE the
+# first start (see the runbook): /opt/trad_bot_me_inverse_short_release/logs
+# and .../var owned by tradbot:tradbot, mode 0750. This addresses the
+# earlier deployment failure `PermissionError: /opt/trad_bot_pr267_release/logs`.
+ProtectSystem=strict
+ReadWritePaths=/opt/trad_bot_me_inverse_short_release/logs /opt/trad_bot_me_inverse_short_release/var
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+
+# Resource bounds (the runtime is a small, steady-state poller).
+MemoryMax=512M
+TasksMax=64
+LimitNOFILE=4096
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trad-bot-me-inverse-short-runtime
+
+[Install]
+WantedBy=multi-user.target
