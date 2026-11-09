@@ -44,11 +44,16 @@ def test_srr_short_fill_migrations_are_exactly_082_and_083():
 def test_migration_number_is_next_and_not_taken():
     numbers = sorted(int(p.name.split("_")[0]) for p in
                      (ROOT / "sql" / "migrations").glob("[0-9][0-9][0-9]_*.sql"))
-    # F3 hardening added 083 (coverage ledger); it is the highest number
-    # and appears exactly once — never reuses an old number either.
-    assert numbers[-1] == 83
-    assert numbers.count(83) == 1
-    assert numbers.count(82) == 1
+    # 082 (feasibility) + 083 (coverage) are the F3 hardening numbers; this
+    # PR adds 084 (paper execution-policy recovery), 085 (inverse-short
+    # contour) and 086 (inverse-short close outbox).  Every one of those
+    # numbers must appear EXACTLY once — an old number is never reused —
+    # and the branch's newest migration carries the highest number.
+    for taken in (82, 83, 84, 85, 86):
+        assert numbers.count(taken) == 1, (
+            f"migration number {taken:03d} must be unique"
+        )
+    assert numbers[-1] == 86
 
 
 def test_migration_is_transactional_and_idempotent():

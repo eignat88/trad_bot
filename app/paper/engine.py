@@ -43,6 +43,34 @@ _ENTRY_TIMEOUT_BASE = {
 }
 
 
+def _parse_planned_exit(value: Any) -> datetime | None:
+    """Recover ``planned_exit_at`` from a persisted OPEN paper trade.
+
+    Recovery must never crash startup and never silently DROP a fixed
+    horizon: a malformed value is logged and treated as absent (the trade
+    then follows the DEFAULT expiry path), an absent value stays ``None``.
+    Naive timestamps are interpreted as UTC so the fixed-horizon comparison
+    against the always-aware engine clock can never raise.
+    """
+    if value is None or value == "":
+        return None
+    parsed: datetime | None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            logger.error(
+                "paper recovery: unparseable planned_exit_at=%r — fixed horizon "
+                "time exit disabled for this trade until re-persisted", value,
+            )
+            return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 @dataclass
 class PaperTradeRecord:
     """In-memory representation of an open paper trade."""
@@ -1342,6 +1370,19 @@ class PaperTradingEngine:
                     dca_data = {}
                 dca_state_obj = DCAPositionState.from_dict(dca_data)
 
+            execution_policy = str(row.get("execution_policy") or "DEFAULT")
+            execution_policy_version = str(row.get("execution_policy_version") or "")
+            planned_exit = _parse_planned_exit(row.get("planned_exit_at"))
+            if execution_policy != "DEFAULT":
+                logger.info(
+                    "paper recovery: restored execution_policy=%s "
+                    "execution_policy_version=%s planned_exit_at=%s "
+                    "symbol=%s trade_id=%s",
+                    execution_policy, execution_policy_version,
+                    planned_exit.isoformat() if planned_exit else None,
+                    row["symbol"], row.get("trade_id"),
+                )
+
             trade = PaperTradeRecord(
                 trade_id=row["trade_id"],
                 setup_id=row["setup_id"],
@@ -1370,6 +1411,9 @@ class PaperTradingEngine:
                 funding_periods_charged=int(row.get("funding_periods", 0)),
                 dca_enabled=dca_enabled,
                 dca_state=dca_state_obj,
+                execution_policy=execution_policy,
+                execution_policy_version=execution_policy_version,
+                planned_exit_at=planned_exit,
             )
             self.open_trades[trade.symbol] = trade
 
