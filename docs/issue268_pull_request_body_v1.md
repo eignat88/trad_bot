@@ -71,20 +71,45 @@ trading side effects.
 
 ### R3 — matched baseline (same environment, `origin/main` = `537ad74`)
 
-* Baseline: fresh shallow clone of `origin/main`, same venv, same pytest
-  command (same 6 `--ignore` files for pre-existing Windows-only import
-  errors): **75 failed, 6228 passed, 81 skipped, 168 errors**.
-* Head (this branch, post-fix): same command → see §3 (identical failure
-  set: every failing/erroring test fails on BOTH sides with the same
-  reason — no local PostgreSQL for the DB suites, plus the documented
-  baseline `test_paper_runner::test_paper_disable_uses_exact_canonical_identifier`).
-* Per-failure classification: `pg8000 InterfaceError: localhost:5432`
-  (DB-dependent suites), registry-content assertions on files untouched by
-  this branch (`test_prospective_oos_v3`), and `sql_quality_gate` internal
-  failures (`test_analysis_runner`) — none import or read any file changed
-  here. This branch's diff vs `origin/main` is **new files only** (base
-  tree hash `720726c…` == `origin/main` tree hash; `git diff c1e560a HEAD`
-  lists exactly the 9 Issue #268 files).
+* **Method:** fresh shallow clone of `origin/main`, unshallowed to full
+  history (a shallow clone made6 git-history-dependent tests fail — fixed
+  before the final run), same venv, same pytest command (same 6 `--ignore`
+  files for pre-existing Windows-only import errors), runs executed
+  sequentially in their own trees.
+* **Baseline (`537ad74`):** **72 failed, 6145 passed, 78 skipped,
+  168 errors**.
+* **Head (`170046c`, this PR):** **74 failed, 6232 passed, 81 skipped,
+  168 errors**.
+* **Failure-set diff:** baseline-only failures = **0**; head-only
+  failures = **exactly 2**, both git-based branch-hygiene guards of the
+  HTF Phase-2 line:
+  * `test_htf_baseline_short_phase2_isolation_v1.py::test_new_files_are_confined_to_phase2_surface`
+    — every NEW file vs merge-base must live under the HTF Phase-2
+    surface;
+  * `test_htf_baseline_short_phase2_systemd_bybit_wiring_v1.py::test_scanner_paper_evaluator_settings_unchanged`
+    — no changed path may match `scanner|paper|live|evaluator|...`
+    (this branch necessarily adds `app/paper/me_long_v2_inverse_short_v1/**`).
+* **Control experiment:** both tests were re-run on the PR **#267**
+  branch state (`c1e560a`, pre-Issue-#268, simulated pre-merge
+  `origin/main`) in the same environment — **both FAIL there too**, with
+  PR #267's own files as offenders (`app/paper/**`, `scanner_runner.py`,
+  …). They are merge-base surface guards that fail on ANY feature branch
+  touching those paths; they assert nothing about runtime behaviour and
+  pass on a clean `main` (as the baseline run shows).
+* Counts reconcile exactly: `6145 − 2 (hygiene flipped) + 89 (my tests:
+  92 collected − 3 PG skips without TEST_DB) = 6232` and
+  `78 + 3 = 81` skips; errors identical (168).
+* Per-failure classification of the common72: `pg8000 InterfaceError:
+  localhost:5432` (DB-dependent suites — no server in this environment),
+  registry-content assertions on files untouched by this branch
+  (`test_prospective_oos_v3`), `sql_quality_gate` internal failures
+  (`test_analysis_runner`), and the documented baseline
+  `test_paper_runner::test_paper_disable_uses_exact_canonical_identifier`.
+  None of them imports or reads a file changed here.
+* This branch's diff vs `origin/main` is **new files only for the first
+  commit + the review-fix commit** (base tree hash `720726c…` ==
+  `origin/main` tree hash; `git diff c1e560a HEAD --name-only` lists
+  exactly the Issue #268 files; frozen PR #267 files untouched).
 
 ### R4 — BybitClient / limiter / config / events: **covered by tests**
 
@@ -201,7 +226,7 @@ never backfills (`signal_time > freeze_ts` gate + migration-085 CHECK).
 | `tests/test_me_long_v2_inverse_short_production_runtime_pg_it_v1.py` | **3 passed on a real isolated PostgreSQL 16.15** (`TEST_DB_*` → `trad_bot_migration_test`; commands + isolation proof in §0 R2) — NOT skipped, NOT mocked |
 | PR #267 contour regression (v1, source capture, redelivery, ambiguous commit, close durability, funding/draining, PG reconnect, review2/review3, adoption costs) | **196 passed, 1 skipped** |
 | Bybit client / retry budget / API telemetry / global rate limiter / candle-safety | **412 passed, 3 skipped** |
-| Full suite vs matched `origin/main` baseline (same env, same 6 `--ignore` files for pre-existing Windows import errors) | baseline `537ad74`: **75 failed, 6228 passed, 81 skipped, 168 errors**; head: identical failure/error SET (per-failure classification in §0 R3) |
+| Full suite vs matched `origin/main` baseline (same env, full history, same 6 `--ignore` files) | baseline `537ad74`: **72 failed, 6145 passed, 78 skipped, 168 errors**; head `170046c`: **74 failed, 6232 passed, 81 skipped, 168 errors** — baseline-only failures **0**, head-only = **2 HTF branch-hygiene git guards** (pre-existing on any feature branch incl. PR #267 — control experiment in §0 R3) |
 
 Mandatory §5 coverage map (18 items) is documented in the docstring of
 `tests/test_me_long_v2_inverse_short_production_runtime_v1.py`; items 11–13
