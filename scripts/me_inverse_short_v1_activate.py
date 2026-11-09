@@ -148,6 +148,8 @@ def plan_activation(
     note: str,
 ) -> tuple[str, tuple[Any, ...]]:
     """Decide the activation UPDATE (raises ActivationError when refused)."""
+    if existing_status is None:
+        raise ActivationError("activation row is missing; refusing to create an implicit activation")
     if existing_status == "RUNNING" and not re_freeze:
         same = (
             existing_fingerprint == current_fingerprint
@@ -290,6 +292,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             cursor = conn.cursor()
             cursor.execute(sql, params)
+            if cursor.rowcount != 1:
+                raise ActivationError("activation update affected != 1 row; rolling back")
             conn.commit()
             print(
                 json.dumps(
@@ -315,6 +319,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             cursor = conn.cursor()
             cursor.execute(sql, params)
+            if cursor.rowcount != 1:
+                raise ActivationError("activation update affected != 1 row; rolling back")
             conn.commit()
             print(json.dumps({"action": "drain", "status": "DRAINING"}, indent=2))
             return 0
