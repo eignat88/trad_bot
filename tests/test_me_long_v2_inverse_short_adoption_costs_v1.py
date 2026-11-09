@@ -95,17 +95,20 @@ def _entry_costs(row: dict) -> float:
     return float(row["entry_fee"]) + float(row["entry_slippage"])
 
 
-def _cycle_ambiguous_insert_deferred(
+def _cycle_ambiguous_insert_unbooked(
     server, contour, store, clock, caplog, *, symbol="ETHUSDT", bal_times=1,
 ):
-    """One cycle: INSERT COMMITTED + ACK lost AND a failed confirm-read.
+    """One cycle: INSERT COMMITTED + ACK lost + FAILED adoption confirm-read.
 
     The INSERT applies server-side but its acknowledgement is lost; the
     idempotent retry sees the committed row (rowcount 0), so
-    save_position() returns False and adoption is attempted — but the
-    adoption's fresh balance_components() read fails (``bal_times``), so
-    the adoption DEFERS: nothing opened, nothing booked, accounting
-    untrusted, the event stays CAPTURED for the next cycle.
+    save_position() returns False and adoption runs — but the adoption's
+    fresh balance_components() read fails (``bal_times``).  Review P1
+    semantics: the VERIFIED row is adopted ANYWAY (protective STOP/TP/
+    TIMEOUT active from the very next cycle), NOTHING is booked (the
+    balance stays untouched; the entry costs land exactly once at the
+    next successful reconciliation) and accounting stays untrusted, so
+    new entries are blocked.
 
     Returns ``(event_key, position_key, cycle)``.
     """
@@ -114,6 +117,7 @@ def _cycle_ambiguous_insert_deferred(
     ) == CAPTURED
     ev_key = _captured_event_key(store)
     key = build_position_key(ev_key)
+    engine = contour.engine
     server.commit_ack_lost = True
     server.commit_ack_lost_on = "INSERT_POSITION"
     server.fail_execute_with = pg_dbapi.IntegrityError(
@@ -123,11 +127,20 @@ def _cycle_ambiguous_insert_deferred(
     server.fail_execute_times = bal_times
     with caplog.at_level(logging.WARNING, logger=ENGINE_LOGGER):
         cycle = contour.run_cycle({symbol: 100.0})
-    assert cycle["entries"] == 0, cycle
-    assert key not in contour.engine.open_positions
+    # Adopted for protective management despite the failed confirm-read:
+    assert cycle["entries"] == 1, cycle
+    assert key in engine.open_positions
+    assert "accounting UNCONFIRMED" in caplog.text
+    assert "ADOPTED committed position" in caplog.text
+    # …but NOT booked and NOT trusted:
+    assert engine.balance == pytest.approx(_INITIAL)
+    assert engine._balance_trusted is False
+    assert cycle["accounting_consistent"] is False
+    # The committed row verbatim, exactly one INSERT, event marked entered:
     assert server.positions[key]["status"] == POSITION_STATUS_OPEN
     assert server.apply_log.count(("INSERT_POSITION", key)) == 1
-    assert "adoption DEFERRED" in caplog.text
+    assert server.apply_log.count(("MARK_EVENT_ENTERED", ev_key)) == 1
+    assert len(store.list_events(status=EVENT_STATUS_ENTERED)) == 1
     return ev_key, key, cycle
 
 
@@ -186,31 +199,34 @@ class TestAdoptionEntryCostAccounting:
         )
 
     def test_adoption_after_reconciliation_never_double_books(self, caplog):
-        """THE BUG (Codex P2-2): reconcile first, adoption afterwards.
+        """THE BUG (Codex P2-2): the costs must land exactly ONCE.
 
-        Cycle 1 defers the adoption (failed confirmation read), so the
-        committed row sits in PostgreSQL with nothing booked.  Cycle 2's
-        reconciliation at the top of open_entries folds the committed
-        entry costs into memory FIRST — the adoption that follows must
-        only verify and open, never subtract the same costs again.
+        Cycle 1 adopts the committed row with a FAILED confirm-read (P1:
+        protective exits active, NOTHING booked).  Cycle 2's reconciliation
+        at the top of open_entries folds the committed entry costs into
+        memory exactly once — and no adoption step may ever subtract them
+        again (the old code deferred the adoption AND later re-subtracted
+        by hand, double-counting the costs against the confirmed ledger).
         """
         server = _FakeServer()
         store, contour, clock = _contour(server)
         engine = contour.engine
-        ev_key, key, cycle1 = _cycle_ambiguous_insert_deferred(
+        ev_key, key, cycle1 = _cycle_ambiguous_insert_unbooked(
             server, contour, store, clock, caplog,
         )
-        # Nothing booked yet while the outcome is unverifiable:
+        # Adopted for protection, but nothing booked while unconfirmed:
         assert engine.balance == pytest.approx(_INITIAL)
         assert engine._balance_trusted is False
         assert cycle1["accounting_consistent"] is False
-        assert len(store.list_events(status=EVENT_STATUS_CAPTURED)) == 1
+        assert len(store.list_events(status=EVENT_STATUS_ENTERED)) == 1
 
-        # Cycle 2: reads heal -> reconciliation runs BEFORE the adoption.
+        # Cycle 2: reads heal -> the reconciliation folds the committed
+        # costs in ONCE; the adoption itself never re-runs (the event is
+        # marked and the position key is guarded).
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger=ENGINE_LOGGER):
             cycle2 = contour.run_cycle({"ETHUSDT": 100.0})
-        assert cycle2["entries"] == 1, cycle2
+        assert cycle2["entries"] == 0, cycle2
         assert key in engine.open_positions
         assert engine._balance_trusted is True
 
@@ -246,15 +262,17 @@ class TestAdoptionEntryCostAccounting:
             store.balance_components()["balance"],
         )
 
-    def test_adoption_deferred_across_several_failed_reconciliations(
+    def test_adoption_blocked_across_several_failed_reconciliations(
         self, caplog,
     ):
-        """Two consecutive failed confirm-reads block everything, then heal.
+        """Several failed confirm-reads keep NEW entries blocked, then heal.
 
-        Cycle 1: adoption deferred (first failure).  Cycle 2: the
-        reconciliation itself fails again -> accounting stays untrusted and
-        the gate refuses new entries.  Cycle 3: reads succeed -> reconcile
-        then adopt, booked exactly once, invariant restored.
+        Cycle 1: adoption (unbooked, protective) with the first failure.
+        Cycle 2: both reconciliation retries fail again -> accounting stays
+        untrusted and the gate refuses the SECOND candidate while the
+        adopted position keeps its protective management.  Cycle 3: reads
+        succeed -> the reconciliation folds the committed entry costs in
+        exactly once, then the blocked candidate may open.
         """
         server = _FakeServer()
         store, contour, clock = _contour(server)
@@ -263,33 +281,45 @@ class TestAdoptionEntryCostAccounting:
         # cycle 1's adoption confirm-read, cycle 2's recovery retry inside
         # check_exits(), and cycle 2's retry inside open_entries() — the
         # gate then blocks the whole second cycle.
-        ev_key, key, cycle1 = _cycle_ambiguous_insert_deferred(
+        ev_key, key, cycle1 = _cycle_ambiguous_insert_unbooked(
             server, contour, store, clock, caplog, bal_times=3,
         )
+        # A second candidate waits behind the blocked accounting:
+        assert _capture(
+            store, _candidate("SOLUSDT", 100.0, detected_at=clock()),
+            clock=clock,
+        ) == CAPTURED
+        sol_key = build_position_key(_captured_event_key(store))
         assert engine.balance == pytest.approx(_INITIAL)
         assert engine._balance_trusted is False
 
-        # Cycle 2: the reconciliation at the top of open_entries fails
-        # again -> entries refused, nothing adopted, balance untouched.
+        # Cycle 2: both reconciliation retries fail -> entries refused,
+        # the adopted position stays under protective management.
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger=ENGINE_LOGGER):
-            cycle2 = contour.run_cycle({"ETHUSDT": 100.0})
+            cycle2 = contour.run_cycle(
+                {"ETHUSDT": 100.0, "SOLUSDT": 100.0},
+            )
         assert cycle2["entries"] == 0, cycle2
         assert "not trustworthy" in caplog.text
         assert engine._balance_trusted is False
-        assert key not in engine.open_positions
+        assert key in engine.open_positions          # P1: exits stay active
+        assert sol_key not in engine.open_positions  # new entry blocked
         assert engine.balance == pytest.approx(_INITIAL)
         assert server.apply_log.count(("INSERT_POSITION", key)) == 1
-        assert server.apply_log.count(("MARK_EVENT_ENTERED", ev_key)) == 0
+        assert server.apply_log.count(("MARK_EVENT_ENTERED", ev_key)) == 1
 
-        # Cycle 3: injection exhausted -> reconcile + adoption succeed.
+        # Cycle 3: injection exhausted -> the reconciliation lands the
+        # committed ETH entry costs exactly once, then SOL opens normally.
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger=ENGINE_LOGGER):
-            cycle3 = contour.run_cycle({"ETHUSDT": 100.0})
+            cycle3 = contour.run_cycle(
+                {"ETHUSDT": 100.0, "SOLUSDT": 100.0},
+            )
         assert cycle3["entries"] == 1, cycle3
-        row = server.positions[key]
-        costs = _entry_costs(row)
-        assert engine.balance == pytest.approx(_INITIAL - costs)
+        eth_costs = _entry_costs(server.positions[key])
+        sol_costs = _entry_costs(server.positions[sol_key])
+        assert engine.balance == pytest.approx(_INITIAL - eth_costs - sol_costs)
         assert engine.balance == pytest.approx(
             store.balance_components()["balance"],
         )
@@ -394,37 +424,46 @@ class TestAdoptionEntryCostAccounting:
     def test_duplicate_delivery_after_adoption_never_rebooks(self, caplog):
         """A repeated delivery of the adopted event never rebooks costs.
 
-        The entry mark fails after a successful adoption (fail-open), so
-        the event stays CAPTURED and is offered again — the position guard
-        must return it without a second INSERT, a second mark or any
-        balance movement.
+        Cycle 1: the INSERT commits with a lost ACK, the adoption
+        reconciles and books the entry costs ONCE, but the entry MARK is
+        rejected (fail-open) — the event stays CAPTURED and is offered
+        again.  The position guard must answer every repetition without a
+        second INSERT, a second mark or any balance movement.
         """
         server = _FakeServer()
         store, contour, clock = _contour(server)
         engine = contour.engine
-        ev_key, key, cycle1 = _cycle_ambiguous_insert_deferred(
-            server, contour, store, clock, caplog,
-        )
+        assert _capture(
+            store, _candidate("ETHUSDT", 100.0, detected_at=clock()),
+            clock=clock,
+        ) == CAPTURED
+        ev_key = _captured_event_key(store)
+        key = build_position_key(ev_key)
 
-        # Cycle 2: adoption succeeds, the entry mark is rejected:
+        server.commit_ack_lost = True
+        server.commit_ack_lost_on = "INSERT_POSITION"
         server.fail_execute_with = pg_dbapi.IntegrityError("mark_rejected")
         server.fail_execute_match = _MARK_MATCH
         server.fail_execute_times = 1
         with caplog.at_level(logging.WARNING, logger=ENGINE_LOGGER):
-            cycle2 = contour.run_cycle({"ETHUSDT": 100.0})
-        assert cycle2["entries"] == 1, cycle2
+            cycle1 = contour.run_cycle({"ETHUSDT": 100.0})
+        # Adopted and booked exactly once; the MARK was rejected:
+        assert cycle1["entries"] == 1, cycle1
         assert key in engine.open_positions
         assert len(store.list_events(status=EVENT_STATUS_CAPTURED)) == 1
+        assert server.apply_log.count(("INSERT_POSITION", key)) == 1
+        assert server.apply_log.count(("MARK_EVENT_ENTERED", ev_key)) == 0
         row = server.positions[key]
         costs = _entry_costs(row)
         assert engine.balance == pytest.approx(_INITIAL - costs)
+        assert engine._balance_trusted is True
 
-        # Cycle 3: the same event is delivered again — position guard
+        # Cycle 2: the same event is delivered again — position guard
         # returns it, nothing is inserted, marked or rebooked:
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger=ENGINE_LOGGER):
-            cycle3 = contour.run_cycle({"ETHUSDT": 100.0})
-        assert cycle3["entries"] == 0, cycle3
+            cycle2 = contour.run_cycle({"ETHUSDT": 100.0})
+        assert cycle2["entries"] == 0, cycle2
         assert engine.balance == pytest.approx(_INITIAL - costs)
         assert engine.balance == pytest.approx(
             store.balance_components()["balance"],
@@ -457,13 +496,15 @@ class TestAdoptionEntryCostAccounting:
         server = _FakeServer()
         store, contour, clock = _contour(server)
         engine = contour.engine
-        ev_key, key, _ = _cycle_ambiguous_insert_deferred(
+        ev_key, key, _ = _cycle_ambiguous_insert_unbooked(
             server, contour, store, clock, caplog,
         )
+        assert engine.balance == pytest.approx(_INITIAL)  # adopted, unbooked
         cycle2 = contour.run_cycle({"ETHUSDT": 100.0})
-        assert cycle2["entries"] == 1, cycle2
+        assert cycle2["entries"] == 0, cycle2  # event already marked ENTERED
         row = server.positions[key]
         costs = _entry_costs(row)
+        # The reconciliation folded the committed entry costs in exactly once:
         assert engine.balance == pytest.approx(_INITIAL - costs)
         assert store.list_events(status=EVENT_STATUS_ENTERED)
 
@@ -509,11 +550,12 @@ class TestAdoptionEntryCostAccounting:
         server = _FakeServer()
         store, contour, clock = _contour(server)
         engine = contour.engine
-        _ev_key, key, _ = _cycle_ambiguous_insert_deferred(
+        _ev_key, key, _ = _cycle_ambiguous_insert_unbooked(
             server, contour, store, clock, caplog,
         )
         cycle2 = contour.run_cycle({"ETHUSDT": 100.0})
-        assert cycle2["entries"] == 1, cycle2
+        assert cycle2["entries"] == 0, cycle2  # event already marked ENTERED
+        # The reconciliation folded the committed entry costs in exactly once:
         assert engine.balance == pytest.approx(
             _INITIAL - _entry_costs(server.positions[key]),
         )
@@ -557,6 +599,130 @@ class TestAdoptionEntryCostAccounting:
 
         for _ in range(3):
             cycle = contour.run_cycle({"ETHUSDT": _TP_PRICE})
+            assert cycle["entries"] == 0 and not cycle["closed"], cycle
+        assert engine.balance == pytest.approx(
+            store.balance_components()["balance"],
+        )
+
+    def test_protective_exits_survive_failed_adoption_reconciliation(
+        self, caplog,
+    ):
+        """Review P1 chain: INSERT committed -> ACK lost -> repeated failed
+        reconciliations -> STOP still fires -> terminal persistence and
+        recovery -> balance reconciled, entry costs charged exactly once.
+
+        The verified OPEN row is adopted for protective management even
+        while balance_components() keeps failing; nothing is booked in the
+        meantime and NEW entries stay blocked (the second candidate is
+        refused every cycle until the balance is confirmed); afterwards the
+        final ledger equals exactly ``initial + realized net PnL`` (entry
+        costs landed once, inside the closed row's net) with no drift over
+        idle cycles.
+        """
+        server = _FakeServer()
+        store, contour, clock = _contour(server)
+        engine = contour.engine
+
+        # 1) INSERT COMMITTED + ACK lost + first failed confirm-read:
+        #    adopted UNBOOKED — protective exits are now ACTIVE (P1).
+        ev_key, key, cycle1 = _cycle_ambiguous_insert_unbooked(
+            server, contour, store, clock, caplog, bal_times=3,
+        )
+        assert key in engine.open_positions
+        # A second candidate waits behind the blocked accounting:
+        assert _capture(
+            store, _candidate("SOLUSDT", 100.0, detected_at=clock()),
+            clock=clock,
+        ) == CAPTURED
+        sol_key = build_position_key(_captured_event_key(store))
+
+        # 2) Cycle 2: BOTH remaining reconciliation retries fail — the
+        #    second candidate stays blocked for the WHOLE cycle and the
+        #    adopted position keeps protective management (still unbooked).
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=ENGINE_LOGGER):
+            cycle2 = contour.run_cycle(
+                {"ETHUSDT": 100.0, "SOLUSDT": 100.0},
+            )
+        assert cycle2["entries"] == 0, cycle2            # blocked (untrusted)
+        assert "not trustworthy" in caplog.text          # SOL refused
+        assert key in engine.open_positions              # protective still on
+        assert sol_key not in engine.open_positions      # new entry blocked
+        assert engine.balance == pytest.approx(_INITIAL) # still unbooked
+        assert engine._balance_trusted is False
+        # The DETERMINISTIC invariant holds against the last CONFIRMED
+        # read (the construction-time one here — every fresh read fails):
+        # the committed entry costs are deliberately NOT in memory yet and
+        # land exactly once at the next successful reconciliation.
+        assert engine.balance == pytest.approx(
+            engine.confirmed_balance
+            + sum(engine._uncommitted_deltas.values()),
+        )
+
+        # 3) Cycle 3: the PROTECTIVE STOP fires (price gapped beyond the
+        #    stop) and the terminal write is rejected once — persistence
+        #    pending, close delta local; the balance confirmed earlier in
+        #    the cycle unblocks the second candidate afterwards.
+        clock.advance(minutes=15)
+        server.fail_execute_with = pg_dbapi.IntegrityError("terminal_rejected")
+        server.fail_execute_match = _UPDATE_ONLY
+        server.fail_execute_times = 1
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=ENGINE_LOGGER):
+            cycle3 = contour.run_cycle(
+                {"ETHUSDT": 110.0, "SOLUSDT": 100.0},
+            )
+        assert cycle3["exits"] == 1, cycle3
+        assert cycle3["exit_reasons"] == ["STOP_LOSS_GAP"], cycle3
+        assert key not in engine.open_positions          # closed out of memory
+        assert key in engine.pending_closes              # terminal persistence
+        assert engine._uncommitted_deltas[key]           # close delta local
+        # The failed terminal write was re-confirmed in the SAME cycle by
+        # the healthy store read (the row is still OPEN server-side), so
+        # accounting is trustworthy again and the second candidate unblocks:
+        assert engine._balance_trusted is True
+        assert cycle3["entries"] == 1, cycle3            # balance confirmed
+        assert sol_key in engine.open_positions
+
+        # 4) Cycle 4: healthy again — the flush replays the close, the
+        #    reconciliation folds EVERYTHING in exactly once (entry costs
+        #    via the closed row's net) and nothing is pending any more.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=ENGINE_LOGGER):
+            cycle4 = contour.run_cycle(
+                {"ETHUSDT": 100.0, "SOLUSDT": 100.0},
+            )
+        assert cycle4["entries"] == 0 and not cycle4["closed"], cycle4
+        assert not engine.pending_closes and not engine._uncommitted_deltas
+        assert engine._balance_trusted is True
+        closed_row = server.positions[key]
+        assert closed_row["status"] == POSITION_STATUS_CLOSED
+
+        # THE identity: entry costs charged EXACTLY once (inside net_pnl):
+        net = float(closed_row["net_pnl"])
+        sol_costs = _entry_costs(server.positions[sol_key])
+        assert engine.balance == pytest.approx(_INITIAL + net - sol_costs)
+        assert engine.balance == pytest.approx(
+            store.balance_components()["balance"],
+        )
+        # Exactly one INSERT and one terminal UPDATE for the adopted key:
+        assert server.apply_log.count(("INSERT_POSITION", key)) == 1
+        assert server.apply_log.count(("UPDATE_POSITION", key)) == 1
+
+        # Original entry facts verbatim through the whole chain:
+        assert closed_row["entered_at"] == SIGNAL_AT
+        assert closed_row["deadline_at"] == deadline_for(SIGNAL_AT)
+        assert closed_row["exit_reason"] == "STOP_LOSS_GAP"
+        assert closed_row["event_key"] == ev_key
+
+        # The deterministic invariant re-armed against a fresh confirmed
+        # read: memory_balance == confirmed_balance + Σ uncommitted_deltas.
+        assert engine.reconcile_balance() is True
+        assert not engine._uncommitted_deltas
+        assert engine.balance == pytest.approx(engine.confirmed_balance)
+
+        for _ in range(3):
+            cycle = contour.run_cycle({"ETHUSDT": 100.0, "SOLUSDT": 100.0})
             assert cycle["entries"] == 0 and not cycle["closed"], cycle
         assert engine.balance == pytest.approx(
             store.balance_components()["balance"],

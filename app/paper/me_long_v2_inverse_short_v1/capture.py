@@ -6,10 +6,13 @@ events into the contour's own event ledger, INDEPENDENTLY of the trading
 either of them.
 
 Capture point: ``ScannerOrchestrator.scan_all_with_stats`` publishes the
-post-dedup, PRE-geometry / PRE-gate / PRE-expectancy candidates under the
+PRE-dedup, PRE-geometry / PRE-gate / PRE-expectancy candidates under the
 ``_me_inverse_short_source_events`` stats key; ``scanner_runner`` forwards
-them here.  Both layers are fail-open: an exception here can never break a
-scanner cycle or change a trading decision.
+them here.  The pre-dedup publication lets an unconfirmed capture (a
+PostgreSQL failure on the first delivery) be re-delivered by a later scan
+of the same candidate, while ``event_key`` idempotency guarantees the
+replay never creates a second row.  Both layers are fail-open: an exception
+here can never break a scanner cycle or change a trading decision.
 
 Safety invariants
 -----------------

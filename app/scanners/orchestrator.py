@@ -257,8 +257,23 @@ class ScannerOrchestrator:
         # filters — without changing the filters or their data.  The caller
         # (scanner_runner) forwards these to the fail-open capture layer,
         # which keys them by a stable event_key for idempotent delivery.
+        #
+        # Review P2 (retry unconfirmed captures): the list is built from
+        # the PRE-DEDUP candidates, not from ``unique``.  In-memory dedup
+        # marks a candidate as seen on the FIRST scan — if the research
+        # capture then failed with a PostgreSQL error, the event was never
+        # persisted and a later scan would drop it as a duplicate, losing
+        # the signal forever.  Re-publishing every current-scan source
+        # candidate makes unconfirmed events get re-delivered until they
+        # land, while the capture layer's deterministic event_key keeps it
+        # strictly idempotent: an already-captured candidate replays as a
+        # silent DUPLICATE (one row, never two).  Production dedup,
+        # scoring, gates and trading behaviour are untouched — they are
+        # all driven by ``unique`` below, which still filters normally.
+        # Only candidates the CURRENT scan emits are ever published here:
+        # no historical backfill is possible.
         stats["_me_inverse_short_source_events"] = [
-            c for c in unique
+            c for c in scored
             if c.scanner_name == "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2"
             and c.direction == "LONG"
         ]

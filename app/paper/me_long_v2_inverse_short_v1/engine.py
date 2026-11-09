@@ -494,14 +494,14 @@ class InverseShortPaperEngine:
         original ``entered_at`` / ``deadline_at`` / entry price / STOP / TP
         are never recomputed, no second INSERT is issued, and the position
         enters ``open_positions`` immediately — so protective
-        STOP/TP/TIMEOUT applies from the very next cycle.  Entry-cost
-        accounting goes through a FRESH ``reconcile_balance()`` (review
-        P2-2): the confirmed ledger already carries the committed row's
-        costs, so they are folded into the memory balance exactly once —
-        never re-subtracted by hand, never double-counted when a
-        reconciliation ran earlier.  Every failure path stays fail-closed:
-        nothing is opened, booked or marked unless the committed row fully
-        verifies AND the confirmed balance can be read.
+        STOP/TP/TIMEOUT applies from the very next cycle EVEN when the
+        accounting reconciliation read is unavailable (review P1).  Entry
+        costs are never subtracted by hand (review P2-2): they are folded
+        in exactly once by a successful ``reconcile_balance()`` — either
+        here, or later, while the accounting-consistent gate keeps new
+        entries blocked until that confirmation succeeds.  Every other
+        failure path stays fail-closed: nothing is opened, booked or
+        marked unless the committed row fully verifies.
         """
         if position_key in self.open_positions:
             # Already adopted in this process — never book the fees twice.
@@ -533,29 +533,30 @@ class InverseShortPaperEngine:
                 stored.symbol,
             )
             return None
-        # Review P2-2: entry accounting is reconciled against a FRESH
-        # confirmed ledger BEFORE anything is booked or marked.  A fresh
-        # balance_components() read already includes this committed row's
-        # entry costs (OPEN rows contribute entry_fee + entry_slippage),
-        # so re-subtracting them here would DOUBLE-COUNT whenever a
-        # reconciliation ran between the ambiguous COMMIT and this
-        # adoption — memory would already carry the costs through
-        # confirmed_balance.  reconcile_balance() re-establishes the
-        # deterministic invariant
-        #     memory_balance == confirmed_balance + Σ uncommitted_deltas
-        # instead of a manual fee subtraction, and it REFUSES the
-        # adoption while the confirmed balance cannot be read: nothing is
-        # opened, booked or marked, and the accounting-consistent gate
-        # keeps new entries blocked until a reconciliation succeeds.
-        if not self.reconcile_balance():
+        # Review P2-2 + Review P1: the committed row is ALWAYS adopted
+        # once it verifies — protective STOP/TP/TIMEOUT must never be
+        # held hostage by an unavailable accounting read.  Entry costs
+        # are NEVER subtracted by hand; a fresh balance_components()
+        # read already carries them (OPEN rows contribute entry_fee +
+        # entry_slippage), so reconcile_balance() folds them into the
+        # memory ledger exactly once and re-establishes
+        #     memory_balance == confirmed_balance + Σ uncommitted_deltas.
+        # If that read FAILS, the position is still opened for protective
+        # management — but nothing is booked: _balance_trusted stays
+        # False, the accounting-consistent gate keeps NEW entries blocked,
+        # and the entry costs land exactly once at the next successful
+        # reconciliation (which reads them from the confirmed ledger).
+        accounting_confirmed = self.reconcile_balance()
+        if not accounting_confirmed:
             logger.warning(
-                "me inverse short adoption DEFERRED: confirmed balance "
-                "unreadable — entry costs NOT booked, position NOT opened, "
-                "new entries blocked until a reconciliation succeeds: "
+                "me inverse short adoption accounting UNCONFIRMED: "
+                "confirmed balance unreadable — position opened for "
+                "protective STOP/TP/TIMEOUT management only, entry costs "
+                "NOT booked (they land exactly once at the next successful "
+                "reconciliation), new entries blocked until then: "
                 "key=%s symbol=%s",
                 position_key[:48], stored.symbol,
             )
-            return None
         try:
             self.store.mark_event_entered(event.event_key, position_key)
         except Exception:
@@ -566,19 +567,31 @@ class InverseShortPaperEngine:
                 exc_info=True,
             )
         # NO manual fee subtraction (review P2-2): the confirmed ledger
-        # carries the entry costs and reconcile_balance() just folded them
-        # into self.balance exactly once — booked never twice, and the
-        # invariant above holds from this moment on.
+        # carries the entry costs — either folded in just now (confirmed)
+        # or folded in by the next successful reconciliation (unconfirmed,
+        # review P1).  Booked never twice, protective exits always active.
         self.open_positions[position_key] = stored
-        logger.warning(
-            "me inverse short ADOPTED committed position after an ambiguous "
-            "INSERT (no re-open, original entry facts kept, entry costs "
-            "taken from the confirmed ledger exactly once): "
-            "key=%s symbol=%s entered_at=%s stop=%.6f target=%.6f",
-            position_key[:48], stored.symbol,
-            stored.entered_at.isoformat() if stored.entered_at else "?",
-            stored.stop_price, stored.target_price,
-        )
+        if accounting_confirmed:
+            logger.warning(
+                "me inverse short ADOPTED committed position after an "
+                "ambiguous INSERT (no re-open, original entry facts kept, "
+                "entry costs taken from the confirmed ledger exactly once): "
+                "key=%s symbol=%s entered_at=%s stop=%.6f target=%.6f",
+                position_key[:48], stored.symbol,
+                stored.entered_at.isoformat() if stored.entered_at else "?",
+                stored.stop_price, stored.target_price,
+            )
+        else:
+            logger.warning(
+                "me inverse short ADOPTED committed position after an "
+                "ambiguous INSERT (accounting UNCONFIRMED — protective "
+                "exits active, booking deferred to the next successful "
+                "reconciliation, original entry facts kept): "
+                "key=%s symbol=%s entered_at=%s stop=%.6f target=%.6f",
+                position_key[:48], stored.symbol,
+                stored.entered_at.isoformat() if stored.entered_at else "?",
+                stored.stop_price, stored.target_price,
+            )
         return stored
 
     def _build_position(
