@@ -9,6 +9,48 @@ trading side effects.
 
 ## 0. Review response (PR #269 review `5825354280`)
 
+### Codex re-review round — three findings: **all FIXED (red→green)**
+
+* **P1 — straddle candle could close the SHORT.** `_merge_bars` now
+  requires the candle's WHOLE interval after the entry
+  (`open_ms >= max(entered_at)` on the symbol): a candle that closed
+  after the entry but OPENED before it (or carries no known `open_ms`) is
+  inadmissible and withheld from ALL positions on that symbol — the
+  engine falls back to the observed price only (conservative delay,
+  no lookahead, no pre-entry extremes, no invented fills). Red→green:
+  `test_straddling_candle_high_cannot_stop_out_the_short`,
+  `test_straddling_candle_low_cannot_take_profit_the_short`,
+  `test_unknown_bar_provenance_is_never_used_for_exits` (missing
+  `open_ms`), `test_merge_admits_only_whole_intervals_after_the_entry`,
+  `test_multiple_positions_symbol_clips_to_the_latest_entry`,
+  `test_restart_does_not_change_bar_admissibility` — every one of them
+  failed before the fix and passes after it.
+* **P1 — quote stale after slow API requests.** `MarketDataProvider.
+  snapshot()` now runs a RETURN-TIME freshness gate immediately before
+  returning: every usable price/bar/funding observation is re-checked
+  against the current UTC clock and excluded as `STALE` when it aged out
+  during the cycle's later OHLC/funding requests (with
+  `PRICE_MAX_AGE_S=30`, a quote followed by a 60 s kline request can
+  never reach the engine as `OK`). Red→green: `TestReturnTimeFreshnessGate`
+  (slow kline / slow funding / per-symbol observation times) and the
+  runtime-level `TestSlowApiStalenessRuntime` (an aged quote blocks the
+  new entry **without losing the pending event** and enters exactly once
+  after recovery; an aged quote never fabricates a TP — management
+  resumes on the first healthy cycle).
+* **P2 — empty funding history must not become `0.0`.** The provider
+  fetches funding through the SAME Bybit API layer (`_public_get` —
+  budgeted, retried, limiter- and telemetry-aware) with the tri-state
+  preserved: a row → `OK` (a genuine `0.0` included), an EMPTY list →
+  `MISSING` (never a zero), a malformed row → `INVALID`, a failure →
+  `API_ERROR`. `BybitClient.get_funding_rate()` is NOT modified (its
+  historical contract still serves other callers). Red→green:
+  `TestFundingRealClientContract` — against the REAL `BybitClient` the
+  test proves `get_funding_rate() == 0.0` on an empty history while the
+  provider reports `MISSING` and ships no rate — plus the end-to-end
+  `TestFundingEmptyHistoryRuntime`: `funding_periods_charged` stays `0`
+  while the history is empty, settles exactly once at the first real
+  rate, and stays unchanged across a restart.
+
 ### R1 (P1) — pre-entry candle could close the SHORT: **CONFIRMED → FIXED (red→green)**
 
 * **Defect (confirmed):** `_merge_bars` handed the last CLOSED bar to
@@ -221,12 +263,13 @@ never backfills (`signal_time > freeze_ts` gate + migration-085 CHECK).
 
 | Suite | Result |
 |---|---|
-| `tests/test_me_long_v2_inverse_short_market_data_v1.py` | **42 passed** |
-| `tests/test_me_long_v2_inverse_short_production_runtime_v1.py` | **47 passed** (incl. `TestPreEntryBarClipping` red→green, `TestBybitClientContract`, outage-capture) |
+| `tests/test_me_long_v2_inverse_short_market_data_v1.py` | **51 passed** (incl. `TestReturnTimeFreshnessGate` + `TestFundingRealClientContract` red→green, Codex R2) |
+| `tests/test_me_long_v2_inverse_short_production_runtime_v1.py` | **54 passed** (incl. `TestPreEntryBarClipping` straddle/restart/multi-position red→green, `TestSlowApiStalenessRuntime`, `TestFundingEmptyHistoryRuntime`, `TestBybitClientContract`, outage-capture) |
 | `tests/test_me_long_v2_inverse_short_production_runtime_pg_it_v1.py` | **3 passed on a real isolated PostgreSQL 16.15** (`TEST_DB_*` → `trad_bot_migration_test`; commands + isolation proof in §0 R2) — NOT skipped, NOT mocked |
 | PR #267 contour regression (v1, source capture, redelivery, ambiguous commit, close durability, funding/draining, PG reconnect, review2/review3, adoption costs) | **196 passed, 1 skipped** |
-| Bybit client / retry budget / API telemetry / global rate limiter / candle-safety | **412 passed, 3 skipped** |
-| Full suite vs matched `origin/main` baseline (same env, full history, same 6 `--ignore` files) | baseline `537ad74`: **72 failed, 6145 passed, 78 skipped, 168 errors**; head `170046c`: **74 failed, 6232 passed, 81 skipped, 168 errors** — baseline-only failures **0**, head-only = **2 HTF branch-hygiene git guards** (pre-existing on any feature branch incl. PR #267 — control experiment in §0 R3) |
+| Bybit client / retry budget / API telemetry / global rate limiter (R2 rerun: 224 passed) + candle-safety (8 pre-existing fixture failures, identical in baseline) | **412 passed, 3 skipped** (full-suite equivalent) |
+| Scanner / Paper / Evaluator critical subset (R2 rerun) | head **16 failed, 306 passed, 15 errors** — byte-identical counts on the baseline clone (**16 / 306 / 15**): no-local-PostgreSQL + documented `test_paper_disable_uses_exact_canonical_identifier` |
+| Full suite vs matched `origin/main` baseline (same env, full history, same 6 `--ignore` files) | baseline `537ad74`: **72 failed, 6145 passed, 78 skipped, 168 errors**; head (Codex R2 fixes): **74 failed, 6248 passed, 81 skipped, 168 errors** — baseline-only failures **0**, head-only = **2 HTF branch-hygiene git guards** (pre-existing on any feature branch incl. PR #267 — control experiment in §0 R3); the +103 passing tests are this PR's new suites (87 pre-R2 + 16 Codex-R2 red→green) |
 
 Mandatory §5 coverage map (18 items) is documented in the docstring of
 `tests/test_me_long_v2_inverse_short_production_runtime_v1.py`; items 11–13

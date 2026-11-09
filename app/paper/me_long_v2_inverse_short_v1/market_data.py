@@ -309,6 +309,53 @@ class MarketDataProvider:
             return None
         return number
 
+    def _expire_on_return(
+        self,
+        final_now: datetime,
+        statuses: dict[str, dict[str, str]],
+        prices: dict[str, float],
+        price_age_ms: dict[str, int],
+        bars: dict[str, dict[str, float]],
+        funding: dict[str, float],
+    ) -> None:
+        """Drop observations that aged out BEFORE the snapshot returned.
+
+        The per-stream triage inside ``snapshot()`` runs against the time
+        the cycle STARTED, but the bar and funding requests in between
+        (retries included) can consume seconds — a quote that was fresh
+        when fetched may be older than ``price_max_age_s`` by the time
+        the snapshot reaches the engine (Codex R2 P1).  This gate runs
+        immediately before the return: every USABLE observation is
+        re-checked against the CURRENT UTC clock and anything no longer
+        provably fresh is removed and honestly re-triaged ``STALE`` —
+        never passed on as ``OK`` with an age that was true only at cycle
+        start, and never substituted with a last-known value.
+        """
+        final_ms = int(final_now.timestamp() * 1000)
+        for symbol in list(prices):
+            cached = self._price_cache.get(symbol)
+            age_ms = self._age_ms(cached[1], final_now) if cached else None
+            if age_ms is None or age_ms > self.config.price_max_age_s * 1000.0:
+                prices.pop(symbol)
+                if age_ms is not None:
+                    # Diagnostic age of the newest observation (updated
+                    # to the RETURN time — that is what excluded it).
+                    price_age_ms[symbol] = age_ms
+                statuses[symbol][PRICE_STREAM] = STATUS_STALE
+        for symbol, bar in list(bars.items()):
+            age_ms = final_ms - int(bar["close_ms"])
+            if age_ms < 0 or age_ms > self.config.bar_max_age_s * 1000.0:
+                # ``age_ms < 0`` = the clock moved backwards mid-cycle:
+                # never fresh, honestly reported.
+                bars.pop(symbol)
+                statuses[symbol][BAR_STREAM] = STATUS_STALE
+        for symbol in list(funding):
+            cached = self._funding_cache.get(symbol)
+            age_ms = self._age_ms(cached[1], final_now) if cached else None
+            if age_ms is None or age_ms > self.config.funding_max_age_s * 1000.0:
+                funding.pop(symbol)
+                statuses[symbol][FUNDING_STREAM] = STATUS_STALE
+
     # ------------------------------------------------------------------
     # snapshot
     # ------------------------------------------------------------------
@@ -469,24 +516,32 @@ class MarketDataProvider:
             fetch_failed = False
             invalid_response = False
             refreshed = False
-            try:
-                raw = self.client.get_funding_rate(symbol)
-            except Exception:
+            fetched, fetched_value, fetch_exc = self._fetch_funding_rate(
+                symbol,
+            )
+            if fetched == STATUS_API_ERROR:
                 fetch_failed = True
                 api_errors += 1
                 logger.warning(
                     "me inverse short market data: funding fetch failed for "
                     "%s (rate stays UNKNOWN — the obligation is preserved, "
                     "nothing is booked, no zero is fabricated)",
-                    symbol, exc_info=True,
+                    symbol, exc_info=fetch_exc,
                 )
-            else:
-                value = self._valid_price_or_zero(raw)
-                if value is None:
-                    invalid_response = True
-                else:
-                    refreshed = True
-                    self._funding_cache[symbol] = (value, now)
+            elif fetched == STATUS_INVALID:
+                invalid_response = True
+            elif fetched == STATUS_MISSING:
+                # Valid but EMPTY funding history (Codex R2 P2): no
+                # observation was made — the rate stays UNKNOWN and an
+                # empty list is NEVER a confirmed 0.0 rate.
+                logger.debug(
+                    "me inverse short market data: empty funding history "
+                    "for %s — rate remains UNKNOWN (no zero fabricated)",
+                    symbol,
+                )
+            else:  # STATUS_OK — a real row, 0.0 included
+                refreshed = True
+                self._funding_cache[symbol] = (fetched_value, now)
             status, value, _age = self._cache_status(
                 self._funding_cache.get(symbol), now,
                 self.config.funding_max_age_s,
@@ -497,6 +552,16 @@ class MarketDataProvider:
             statuses[symbol][FUNDING_STREAM] = status
             if value is not None:
                 funding[symbol] = value
+
+        # ---- RETURN-TIME freshness gate (Codex R2 P1) ------------------
+        # The triage above ran at cycle START; the bar/funding requests
+        # may have consumed seconds since.  Re-check every usable
+        # observation against the CURRENT clock before returning.
+        final_now = _as_utc(self._clock())
+        self._expire_on_return(
+            final_now if final_now is not None else now,
+            statuses, prices, price_age_ms, bars, funding,
+        )
 
         return MarketDataSnapshot(
             observed_at=now,
@@ -518,3 +583,59 @@ class MarketDataProvider:
         if not math.isfinite(number):
             return None
         return number
+
+    def _fetch_funding_rate(
+        self, symbol: str,
+    ) -> tuple[str, float | None, BaseException | None]:
+        """Fetch one funding rate WITHOUT collapsing "no history" into 0.0.
+
+        ``BybitClient.get_funding_rate`` returns a literal ``0.0`` when
+        the funding-history response is an EMPTY list — a value
+        indistinguishable from a CONFIRMED zero rate.  Adopting it would
+        permanently advance ``funding_periods_charged`` with a fabricated
+        zero (Codex R2 P2).  This adapter goes through the SAME Bybit API
+        layer that helper uses (``_public_get`` — budgeted, retried,
+        limiter- and telemetry-aware) but keeps the tri-state:
+
+          * ``("OK", rate_percent, None)``   — a history row was present
+            (a genuine 0.0 included);
+          * ``("MISSING", None, None)``      — the history list is empty
+            (not yet published): UNKNOWN, never a zero;
+          * ``("INVALID", None, None)``      — the row exists but is
+            malformed / non-finite;
+          * ``("API_ERROR", None, exc)``     — the request failed.
+
+        Scripted doubles without the raw layer keep their existing
+        behaviour through the public helper.  ``BybitClient`` itself is
+        NOT modified — its historical contract serves other callers
+        unchanged (regression: tests/test_bybit_*).
+        """
+        raw_get = getattr(self.client, "_public_get", None)
+        if not callable(raw_get):
+            # Scripted test double: only the public helper exists.
+            try:
+                raw = self.client.get_funding_rate(symbol)
+            except Exception as exc:
+                return STATUS_API_ERROR, None, exc
+            value = self._valid_price_or_zero(raw)
+            if value is None:
+                return STATUS_INVALID, None, None
+            return STATUS_OK, value, None
+        try:
+            payload = raw_get(
+                "/v5/market/funding/history",
+                category="linear", symbol=symbol, limit=1,
+            )
+            rows = payload["result"]["list"]
+        except Exception as exc:
+            return STATUS_API_ERROR, None, exc
+        if not rows:
+            # Empty history: no observation was made.  NEVER 0.0.
+            return STATUS_MISSING, None, None
+        row = rows[0] if isinstance(rows[0], dict) else None
+        value = self._valid_price_or_zero(
+            row.get("fundingRate") if row is not None else None,
+        )
+        if value is None:
+            return STATUS_INVALID, None, None
+        return STATUS_OK, value * 100.0, None   # fraction -> percent

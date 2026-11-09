@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from app.config import Settings
 from app.models import Candle
 from app.paper.me_long_v2_inverse_short_v1.market_data import (
     DEFAULT_BAR_INTERVAL,
@@ -66,15 +67,25 @@ class FakeBybitClient:
         self.klines = klines or {}
         self.funding = funding or {}
         self.calls: list[tuple] = []
+        # Simulated request latency: called INSIDE the request, so a test
+        # can age the clock between the price fetch and the snapshot's
+        # return-time freshness gate (Codex R2 P1).
+        self.before_klines = None
+        self.before_funding = None
+        self.before_tickers = None
 
     def get_tickers(self, category: str = "linear"):
         self.calls.append(("tickers", category))
+        if self.before_tickers is not None:
+            self.before_tickers()
         if isinstance(self.tickers, BaseException):
             raise self.tickers
         return self.tickers
 
     def get_klines(self, symbol: str, interval: str = "5", limit: int = 200):
         self.calls.append(("klines", symbol, interval, limit))
+        if self.before_klines is not None:
+            self.before_klines()
         value = self.klines.get(symbol, [])
         if isinstance(value, BaseException):
             raise value
@@ -82,6 +93,8 @@ class FakeBybitClient:
 
     def get_funding_rate(self, symbol: str) -> float:
         self.calls.append(("funding", symbol))
+        if self.before_funding is not None:
+            self.before_funding()
         value = self.funding.get(symbol)
         if isinstance(value, BaseException):
             raise value
@@ -408,3 +421,201 @@ class TestConfigAndHelpers:
         ]
         summary = snapshot.summary()
         assert summary[STATUS_OK] == 1 and summary[STATUS_MISSING] == 1
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 P1 — freshness is re-checked when the snapshot is RETURNED
+# ---------------------------------------------------------------------------
+class TestReturnTimeFreshnessGate:
+    """A quote validated when the cycle STARTED can age out while later
+    OHLC/funding requests (retries included) are still running.  The
+    provider must re-check every usable observation against the CURRENT
+    UTC clock immediately before returning and exclude anything no longer
+    provably fresh — never hand the engine an ``OK`` price whose age was
+    true only at cycle start."""
+
+    def test_slow_kline_request_expires_the_quote_before_return(self):
+        clock = _Clock(NOW)                       # 12:07:00
+        client = FakeBybitClient(
+            tickers=[{"symbol": "BTCUSDT", "lastPrice": "50000"}],
+            klines={"BTCUSDT": [_candle(datetime(2026, 6, 1, 12, 0))]},
+        )
+        # The kline request (with its retries) takes 60 seconds: with
+        # PRICE_MAX_AGE_S=30 the quote fetched at 12:07:00 is 60s old by
+        # the time the snapshot would reach the engine.
+        client.before_klines = lambda: clock.advance(seconds=60)
+        snapshot = _provider(client, clock=clock).snapshot(
+            price_symbols={"BTCUSDT"}, bar_symbols={"BTCUSDT"},
+        )
+        assert snapshot.prices == {}
+        assert snapshot.price_status("BTCUSDT") == STATUS_STALE
+        assert snapshot.price_age_ms["BTCUSDT"] == 60_000
+
+    def test_slow_funding_request_expires_the_quote_before_return(self):
+        clock = _Clock(NOW)
+        client = FakeBybitClient(
+            tickers=[{"symbol": "BTCUSDT", "lastPrice": "50000"}],
+            funding={"BTCUSDT": 0.01},
+        )
+        client.before_funding = lambda: clock.advance(seconds=60)
+        snapshot = _provider(client, clock=clock).snapshot(
+            price_symbols={"BTCUSDT"}, funding_symbols={"BTCUSDT"},
+        )
+        assert snapshot.prices == {}
+        assert snapshot.price_status("BTCUSDT") == STATUS_STALE
+        # The funding observation itself (3600s window) survives the wait.
+        assert snapshot.funding_rates_percent == {"BTCUSDT": 0.01}
+        assert snapshot.status("BTCUSDT", "funding") == STATUS_OK
+
+    def test_quote_stays_ok_when_all_requests_are_fast(self):
+        clock = _Clock(NOW)
+        client = FakeBybitClient(
+            tickers=[{"symbol": "BTCUSDT", "lastPrice": "50000"}],
+            klines={"BTCUSDT": [_candle(datetime(2026, 6, 1, 12, 0))]},
+            funding={"BTCUSDT": 0.01},
+        )
+        snapshot = _provider(client, clock=clock).snapshot(
+            price_symbols={"BTCUSDT"},
+            bar_symbols={"BTCUSDT"},
+            funding_symbols={"BTCUSDT"},
+        )
+        assert snapshot.prices == {"BTCUSDT": 50000.0}
+        assert snapshot.price_status("BTCUSDT") == STATUS_OK
+        assert snapshot.max_price_age_ms == 0
+
+    def test_symbols_expire_independently_by_observation_time(self):
+        clock = _Clock(NOW)
+        client = FakeBybitClient(tickers=[
+            {"symbol": "BTCUSDT", "lastPrice": "1"},
+            {"symbol": "ETHUSDT", "lastPrice": "2"},
+        ])
+        provider = _provider(client, clock=clock)
+        first = provider.snapshot(price_symbols={"BTCUSDT", "ETHUSDT"})
+        assert first.prices == {"BTCUSDT": 1.0, "ETHUSDT": 2.0}
+
+        # 15s later only ETHUSDT is re-observed; BTCUSDT keeps its
+        # 12:07:00 observation.  The BTCUSDT kline request then takes 20s.
+        clock.advance(seconds=15)
+        client.tickers = [{"symbol": "ETHUSDT", "lastPrice": "2.5"}]
+        client.klines = {"BTCUSDT": [_candle(datetime(2026, 6, 1, 12, 0))]}
+        client.before_klines = lambda: clock.advance(seconds=20)
+        second = provider.snapshot(
+            price_symbols={"BTCUSDT", "ETHUSDT"}, bar_symbols={"BTCUSDT"},
+        )
+        # BTCUSDT: 15s + 20s = 35s old > 30s -> STALE, excluded.
+        assert "BTCUSDT" not in second.prices
+        assert second.price_status("BTCUSDT") == STATUS_STALE
+        # ETHUSDT: re-observed at 12:07:15, 20s old at return -> still OK.
+        assert second.prices == {"ETHUSDT": 2.5}
+        assert second.price_status("ETHUSDT") == STATUS_OK
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 P2 — the REAL BybitClient funding contract (empty history)
+# ---------------------------------------------------------------------------
+class _Resp:
+    """Minimal urllib-like response double (see ScriptedSession in
+    tests/test_issue253_shared_limiter_alignment_v1.py)."""
+
+    status = 200
+    headers = None
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+class _FundingSession:
+    """URL-dispatching session double for the REAL ``BybitClient``.
+
+    Only the funding-history endpoint is exercised here — the client's
+    own retry/parse/signing layers run for real, only the HTTP transport
+    is scripted.
+    """
+
+    def __init__(self, funding):
+        self.funding = funding          # list-of-rows OR an exception
+        self.calls: list[str] = []
+
+    def get(self, url, params=None, timeout=None, headers=None):
+        self.calls.append(url)
+        if "funding/history" not in url:
+            raise AssertionError(f"unexpected endpoint: {url}")
+        if isinstance(self.funding, BaseException):
+            raise self.funding
+        return _Resp({
+            "retCode": 0, "retMsg": "OK",
+            "result": {"list": [dict(row) for row in self.funding]},
+        })
+
+
+def _real_client(session) -> BybitClient:
+    from app.exchange.bybit_client import BybitClient
+    return BybitClient(
+        Settings(bybit_max_attempts=1, bybit_retry_backoff=0.0),
+        session,
+    )
+
+
+class TestFundingRealClientContract:
+    """Codex R2 P2: ``BybitClient.get_funding_rate`` collapses an EMPTY
+    funding-history response into a literal ``0.0`` — a value that must
+    never be mistaken for a CONFIRMED zero rate (it would permanently
+    advance ``funding_periods_charged`` with a fabricated zero).  These
+    tests exercise the REAL client contract, not a mock that merely
+    raises on missing history."""
+
+    def test_empty_history_reports_missing_not_ok(self):
+        session = _FundingSession(funding=[])
+        client = _real_client(session)
+        # The real client's historical collapse (the defect's source):
+        assert client.get_funding_rate("BTCUSDT") == 0.0
+
+        snapshot = _provider(client).snapshot(funding_symbols={"BTCUSDT"})
+        # The provider must NOT adopt that fabricated zero:
+        assert snapshot.status("BTCUSDT", "funding") == STATUS_MISSING
+        assert "BTCUSDT" not in snapshot.funding_rates_percent
+        assert snapshot.api_errors == 0     # a valid, empty response
+
+    def test_confirmed_zero_rate_is_ok(self):
+        session = _FundingSession(funding=[{"fundingRate": "0"}])
+        snapshot = _provider(_real_client(session)).snapshot(
+            funding_symbols={"BTCUSDT"},
+        )
+        assert snapshot.status("BTCUSDT", "funding") == STATUS_OK
+        assert snapshot.funding_rates_percent == {"BTCUSDT": 0.0}
+
+    def test_observed_rate_is_percent_converted(self):
+        session = _FundingSession(funding=[{"fundingRate": "0.0001"}])
+        snapshot = _provider(_real_client(session)).snapshot(
+            funding_symbols={"BTCUSDT"},
+        )
+        assert snapshot.status("BTCUSDT", "funding") == STATUS_OK
+        assert snapshot.funding_rates_percent == {"BTCUSDT": 0.01}
+
+    def test_api_timeout_is_api_error(self):
+        session = _FundingSession(funding=TimeoutError("slow"))
+        snapshot = _provider(_real_client(session)).snapshot(
+            funding_symbols={"BTCUSDT"},
+        )
+        assert snapshot.status("BTCUSDT", "funding") == STATUS_API_ERROR
+        assert "BTCUSDT" not in snapshot.funding_rates_percent
+        assert snapshot.api_errors == 1
+
+    def test_stale_funding_cache_is_excluded_on_the_real_client(self):
+        clock = _Clock()
+        session = _FundingSession(funding=[{"fundingRate": "0.01"}])
+        provider = _provider(_real_client(session), clock=clock)
+        first = provider.snapshot(funding_symbols={"BTCUSDT"})
+        assert first.status("BTCUSDT", "funding") == STATUS_OK
+
+        clock.advance(seconds=3601)          # > funding_max_age_s
+        session.funding = TimeoutError("down")
+        second = provider.snapshot(funding_symbols={"BTCUSDT"})
+        assert "BTCUSDT" not in second.funding_rates_percent
+        assert second.status("BTCUSDT", "funding") == STATUS_STALE

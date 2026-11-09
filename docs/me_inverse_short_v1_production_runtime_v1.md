@@ -56,22 +56,30 @@ events impossible.
 |----------|-------------------------------------|----------------------------------------|--------------|
 | Price    | `GET /v5/market/tickers` (`lastPrice`) | `ME_INVERSE_SHORT_MD_PRICE_MAX_AGE_S` (30 s) | excluded → entries fail closed, exits HOLD |
 | OHLC bar | `GET /v5/market/kline` (interval `ME_INVERSE_SHORT_MD_BAR_INTERVAL`, default 5m) | `ME_INVERSE_SHORT_MD_BAR_MAX_AGE_S` (600 s) | no bar handed to the engine → intrabar check falls back to the observed price |
-| Funding  | `GET /v5/market/funding/history` (percent) | `ME_INVERSE_SHORT_MD_FUNDING_MAX_AGE_S` (3600 s) | rate = UNKNOWN → obligation preserved, nothing booked, no zero fabricated |
+| Funding  | `GET /v5/market/funding/history` (percent) | `ME_INVERSE_SHORT_MD_FUNDING_MAX_AGE_S` (3600 s) | rate = UNKNOWN → obligation preserved, nothing booked; an **empty history list is `MISSING`, never a confirmed `0.0`** |
 
 * **No lookahead:** a bar qualifies only when `open_ms + interval_ms <= now_ms`
   (closed at/before the observation time); off-grid or malformed bars are
   rejected. The bar range handed to the engine is the closed bar **widened by
   the live quote** (both observable now — a touch during the forming bar is
   never missed, a future value is never used).
-* **Entry-time clipping (review P1):** a candle whose window ENDED at or
-  before a position's `entered_at` carries only PRE-entry extremes — it can
-  never close that position (a pre-entry high/low must not fabricate an
-  SL/TP fill that was never executable after the entry). The runtime
-  supplies a bar per symbol only when it closed after EVERY open position
-  on that symbol and its close time is known; otherwise the engine falls
-  back to the observed price only — a conservative delay (detected when
-  the next candle closes), never a fabricated fill. Covered by
-  `TestPreEntryBarClipping` (failing-then-passing).
+* **Return-time freshness (Codex R2 P1):** the price triage runs when the
+  cycle starts, but later OHLC/funding requests (retries included) can take
+  seconds — immediately before the snapshot is returned every usable
+  observation is re-checked against the current UTC clock and anything no
+  longer provably fresh is excluded and reported `STALE` (e.g. with
+  `PRICE_MAX_AGE_S=30`, a quote followed by a 60 s kline request can never
+  reach the engine as `OK`).
+* **Whole-interval entry clipping (Codex R2 P1):** a candle is handed to the
+  exit engine only when its WHOLE interval lies after the entry —
+  `open_ms >= max(entered_at)` on that symbol. A candle that straddled the
+  entry (e.g. opened 12:00, SHORT entered 12:00:30) may hold a high/low
+  printed *before* the position existed — it can never close that position;
+  a candle without a known `open_ms` is inadmissible too. Otherwise the
+  engine falls back to the observed price only — a conservative delay
+  (detected when the next candle closes), never a fabricated fill. Covered
+  by `TestPreEntryBarClipping` (failing-then-passing, incl. the straddle,
+  restart and multi-position cases).
 * **No substitution:** `STALE` / `MISSING` / `API_ERROR` / `INVALID` values are
   excluded, never replaced by guesses; every (symbol, stream) carries its
   status into telemetry (`market_data_statuses`).

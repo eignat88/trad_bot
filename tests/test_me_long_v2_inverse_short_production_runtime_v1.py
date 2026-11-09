@@ -92,11 +92,21 @@ def _epoch_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 
-# The SHORT opens at SIGNAL_AT = 12:00:30.  The 11:55-12:00 candle CLOSED
-# at 12:00:00 — entirely BEFORE the entry — while the 12:00-12:05 candle
-# closes after it.
-BAR_CLOSE_PRE_ENTRY_MS = _epoch_ms(SIGNAL_AT.replace(second=0, microsecond=0))
-BAR_CLOSE_POST_ENTRY_MS = _epoch_ms(SIGNAL_AT + timedelta(minutes=5))
+# The SHORT opens at SIGNAL_AT = 12:00:30.  Three candles matter for the
+# whole-OHLC-interval admissibility rule (Codex R2 P1) — all on the 5m grid:
+#   [11:55, 12:00) — CLOSED entirely BEFORE the entry;
+#   [12:00, 12:05) — STRADDLES the entry (the position opened inside it,
+#                    so its high/low may predate the entry);
+#   [12:05, 12:10) — lies ENTIRELY AFTER the entry (first admissible one).
+ENTRY_BOUNDARY_MS = _epoch_ms(
+    SIGNAL_AT.replace(second=0, microsecond=0),
+)                                        # 12:00:00 (candle-grid boundary)
+BAR_OPEN_PRE_ENTRY_MS = ENTRY_BOUNDARY_MS - 300_000      # 11:55:00
+BAR_CLOSE_PRE_ENTRY_MS = ENTRY_BOUNDARY_MS              # 12:00:00
+BAR_OPEN_STRADDLE_MS = ENTRY_BOUNDARY_MS                # 12:00:00
+BAR_CLOSE_STRADDLE_MS = ENTRY_BOUNDARY_MS + 300_000     # 12:05:00
+BAR_OPEN_POST_ENTRY_MS = ENTRY_BOUNDARY_MS + 300_000    # 12:05:00
+BAR_CLOSE_POST_ENTRY_MS = ENTRY_BOUNDARY_MS + 600_000   # 12:10:00
 
 
 # ---------------------------------------------------------------------------
@@ -548,16 +558,18 @@ class TestIntrabar:
         runtime = _runtime(store, provider, clock=clock)
         _capture(store, clock)
         _open_position(runtime, provider)
-        # The entry happened at 12:00:30; move to 12:05:30 so the first
-        # POST-entry 5m candle (12:00-12:05, close_ms=12:05) has genuinely
-        # closed — the tests never hand the engine a future candle.
-        clock.advance(minutes=5)
+        # The entry happened at 12:00:30; move to 12:10:30 so the first
+        # ENTIRELY-AFTER candle (12:05-12:10) has genuinely closed — the
+        # tests never hand the engine a future candle.
+        clock.advance(minutes=10)
         return store, provider, runtime
 
     def test_closed_bar_range_triggers_stop(self, opened):
         store, provider, runtime = opened
         provider.bars = {"BTCUSDT": {
-            "high": 110.5, "low": 95.0, "close_ms": BAR_CLOSE_POST_ENTRY_MS,
+            "high": 110.5, "low": 95.0,
+            "open_ms": BAR_OPEN_POST_ENTRY_MS,
+            "close_ms": BAR_CLOSE_POST_ENTRY_MS,
         }}
         provider.prices = {"BTCUSDT": ENTRY_PRICE}   # below the stop itself
         assert runtime.run(once=True) == EXIT_OK
@@ -570,7 +582,9 @@ class TestIntrabar:
         # The last CLOSED bar never touched the stop, but the live price
         # (observable right now) has: the merged range must catch it.
         provider.bars = {"BTCUSDT": {
-            "high": 105.0, "low": 95.0, "close_ms": BAR_CLOSE_POST_ENTRY_MS,
+            "high": 105.0, "low": 95.0,
+            "open_ms": BAR_OPEN_POST_ENTRY_MS,
+            "close_ms": BAR_CLOSE_POST_ENTRY_MS,
         }}
         provider.prices = {"BTCUSDT": 110.0}
         assert runtime.run(once=True) == EXIT_OK
@@ -588,7 +602,9 @@ class TestIntrabar:
     def test_take_profit_from_closed_bar_low(self, opened):
         store, provider, runtime = opened
         provider.bars = {"BTCUSDT": {
-            "high": 101.0, "low": 85.0, "close_ms": BAR_CLOSE_POST_ENTRY_MS,
+            "high": 101.0, "low": 85.0,
+            "open_ms": BAR_OPEN_POST_ENTRY_MS,
+            "close_ms": BAR_CLOSE_POST_ENTRY_MS,
         }}
         provider.prices = {"BTCUSDT": ENTRY_PRICE}
         assert runtime.run(once=True) == EXIT_OK
@@ -610,6 +626,7 @@ class TestIntrabar:
             prices={"BTCUSDT": 110.0},
             bars={"BTCUSDT": {
                 "high": 105.0, "low": 85.0,
+                "open_ms": BAR_OPEN_POST_ENTRY_MS,
                 "close_ms": BAR_CLOSE_POST_ENTRY_MS,
             }},
         )
@@ -621,13 +638,17 @@ class TestIntrabar:
 # Review P1 — a candle formed BEFORE the entry must never close the position
 # ---------------------------------------------------------------------------
 class TestPreEntryBarClipping:
-    """The intrabar extremes of a candle whose window ENDED before
-    ``entered_at`` existed in the market BEFORE the position — supplying
-    them to ``check_exits`` would fabricate an SL/TP fill that was never
-    executable after the entry (and would feed pre-entry path information
-    into the exit decision).  The runtime must clip every bar to the
-    entry time; without an admissible bar the engine falls back to the
-    observed price only (conservative delay, never a fabricated fill).
+    """A candle whose window is not ENTIRELY after the entry may carry
+    PRE-entry extremes: it either closed before the position existed
+    (11:55-12:00) or STRADDLED the entry (12:00-12:05, opened at 12:00:00
+    while the SHORT opened at 12:00:30 — its high/low may have printed at
+    12:00:10).  Handing either to ``check_exits`` could fabricate an SL/TP
+    fill that was never executable after the entry (Codex R2 P1) and would
+    feed pre-entry path information into the exit decision.  The runtime
+    therefore admits a bar only when its WHOLE interval lies after EVERY
+    entry on the symbol (``open_ms >= max(entered_at)``); without such a
+    bar the engine falls back to the observed price only (conservative
+    delay, never a fabricated fill, never a pre-entry extreme).
     """
 
     @pytest.fixture
@@ -639,10 +660,11 @@ class TestPreEntryBarClipping:
         runtime = _runtime(store, provider, clock=clock)
         _capture(store, clock)
         _open_position(runtime, provider)
-        # Entry at 12:00:30; at 12:05:30 the 12:00-12:05 candle is genuinely
-        # closed while the 11:55-12:00 candle is genuinely pre-entry — the
-        # temporal facts the clipping under test relies on.
-        clock.advance(minutes=5)
+        # Entry at 12:00:30; at 12:10:30 the 12:05-12:10 candle (the first
+        # one lying ENTIRELY after the entry) has genuinely closed while
+        # the 11:55-12:00 candle closed before it and the 12:00-12:05
+        # candle straddles it — the three temporal facts under test.
+        clock.advance(minutes=10)
         return store, provider, runtime
 
     def test_pre_entry_candle_high_cannot_stop_out_the_short(self, opened):
@@ -650,7 +672,9 @@ class TestPreEntryBarClipping:
         # 11:55-12:00 candle: CLOSED at 12:00:00, i.e. BEFORE the entry at
         # 12:00:30, and its high 112 breached the SHORT stop (110) pre-entry.
         provider.bars = {"BTCUSDT": {
-            "high": 112.0, "low": 99.0, "close_ms": BAR_CLOSE_PRE_ENTRY_MS,
+            "high": 112.0, "low": 99.0,
+            "open_ms": BAR_OPEN_PRE_ENTRY_MS,
+            "close_ms": BAR_CLOSE_PRE_ENTRY_MS,
         }}
         # The live quote is below the stop: nothing touched the stop AFTER
         # the entry, so the position must stay open (no fake STOP_LOSS).
@@ -666,7 +690,43 @@ class TestPreEntryBarClipping:
         # (90): that touch happened before the position existed, so no
         # fabricated TAKE_PROFIT_1 may be booked.
         provider.bars = {"BTCUSDT": {
-            "high": 101.0, "low": 85.0, "close_ms": BAR_CLOSE_PRE_ENTRY_MS,
+            "high": 101.0, "low": 85.0,
+            "open_ms": BAR_OPEN_PRE_ENTRY_MS,
+            "close_ms": BAR_CLOSE_PRE_ENTRY_MS,
+        }}
+        provider.prices = {"BTCUSDT": 105.0}
+        assert runtime.run(once=True) == EXIT_OK
+        assert runtime.last_telemetry["exit_reasons"] == []
+        assert len(store.list_positions(POSITION_STATUS_OPEN)) == 1
+
+    def test_straddling_candle_high_cannot_stop_out_the_short(self, opened):
+        """Codex R2 P1 (defect): the position opened INSIDE 12:00-12:05.
+
+        The candle closed at 12:05 (after the 12:00:30 entry) so the old
+        ``close_ms > entered_at`` rule admitted it, but its high 112 may
+        have printed at 12:00:10 — BEFORE the entry.  With every later
+        price below the stop, no STOP_LOSS may be fabricated from that
+        pre-entry extreme.
+        """
+        store, provider, runtime = opened
+        provider.bars = {"BTCUSDT": {
+            "high": 112.0, "low": 99.0,
+            "open_ms": BAR_OPEN_STRADDLE_MS,      # 12:00:00 < entered_at
+            "close_ms": BAR_CLOSE_STRADDLE_MS,    # 12:05:00 > entered_at
+        }}
+        provider.prices = {"BTCUSDT": 105.0}      # never touched the stop
+        assert runtime.run(once=True) == EXIT_OK
+        assert runtime.last_telemetry["exit_reasons"] == []
+        assert len(store.list_positions(POSITION_STATUS_OPEN)) == 1
+
+    def test_straddling_candle_low_cannot_take_profit_the_short(self, opened):
+        """Same straddle defect for TAKE_PROFIT_1: the low 85 may have
+        printed before the entry — never bookable as a post-entry TP."""
+        store, provider, runtime = opened
+        provider.bars = {"BTCUSDT": {
+            "high": 101.0, "low": 85.0,
+            "open_ms": BAR_OPEN_STRADDLE_MS,
+            "close_ms": BAR_CLOSE_STRADDLE_MS,
         }}
         provider.prices = {"BTCUSDT": 105.0}
         assert runtime.run(once=True) == EXIT_OK
@@ -675,9 +735,12 @@ class TestPreEntryBarClipping:
 
     def test_unknown_bar_provenance_is_never_used_for_exits(self, opened):
         store, provider, runtime = opened
-        # No close time -> the bar cannot be proven post-entry -> fail-safe
-        # price-only check (the live quote still protects the position).
-        provider.bars = {"BTCUSDT": {"high": 112.0, "low": 99.0}}
+        # close_ms is present but open_ms is NOT: the candle cannot be
+        # proven to lie entirely after the entry -> fail-safe price-only
+        # check (the live quote still protects the position).
+        provider.bars = {"BTCUSDT": {
+            "high": 112.0, "low": 99.0, "close_ms": BAR_CLOSE_POST_ENTRY_MS,
+        }}
         provider.prices = {"BTCUSDT": 105.0}
         assert runtime.run(once=True) == EXIT_OK
         assert runtime.last_telemetry["exit_reasons"] == []
@@ -685,15 +748,51 @@ class TestPreEntryBarClipping:
 
     def test_post_entry_candle_still_stops_out(self, opened):
         store, provider, runtime = opened
-        # The 12:00-12:05 candle CLOSED after the entry and its high
-        # breached the stop while the quote is below it: a real STOP_LOSS
-        # (protective exits must keep working after the clipping).
+        # The 12:05-12:10 candle lies ENTIRELY after the entry and its
+        # high breached the stop while the quote is below it: a real
+        # STOP_LOSS (protective exits must keep working after the clipping).
         provider.bars = {"BTCUSDT": {
-            "high": 112.0, "low": 99.0, "close_ms": BAR_CLOSE_POST_ENTRY_MS,
+            "high": 112.0, "low": 99.0,
+            "open_ms": BAR_OPEN_POST_ENTRY_MS,
+            "close_ms": BAR_CLOSE_POST_ENTRY_MS,
         }}
         provider.prices = {"BTCUSDT": 105.0}
         assert runtime.run(once=True) == EXIT_OK
         assert runtime.last_telemetry["exit_reasons"] == ["STOP_LOSS"]
+        assert store.list_positions(POSITION_STATUS_OPEN) == []
+
+    def test_restart_does_not_change_bar_admissibility(self, monkeypatch):
+        """The persisted ``entered_at`` must clip identically after a
+        process restart (a fresh runtime instance over the same store)."""
+        monkeypatch.setenv(ACTIVATION_FLAG, "1")
+        clock = _Clock(SIGNAL_AT)
+        store = _store()
+        provider = FakeProvider(prices={"BTCUSDT": ENTRY_PRICE})
+        runtime = _runtime(store, provider, clock=clock)
+        _capture(store, clock)
+        _open_position(runtime, provider)
+        clock.advance(minutes=10)
+
+        # --- restart: brand-new runtime, same store (entered_at reloaded).
+        restarted = _runtime(store, provider, clock=clock)
+        provider.bars = {"BTCUSDT": {
+            "high": 112.0, "low": 99.0,
+            "open_ms": BAR_OPEN_STRADDLE_MS,
+            "close_ms": BAR_CLOSE_STRADDLE_MS,
+        }}
+        provider.prices = {"BTCUSDT": 105.0}
+        assert restarted.run(once=True) == EXIT_OK
+        assert restarted.last_telemetry["exit_reasons"] == []
+        assert len(store.list_positions(POSITION_STATUS_OPEN)) == 1
+
+        # ...and the entirely-after candle still closes the position.
+        provider.bars = {"BTCUSDT": {
+            "high": 112.0, "low": 99.0,
+            "open_ms": BAR_OPEN_POST_ENTRY_MS,
+            "close_ms": BAR_CLOSE_POST_ENTRY_MS,
+        }}
+        assert restarted.run(once=True) == EXIT_OK
+        assert restarted.last_telemetry["exit_reasons"] == ["STOP_LOSS"]
         assert store.list_positions(POSITION_STATUS_OPEN) == []
 
     def test_reverted_forming_bar_touch_is_detected_when_bar_closes(
@@ -704,59 +803,114 @@ class TestPreEntryBarClipping:
         A touch that happened inside the FORMING bar and already reverted
         is not reconstructable from the last closed bar + the last quote —
         so nothing is invented now (no lookahead, no fabricated fill) —
-        but once that candle CLOSES with the extreme inside its range the
-        exit fires on the next cycle (bounded delay of at most one bar).
+        but once a candle that lies ENTIRELY after the entry closes with
+        the extreme inside its range the exit fires on the next cycle
+        (bounded delay of at most one bar).
         """
         store, provider, runtime = opened
         provider.bars = {"BTCUSDT": {
-            "high": 101.0, "low": 99.0, "close_ms": BAR_CLOSE_POST_ENTRY_MS,
+            "high": 101.0, "low": 99.0,
+            "open_ms": BAR_OPEN_POST_ENTRY_MS,
+            "close_ms": BAR_CLOSE_POST_ENTRY_MS,
         }}
         provider.prices = {"BTCUSDT": 105.0}   # never touched the stop
         assert runtime.run(once=True) == EXIT_OK
         assert runtime.last_telemetry["exit_reasons"] == []
-        # That candle now closes with the stop inside its range -> the
+        # The NEXT candle closes with the stop inside its range -> the
         # touch is observable and the exit fires exactly once.
-        runtime._clock.advance(minutes=5)      # now 12:10:30
+        runtime._clock.advance(minutes=5)      # now 12:15:30
         provider.bars = {"BTCUSDT": {
             "high": 112.0, "low": 99.0,
+            "open_ms": BAR_OPEN_POST_ENTRY_MS + 300_000,
             "close_ms": BAR_CLOSE_POST_ENTRY_MS + 300_000,
         }}
         assert runtime.run(once=True) == EXIT_OK
         assert runtime.last_telemetry["exit_reasons"] == ["STOP_LOSS"]
         assert store.list_positions(POSITION_STATUS_OPEN) == []
 
-    def test_merge_clips_pre_entry_and_unknown_provenance_bars(self):
+    def test_merge_admits_only_whole_intervals_after_the_entry(self):
         position = SimpleNamespace(symbol="BTCUSDT", entered_at=SIGNAL_AT)
         positions = {"k1": position}
         prices = {"BTCUSDT": 105.0}
 
-        # (a) closed BEFORE the entry -> never handed to the engine.
-        pre = MarketDataSnapshot(
-            observed_at=SIGNAL_AT + timedelta(seconds=30),
-            prices=prices,
-            bars={"BTCUSDT": {"high": 112.0, "low": 99.0,
-                              "close_ms": BAR_CLOSE_PRE_ENTRY_MS}},
-        )
-        assert ProductionRuntime._merge_bars(pre, prices, positions) == {}
+        def _merge(bars):
+            snapshot = MarketDataSnapshot(
+                observed_at=SIGNAL_AT + timedelta(seconds=30),
+                prices=prices, bars=bars,
+            )
+            return ProductionRuntime._merge_bars(snapshot, prices, positions)
 
-        # (b) unknown close time -> fail-safe clip.
-        unknown = MarketDataSnapshot(
-            observed_at=SIGNAL_AT + timedelta(seconds=30),
-            prices=prices,
-            bars={"BTCUSDT": {"high": 112.0, "low": 99.0}},
-        )
-        assert ProductionRuntime._merge_bars(unknown, prices, positions) == {}
+        # (a) candle CLOSED entirely before the entry -> never handed over.
+        assert _merge({"BTCUSDT": {
+            "high": 112.0, "low": 99.0,
+            "open_ms": BAR_OPEN_PRE_ENTRY_MS,
+            "close_ms": BAR_CLOSE_PRE_ENTRY_MS,
+        }}) == {}
 
-        # (c) closed AFTER the entry -> admissible, widened by the quote.
-        post = MarketDataSnapshot(
-            observed_at=SIGNAL_AT + timedelta(seconds=30),
-            prices=prices,
-            bars={"BTCUSDT": {"high": 112.0, "low": 99.0,
-                              "close_ms": BAR_CLOSE_POST_ENTRY_MS}},
+        # (b) candle STRADDLING the entry (open before, close after) ->
+        # its high/low may predate the entry -> inadmissible (defect case).
+        assert _merge({"BTCUSDT": {
+            "high": 112.0, "low": 99.0,
+            "open_ms": BAR_OPEN_STRADDLE_MS,
+            "close_ms": BAR_CLOSE_STRADDLE_MS,
+        }}) == {}
+
+        # (c) open_ms missing (close known) -> fail-safe clip.
+        assert _merge({"BTCUSDT": {
+            "high": 112.0, "low": 99.0,
+            "close_ms": BAR_CLOSE_POST_ENTRY_MS,
+        }}) == {}
+
+        # (d) ENTIRELY after the entry -> admissible, widened by the quote.
+        assert _merge({"BTCUSDT": {
+            "high": 112.0, "low": 99.0,
+            "open_ms": BAR_OPEN_POST_ENTRY_MS,
+            "close_ms": BAR_CLOSE_POST_ENTRY_MS,
+        }}) == {"BTCUSDT": {"high": 112.0, "low": 99.0}}
+
+    def test_multiple_positions_symbol_clips_to_the_latest_entry(self):
+        """Several open positions on ONE symbol: a candle is admissible
+        only when its whole interval lies after the LATEST entry — an
+        invalid range is never handed to ANY of them (the engine looks
+        bars up per symbol)."""
+        early = SimpleNamespace(
+            symbol="BTCUSDT",
+            entered_at=SIGNAL_AT.replace(second=0),        # 12:00:00
         )
-        assert ProductionRuntime._merge_bars(post, prices, positions) == {
-            "BTCUSDT": {"high": 112.0, "low": 99.0},
-        }
+        late = SimpleNamespace(
+            symbol="BTCUSDT",
+            entered_at=SIGNAL_AT.replace(minute=4, second=0),  # 12:04:00
+        )
+        prices = {"BTCUSDT": 105.0}
+
+        def _merge(bars, positions):
+            snapshot = MarketDataSnapshot(
+                observed_at=SIGNAL_AT + timedelta(seconds=30),
+                prices=prices, bars=bars,
+            )
+            return ProductionRuntime._merge_bars(snapshot, prices, positions)
+
+        both = {"k1": early, "k2": late}
+        # 12:00-12:05 is after `early` but STRADDLES `late` -> withheld
+        # from BOTH positions on the symbol.
+        assert _merge({"BTCUSDT": {
+            "high": 112.0, "low": 99.0,
+            "open_ms": BAR_OPEN_STRADDLE_MS,
+            "close_ms": BAR_CLOSE_STRADDLE_MS,
+        }}, both) == {}
+        # 12:05-12:10 is entirely after BOTH entries -> admissible.
+        assert _merge({"BTCUSDT": {
+            "high": 112.0, "low": 99.0,
+            "open_ms": BAR_OPEN_POST_ENTRY_MS,
+            "close_ms": BAR_CLOSE_POST_ENTRY_MS,
+        }}, both) == {"BTCUSDT": {"high": 112.0, "low": 99.0}}
+        # An UNKNOWN entry time is the most restrictive threshold.
+        unknown = {"k1": SimpleNamespace(symbol="BTCUSDT", entered_at=None)}
+        assert _merge({"BTCUSDT": {
+            "high": 112.0, "low": 99.0,
+            "open_ms": BAR_OPEN_POST_ENTRY_MS,
+            "close_ms": BAR_CLOSE_POST_ENTRY_MS,
+        }}, unknown) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -841,6 +995,208 @@ class TestFunding:
         position = store.list_positions(POSITION_STATUS_OPEN)[0]
         assert position.funding_periods_charged == 1   # backlog, exactly once
         assert runtime.last_telemetry["funding_pending"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 P1 — a quote must still be fresh when it REACHES the engine
+# ---------------------------------------------------------------------------
+class _Resp:
+    """Minimal urllib-like response double for the REAL BybitClient."""
+
+    status = 200
+    headers = None
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+class _RuntimeBybitSession:
+    """URL-dispatching session double for the REAL ``BybitClient``.
+
+    The slow knobs advance the injected UTC clock INSIDE the request,
+    exactly as a slow/retried HTTP call ages everything fetched earlier
+    in the same snapshot.
+    """
+
+    def __init__(self, clock) -> None:
+        self.clock = clock
+        self.price = "100.0"
+        self.klines: list = []          # raw rows, newest first
+        self.funding_rows: list = []
+        self.slow_tickers_s = 0.0
+        self.slow_klines_s = 0.0
+        self.slow_funding_s = 0.0
+        self.calls: list[str] = []
+
+    def get(self, url, params=None, timeout=None, headers=None):
+        self.calls.append(url)
+        if url.endswith("/v5/market/tickers"):
+            if self.slow_tickers_s:
+                self.clock.advance(seconds=self.slow_tickers_s)
+            return _Resp({"retCode": 0, "retMsg": "OK", "result": {"list": [
+                {"symbol": "BTCUSDT", "lastPrice": self.price},
+            ]}})
+        if url.endswith("/v5/market/kline"):
+            if self.slow_klines_s:
+                self.clock.advance(seconds=self.slow_klines_s)
+            return _Resp({"retCode": 0, "retMsg": "OK",
+                          "result": {"list": [list(r) for r in self.klines]}})
+        if url.endswith("/v5/market/funding/history"):
+            if self.slow_funding_s:
+                self.clock.advance(seconds=self.slow_funding_s)
+            return _Resp({"retCode": 0, "retMsg": "OK",
+                          "result": {"list": [dict(r) for r in self.funding_rows]}})
+        raise AssertionError(f"unexpected endpoint: {url}")
+
+
+def _real_provider_runtime(clock, store, session):
+    from app.exchange.bybit_client import BybitClient
+    client = BybitClient(
+        Settings(bybit_max_attempts=1, bybit_retry_backoff=0.0),
+        session,
+    )
+    provider = MarketDataProvider(client, clock=clock)
+    return _runtime(store, provider, clock=clock)
+
+
+def _safe_kline_row(open_ms: int) -> list:
+    """A closed 5m candle inside the safe band (no stop, no TP, no gap)."""
+    return [str(open_ms), "100.0", "101.0", "95.0", "100.0", "1.0"]
+
+
+class TestSlowApiStalenessRuntime:
+    """Codex R2 P1 end-to-end: a quote validated when the cycle STARTED
+    can age out during later requests of the same cycle.  The engine must
+    never receive it — stale quotes neither fill entries nor fabricate
+    exits, and recovery never loses the pending event."""
+
+    def test_quote_aged_out_during_requests_blocks_entry_then_recovers(
+        self, monkeypatch,
+    ):
+        monkeypatch.setenv(ACTIVATION_FLAG, "1")
+        clock = _Clock(SIGNAL_AT)
+        store = _store()
+        session = _RuntimeBybitSession(clock)
+        runtime = _real_provider_runtime(clock, store, session)
+        assert _capture(store, clock) == "CAPTURED"
+
+        # The tickers request itself takes 60s (> PRICE_MAX_AGE_S=30):
+        # by snapshot return the quote is STALE -> no entry, no fill.
+        session.slow_tickers_s = 60.0
+        assert runtime.run(once=True) == EXIT_OK
+        telemetry = runtime.last_telemetry
+        assert telemetry["entries"] == 0
+        assert "PRICE_STALE:BTCUSDT" in telemetry["entry_refusals"]
+        assert store.list_positions() == []
+        # The pending event survives untouched (nothing consumed it).
+        assert len(store.list_events(status="CAPTURED")) == 1
+
+        # Recovery: healthy feed again -> the SAME event enters exactly
+        # once, and later cycles never re-enter it.
+        session.slow_tickers_s = 0.0
+        assert runtime.run(once=True) == EXIT_OK
+        assert runtime.last_telemetry["entries"] == 1
+        assert runtime.run(once=True) == EXIT_OK
+        assert runtime.last_telemetry["entries"] == 0
+        assert len(store.list_positions(POSITION_STATUS_OPEN)) == 1
+        assert store.list_events(status="CAPTURED") == []
+
+    def test_quote_aged_out_during_klines_holds_exits_then_recovers(
+        self, monkeypatch,
+    ):
+        monkeypatch.setenv(ACTIVATION_FLAG, "1")
+        clock = _Clock(SIGNAL_AT)
+        store = _store()
+        session = _RuntimeBybitSession(clock)
+        runtime = _real_provider_runtime(clock, store, session)
+        _capture(store, clock)
+        assert runtime.run(once=True) == EXIT_OK        # entry at 12:00:30
+        assert runtime.last_telemetry["entries"] == 1
+
+        # A closed candle exists, but the kline request takes 60s.  The
+        # quote (89.0 — at the TP target) was fetched at cycle start; by
+        # snapshot return it is 60s old (> 30s) and must be EXCLUDED: an
+        # aged-out quote may not fabricate a TAKE_PROFIT_1, so the
+        # position stays open.
+        session.price = "89.0"
+        session.klines = [_safe_kline_row(
+            _epoch_ms(SIGNAL_AT.replace(minute=55, second=0, microsecond=0)),
+        )]
+        session.slow_klines_s = 60.0
+        assert runtime.run(once=True) == EXIT_OK
+        telemetry = runtime.last_telemetry
+        assert telemetry["exits"] == 0
+        assert len(store.list_positions(POSITION_STATUS_OPEN)) == 1
+
+        # Recovery: fast requests again, the (still) fresh quote at the
+        # target -> the real TAKE_PROFIT_1 fires (management resumes,
+        # nothing was lost).
+        session.slow_klines_s = 0.0
+        assert runtime.run(once=True) == EXIT_OK
+        assert runtime.last_telemetry["exit_reasons"] == ["TAKE_PROFIT_1"]
+        assert store.list_positions(POSITION_STATUS_OPEN) == []
+
+
+# ---------------------------------------------------------------------------
+# Codex R2 P2 — an EMPTY funding history must never become a confirmed 0.0
+# ---------------------------------------------------------------------------
+class TestFundingEmptyHistoryRuntime:
+    """End-to-end over the REAL ``BybitClient`` contract: an empty
+    funding-history response reports ``MISSING`` (never a fabricated
+    ``0.0``), so ``funding_periods_charged`` cannot advance until a rate
+    is actually observed — and then exactly once, restart included."""
+
+    @pytest.fixture
+    def opened(self, monkeypatch):
+        monkeypatch.setenv(ACTIVATION_FLAG, "1")
+        clock = _Clock(SIGNAL_AT)
+        store = _store()
+        session = _RuntimeBybitSession(clock)   # funding history EMPTY
+        runtime = _real_provider_runtime(clock, store, session)
+        assert _capture(store, clock) == "CAPTURED"
+        assert runtime.run(once=True) == EXIT_OK
+        assert runtime.last_telemetry["entries"] == 1
+        session.klines = [_safe_kline_row(
+            _epoch_ms(SIGNAL_AT.replace(minute=55, second=0, microsecond=0)),
+        )]
+        return clock, store, session, runtime
+
+    def test_empty_history_never_advances_the_counter(self, opened):
+        clock, store, session, runtime = opened
+        clock.advance(hours=8)               # one funding period due
+
+        assert runtime.run(once=True) == EXIT_OK
+        position = store.list_positions(POSITION_STATUS_OPEN)[0]
+        assert position.funding_periods_charged == 0   # no fabricated zero
+        assert position.funding_paid == 0.0
+        assert runtime.last_telemetry["funding_pending"] == 1
+
+        # The first REAL observation settles the backlog exactly once.
+        session.funding_rows = [{"fundingRate": "0.0001"}]
+        assert runtime.run(once=True) == EXIT_OK
+        position = store.list_positions(POSITION_STATUS_OPEN)[0]
+        assert position.funding_periods_charged == 1
+        assert position.funding_paid != 0.0
+        assert runtime.last_telemetry["funding_pending"] == 0
+
+        # Same clock, same rate: a second cycle changes NOTHING.
+        assert runtime.run(once=True) == EXIT_OK
+        position = store.list_positions(POSITION_STATUS_OPEN)[0]
+        assert position.funding_periods_charged == 1
+
+        # Restart (fresh runtime over the same store): no re-charge, no
+        # missed period, obligation state carried over.
+        restarted = _runtime(store, runtime.provider, clock=clock)
+        assert restarted.run(once=True) == EXIT_OK
+        position = store.list_positions(POSITION_STATUS_OPEN)[0]
+        assert position.funding_periods_charged == 1
+        assert restarted.last_telemetry["funding_pending"] == 0
 
 
 # ---------------------------------------------------------------------------
