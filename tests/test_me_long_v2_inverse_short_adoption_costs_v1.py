@@ -728,5 +728,125 @@ class TestAdoptionEntryCostAccounting:
             store.balance_components()["balance"],
         )
 
+    def test_entry_processing_halts_after_failed_adoption_reconciliation(
+        self, caplog,
+    ):
+        """Review P2 (Codex): ``_adopt_stored_position()`` may clear
+        ``_balance_trusted`` mid-cycle (its fresh reconciliation failed) —
+        the REMAINING entry processing of that same cycle must stop.
+
+        Fault injection: two independent captured events in ONE cycle; the
+        first INSERT commits with a lost ACK; adoption confirms the stored
+        position; ``balance_components()`` fails; the restored position
+        stays under protective management (its STOP still fires while
+        accounting is untrusted); the SECOND position of that cycle must NOT
+        open; after a successful reconciliation new entries resume and
+        every entry cost is charged exactly once (no double subtraction).
+        """
+        server = _FakeServer()
+        store, contour, clock = _contour(server)
+        engine = contour.engine
+
+        assert _capture(
+            store, _candidate("ETHUSDT", 100.0, detected_at=clock()),
+            clock=clock,
+        ) == CAPTURED
+        # list_events() is ordered by signal_time ASC — the ETH event must
+        # be the FIRST processed one so its failed adoption can halt the
+        # processing of the later (SOL) event within the same cycle.
+        clock.advance(minutes=1)
+        assert _capture(
+            store, _candidate("SOLUSDT", 100.0, detected_at=clock()),
+            clock=clock,
+        ) == CAPTURED
+        captured = store.list_events(status=EVENT_STATUS_CAPTURED)
+        assert [e.symbol for e in captured] == ["ETHUSDT", "SOLUSDT"]
+        eth_key = build_position_key(captured[0].event_key)
+        sol_key = build_position_key(captured[1].event_key)
+
+        # Cycle 1: the first INSERT commits with a lost ACK and adoption
+        # confirms the stored row — but its fresh balance_components() read
+        # fails (one more failure is armed for the next cycle's retry).
+        server.commit_ack_lost = True
+        server.commit_ack_lost_on = "INSERT_POSITION"
+        server.fail_execute_with = pg_dbapi.IntegrityError(
+            "confirmed_balance_unavailable",
+        )
+        server.fail_execute_match = _BAL_MATCH
+        server.fail_execute_times = 2   # c1 adoption + c2 flush-end retry
+
+        caplog.clear()
+        entry_time = clock()            # the clock cycle 1 enters at
+        with caplog.at_level(logging.WARNING, logger=ENGINE_LOGGER):
+            cycle1 = contour.run_cycle({"ETHUSDT": 100.0, "SOLUSDT": 100.0})
+
+        # The first position is adopted and stays under protective
+        # management — but accounting is now unconfirmed …
+        assert cycle1["entries"] == 1, cycle1
+        assert eth_key in engine.open_positions
+        assert "ADOPTED committed position" in caplog.text
+        assert engine.balance == pytest.approx(_INITIAL)   # nothing booked
+        assert engine._balance_trusted is False
+        assert cycle1["accounting_consistent"] is False
+        # …so the SECOND candidate of the SAME cycle must not open:
+        assert "entry processing halted" in caplog.text
+        assert sol_key not in engine.open_positions
+        assert [e.symbol for e in store.list_events(
+            status=EVENT_STATUS_CAPTURED,
+        )] == ["SOLUSDT"]                                   # deferred, not lost
+        # Exactly ONE insert ever — the second event was never attempted:
+        assert sum(
+            1 for op, _key in server.apply_log if op == "INSERT_POSITION"
+        ) == 1
+
+        # Cycle 2: the flush-end confirmation read fails once more; the
+        # protective STOP of the restored position fires WHILE accounting
+        # is untrusted; the close write succeeds (injection exhausted) and
+        # the in-cycle balance retry confirms the ledger — so the deferred
+        # candidate resumes in this very cycle with costs booked once.
+        clock.advance(minutes=15)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=ENGINE_LOGGER):
+            cycle2 = contour.run_cycle({"ETHUSDT": 110.0, "SOLUSDT": 100.0})
+        assert cycle2["exits"] == 1, cycle2
+        assert cycle2["exit_reasons"] == ["STOP_LOSS_GAP"], cycle2
+        assert eth_key not in engine.open_positions
+        assert server.positions[eth_key]["status"] == POSITION_STATUS_CLOSED
+        assert not engine.pending_closes                    # write confirmed
+        assert cycle2["entries"] == 1, cycle2               # resumed
+        assert sol_key in engine.open_positions
+        assert engine._balance_trusted is True
+        net = float(server.positions[eth_key]["net_pnl"])
+        sol_costs = _entry_costs(server.positions[sol_key])
+        # Entry costs landed EXACTLY once (ETH's inside its closed net,
+        # SOL's subtracted by its own normal open path):
+        assert engine.balance == pytest.approx(_INITIAL + net - sol_costs)
+        assert engine.balance == pytest.approx(
+            store.balance_components()["balance"],
+        )
+
+        # Several idle cycles without drift, no re-openings:
+        for _ in range(3):
+            cycle = contour.run_cycle({"ETHUSDT": 100.0, "SOLUSDT": 100.0})
+            assert cycle["entries"] == 0 and not cycle["closed"], cycle
+        assert engine.balance == pytest.approx(
+            store.balance_components()["balance"],
+        )
+
+        # No double booking anywhere: one INSERT per position, one
+        # terminal UPDATE for the closed one, events consumed exactly once:
+        assert server.apply_log.count(("INSERT_POSITION", eth_key)) == 1
+        assert server.apply_log.count(("INSERT_POSITION", sol_key)) == 1
+        assert server.apply_log.count(("UPDATE_POSITION", eth_key)) == 1
+        assert store.list_events(status=EVENT_STATUS_CAPTURED) == []
+        assert len(store.list_events(status=EVENT_STATUS_ENTERED)) == 2
+
+        # Entry facts verbatim through the whole chain (the cycle-1 clock
+        # — the ordering advance above moved it past SIGNAL_AT):
+        row = server.positions[eth_key]
+        assert row["entered_at"] == entry_time
+        assert row["deadline_at"] == deadline_for(entry_time)
+        assert row["exit_reason"] == "STOP_LOSS_GAP"
+
     def test_frozen_protocol_fingerprint_unchanged(self):
         assert protocol_fingerprint() == FROZEN_FINGERPRINT

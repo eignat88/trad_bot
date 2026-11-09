@@ -338,10 +338,29 @@ class InverseShortPaperEngine:
         # run_cycle) stay fully functional.
         try:
             events = self.store.list_events(status=EVENT_STATUS_CAPTURED)
-            for event in events:
+            for index, event in enumerate(events):
                 if len(self.open_positions) >= max_positions:
                     logger.info(
                         "me inverse short entry cap reached (%d)", max_positions,
+                    )
+                    break
+                # Review P2 (Codex): an earlier entry of THIS cycle may have
+                # adopted a committed position whose fresh reconciliation
+                # failed and cleared _balance_trusted — re-check accounting
+                # consistency before the NEXT entry so an untrustworthy
+                # balance never opens another position in the same cycle.
+                # The already-restored position keeps its protective STOP/TP/
+                # TIMEOUT management (exits ran before this method) and its
+                # entry costs are still folded in exactly once later; the
+                # deferred events stay CAPTURED for the next cycle.
+                if not self.accounting_consistent:
+                    logger.warning(
+                        "me inverse short entry processing halted (fail "
+                        "closed): accounting consistency lost during this "
+                        "cycle (balance reconciliation failed) — remaining "
+                        "%d candidate(s) deferred until a reconciliation "
+                        "succeeds",
+                        len(events) - index,
                     )
                     break
                 position = self._open_event(event, prices)
