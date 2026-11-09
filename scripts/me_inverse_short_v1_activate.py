@@ -43,6 +43,9 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from app.config import load_settings  # noqa: E402
+from scripts.me_inverse_short_v1_preflight import (  # noqa: E402
+    read_service_env, PreflightRefused,
+)
 from app.paper.me_long_v2_inverse_short_v1.activation import (  # noqa: E402
     evaluate_activation,
     is_runtime_enabled,
@@ -200,15 +203,17 @@ def plan_drain(
     )
 
 
-def _connect(settings: Any) -> Any:
+def _connect(settings: Any, db_env: dict[str, str] | None = None) -> Any:
     import pg8000
 
+    cfg = db_env or {}
     return pg8000.connect(
-        host=settings.db_host,
-        port=int(settings.db_port),
-        database=settings.db_name,
-        user=settings.db_user,
-        password=settings.db_password,
+        host=cfg.get("DB_HOST", settings.db_host),
+        port=int(cfg.get("DB_PORT", settings.db_port)),
+        database=cfg.get("DB_NAME", settings.db_name),
+        user=cfg.get("DB_USER", settings.db_user),
+        password=cfg.get("DB_PASSWORD", settings.db_password),
+        timeout=10,
     )
 
 
@@ -237,7 +242,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--freeze-ts", default=None, help="ISO-8601 prospective boundary for --activate")
     parser.add_argument("--re-freeze", action="store_true", help="allow replacing an existing RUNNING freeze")
     parser.add_argument("--note", default="", help="operator note stored in the activation row")
+    parser.add_argument("--env-file", type=Path, default=None,
+                        help="explicit dedicated runtime EnvironmentFile; required for writes")
     args = parser.parse_args(argv)
+
+    if (args.activate or args.drain) and args.env_file is None:
+        print("REFUSED: --env-file is required for production state changes", file=sys.stderr)
+        return 1
+    try:
+        db_env = (read_service_env(args.env_file, require_disabled=args.activate)
+                  if args.env_file is not None else None)
+    except PreflightRefused as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 1
 
     settings = load_settings()
     fingerprint = protocol_fingerprint()
@@ -249,7 +266,7 @@ def main(argv: list[str] | None = None) -> int:
         freeze_ts = None
 
     try:
-        conn = _connect(settings)
+        conn = _connect(settings, db_env)
     except Exception as exc:
         print(
             f"REFUSED: cannot connect to PostgreSQL for the activation row: {exc}",
@@ -309,7 +326,8 @@ def main(argv: list[str] | None = None) -> int:
             stored_fingerprint=stored_fp,
             stored_freeze=stored_freeze,
             now=now,
-            runtime_enabled=is_runtime_enabled(),
+            runtime_enabled=(db_env["ME_INVERSE_SHORT_V1_ENABLED"] == "1"
+                             if db_env is not None else is_runtime_enabled()),
         )
         report["stored_notes"] = notes
         report["stored_updated_at"] = updated_at.isoformat() if updated_at else None
