@@ -258,3 +258,108 @@ TEST_DB_HOST=127.0.0.1 TEST_DB_PORT=55432 TEST_DB_NAME=trad_bot_migration_test \
 No test writes to the production database (guarded by `TEST_DB_*` + the
 skipif contract used across this repository, plus the explicit
 `current_database()` production-name guard in this suite).
+
+---
+
+## 8. PR #271 — read-only preactivation audit (requires separate approval to start)
+
+The deployment described above has been verified in production with the service
+**active/enabled but inert**: flag `0`, DB row `READY_TO_START`, stored
+fingerprint/freeze NULL, events/positions/outbox `0/0/0`.
+
+The dedicated runtime uses `pg8000==1.31.5` and **`scramp==1.4.18`**.
+`scramp==1.5.0` breaks PostgreSQL connectivity with
+`AttributeError: make_channel_binding`. Install from the updated
+`requirements.txt` in a clean isolated release venv and run `pip check`.
+Do not replace the Scanner/Paper/Research Evaluator environments.
+
+### Read-only preflight
+
+Run from the dedicated release checkout as an account allowed to read the
+`root:tradbot 0640` environment file:
+
+```bash
+cd /opt/trad_bot_me_inverse_short_release
+.venv/bin/python scripts/me_inverse_short_v1_preflight.py \
+  --env-file /etc/trad-bot/me-inverse-short-runtime.env
+```
+
+**No activation occurs**. The audit explicitly reads that EnvironmentFile
+rather than depending on `load_settings()` fallback. It refuses absent,
+duplicated, malformed or non-OFF configuration, unexpected DB name, missing or
+already-frozen activation row, and any existing event/position/outbox rows.
+The dedicated connection issues only `BEGIN TRANSACTION READ ONLY` and
+`SELECT` statements and rolls back. The report never includes DB credentials.
+`PREACTIVATION_DB_PASS` means only that the **dedicated runtime DB and
+static protocol** meet these constraints. It does *not* mean the entire
+end-to-end ingestion is proven.
+
+### Critical blocker: capture runs in a DIFFERENT process
+
+`scanner_runner.py::_capture_me_inverse_short_source()` checks
+`ME_INVERSE_SHORT_V1_ENABLED` inside **the production Scanner process**.
+Enabling the flag in the dedicated runtime's EnvironmentFile alone **does not
+enable source capture**. No source events then arrive; zero OOS accumulation
+would be expected despite the runtime showing `FULL`.
+
+Before separate activation approval the operator MUST independently confirm:
+
+1. The deployed, running Scanner release includes the PR #267 independent
+   `_me_inverse_short_source_events` pre-gate/prefilter source hook and
+   `_capture_me_inverse_short_source` wiring. The candidate must be original
+   `MOMENTUM_EXHAUSTION_REVERSE_LONG_V2` / `LONG`; paper side is `SHORT`.
+2. The Scanner's actual effective process environment can be set to
+   `ME_INVERSE_SHORT_V1_ENABLED=1` without modifying trading filters/gates.
+   Verify the actual systemd unit and environment source. This is **not**
+   the dedicated runtime env and may require an explicitly approved Scanner
+   restart; never assume inheritance.
+3. Verify the scanner's source universe from its effective `config.yaml`
+   and runtime scanner configuration; **no fixed symbol allowlist is hardcoded
+   in this inverse-short contour**. Check symbols seen in source events after
+   activation, not guessed symbols.
+4. Verify the shared global Bybit limiter is enabled for the isolated runtime
+   and that source capture can reach the same production `trad_bot` database;
+   check permissions and capture error telemetry without leaking secrets.
+5. Agree on monitoring/rollback, the expected rate of new signals and a time
+   window for watching the first genuine *post-freeze* event.
+
+If any item is unverified, **STOP**. Do not write a freeze, enable flags or
+restart existing production services.
+
+### Operator sequence, only AFTER an explicit separate GO decision
+
+1. Freeze the reviewed code/spec and confirm the preflight above is PASS,
+   activation is exactly `READY_TO_START`, stored fingerprint/freeze NULL,
+   and all OOS tables empty. Capture the intended *new* UTC boundary at the
+   actual activation time; never recycle a sample timestamp from documentation.
+2. Use the existing `scripts/me_inverse_short_v1_activate.py --show` with
+   the **dedicated runtime database environment explicitly loaded**. It calls
+   `load_settings()` and **does not itself read the systemd EnvironmentFile**;
+   a bare invocation could point to the wrong database. Verify the reported
+   experiment ID and current fingerprint first. Never paste DB passwords into
+   terminal commands or logs.
+3. Only after confirming the Scanner's effective flag can be enabled and
+   the source stream is available, execute the explicitly approved
+   `--activate --freeze-ts <NEW_UTC_TIMESTAMP>` once with those same dedicated
+   DB settings. The script atomically fixes `RUNNING`, current fingerprint
+   and freeze_ts. **Do not use `--re-freeze`.**
+4. Enable `ME_INVERSE_SHORT_V1_ENABLED=1` for the dedicated runtime **and
+   separately for the Scanner's effective process environment** through the
+   existing approved deployment procedures. Restart only the dedicated unit
+   and (if explicitly authorized and necessary) the Scanner service.
+   Do not alter Scanner trading gates, Paper, or Research Evaluator.
+5. Check both activation factors, `FULL` telemetry, scanner source capture
+   status (errors/duplicates/captured), event lineage and strictly
+   `signal_time > freeze_ts`, first paper-only positions, ongoing cycle/DB/API
+   errors and pending close-outbox. An absence of new source signals is
+   not a PASS; diagnose whether the scanner is actually emitting them.
+6. On a stop decision: first disable source intake safely in the Scanner,
+   drain `RUNNING -> DRAINING` via `--drain` using the same verified
+   database settings, and ensure the runtime stays enabled in EXIT_ONLY
+   mode to manage existing positions/outbox. Do **not** immediately disable
+   the runtime flag while positions or closes are pending; it prevents
+   exit-only management. Preserve freeze, fingerprint and all event history.
+
+**Not performed by PR #271:** freeze/activation, Scanner env changes, any
+production DB write, VPS deploy, or production restart. Activation is an
+independent controlled change.
