@@ -120,3 +120,17 @@ def test_activate_zero_updated_rows_rolls_back(tmp_path, monkeypatch, capsys):
     assert conn.rollbacks == 1
     assert conn.commits == 0
     assert "activation update affected" in capsys.readouterr().err
+
+
+def test_draining_requires_explicit_refreeze():
+    from datetime import datetime, timezone
+    with pytest.raises(operator.ActivationError, match="DRAINING"):
+        operator.plan_activation(
+            current_fingerprint="fp",
+            freeze_ts=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            existing_status="DRAINING",
+            existing_fingerprint="old",
+            existing_freeze=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            re_freeze=False,
+            note="test",
+        )
