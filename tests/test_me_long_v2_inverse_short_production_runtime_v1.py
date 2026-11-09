@@ -37,6 +37,7 @@ import signal
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -85,6 +86,17 @@ SIGNAL_AT = datetime(2026, 6, 1, 12, 0, 30, tzinfo=timezone.utc)
 ENTRY_PRICE = 100.0
 # Entry at 100 with the frozen slippage: SHORT fill = 100 * (1 - 0.0005).
 ENTRY_SLIPPAGE = 0.0005
+
+
+def _epoch_ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+
+# The SHORT opens at SIGNAL_AT = 12:00:30.  The 11:55-12:00 candle CLOSED
+# at 12:00:00 — entirely BEFORE the entry — while the 12:00-12:05 candle
+# closes after it.
+BAR_CLOSE_PRE_ENTRY_MS = _epoch_ms(SIGNAL_AT.replace(second=0, microsecond=0))
+BAR_CLOSE_POST_ENTRY_MS = _epoch_ms(SIGNAL_AT + timedelta(minutes=5))
 
 
 # ---------------------------------------------------------------------------
@@ -536,11 +548,17 @@ class TestIntrabar:
         runtime = _runtime(store, provider, clock=clock)
         _capture(store, clock)
         _open_position(runtime, provider)
+        # The entry happened at 12:00:30; move to 12:05:30 so the first
+        # POST-entry 5m candle (12:00-12:05, close_ms=12:05) has genuinely
+        # closed — the tests never hand the engine a future candle.
+        clock.advance(minutes=5)
         return store, provider, runtime
 
     def test_closed_bar_range_triggers_stop(self, opened):
         store, provider, runtime = opened
-        provider.bars = {"BTCUSDT": {"high": 110.5, "low": 95.0}}
+        provider.bars = {"BTCUSDT": {
+            "high": 110.5, "low": 95.0, "close_ms": BAR_CLOSE_POST_ENTRY_MS,
+        }}
         provider.prices = {"BTCUSDT": ENTRY_PRICE}   # below the stop itself
         assert runtime.run(once=True) == EXIT_OK
         telemetry = runtime.last_telemetry
@@ -551,7 +569,9 @@ class TestIntrabar:
         store, provider, runtime = opened
         # The last CLOSED bar never touched the stop, but the live price
         # (observable right now) has: the merged range must catch it.
-        provider.bars = {"BTCUSDT": {"high": 105.0, "low": 95.0}}
+        provider.bars = {"BTCUSDT": {
+            "high": 105.0, "low": 95.0, "close_ms": BAR_CLOSE_POST_ENTRY_MS,
+        }}
         provider.prices = {"BTCUSDT": 110.0}
         assert runtime.run(once=True) == EXIT_OK
         telemetry = runtime.last_telemetry
@@ -567,7 +587,9 @@ class TestIntrabar:
 
     def test_take_profit_from_closed_bar_low(self, opened):
         store, provider, runtime = opened
-        provider.bars = {"BTCUSDT": {"high": 101.0, "low": 85.0}}
+        provider.bars = {"BTCUSDT": {
+            "high": 101.0, "low": 85.0, "close_ms": BAR_CLOSE_POST_ENTRY_MS,
+        }}
         provider.prices = {"BTCUSDT": ENTRY_PRICE}
         assert runtime.run(once=True) == EXIT_OK
         telemetry = runtime.last_telemetry
@@ -581,15 +603,160 @@ class TestIntrabar:
             prices={"BTCUSDT": 110.0},
             bars={},   # excluded (forming / stale / invalid)
         )
-        assert ProductionRuntime._merge_bars(snapshot, snapshot.prices) == {}
+        assert ProductionRuntime._merge_bars(snapshot, snapshot.prices, {}) == {}
         # And the merged range is exactly max/min of admissible inputs.
         snapshot2 = MarketDataSnapshot(
             observed_at=datetime.now(timezone.utc),
             prices={"BTCUSDT": 110.0},
-            bars={"BTCUSDT": {"high": 105.0, "low": 85.0}},
+            bars={"BTCUSDT": {
+                "high": 105.0, "low": 85.0,
+                "close_ms": BAR_CLOSE_POST_ENTRY_MS,
+            }},
         )
-        merged = ProductionRuntime._merge_bars(snapshot2, snapshot2.prices)
+        merged = ProductionRuntime._merge_bars(snapshot2, snapshot2.prices, {})
         assert merged == {"BTCUSDT": {"high": 110.0, "low": 85.0}}
+
+
+# ---------------------------------------------------------------------------
+# Review P1 — a candle formed BEFORE the entry must never close the position
+# ---------------------------------------------------------------------------
+class TestPreEntryBarClipping:
+    """The intrabar extremes of a candle whose window ENDED before
+    ``entered_at`` existed in the market BEFORE the position — supplying
+    them to ``check_exits`` would fabricate an SL/TP fill that was never
+    executable after the entry (and would feed pre-entry path information
+    into the exit decision).  The runtime must clip every bar to the
+    entry time; without an admissible bar the engine falls back to the
+    observed price only (conservative delay, never a fabricated fill).
+    """
+
+    @pytest.fixture
+    def opened(self, monkeypatch):
+        monkeypatch.setenv(ACTIVATION_FLAG, "1")
+        clock = _Clock(SIGNAL_AT)
+        store = _store()
+        provider = FakeProvider(prices={"BTCUSDT": ENTRY_PRICE})
+        runtime = _runtime(store, provider, clock=clock)
+        _capture(store, clock)
+        _open_position(runtime, provider)
+        # Entry at 12:00:30; at 12:05:30 the 12:00-12:05 candle is genuinely
+        # closed while the 11:55-12:00 candle is genuinely pre-entry — the
+        # temporal facts the clipping under test relies on.
+        clock.advance(minutes=5)
+        return store, provider, runtime
+
+    def test_pre_entry_candle_high_cannot_stop_out_the_short(self, opened):
+        store, provider, runtime = opened
+        # 11:55-12:00 candle: CLOSED at 12:00:00, i.e. BEFORE the entry at
+        # 12:00:30, and its high 112 breached the SHORT stop (110) pre-entry.
+        provider.bars = {"BTCUSDT": {
+            "high": 112.0, "low": 99.0, "close_ms": BAR_CLOSE_PRE_ENTRY_MS,
+        }}
+        # The live quote is below the stop: nothing touched the stop AFTER
+        # the entry, so the position must stay open (no fake STOP_LOSS).
+        provider.prices = {"BTCUSDT": 105.0}
+        assert runtime.run(once=True) == EXIT_OK
+        telemetry = runtime.last_telemetry
+        assert telemetry["exit_reasons"] == []
+        assert len(store.list_positions(POSITION_STATUS_OPEN)) == 1
+
+    def test_pre_entry_candle_low_cannot_take_profit_the_short(self, opened):
+        store, provider, runtime = opened
+        # The same pre-entry candle already printed a low below the target
+        # (90): that touch happened before the position existed, so no
+        # fabricated TAKE_PROFIT_1 may be booked.
+        provider.bars = {"BTCUSDT": {
+            "high": 101.0, "low": 85.0, "close_ms": BAR_CLOSE_PRE_ENTRY_MS,
+        }}
+        provider.prices = {"BTCUSDT": 105.0}
+        assert runtime.run(once=True) == EXIT_OK
+        assert runtime.last_telemetry["exit_reasons"] == []
+        assert len(store.list_positions(POSITION_STATUS_OPEN)) == 1
+
+    def test_unknown_bar_provenance_is_never_used_for_exits(self, opened):
+        store, provider, runtime = opened
+        # No close time -> the bar cannot be proven post-entry -> fail-safe
+        # price-only check (the live quote still protects the position).
+        provider.bars = {"BTCUSDT": {"high": 112.0, "low": 99.0}}
+        provider.prices = {"BTCUSDT": 105.0}
+        assert runtime.run(once=True) == EXIT_OK
+        assert runtime.last_telemetry["exit_reasons"] == []
+        assert len(store.list_positions(POSITION_STATUS_OPEN)) == 1
+
+    def test_post_entry_candle_still_stops_out(self, opened):
+        store, provider, runtime = opened
+        # The 12:00-12:05 candle CLOSED after the entry and its high
+        # breached the stop while the quote is below it: a real STOP_LOSS
+        # (protective exits must keep working after the clipping).
+        provider.bars = {"BTCUSDT": {
+            "high": 112.0, "low": 99.0, "close_ms": BAR_CLOSE_POST_ENTRY_MS,
+        }}
+        provider.prices = {"BTCUSDT": 105.0}
+        assert runtime.run(once=True) == EXIT_OK
+        assert runtime.last_telemetry["exit_reasons"] == ["STOP_LOSS"]
+        assert store.list_positions(POSITION_STATUS_OPEN) == []
+
+    def test_reverted_forming_bar_touch_is_detected_when_bar_closes(
+        self, opened,
+    ):
+        """No-lookaround honesty for the still-forming candle.
+
+        A touch that happened inside the FORMING bar and already reverted
+        is not reconstructable from the last closed bar + the last quote —
+        so nothing is invented now (no lookahead, no fabricated fill) —
+        but once that candle CLOSES with the extreme inside its range the
+        exit fires on the next cycle (bounded delay of at most one bar).
+        """
+        store, provider, runtime = opened
+        provider.bars = {"BTCUSDT": {
+            "high": 101.0, "low": 99.0, "close_ms": BAR_CLOSE_POST_ENTRY_MS,
+        }}
+        provider.prices = {"BTCUSDT": 105.0}   # never touched the stop
+        assert runtime.run(once=True) == EXIT_OK
+        assert runtime.last_telemetry["exit_reasons"] == []
+        # That candle now closes with the stop inside its range -> the
+        # touch is observable and the exit fires exactly once.
+        runtime._clock.advance(minutes=5)      # now 12:10:30
+        provider.bars = {"BTCUSDT": {
+            "high": 112.0, "low": 99.0,
+            "close_ms": BAR_CLOSE_POST_ENTRY_MS + 300_000,
+        }}
+        assert runtime.run(once=True) == EXIT_OK
+        assert runtime.last_telemetry["exit_reasons"] == ["STOP_LOSS"]
+        assert store.list_positions(POSITION_STATUS_OPEN) == []
+
+    def test_merge_clips_pre_entry_and_unknown_provenance_bars(self):
+        position = SimpleNamespace(symbol="BTCUSDT", entered_at=SIGNAL_AT)
+        positions = {"k1": position}
+        prices = {"BTCUSDT": 105.0}
+
+        # (a) closed BEFORE the entry -> never handed to the engine.
+        pre = MarketDataSnapshot(
+            observed_at=SIGNAL_AT + timedelta(seconds=30),
+            prices=prices,
+            bars={"BTCUSDT": {"high": 112.0, "low": 99.0,
+                              "close_ms": BAR_CLOSE_PRE_ENTRY_MS}},
+        )
+        assert ProductionRuntime._merge_bars(pre, prices, positions) == {}
+
+        # (b) unknown close time -> fail-safe clip.
+        unknown = MarketDataSnapshot(
+            observed_at=SIGNAL_AT + timedelta(seconds=30),
+            prices=prices,
+            bars={"BTCUSDT": {"high": 112.0, "low": 99.0}},
+        )
+        assert ProductionRuntime._merge_bars(unknown, prices, positions) == {}
+
+        # (c) closed AFTER the entry -> admissible, widened by the quote.
+        post = MarketDataSnapshot(
+            observed_at=SIGNAL_AT + timedelta(seconds=30),
+            prices=prices,
+            bars={"BTCUSDT": {"high": 112.0, "low": 99.0,
+                              "close_ms": BAR_CLOSE_POST_ENTRY_MS}},
+        )
+        assert ProductionRuntime._merge_bars(post, prices, positions) == {
+            "BTCUSDT": {"high": 112.0, "low": 99.0},
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -931,6 +1098,36 @@ class TestApiOutage:
         assert runtime.last_telemetry["api_errors"] == 0
         assert len(store.list_positions(POSITION_STATUS_OPEN)) == 1
 
+    def test_source_event_delivered_during_outage_is_kept_and_enters_later(
+        self, monkeypatch,
+    ):
+        """Source capture is independent of the Bybit API (review item 4)."""
+        monkeypatch.setenv(ACTIVATION_FLAG, "1")
+        clock = _Clock(SIGNAL_AT)
+        store = _store()
+        client = _OutageClient()          # every public GET raises
+        provider = MarketDataProvider(
+            client, clock=lambda: datetime.now(timezone.utc),
+            config=MarketDataConfig(),
+        )
+        runtime = _runtime(store, provider, clock=clock)
+
+        # A source event arrives WHILE the API is down: the capture path
+        # (store only) still accepts it — no entry is possible yet.
+        clock.advance(minutes=1)
+        assert _capture(store, clock) == "CAPTURED"
+        assert runtime.run(once=True) == EXIT_OK
+        telemetry = runtime.last_telemetry
+        assert telemetry["entries"] == 0
+        assert "PRICE_API_ERROR:BTCUSDT" in telemetry["entry_refusals"]
+        assert store.list_positions() == []
+
+        # Feed recovers: the event captured during the outage enters.
+        client.tickers = [{"symbol": "BTCUSDT", "lastPrice": str(ENTRY_PRICE)}]
+        assert runtime.run(once=True) == EXIT_OK
+        assert runtime.last_telemetry["entries"] == 1
+        assert len(store.list_positions(POSITION_STATUS_OPEN)) == 1
+
 
 # ---------------------------------------------------------------------------
 # Telemetry contract (Issue §3.7)
@@ -1101,8 +1298,61 @@ class TestSystemdUnitContract:
 
 
 # ---------------------------------------------------------------------------
+# Review item 4 — BybitClient contract: resolved shared limiter, no secrets
+# ---------------------------------------------------------------------------
+class TestBybitClientContract:
+    def test_shared_limiter_follows_the_resolved_settings_flag(self):
+        from app.exchange.bybit_client import BybitClient
+
+        # DEFAULT-OFF: no limiter object is built at all (honest default,
+        # zero shared-state I/O) — the runtime never force-enables it.
+        off = BybitClient(_settings())
+        assert off._shared_limiter() is None
+
+        # Resolved flag ON: the client builds the process-shared limiter
+        # exactly once and always hands back the SAME object (no per-
+        # request rebuild, no private limiter beside it).
+        on = BybitClient(dataclasses.replace(
+            _settings(), global_bybit_rate_limiter_enabled=True,
+        ))
+        limiter = on._shared_limiter()
+        assert limiter is not None
+        assert on._shared_limiter() is limiter
+
+    def test_runtime_cycle_never_logs_credentials(self, monkeypatch, caplog):
+        import logging as std_logging
+
+        monkeypatch.setenv(ACTIVATION_FLAG, "1")
+        clock = _Clock(SIGNAL_AT)
+        store = _store()
+        provider = FakeProvider(prices={"BTCUSDT": ENTRY_PRICE})
+        settings = dataclasses.replace(
+            _settings(),
+            db_password="S3CRET-DB-PASSWORD-XYZ",
+            bybit_api_secret="S3CRET-BYBIT-SECRET-XYZ",
+        )
+        runtime = ProductionRuntime(
+            settings, store, provider, clock=clock, interval_s=0.01,
+        )
+        _capture(store, clock)
+        with caplog.at_level(std_logging.DEBUG):
+            assert runtime.run(once=True) == EXIT_OK
+        # Neither the DB password nor the API secret may ever reach the log
+        # (systemd ships logs to the journal).
+        assert "S3CRET-DB-PASSWORD-XYZ" not in caplog.text
+        assert "S3CRET-BYBIT-SECRET-XYZ" not in caplog.text
+        # The per-cycle telemetry is equally clean.
+        for key in runtime.last_telemetry:
+            lowered = key.lower()
+            assert "password" not in lowered
+            assert "secret" not in lowered
+            assert "api_key" not in lowered
+
+
+# ---------------------------------------------------------------------------
 # Startup guards
-# ---------------------------------------------------------------------------class TestStartupGuards:
+# ---------------------------------------------------------------------------
+class TestStartupGuards:
     def test_interval_must_be_positive(self):
         store = _store()
         with pytest.raises(ValueError, match="INTERVAL_INVALID"):

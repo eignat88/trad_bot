@@ -6,7 +6,8 @@ SEPARATE TEST DATABASE ONLY — the suite:
 * runs only when TEST_DB_HOST / TEST_DB_UNIX_SOCK is configured
   (the repository-wide convention for real-PG tests);
 * applies migrations 085/086 to the TEST database when they are missing
-  (idempotent files) and skips honestly when psql is unavailable;
+  (idempotent files, executed through the test connection itself — no
+  psql binary needed) and skips honestly when they cannot be applied;
 * snapshots the activation row and RESTORES it in ``finally`` — a test
   never leaves a RUNNING activation behind;
 * deletes every row it created (event / position / close outbox).
@@ -45,7 +46,7 @@ from app.paper.me_long_v2_inverse_short_v1.production_runtime import (
 )
 from app.paper.me_long_v2_inverse_short_v1.store import connect_pg_store
 from app.scanners.models import SetupCandidate, SetupState
-from conftest import connect_test_db, run_psql_file
+from conftest import connect_test_db
 
 pytestmark = pytest.mark.skipif(
     not (os.environ.get("TEST_DB_HOST") or os.environ.get("TEST_DB_UNIX_SOCK")),
@@ -178,13 +179,19 @@ def _table_exists(conn, table: str) -> bool:
 
 
 def _apply_migrations(conn) -> None:
+    """Apply the contour migrations through the TEST connection itself.
+
+    No ``psql`` binary is required (it is often absent on dev machines and
+    containers): migrations 085/086 are plain SQL without psql
+    meta-commands, so each file runs as one transaction on the isolated
+    test database.  Any failure is raised and the fixture skips honestly.
+    """
     for name in MIGRATIONS:
-        result = run_psql_file(REPO_ROOT / "sql" / "migrations" / name)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"psql failed for {name}: "
-                f"{(result.stderr or result.stdout or '').strip()[:400]}",
-            )
+        path = REPO_ROOT / "sql" / "migrations" / name
+        sql = path.read_text(encoding="utf-8")
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        conn.commit()
 
 
 @pytest.fixture

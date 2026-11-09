@@ -456,7 +456,13 @@ class MarketDataProvider:
                 statuses[symbol][BAR_STREAM] = STATUS_STALE
                 continue
             statuses[symbol][BAR_STREAM] = STATUS_OK
-            bars[symbol] = {"high": high, "low": low}
+            # ``close_ms`` is the bar's provenance: the runtime clips every
+            # bar to the position entry time (review P1) and treats a bar
+            # WITHOUT a known close time as inadmissible for exits.
+            bars[symbol] = {
+                "high": high, "low": low,
+                "open_ms": open_ms, "close_ms": close_ms,
+            }
 
         # ---- funding: observed rate in PERCENT (tri-state preserved) ---
         for symbol in sorted(funding_symbols):

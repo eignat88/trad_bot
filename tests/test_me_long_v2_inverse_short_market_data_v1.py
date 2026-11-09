@@ -238,7 +238,13 @@ class TestBars:
         )
         client = FakeBybitClient(klines={"BTCUSDT": [closed, forming]})
         snapshot = _provider(client).snapshot(bar_symbols={"BTCUSDT"})
-        assert snapshot.bars == {"BTCUSDT": {"high": 101.0, "low": 99.0}}
+        assert snapshot.bars == {"BTCUSDT": {
+            "high": 101.0, "low": 99.0,
+            "open_ms": int(datetime(2026, 6, 1, 12, 0,
+                                    tzinfo=timezone.utc).timestamp() * 1000),
+            "close_ms": int(datetime(2026, 6, 1, 12, 5,
+                                     tzinfo=timezone.utc).timestamp() * 1000),
+        }}
         assert snapshot.status("BTCUSDT", "bar") == STATUS_OK
 
     def test_forming_only_feed_yields_no_bar(self):

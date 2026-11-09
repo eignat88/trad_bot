@@ -63,6 +63,15 @@ events impossible.
   rejected. The bar range handed to the engine is the closed bar **widened by
   the live quote** (both observable now — a touch during the forming bar is
   never missed, a future value is never used).
+* **Entry-time clipping (review P1):** a candle whose window ENDED at or
+  before a position's `entered_at` carries only PRE-entry extremes — it can
+  never close that position (a pre-entry high/low must not fabricate an
+  SL/TP fill that was never executable after the entry). The runtime
+  supplies a bar per symbol only when it closed after EVERY open position
+  on that symbol and its close time is known; otherwise the engine falls
+  back to the observed price only — a conservative delay (detected when
+  the next candle closes), never a fabricated fill. Covered by
+  `TestPreEntryBarClipping` (failing-then-passing).
 * **No substitution:** `STALE` / `MISSING` / `API_ERROR` / `INVALID` values are
   excluded, never replaced by guesses; every (symbol, stream) carries its
   status into telemetry (`market_data_statuses`).
@@ -109,7 +118,9 @@ sudo mkdir -p /opt/trad_bot_me_inverse_short_release
 sudo git -C /opt/trad_bot_me_inverse_short_release clone <repo-url> .
 sudo git -C /opt/trad_bot_me_inverse_short_release checkout <release-tag-or-commit>
 
-# 2) Python environment of THIS release
+# 2) Python environment of THIS release — the unit's ExecStart uses
+#    exactly this interpreter (/opt/trad_bot_me_inverse_short_release/.venv/
+#    bin/python), so create it HERE before installing the unit:
 sudo python3 -m venv /opt/trad_bot_me_inverse_short_release/.venv
 sudo /opt/trad_bot_me_inverse_short_release/.venv/bin/pip install -r \
     /opt/trad_bot_me_inverse_short_release/requirements.txt
@@ -126,6 +137,10 @@ sudo -u tradbot touch /opt/trad_bot_me_inverse_short_release/logs/.write_probe \
     && echo "logs dir writable OK"
 
 # 4) Environment file (activation stays OFF)
+#    DB_PASSWORD=CHANGE_ME in the example is a PLACEHOLDER: set the real
+#    credential only on the server, keep the file mode 0640 (root:tradbot)
+#    and never commit/paste real credentials — the runtime never logs
+#    settings, passwords or API secrets (asserted by tests).
 sudo mkdir -p /etc/trad-bot
 sudo cp deploy/env/me-inverse-short-runtime.env.example \
     /etc/trad-bot/me-inverse-short-runtime.env
@@ -224,10 +239,14 @@ units and separate processes.
     tests/test_me_long_v2_inverse_short_*.py tests/test_me_inverse_short_source_redelivery_v1.py -q
 
 # Optional real-PostgreSQL integration (separate TEST DB only; skipped
-# unless TEST_DB_HOST / TEST_DB_UNIX_SOCK is configured):
+# unless TEST_DB_HOST / TEST_DB_UNIX_SOCK is configured). No psql binary
+# is needed: migrations 085/086 are applied through the test connection
+# itself. The suite refuses a database named like production
+# (PRODUCTION_DB_NAME guard) and restores the activation row in teardown:
 TEST_DB_HOST=127.0.0.1 TEST_DB_PORT=55432 TEST_DB_NAME=trad_bot_migration_test \
-  .venv/bin/python -m pytest tests/test_me_long_v2_inverse_short_production_runtime_pg_it_v1.py -q
+  .venv/bin/python -m pytest tests/test_me_long_v2_inverse_short_production_runtime_pg_it_v1.py -v
 ```
 
 No test writes to the production database (guarded by `TEST_DB_*` + the
-skipif contract used across this repository).
+skipif contract used across this repository, plus the explicit
+`current_database()` production-name guard in this suite).

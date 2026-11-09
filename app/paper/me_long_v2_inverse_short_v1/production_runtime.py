@@ -19,6 +19,9 @@ this module only owns the process lifecycle around it:
 * fail-closed data policy: stale/missing prices are excluded from the
   price map, so new entries never fill on guessed prices and protective
   exits HOLD instead of closing on stale data (retried next cycle);
+  bars are additionally clipped to the position entry time — a candle
+  that closed before ``entered_at`` can never produce an SL/TP exit
+  (review P1);
 * structured per-cycle telemetry (Issue §3.7) + a heartbeat file for
   hung-runtime diagnostics;
 * startup directory/writability verification (the
@@ -232,6 +235,25 @@ def install_signal_handlers(shutdown: threading.Event) -> dict[int, Any]:
     return previous
 
 
+def _to_epoch_ms(value: Any) -> int | None:
+    """UTC epoch milliseconds for a datetime / epoch-ms value; else None.
+
+    A naive datetime is interpreted as UTC (the contour clock is UTC);
+    anything unrecognisable yields ``None`` so callers fail SAFE (clip the
+    bar) instead of guessing a timestamp.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, datetime):
+        moment = value if value.tzinfo is not None else value.replace(
+            tzinfo=timezone.utc,
+        )
+        return int(moment.timestamp() * 1000)
+    return None
+
+
 def _connect_store_with_retry(
     settings: Settings,
     *,
@@ -319,7 +341,9 @@ class ProductionRuntime:
     # ------------------------------------------------------------------
     @staticmethod
     def _merge_bars(
-        snapshot: MarketDataSnapshot, prices: dict[str, float],
+        snapshot: MarketDataSnapshot,
+        prices: dict[str, float],
+        open_positions: dict[str, Any],
     ) -> dict[str, dict[str, float]]:
         """Hand the engine the closed-bar range WIDENED by the live price.
 
@@ -327,12 +351,38 @@ class ProductionRuntime:
         current quote), so no future OHLC can leak in, while a level
         touched during the current (still forming) bar is never missed
         just because the last closed bar did not contain it.
+
+        Entry-time clipping (review P1): a candle whose window ENDED at or
+        before a position's ``entered_at`` carries only PRE-entry
+        extremes — handing it to ``check_exits`` could fabricate an SL/TP
+        touch that never existed after the entry.  The engine looks bars
+        up per symbol, so a bar is supplied only when it closed after
+        EVERY open position on that symbol AND its close time is known;
+        otherwise the engine falls back to the observed price only — a
+        conservative delay, never a fabricated fill and never a pre-entry
+        extreme in the exit decision.
         """
+        # Latest entry per symbol; ``inf`` = entry time unknown -> clip.
+        latest_entry_ms: dict[str, float] = {}
+        for position in open_positions.values():
+            entered_ms = _to_epoch_ms(getattr(position, "entered_at", None))
+            threshold = float("inf") if entered_ms is None else float(entered_ms)
+            symbol = position.symbol
+            if symbol not in latest_entry_ms or threshold > latest_entry_ms[symbol]:
+                latest_entry_ms[symbol] = threshold
+
         merged: dict[str, dict[str, float]] = {}
         for symbol, bar in snapshot.bars.items():
             price = prices.get(symbol)
             if price is None:
                 continue  # the engine refuses to act without a price anyway
+            threshold = latest_entry_ms.get(symbol)
+            if threshold is not None:
+                close_ms = _to_epoch_ms(bar.get("close_ms"))
+                if close_ms is None or float(close_ms) <= threshold:
+                    # Bar closed before (or unknown vs.) the entry: its
+                    # extremes are pre-entry -> not admissible for exits.
+                    continue
             merged[symbol] = {
                 "high": max(float(bar["high"]), float(price)),
                 "low": min(float(bar["low"]), float(price)),
@@ -445,7 +495,9 @@ class ProductionRuntime:
 
         # -- 3..6) the frozen contour cycle (PR #267 ordering preserved) --
         prices = dict(snapshot.prices)
-        bars = self._merge_bars(snapshot, prices)
+        bars = self._merge_bars(
+            snapshot, prices, self.contour.engine.open_positions,
+        )
         result = self.contour.run_cycle(
             prices, snapshot.funding_rates_percent, bars,
         )
