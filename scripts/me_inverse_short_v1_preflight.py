@@ -34,7 +34,7 @@ class PreflightRefused(RuntimeError):
     """A safe, secret-free explanation for refusal."""
 
 
-def read_service_env(path: Path) -> dict[str, str]:
+def read_service_env(path: Path, *, require_disabled: bool = True) -> dict[str, str]:
     """Parse only necessary EnvironmentFile keys; never expose their values."""
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -62,7 +62,9 @@ def read_service_env(path: Path) -> dict[str, str]:
         values[key] = parsed[0]
     if any(not values.get(key) for key in ENV_KEYS):
         raise PreflightRefused("SERVICE_ENV_INCOMPLETE")
-    if values["ME_INVERSE_SHORT_V1_ENABLED"] != "0":
+    if values["ME_INVERSE_SHORT_V1_ENABLED"] not in ("0", "1"):
+        raise PreflightRefused("SERVICE_FLAG_INVALID")
+    if require_disabled and values["ME_INVERSE_SHORT_V1_ENABLED"] != "0":
         raise PreflightRefused("SERVICE_FLAG_MUST_BE_OFF")
     if values["DB_NAME"] != "trad_bot":
         raise PreflightRefused("UNEXPECTED_DB_NAME")
