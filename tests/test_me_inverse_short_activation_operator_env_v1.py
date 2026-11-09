@@ -68,3 +68,55 @@ def test_operator_show_routes_dedicated_database_env(tmp_path, monkeypatch, caps
     output = capsys.readouterr().out
     assert "READY_TO_START" in output
     assert "mock_secret" not in output
+
+
+def test_missing_activation_row_cannot_be_activated():
+    from datetime import datetime, timezone
+    with pytest.raises(operator.ActivationError, match="row is missing"):
+        operator.plan_activation(
+            current_fingerprint="fp",
+            freeze_ts=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            existing_status=None,
+            existing_fingerprint=None,
+            existing_freeze=None,
+            re_freeze=False,
+            note="test",
+        )
+
+
+def test_activate_zero_updated_rows_rolls_back(tmp_path, monkeypatch, capsys):
+    path = make_env(tmp_path)
+    from datetime import datetime, timezone
+
+    class Cursor:
+        rowcount = 0
+        def execute(self, sql, params=None):
+            self.sql = sql
+        def fetchone(self):
+            return ("READY_TO_START", None, None, "", None)
+        def close(self):
+            pass
+
+    class Connection:
+        def __init__(self):
+            self.rollbacks = 0
+            self.commits = 0
+        def cursor(self):
+            return Cursor()
+        def rollback(self):
+            self.rollbacks += 1
+        def commit(self):
+            self.commits += 1
+        def close(self):
+            pass
+
+    conn = Connection()
+    monkeypatch.setattr(operator, "load_settings", lambda: SimpleNamespace())
+    monkeypatch.setattr(operator, "_connect", lambda *a, **k: conn)
+    assert operator.main([
+        "--activate", "--freeze-ts", "2026-01-01T00:00:00Z",
+        "--env-file", str(path),
+    ]) == 1
+    assert conn.rollbacks == 1
+    assert conn.commits == 0
+    assert "activation update affected" in capsys.readouterr().err
