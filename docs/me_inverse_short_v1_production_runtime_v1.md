@@ -225,13 +225,13 @@ units and separate processes.
   market-data requests.
 * Future clean prospective OOS start (SEPARATE approval, not part of #268):
   1. deploy this service with `ME_INVERSE_SHORT_V1_ENABLED=0` and verify §4;
-  2. run `scripts/me_inverse_short_v1_activate.py --activate --freeze-ts <UTC>`
+  2. run `scripts/me_inverse_short_v1_activate.py --env-file /etc/trad-bot/me-inverse-short-runtime.env --activate --freeze-ts <UTC>`
      (fixes the CURRENT fingerprint + freeze atomically);
   3. set `ME_INVERSE_SHORT_V1_ENABLED=1` in `/etc/trad-bot/me-inverse-short-runtime.env`;
   4. `systemctl restart trad-bot-me-inverse-short-runtime.service`;
   5. verify `activation_mode=FULL`, `signal_time > freeze_ts` on every event,
      and that no pre-freeze row can exist (migration-085 CHECK);
-  6. drain later with `scripts/me_inverse_short_v1_activate.py --drain`
+  6. drain later with `scripts/me_inverse_short_v1_activate.py --env-file /etc/trad-bot/me-inverse-short-runtime.env --drain`
      (RUNNING → DRAINING: exits only, fingerprint/freeze preserved).
 
 ## 7. Tests
@@ -363,3 +363,24 @@ restart existing production services.
 **Not performed by PR #271:** freeze/activation, Scanner env changes, any
 production DB write, VPS deploy, or production restart. Activation is an
 independent controlled change.
+
+### Explicit operator CLI shape (documentation ONLY; separate GO required)
+
+```bash
+cd /opt/trad_bot_me_inverse_short_release
+.venv/bin/python scripts/me_inverse_short_v1_activate.py --show \
+  --env-file /etc/trad-bot/me-inverse-short-runtime.env
+
+# AFTER separate written GO, use a FRESH CURRENT UTC timestamp:
+# .venv/bin/python scripts/me_inverse_short_v1_activate.py --activate \
+#   --freeze-ts <FRESH_UTC_ISO8601> \
+#   --env-file /etc/trad-bot/me-inverse-short-runtime.env
+
+# Drain only with exit-only recovery plan (do not disable runtime mid-close):
+# .venv/bin/python scripts/me_inverse_short_v1_activate.py --drain \
+#   --env-file /etc/trad-bot/me-inverse-short-runtime.env
+```
+
+Run as a user who can read the protected EnvironmentFile. No shell sourcing
+of database secrets is needed. Scanner's separately effective flag remains
+a mandatory operational hold point.
