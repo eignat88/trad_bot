@@ -24,9 +24,10 @@ events, positions, paper trades, setups, gates or expectancy data.
 
 Typical sequence (after the test suites pass):
 
-    python scripts/me_inverse_short_v1_activate.py --show
-    python scripts/me_inverse_short_v1_activate.py --activate --freeze-ts 2026-11-07T00:00:00Z
-    python scripts/me_inverse_short_v1_activate.py --show
+    python scripts/me_inverse_short_v1_activate.py --show --env-file /etc/trad-bot/me-inverse-short-runtime.env
+    # Only after explicit approval; FRESH_UTC must be within 2 min of execution:
+    python scripts/me_inverse_short_v1_activate.py --activate --freeze-ts <FRESH_UTC> --env-file /etc/trad-bot/me-inverse-short-runtime.env
+    python scripts/me_inverse_short_v1_activate.py --show --env-file /etc/trad-bot/me-inverse-short-runtime.env
 """
 from __future__ import annotations
 
