@@ -114,7 +114,7 @@ def test_activate_zero_updated_rows_rolls_back(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(operator, "load_settings", lambda: SimpleNamespace())
     monkeypatch.setattr(operator, "_connect", lambda *a, **k: conn)
     assert operator.main([
-        "--activate", "--freeze-ts", "2026-01-01T00:00:00Z",
+        "--activate", "--freeze-ts", datetime.now(timezone.utc).isoformat(),
         "--env-file", str(path),
     ]) == 1
     assert conn.rollbacks == 1
@@ -134,3 +134,13 @@ def test_draining_requires_explicit_refreeze():
             re_freeze=False,
             note="test",
         )
+
+
+def test_activate_rejects_stale_or_invalid_freeze_before_connection(tmp_path, monkeypatch):
+    path = make_env(tmp_path)
+    monkeypatch.setattr(operator, "_connect", lambda *a, **k: pytest.fail("unexpected connection"))
+    for boundary in ("2026-01-01T00:00:00Z", "not-a-timestamp", "2026-11-09T16:00:00"):
+        assert operator.main([
+            "--activate", "--freeze-ts", boundary,
+            "--env-file", str(path),
+        ]) == 1
