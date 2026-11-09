@@ -33,7 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -266,16 +266,23 @@ def main(argv: list[str] | None = None) -> int:
     fingerprint = protocol_fingerprint()
     now = datetime.now(timezone.utc)
 
-    if args.freeze_ts is not None:
-        freeze_ts: datetime | None = parse_freeze_ts(args.freeze_ts, now=now)
-    else:
-        freeze_ts = None
+    try:
+        freeze_ts = (parse_freeze_ts(args.freeze_ts, now=now)
+                     if args.freeze_ts is not None else None)
+        if args.activate:
+            if freeze_ts is None:
+                raise ActivationError("--activate requires --freeze-ts <ISO-8601>")
+            if now - freeze_ts > timedelta(minutes=2):
+                raise ActivationError("freeze-ts is stale: use a fresh current UTC boundary")
+    except ActivationError as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 1
 
     try:
         conn = _connect(settings, db_env)
     except Exception as exc:
         print(
-            f"REFUSED: cannot connect to PostgreSQL for the activation row: {exc}",
+            f"REFUSED: cannot connect to PostgreSQL ({type(exc).__name__})",
             file=sys.stderr,
         )
         return 1
@@ -345,6 +352,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except ActivationError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 1
+    except Exception as exc:
+        print(f"REFUSED: operator action failed ({type(exc).__name__})", file=sys.stderr)
         try:
             conn.rollback()
         except Exception:
