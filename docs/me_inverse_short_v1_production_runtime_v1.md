@@ -333,11 +333,10 @@ restart existing production services.
    and all OOS tables empty. Capture the intended *new* UTC boundary at the
    actual activation time; never recycle a sample timestamp from documentation.
 2. Use the existing `scripts/me_inverse_short_v1_activate.py --show` with
-   the **dedicated runtime database environment explicitly loaded**. It calls
-   `load_settings()` and **does not itself read the systemd EnvironmentFile**;
-   a bare invocation could point to the wrong database. Verify the reported
-   experiment ID and current fingerprint first. Never paste DB passwords into
-   terminal commands or logs.
+   `--env-file /etc/trad-bot/me-inverse-short-runtime.env`. The CLI now
+   explicitly uses the dedicated DB credentials and refuses any mutating
+   operation without that option. Verify the experiment ID and current
+   fingerprint first; never paste secrets into commands or logs.
 3. Only after confirming the Scanner's effective flag can be enabled and
    the source stream is available, execute the explicitly approved
    `--activate --freeze-ts <NEW_UTC_TIMESTAMP>` once with those same dedicated
