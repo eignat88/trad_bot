@@ -150,6 +150,10 @@ def plan_activation(
     """Decide the activation UPDATE (raises ActivationError when refused)."""
     if existing_status is None:
         raise ActivationError("activation row is missing; refusing to create an implicit activation")
+    if existing_status == "DRAINING" and not re_freeze:
+        raise ActivationError("DRAINING activation cannot be restarted without explicit --re-freeze")
+    if existing_status not in ("READY_TO_START", "RUNNING", "DRAINING", "CANCELLED"):
+        raise ActivationError("unknown activation status; refusing mutation")
     if existing_status == "RUNNING" and not re_freeze:
         same = (
             existing_fingerprint == current_fingerprint
