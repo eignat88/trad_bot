@@ -24,16 +24,17 @@ events, positions, paper trades, setups, gates or expectancy data.
 
 Typical sequence (after the test suites pass):
 
-    python scripts/me_inverse_short_v1_activate.py --show
-    python scripts/me_inverse_short_v1_activate.py --activate --freeze-ts 2026-11-07T00:00:00Z
-    python scripts/me_inverse_short_v1_activate.py --show
+    python scripts/me_inverse_short_v1_activate.py --show --env-file /etc/trad-bot/me-inverse-short-runtime.env
+    # Only after explicit approval; FRESH_UTC must be within 2 min of execution:
+    python scripts/me_inverse_short_v1_activate.py --activate --freeze-ts <FRESH_UTC> --env-file /etc/trad-bot/me-inverse-short-runtime.env
+    python scripts/me_inverse_short_v1_activate.py --show --env-file /etc/trad-bot/me-inverse-short-runtime.env
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,9 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from app.config import load_settings  # noqa: E402
+from scripts.me_inverse_short_v1_preflight import (  # noqa: E402
+    read_service_env, PreflightRefused,
+)
 from app.paper.me_long_v2_inverse_short_v1.activation import (  # noqa: E402
     evaluate_activation,
     is_runtime_enabled,
@@ -145,6 +149,12 @@ def plan_activation(
     note: str,
 ) -> tuple[str, tuple[Any, ...]]:
     """Decide the activation UPDATE (raises ActivationError when refused)."""
+    if existing_status is None:
+        raise ActivationError("activation row is missing; refusing to create an implicit activation")
+    if existing_status == "DRAINING" and not re_freeze:
+        raise ActivationError("DRAINING activation cannot be restarted without explicit --re-freeze")
+    if existing_status not in ("READY_TO_START", "RUNNING", "DRAINING", "CANCELLED"):
+        raise ActivationError("unknown activation status; refusing mutation")
     if existing_status == "RUNNING" and not re_freeze:
         same = (
             existing_fingerprint == current_fingerprint
@@ -200,15 +210,17 @@ def plan_drain(
     )
 
 
-def _connect(settings: Any) -> Any:
+def _connect(settings: Any, db_env: dict[str, str] | None = None) -> Any:
     import pg8000
 
+    cfg = db_env or {}
     return pg8000.connect(
-        host=settings.db_host,
-        port=int(settings.db_port),
-        database=settings.db_name,
-        user=settings.db_user,
-        password=settings.db_password,
+        host=cfg.get("DB_HOST", settings.db_host),
+        port=int(cfg.get("DB_PORT", settings.db_port)),
+        database=cfg.get("DB_NAME", settings.db_name),
+        user=cfg.get("DB_USER", settings.db_user),
+        password=cfg.get("DB_PASSWORD", settings.db_password),
+        timeout=10,
     )
 
 
@@ -237,22 +249,41 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--freeze-ts", default=None, help="ISO-8601 prospective boundary for --activate")
     parser.add_argument("--re-freeze", action="store_true", help="allow replacing an existing RUNNING freeze")
     parser.add_argument("--note", default="", help="operator note stored in the activation row")
+    parser.add_argument("--env-file", type=Path, default=None,
+                        help="explicit dedicated runtime EnvironmentFile; required for writes")
     args = parser.parse_args(argv)
+
+    if (args.activate or args.drain) and args.env_file is None:
+        print("REFUSED: --env-file is required for production state changes", file=sys.stderr)
+        return 1
+    try:
+        db_env = (read_service_env(args.env_file, require_disabled=args.activate)
+                  if args.env_file is not None else None)
+    except PreflightRefused as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 1
 
     settings = load_settings()
     fingerprint = protocol_fingerprint()
     now = datetime.now(timezone.utc)
 
-    if args.freeze_ts is not None:
-        freeze_ts: datetime | None = parse_freeze_ts(args.freeze_ts, now=now)
-    else:
-        freeze_ts = None
+    try:
+        freeze_ts = (parse_freeze_ts(args.freeze_ts, now=now)
+                     if args.freeze_ts is not None else None)
+        if args.activate:
+            if freeze_ts is None:
+                raise ActivationError("--activate requires --freeze-ts <ISO-8601>")
+            if now - freeze_ts > timedelta(minutes=2):
+                raise ActivationError("freeze-ts is stale: use a fresh current UTC boundary")
+    except ActivationError as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 1
 
     try:
-        conn = _connect(settings)
+        conn = _connect(settings, db_env)
     except Exception as exc:
         print(
-            f"REFUSED: cannot connect to PostgreSQL for the activation row: {exc}",
+            f"REFUSED: cannot connect to PostgreSQL ({type(exc).__name__})",
             file=sys.stderr,
         )
         return 1
@@ -273,6 +304,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             cursor = conn.cursor()
             cursor.execute(sql, params)
+            if cursor.rowcount != 1:
+                raise ActivationError("activation update affected != 1 row; rolling back")
             conn.commit()
             print(
                 json.dumps(
@@ -298,6 +331,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             cursor = conn.cursor()
             cursor.execute(sql, params)
+            if cursor.rowcount != 1:
+                raise ActivationError("activation update affected != 1 row; rolling back")
             conn.commit()
             print(json.dumps({"action": "drain", "status": "DRAINING"}, indent=2))
             return 0
@@ -309,7 +344,8 @@ def main(argv: list[str] | None = None) -> int:
             stored_fingerprint=stored_fp,
             stored_freeze=stored_freeze,
             now=now,
-            runtime_enabled=is_runtime_enabled(),
+            runtime_enabled=(db_env["ME_INVERSE_SHORT_V1_ENABLED"] == "1"
+                             if db_env is not None else is_runtime_enabled()),
         )
         report["stored_notes"] = notes
         report["stored_updated_at"] = updated_at.isoformat() if updated_at else None
@@ -317,6 +353,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except ActivationError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 1
+    except Exception as exc:
+        print(f"REFUSED: operator action failed ({type(exc).__name__})", file=sys.stderr)
         try:
             conn.rollback()
         except Exception:
