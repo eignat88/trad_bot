@@ -39,7 +39,7 @@
             "type": "postgres",
             "uid": "trad_bot_postgres"
           },
-          "rawSql": "SELECT CASE status WHEN 'READY_TO_START' THEN 0 WHEN 'RUNNING' THEN 1 WHEN 'DRAINING' THEN 2 WHEN 'CANCELLED' THEN 3 ELSE -1 END AS value FROM dds.me_long_v2_inverse_short_v1_activation WHERE experiment_id='ME_LONG_V2_INVERSE_SHORT_V1';",
+          "rawSql": "\nSELECT\n  CASE status\n    WHEN 'READY_TO_START' THEN 0\n    WHEN 'RUNNING' THEN 1\n    WHEN 'DRAINING' THEN 2\n    WHEN 'CANCELLED' THEN 3\n    ELSE -1\n  END AS value\nFROM dds.me_long_v2_inverse_short_v1_activation\nWHERE experiment_id='ME_LONG_V2_INVERSE_SHORT_V1';\n",
           "format": "table"
         }
       ],
