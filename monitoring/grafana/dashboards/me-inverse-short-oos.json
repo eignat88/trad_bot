@@ -10,7 +10,7 @@
   ],
   "timezone": "utc",
   "schemaVersion": 39,
-  "version": 2,
+  "version": 3,
   "refresh": "30s",
   "time": {
     "from": "now-7d",
@@ -649,6 +649,61 @@
         "overrides": []
       },
       "options": {}
+    },
+    {
+      "id": 15,
+      "title": "Open SHORT Positions — Details",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 24,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT\n    symbol AS coin,\n    direction,\n    to_char(entered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS entry_time_utc,\n    entry_price,\n    position_size,\n    stop_price AS stop_loss,\n    target_price AS take_profit,\n    risk_usdt,\n    entry_fee,\n    status\nFROM dds.me_long_v2_inverse_short_v1_position\nWHERE status = 'OPEN'\nORDER BY entered_at DESC;",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        }
+      }
     }
   ]
 }
