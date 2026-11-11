@@ -20,6 +20,12 @@ Two implementations behind ONE small interface:
 Isolation invariants enforced here:
   * events are idempotent on ``event_key`` (``ON CONFLICT DO NOTHING``);
   * positions are idempotent on the NAMESPACED ``position_key``;
+  * position creation is ADMITTED BY PostgreSQL ITSELF (P1-2): the entry
+    TTL at database time, activation/fingerprint identity, strict
+    post-freeze, CAPTURED status and "no existing row" are all enforced
+    inside ``INSERT_POSITION_SQL`` under row locks — never by Python
+    alone — and the TTL sweep refuses to dispose of an event whose
+    position already exists (no EXPIRED-with-position state);
   * the position UPDATE statement never touches ``entered_at`` /
     ``deadline_at`` (or any entry column) — restart recovery reads back the
     original entry time and the original deadline verbatim.
@@ -49,7 +55,7 @@ from .models import (
     POSITION_STATUS_CLOSED,
     POSITION_STATUS_OPEN,
 )
-from .protocol import EXPERIMENT_ID, protocol_fingerprint
+from .protocol import ENTRY_MAX_AGE_MINUTES, EXPERIMENT_ID, protocol_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -135,11 +141,23 @@ class InverseShortStore:
         silent no-op that returns False.  ``reason`` (e.g. ``ENTRY_TTL`` /
         ``ENTRY_CAP``) and ``decided_at`` are persisted on the row so the
         refusal cause and timestamp survive restarts.
+
+        P1-2: an event whose position row already exists is never disposed
+        of (returns False) — EXPIRED-with-position is impossible; in
+        PostgreSQL this is enforced transactionally under the event row
+        lock, so the refusal also holds against a concurrent admission.
         """
         raise NotImplementedError
 
     # -- positions --------------------------------------------------------
     def save_position(self, position: InverseShortPosition) -> bool:
+        """Atomically admit ONE position; True only when it was created.
+
+        The PostgreSQL implementation performs the final admission itself
+        (entry TTL at DB time, activation/fingerprint identity, strict
+        post-freeze, event still CAPTURED, no existing row) — the caller's
+        Python-side checks are a fast path, never the authority.
+        """
         raise NotImplementedError
 
     def update_position(self, position: InverseShortPosition) -> None:
@@ -270,6 +288,13 @@ class InMemoryInverseShortStore(InverseShortStore):
             raise KeyError(event_key)
         if event.status != EVENT_STATUS_CAPTURED:
             return False  # already terminal (ENTERED / previously disposed)
+        # P1-2 parity with the PostgreSQL store: an event whose position
+        # already exists is never disposed of (no EXPIRED-with-position).
+        if any(
+            position.event_key == event_key
+            for position in self._positions.values()
+        ):
+            return False
         event.status = status
         event.status_reason = reason
         event.status_at = decided_at
@@ -401,9 +426,66 @@ INSERT_EVENT_SQL = f"""
     ON CONFLICT (event_key) DO NOTHING
 """
 
+# P1-2 — the entry TTL admission gate lives INSIDE the INSERT.
+#
+# Creating a position is the final admission decision, so PostgreSQL must
+# decide it atomically, not Python.  One statement, one transaction, four
+# gates (all re-checked against the row at lock time):
+#
+#   1. TTL: ``ev.signal_time > statement_timestamp()
+#      - interval '<ENTRY_MAX_AGE_MINUTES> minutes'`` — age STRICTLY below
+#      the TTL (119m59.999s admits, exactly 120m and anything older
+#      refuse).
+#   2. identity: ``ev.protocol_hash == act.protocol_fingerprint ==
+#      <this code's protocol_fingerprint()>`` — an event captured under a
+#      different fingerprint can never be admitted, and neither can a
+#      mismatched activation row.
+#   3. activation: ``act.status = 'RUNNING'`` (NEW_ENTRIES permission),
+#      ``freeze_ts`` present, strict ``ev.signal_time > act.freeze_ts``
+#      (prospective-only; no backfill by construction).
+#   4. idempotency: ``ON CONFLICT (position_key) DO NOTHING`` — a position
+#      row can only ever exist once.
+#
+# Clock semantics (why ``statement_timestamp()``):
+#   * ``statement_timestamp()`` = the instant THIS admission statement
+#     started.  It is FIXED for the whole statement, so every row and
+#     subquery evaluates the boundary against the same value: the decision
+#     is deterministic and equals the moment the admission was issued.
+#   * ``now()`` (``transaction_timestamp()``) = transaction start.  Equal
+#     to statement time only for a single-statement transaction; as a
+#     boundary it would silently age with the transaction (a stale
+#     admission decision if the unit ever spans earlier statements).
+#   * ``clock_timestamp()`` = the actual clock DURING execution: it moves
+#     within one statement, so the same row could pass or fail depending
+#     on evaluation order — non-deterministic, untestable.
+#
+# Concurrency: ``FOR UPDATE OF ev, act`` row-locks the event AND the
+# activation row until commit.  The TTL sweep (``mark_event_expired``)
+# locks the same event row first, and the RUNNING → DRAINING transition
+# updates the same activation row — whichever transaction commits first
+# wins and the loser re-evaluates (EvalPlanQual) against the committed
+# state and refuses.  Exactly one valid outcome is possible: never
+# EXPIRED-with-position, never a position created after DRAINING is in
+# force, never a duplicate (the UNIQUE event/position keys back this up).
 INSERT_POSITION_SQL = f"""
     INSERT INTO {POSITION_TABLE} ({", ".join(_POSITION_COLUMNS)})
-    VALUES ({_POSITION_VALUES_SQL})
+    SELECT {_POSITION_VALUES_SQL}
+    WHERE EXISTS (
+        SELECT 1
+        FROM {EVENT_TABLE} AS ev
+        JOIN {ACTIVATION_TABLE} AS act
+          ON act.experiment_id = %s
+        WHERE ev.event_key = %s
+          AND ev.status = %s
+          AND ev.protocol_hash = act.protocol_fingerprint
+          AND act.protocol_fingerprint = %s
+          AND act.status = 'RUNNING'
+          AND act.freeze_ts IS NOT NULL
+          AND ev.signal_time > act.freeze_ts
+          AND ev.signal_time > statement_timestamp()
+              - interval '{int(ENTRY_MAX_AGE_MINUTES)} minutes'
+        FOR UPDATE OF ev, act
+    )
     ON CONFLICT (position_key) DO NOTHING
 """
 
@@ -438,14 +520,37 @@ MARK_EVENT_ENTERED_SQL = f"""
     WHERE event_key = %s AND status = %s
 """
 
-# V2 terminal disposition (TTL sweep): EXPIRED / CAPACITY_REJECTED with the
-# refusal reason and the decision timestamp persisted on the row.  The
-# WHERE status='CAPTURED' guard makes the transition exactly-once and keeps
-# a concurrently-entered event from ever being disposed of.
-MARK_EVENT_EXPIRED_SQL = f"""
-    UPDATE {EVENT_TABLE}
-    SET status = %s, status_reason = %s, status_at = %s, updated_at = now()
+# P1-2 — sweep side of the admission race.  The disposition takes the
+# EVENT row lock in its own statement FIRST (MARK_EVENT_EXPIRED_LOCK_SQL,
+# executed inside the same transaction), then evaluates the UPDATE below.
+# The NOT EXISTS guard runs against a FRESH READ COMMITTED snapshot, so a
+# position committed by a concurrent admission while the lock was being
+# acquired is visible: an event that already has a position can never be
+# disposed of as EXPIRED / CAPACITY_REJECTED (EXPIRED-with-position is
+# impossible by construction).  The WHERE status='CAPTURED' guard keeps the
+# transition exactly-once and keeps a concurrently-entered event from ever
+# being disposed of.
+#
+# Both interleavings against INSERT_POSITION_SQL resolve to exactly one
+# valid outcome (the two statements contend on the same event row):
+#   admission first -> sweep sees the committed position (or status
+#                      != CAPTURED) and refuses;
+#   sweep first     -> the admission's gate re-checks the committed row
+#                      (EvalPlanQual) and inserts nothing.
+MARK_EVENT_EXPIRED_LOCK_SQL = f"""
+    SELECT status FROM {EVENT_TABLE}
     WHERE event_key = %s AND status = %s
+    FOR UPDATE
+"""
+
+MARK_EVENT_EXPIRED_SQL = f"""
+    UPDATE {EVENT_TABLE} AS ev
+    SET status = %s, status_reason = %s, status_at = %s, updated_at = now()
+    WHERE ev.event_key = %s AND ev.status = %s
+      AND NOT EXISTS (
+          SELECT 1 FROM {POSITION_TABLE} AS pos
+          WHERE pos.event_key = ev.event_key
+      )
 """
 
 # Durable close outbox (P1-3): staged BEFORE the position row flips to
@@ -900,13 +1005,40 @@ class PgInverseShortStore(InverseShortStore):
         reason: str,
         decided_at: datetime,
     ) -> bool:
+        """Atomically dispose of one CAPTURED event (P1-2, sweep side).
+
+        Two statements in ONE reconnect-retried transaction: lock the event
+        row (refusing immediately when it is no longer CAPTURED), then run
+        the guarded UPDATE whose fresh snapshot refuses when a position for
+        this event already exists.  The lock is what serializes this method
+        against a concurrent ``save_position`` admission.
+        """
         if status not in (EVENT_STATUS_EXPIRED, EVENT_STATUS_CAPACITY_REJECTED):
             raise ValueError(f"INVALID_TERMINAL_EVENT_STATUS:{status}")
-        try:
-            result = self._execute_commit(
+
+        def operation() -> _QueryResult:
+            # 1) Lock the event row; no row (missing / already terminal)
+            #    means nothing to dispose of — end the empty transaction.
+            lock = self._execute_once(
+                MARK_EVENT_EXPIRED_LOCK_SQL,
+                (event_key, EVENT_STATUS_CAPTURED),
+                fetch="one",
+            )
+            if lock.fetchone() is None:
+                self._conn.rollback()
+                return _QueryResult(columns=[], rows=[], rowcount=0)
+            # 2) Fresh snapshot under the held lock: refuses when a position
+            #    for this event already exists (no EXPIRED-with-position).
+            result = self._execute_once(
                 MARK_EVENT_EXPIRED_SQL,
                 (status, reason, decided_at, event_key, EVENT_STATUS_CAPTURED),
+                fetch="none",
             )
+            self._conn.commit()
+            return result
+
+        try:
+            result = self._with_reconnect(operation)
             return bool(result and result.rowcount == 1)
         except Exception:
             self._rollback()
@@ -918,10 +1050,26 @@ class PgInverseShortStore(InverseShortStore):
         return tuple(row.get(column) for column in _POSITION_COLUMNS)
 
     def save_position(self, position: InverseShortPosition) -> bool:
+        """Atomically create the position — the final admission (P1-2).
+
+        ``True`` only when THIS call inserted the row.  ``False`` means the
+        PostgreSQL admission gate refused (TTL reached at DB time, event no
+        longer CAPTURED, activation not RUNNING / fingerprint mismatch, or
+        the row already existed) — both cases are resolved by the caller's
+        adoption path (``has_position`` / ``get_position``), which is what
+        lets an ambiguous COMMIT (commit durable, acknowledgement lost)
+        recover without a duplicate INSERT and without a second fee.
+        """
+        params = self._position_params(position) + (
+            # WHERE EXISTS gate params: activation identity, event identity,
+            # event status and this code's frozen protocol fingerprint.
+            self._experiment_id,
+            position.event_key,
+            EVENT_STATUS_CAPTURED,
+            self._expected_fingerprint,
+        )
         try:
-            result = self._execute_commit(
-                INSERT_POSITION_SQL, self._position_params(position),
-            )
+            result = self._execute_commit(INSERT_POSITION_SQL, params)
             return result.rowcount == 1
         except Exception:
             self._rollback()

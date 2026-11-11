@@ -939,6 +939,185 @@ def _capture_me_inverse_short_source(
         _report_error("EXCEPTION")
 
 
+# --- ME_LONG_V2_INVERSE_SHORT_V2 source capture (P1-1) -------------------
+#
+# Independent prospective SHORT paper contour #2 (the V2 production-hardened
+# implementation): it consumes the SAME pre-dedup source events the
+# orchestrator publishes under stats["_me_inverse_short_source_events"]
+# (pre-direction-gate, pre-expectancy), delivered INDEPENDENTLY of the V1
+# delivery above — own flag (ME_INVERSE_SHORT_V2_ENABLED), own activation
+# row/fingerprint, own dedicated store connection, own error sink
+# (ME_INVERSE_SHORT_V2_SOURCE_CAPTURE_ERROR) and own module state.
+#
+# Fail-open by contract: a V2 failure must never break the scanner cycle,
+# never affect the V1 delivery and never touch trading/scoring/regime
+# logic.  The flag is checked BEFORE any connection attempt: with the flag
+# off the hook performs no DB I/O at all.
+
+_me_inverse_short_v2_store = None
+_me_inverse_short_v2_store_retry_at = 0.0
+
+# P1-1 diagnostic control (requirement 3.4): runtime delivery counters for
+# the V2 hook.  Together with me_inverse_short_v2_source_wiring() they prove
+# the V2 hook is not merely importable but sits on the production source
+# path and actually receives published source events.
+_me_inverse_short_v2_source_stats: dict = {
+    "deliveries": 0, "captured": 0, "duplicates": 0, "disabled": 0,
+    "not_active": 0, "pre_freeze": 0, "invalid": 0, "errors": 0,
+}
+
+
+def _get_me_inverse_short_v2_store(repository: ScannerRepository):
+    """Dedicated pg8000 store for the V2 contour's source-event ledger.
+
+    Independent from the scanner's main transaction, from the V1 contour
+    store and from every research observer: V2 commits/rollbacks can never
+    touch a production transaction (and vice versa).
+    """
+    global _me_inverse_short_v2_store, _me_inverse_short_v2_store_retry_at
+    if _me_inverse_short_v2_store is not None:
+        return _me_inverse_short_v2_store
+    now = time.monotonic()
+    if now - _me_inverse_short_v2_store_retry_at < 60.0:
+        return None
+    try:
+        from app.paper.me_long_v2_inverse_short_v2.store import connect_pg_store
+
+        _me_inverse_short_v2_store = connect_pg_store(
+            host=repository._host,
+            port=repository._port,
+            database=repository._database,
+            user=repository._user,
+            password=repository._password,
+            unix_sock=repository._unix_sock or None,
+        )
+        return _me_inverse_short_v2_store
+    except Exception:
+        _me_inverse_short_v2_store = None
+        _me_inverse_short_v2_store_retry_at = now
+        logger.debug(
+            "ME_LONG_V2_INVERSE_SHORT_V2 source store unavailable", exc_info=True)
+        return None
+
+
+def _capture_me_inverse_short_v2_source(
+    repository: ScannerRepository,
+    candidate: SetupCandidate,
+) -> None:
+    """Append ONE published source event to the V2 contour's event ledger.
+
+    Same source detector as V1 (``MOMENTUM_EXHAUSTION_REVERSE_LONG_V2`` /
+    ``LONG``); the V2 contour trades the inverse SHORT side under its own
+    frozen fingerprint.  Nothing is routed back into the trading flow and
+    no scanner decision is changed.  Fail-open: the whole body is wrapped
+    and must never raise into the scanner cycle.
+    """
+    if (
+        candidate.scanner_name != "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2"
+        or candidate.direction != "LONG"
+    ):
+        return
+
+    _me_inverse_short_v2_source_stats["deliveries"] += 1
+
+    def _report_error(status: str) -> None:
+        """Separate V2 source-capture error diagnostics; never silent."""
+        try:
+            repository.save_error(
+                symbol=candidate.symbol,
+                scanner_name=candidate.scanner_name,
+                error_type="ME_INVERSE_SHORT_V2_SOURCE_CAPTURE_ERROR",
+                error_message=(
+                    f"status={status} signal_time={candidate.detected_at} "
+                    f"setup_id={candidate.setup_id}"),
+            )
+        except Exception:
+            logger.debug(
+                "ME inverse short v2 source capture error sink failed",
+                exc_info=True)
+
+    try:
+        # TWO-FACTOR, V2-ONLY: ME_INVERSE_SHORT_V2_ENABLED (never the V1
+        # flag) must be ON before any connection attempt or write.
+        from app.paper.me_long_v2_inverse_short_v2.activation import (
+            is_runtime_enabled,
+        )
+        if not is_runtime_enabled():
+            _me_inverse_short_v2_source_stats["disabled"] += 1
+            return  # no connection attempt, no write while the flag is off
+
+        from app.paper.me_long_v2_inverse_short_v2.capture import (
+            CAPTURE_DISABLED,
+            CAPTURE_DUPLICATE,
+            CAPTURE_ERROR,
+            CAPTURE_NOT_ACTIVE,
+            CAPTURE_PRE_FREEZE,
+            CAPTURED,
+            capture_with_status,
+        )
+        from app.paper.me_long_v2_inverse_short_v2.protocol import (
+            ROUTE_PRE_FILTER_SOURCE,
+        )
+
+        store = _get_me_inverse_short_v2_store(repository)
+        if store is None:
+            raise RuntimeError("me inverse short v2 source store unavailable")
+        status = capture_with_status(
+            store, candidate, capture_route=ROUTE_PRE_FILTER_SOURCE,
+        )
+        _status_counter = {
+            CAPTURED: "captured",
+            CAPTURE_DUPLICATE: "duplicates",
+            CAPTURE_DISABLED: "disabled",
+            CAPTURE_NOT_ACTIVE: "not_active",
+            CAPTURE_PRE_FREEZE: "pre_freeze",
+            CAPTURE_ERROR: "errors",
+        }
+        _me_inverse_short_v2_source_stats[
+            _status_counter.get(status, "invalid")] += 1
+        if status == CAPTURE_ERROR:
+            logger.error(
+                "ME_LONG_V2_INVERSE_SHORT_V2 source capture persistence error; "
+                "scanner unaffected symbol=%s signal_time=%s",
+                candidate.symbol, candidate.detected_at)
+            _report_error(status)
+        elif status in ("DISABLED", "NOT_ACTIVE", "PRE_FREEZE"):
+            logger.info(
+                "ME_LONG_V2_INVERSE_SHORT_V2 source capture status=%s symbol=%s",
+                status, candidate.symbol)
+    except Exception:
+        _me_inverse_short_v2_source_stats["errors"] += 1
+        logger.exception(
+            "ME_LONG_V2_INVERSE_SHORT_V2 source capture failed; scanner unaffected "
+            "symbol=%s signal_time=%s",
+            candidate.symbol, candidate.detected_at)
+        _report_error("EXCEPTION")
+
+
+def me_inverse_short_v2_source_wiring() -> dict:
+    """P1-1 diagnostic control: prove V2 capture is on the production path.
+
+    Combines the STATIC source audit (the same implementation the preflight
+    ``V2_SOURCE_CAPTURE_READY`` check uses) with the RUNTIME delivery
+    counters collected by the hook above.  ``wired`` is True only when the
+    audit proves the production source path delivers to the V2 hook; the
+    counters show how many published source events THIS process has
+    actually delivered (``stats["deliveries"] > 0`` after a scan that
+    published events is the runtime half of the proof).
+    """
+    from app.paper.me_long_v2_inverse_short_v2.source_path import (
+        audit_source_path,
+    )
+
+    audit = audit_source_path(PROJECT_ROOT)
+    return {
+        "wired": audit["wired"],
+        "checks": audit["checks"],
+        "runtime_flag": os.environ.get("ME_INVERSE_SHORT_V2_ENABLED", "<unset>"),
+        "stats": dict(_me_inverse_short_v2_source_stats),
+    }
+
+
 # --- Prospective OOS Observer -------------------------------------------
 
 _prospective_observer = None
@@ -1681,6 +1860,16 @@ def run_scan_cycle(
                     "_me_inverse_short_source_events", []
                 ):
                     _capture_me_inverse_short_source(repository, inv_candidate)
+
+                # ME_LONG_V2_INVERSE_SHORT_V2 source intake (P1-1): the SAME
+                # published source events, delivered through its OWN hook —
+                # own flag, own activation/fingerprint, own store connection,
+                # own error sink. Independent of the V1 delivery: a V2
+                # failure never affects V1 and vice versa; fail-open.
+                for inv_candidate in symbol_stats.get(
+                    "_me_inverse_short_source_events", []
+                ):
+                    _capture_me_inverse_short_v2_source(repository, inv_candidate)
 
                 # SRR LONG Research: capture every SRR LONG candidate for
                 # research outcome tracking (independent of paper trading).

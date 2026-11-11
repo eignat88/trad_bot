@@ -801,6 +801,13 @@ def test_every_frozen_and_allowlisted_path_routes_on(tmp_path, monkeypatch):
     external_allowlisted = {
         "tests/test_srr_short_fill_feasibility_migration_082_v1.py",
         "tests/test_srr_short_fill_pre_activation_hardening_v1.py",
+        # issue268 V2 hardening (P1-1): scanner_runner.py is the ONE tracked
+        # pre-existing file the V2 fix edits (V2 source-capture block only),
+        # allowlisted in the isolation gate with a documented comment.
+        # scanner_runner.py is NOT a phase-2 surface (it is in the routing
+        # gate's UNGOVERNED set), so it must route the FULL PR gate
+        # (NO_PHASE2) exactly like the two cross-PR paths above.
+        "scanner_runner.py",
     }
     for path in (*frozen, *allowed_modified):
         expected = NO_PHASE2 if path in external_allowlisted else PHASE2_ONLY
