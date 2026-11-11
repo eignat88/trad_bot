@@ -28,6 +28,7 @@ from __future__ import annotations
 import ast
 import importlib
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -191,9 +192,16 @@ def _scanner_env_text(
 # fabricated locally.  Unit tests NEVER read a real systemd or /proc and
 # NEVER restart anything.
 # ---------------------------------------------------------------------------
-def _write_scanner_unit(path: Path, root: Path, env_file: Path) -> Path:
-    """Install a fixture `trad-bot-scanner.service` for ``root``."""
+def _write_scanner_unit(
+    path: Path, root: Path, env_file: Path, *, python_exe: str | None = None,
+) -> Path:
+    """Install a fixture `trad-bot-scanner.service` for ``root``.
+
+    ``python_exe`` overrides the ExecStart interpreter (default: the
+    checkout's own ``<root>/.venv/bin/python``).
+    """
     r = root.as_posix().rstrip("/")
+    python = python_exe if python_exe is not None else f"{r}/.venv/bin/python"
     path.write_text(
         "[Unit]\n"
         "Description=Trad Bot Scanner\n"
@@ -202,7 +210,7 @@ def _write_scanner_unit(path: Path, root: Path, env_file: Path) -> Path:
         "Type=simple\n"
         f"WorkingDirectory={r}\n"
         f"EnvironmentFile={env_file.as_posix()}\n"
-        f"ExecStart={r}/.venv/bin/python {r}/scanner_runner.py\n"
+        f"ExecStart={python} {r}/scanner_runner.py\n"
         "Restart=on-failure\n"
         "User=tradbot\n"
         "\n"
@@ -211,6 +219,96 @@ def _write_scanner_unit(path: Path, root: Path, env_file: Path) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    """Create a FILE symlink; skip the test where the host forbids it.
+
+    Windows without Developer Mode / admin lacks
+    ``SeCreateSymbolicLinkPrivilege`` (WinError 1314); such hosts skip the
+    symlink scenario (it executes on Linux), while DIRECTORY links fall
+    back to privilege-free junctions below.
+    """
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(
+            f"file symlinks unavailable on this host ({exc}); "
+            "the symlink-based virtualenv scenario runs on Linux",
+        )
+
+
+def _link_dir_or_skip(link: Path, target: Path) -> None:
+    """Directory link: symlink where allowed, junction fallback on Windows."""
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except (OSError, NotImplementedError):
+        pass
+    import subprocess
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0 or not link.exists():
+        pytest.skip(
+            "directory links unavailable on this host "
+            f"({(result.stderr or result.stdout or '').strip()[:120]}); "
+            "this scenario runs on Linux",
+        )
+
+
+def _make_fixture_venv(
+    root: Path, *, style: str = "copy", system_target: Path | None = None,
+) -> Path:
+    """A REAL ``<root>/.venv/{pyvenv.cfg,bin/python}`` layout (never run).
+
+    ``style="copy"``    — interpreter is a real file inside the venv.
+    ``style="symlink"`` — interpreter is a symlink to a system interpreter
+                          OUTSIDE the checkout (the standard Linux venv
+                          shape that broke the pre-fix validation).
+    """
+    venv = root / ".venv"
+    (venv / "bin").mkdir(parents=True, exist_ok=True)
+    (venv / "pyvenv.cfg").write_text(
+        "home = /usr/bin\n"
+        "version = 3.12.3\n"
+        "include-system-site-packages = false\n",
+        encoding="utf-8",
+    )
+    exe = venv / "bin" / "python"
+    if style == "copy":
+        exe.write_text(
+            "# fixture interpreter — never executed by the tests\n",
+            encoding="utf-8",
+        )
+    elif style == "symlink":
+        if system_target is None:
+            system_target = root.parent / "system-python" / "python3"
+            system_target.parent.mkdir(parents=True, exist_ok=True)
+            system_target.write_text(
+                "# system interpreter fixture — never executed\n",
+                encoding="utf-8",
+            )
+        system_target.chmod(0o755)
+        _symlink_or_skip(exe, system_target)
+    else:
+        raise ValueError(f"unknown venv style: {style}")
+    exe.chmod(0o755)
+    return venv
+
+
+def _make_scanner_checkout(
+    base: Path, name: str = "scanner", *, venv_style: str = "copy",
+) -> Path:
+    """A temporary Scanner checkout with the CURRENT sources + a venv."""
+    root = base / name
+    for rel in SOURCE_FILES:
+        dst = root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes((PROJECT_ROOT / rel).read_bytes())
+    _make_fixture_venv(root, style=venv_style)
+    return root
 
 
 def _scanner_process_fixture(
@@ -231,16 +329,6 @@ def _scanner_process_fixture(
         "started_at": time.time() + 3600.0 if started_at is None
         else started_at,
     }
-
-
-def _make_scanner_checkout(base: Path, name: str = "scanner") -> Path:
-    """A temporary Scanner checkout with the CURRENT sources."""
-    root = base / name
-    for rel in SOURCE_FILES:
-        dst = root / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.write_bytes((PROJECT_ROOT / rel).read_bytes())
-    return root
 
 
 @pytest.fixture
@@ -264,15 +352,21 @@ _PROCESS_AUTO = object()
 
 
 def _run(runtime: Path, scanner: Path, results: list, *, repo_root=None,
-         scanner_root: Path = PROJECT_ROOT, scanner_unit_path: Path | None = None,
+         scanner_root: Path | None = None, scanner_unit_path: Path | None = None,
          scanner_process=_PROCESS_AUTO):
     """run_preflight with fixture Scanner checkout/unit/process metadata.
 
-    ``scanner_root`` defaults to the project's own sources (a real, wired
-    Scanner checkout); ``scanner_unit_path`` defaults to the unit installed
-    next to the env files, pointing at that checkout; ``scanner_process``
-    defaults to matching metadata — scenarios override each ingredient.
+    ``scanner_root`` defaults to a REAL temporary Scanner checkout built
+    next to the env files (sources + a valid fixture virtualenv — the
+    interpreter validation needs an actual ``pyvenv.cfg`` layout);
+    ``scanner_unit_path`` defaults to the unit installed next to the env
+    files, pointing at that checkout; ``scanner_process`` defaults to
+    matching metadata — scenarios override each ingredient.
     """
+    if scanner_root is None:
+        scanner_root = _make_scanner_checkout(
+            runtime.parent, "scanner-checkout",
+        )
     if scanner_unit_path is None:
         scanner_unit_path = _write_scanner_unit(
             runtime.parent / "scanner-unit.service", scanner_root, scanner,
@@ -861,6 +955,282 @@ class TestScannerRuntimeAudit:
         assert result["ready_for_activation"] is False
 
 
+class TestScannerVirtualenvValidation:
+    """Codex P2 (discussion_r4541445199): a standard symlink-based Linux
+    virtualenv must NOT read as ``SCANNER_UNIT_CHECKOUT_MISMATCH`` — the
+    venv LOCATION, not the system interpreter behind the symlink, is what
+    belongs to the Scanner checkout; foreign / missing / undeterminable
+    environments must never PASS.  All fixtures are REAL files under
+    ``tmp_path`` (no Path.resolve() mocks, no interpreter ever executed).
+    """
+
+    def test_symlink_based_venv_passes(self, env_files, tmp_path):
+        """The Codex reproduction: `<root>/.venv/bin/python` → system python
+        outside the checkout (standard Linux venv) reads PASS after the fix
+        (it read FAIL/SCANNER_UNIT_CHECKOUT_MISMATCH before it).
+        """
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(
+            tmp_path, "symlink-venv-checkout", venv_style="symlink",
+        )
+        # The system interpreter really lives outside the checkout and the
+        # link really is a symlink on this filesystem:
+        assert root.joinpath(".venv/bin/python").is_symlink()
+        resolved = root.joinpath(".venv/bin/python").resolve()
+        assert not str(resolved).startswith(str(root.resolve()))
+        unit = _write_scanner_unit(
+            tmp_path / "symlink-unit.service", root, scanner,
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_PASS
+        assert "pyvenv.cfg present" in check["detail"]
+        assert result["checks"]["V2_RUNTIME_CONFIG_READY"]["status"] == \
+            preflight.STATUS_PASS
+        assert result["ready_for_activation"] is True
+        assert result["result"] == "READY_FOR_ACTIVATION"
+
+    def test_copy_based_venv_passes(self, env_files, tmp_path):
+        """A copy-based virtualenv (interpreter file inside the venv) PASSes."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "copy-venv-checkout")
+        exe = root / ".venv/bin/python"
+        assert exe.is_file() and not exe.is_symlink()
+        unit = _write_scanner_unit(
+            tmp_path / "copy-unit.service", root, scanner,
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_PASS
+        assert "virtualenv" in check["detail"]
+        assert result["ready_for_activation"] is True
+
+    def test_python_from_another_checkout_fails(self, env_files, tmp_path):
+        """ExecStart interpreter from a DIFFERENT checkout → FAIL."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "scanner-checkout")
+        other = _make_scanner_checkout(tmp_path, "other-checkout")
+        unit = _write_scanner_unit(
+            tmp_path / "other-python-unit.service", root, scanner,
+            python_exe=(other / ".venv/bin/python").as_posix(),
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert "scanner_unit_matches_checkout:SCANNER_PYTHON_OUTSIDE_CHECKOUT" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_prefix_sibling_checkout_fails(self, env_files, tmp_path):
+        """`.../trad_bot_other/...` vs root `.../trad_bot` is NOT a member
+        (prefix trap) → FAIL."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "trad_bot")
+        sibling = _make_scanner_checkout(tmp_path, "trad_bot_other")
+        unit = _write_scanner_unit(
+            tmp_path / "sibling-unit.service", root, scanner,
+            python_exe=(sibling / ".venv/bin/python").as_posix(),
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert "scanner_unit_matches_checkout:SCANNER_PYTHON_OUTSIDE_CHECKOUT" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_venv_dir_link_to_foreign_checkout_fails(self, env_files,
+                                                     tmp_path):
+        """`.venv` substituted by a directory link to a FOREIGN virtualenv
+        (lexical path looks local) → FAIL, never PASS."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "linked-venv-checkout")
+        foreign_root = _make_scanner_checkout(tmp_path, "foreign-root")
+        foreign_venv = foreign_root / ".venv"
+        shutil.rmtree(root / ".venv")
+        _link_dir_or_skip(root / ".venv", foreign_venv)
+        unit = _write_scanner_unit(
+            tmp_path / "linked-venv-unit.service", root, scanner,
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert "scanner_unit_matches_checkout:SCANNER_VENV_SYMLINK_ESCAPE" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_missing_pyvenv_cfg_is_not_verified(self, env_files, tmp_path):
+        """Without pyvenv.cfg the virtualenv cannot be established →
+        NOT_VERIFIED (never a silent PASS)."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "no-cfg-checkout")
+        (root / ".venv/pyvenv.cfg").unlink()
+        unit = _write_scanner_unit(
+            tmp_path / "no-cfg-unit.service", root, scanner,
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_NOT_VERIFIED
+        assert "scanner_unit_matches_checkout:SCANNER_PYVENV_CFG_MISSING" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+        assert result["result"] == "NOT_READY"
+
+    def test_missing_python_executable_is_not_verified(self, env_files,
+                                                       tmp_path):
+        """Missing interpreter file → NOT_VERIFIED, never PASS."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "no-python-checkout")
+        (root / ".venv/bin/python").unlink()
+        unit = _write_scanner_unit(
+            tmp_path / "no-python-unit.service", root, scanner,
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_NOT_VERIFIED
+        assert "scanner_unit_matches_checkout:SCANNER_PYTHON_MISSING" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_relative_python_in_execstart_fails(self, env_files, tmp_path):
+        """ExecStart with a RELATIVE interpreter path → FAIL."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "relative-python-checkout")
+        unit = _write_scanner_unit(
+            tmp_path / "relative-python-unit.service", root, scanner,
+            python_exe=".venv/bin/python",
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert "scanner_unit_matches_checkout:SCANNER_PYTHON_NOT_ABSOLUTE" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_path_traversal_python_fails(self, env_files, tmp_path):
+        """`ExecStart` with `..` escaping the checkout → FAIL (lexical
+        normalization, no symlink following)."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "traversal-checkout")
+        r = root.as_posix().rstrip("/")
+        unit = _write_scanner_unit(
+            tmp_path / "traversal-unit.service", root, scanner,
+            python_exe=f"{r}/../escaped/.venv/bin/python",
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert "scanner_unit_matches_checkout:SCANNER_PYTHON_OUTSIDE_CHECKOUT" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_old_scanner_with_valid_venv_fails_by_source_routing(
+            self, env_files, tmp_path):
+        """Valid virtualenv + OLD scanner sources → the failure comes from
+        source routing alone (no python-env reason pollutes the report)."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "old-sources-checkout")
+        runner = root / "scanner_runner.py"
+        source = runner.read_text(encoding="utf-8")
+        needle = (
+            "                    "
+            "_capture_me_inverse_short_v2_source(repository, inv_candidate)\n"
+        )
+        assert needle in source
+        runner.write_text(
+            source.replace(needle, "                    pass\n"),
+            encoding="utf-8",
+        )
+        unit = _write_scanner_unit(
+            tmp_path / "old-sources-unit.service", root, scanner,
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert (
+            "scanner_source_routing:V2_DELIVERY_MISSING_FROM_PRODUCTION_LOOP"
+            in check["reason"]
+        )
+        assert "SCANNER_PYTHON" not in check["reason"]
+        assert "SCANNER_VENV" not in check["reason"]
+        assert "SCANNER_PYVENV" not in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_process_mismatch_with_valid_venv_fails(self, env_files,
+                                                    tmp_path):
+        """Valid virtualenv + process running another tree → FAIL on the
+        process↔unit comparison (the venv does not mask it)."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "process-mismatch-checkout")
+        unit = _write_scanner_unit(
+            tmp_path / "process-mismatch-unit.service", root, scanner,
+        )
+        other = _make_scanner_checkout(tmp_path, "running-other")
+        process = _scanner_process_fixture(other, unit=unit)
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+            scanner_process=process,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert "scanner_process_matches_unit:SCANNER_PROCESS_UNIT_MISMATCH" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_fully_correct_checkout_unit_process_venv_passes(
+            self, env_files, tmp_path):
+        """Everything correct (checkout + unit + process + copy-based venv)
+        → all six PASS, READY_FOR_ACTIVATION."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "all-good-checkout")
+        unit = _write_scanner_unit(
+            tmp_path / "all-good-unit.service", root, scanner,
+        )
+        process = _scanner_process_fixture(root, unit=unit)
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+            scanner_process=process,
+        )
+        for name in preflight.CHECK_NAMES:
+            assert result["checks"][name]["status"] == \
+                preflight.STATUS_PASS, (name, result["checks"][name])
+        assert result["ready_for_activation"] is True
+        assert result["result"] == "READY_FOR_ACTIVATION"
+        assert "virtualenv" in result["checks"]["V2_SOURCE_CAPTURE_READY"][
+            "detail"]
+
+
 class TestPreflightCli:
     def test_main_returns_zero_only_when_ready(self, env_files, monkeypatch,
                                                capsys):
@@ -868,19 +1238,24 @@ class TestPreflightCli:
         monkeypatch.setattr(
             "pg8000.dbapi.connect", _fake_connect_factory(_happy_db_results()),
         )
-        unit = runtime.parent / "scanner-unit.service"
+        # A REAL Scanner checkout + unit next to the env files (the venv
+        # validation needs an actual pyvenv.cfg layout).
+        checkout = _make_scanner_checkout(runtime.parent, "scanner-checkout")
+        unit = _write_scanner_unit(
+            runtime.parent / "scanner-unit.service", checkout, scanner,
+        )
         # Effective-runtime metadata comes from fixtures — never from the
         # real systemd//proc of this test host (P2-4).
         monkeypatch.setattr(
             preflight, "_detect_scanner_process",
             lambda _unit_path=None: _scanner_process_fixture(
-                PROJECT_ROOT, unit=unit,
+                checkout, unit=unit,
             ),
         )
         code = preflight.main([
             "--env-file", str(runtime),
             "--scanner-env-file", str(scanner),
-            "--scanner-root", str(PROJECT_ROOT),
+            "--scanner-root", str(checkout),
             "--scanner-unit", str(unit),
         ])
         out = capsys.readouterr().out

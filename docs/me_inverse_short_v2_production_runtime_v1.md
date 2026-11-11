@@ -299,6 +299,22 @@ preflight honestly reports `SCANNER_PROCESS_NOT_VERIFIABLE`
 (`NOT_VERIFIED` — never a silent PASS), it never guesses and never
 restarts the Scanner to make verification easier.
 
+Note — Python virtualenv: standard Linux virtualenvs are supported,
+including the usual **symlink-based** interpreter
+(`/opt/trad_bot/.venv/bin/python → python3 → /usr/bin/python3.12`).
+The preflight validates the location of the **virtualenv itself** — an
+absolute `ExecStart` interpreter path lexically inside `--scanner-root`
+(`..`-traversal safe), the `<venv>/bin/python*` layout and a well-formed
+`pyvenv.cfg`, with the venv/bin directories resolving inside the
+checkout — not the final system-interpreter target behind the symlink.
+Copy-based virtualenvs are equally valid; a foreign interpreter, a
+directory-symlink substitution of the venv, a missing/invalid
+`pyvenv.cfg` or a missing executable block activation (`FAIL`) or stay
+`NOT_VERIFIED` (`ready_for_activation=false`). All of these checks read
+path metadata and the venv configuration only — they never execute any
+interpreter, never touch the production virtualenv, and never restart or
+reconfigure the Scanner.
+
 Example — old Scanner checkout (V2 release fully ready), the
 `V2_SOURCE_CAPTURE_READY` compound stays blocked:
 
@@ -326,6 +342,14 @@ process): `{"status": "NOT_VERIFIED", "reason": "…:SCANNER_PROCESS_NOT_VERIFIA
   differs from the unit, if audited sources are newer than the process
   start time, if the Scanner unit file is unreadable, or if the release
   is ready while the Scanner checkout fails its source-routing audit.
+* **STOP** if the Scanner's Python virtualenv cannot be validated —
+  interpreter path relative/traversing outside `--scanner-root`, venv or
+  `bin` directory substituted by a link to a foreign environment, missing
+  or malformed `pyvenv.cfg`, missing/non-executable interpreter, or a
+  symlink target belonging to another virtualenv. A standard
+  symlink-based Linux venv pointing at the system interpreter is CORRECT
+  and does not stop the run; anything unconfirmable stays `NOT_VERIFIED`
+  and `ready_for_activation` stays `false`.
 * **STOP** and report honestly: confirming the exact *loaded bytecode*
   is impossible without restarting the Scanner or adding extra
   diagnostics — the preflight uses read-only `systemctl show`/`/proc`

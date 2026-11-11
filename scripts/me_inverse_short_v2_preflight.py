@@ -364,6 +364,158 @@ def _path_key(value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Python virtualenv validation (Codex P2 discussion_r4541445199).
+#
+# A standard Linux virtualenv SYMLINKS its interpreter:
+#   <root>/.venv/bin/python -> python3 -> /usr/bin/python3.12
+# so the FINAL symlink target legitimately lives OUTSIDE the checkout.
+# What must belong to the Scanner checkout is the VENV ITSELF (layout +
+# pyvenv.cfg + no directory-symlink substitution), not the system
+# interpreter behind the link.  Path metadata and the venv configuration
+# are inspected only — no interpreter is ever executed here.
+# ---------------------------------------------------------------------------
+_VENV_BIN_NAMES = ("bin", "Scripts")
+
+
+def _path_inside(path_value: str, root_value: str) -> bool:
+    """Lexical (``..``-safe, symlink-blind) membership of path in root."""
+    path_norm = os.path.normcase(os.path.normpath(path_value))
+    root_norm = os.path.normcase(os.path.normpath(root_value))
+    return path_norm == root_norm or path_norm.startswith(root_norm + os.sep)
+
+
+def _validate_scanner_python_environment(
+    python_exe: str, scanner_root: Path,
+) -> tuple[str, str, str]:
+    """Validate that the unit's interpreter belongs to the Scanner checkout.
+
+    Returns ``(status, reason, detail)`` with status one of
+    ``PASS`` / ``FAIL`` / ``NOT_VERIFIED``:
+
+    * ``FAIL``      — relative/traversal/foreign interpreter, directory
+                      symlink substitution (venv or bin dir resolving
+                      outside the checkout), interpreter behind a foreign
+                      ``pyvenv.cfg``, or a non-executable file;
+    * ``NOT_VERIFIED`` — the virtualenv cannot be established
+                      (missing/invalid ``pyvenv.cfg``, missing executable,
+                      unsupported ``bin/python*`` layout, unresolvable
+                      path) — never a silent PASS;
+    * ``PASS``      — absolute path, lexically inside the checkout, real
+                      ``bin/python*`` layout with a well-formed
+                      ``pyvenv.cfg``, venv/bin directories resolving
+                      inside the checkout, executable file present; a
+                      symlink target may be the SYSTEM interpreter, but
+                      never another virtualenv.
+    """
+    root = Path(scanner_root)
+
+    # 1) ExecStart must carry an ABSOLUTE interpreter path.
+    if not Path(python_exe).is_absolute():
+        return (
+            STATUS_FAIL, "SCANNER_PYTHON_NOT_ABSOLUTE",
+            "ExecStart Python path must be absolute",
+        )
+
+    # 2) Lexical membership: normpath collapses '..' WITHOUT following
+    #    symlinks, so traversal escapes are rejected here.
+    if not _path_inside(python_exe, str(root)):
+        return (
+            STATUS_FAIL, "SCANNER_PYTHON_OUTSIDE_CHECKOUT",
+            "ExecStart Python path resolves lexically outside --scanner-root",
+        )
+
+    # 3) Virtualenv layout: <venv>/{bin|Scripts}/python*.
+    norm_exe = Path(os.path.normpath(python_exe))
+    bin_dir, venv_dir = norm_exe.parent, norm_exe.parent.parent
+    if bin_dir.name not in _VENV_BIN_NAMES or \
+            not norm_exe.name.startswith("python"):
+        return (
+            STATUS_NOT_VERIFIED, "SCANNER_PYVENV_LAYOUT_UNSUPPORTED",
+            "Python executable is not <venv>/{bin,Scripts}/python*; the "
+            "virtualenv cannot be identified",
+        )
+
+    # 4) pyvenv.cfg must exist and have the expected key = value structure.
+    cfg = venv_dir / "pyvenv.cfg"
+    try:
+        cfg_text = cfg.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return (
+            STATUS_NOT_VERIFIED, "SCANNER_PYVENV_CFG_MISSING",
+            "pyvenv.cfg missing next to the virtualenv directory",
+        )
+    if not any(
+        "=" in line and line.partition("=")[0].strip()
+        for line in cfg_text.splitlines() if line.strip()
+    ):
+        return (
+            STATUS_NOT_VERIFIED, "SCANNER_PYVENV_CFG_INVALID",
+            "pyvenv.cfg exists but has no key = value entry",
+        )
+
+    # 5) The venv and bin DIRECTORIES must resolve inside the checkout —
+    #    a directory symlink/junction substituting a foreign environment
+    #    is a definite FAIL even though the lexical path looks local.
+    try:
+        root_resolved = str(root.resolve())
+    except OSError:
+        root_resolved = str(root)
+    for label, directory in (("venv", venv_dir), ("bin", bin_dir)):
+        try:
+            resolved_dir = str(directory.resolve())
+        except (OSError, ValueError):
+            return (
+                STATUS_NOT_VERIFIED, "SCANNER_VENV_UNRESOLVABLE",
+                f"{label} directory cannot be resolved",
+            )
+        if not _path_inside(resolved_dir, root_resolved):
+            return (
+                STATUS_FAIL, "SCANNER_VENV_SYMLINK_ESCAPE",
+                f"{label} directory resolves outside --scanner-root "
+                "(directory symlink/junction substitution)",
+            )
+
+    # 6) The interpreter file must exist and be executable.
+    if not Path(os.path.normpath(python_exe)).is_file():
+        return (
+            STATUS_NOT_VERIFIED, "SCANNER_PYTHON_MISSING",
+            "Python executable does not exist in the Scanner checkout",
+        )
+    if not os.access(os.path.normpath(python_exe), os.X_OK):
+        return (
+            STATUS_FAIL, "SCANNER_PYTHON_NOT_EXECUTABLE",
+            "Python executable exists but is not executable",
+        )
+
+    # 7/8) Symlink chain: the final target may be the SYSTEM interpreter
+    #    (correct for a standard venv) but must never be a FOREIGN
+    #    virtualenv behind a substituted link.
+    try:
+        target = Path(os.path.normpath(python_exe)).resolve()
+    except (OSError, ValueError):
+        return (
+            STATUS_NOT_VERIFIED, "SCANNER_PYTHON_UNRESOLVABLE",
+            "Python executable path cannot be resolved",
+        )
+    our_cfg_dir = _path_key(str(venv_dir))
+    target_cfg_dir = None
+    for ancestor in target.parents:
+        if (ancestor / "pyvenv.cfg").is_file():
+            target_cfg_dir = _path_key(str(ancestor))
+            break
+    if target_cfg_dir is not None and target_cfg_dir != our_cfg_dir:
+        return (
+            STATUS_FAIL, "SCANNER_PYTHON_FOREIGN_VENV",
+            "interpreter symlink target belongs to another virtualenv",
+        )
+    return (
+        STATUS_PASS, "",
+        "python executable belongs to the checkout's virtualenv "
+        "(pyvenv.cfg present); system-interpreter symlink targets allowed",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Individual checks (each returns {status, reason, detail})
 # ---------------------------------------------------------------------------
 def _runtime_config_check(
@@ -521,34 +673,49 @@ def _scanner_source_check(
     else:
         script = exec_parts[-1] if exec_parts else ""
         python_exe = exec_parts[0] if exec_parts else ""
-        problems: list[str] = []
+        structural: list[str] = []
         if not script.endswith("scanner_runner.py"):
-            problems.append("ExecStart has no scanner_runner.py script path")
+            structural.append("ExecStart has no scanner_runner.py script path")
         elif Path(script).parent.resolve() != root.resolve():
-            problems.append("ExecStart script lives outside --scanner-root")
+            structural.append("ExecStart script lives outside --scanner-root")
         if not python_exe:
-            problems.append("ExecStart python missing")
-        else:
-            try:
-                Path(python_exe).resolve().relative_to(root.resolve())
-            except (OSError, ValueError):
-                problems.append(
-                    "ExecStart python environment is outside --scanner-root",
-                )
+            structural.append("ExecStart python missing")
         if not workdir:
-            problems.append("WorkingDirectory missing")
+            structural.append("WorkingDirectory missing")
         elif Path(workdir).resolve() != root.resolve():
-            problems.append("WorkingDirectory differs from --scanner-root")
-        if problems:
+            structural.append("WorkingDirectory differs from --scanner-root")
+
+        # The interpreter is validated as a VIRTUALENV (P2-1): a standard
+        # symlink-based Linux venv must PASS even though its final target
+        # (/usr/bin/python3.x) lives outside the checkout.
+        if python_exe:
+            py_status, py_reason, py_detail = (
+                _validate_scanner_python_environment(python_exe, root)
+            )
+        else:
+            py_status, py_reason, py_detail = STATUS_PASS, "", ""
+
+        if structural:
+            detail = "; ".join(structural)
+            if py_status == STATUS_FAIL and py_detail:
+                detail = f"{detail}; {py_detail}"
             subs["scanner_unit_matches_checkout"] = (
-                STATUS_FAIL, "SCANNER_UNIT_CHECKOUT_MISMATCH",
-                "; ".join(problems),
+                STATUS_FAIL, "SCANNER_UNIT_CHECKOUT_MISMATCH", detail,
+            )
+        elif py_status == STATUS_FAIL:
+            subs["scanner_unit_matches_checkout"] = (
+                STATUS_FAIL, py_reason, py_detail,
+            )
+        elif py_status == STATUS_NOT_VERIFIED:
+            subs["scanner_unit_matches_checkout"] = (
+                STATUS_NOT_VERIFIED, py_reason, py_detail,
             )
         else:
             subs["scanner_unit_matches_checkout"] = (
                 STATUS_PASS, "",
-                "unit ExecStart/WorkingDirectory/Python environment resolve "
-                "to the audited Scanner checkout",
+                "unit ExecStart/WorkingDirectory resolve to the audited "
+                "Scanner checkout; " + (py_detail or "python environment "
+                                        "validated"),
             )
 
     # 4) The Scanner env audited here must be the unit's EnvironmentFile.
