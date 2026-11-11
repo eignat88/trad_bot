@@ -8,6 +8,13 @@ Covers, without touching any real database or systemd:
   ever reaches the (fake) connection, nothing is ever committed, and no
   credential/secret value can appear in the JSON report or the CLI
   output (exit code 0 only when ready);
+* the P2 Scanner runtime audit — the preflight checks the EXPLICIT
+  production Scanner checkout (``--scanner-root``), its systemd unit
+  (``ExecStart``/``WorkingDirectory``/``EnvironmentFile``) and fixture
+  process metadata; an old Scanner checkout, a unit pointing elsewhere,
+  stale sources vs process start, missing unit/process metadata all block
+  ``READY_FOR_ACTIVATION`` even when the V2 release is fully ready
+  (never touching a real systemd or /proc, never restarting anything);
 * the deployment assets — V2 systemd unit, V2 runtime env example,
   Scanner env fragment, and the runbook's install/verify/rollback steps;
 * two-process consistency wiring — the preflight's default file locations
@@ -18,9 +25,11 @@ No PostgreSQL, no systemd and no production configuration are required.
 """
 from __future__ import annotations
 
+import ast
 import importlib
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -177,6 +186,63 @@ def _scanner_env_text(
     )
 
 
+# ---------------------------------------------------------------------------
+# P2 fixtures: Scanner checkout / systemd unit / process metadata — all
+# fabricated locally.  Unit tests NEVER read a real systemd or /proc and
+# NEVER restart anything.
+# ---------------------------------------------------------------------------
+def _write_scanner_unit(path: Path, root: Path, env_file: Path) -> Path:
+    """Install a fixture `trad-bot-scanner.service` for ``root``."""
+    r = root.as_posix().rstrip("/")
+    path.write_text(
+        "[Unit]\n"
+        "Description=Trad Bot Scanner\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"WorkingDirectory={r}\n"
+        f"EnvironmentFile={env_file.as_posix()}\n"
+        f"ExecStart={r}/.venv/bin/python {r}/scanner_runner.py\n"
+        "Restart=on-failure\n"
+        "User=tradbot\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _scanner_process_fixture(
+    root: Path, *, unit: Path, started_at: float | None = None,
+) -> dict:
+    """Read-only process metadata exactly as _detect_scanner_process models it.
+
+    ``started_at`` defaults to now+1h so the fixture dominates any checkout
+    mtime deterministically; scenarios modelling a stale process pass an
+    explicit past timestamp.
+    """
+    r = root.as_posix().rstrip("/")
+    return {
+        "available": True, "active": True, "state": "active", "pid": 4242,
+        "fragment": unit.as_posix(),
+        "cmdline": [f"{r}/.venv/bin/python", f"{r}/scanner_runner.py"],
+        "cwd": r,
+        "started_at": time.time() + 3600.0 if started_at is None
+        else started_at,
+    }
+
+
+def _make_scanner_checkout(base: Path, name: str = "scanner") -> Path:
+    """A temporary Scanner checkout with the CURRENT sources."""
+    root = base / name
+    for rel in SOURCE_FILES:
+        dst = root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes((PROJECT_ROOT / rel).read_bytes())
+    return root
+
+
 @pytest.fixture
 def env_files(tmp_path):
     runtime = tmp_path / "v2-runtime.env"
@@ -189,16 +255,41 @@ def env_files(tmp_path):
     scanner.write_text(
         _scanner_env_text(password=RUNTIME_PASSWORD), encoding="utf-8",
     )
+    # The Scanner systemd unit of the default Scanner checkout (P2-1).
+    _write_scanner_unit(tmp_path / "scanner-unit.service", PROJECT_ROOT, scanner)
     return runtime, scanner
 
 
-def _run(runtime: Path, scanner: Path, results: list, *, repo_root=None):
+_PROCESS_AUTO = object()
+
+
+def _run(runtime: Path, scanner: Path, results: list, *, repo_root=None,
+         scanner_root: Path = PROJECT_ROOT, scanner_unit_path: Path | None = None,
+         scanner_process=_PROCESS_AUTO):
+    """run_preflight with fixture Scanner checkout/unit/process metadata.
+
+    ``scanner_root`` defaults to the project's own sources (a real, wired
+    Scanner checkout); ``scanner_unit_path`` defaults to the unit installed
+    next to the env files, pointing at that checkout; ``scanner_process``
+    defaults to matching metadata — scenarios override each ingredient.
+    """
+    if scanner_unit_path is None:
+        scanner_unit_path = _write_scanner_unit(
+            runtime.parent / "scanner-unit.service", scanner_root, scanner,
+        )
+    if scanner_process is _PROCESS_AUTO:
+        scanner_process = _scanner_process_fixture(
+            scanner_root, unit=scanner_unit_path,
+        )
     connect = _fake_connect_factory(results)
     result = preflight.run_preflight(
         runtime,
         connect=connect,
         scanner_env_path=scanner,
         repo_root=repo_root,
+        scanner_root=scanner_root,
+        scanner_unit_path=scanner_unit_path,
+        scanner_process=scanner_process,
     )
     return result, _fake_connect_factory.last_connection
 
@@ -387,11 +478,7 @@ class TestPreflightSixChecks:
     def test_source_path_audit_failure_blocks_source_capture(self, env_files,
                                                               tmp_path):
         runtime, scanner = env_files
-        root = tmp_path / "repo"
-        for rel in SOURCE_FILES:
-            dst = root / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes((PROJECT_ROOT / rel).read_bytes())
+        root = _make_scanner_checkout(tmp_path, "mutated-scanner")
         runner = root / "scanner_runner.py"
         source = runner.read_text(encoding="utf-8")
         needle = (
@@ -403,9 +490,18 @@ class TestPreflightSixChecks:
             source.replace(needle, "                    pass\n"),
             encoding="utf-8",
         )
+        # The V2 RELEASE (repo_root) stays intact and ready — only the
+        # ACTUAL Scanner checkout loses its V2 delivery (P2-2): the audit
+        # runs against --scanner-root, never against the release.
         result, _ = _run(
-            runtime, scanner, _happy_db_results(), repo_root=root,
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root,
+            scanner_unit_path=_write_scanner_unit(
+                tmp_path / "scanner-unit-mutated.service", root, scanner,
+            ),
         )
+        assert result["checks"]["V2_RUNTIME_CONFIG_READY"]["status"] == \
+            preflight.STATUS_PASS
         check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
         assert check["status"] == preflight.STATUS_FAIL
         assert "V2_DELIVERY_MISSING_FROM_PRODUCTION_LOOP" in check["reason"]
@@ -445,6 +541,326 @@ class TestPreflightSixChecks:
         assert result["ready_for_activation"] is False
 
 
+# ---------------------------------------------------------------------------
+# 4. P2 — the Scanner runtime audit: the preflight verifies the ACTUAL
+#    production Scanner checkout + its systemd unit + the running process
+#    (fixture metadata only: no real systemd, no /proc, never a restart).
+# ---------------------------------------------------------------------------
+class TestScannerRuntimeAudit:
+    """Codex P2 (discussion_r4540652743): a fully ready V2 release must
+    never yield READY_FOR_ACTIVATION while the real Scanner is old."""
+
+    def test_release_ready_but_old_scanner_checkout_fails(
+        self, env_files, tmp_path,
+    ):
+        """V2 release новый, Scanner checkout старый -> FAIL."""
+        runtime, scanner = env_files
+        old = _make_scanner_checkout(tmp_path, "old-scanner")
+        runner = old / "scanner_runner.py"
+        source = runner.read_text(encoding="utf-8")
+        needle = (
+            "                    "
+            "_capture_me_inverse_short_v2_source(repository, inv_candidate)\n"
+        )
+        assert needle in source
+        runner.write_text(
+            source.replace(needle, "                    pass\n"),
+            encoding="utf-8",
+        )
+        unit = _write_scanner_unit(
+            tmp_path / "unit-old.service", old, scanner,
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=old, scanner_unit_path=unit,
+        )
+        # The RELEASE itself is ready (V2_RUNTIME_CODE_READY passes)…
+        assert result["checks"]["V2_RUNTIME_CONFIG_READY"]["status"] == \
+            preflight.STATUS_PASS
+        # …but the Scanner-side compound fails on the old checkout:
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert (
+            "scanner_source_routing:V2_DELIVERY_MISSING_FROM_PRODUCTION_LOOP"
+            in check["reason"]
+        )
+        assert result["ready_for_activation"] is False
+        assert result["result"] == "NOT_READY"
+
+    def test_missing_scanner_checkout_is_not_verified(self, env_files,
+                                                      tmp_path):
+        """V2 release новый, Scanner checkout отсутствует -> NOT_VERIFIED."""
+        runtime, scanner = env_files
+        absent = tmp_path / "no-such-checkout"
+        unit = _write_scanner_unit(
+            tmp_path / "unit-absent.service", absent, scanner,
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=absent, scanner_unit_path=unit,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_NOT_VERIFIED
+        assert "scanner_checkout_resolved:SCANNER_CHECKOUT_MISSING" in \
+            check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_unit_pointing_to_another_checkout_fails(self, env_files,
+                                                     tmp_path):
+        """Scanner source содержит hook, но systemd указывает на другой
+        checkout -> FAIL."""
+        runtime, scanner = env_files
+        good = _make_scanner_checkout(tmp_path, "good-scanner")
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        unit = _write_scanner_unit(
+            tmp_path / "unit-elsewhere.service", elsewhere, scanner,
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=good, scanner_unit_path=unit,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert (
+            "scanner_unit_matches_checkout:SCANNER_UNIT_CHECKOUT_MISMATCH"
+            in check["reason"]
+        )
+        assert result["ready_for_activation"] is False
+
+    def test_sources_updated_after_process_start_is_not_verified(
+        self, env_files, tmp_path,
+    ):
+        """Scanner source обновлён, работающий процесс старый ->
+        NOT_VERIFIED (loaded-code honesty, P2-4)."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "fresh")  # mtimes = now
+        unit = _write_scanner_unit(tmp_path / "unit-fresh.service", root,
+                                   scanner)
+        process = _scanner_process_fixture(
+            root, unit=unit, started_at=time.time() - 7200.0,
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+            scanner_process=process,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_NOT_VERIFIED
+        assert (
+            "scanner_sources_effective:SCANNER_SOURCES_CHANGED_AFTER_START"
+            in check["reason"]
+        )
+        assert result["ready_for_activation"] is False
+
+    def test_missing_scanner_unit_is_not_verified(self, env_files, tmp_path):
+        """Scanner systemd unit недоступен -> NOT_VERIFIED."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "unitless")
+        missing_unit = tmp_path / "unit-was-never-installed.service"
+        process = _scanner_process_fixture(root, unit=missing_unit)
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=missing_unit,
+            scanner_process=process,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_NOT_VERIFIED
+        assert "scanner_unit_available:SCANNER_UNIT_UNAVAILABLE" in \
+            check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_uninspectable_process_is_not_verified(self, env_files, tmp_path):
+        """No process metadata -> NOT_VERIFIED, never PASS (P2-4: a static
+        audit is never runtime evidence)."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "opaque")
+        unit = _write_scanner_unit(tmp_path / "unit-opaque.service", root,
+                                   scanner)
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+            scanner_process={"available": False,
+                             "reason": "SYSTEMCTL_UNAVAILABLE"},
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_NOT_VERIFIED
+        assert (
+            "scanner_process_matches_unit:SCANNER_PROCESS_NOT_VERIFIABLE"
+            in check["reason"]
+        )
+        assert result["ready_for_activation"] is False
+
+    def test_process_running_another_checkout_fails(self, env_files,
+                                                    tmp_path):
+        """The unit and checkout are right, but the RUNNING process
+        executes another tree -> FAIL."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "declared")
+        other = tmp_path / "actually-running"
+        other.mkdir()
+        unit = _write_scanner_unit(tmp_path / "unit-declared.service", root,
+                                   scanner)
+        process = _scanner_process_fixture(other, unit=unit)
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+            scanner_process=process,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert (
+            "scanner_process_matches_unit:SCANNER_PROCESS_UNIT_MISMATCH"
+            in check["reason"]
+        )
+        assert result["ready_for_activation"] is False
+
+    def test_verified_scanner_runtime_allows_ready(self, env_files,
+                                                   tmp_path):
+        """Scanner source и runtime подтверждены -> PASS (the §3 row-8
+        flag-off case included: PASS by configuration)."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "verified")
+        unit = _write_scanner_unit(tmp_path / "unit-verified.service", root,
+                                   scanner)
+        process = _scanner_process_fixture(root, unit=unit)
+        result, connection = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+            scanner_process=process,
+        )
+        for name in preflight.CHECK_NAMES:
+            assert result["checks"][name]["status"] == preflight.STATUS_PASS, (
+                name, result["checks"][name],
+            )
+        assert result["ready_for_activation"] is True
+        assert result["result"] == "READY_FOR_ACTIVATION"
+        source_detail = result["checks"]["V2_SOURCE_CAPTURE_READY"]["detail"]
+        assert "no audited source changed after process start" in source_detail
+        assert "Scanner flag configured and OFF at preflight" in source_detail
+        assert "unit EnvironmentFile equals" in source_detail
+        config_detail = result["checks"]["V2_RUNTIME_CONFIG_READY"]["detail"]
+        assert "V2 release passes the static source-path audit" in config_detail
+        _assert_read_only(connection)
+
+    def test_v1_capture_missing_in_scanner_fails(self, env_files, tmp_path):
+        """V1 capture отсутствует (доставка) в Scanner checkout -> FAIL."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "v1-missing")
+        runner = root / "scanner_runner.py"
+        source = runner.read_text(encoding="utf-8")
+        v1_needle = (
+            "                    "
+            "_capture_me_inverse_short_source(repository, inv_candidate)\n"
+        )
+        assert v1_needle in source
+        runner.write_text(
+            source.replace(v1_needle, "                    pass\n"),
+            encoding="utf-8",
+        )
+        unit = _write_scanner_unit(tmp_path / "unit-v1.service", root,
+                                   scanner)
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert (
+            "scanner_source_routing:V1_DELIVERY_MISSING_FROM_PRODUCTION_LOOP"
+            in check["reason"]
+        )
+        assert result["ready_for_activation"] is False
+
+    def test_v2_hook_missing_in_scanner_fails(self, env_files, tmp_path):
+        """V2 hook отсутствует в Scanner checkout -> FAIL."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "hook-missing")
+        runner = root / "scanner_runner.py"
+        source = runner.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        hook = next(
+            node for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "_capture_me_inverse_short_v2_source"
+        )
+        lines = source.splitlines(keepends=True)
+        del lines[hook.lineno - 1:hook.end_lineno]
+        runner.write_text("".join(lines), encoding="utf-8")
+        unit = _write_scanner_unit(tmp_path / "unit-nov2.service", root,
+                                   scanner)
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert "scanner_source_routing:V2_HOOK_NOT_DEFINED" in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_gate_dependency_in_scanner_hook_fails(self, env_files,
+                                                   tmp_path):
+        """P2-2: a Scanner hook consulting trading decisions -> FAIL even
+        though the V2 release itself is clean."""
+        runtime, scanner = env_files
+        root = _make_scanner_checkout(tmp_path, "gated")
+        runner = root / "scanner_runner.py"
+        source = runner.read_text(encoding="utf-8")
+        mutated = source.replace(
+            "_get_me_inverse_short_v2_store",
+            "_get_me_inverse_short_v2_store_gate_accepted",
+        )
+        assert mutated != source, "control needle moved; update it"
+        runner.write_text(mutated, encoding="utf-8")
+        unit = _write_scanner_unit(tmp_path / "unit-gated.service", root,
+                                   scanner)
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+        )
+        assert result["checks"]["V2_RUNTIME_CONFIG_READY"]["status"] == \
+            preflight.STATUS_PASS
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert (
+            "scanner_source_routing:V2_HOOK_TRADING_GATE_DEPENDENCY"
+            in check["reason"]
+        )
+        assert result["ready_for_activation"] is False
+
+    def test_release_without_wiring_fails_runtime_code_ready(
+        self, env_files, tmp_path,
+    ):
+        """The release half of the split: a V2 release WITHOUT the wiring
+        fails V2_RUNTIME_CONFIG_READY (runtime_code_ready), while the
+        verified Scanner checkout alone can never make it ready."""
+        runtime, scanner = env_files
+        release = _make_scanner_checkout(tmp_path, "broken-release")
+        runner = release / "scanner_runner.py"
+        source = runner.read_text(encoding="utf-8")
+        needle = (
+            "                    "
+            "_capture_me_inverse_short_v2_source(repository, inv_candidate)\n"
+        )
+        assert needle in source
+        runner.write_text(
+            source.replace(needle, "                    pass\n"),
+            encoding="utf-8",
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=release,
+        )
+        check = result["checks"]["V2_RUNTIME_CONFIG_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert (
+            "runtime_code_ready:V2_DELIVERY_MISSING_FROM_PRODUCTION_LOOP"
+            in check["reason"]
+        )
+        assert result["checks"]["V2_SOURCE_CAPTURE_READY"]["status"] == \
+            preflight.STATUS_PASS
+        assert result["ready_for_activation"] is False
+
+
 class TestPreflightCli:
     def test_main_returns_zero_only_when_ready(self, env_files, monkeypatch,
                                                capsys):
@@ -452,9 +868,20 @@ class TestPreflightCli:
         monkeypatch.setattr(
             "pg8000.dbapi.connect", _fake_connect_factory(_happy_db_results()),
         )
+        unit = runtime.parent / "scanner-unit.service"
+        # Effective-runtime metadata comes from fixtures — never from the
+        # real systemd//proc of this test host (P2-4).
+        monkeypatch.setattr(
+            preflight, "_detect_scanner_process",
+            lambda _unit_path=None: _scanner_process_fixture(
+                PROJECT_ROOT, unit=unit,
+            ),
+        )
         code = preflight.main([
             "--env-file", str(runtime),
             "--scanner-env-file", str(scanner),
+            "--scanner-root", str(PROJECT_ROOT),
+            "--scanner-unit", str(unit),
         ])
         out = capsys.readouterr().out
         report = json.loads(out)
@@ -503,6 +930,18 @@ class TestPreflightCli:
         assert code == 1
         assert SCANNER_PASSWORD not in out
         assert RUNTIME_PASSWORD not in out
+
+    def test_cli_exposes_the_scanner_checkout_arguments(self, capsys):
+        """P2-1: the production Scanner checkout/unit are explicit CLI
+        parameters with the production defaults."""
+        with pytest.raises(SystemExit) as excinfo:
+            preflight.main(["--help"])
+        assert excinfo.value.code == 0
+        out = capsys.readouterr().out
+        assert "--scanner-root" in out
+        assert "--scanner-unit" in out
+        assert preflight.DEFAULT_SCANNER_ROOT.as_posix() in out
+        assert preflight.DEFAULT_SCANNER_UNIT.as_posix() in out
 
 
 class TestPreflightCompatibility:
@@ -627,8 +1066,8 @@ class TestDeployAssets:
         )
         assert runbook.is_file()
         text = runbook.read_text(encoding="utf-8")
-        # 11 numbered steps:
-        for step in range(1, 12):
+        # 12 numbered steps:
+        for step in range(1, 13):
             assert f"### Step {step} " in text, step
         # STOP conditions are explicit throughout:
         assert text.count("**STOP**") >= 10
@@ -640,10 +1079,22 @@ class TestDeployAssets:
         assert "NOT_VERIFIED" in text
         # Migration 087 + rollback + drain documented:
         assert "087_me_long_v2_inverse_short_v2.sql" in text
-        assert "### Step 11 — Stop / drain / rollback" in text
+        assert "### Step 12 — Stop / drain / rollback" in text
         assert "--drain" in text
         # The two-process scanner half is present:
         assert "me-inverse-short-scanner.env.example" in text
+        # P2: the Scanner source installation stage with its explicit
+        # CLI parameters and the release/scanner readiness split:
+        assert (
+            "### Step 9 — Scanner source installation and effective "
+            "runtime verification" in text
+        )
+        assert "V2_RUNTIME_CODE_READY" in text
+        assert "--scanner-root /opt/trad_bot" in text
+        assert "--scanner-unit /etc/systemd/system/trad-bot-scanner.service" \
+            in text
+        # Scanner updates/restarts stay a separate operational GO:
+        assert "separate" in text and "GO" in text
 
     def test_preflight_defaults_match_the_deploy_assets(self):
         v2_unit = (
@@ -659,6 +1110,28 @@ class TestDeployAssets:
         # The scanner default matches the Scanner unit's EnvironmentFile:
         assert preflight.DEFAULT_SCANNER_ENV.as_posix() in scanner_unit
         assert preflight.DEFAULT_SCANNER_ENV.as_posix() == "/opt/trad_bot/.env"
+        # P2-1: CLI scanner checkout/unit defaults agree with the systemd
+        # unit's WorkingDirectory / ExecStart / script path:
+        assert preflight.DEFAULT_SCANNER_ROOT == Path("/opt/trad_bot")
+        assert preflight.DEFAULT_SCANNER_ROOT.as_posix() in scanner_unit
+        assert preflight.DEFAULT_SCANNER_UNIT.name == "trad-bot-scanner.service"
+        exec_start = next(
+            line for line in scanner_unit.splitlines()
+            if line.startswith("ExecStart=")
+        )
+        script_token = exec_start.split()[-1]
+        assert Path(script_token).name == "scanner_runner.py"
+        assert Path(script_token).parent == preflight.DEFAULT_SCANNER_ROOT
+        workdir = next(
+            line for line in scanner_unit.splitlines()
+            if line.startswith("WorkingDirectory=")
+        ).split("=", 1)[1]
+        assert Path(workdir) == preflight.DEFAULT_SCANNER_ROOT
+        # The unit file exists under the name the CLI default points at:
+        assert (
+            PROJECT_ROOT / "deploy" / "systemd"
+            / preflight.DEFAULT_SCANNER_UNIT.name
+        ).is_file()
 
     def test_v2_module_entrypoint_exists_for_the_unit(self):
         module = (

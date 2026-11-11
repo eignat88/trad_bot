@@ -98,7 +98,7 @@ compares the two unit files directive by directive.
 
 ---
 
-## 3. Installation — 11 steps with STOP conditions
+## 3. Installation — 12 steps with STOP conditions
 
 ### Step 1 — Pin the reviewed release
 
@@ -247,13 +247,103 @@ sudo -u postgres psql -d trad_bot -c \
   row is not `READY_TO_START` with NULL fingerprint/freeze, if telemetry
   reports `activated=true`, or if the heartbeat does not advance.
 
-### Step 9 — Read-only preflight: all six checks must PASS
+### Step 9 — Scanner source installation and effective runtime verification
+
+The V2 release (`/opt/trad_bot_me_inverse_short_v2_release`) and the
+production Scanner (`/opt/trad_bot`, `trad-bot-scanner.service`) are
+SEPARATE installations: a fully ready V2 release proves nothing about the
+Scanner that must actually deliver `_me_inverse_short_source_events`.
+Scanner readiness in the preflight is `V2_SOURCE_CAPTURE_READY`
+(Scanner-side, audited against `--scanner-root`); release readiness is the
+`V2_RUNTIME_CODE_READY` concept inside `V2_RUNTIME_CONFIG_READY`.
+Safe sequence — any Scanner update or restart is a **separate
+operational GO**, never part of a V2 activation approval:
+
+1. Check the current production Scanner version
+   (`git -C /opt/trad_bot rev-parse HEAD`, `stat -c '%y' /opt/trad_bot/scanner_runner.py`,
+   `systemctl show trad-bot-scanner.service -p ExecStart,MainPID,FragmentPath`).
+2. Confirm the required V2 source capture is present in the TARGET
+   Scanner release (both hooks + `_capture_me_inverse_short_v2_source`
+   delivery + `ROUTE_PRE_FILTER_SOURCE` routing — the preflight's
+   `--scanner-root` audit proves this on the checkout).
+3. Prepare the updated Scanner tree independently of the V2 runtime
+   (staged copy/checkout — installing it is NOT yet allowed).
+4. Verify compatibility with the existing V1: V1 capture hook still
+   present, V1 delivery untouched, scanner flag `ME_INVERSE_SHORT_V2_ENABLED`
+   still `0`.
+5. Obtain a **separate, explicit GO** to install/restart the production
+   Scanner (this document/task does NOT grant it).
+6. Only after that GO: install, restart ONLY `trad-bot-scanner.service`,
+   then verify the effective version of the RUNNING process
+   (`systemctl show … -p MainPID`, `/proc/<pid>/cmdline`,
+   start time vs source mtimes) — sources updated after process start
+   mean the process may still hold pre-update code.
+7. Confirm V2 source routing on the running checkout (read-only
+   preflight, see the command below: `V2_SOURCE_CAPTURE_READY=PASS`).
+8. Only after 1–7 allow the further V2 activation preflight (Step 10).
+
+Read-only preflight for this step (never writes, never restarts):
 
 ```bash
 cd /opt/trad_bot_me_inverse_short_v2_release
 .venv/bin/python scripts/me_inverse_short_v2_preflight.py \
   --env-file /etc/trad-bot/me-inverse-short-v2-runtime.env \
-  --scanner-env-file /opt/trad_bot/.env
+  --scanner-env-file /opt/trad_bot/.env \
+  --scanner-root /opt/trad_bot \
+  --scanner-unit /etc/systemd/system/trad-bot-scanner.service
+```
+
+Note: reading the running process metadata (`/proc/<pid>/cwd`) requires
+sufficient privileges (root or the Scanner's user); without them the
+preflight honestly reports `SCANNER_PROCESS_NOT_VERIFIABLE`
+(`NOT_VERIFIED` — never a silent PASS), it never guesses and never
+restarts the Scanner to make verification easier.
+
+Example — old Scanner checkout (V2 release fully ready), the
+`V2_SOURCE_CAPTURE_READY` compound stays blocked:
+
+```json
+"V2_RUNTIME_CONFIG_READY": {"status": "PASS", "reason": ""},
+"V2_SOURCE_CAPTURE_READY": {"status": "FAIL",
+  "reason": "scanner_source_routing:V2_DELIVERY_MISSING_FROM_PRODUCTION_LOOP"}
+```
+
+Example — Scanner checkout, systemd unit and running process all
+confirmed (and no source changed after process start):
+
+```json
+"V2_SOURCE_CAPTURE_READY": {"status": "PASS", "reason": ""}
+```
+
+Example — checkout/unit/process metadata not confirmable (unit not
+installed, host without systemd metadata, sources newer than the running
+process): `{"status": "NOT_VERIFIED", "reason": "…:SCANNER_PROCESS_NOT_VERIFIABLE"}`
+— `NOT_VERIFIED` never counts as satisfied; `ready_for_activation` stays
+`false`.
+
+* **STOP** if `--scanner-root` does not match the unit's
+  `ExecStart`/`WorkingDirectory`, if the running process cmdline/cwd
+  differs from the unit, if audited sources are newer than the process
+  start time, if the Scanner unit file is unreadable, or if the release
+  is ready while the Scanner checkout fails its source-routing audit.
+* **STOP** and report honestly: confirming the exact *loaded bytecode*
+  is impossible without restarting the Scanner or adding extra
+  diagnostics — the preflight uses read-only `systemctl show`/`/proc`
+  metadata (process↔unit agreement + source freshness) and never
+  pretends more. Do NOT treat the static AST audit as runtime proof.
+* **STOP** if any of the steps above (install/restart of the production
+  Scanner) was not covered by its own explicit GO. This task performs
+  NONE of them.
+
+### Step 10 — Read-only preflight: all six checks must PASS
+
+```bash
+cd /opt/trad_bot_me_inverse_short_v2_release
+.venv/bin/python scripts/me_inverse_short_v2_preflight.py \
+  --env-file /etc/trad-bot/me-inverse-short-v2-runtime.env \
+  --scanner-env-file /opt/trad_bot/.env \
+  --scanner-root /opt/trad_bot \
+  --scanner-unit /etc/systemd/system/trad-bot-scanner.service
 ```
 
 Exit code `0` prints `"result": "READY_FOR_ACTIVATION"` — the ONLY value
@@ -262,25 +352,25 @@ that may proceed to an activation request. The six independent checks:
 | Check | Meaning |
 |---|---|
 | `DB_READY` | dedicated credentials reach the DB; migration-087 schema present; read-only transaction only |
-| `V2_RUNTIME_CONFIG_READY` | dedicated env file present/valid, flag `0`, port/DB name sane |
-| `V2_SOURCE_CAPTURE_READY` | static audit proves the production loop delivers the pre-gate publication to BOTH hooks, AND the Scanner process's flag/DB tuple are consistent (two-process check) |
+| `V2_RUNTIME_CONFIG_READY` | RELEASE-side: dedicated env file present/valid, flag `0`, port/DB name sane, AND the release passes the static source audit (`runtime_code_ready` = the `V2_RUNTIME_CODE_READY` concept) |
+| `V2_SOURCE_CAPTURE_READY` | SCANNER-side: the ACTUAL checkout from `--scanner-root` is audited (pre-gate publication to BOTH hooks, fail-open, flag-only, no trading-gate dependency), agrees with the systemd unit (`ExecStart`/`WorkingDirectory`/Python env/`EnvironmentFile`), the running process matches the unit and predates no audited source, and the Scanner flag/DB tuple are consistent (two-process check) |
 | `V2_ACTIVATION_READY` | `READY_TO_START`, fingerprint/freeze NULL, event/position/outbox empty |
 | `PROTOCOL_FINGERPRINT_VALID` | deployed fingerprint equals the reviewed pin; paper/prospective/no-backfill/direction invariants hold |
-| `V1_ISOLATION_VALID` | no V1 key in the V2 env; V2 unit paths/env/exec disjoint from the V1 unit; V1 capture hook still present |
+| `V1_ISOLATION_VALID` | no V1 key in the V2 env; V2 unit paths/env/exec disjoint from the V1 unit; V1 capture hook still present in the ACTUAL Scanner checkout |
 
 * Each check reports `PASS` / `FAIL` / `NOT_VERIFIED`; **`NOT_VERIFIED`
   never auto-passes** — `READY_FOR_ACTIVATION` requires all six `PASS`.
-* The tool never writes, never activates, prints no credentials, and
-  always rolls back its read-only transaction.
+* The tool never writes, never activates, never restarts the Scanner,
+  prints no credentials, and always rolls back its read-only transaction.
 * **STOP** if any check is not `PASS`, if the fingerprint pin differs, or
   if the report contains anything but `PASS` for a mandatory check.
 
-### Step 10 — Activation (SEPARATE APPROVED GO — documentation only)
+### Step 11 — Activation (SEPARATE APPROVED GO — documentation only)
 
 Only after an explicit, separate activation decision:
 
 ```bash
-# 1. Confirm preflight still READY_FOR_ACTIVATION (Step 9) and capture a
+# 1. Confirm preflight still READY_FOR_ACTIVATION (Step 10) and capture a
 #    FRESH current UTC boundary (never a timestamp copied from docs).
 # 2. Read-only status first:
 .venv/bin/python scripts/me_inverse_short_v2_activate.py --show \
@@ -306,7 +396,7 @@ Only after an explicit, separate activation decision:
   changing the execution spec requires a NEW review (the fingerprint must
   never change silently).
 
-### Step 11 — Stop / drain / rollback
+### Step 12 — Stop / drain / rollback
 
 ```bash
 # Graceful stop (finishes the current cycle, exits 0, releases the lock):

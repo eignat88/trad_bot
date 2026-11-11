@@ -13,15 +13,27 @@ P1-3 design — SIX independent checks, each reported as exactly one of
     V2 schema exists, and the read succeeds inside ``BEGIN TRANSACTION
     READ ONLY`` (no DML is possible).
 ``V2_RUNTIME_CONFIG_READY``
-    The dedicated runtime EnvironmentFile exists, parses (no export lines,
-    no duplicates), defines all required keys, has flag ``0``, a sane port
-    and the expected database name.
+    Release-side readiness (concept ``V2_RUNTIME_CODE_READY`` plus the
+    configuration): the dedicated runtime EnvironmentFile exists, parses
+    (no export lines, no duplicates), defines all required keys, has flag
+    ``0``, a sane port and the expected database name, AND the V2 RELEASE
+    itself passes the static source-path audit (``runtime_code_ready``
+    subcheck — the release carries the wired capture code).
 ``V2_SOURCE_CAPTURE_READY``
-    The production source path audit proves ``scanner_runner`` delivers the
-    pre-gate ``_me_inverse_short_source_events`` publication to BOTH the V1
-    and the V2 hook, AND the Scanner process's own environment (the second
-    process) is consistent with the runtime environment (flag configured
-    and OFF at preflight; DB tuple comparable and equal).
+    Scanner-side readiness (P2): audits the ACTUAL production Scanner
+    checkout given explicitly via ``--scanner-root`` (normally
+    ``/opt/trad_bot`` — the V2 release directory is NEVER used as the
+    Scanner source), verifies it against the installed systemd unit
+    (``--scanner-unit``: ExecStart, WorkingDirectory, Python environment,
+    script path, EnvironmentFile), audits V2 source routing on THAT
+    checkout (an old Scanner checkout fails here even when the V2 release
+    is fully ready), confirms from read-only process metadata that the
+    running Scanner matches the unit and that no audited source changed
+    after the process started (never restarting anything), and keeps the
+    two-process flag/DB consistency checks.  When the real Scanner
+    checkout, its unit or the running process cannot be confirmed, the
+    check reports ``NOT_VERIFIED`` and ``ready_for_activation`` stays
+    false — a static audit is never substituted for runtime evidence.
 ``V2_ACTIVATION_READY``
     The activation row is exactly ``READY_TO_START`` with NULL fingerprint
     and NULL freeze, and event/position/close_outbox are empty (no OOS
@@ -45,6 +57,12 @@ environment values — and the only database statements executed are
 ``SELECT``/``to_regclass`` inside a read-only transaction that is always
 rolled back.
 
+Effective-runtime honesty (P2-4): the Scanner process is inspected with
+read-only metadata only (``systemctl show`` + ``/proc/<pid>``) — this tool
+never restarts anything.  Exact identity of the *loaded* bytecode cannot
+be proven without an approved Scanner restart or additional diagnostics;
+the preflight says so instead of pretending (see runbook Step 9).
+
 Compatibility exports (used by ``scripts/me_inverse_short_v2_activate.py``):
 ``read_service_env``, ``PreflightRefused``.
 """
@@ -52,8 +70,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -99,8 +120,27 @@ STATUS_NOT_VERIFIED = "NOT_VERIFIED"
 # Default file locations (documented in the V2 runbook).
 DEFAULT_RUNTIME_ENV = Path("/etc/trad-bot/me-inverse-short-v2-runtime.env")
 DEFAULT_SCANNER_ENV = Path("/opt/trad_bot/.env")
+# P2-1: the Scanner audit target is ALWAYS an explicit production checkout
+# (consistent with the systemd unit below) — never the V2 release directory.
+DEFAULT_SCANNER_ROOT = Path("/opt/trad_bot")
+DEFAULT_SCANNER_UNIT = Path("/etc/systemd/system/trad-bot-scanner.service")
 V1_UNIT_NAME = "trad-bot-me-inverse-short-runtime.service"
 V2_UNIT_NAME = "trad-bot-me-inverse-short-v2-runtime.service"
+SCANNER_UNIT_NAME = "trad-bot-scanner.service"
+
+# The files audit_source_path() reads: their on-disk state must predate the
+# running Scanner process for the process to be executing this audit state.
+SCANNER_AUDIT_FILES = (
+    "scanner_runner.py",
+    "app/scanners/orchestrator.py",
+    "app/paper/me_long_v2_inverse_short_v2/capture.py",
+    "app/paper/me_long_v2_inverse_short_v2/engine.py",
+    "app/paper/me_long_v2_inverse_short_v2/protocol.py",
+)
+
+# Sentinel: "detect the running Scanner process at runtime" (tests inject
+# fixture process metadata explicitly instead — they never touch /proc).
+_AUTO_PROCESS = object()
 
 # read_service_env failures that mean "configuration is violated" (FAIL)
 # versus "we cannot verify it here" (NOT_VERIFIED).
@@ -222,31 +262,162 @@ def _read_scanner_env_keys(path: Path) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Scanner unit / effective-runtime inspection (P2-1, P2-4) — READ-ONLY.
+# Nothing here starts, stops, restarts or reloads any unit; only the unit
+# FILE is read and (at runtime) `systemctl show` + /proc/<pid> metadata.
+# ---------------------------------------------------------------------------
+def _unit_directives(text: str) -> dict[str, list[str]]:
+    """Extract the directives this audit compares (all values, no secrets)."""
+    found: dict[str, list[str]] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        for name in (
+            "EnvironmentFile", "WorkingDirectory", "ExecStart",
+            "SyslogIdentifier", "ConditionPathExists", "ReadWritePaths",
+        ):
+            if line.startswith(name + "="):
+                found.setdefault(name, []).append(line.split("=", 1)[1].strip())
+    return found
+
+
+def _read_unit_directives(path: Path) -> dict[str, list[str]] | None:
+    """Parse the installed systemd unit; None when it cannot be read."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return _unit_directives(text)
+
+
+def _detect_scanner_process(unit_path: Path) -> dict[str, Any]:
+    """Read-only metadata of the RUNNING Scanner process (never restarts).
+
+    Returns ``{"available": False, "reason": ...}`` when this host cannot
+    provide the metadata (non-systemd host, permission denied, unit not
+    loaded) — the preflight then reports NOT_VERIFIED instead of guessing.
+    A file on disk proves nothing about the executing process by itself.
+    """
+    try:
+        shown = subprocess.run(
+            ["systemctl", "show", unit_path.name, "--no-pager",
+             "--property=ActiveState,SubState,MainPID,FragmentPath"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {"available": False, "reason": "SYSTEMCTL_UNAVAILABLE"}
+    if shown.returncode != 0:
+        return {"available": False, "reason": "SYSTEMCTL_SHOW_FAILED"}
+    props: dict[str, str] = {}
+    for line in shown.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            props[key] = value
+    try:
+        pid = int(props.get("MainPID", "0") or 0)
+    except ValueError:
+        pid = 0
+    fragment = props.get("FragmentPath", "")
+    if props.get("ActiveState") != "active" or pid <= 0:
+        return {
+            "available": True, "active": False, "pid": pid,
+            "state": props.get("ActiveState", "unknown"), "fragment": fragment,
+        }
+    try:
+        cmdline = [
+            part.decode("utf-8", "replace")
+            for part in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if part
+        ]
+        cwd = str(Path(f"/proc/{pid}/cwd").resolve())
+        # /proc/<pid>/stat field 22 (0-based 19 after "comm) ") = start time
+        # in clock ticks; combine with /proc/uptime for a wall-clock start.
+        rest = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        start_ticks = int(rest.split(") ", 1)[1].split()[19])
+        clock_ticks = float(os.sysconf("SC_CLK_TCK"))
+        uptime = float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0])
+        started_at = time.time() - (uptime - start_ticks / clock_ticks)
+    except (OSError, ValueError, IndexError):
+        return {"available": False, "reason": "PROC_METADATA_UNREADABLE"}
+    return {
+        "available": True, "active": True, "state": "active", "pid": pid,
+        "fragment": fragment, "cmdline": cmdline, "cwd": cwd,
+        "started_at": started_at,
+    }
+
+
+def _path_text(value: str) -> str:
+    """Normalize a path spelling for unit/process comparisons (no IO)."""
+    try:
+        return str(Path(value))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _path_key(value: str) -> str:
+    """Canonical path key for file-backed comparisons (unit fragment,
+    EnvironmentFile): equivalent spellings/symlinks must not read as
+    mismatches; falls back to the plain normalization when unresolvable."""
+    try:
+        return str(Path(value).resolve())
+    except (OSError, ValueError):
+        return _path_text(value)
+
+
+# ---------------------------------------------------------------------------
 # Individual checks (each returns {status, reason, detail})
 # ---------------------------------------------------------------------------
-def _runtime_config_check(path: Path) -> tuple[dict[str, str], dict | None]:
+def _runtime_config_check(
+    path: Path, repo_root: Path,
+) -> tuple[dict[str, str], dict | None]:
+    """Release-side readiness (P2-3): config + the V2 RELEASE source code.
+
+    The ``runtime_code_ready`` subcheck carries the concept
+    ``V2_RUNTIME_CODE_READY``: the V2 release checkout itself must pass
+    the static source-path audit.  It says nothing about the production
+    Scanner — that is what ``V2_SOURCE_CAPTURE_READY`` audits (Scanner
+    checkout + systemd unit + running process).
+    """
+    subs: dict[str, tuple[str, str, str]] = {}
+
     try:
         values = read_service_env(path)
     except PreflightRefused as exc:
         code = str(exc)
+        values = None
         if code in _CONFIG_UNVERIFIABLE:
-            return (
-                _check(
-                    STATUS_NOT_VERIFIED,
-                    reason="SERVICE_ENV_NOT_INSTALLED",
-                    detail="dedicated runtime EnvironmentFile unreadable/absent",
-                ),
-                None,
+            subs["service_env"] = (
+                STATUS_NOT_VERIFIED, "SERVICE_ENV_NOT_INSTALLED",
+                "dedicated runtime EnvironmentFile unreadable/absent",
             )
-        return _check(STATUS_FAIL, reason=code), None
-    return (
-        _check(
-            STATUS_PASS,
-            detail="dedicated runtime EnvironmentFile parsed: flag OFF, "
-                   "required keys complete, port/DB name valid",
-        ),
-        values,
-    )
+        else:
+            subs["service_env"] = (STATUS_FAIL, code, "")
+    else:
+        subs["service_env"] = (
+            STATUS_PASS, "",
+            "dedicated runtime EnvironmentFile parsed: flag OFF, "
+            "required keys complete, port/DB name valid",
+        )
+
+    # V2_RUNTIME_CODE_READY (concept): the V2 release carries the wiring.
+    audit = audit_source_path(repo_root)
+    if audit["wired"]:
+        subs["runtime_code_ready"] = (
+            STATUS_PASS, "",
+            "V2 release passes the static source-path audit (pre-gate "
+            "publication delivered to both hooks, fail-open, V2-flag-only)",
+        )
+    else:
+        failing = [
+            (name, check) for name, check in audit["checks"].items()
+            if check["status"] != STATUS_PASS
+        ]
+        reason = failing[0][1]["reason"] or "SOURCE_PATH_NOT_WIRED" if failing \
+            else "SOURCE_PATH_NOT_WIRED"
+        subs["runtime_code_ready"] = (
+            STATUS_FAIL, reason,
+            f"failed release audit check: {failing[0][0]}" if failing else "",
+        )
+    return _combine(subs), values
 
 
 def _protocol_check() -> dict[str, str]:
@@ -269,34 +440,279 @@ def _protocol_check() -> dict[str, str]:
     )
 
 
-def _source_capture_check(
-    repo_root: Path,
+def _scanner_source_check(
+    scanner_root: Path,
     runtime_values: dict | None,
     scanner_env_path: Path,
+    *,
+    scanner_unit_path: Path,
+    process: dict[str, Any] | None,
 ) -> dict[str, str]:
-    subs: dict[str, tuple[str, str, str]] = {}
+    """Scanner-side readiness (P2): the ACTUAL production Scanner, never the
+    V2 release directory.
 
-    # 1) Static production-path audit (both hooks fed pre-gate publication).
-    audit = audit_source_path(repo_root)
-    if audit["wired"]:
-        subs["static_wiring"] = (
+    Subchecks (compound — worst wins): ``scanner_checkout_resolved`` (an
+    explicit ``--scanner-root`` checkout exists), ``scanner_unit_available``
+    (the installed systemd unit file is readable), ``scanner_unit_matches_
+    checkout`` (ExecStart script + Python environment + WorkingDirectory
+    resolve to this checkout), ``scanner_unit_env`` (the unit's
+    EnvironmentFile is the Scanner env audited here), ``scanner_source_
+    routing`` (``audit_source_path`` over THIS checkout — an old Scanner
+    fails even when the V2 release passes), ``scanner_process_matches_unit``
+    (read-only process metadata agrees with the unit; never restarted),
+    ``scanner_sources_effective`` (no audited source changed after the
+    process started), plus the unchanged ``scanner_flag`` /
+    ``db_consistency`` two-process env checks.  Anything unconfirmable is
+    NOT_VERIFIED — a static audit is never passed off as runtime proof.
+    """
+    subs: dict[str, tuple[str, str, str]] = {}
+    root = Path(scanner_root)
+
+    # 1) The explicit production Scanner checkout (NEVER the V2 release dir).
+    runner = root / "scanner_runner.py"
+    checkout_ok = root.is_dir() and runner.is_file()
+    if checkout_ok:
+        subs["scanner_checkout_resolved"] = (
             STATUS_PASS, "",
-            "production loop delivers the pre-gate source publication to "
-            "the V1 and V2 hooks (fail-open, V2-flag-only)",
+            f"scanner checkout resolved from --scanner-root ({root.name}), "
+            "separate from the V2 release directory",
         )
     else:
-        failing = [
-            (name, check) for name, check in audit["checks"].items()
-            if check["status"] != STATUS_PASS
-        ]
-        reason = failing[0][1]["reason"] or "SOURCE_PATH_NOT_WIRED" if failing \
-            else "SOURCE_PATH_NOT_WIRED"
-        subs["static_wiring"] = (
-            STATUS_FAIL, reason, f"failed audit check: {failing[0][0]}"
-            if failing else "",
+        subs["scanner_checkout_resolved"] = (
+            STATUS_NOT_VERIFIED, "SCANNER_CHECKOUT_MISSING",
+            "the explicit production Scanner checkout has no "
+            "scanner_runner.py; Scanner readiness cannot be established",
         )
 
-    # 2) The Scanner process (second process) has the V2 flag configured
+    # 2) The installed systemd unit FILE of the Scanner.
+    directives = _read_unit_directives(scanner_unit_path)
+    if directives is None:
+        subs["scanner_unit_available"] = (
+            STATUS_NOT_VERIFIED, "SCANNER_UNIT_UNAVAILABLE",
+            f"systemd unit {scanner_unit_path.name} unreadable/absent; the "
+            "running Scanner cannot be attributed to this checkout",
+        )
+    else:
+        subs["scanner_unit_available"] = (
+            STATUS_PASS, "",
+            "Scanner systemd unit parsed (ExecStart/WorkingDirectory/"
+            "EnvironmentFile)",
+        )
+
+    exec_parts: list[str] = []
+    workdir = ""
+    unit_env = ""
+    if directives is not None:
+        exec_start = (directives.get("ExecStart") or [""])[0]
+        exec_parts = exec_start.split() if exec_start else []
+        workdir = (directives.get("WorkingDirectory") or [""])[0]
+        env_files = directives.get("EnvironmentFile") or []
+        unit_env = env_files[0] if env_files else ""
+
+    # 3) The unit must run THIS checkout: script path, Python environment
+    #    and WorkingDirectory.  scanner_runner.py merely existing proves
+    #    nothing when the unit executes a different tree.
+    if directives is None or not checkout_ok:
+        subs["scanner_unit_matches_checkout"] = (
+            STATUS_NOT_VERIFIED, "SCANNER_CHECKOUT_OR_UNIT_UNAVAILABLE",
+            "unit or Scanner checkout unavailable — unit<->checkout "
+            "consistency not verifiable",
+        )
+    else:
+        script = exec_parts[-1] if exec_parts else ""
+        python_exe = exec_parts[0] if exec_parts else ""
+        problems: list[str] = []
+        if not script.endswith("scanner_runner.py"):
+            problems.append("ExecStart has no scanner_runner.py script path")
+        elif Path(script).parent.resolve() != root.resolve():
+            problems.append("ExecStart script lives outside --scanner-root")
+        if not python_exe:
+            problems.append("ExecStart python missing")
+        else:
+            try:
+                Path(python_exe).resolve().relative_to(root.resolve())
+            except (OSError, ValueError):
+                problems.append(
+                    "ExecStart python environment is outside --scanner-root",
+                )
+        if not workdir:
+            problems.append("WorkingDirectory missing")
+        elif Path(workdir).resolve() != root.resolve():
+            problems.append("WorkingDirectory differs from --scanner-root")
+        if problems:
+            subs["scanner_unit_matches_checkout"] = (
+                STATUS_FAIL, "SCANNER_UNIT_CHECKOUT_MISMATCH",
+                "; ".join(problems),
+            )
+        else:
+            subs["scanner_unit_matches_checkout"] = (
+                STATUS_PASS, "",
+                "unit ExecStart/WorkingDirectory/Python environment resolve "
+                "to the audited Scanner checkout",
+            )
+
+    # 4) The Scanner env audited here must be the unit's EnvironmentFile.
+    if directives is None:
+        subs["scanner_unit_env"] = (
+            STATUS_NOT_VERIFIED, "SCANNER_UNIT_UNAVAILABLE",
+            "unit EnvironmentFile directive not verifiable",
+        )
+    elif not unit_env:
+        subs["scanner_unit_env"] = (
+            STATUS_NOT_VERIFIED, "SCANNER_UNIT_ENV_MISSING",
+            "unit has no EnvironmentFile; the audited Scanner env cannot "
+            "be attributed to it",
+        )
+    elif _path_key(unit_env) != _path_key(str(scanner_env_path)):
+        subs["scanner_unit_env"] = (
+            STATUS_FAIL, "SCANNER_UNIT_ENV_MISMATCH",
+            "unit EnvironmentFile differs from --scanner-env-file; the "
+            "audited Scanner env is not the unit's",
+        )
+    else:
+        subs["scanner_unit_env"] = (
+            STATUS_PASS, "",
+            "unit EnvironmentFile equals the audited --scanner-env-file",
+        )
+
+    # 5) V2 source routing on the SCANNER checkout (P2-2): publication,
+    #    V1+V2 delivery, fail-open hook, flag independence, pre-filter
+    #    route, permission parity, no trading-gate dependence.
+    if not checkout_ok:
+        subs["scanner_source_routing"] = (
+            STATUS_NOT_VERIFIED, "SCANNER_CHECKOUT_UNAVAILABLE",
+            "Scanner checkout unavailable — V2 source routing not audited",
+        )
+    else:
+        audit = audit_source_path(root)
+        if audit["wired"]:
+            subs["scanner_source_routing"] = (
+                STATUS_PASS, "",
+                "Scanner checkout delivers the pre-gate publication to BOTH "
+                "hooks with independent V2 routing (fail-open, V2-flag-only, "
+                "no trading-gate dependency)",
+            )
+        else:
+            failing = [
+                (name, check) for name, check in audit["checks"].items()
+                if check["status"] != STATUS_PASS
+            ]
+            reason = failing[0][1]["reason"] or "SOURCE_PATH_NOT_WIRED" \
+                if failing else "SOURCE_PATH_NOT_WIRED"
+            subs["scanner_source_routing"] = (
+                STATUS_FAIL, reason,
+                f"failed scanner audit check: {failing[0][0]}"
+                if failing else "",
+            )
+
+    # 6) The RUNNING Scanner must match the unit (read-only metadata —
+    #    this tool never restarts anything; mismatch = definite FAIL,
+    #    unavailable = NOT_VERIFIED, never a silent PASS).
+    if directives is None:
+        subs["scanner_process_matches_unit"] = (
+            STATUS_NOT_VERIFIED, "SCANNER_UNIT_UNAVAILABLE",
+            "running Scanner cannot be checked without the unit file",
+        )
+    elif not process or not process.get("available"):
+        reason = (process or {}).get("reason", "PROCESS_METADATA_UNAVAILABLE")
+        subs["scanner_process_matches_unit"] = (
+            STATUS_NOT_VERIFIED, "SCANNER_PROCESS_NOT_VERIFIABLE",
+            f"running Scanner metadata unavailable ({reason}); a static "
+            "audit alone is never runtime evidence",
+        )
+    elif not process.get("active"):
+        subs["scanner_process_matches_unit"] = (
+            STATUS_NOT_VERIFIED, "SCANNER_PROCESS_NOT_RUNNING",
+            "the Scanner unit is not active — the audited sources are not "
+            "provably executing",
+        )
+    else:
+        cmdline = [str(token) for token in process.get("cmdline", [])]
+        problems = []
+        if not cmdline:
+            problems.append("running cmdline unreadable")
+        elif not exec_parts:
+            problems.append("unit ExecStart missing")
+        else:
+            if _path_text(cmdline[0]) != _path_text(exec_parts[0]):
+                problems.append(
+                    "running python differs from unit ExecStart python",
+                )
+            wanted_script = exec_parts[-1]
+            if not any(
+                _path_text(token) == _path_text(wanted_script)
+                for token in cmdline
+            ):
+                problems.append(
+                    "running script path differs from unit ExecStart "
+                    "scanner_runner.py",
+                )
+        if workdir and _path_text(str(process.get("cwd", ""))) != \
+                _path_text(workdir):
+            problems.append("running cwd differs from unit WorkingDirectory")
+        fragment = str(process.get("fragment", "") or "")
+        if fragment and _path_key(fragment) != _path_key(str(scanner_unit_path)):
+            problems.append(
+                "loaded unit fragment differs from the audited unit file",
+            )
+        if problems:
+            subs["scanner_process_matches_unit"] = (
+                STATUS_FAIL, "SCANNER_PROCESS_UNIT_MISMATCH",
+                "; ".join(problems),
+            )
+        else:
+            subs["scanner_process_matches_unit"] = (
+                STATUS_PASS, "",
+                f"running Scanner (pid {process.get('pid')}) "
+                "cmdline/cwd/loaded-unit match the unit",
+            )
+
+    # 7) Sources-on-disk vs the running process: files updated AFTER the
+    #    process start mean it may still hold pre-update code.
+    if not checkout_ok:
+        subs["scanner_sources_effective"] = (
+            STATUS_NOT_VERIFIED, "SCANNER_CHECKOUT_UNAVAILABLE",
+            "audited source freshness not checkable without the checkout",
+        )
+    elif not process or not process.get("available") \
+            or not process.get("active") \
+            or process.get("started_at") is None:
+        subs["scanner_sources_effective"] = (
+            STATUS_NOT_VERIFIED, "SCANNER_PROCESS_START_TIME_UNKNOWN",
+            "running Scanner start time unavailable — sources-on-disk vs "
+            "loaded code cannot be compared",
+        )
+    else:
+        try:
+            newest = max(
+                (root / rel).stat().st_mtime for rel in SCANNER_AUDIT_FILES
+            )
+        except OSError:
+            subs["scanner_sources_effective"] = (
+                STATUS_NOT_VERIFIED, "SCANNER_SOURCE_STAT_FAILED",
+                "audited source files cannot be stat'ed",
+            )
+        else:
+            if newest > float(process["started_at"]):
+                subs["scanner_sources_effective"] = (
+                    STATUS_NOT_VERIFIED,
+                    "SCANNER_SOURCES_CHANGED_AFTER_START",
+                    "audited sources were modified AFTER the Scanner "
+                    "started — the process may still hold pre-update code; "
+                    "confirming the loaded version needs the approved "
+                    "Scanner restart (separate GO) or extra diagnostics — "
+                    "never done here",
+                )
+            else:
+                subs["scanner_sources_effective"] = (
+                    STATUS_PASS, "",
+                    "no audited source changed after process start: disk "
+                    "state is consistent with the loaded code (read-only "
+                    "process metadata; exact loaded-bytecode identity would "
+                    "require an approved restart — see runbook Step 9)",
+                )
+
+    # 8) The Scanner process (second process) has the V2 flag configured
     #    and OFF at preflight time.
     scanner = _read_scanner_env_keys(scanner_env_path)
     if not scanner["available"]:
@@ -327,7 +743,7 @@ def _source_capture_check(
             STATUS_PASS, "", "Scanner flag configured and OFF at preflight",
         )
 
-    # 3) Two-process DB consistency: both environments must point at the
+    # 9) Two-process DB consistency: both environments must point at the
     #    same database (compared WITHOUT printing any value).
     scanner_keys = scanner["keys"]
     if runtime_values is None:
@@ -355,7 +771,9 @@ def _source_capture_check(
     return _combine(subs)
 
 
-def _v1_isolation_check(repo_root: Path, runtime_env_path: Path) -> dict[str, str]:
+def _v1_isolation_check(
+    repo_root: Path, runtime_env_path: Path, scanner_root: Path,
+) -> dict[str, str]:
     subs: dict[str, tuple[str, str, str]] = {}
 
     # 1) The V2 runtime environment must not carry any V1 flag key.
@@ -397,23 +815,8 @@ def _v1_isolation_check(repo_root: Path, runtime_env_path: Path) -> dict[str, st
     else:
         v2_text = v2_unit.read_text(encoding="utf-8")
         v1_text = v1_unit.read_text(encoding="utf-8")
-
-        def _directives(text: str) -> dict[str, list[str]]:
-            found: dict[str, list[str]] = {}
-            for line in text.splitlines():
-                line = line.strip()
-                for name in (
-                    "EnvironmentFile", "WorkingDirectory", "ExecStart",
-                    "SyslogIdentifier", "ConditionPathExists", "ReadWritePaths",
-                ):
-                    if line.startswith(name + "="):
-                        found.setdefault(name, []).append(
-                            line.split("=", 1)[1].strip(),
-                        )
-            return found
-
-        v1_values = _directives(v1_text)
-        v2_values = _directives(v2_text)
+        v1_values = _unit_directives(v1_text)
+        v2_values = _unit_directives(v2_text)
         shared_names = set(v1_values) & set(v2_values)
         collisions = sorted(
             name for name in shared_names
@@ -441,16 +844,18 @@ def _v1_isolation_check(repo_root: Path, runtime_env_path: Path) -> dict[str, st
                 "V2 unit paths/EnvironmentFile/ExecStart disjoint from V1",
             )
 
-    # 3) The V1 capture hook still exists in scanner_runner (deploying V2
-    #    must not have removed or disabled V1 delivery).
-    runner = repo_root / "scanner_runner.py"
+    # 3) The V1 capture hook still exists in the ACTUAL Scanner's
+    #    scanner_runner (deploying V2 must not have removed or disabled
+    #    V1 delivery in the production checkout that really runs).
+    runner = Path(scanner_root) / "scanner_runner.py"
     try:
         runner_text = runner.read_text(encoding="utf-8")
     except OSError:
         runner_text = None
     if runner_text is None:
         subs["v1_surface"] = (
-            STATUS_NOT_VERIFIED, "SCANNER_RUNNER_UNREADABLE", "",
+            STATUS_NOT_VERIFIED, "SCANNER_RUNNER_UNREADABLE",
+            "Scanner checkout unavailable — V1 hook presence not verifiable",
         )
     elif "def _capture_me_inverse_short_source(" in runner_text:
         subs["v1_surface"] = (
@@ -583,11 +988,33 @@ def run_preflight(
     connect: Any = None,
     scanner_env_path: Path | None = None,
     repo_root: Path | None = None,
+    scanner_root: Path | None = None,
+    scanner_unit_path: Path | None = None,
+    scanner_process: dict[str, Any] | None | object = _AUTO_PROCESS,
 ) -> dict[str, Any]:
-    """Run ALL SIX checks; never activates, never writes, never prints secrets."""
+    """Run ALL SIX checks; never activates, never writes, never prints secrets.
+
+    ``scanner_root`` is the EXPLICIT production Scanner checkout (P2-1:
+    defaults to ``/opt/trad_bot`` — the V2 release ``repo_root`` is never
+    reused as the Scanner source); ``scanner_unit_path`` is the installed
+    systemd unit it must agree with; ``scanner_process`` is the running
+    process metadata (default: read-only detection via
+    ``_detect_scanner_process`` — tests inject fixtures and never touch a
+    real systemd or /proc).
+    """
     repo_root = Path(repo_root) if repo_root is not None else _ROOT
     if scanner_env_path is None:
         scanner_env_path = DEFAULT_SCANNER_ENV
+    if scanner_root is None:
+        scanner_root = DEFAULT_SCANNER_ROOT
+    else:
+        scanner_root = Path(scanner_root)
+    if scanner_unit_path is None:
+        scanner_unit_path = DEFAULT_SCANNER_UNIT
+    else:
+        scanner_unit_path = Path(scanner_unit_path)
+    if scanner_process is _AUTO_PROCESS:
+        scanner_process = _detect_scanner_process(scanner_unit_path)
     if connect is None:
         # dbapi flavour: exposes cursor()/autocommit/rollback for the
         # read-only transaction below (the native flavour does not).
@@ -596,15 +1023,19 @@ def run_preflight(
 
     checks: dict[str, dict[str, str]] = {}
 
-    checks["V2_RUNTIME_CONFIG_READY"], runtime_values = _runtime_config_check(path)
+    checks["V2_RUNTIME_CONFIG_READY"], runtime_values = _runtime_config_check(
+        path, repo_root,
+    )
     checks["PROTOCOL_FINGERPRINT_VALID"] = _protocol_check()
-    checks["V2_SOURCE_CAPTURE_READY"] = _source_capture_check(
-        repo_root, runtime_values, scanner_env_path,
+    checks["V2_SOURCE_CAPTURE_READY"] = _scanner_source_check(
+        scanner_root, runtime_values, scanner_env_path,
+        scanner_unit_path=scanner_unit_path,
+        process=scanner_process if isinstance(scanner_process, dict) else None,
     )
     checks["DB_READY"], checks["V2_ACTIVATION_READY"] = _evaluate_db(
         runtime_values, connect,
     )
-    checks["V1_ISOLATION_VALID"] = _v1_isolation_check(repo_root, path)
+    checks["V1_ISOLATION_VALID"] = _v1_isolation_check(repo_root, path, scanner_root)
 
     # NEVER auto-PASS: ready requires every check confirmed in THIS run.
     ready = all(
@@ -630,9 +1061,26 @@ def main(argv: list[str] | None = None) -> int:
         "--scanner-env-file", type=Path, default=DEFAULT_SCANNER_ENV,
         help="the Scanner service's environment file (second process)",
     )
+    parser.add_argument(
+        "--scanner-root", type=Path, default=DEFAULT_SCANNER_ROOT,
+        help="production Scanner checkout to audit (the systemd ExecStart "
+             "tree; never the V2 release directory) "
+             f"(default: {DEFAULT_SCANNER_ROOT.as_posix()})",
+    )
+    parser.add_argument(
+        "--scanner-unit", type=Path, default=DEFAULT_SCANNER_UNIT,
+        help="installed Scanner systemd unit file "
+             "(ExecStart/WorkingDirectory/EnvironmentFile) "
+             f"(default: {DEFAULT_SCANNER_UNIT.as_posix()})",
+    )
     args = parser.parse_args(argv)
     try:
-        result = run_preflight(args.env_file, scanner_env_path=args.scanner_env_file)
+        result = run_preflight(
+            args.env_file,
+            scanner_env_path=args.scanner_env_file,
+            scanner_root=args.scanner_root,
+            scanner_unit_path=args.scanner_unit,
+        )
     except PreflightRefused as exc:
         print(json.dumps({"result": "REFUSED", "reason": str(exc)}))
         return 1

@@ -34,6 +34,17 @@ V2_CAPTURE_HOOK = "_capture_me_inverse_short_v2_source"
 # The one source detector both contours derive their events from.
 SOURCE_SCANNER_NAME = "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2"
 
+# P2-2: the V2 hook must never consult trading decisions (direction gate,
+# regime filter, expectancy, scoring).  Kept as tokens shared with
+# tests/test_me_long_v2_inverse_short_v2_source_capture.py
+# (test_hook_source_never_depends_on_trading_gates) so the audit and that
+# test can never drift apart.
+TRADING_GATE_TOKENS = (
+    "gate_accepted", "expectancy", "market_regime", "scanner_setup",
+    "setup_state", "score", "allowlist", "blacklist", "blocklist",
+    "min_score",
+)
+
 # Audit vocabulary (preflight check statuses).
 STATUS_PASS = "PASS"
 STATUS_FAIL = "FAIL"
@@ -142,6 +153,7 @@ def audit_source_path(repo_root: Path | str) -> dict[str, Any]:
             "v2_hook_flag_independent",
             "capture_module_ready",
             "permission_parity",
+            "v2_hook_no_trading_gates",
         ):
             checks[name] = {
                 "status": STATUS_FAIL,
@@ -318,6 +330,27 @@ def audit_source_path(repo_root: Path | str) -> dict[str, Any]:
         pass_detail=(
             "capture.py and engine.py both import PERMISSION_NEW_ENTRIES "
             "from the same V2 activation module (no permission drift)"
+        ),
+    )
+
+    # ── 7. The V2 hook never reads trading decisions (P2-2) ──────────────
+    #    No dependence on the direction gate, the regime filter, expectancy
+    #    or scoring may creep into the scanner-side delivery hook: V2
+    #    routing stays independent of every trading decision.
+    v2_hook_lower = v2_hook_text.lower()
+    gate_hits = sorted(
+        token for token in TRADING_GATE_TOKENS if token in v2_hook_lower
+    )
+    checks["v2_hook_no_trading_gates"] = _check(
+        bool(v2_hook_text) and not gate_hits,
+        fail_reason=(
+            "V2_HOOK_NOT_DEFINED"
+            if not v2_hook_text
+            else "V2_HOOK_TRADING_GATE_DEPENDENCY:" + ",".join(gate_hits)
+        ),
+        pass_detail=(
+            "the V2 hook consults neither direction gate, regime filter, "
+            "expectancy nor scoring inputs (fail-open source delivery only)"
         ),
     )
 
