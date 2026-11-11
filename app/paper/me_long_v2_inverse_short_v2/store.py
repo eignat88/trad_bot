@@ -426,6 +426,47 @@ INSERT_EVENT_SQL = f"""
     ON CONFLICT (event_key) DO NOTHING
 """
 
+# P1-final — lock-first admission protocol (why the INSERT must NOT be the
+# first statement of the transaction).
+#
+# ``INSERT_POSITION_SQL`` judges age against ``statement_timestamp()`` — the
+# instant THIS command started.  A one-statement admission that starts
+# BEFORE the row locks are available and then WAITS for ``FOR UPDATE`` would
+# still be judged by its pre-wait start time: an entry could be admitted
+# after the 120-minute TTL had actually elapsed.  ``save_position`` therefore
+# acquires BOTH row locks in their own statements FIRST and only then issues
+# the admission INSERT, all in one transaction:
+#
+#   1. lock the EVENT row      (blocks here for as long as needed)
+#   2. lock the ACTIVATION row (blocks here for as long as needed)
+#   3. INSERT ... WHERE EXISTS (gates + TTL vs statement_timestamp())
+#   4. COMMIT  (rollback ends a refusal and releases the locks)
+#
+# Because every wait happens in steps 1-2, step 3's ``statement_timestamp()``
+# is strictly AFTER the locks are in hand — the TTL is judged at the moment
+# the decision is actually made, with no predicate-vs-lock evaluation-order
+# question left inside a single statement.
+#
+# Lock order is always event THEN activation — the same order a second
+# admission uses, while the sweep locks only the event row and the drain
+# locks only the activation row — so admission/sweep/drain cannot deadlock
+# with each other.  The inner ``FOR UPDATE OF ev, act`` stays in the INSERT
+# as a defensive re-lock (a no-op under the protocol) for anybody who would
+# execute ``INSERT_POSITION_SQL`` directly.
+LOCK_EVENT_FOR_ADMISSION_SQL = f"""
+    SELECT status
+    FROM {EVENT_TABLE}
+    WHERE event_key = %s AND status = %s
+    FOR UPDATE
+"""
+
+LOCK_ACTIVATION_FOR_ADMISSION_SQL = f"""
+    SELECT status
+    FROM {ACTIVATION_TABLE}
+    WHERE experiment_id = %s
+    FOR UPDATE
+"""
+
 # P1-2 — the entry TTL admission gate lives INSIDE the INSERT.
 #
 # Creating a position is the final admission decision, so PostgreSQL must
@@ -446,27 +487,36 @@ INSERT_EVENT_SQL = f"""
 #   4. idempotency: ``ON CONFLICT (position_key) DO NOTHING`` — a position
 #      row can only ever exist once.
 #
-# Clock semantics (why ``statement_timestamp()``):
-#   * ``statement_timestamp()`` = the instant THIS admission statement
-#     started.  It is FIXED for the whole statement, so every row and
-#     subquery evaluates the boundary against the same value: the decision
-#     is deterministic and equals the moment the admission was issued.
-#   * ``now()`` (``transaction_timestamp()``) = transaction start.  Equal
-#     to statement time only for a single-statement transaction; as a
-#     boundary it would silently age with the transaction (a stale
-#     admission decision if the unit ever spans earlier statements).
+# Clock semantics (why ``statement_timestamp()`` — and why the lock-first
+# protocol above is REQUIRED for it to be correct):
+#   * ``statement_timestamp()`` = the instant THIS admission command
+#     started.  It is FIXED for the whole command, so it is only a valid
+#     decision time BECAUSE ``save_position`` issues the command AFTER the
+#     event and activation row locks are already held (all waiting happens
+#     in the earlier lock statements).  Within the command every row and
+#     subquery then evaluates the boundary against that post-lock instant:
+#     deterministic AND current — no mechanical switch to
+#     ``clock_timestamp()`` is needed, and none would be safer, because
+#     intra-statement evaluation order would then decide the outcome.
+#   * ``now()`` (``transaction_timestamp()``) = transaction start = the
+#     FIRST lock statement, i.e. PRE-wait: using it for the TTL gate would
+#     reintroduce exactly the stale-clock admission this protocol removes.
+#     Forbidden here (asserted by the SQL-contract tests).
 #   * ``clock_timestamp()`` = the actual clock DURING execution: it moves
-#     within one statement, so the same row could pass or fail depending
-#     on evaluation order — non-deterministic, untestable.
+#     within one command, so the same row could pass or fail depending on
+#     evaluation order — non-deterministic, untestable.  Not used.
 #
-# Concurrency: ``FOR UPDATE OF ev, act`` row-locks the event AND the
-# activation row until commit.  The TTL sweep (``mark_event_expired``)
-# locks the same event row first, and the RUNNING → DRAINING transition
-# updates the same activation row — whichever transaction commits first
-# wins and the loser re-evaluates (EvalPlanQual) against the committed
-# state and refuses.  Exactly one valid outcome is possible: never
-# EXPIRED-with-position, never a position created after DRAINING is in
-# force, never a duplicate (the UNIQUE event/position keys back this up).
+# Concurrency: the real waiting happens in
+# ``LOCK_EVENT_FOR_ADMISSION_SQL`` / ``LOCK_ACTIVATION_FOR_ADMISSION_SQL``
+# (event row then activation row, that fixed order until commit); the
+# statement below re-locks the same rows (no-op) and the sweep
+# (``mark_event_expired``) locks the same event row first, while the
+# RUNNING → DRAINING transition updates the same activation row —
+# whichever transaction commits first wins and the loser re-evaluates
+# (EvalPlanQual) against the committed state and refuses.  Exactly one
+# valid outcome is possible: never EXPIRED-with-position, never a position
+# created after DRAINING is in force, never a duplicate (the UNIQUE
+# event/position keys back this up).
 INSERT_POSITION_SQL = f"""
     INSERT INTO {POSITION_TABLE} ({", ".join(_POSITION_COLUMNS)})
     SELECT {_POSITION_VALUES_SQL}
@@ -1050,7 +1100,15 @@ class PgInverseShortStore(InverseShortStore):
         return tuple(row.get(column) for column in _POSITION_COLUMNS)
 
     def save_position(self, position: InverseShortPosition) -> bool:
-        """Atomically create the position — the final admission (P1-2).
+        """Atomically create the position — the final admission (P1-2, P1-final).
+
+        Lock-first protocol (see ``LOCK_EVENT_FOR_ADMISSION_SQL``): the event
+        row and the activation row are locked in THEIR OWN statements —
+        blocking there for as long as needed — and only then the guarded
+        INSERT runs, so its ``statement_timestamp()`` judges the entry TTL at
+        the actual decision instant and never at the start of a lock wait
+        (an admission must be refused once 120 minutes have elapsed, even
+        when the wait itself is what consumed the remainder of the TTL).
 
         ``True`` only when THIS call inserted the row.  ``False`` means the
         PostgreSQL admission gate refused (TTL reached at DB time, event no
@@ -1058,7 +1116,10 @@ class PgInverseShortStore(InverseShortStore):
         the row already existed) — both cases are resolved by the caller's
         adoption path (``has_position`` / ``get_position``), which is what
         lets an ambiguous COMMIT (commit durable, acknowledgement lost)
-        recover without a duplicate INSERT and without a second fee.
+        recover without a duplicate INSERT and without a second fee.  A
+        connection loss retried by ``_with_reconnect`` re-runs the whole
+        unit: if the lost commit was in fact durable, the retried INSERT
+        conflicts into 0 rows and the caller adopts instead of duplicating.
         """
         params = self._position_params(position) + (
             # WHERE EXISTS gate params: activation identity, event identity,
@@ -1068,9 +1129,43 @@ class PgInverseShortStore(InverseShortStore):
             EVENT_STATUS_CAPTURED,
             self._expected_fingerprint,
         )
+
+        def operation() -> _QueryResult:
+            # 1) Lock the EVENT row (CAPTURED gate folded into the lock; a
+            #    concurrent EXPIRE is re-checked by EvalPlanQual once the
+            #    lock is granted).  No row -> nothing admissible.
+            lock_event = self._execute_once(
+                LOCK_EVENT_FOR_ADMISSION_SQL,
+                (position.event_key, EVENT_STATUS_CAPTURED),
+                fetch="one",
+            )
+            if lock_event.fetchone() is None:
+                self._conn.rollback()  # releases any partial lock state
+                return _QueryResult(columns=[], rows=[], rowcount=0)
+            # 2) Lock the ACTIVATION row — this is where a concurrent
+            #    RUNNING -> DRAINING transition is waited out; the status /
+            #    identity gates themselves stay in the INSERT below (single
+            #    source of truth).  No row -> refuse.
+            lock_activation = self._execute_once(
+                LOCK_ACTIVATION_FOR_ADMISSION_SQL,
+                (self._experiment_id,),
+                fetch="one",
+            )
+            if lock_activation.fetchone() is None:
+                self._conn.rollback()
+                return _QueryResult(columns=[], rows=[], rowcount=0)
+            # 3) Admission INSERT: it can no longer block on ev/act (this
+            #    transaction holds both locks), so its
+            #    statement_timestamp() IS the post-wait decision time.
+            result = self._execute_once(INSERT_POSITION_SQL, params, fetch="none")
+            # 4) One commit for locks + decision; a refusal already rolled
+            #    back above, which is what releases the row locks.
+            self._conn.commit()
+            return result
+
         try:
-            result = self._execute_commit(INSERT_POSITION_SQL, params)
-            return result.rowcount == 1
+            result = self._with_reconnect(operation)
+            return bool(result and result.rowcount == 1)
         except Exception:
             self._rollback()
             raise
