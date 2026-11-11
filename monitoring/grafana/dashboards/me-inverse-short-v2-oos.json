@@ -1,0 +1,559 @@
+{
+  "uid": "me-inverse-short-v2-oos",
+  "title": "Trad Bot — ME Inverse SHORT V2 OOS",
+  "description": "Prospective-only paper SHORT research (V2). Source: MOMENTUM_EXHAUSTION_REVERSE_LONG_V2 LONG. Frozen entry TTL: 120 minutes from signal_time (EXPIRED / CAPACITY_REJECTED dispositions are terminal, reason + status_at persisted). V2 protocol fingerprint: 5a9047ca3621cefb4d53b45275ad6348887440568cb055f843f85e2eb1abdacc. Realized Net PnL excludes unrealized open-position PnL.",
+  "tags": [
+    "trad_bot",
+    "OOS",
+    "ME",
+    "inverse-short",
+    "V2"
+  ],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "editable": true,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Activation Status",
+      "type": "stat",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "\nSELECT\n  CASE status\n    WHEN 'READY_TO_START' THEN 0\n    WHEN 'RUNNING' THEN 1\n    WHEN 'DRAINING' THEN 2\n    WHEN 'CANCELLED' THEN 3\n    ELSE -1\n  END AS value\nFROM dds.me_long_v2_inverse_short_v2_activation\nWHERE experiment_id='ME_LONG_V2_INVERSE_SHORT_V2';\n",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "READY_TO_START"
+                },
+                "1": {
+                  "text": "RUNNING"
+                },
+                "2": {
+                  "text": "DRAINING"
+                },
+                "3": {
+                  "text": "CANCELLED"
+                },
+                "-1": {
+                  "text": "UNKNOWN"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              },
+              {
+                "color": "orange",
+                "value": 2
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Source Events (all dispositions)",
+      "type": "stat",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT count(*) AS value FROM dds.me_long_v2_inverse_short_v2_event;",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 3,
+      "title": "Captured (eligible, age < TTL)",
+      "type": "stat",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT count(*) AS value FROM dds.me_long_v2_inverse_short_v2_event WHERE status='CAPTURED';",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 4,
+      "title": "Entered",
+      "type": "stat",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT count(*) AS value FROM dds.me_long_v2_inverse_short_v2_event WHERE status='ENTERED';",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 5,
+      "title": "Expired (age >= TTL)",
+      "type": "stat",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT count(*) AS value FROM dds.me_long_v2_inverse_short_v2_event WHERE status='EXPIRED';",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "orange",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 6,
+      "title": "Capacity Rejected (age >= TTL, ENTRY_CAP)",
+      "type": "stat",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 5,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT count(*) AS value FROM dds.me_long_v2_inverse_short_v2_event WHERE status='CAPACITY_REJECTED';",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 7,
+      "title": "Open Positions",
+      "type": "stat",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 5,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT count(*) AS value FROM dds.me_long_v2_inverse_short_v2_position WHERE status='OPEN';",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 8,
+      "title": "Finalized Outcomes (CLOSED)",
+      "type": "stat",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 5,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT count(*) AS value FROM dds.me_long_v2_inverse_short_v2_position WHERE status='CLOSED';",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 9,
+      "title": "Finalized Net PnL (USDT)",
+      "type": "stat",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 10,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT coalesce(sum(net_pnl),0) AS value FROM dds.me_long_v2_inverse_short_v2_position WHERE status='CLOSED';",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 10,
+      "title": "Entry Latency (entered_at - signal_time, min)",
+      "type": "stat",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 10,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT round(avg(EXTRACT(EPOCH FROM (p.entered_at - e.signal_time)) / 60.0)::numeric, 2) AS value FROM dds.me_long_v2_inverse_short_v2_event e JOIN dds.me_long_v2_inverse_short_v2_position p ON p.event_key = e.event_key WHERE e.status = 'ENTERED';",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "unit": "m",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 11,
+      "title": "Event Dispositions (oldest first)",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 10,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT signal_time, symbol, status, status_reason, status_at, left(event_key,16) AS event_key FROM dds.me_long_v2_inverse_short_v2_event ORDER BY signal_time ASC LIMIT 100;",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 12,
+      "title": "Recent Finalized Outcomes",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT symbol, entered_at, closed_at, entry_price, exit_price, exit_reason, gross_pnl, net_pnl FROM dds.me_long_v2_inverse_short_v2_position WHERE status='CLOSED' ORDER BY closed_at DESC LIMIT 30;",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    }
+  ]
+}

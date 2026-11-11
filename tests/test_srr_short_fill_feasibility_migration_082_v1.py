@@ -46,14 +46,16 @@ def test_migration_number_is_next_and_not_taken():
                      (ROOT / "sql" / "migrations").glob("[0-9][0-9][0-9]_*.sql"))
     # 082 (feasibility) + 083 (coverage) are the F3 hardening numbers; this
     # PR adds 084 (paper execution-policy recovery), 085 (inverse-short
-    # contour) and 086 (inverse-short close outbox).  Every one of those
-    # numbers must appear EXACTLY once — an old number is never reused —
-    # and the branch's newest migration carries the highest number.
-    for taken in (82, 83, 84, 85, 86):
+    # contour) and 086 (inverse-short close outbox); 087 is the
+    # ME_LONG_V2_INVERSE_SHORT_V2 contour migration (stale-entry guard,
+    # owner decision Q2 variant B).  Every one of those numbers must appear
+    # EXACTLY once — an old number is never reused — and the branch's newest
+    # migration carries the highest number.
+    for taken in (82, 83, 84, 85, 86, 87):
         assert numbers.count(taken) == 1, (
             f"migration number {taken:03d} must be unique"
         )
-    assert numbers[-1] == 86
+    assert numbers[-1] == 87
 
 
 def test_migration_is_transactional_and_idempotent():
