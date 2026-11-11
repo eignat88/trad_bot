@@ -815,6 +815,27 @@ def test_no_tracked_file_modified_against_base():
         "tools/research/htf_baseline_short_phase2_freeze_record_v1.py",
         "tests/test_htf_baseline_short_phase2_freeze_record_v1.py",
         "tests/test_htf_baseline_short_phase2_freeze_record_postgres_v1.py",
+        # issue268 (ME inverse SHORT stale-entry guard): migration 087 bumps
+        # the branch's newest migration number, so the two migration-number
+        # pins are updated mechanically (uniqueness of 087 + newest-is-
+        # highest).  Only those two assertions/comments change; no migration
+        # content outside the brand-new 087 file is touched.
+        "tests/test_srr_short_fill_feasibility_migration_082_v1.py",
+        "tests/test_srr_short_fill_pre_activation_hardening_v1.py",
+        # issue268 V2 hardening (P1-1/P1-2/P1-3 review findings): the ONLY
+        # tracked pre-existing file this review edits is scanner_runner.py —
+        # and only inside the V2 source-capture block (the V1 hook, V1
+        # store getter and V1 call site stay byte-identical to the audited
+        # base, asserted by
+        # tests/test_me_long_v2_inverse_short_v2_source_capture.py::
+        # TestV1ByteIdentity).  The other issue268 surfaces (V2 store,
+        # V2 preflight) are new-against-base files and never appear as M.
+        "scanner_runner.py",
+        # …and the routing gate itself, which must be taught that the two
+        # cross-PR paths above are NOT phase2-governed (they route NO_PHASE2
+        # through the full PR gate — see its
+        # test_every_frozen_and_allowlisted_path_routes_on).
+        "tests/test_htf_baseline_short_phase2_scope_routing_v1.py",
     )
 
     unexpected = []
