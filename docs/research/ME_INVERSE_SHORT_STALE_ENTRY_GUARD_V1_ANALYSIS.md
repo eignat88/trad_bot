@@ -785,3 +785,154 @@ the backlog.
 | `monitoring/grafana/dashboards/me-inverse-short-oos.json` | CAPTURED panel 337; event list 590; integrity 506 |
 | TTL precedents | `app/paper/engine.py:36-43,1431-1437`; `app/config/settings.py:298`; `app/db/repository.py:1684-1703`; `paper_runner.py:478-484`; `app/paper/cli.py:345-347`; `app/scanners/orchestrator.py:35-40,663-681`; `app/scanners/deduplication.py:57-65`; `app/research/me_r_long_early_mae_v3/protocol.py:30` |
 | Tests encoding current contract | `tests/test_me_long_v2_inverse_short_v1.py:282-313,694-707,794-836`; `..._ambiguous_commit_v1.py:905`; `..._production_runtime_v1.py:1520-1534`; `..._funding_draining_v1.py:468-486`; `..._source_redelivery_v1.py` |
+
+---
+
+## Appendix C — IMPLEMENTATION ADDENDUM (stage: IMPLEMENTATION + LOCAL TESTS ONLY)
+
+> **Scope of this stage:** code + tests only. No PR, no deploy, no VPS /
+> PostgreSQL / systemd / paper / live / OOS-registry change was made; migration
+> 087 is source-controlled only and has NOT been applied to any database.
+> Owner decisions applied: **Q1 = 120-minute entry TTL** living inside the
+> frozen V2 `execution_spec()` (Q2 → variant B: the TTL is part of the hashed
+> protocol payload, not an out-of-band guard), and **Q2 = variant B** — a NEW
+> experiment `ME_LONG_V2_INVERSE_SHORT_V2` with its own fingerprint, its own
+> activation row and its own clean prospective holdout; V1 is untouched.
+
+### C.1 Delivered artifacts (branch `fix/me-inverse-short-stale-entry-guard-v1`)
+
+| # | Artifact | Path |
+|---|---|---|
+| 1 | V2 protocol — frozen spec + `entry_max_age_minutes: 120` + derivation | `app/paper/me_long_v2_inverse_short_v2/protocol.py` |
+| 2 | Four-state event model + refusal audit fields (`EXPIRED`, `CAPACITY_REJECTED`, `status_reason`, `status_at`) | `.../models.py` |
+| 3 | Exactly-once disposition transitions (CAS on `status`; `ENTERED` clears the reason) | `.../store.py` — `mark_event_expired(event_key, status, *, reason, decided_at) -> bool` |
+| 4 | Backlog sweep + per-event age gate | `.../engine.py` — `_sweep_stale_events()` (line 290), called from `open_entries()` (line 403) **before** the capacity early-return and the fail-closed gates; second age check in `_open_event()` (lines 536-542) **after** the `has_position → adopt` branch |
+| 5 | Read-only signal-level prospective observer | `.../observer.py` — `SignalLevelProspectiveObserver.observe()` / `.dispositions()` |
+| 6 | Activation / capture / runner / identity / market-data / production-runtime | V2-renamed copies — flag `ME_INVERSE_SHORT_V2_ENABLED`, namespace `ME_LONG_V2_INVERSE_SHORT_V2:`, lock/heartbeat `me_inverse_short_v2_runtime*` |
+| 7 | Additive migration (source-controlled, NOT applied) | `sql/migrations/087_me_long_v2_inverse_short_v2.sql` |
+| 8 | Grafana dashboard — 12 panels (captured / entered / expired / capacity-rejected / open / finalized + dispositions table) | `monitoring/grafana/dashboards/me-inverse-short-v2-oos.json` |
+| 9 | Activation + preflight tooling | `scripts/me_inverse_short_v2_activate.py`, `scripts/me_inverse_short_v2_preflight.py` |
+| 10 | New tests — 55 tests in two suites | `tests/test_me_long_v2_inverse_short_v2_entry_ttl_v1.py` (behaviour), `tests/test_me_long_v2_inverse_short_v2_isolation_v1.py` (isolation/observer) |
+| 11 | Test-contract updates forced by migration 087 (mechanical, cross-PR) | `tests/test_srr_short_fill_feasibility_migration_082_v1.py` (newest-number pin 086 → 087), `tests/test_srr_short_fill_pre_activation_hardening_v1.py` (stale pin repaired), `tests/test_htf_baseline_short_phase2_isolation_v1.py` (allowlist) + `tests/test_htf_baseline_short_phase2_scope_routing_v1.py` (routing expectation for the two external paths) |
+
+### C.2 Frozen protocol fingerprints
+
+| Experiment | `protocol_fingerprint()` |
+|---|---|
+| **V2 (new)** | `5a9047ca3621cefb4d53b45275ad6348887440568cb055f843f85e2eb1abdacc` |
+| **V1 (unchanged)** | `4f97850478d65360a8a9500633d98cde5d8cb476c7a755fe05731c3748ab163c` |
+
+`execution_spec()` gained exactly one field — `entry_max_age_minutes: 120` —
+so the V2 fingerprint moved exactly once, for exactly the owner-approved
+reason (Q2 → B). Both values are pinned in
+`tests/test_me_long_v2_inverse_short_v2_isolation_v1.py`; a mutation test
+proves the TTL is inside the hashed payload.
+
+### C.3 Acceptance criteria → evidence
+
+| Acceptance criterion | Evidence (all local, in-memory) |
+|---|---|
+| age < 120 min may enter (other gates intact) | `test_fresh_event_enters_same_cycle`, `test_event_just_under_ttl_still_enters` (119 m 59 s), `test_fresh_event_without_price_stays_pending` |
+| age ≥ 120 min can NEVER open a new position | `test_event_at_exactly_ttl_never_enters` (exactly 120 m), `test_event_past_ttl_never_enters`, `test_expired_event_is_terminal_across_cycles_and_redelivery` |
+| headline: slot frees after TTL → no stale entry | `test_slot_release_never_opens_a_stale_backlog_event` (BTC TP frees a slot; stale `XRPUSDT` → `EXPIRED`/`ENTRY_TTL`, fresh `DOGEUSDT` takes the slot) |
+| `ENTRY_CAP` blocks new positions | `test_entry_cap_blocks_a_fresh_signal_without_disposing_it` (fresh stays `CAPTURED`), `test_stale_event_while_book_is_full_is_capacity_rejected` |
+| `EXPIRED` ≠ `CAPACITY_REJECTED`, both with cause + timestamp | sweep classification (`ENTRY_TTL` vs `ENTRY_CAP`, `status_at = decision clock`), `test_sweep_runs_even_while_fail_closed_gates_block_entries`, `test_observer_dispositions_expose_reason_and_timestamp` |
+| duplicate delivery / restart / ambiguous COMMIT preserved | `test_expired_event_is_terminal_across_cycles_and_redelivery` (redelivery → `CAPTURE_DUPLICATE`, row count unchanged), `test_restart_with_captured_backlog_resumes_the_sweep`, `test_ambiguous_commit_adoption_is_never_age_gated` (committed row adopted verbatim past TTL, exactly one position row), `test_duplicate_position_suppression_still_holds_with_ttl` |
+| FIFO backlog order | `test_fresh_backlog_enters_in_signal_time_order`, `test_mixed_ages_stale_head_is_skipped_fresh_tail_enters_in_order` |
+| STOP / TP / TIMEOUT exits unchanged | `test_stop_loss_exit_is_preserved` (intrabar → `STOP_LOSS`), `test_take_profit_exit_is_preserved`, `test_timeout_exit_is_preserved_past_the_ttl` |
+| no backfill | `test_pre_freeze_event_is_refused_at_capture`, `test_capture_is_disabled_without_the_v2_flag`, `test_engine_double_checks_pre_freeze_events`, migration `CHECK (signal_time > activation_freeze_ts)` |
+| sweep fail-soft / DRAINING never sweeps | `test_sweep_read_failure_fails_closed_without_raising`, `test_sweep_write_failure_keeps_event_capTUREd_but_refuses_entry`, `test_draining_never_sweeps_and_never_enters` |
+| observer: read-only, no trades when cap full, no look-ahead | `test_observer_is_read_only_and_creates_no_trades_when_cap_full`, `test_observer_source_is_structurally_read_only`, `test_observer_has_no_lookahead_across_clock_moves`, `test_observer_after_expiry_reports_expired_disposition` |
+| V1 fingerprint / freeze / tables / results unchanged | `test_v1_fingerprint_is_still_the_frozen_v1_value`, `test_v1_contour_still_enters_and_is_two_state` (V1 still enters a 10-hour-old event — old contract intact), `git diff` vs merge-base: **no V1 file modified** |
+| V2 own fingerprint / activation / namespace | `TestV2Fingerprint`, `TestActivationIsolation`, `TestStoreIsolation` (4-state, namespaced keys, cross-version keys differ) |
+| migration 087 additive, V2-only | `TestMigration087` (4 `CREATE TABLE`, no `_V1_` in executable statements, no `DROP`/`TRUNCATE`/`ALTER TABLE`, four-state CHECK + refusal audit, fail-closed seed) |
+| Grafana panels observable | `TestGrafanaDashboard` (all queries hit `*_v2_*` tables, all four dispositions queryable) |
+
+### C.4 Local test results (this stage)
+
+| Suite | Result |
+|---|---|
+| New V2 suites (`..._entry_ttl_v1.py` + `..._isolation_v1.py`) | **55 passed** |
+| All inverse-short suites (14 files: V1 + V2 + ambiguous-commit + production-runtime + funding/draining + redelivery) | **354 passed, 4 skipped** (skips = PostgreSQL-backed tests; no `TEST_DB_*` locally) |
+| Full local suite, clean-HEAD baseline (archive of HEAD, same excludes) | 77 failed / 6268 passed / 81 skipped / 168 errors |
+| Full local suite, this implementation | **73 failed / 6327 passed / 81 skipped / 168 errors** |
+| Failures unique to this implementation vs baseline | **0** (baseline-minus-final = 3 git-artifact failures of the `.git`-less archive copy + 1 stale pin repaired here: `test_migration_083_is_next_and_unique`) |
+
+The remaining 73 failures are byte-identical to the clean-HEAD baseline set:
+PostgreSQL-dependent tests (no local `TEST_DB_*`), platform/dependency tests
+(`pwd`, `uid`, `scramp 1.5.0` vs `pg8000`, missing `psycopg2`/`requests`/`tools`),
+config-drift tests (prospective registry count, `PAPER_DISABLED_SCANNERS`),
+and the pre-existing `test_new_files_are_confined_to_phase2_surface` (it fails
+at HEAD itself: the committed analysis doc is an `A` entry outside the
+Phase-2 allowlist, plus pre-existing untracked workspace artifacts). Six
+further test modules cannot even be collected locally (Unix-only `pwd`,
+`psycopg2`, `requests`, `tools.research`) and are excluded from both runs —
+same exclusions on both sides.
+
+### C.5 Migration 087 — plan (NOT applied in this stage)
+
+`sql/migrations/087_me_long_v2_inverse_short_v2.sql` creates, inside the
+existing `dds` schema, four brand-new objects mirroring 085+086 with V2
+identity: `me_long_v2_inverse_short_v2_activation` (seeded `READY_TO_START`,
+fingerprint/freeze NULL → fail-closed), `..._event` (four-state CHECK,
+`status_reason`/`status_at` with `status NOT IN ('EXPIRED','CAPACITY_REJECTED')
+OR (status_reason IS NOT NULL AND status_at IS NOT NULL)`, prospective
+`CHECK (signal_time > activation_freeze_ts)`), `..._position`
+(namespaced `position_key`, entry-facts/deadline immutability trigger),
+`..._close_outbox` (durable terminal snapshot, contract of 086). It contains
+no `ALTER`/`DROP`/`TRUNCATE` of anything existing, never references a `_v1_`
+object in executable statements, and never writes the V1 activation row.
+
+Deploy-stage application sequence (separately approved): schema review →
+apply on target PostgreSQL inside a transaction (already `BEGIN/COMMIT`) →
+verify `pg_constraint` names dynamically (Q9) → run preflight → freeze the
+fingerprint (`5a9047…`) + fresh `freeze_ts` via
+`scripts/me_inverse_short_v2_activate.py --activate` → only then set
+`ME_INVERSE_SHORT_V2_ENABLED=1`. Rollback = drop the four new V2 objects
+only; V1 is never in the blast radius.
+
+### C.6 Deploy prerequisites (deliberately NOT done here)
+
+1. `deploy/env/me-inverse-short-v2-runtime.env.example` + systemd unit copy
+   (`EnvironmentFile` for the V2 flag, `me_inverse_short_v2_runtime` lock and
+   heartbeat paths) — V1 unit/env stay byte-identical.
+2. Apply migration 087 to the target database (approved stage).
+3. `python scripts/me_inverse_short_v2_preflight.py --env-file
+   /etc/trad-bot/me-inverse-short-v2-runtime.env` (flag must be `0` at this
+   point; both V1 rows/tables verified present and untouched).
+4. Fixation: `me_inverse_short_v2_activate.py --activate --freeze-ts
+   <FRESH_UTC>` — writes ONLY `dds.me_long_v2_inverse_short_v2_activation`.
+5. Flip `ME_INVERSE_SHORT_V2_ENABLED=1`, start the V2 runtime; confirm the
+   first events have `signal_time > freeze_ts` (no backfill).
+6. Import `monitoring/grafana/dashboards/me-inverse-short-v2-oos.json`.
+
+### C.7 Known risks / limitations
+
+1. **Migration 087 has not been executed against a live PostgreSQL** in this
+   stage (forbidden): SQL is reviewed and unit-tested textually only; the
+   PostgreSQL-backed tests skip locally (no `TEST_DB_*`).
+2. **Runtime modules are renamed copies of V1** (`production_runtime.py`,
+   `market_data.py`, `runner.py`): future V1 fixes must be ported manually —
+   drift risk inherent to the variant-B isolation choice.
+3. **Grafana JSON is validated structurally** (parses, panel/SQL assertions)
+   but has not been rendered in a live Grafana.
+4. **Sweep classification uses the current-state rule** (book full at
+   decision time → `CAPACITY_REJECTED`); the Q5 lineage stamp
+   (`lineage.capacity_blocked_from`) was accepted as a follow-up, so an event
+   rejected while the book was full earlier and evaluated when a slot is free
+   is classified `EXPIRED` — disposition remains terminal either way.
+5. **Activate/preflight scripts are compile-checked, not executed** (they
+   need a database).
+6. **Pre-existing local failures remain** (identical to clean-HEAD baseline,
+   see C.4) — none reference V1/V2 inverse-short code.
+7. `event_key` for V2 embeds the V2 experiment id (namespaced identity), so
+   V1 and V2 rows for the same source candle intentionally differ — the
+   idempotency mechanism is preserved, keys are not shared across ledgers.
+
+### C.8 Verdict
+
+**READY_FOR_REVIEW** — implementation complete in isolation (V1 byte-identical),
+migration/dashboard/tooling delivered, acceptance criteria each mapped to a
+passing local test, **0 test regressions vs clean-HEAD baseline**, all
+inverse-short suites green (354 passed, 4 environment-skipped) and both new
+suites green (55 passed). Deploy remains a separately approved stage.
