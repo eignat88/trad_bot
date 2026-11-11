@@ -24,7 +24,11 @@ the REAL prospective-only publication chain
   idempotent on re-delivery;
 * V1/V2 independence: own flag, own store state, own error sink — a V2
   failure never touches V1 state and the V2 hook never reads the V1 flag;
-* V1 byte-identity against the pre-change baseline snapshot.
+* V1 byte-identity against the PINNED Git baseline revision
+  (``BASELINE_SHA`` — this PR's merge-base with main), read with local
+  ``git show`` / ``git ls-tree``: the checks are self-contained and work in
+  any checkout without a local ``baseline_repo/`` snapshot, without network
+  access and without depending on the mutable ``origin/main``.
 
 No PostgreSQL is required by this suite.
 """
@@ -32,6 +36,7 @@ from __future__ import annotations
 
 import ast
 import os
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -52,7 +57,12 @@ from app.paper.me_long_v2_inverse_short_v2.store import (
 from app.scanners.models import SetupCandidate, SetupState
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-BASELINE_ROOT = PROJECT_ROOT / "baseline_repo"
+
+# Pinned baseline: merge-base of this PR branch against main.  Fixed by
+# content (never ``origin/main`` — its content changes on merge), and read
+# from the LOCAL git object store only (no network from pytest).
+BASELINE_SHA = "6bc7ea777d606a3068e7ff62aef2b8d771be19a4"
+GIT_CMD = "git"
 
 SIGNAL_AT = datetime(2026, 6, 1, 12, 0, 30, tzinfo=timezone.utc)
 FREEZE_TS = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -174,15 +184,135 @@ def _copy_sources(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _copy_sources_from_git(tmp_path: Path, *, revision: str = BASELINE_SHA) -> Path:
+    """Minimal source tree materialized FROM the pinned Git baseline.
+
+    Lets the audit run against the pre-change tree without any local
+    ``baseline_repo/`` directory.  A source file that does not exist AT the
+    baseline (the V2 package predates nothing — it was added by this
+    branch) is simply absent from the materialized tree: absence is
+    baseline content, not a skipped comparison.
+    """
+    present = set(_git_ls_tree_names(revision))
+    for rel in SOURCE_FILES:
+        if rel not in present:
+            continue
+        dst = tmp_path / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(_git_show_bytes(rel, revision=revision))
+    return tmp_path
+
+
+def _copy_v1_package(tmp_path: Path) -> Path:
+    """Copy the current V1 package into ``tmp_path`` (negative controls)."""
+    for src in sorted((PROJECT_ROOT / V1_PACKAGE).glob("*.py")):
+        dst = tmp_path / V1_PACKAGE / src.name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(src.read_bytes())
+    return tmp_path
+
+
+def _norm_eol(data: bytes) -> bytes:
+    """Checkout-normalized blob equivalence (core.autocrlf=true on Windows).
+
+    Raw bytes may legitimately differ between a checked-out file (CRLF) and
+    the stored Git blob (LF); only EOL normalization is allowed to differ.
+    """
+    return data.replace(b"\r\n", b"\n")
+
+
+def _git_failure(action: str, detail: str) -> AssertionError:
+    return AssertionError(
+        f"{action} (pinned baseline {BASELINE_SHA}): {detail}. The tests "
+        "read the baseline from the LOCAL git object store only — no "
+        "network access from pytest. Fix the checkout instead of skipping "
+        "(actions/checkout uses fetch-depth: 0; otherwise run "
+        f"`git fetch origin {BASELINE_SHA}` or `git fetch --unshallow`)."
+    )
+
+
+def _git_show_bytes(relative_path: str, *, revision: str = BASELINE_SHA) -> bytes:
+    """Read one file from the pinned baseline revision via local git.
+
+    FAILS with an explicit diagnostic when git is missing or the
+    revision/path is unavailable (e.g. a shallow checkout without
+    ``BASELINE_SHA``) — never skips, never silently passes.
+    """
+    try:
+        proc = subprocess.run(
+            [GIT_CMD, "show", f"{revision}:{relative_path}"],
+            cwd=PROJECT_ROOT, capture_output=True, check=False,
+        )
+    except FileNotFoundError:
+        raise _git_failure(
+            "git executable not found",
+            f"the V1 baseline identity checks require a local git "
+            f"checkout ({GIT_CMD!r} is unavailable)",
+        ) from None
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", "replace").strip()
+        raise _git_failure(
+            "baseline revision unavailable",
+            f"git show {revision}:{relative_path} exited "
+            f"{proc.returncode}: {stderr or '<no stderr>'}",
+        )
+    return proc.stdout
+
+
+def _git_ls_tree_names(revision: str, *path: str) -> list[str]:
+    """File names tracked at ``revision`` (optionally under ``path``).
+
+    FAILS with an explicit diagnostic when git is missing or the revision
+    is unavailable — never skips.
+    """
+    cmd = [GIT_CMD, "ls-tree", "-r", "--name-only", revision]
+    if path:
+        cmd += ["--", *path]
+    try:
+        proc = subprocess.run(
+            cmd, cwd=PROJECT_ROOT, capture_output=True, check=False,
+        )
+    except FileNotFoundError:
+        raise _git_failure(
+            "git executable not found",
+            f"the V1 baseline identity checks require a local git "
+            f"checkout ({GIT_CMD!r} is unavailable)",
+        ) from None
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", "replace").strip()
+        raise _git_failure(
+            "baseline revision unavailable",
+            f"git ls-tree {revision} {' '.join(path)} exited "
+            f"{proc.returncode}: {stderr or '<no stderr>'}",
+        )
+    return [
+        line for line in proc.stdout.decode("utf-8", "replace").splitlines()
+        if line
+    ]
+
+
+def _git_baseline_v1_files(*, revision: str = BASELINE_SHA) -> list[str]:
+    """V1 package files at the pinned revision (via ``git ls-tree``)."""
+    return _git_ls_tree_names(revision, V1_PACKAGE)
+
+
 def _function_source(path: Path, name: str) -> str:
     """Byte-exact source of one top-level function (AST line range)."""
-    source = path.read_text(encoding="utf-8")
+    return _function_source_from_text(
+        path.read_text(encoding="utf-8"), name, origin=str(path),
+    )
+
+
+def _function_source_from_text(source: str, name: str, *, origin: str) -> str:
+    # Normalize line endings first: the checked-out file may be CRLF while
+    # the baseline blob is LF (core.autocrlf=true) — EOL is not content.
+    source = source.replace("\r\n", "\n")
     tree = ast.parse(source)
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
             lines = source.splitlines(keepends=True)
             return "".join(lines[node.lineno - 1:node.end_lineno])
-    raise AssertionError(f"function {name!r} not found in {path}")
+    raise AssertionError(f"function {name!r} not found in {origin}")
 
 
 def _v2_hook_source() -> str:
@@ -268,10 +398,14 @@ class TestStaticProductionPathAudit:
             assert check["status"] == "FAIL", name
             assert check["reason"].startswith("SOURCE_FILE_MISSING"), name
 
-    def test_audit_never_reports_not_verified(self):
+    def test_audit_never_reports_not_verified(self, tmp_path):
         # The audit either proves the wiring or reports a concrete FAIL —
         # it must never emit a soft status that could be read as PASS.
-        for root in (PROJECT_ROOT, BASELINE_ROOT):
+        # Run it on the checked-out tree AND on the pinned-baseline tree
+        # (materialized from git — the pre-change code has no V2 wiring, so
+        # its V2 checks FAIL concretely instead of being "not verified").
+        baseline_tree = _copy_sources_from_git(tmp_path)
+        for root in (PROJECT_ROOT, baseline_tree):
             result = audit_source_path(root)
             for check in result["checks"].values():
                 assert check["status"] in ("PASS", "FAIL")
@@ -548,35 +682,127 @@ class TestV1V2Independence:
 
 
 # ---------------------------------------------------------------------------
-# 5. V1 byte-identity vs the pre-change baseline snapshot
+# 5. V1 byte-identity vs the pinned Git baseline (self-contained)
 # ---------------------------------------------------------------------------
-class TestV1ByteIdentity:
-    def test_v1_package_files_are_byte_identical_to_baseline(self):
-        baseline_pkg = BASELINE_ROOT / V1_PACKAGE
-        assert baseline_pkg.is_dir(), "baseline snapshot missing"
-        compared = 0
-        for current in sorted((PROJECT_ROOT / V1_PACKAGE).glob("*.py")):
-            baseline = baseline_pkg / current.name
-            if not baseline.is_file():
-                continue
-            compared += 1
-            assert current.read_bytes() == baseline.read_bytes(), (
-                f"V1 file changed: {current.name}",
-            )
-        assert compared >= 8, "expected the whole V1 package in baseline"
+def _assert_v1_package_identical(root: Path, *, revision: str = BASELINE_SHA) -> None:
+    """Compare the V1 package under ``root`` to the pinned Git baseline.
 
-    def test_v1_capture_hook_in_scanner_runner_is_byte_identical(self):
-        current = PROJECT_ROOT / "scanner_runner.py"
-        baseline = BASELINE_ROOT / "scanner_runner.py"
-        assert baseline.is_file(), "baseline snapshot missing"
-        for function in (
-            "_get_me_inverse_short_store",
-            "_capture_me_inverse_short_source",
-        ):
-            assert (
-                _function_source(current, function)
-                == _function_source(baseline, function)
-            ), f"V1 function changed: {function}"
+    Detects files ADDED since the baseline, files REMOVED since the
+    baseline and content changes.  Content is compared as normalized Git
+    blobs (EOL-only differences are checkout normalization under
+    ``core.autocrlf=true``); a missing baseline file or an unavailable
+    revision FAILS with a diagnostic — the check never skips.
+    """
+    current = sorted(
+        f"{V1_PACKAGE}/{p.name}" for p in (root / V1_PACKAGE).glob("*.py")
+    )
+    assert current, f"V1 package not found under {root}"
+    baseline = _git_baseline_v1_files(revision=revision)
+    added = sorted(set(current) - set(baseline))
+    removed = sorted(set(baseline) - set(current))
+    assert not added, f"V1 files added since baseline {revision}: {added}"
+    assert not removed, f"V1 files removed since baseline {revision}: {removed}"
+    for rel in current:
+        baseline_bytes = _git_show_bytes(rel, revision=revision)
+        current_bytes = (root / rel).read_bytes()
+        assert _norm_eol(current_bytes) == _norm_eol(baseline_bytes), (
+            f"V1 file changed: {Path(rel).name}",
+        )
+    assert len(current) >= 8, "expected the whole V1 package"
+
+
+def _assert_v1_capture_functions_identical(
+    scanner_path: Path, *, revision: str = BASELINE_SHA,
+) -> None:
+    """Compare the two V1 capture functions to their pinned-baseline text.
+
+    Detects any change in the bodies or signatures of
+    ``_get_me_inverse_short_store`` and ``_capture_me_inverse_short_source``
+    (AST line range, EOL-normalized); a missing function or baseline
+    revision FAILS with a diagnostic.
+    """
+    baseline_source = _git_show_bytes(
+        "scanner_runner.py", revision=revision,
+    ).decode("utf-8", "replace")
+    current_source = scanner_path.read_text(encoding="utf-8")
+    for function in (
+        "_get_me_inverse_short_store",
+        "_capture_me_inverse_short_source",
+    ):
+        baseline_fn = _function_source_from_text(
+            baseline_source, function, origin=f"{revision}:scanner_runner.py",
+        )
+        current_fn = _function_source_from_text(
+            current_source, function, origin=str(scanner_path),
+        )
+        assert current_fn == baseline_fn, f"V1 function changed: {function}"
+
+
+def _tamper_function(path: Path, name: str) -> Path:
+    """Insert a statement INSIDE ``name``'s body (negative controls)."""
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    node = next(
+        n for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+    )
+    lines = source.splitlines(keepends=True)
+    # A statement (not a comment) so the AST line range grows and the
+    # extracted function source provably changes.
+    lines.insert(node.end_lineno, "    pass  # tampered by the negative control\n")
+    path.write_text("".join(lines), encoding="utf-8")
+    return path
+
+
+class TestV1ByteIdentity:
+    def test_v1_package_files_match_the_pinned_git_baseline(self):
+        _assert_v1_package_identical(PROJECT_ROOT)
+
+    def test_v1_capture_hook_functions_match_the_pinned_git_baseline(self):
+        _assert_v1_capture_functions_identical(PROJECT_ROOT / "scanner_runner.py")
+
+    def test_changed_v1_file_is_detected(self, tmp_path):
+        root = _copy_v1_package(tmp_path)
+        target = root / V1_PACKAGE / "capture.py"
+        target.write_bytes(target.read_bytes() + b"# tampered\n")
+        with pytest.raises(AssertionError, match="V1 file changed"):
+            _assert_v1_package_identical(root)
+
+    def test_v1_file_absent_from_the_baseline_is_detected(self, tmp_path):
+        root = _copy_v1_package(tmp_path)
+        (root / V1_PACKAGE / "zz_added_since_baseline.py").write_text(
+            "# not in the pinned baseline\n", encoding="utf-8",
+        )
+        with pytest.raises(AssertionError, match="added since baseline"):
+            _assert_v1_package_identical(root)
+
+    def test_removed_v1_file_is_detected(self, tmp_path):
+        root = _copy_v1_package(tmp_path)
+        (root / V1_PACKAGE / "models.py").unlink()
+        with pytest.raises(AssertionError, match="removed since baseline"):
+            _assert_v1_package_identical(root)
+
+    def test_changed_v1_capture_hook_is_detected(self, tmp_path):
+        scanner = tmp_path / "scanner_runner.py"
+        scanner.write_bytes((PROJECT_ROOT / "scanner_runner.py").read_bytes())
+        _tamper_function(scanner, "_capture_me_inverse_short_source")
+        with pytest.raises(AssertionError, match="V1 function changed"):
+            _assert_v1_capture_functions_identical(scanner)
+
+    def test_unavailable_baseline_revision_fails_with_diagnostics(self):
+        bogus = "0" * 40
+        with pytest.raises(AssertionError, match="baseline revision unavailable"):
+            _git_show_bytes("scanner_runner.py", revision=bogus)
+        with pytest.raises(AssertionError, match="baseline revision unavailable"):
+            _git_baseline_v1_files(revision=bogus)
+
+    def test_missing_git_fails_with_diagnostics(self, monkeypatch):
+        def _no_git(*_args, **_kwargs):
+            raise FileNotFoundError("git")
+
+        monkeypatch.setattr(subprocess, "run", _no_git)
+        with pytest.raises(AssertionError, match="git executable not found"):
+            _git_show_bytes("scanner_runner.py")
 
     def test_v1_delivery_call_site_still_present(self):
         source = (
@@ -590,12 +816,7 @@ class TestV1ByteIdentity:
             "sql/migrations/085_me_long_v2_inverse_short_v1.sql",
             "sql/migrations/086_me_long_v2_inverse_short_v1_close_outbox.sql",
         ):
-            current = PROJECT_ROOT / rel
-            baseline = BASELINE_ROOT / rel
-            if baseline.is_file():
-                # Line endings may differ (checkout normalization); content
-                # must be identical.
-                assert (
-                    current.read_bytes().replace(b"\r\n", b"\n")
-                    == baseline.read_bytes().replace(b"\r\n", b"\n")
-                ), rel
+            baseline_bytes = _git_show_bytes(rel)
+            current_bytes = (PROJECT_ROOT / rel).read_bytes()
+            # EOL-normalized blob equivalence (checkout normalization only).
+            assert _norm_eol(current_bytes) == _norm_eol(baseline_bytes), rel
