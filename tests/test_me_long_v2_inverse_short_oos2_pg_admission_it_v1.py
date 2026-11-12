@@ -142,6 +142,44 @@ class TestAdmissionGateSqlContract:
         assert protocol_fingerprint() == PINNED_V2_FINGERPRINT
 
 
+class TestTestSignalIdentityUniqueness:
+    def test_candle_steps_yield_distinct_deterministic_event_keys(self):
+        """Uniqueness contract for test signal identities.
+
+        Two scenarios (NORMAL vs RECOVERED) need two independent signals:
+        ``candle_steps`` must produce DIFFERENT ``event_key`` values and
+        DIFFERENT production dedup identities, while identical inputs
+        always reproduce the SAME key (dedup/redelivery contract) and a
+        re-delivery inside the same candle keeps hashing identically.
+        Production key/dedup logic is never modified.
+        """
+        from app.paper.me_long_v2_inverse_short_oos2_v1.identity import (
+            source_identity,
+        )
+
+        now = datetime(2026, 1, 5, 12, 0, 30, tzinfo=timezone.utc)
+        base = _candidate(detected_at=now)
+        shifted = _candidate(detected_at=now, candle_steps=1)
+
+        base_key = build_event_key(base)
+        shifted_key = build_event_key(shifted)
+        # uniqueness: the two scenario identities never collide...
+        assert base_key != shifted_key
+        assert source_identity(base) != source_identity(shifted)
+        # ...determinism: identical inputs reproduce the identical key...
+        assert build_event_key(_candidate(detected_at=now)) == base_key
+        assert (
+            build_event_key(_candidate(detected_at=now, candle_steps=1))
+            == shifted_key
+        )
+        # ...and a redelivery of the SAME candle (even at a later
+        # detected_at inside that candle) still hashes to the SAME key —
+        # the production dedup contract is untouched by candle_steps.
+        assert build_event_key(
+            _candidate(detected_at=now + timedelta(minutes=2)),
+        ) == base_key
+
+
 # ---------------------------------------------------------------------------
 # Fixtures / helpers (PostgreSQL)
 # ---------------------------------------------------------------------------
@@ -176,8 +214,19 @@ def _candidate(
     price: float = 100.0,
     *,
     detected_at: datetime,
+    candle_steps: int = 0,
 ) -> SetupCandidate:
-    candle_ms = int(detected_at.timestamp() // 300) * 300_000
+    # ``candle_steps`` deterministically shifts the signal-candle open time
+    # BACK by whole 5-minute grid steps.  The candle open participates in
+    # BOTH the production ``event_key`` payload and the production dedup
+    # identity (``source_identity``), so two test signals with different
+    # steps are two genuinely distinct, reproducible signal identities —
+    # without touching production key/dedup logic.  ``detected_at`` (the
+    # signal_time, admission TTL/freeze gates) stays exactly as fresh as
+    # any other capture in this file.
+    candle_ms = (
+        int(detected_at.timestamp() // 300) * 300_000 - candle_steps * 300_000
+    )
     return SetupCandidate(
         scanner_name="MOMENTUM_EXHAUSTION_REVERSE_LONG_V2",
         scanner_version="1.0.0",
@@ -336,10 +385,27 @@ def running(pg_conn):
     return freeze
 
 
-def _capture_event(store, *, age: timedelta, symbol: str = "BTCUSDT"):
-    """Capture ONE prospective source event ``age`` old; returns its key."""
-    now = datetime.now(timezone.utc)
-    candidate = _candidate(symbol, detected_at=now - age)
+def _capture_event(
+    store, *, age: timedelta, symbol: str = "BTCUSDT",
+    candle_steps: int = 0, signal_at: datetime | None = None,
+):
+    """Capture ONE prospective source event; returns its key.
+
+    ``candle_steps`` gives a second capture a DISTINCT deterministic
+    signal identity (see ``_candidate``) — dedup itself stays fully
+    active: a genuine duplicate still fails the CAPTURED assertion.
+
+    ``signal_at`` pins ``signal_time`` to an explicit instant (typically
+    the TEST ENGINE's clock): admission ages a signal against the
+    engine clock, so a capture taken after ``clock.advance()`` must carry
+    a signal_time on that same timeline or the frozen 120-minute TTL
+    would reject it as stale.
+    """
+    if signal_at is None:
+        signal_at = datetime.now(timezone.utc) - age
+    candidate = _candidate(
+        symbol, detected_at=signal_at, candle_steps=candle_steps,
+    )
     status = capture_with_status(
         store, candidate,
         capture_route=ROUTE_PRE_FILTER_SOURCE,

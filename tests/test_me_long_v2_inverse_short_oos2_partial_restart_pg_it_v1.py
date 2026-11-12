@@ -548,6 +548,10 @@ class TestCodexDurabilityHardeningOnPostgres:
             realized_legs_net=123.45,
             entry_cost_allocated=1.0,
             funding_paid=999.0,
+            # The dataclass field is funding_periods_charged (the DB column
+            # is funding_periods); mutate it so the comparison below proves
+            # the mark write cannot move it either.
+            funding_periods_charged=7,
             net_pnl=-1.0,
             status="CLOSED",
             last_mark_price=row.entry_price * 0.9,
@@ -560,14 +564,17 @@ class TestCodexDurabilityHardeningOnPostgres:
 
         after = store.get_position(position_key)
         assert after is not None
-        # trading / financial columns byte-identical
+        # trading / financial columns byte-identical — every name below is
+        # a real InverseShortPosition attribute (funding_periods_charged,
+        # NOT the DB column name funding_periods).
         for column in (
             "remaining_size", "tp1_executed", "tp2_executed", "tp3_executed",
             "realized_legs_net", "entry_cost_allocated", "funding_paid",
-            "funding_periods", "net_pnl", "gross_pnl", "status",
+            "funding_periods_charged", "net_pnl", "gross_pnl", "status",
             "entered_at", "deadline_at", "position_size", "entry_price",
         ):
             assert getattr(after, column) == getattr(row, column), column
+        assert after.funding_periods_charged == row.funding_periods_charged == 0
         # telemetry moved
         assert after.last_mark_price == pytest.approx(
             row.entry_price * 0.9,
@@ -858,7 +865,19 @@ class TestCodexRound2OnPostgres:
         )
 
         # --- B: same instant, UNKNOWN rate; settle after a RESTART -------
-        event_b = _capture_event(store, age=timedelta(seconds=5))
+        # Two independent deterministic signal identities: candle_steps=1
+        # shifts the production event_key/dedup candle deterministically,
+        # and signal_at=clock() pins B's signal_time onto the ENGINE clock
+        # timeline (admission ages signals against the engine clock, which
+        # has already advanced 8h here).  Dedup stays fully active.
+        event_b = _capture_event(
+            store, age=timedelta(seconds=5), candle_steps=1,
+            signal_at=clock(),
+        )
+        assert event_a != event_b, (
+            "NORMAL and RECOVERED must use two independent deterministic "
+            "signal identities (distinct test event_keys)",
+        )
         contour.run_cycle({"BTCUSDT": 100.0})
         key_b = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:{event_b}"
         clock.advance(hours=8)              # B's period-1 boundary
@@ -952,7 +971,14 @@ class TestCodexRound3OnPostgres:
         store = _connect_store()
         clock = _Clock(datetime.now(timezone.utc))
         contour = _contour(store, clock=clock)
-        event_key = _capture_event(store, age=timedelta(seconds=5))
+        # Distinct deterministic identity vs the reference run's signal
+        # (candle step back): the two scenario signals never collide.
+        event_key = _capture_event(
+            store, age=timedelta(seconds=5), candle_steps=1,
+        )
+        assert event_key != event_ref, (
+            "reference and fault runs must use distinct event_keys",
+        )
         contour.run_cycle({"BTCUSDT": 100.0})
         position_key = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:{event_key}"
 
