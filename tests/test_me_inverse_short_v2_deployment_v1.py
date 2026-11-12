@@ -348,6 +348,8 @@ def _scanner_process_fixture(
 # ---------------------------------------------------------------------------
 def _systemctl_show_text(
     *, fragment_path: str, exec_start_argv: list[str] | None = None,
+    exec_path: str | None = None, exec_code: str = "exited",
+    exec_status: str = "0/0",
     working_directory: str = "", environment_files: list[str] = (),
     drop_in_paths: list[str] = (), main_pid: int = 4242,
     load_state: str = "loaded", active_state: str = "active",
@@ -357,10 +359,15 @@ def _systemctl_show_text(
 
     ExecStart is emitted as the structured record systemd prints — with a
     timestamp CONTAINING SPACES, so a naive whitespace split of the whole
-    line would corrupt the argv extraction; EnvironmentFiles as one
-    ``<path> (ignore_errors=…)`` line per entry; DropInPaths as the
-    shell-quoted space-joined single line (systemd ``shell_maybe_quote`` —
-    ``shlex.quote`` here, so Windows backslashes survive the round-trip).
+    line would corrupt the argv extraction; ``exec_code`` defaults to the
+    exited-process spelling while the PRODUCTION VPS prints
+    ``code=(null) ; status=0/0`` for a LIVE (running) process — the P1
+    regression fixture uses that; ``exec_path`` overrides the ``path=``
+    field independently of ``argv[0]`` (the P2 ``@``/substitution
+    fixtures).  EnvironmentFiles as one ``<path> (ignore_errors=…)`` line
+    per entry; DropInPaths as the shell-quoted space-joined single line
+    (systemd ``shell_maybe_quote`` — ``shlex.quote`` here, so Windows
+    backslashes survive the round-trip).
     """
     lines = [
         f"LoadState={load_state}",
@@ -374,14 +381,17 @@ def _systemctl_show_text(
         f"NeedDaemonReload={'yes' if need_daemon_reload else 'no'}",
     ]
     if exec_start_argv:
+        path_field = (
+            exec_path if exec_path is not None else exec_start_argv[0]
+        )
         lines.append(
-            "ExecStart={ path=" + exec_start_argv[0]
+            "ExecStart={ path=" + path_field
             + " ; argv[]=" + " ".join(exec_start_argv)
             + " ; ignore_errors=no"
             + " ; start_time=[Wed 2026-11-11 12:00:00 MSK]"
             + " ; stop_time=[n/a]"
             + f" ; pid={main_pid}"
-            + " ; code=exited ; status=0/0 }"
+            + f" ; code={exec_code} ; status={exec_status} }}"
         )
     lines.append(f"WorkingDirectory={working_directory}")
     for env_file in environment_files:
@@ -1692,12 +1702,15 @@ def _effective_show(unit_path: Path, **show_kwargs) -> dict:
     )
 
 
-def _dropin_scenario(tmp_path, env_files, *, venv_style="copy"):
+def _dropin_scenario(tmp_path, env_files, *, venv_style="copy",
+                     **show_overrides):
     """Base unit → OLD release; effective config → NEW release (drop-in).
 
     The drop-in file is REAL on disk — with an ``ExecStart=`` reset plus
     the new ExecStart/WorkingDirectory — and is listed in the mocked
-    ``DropInPaths``, exactly like a staged Scanner switch.  Returns
+    ``DropInPaths``, exactly like a staged Scanner switch.  Additional
+    keyword arguments (``exec_code``, ``exec_status``, ``exec_path`` …)
+    are forwarded to the mocked ``systemctl show`` output.  Returns
     ``(runtime, scanner, old, new, unit, dropin, process, effective)``.
     """
     runtime, scanner = env_files
@@ -1730,6 +1743,7 @@ def _dropin_scenario(tmp_path, env_files, *, venv_style="copy"):
         working_directory=new.as_posix(),
         environment_files=[scanner.as_posix()],
         drop_in_paths=[str(dropin)],
+        **show_overrides,
     )
     return runtime, scanner, old, new, unit, dropin, process, effective
 
@@ -2253,6 +2267,122 @@ class TestEffectiveSystemdDropIns:
         assert result["ready_for_activation"] is False
 
 
+    def test_running_scanner_production_execstart_format_passes(
+        self, env_files, tmp_path,
+    ):
+        """The LIVE production VPS record — ``code=(null) ; status=0/0``
+        for a process that has not exited — must not trip
+        ``SCANNER_UNIT_EXEC_UNPARSABLE`` (P1): a healthy running Scanner
+        in the exact observed format still yields all six PASS."""
+        runtime, scanner, old, new, unit, dropin, process, effective = \
+            _dropin_scenario(
+                tmp_path, env_files,
+                exec_code="(null)", exec_status="0/0",
+            )
+        assert effective["available"] is True, effective
+        assert effective["exec_start"]["argv"] == [
+            f"{new.as_posix()}/.venv/bin/python",
+            f"{new.as_posix()}/scanner_runner.py",
+        ]
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        _assert_ready(result)
+
+    def test_argv0_substitution_of_python_fails(self, env_files, tmp_path):
+        """The P2 substitution attack: ``argv[0]`` advertises the audited
+        checkout interpreter while ``path=`` — the file systemd actually
+        executes — is a FOREIGN python.  The membership check binds to
+        ``path=`` (never argv[0] alone) → FAIL, never PASS."""
+        runtime, scanner = env_files
+        new = _make_scanner_checkout(tmp_path, "v2-release")
+        foreign = _make_scanner_checkout(tmp_path, "foreign-checkout")
+        unit = _write_scanner_unit(tmp_path / "scanner-unit.service", new,
+                                   scanner)
+        dropin_dir = Path(f"{unit}.d")
+        dropin_dir.mkdir(parents=True, exist_ok=True)
+        dropin = dropin_dir / "20-scanner-v2-release.conf"
+        dropin.write_text(
+            "[Service]\nExecStart=\n"
+            f"ExecStart=@{foreign.as_posix()}/.venv/bin/python "
+            f"{new.as_posix()}/.venv/bin/python "
+            f"{new.as_posix()}/scanner_runner.py\n"
+            f"WorkingDirectory={new.as_posix()}\n",
+            encoding="utf-8",
+        )
+        process = _scanner_process_fixture(new, unit=unit)
+        effective = _effective_show(
+            unit,
+            fragment_path=str(unit),
+            exec_path=f"{foreign.as_posix()}/.venv/bin/python",
+            exec_start_argv=[
+                f"{new.as_posix()}/.venv/bin/python",
+                f"{new.as_posix()}/scanner_runner.py",
+            ],
+            working_directory=new.as_posix(),
+            environment_files=[scanner.as_posix()],
+            drop_in_paths=[str(dropin)],
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert "scanner_unit_matches_checkout:SCANNER_PYTHON_OUTSIDE_CHECKOUT" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+        assert result["result"] == "NOT_READY"
+
+    def test_execstart_at_prefix_argv0_divergence_fails(
+        self, env_files, tmp_path,
+    ):
+        """systemd ``@`` prefix (systemd.service(5)): the SECOND
+        command-line token becomes argv[0] instead of the actual
+        filename, so ``path=`` (the audited checkout interpreter) and
+        argv[0] (the script) diverge → rejected as
+        ``SCANNER_UNIT_EXEC_PATH_MISMATCH``, never PASS."""
+        runtime, scanner = env_files
+        new = _make_scanner_checkout(tmp_path, "v2-release")
+        unit = _write_scanner_unit(tmp_path / "scanner-unit.service", new,
+                                   scanner)
+        dropin_dir = Path(f"{unit}.d")
+        dropin_dir.mkdir(parents=True, exist_ok=True)
+        dropin = dropin_dir / "20-scanner-v2-release.conf"
+        dropin.write_text(
+            "[Service]\nExecStart=\n"
+            f"ExecStart=@{new.as_posix()}/.venv/bin/python "
+            f"{new.as_posix()}/scanner_runner.py\n"
+            f"WorkingDirectory={new.as_posix()}\n",
+            encoding="utf-8",
+        )
+        process = _scanner_process_fixture(new, unit=unit)
+        effective = _effective_show(
+            unit,
+            fragment_path=str(unit),
+            exec_path=f"{new.as_posix()}/.venv/bin/python",
+            # under `@` argv[0] is the second token (the script), not the
+            # executable:
+            exec_start_argv=[f"{new.as_posix()}/scanner_runner.py"],
+            working_directory=new.as_posix(),
+            environment_files=[scanner.as_posix()],
+            drop_in_paths=[str(dropin)],
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert "scanner_unit_matches_checkout:SCANNER_UNIT_EXEC_PATH_MISMATCH" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+
 class TestEffectiveUnitShowParsing:
     """The `systemctl show` parser itself: documented display formats,
     explicit ambiguity handling, and a strictly read-only command."""
@@ -2400,3 +2530,68 @@ class TestEffectiveUnitShowParsing:
         )
         assert raising["available"] is False
         assert raising["reason"] == "SCANNER_SYSTEMCTL_UNAVAILABLE"
+
+    def test_running_process_execstart_code_null_parses(self):
+        """P1 regression — the ACTUAL production VPS `systemctl show`
+        output for a LIVE (running) Scanner process ends with
+        ``code=(null) ; status=0/0`` (the process has not exited yet).
+        An over-strict ``code=\\w+`` pattern used to reject this healthy
+        record as ``SCANNER_UNIT_EXEC_UNPARSABLE``; it must parse and
+        keep the full path/argv extraction intact."""
+        text = "\n".join([
+            "LoadState=loaded",
+            "ActiveState=active",
+            "SubState=running",
+            "MainPID=24680",
+            "FragmentPath=/etc/systemd/system/trad-bot-scanner.service",
+            "DropInPaths=/etc/systemd/system/trad-bot-scanner.service.d/"
+            "20-scanner-release.conf",
+            "NeedDaemonReload=no",
+            "ExecStart={ path=/opt/trad_bot/.venv/bin/python ; "
+            "argv[]=/opt/trad_bot/.venv/bin/python "
+            "/opt/trad_bot_pr267_release/scanner_runner.py ; "
+            "ignore_errors=no ; start_time=[Wed 2026-11-11 12:00:00 MSK] ; "
+            "stop_time=[n/a] ; pid=24680 ; code=(null) ; status=0/0 }",
+            "WorkingDirectory=/opt/trad_bot_pr267_release",
+            "EnvironmentFiles=/opt/trad_bot/.env (ignore_errors=no)",
+        ]) + "\n"
+        parsed = preflight._parse_effective_unit(text)
+        assert parsed["available"] is True, parsed
+        assert parsed["exec_start"]["path"] == "/opt/trad_bot/.venv/bin/python"
+        assert parsed["exec_start"]["argv"] == [
+            "/opt/trad_bot/.venv/bin/python",
+            "/opt/trad_bot_pr267_release/scanner_runner.py",
+        ]
+        assert parsed["working_directory"] == "/opt/trad_bot_pr267_release"
+        assert parsed["environment_files"] == ["/opt/trad_bot/.env"]
+        assert parsed["main_pid"] == 24680
+        assert parsed["need_daemon_reload"] is False
+
+    def test_running_process_execstart_code_null_end_to_end(self):
+        """The same live record flows through the full query path: the
+        effective unit is available (never SCANNER_UNIT_EXEC_UNPARSABLE)
+        and the argv[0]/path pair is what the process check compares."""
+        text = "\n".join([
+            "LoadState=loaded",
+            "ActiveState=active",
+            "SubState=running",
+            "MainPID=24680",
+            "FragmentPath=/etc/systemd/system/trad-bot-scanner.service",
+            "DropInPaths=",
+            "NeedDaemonReload=no",
+            "ExecStart={ path=/opt/trad_bot/.venv/bin/python ; "
+            "argv[]=/opt/trad_bot/.venv/bin/python "
+            "/opt/trad_bot_pr267_release/scanner_runner.py ; "
+            "ignore_errors=no ; start_time=[Wed 2026-11-11 12:00:00 MSK] ; "
+            "stop_time=[n/a] ; pid=24680 ; code=(null) ; status=0/0 }",
+            "WorkingDirectory=/opt/trad_bot_pr267_release",
+            "EnvironmentFiles=/opt/trad_bot/.env (ignore_errors=no)",
+        ]) + "\n"
+        parsed = preflight._query_effective_unit(
+            Path("/etc/systemd/system/trad-bot-scanner.service"),
+            runner=_fake_systemctl_runner(text),
+        )
+        assert parsed["available"] is True, parsed
+        assert parsed["reason"] != "SCANNER_UNIT_EXEC_UNPARSABLE"
+        assert parsed["exec_start"]["path"] == \
+            parsed["exec_start"]["argv"][0]

@@ -72,6 +72,11 @@ load order (including ``ExecStart=`` resets), read from ``systemctl show``
 (daemon-reload required, a staged-but-unloaded drop-in, an orphaned
 drop-in) and any missing/unparsable/ambiguous value are ``NOT_VERIFIED``,
 never ``PASS``; a clear path/process/fragment mismatch is ``FAIL``.
+The executed file is bound to the record's ``path=`` — validated against
+the Scanner virtualenv, never ``argv[0]`` alone; systemd ``@``-style
+ExecStart (where the second command-line token becomes ``argv[0]``) or
+any ``path=``/``argv[0]`` divergence is rejected as
+``SCANNER_UNIT_EXEC_PATH_MISMATCH``.
 
 Compatibility exports (used by ``scripts/me_inverse_short_v2_activate.py``):
 ``read_service_env``, ``PreflightRefused``.
@@ -378,15 +383,21 @@ def _detect_scanner_process(unit_path: Path) -> dict[str, Any]:
 # The record is parsed FIELD BY FIELD on the ` ; ` separators with the
 # field names as anchors: the timestamp fields legitimately contain
 # spaces, so naively splitting the whole line on whitespace would corrupt
-# the extraction.  `argv[]` is systemd's own space-joined display
-# (strv_join) — splitting THAT one field back on spaces is its exact
-# inverse; a record we cannot parse is reported, never guessed (the
-# Scanner ExecStart contains no space-bearing arguments).
+# the extraction.  `pid`/`code`/`status` values are taken as any
+# non-space, non-separator token because the LIVE process record printed
+# by systemd for a running unit uses `code=(null) ; status=0/0` (the
+# process has not exited yet) — an over-strict `\w+`/digits pattern there
+# used to turn a perfectly healthy running Scanner into
+# SCANNER_UNIT_EXEC_UNPARSABLE (P1 regression, production VPS format).
+# `argv[]` is systemd's own space-joined display (strv_join) — splitting
+# THAT one field back on spaces is its exact inverse; a record we cannot
+# parse is reported, never guessed (the Scanner ExecStart contains no
+# space-bearing arguments).
 _EXEC_START_ENTRY_RE = re.compile(
     r"^\{\s*path=(?P<path>.*?)\s*;\s*argv\[\]=(?P<argv>.*?)\s*;\s*"
-    r"(?:ignore_errors|flags)=\w+\s*;\s*"
+    r"(?:ignore_errors|flags)=[^\s;]+\s*;\s*"
     r"start_time=\[.*?\]\s*;\s*stop_time=\[.*?\]\s*;\s*"
-    r"pid=-?\d+\s*;\s*code=\w+\s*;\s*status=-?\d+",
+    r"pid=[^\s;]+\s*;\s*code=[^\s;]+\s*;\s*status=[^\s;]+",
 )
 
 
@@ -990,6 +1001,17 @@ def _scanner_source_check(
     else:
         script = exec_parts[-1] if exec_parts else ""
         python_exe = exec_parts[0] if exec_parts else ""
+        # P2: the file systemd ACTUALLY executes is the record's ``path=``
+        # (after prefix/specifier expansion), not ``argv[0]``.  With the
+        # systemd ``@`` prefix the SECOND command-line token becomes
+        # argv[0] instead of the actual filename (systemd.service(5),
+        # "Special executable prefixes"), so a substituted argv[0] must
+        # never stand in for the executable.
+        exec_path = str((eff.get("exec_start") or {}).get("path") or "")
+        exec_diverges = (
+            bool(exec_path) and bool(python_exe)
+            and _path_key(exec_path) != _path_key(python_exe)
+        )
         structural: list[str] = []
         if not script.endswith("scanner_runner.py"):
             structural.append("ExecStart has no scanner_runner.py script path")
@@ -997,23 +1019,34 @@ def _scanner_source_check(
             structural.append("ExecStart script lives outside --scanner-root")
         if not python_exe:
             structural.append("ExecStart python missing")
+        if not exec_path:
+            structural.append("ExecStart executable path (path=) missing")
         if not workdir:
             structural.append("WorkingDirectory missing")
         elif Path(workdir).resolve() != root.resolve():
             structural.append("WorkingDirectory differs from --scanner-root")
 
-        # The interpreter is validated as a VIRTUALENV (P2-1): a standard
-        # symlink-based Linux venv must PASS even though its final target
-        # (/usr/bin/python3.x) lives outside the checkout.
-        if python_exe:
+        # The ACTUAL executable (path=) is validated as a VIRTUALENV
+        # (P2-1): a standard symlink-based Linux venv must PASS even
+        # though its final target (/usr/bin/python3.x) lives outside the
+        # checkout — and the check binds to the executed file itself,
+        # never to argv[0] alone.
+        if exec_path or python_exe:
             py_status, py_reason, py_detail = (
-                _validate_scanner_python_environment(python_exe, root)
+                _validate_scanner_python_environment(
+                    exec_path or python_exe, root,
+                )
             )
         else:
             py_status, py_reason, py_detail = STATUS_PASS, "", ""
 
         if structural:
             detail = "; ".join(structural)
+            if exec_diverges:
+                detail = (
+                    f"{detail}; ExecStart executable (path=) differs "
+                    "from argv[0]"
+                )
             if py_status == STATUS_FAIL and py_detail:
                 detail = f"{detail}; {py_detail}"
             subs["scanner_unit_matches_checkout"] = (
@@ -1022,6 +1055,17 @@ def _scanner_source_check(
         elif py_status == STATUS_FAIL:
             subs["scanner_unit_matches_checkout"] = (
                 STATUS_FAIL, py_reason, py_detail,
+            )
+        elif exec_diverges:
+            # systemd `@`-style/aliased ExecStart or an argv[0]
+            # substitution: the executed file and the advertised
+            # interpreter are different files — reject outright (never
+            # PASS, never silently accept one of the two).
+            subs["scanner_unit_matches_checkout"] = (
+                STATUS_FAIL, "SCANNER_UNIT_EXEC_PATH_MISMATCH",
+                "effective ExecStart executable (path=) differs from "
+                f"argv[0] — {exec_path} vs {python_exe}; @-style/aliased "
+                "ExecStart is not accepted for the Scanner",
             )
         elif py_status == STATUS_NOT_VERIFIED:
             subs["scanner_unit_matches_checkout"] = (
