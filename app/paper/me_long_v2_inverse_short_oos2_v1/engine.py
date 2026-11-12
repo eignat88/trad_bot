@@ -1796,9 +1796,27 @@ class InverseShortPaperEngine:
         The position object is resolved from ``open_positions``, then
         ``pending_closes``, then a fresh store read (terminal-close edge: the
         key already left memory but its leg rows are still owed).
+
+        P1 (Codex round 3): a key that owns a PENDING terminal snapshot is
+        SKIPPED entirely — its owed partial legs, terminal leg and outbox
+        are restored ONLY through the unified durable terminal-close
+        recovery transaction (``flush_pending_closes`` → ``stage_close``
+        with ``partial_legs``).  An independent replay here would resolve
+        the CLOSED snapshot and do a leg-only insert against a still-OPEN
+        durable row (conservation break), or retire accounting markers
+        before staging + terminal UPDATE are confirmed.
         """
         persisted = 0
         for position_key, legs in list(self._dirty_legs.items()):
+            if position_key in self.pending_closes:
+                logger.debug(
+                    "me inverse short oos2 dirty leg replay DEFERRED (pending "
+                    "terminal snapshot owns this key's leg rows; restored only "
+                    "by the unified terminal-close recovery): key=%s legs=%s",
+                    position_key[:48],
+                    [l.exit_reason for l in legs],
+                )
+                continue
             if not legs:
                 self._dirty_legs.pop(position_key, None)
                 continue
@@ -2211,7 +2229,16 @@ class InverseShortPaperEngine:
                                 snapshot, terminal_leg,
                                 partial_legs=owed_partial_legs,
                             )):
-                                self._unstaged_closes.discard(position_key)
+                                # P1 (Codex round 3): the staging confirmed
+                                # ONLY its half of the operation — the key
+                                # stays in _unstaged_closes (durability
+                                # risk stays visible, req 3) until the
+                                # terminal UPDATE below confirms too; the
+                                # retirement happens in the committed
+                                # block after BOTH halves.  The re-stage
+                                # is idempotent, so a later cycle simply
+                                # repeats it before retrying the UPDATE.
+                                pass
 
                             else:
                                 # Outbox/leg table absent (migration 088):

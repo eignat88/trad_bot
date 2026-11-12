@@ -539,6 +539,17 @@ class InMemoryInverseShortStore(InverseShortStore):
                 >= leg.entry_cost_share
             ):
                 raise RuntimeError("PARTIAL_EXIT_NOT_OPEN")
+            # P1 (Codex round 3): the leg-only insert is legal ONLY when the
+            # DURABLE row is already CLOSED.  A pending terminal SNAPSHOT
+            # passed as ``position`` while the durable row is still OPEN
+            # must never land a leg row alone (the OPEN row would not carry
+            # the stage flag / remainder — conservation break).
+            stored = self._positions.get(position.position_key)
+            if stored is None or stored.status != POSITION_STATUS_CLOSED:
+                raise RuntimeError(
+                    "PARTIAL_EXIT_LEG_ONLY_ROW_NOT_CLOSED:"
+                    f"{position.position_key}",
+                )
             self._record_close_leg(leg)
             return True
         if round(leg.remaining_after, 12) != round(position.remaining_size, 12):
@@ -1765,6 +1776,27 @@ class PgInverseShortStore(InverseShortStore):
         update_params = self._update_params(position)
 
         def operation() -> _QueryResult:
+            if leg_only:
+                # P1 (Codex round 3): a leg-only insert is legal ONLY when
+                # the DURABLE row is already CLOSED.  A pending terminal
+                # SNAPSHOT passed as ``position`` while the durable row is
+                # still OPEN must never land a leg row alone (the OPEN row
+                # would not carry the stage flag / remainder — conservation
+                # break, and a restart could never reconcile it).
+                stored_status = self._execute_once(
+                    "SELECT status FROM " + POSITION_TABLE
+                    + " WHERE position_key = %s",
+                    (leg.position_key,), fetch="one",
+                ).fetchone_dict()
+                if (
+                    stored_status is None
+                    or stored_status.get("status") != POSITION_STATUS_CLOSED
+                ):
+                    self._conn.rollback()
+                    raise RuntimeError(
+                        "PARTIAL_EXIT_LEG_ONLY_ROW_NOT_CLOSED:"
+                        f"{leg.position_key}",
+                    )
             # 1) Leg row first: the exactly-once identity of this leg.
             insert = self._execute_once(
                 INSERT_CLOSE_LEG_SQL, leg_params, fetch="none",

@@ -1307,6 +1307,204 @@ class TestRound2ExactBoundaryFundingOrder:
 
 
 # ---------------------------------------------------------------------------
+# Codex review round 3 — P1: a pending terminal snapshot OWNS its key's
+# leg rows; no independent dirty-leg replay until staging + terminal
+# UPDATE are both confirmed.
+# ---------------------------------------------------------------------------
+
+class TestRound3PendingSnapshotOwnsLegReplay:
+    def test_fault_injection_pending_snapshot_leg_replay_restart_reconciliation(
+        self,
+    ):
+        """Mandatory fault-injection sequence (round 3, P1):
+        TP1 persistence failure -> STOP -> terminal staging failure ->
+        next-cycle retry -> store recovery -> restart -> reconciliation.
+        The pending terminal snapshot excludes the key from independent
+        dirty-leg replay; owed partial legs, terminal leg and outbox are
+        restored only through the unified terminal-close recovery; the
+        final balance equals the failure-free reference and every close
+        leg is present exactly once."""
+        settings = _settings()
+
+        # ---- reference contour: the identical bar sequence, no failures --
+        ref, ref_store, ref_clock = _contour(settings)
+        ref_pos = _open_one(ref, ref_store, ref_clock)
+        entry = ref_pos.entry_price
+        stop_bars = {
+            ref_pos.symbol: {"high": ref_pos.stop_price * 1.001,
+                             "low": entry * 0.99},
+        }
+        ref.run_cycle({ref_pos.symbol: entry * 0.945})
+        ref.run_cycle({ref_pos.symbol: entry}, bars=stop_bars)
+        assert ref_pos.status == POSITION_STATUS_CLOSED
+        ref_legs = _legs_by_reason(ref_store, ref_pos.position_key)
+        assert sorted(ref_legs) == ["STOP_LOSS", "TAKE_PROFIT_1"]
+        ref_balance = ref.engine.balance
+
+        # ---- fault contour ----------------------------------------------
+        contour, store, clock = _contour(settings)
+        pos = _open_one(contour, store, clock)
+        assert pos.entry_price == pytest.approx(entry, rel=1e-12)
+        position_key = pos.position_key
+
+        original_commit = store.commit_partial_exit
+        original_stage = store.stage_close
+        original_update = store.update_position
+
+        # (a) TP1 persistence failure
+        def fail_commit(position, leg):
+            raise RuntimeError("TP1 persistence failure")
+
+        store.commit_partial_exit = fail_commit
+
+        # terminal staging failure (update_position itself stays healthy)
+        def fail_stage(*args, **kwargs):
+            raise RuntimeError("terminal staging failure")
+
+        store.stage_close = fail_stage
+        update_calls = {"n": 0}
+
+        def spy_update(position_row):
+            update_calls["n"] += 1
+            return original_update(position_row)
+
+        store.update_position = spy_update
+
+        # (b) TP1 fails durably, then the protective STOP with staging down
+        contour.run_cycle({pos.symbol: entry * 0.945})
+        assert position_key in contour.engine.dirty_leg_keys
+        cycle = contour.run_cycle({pos.symbol: entry}, bars=stop_bars)
+        assert cycle["exit_reasons"] == ["STOP_LOSS"]
+        assert update_calls["n"] == 0, (
+            "terminal UPDATE ran before staging was confirmed",
+        )
+        engine = contour.engine
+        assert position_key in engine.pending_closes
+        assert position_key in engine._unstaged_closes
+        assert position_key in engine._terminal_legs
+        assert position_key in engine.dirty_leg_keys
+        assert engine.durability_risk is True
+        durable = store.get_position(position_key)
+        assert durable.status == POSITION_STATUS_OPEN
+        assert store.list_close_legs(position_key) == []
+        assert store.list_pending_closes() == []
+
+        # (c) next-cycle retry: TP1 commit recovered, staging STILL down.
+        #     The pending snapshot must exclude the independent replay —
+        #     no leg-only insert against the still-OPEN durable row.
+        store.commit_partial_exit = original_commit
+        cycle = contour.run_cycle({pos.symbol: entry}, bars=stop_bars)
+        assert store.list_close_legs(position_key) == [], (
+            "independent dirty-leg replay ran against a pending terminal "
+            "snapshot (leg-only insert into an OPEN row)",
+        )
+        durable = store.get_position(position_key)
+        assert durable.status == POSITION_STATUS_OPEN
+        assert durable.tp1_executed is False
+        assert durable.remaining_size == pytest.approx(
+            durable.position_size, rel=1e-9,
+        )
+        assert update_calls["n"] == 0
+        assert position_key in contour.engine.dirty_leg_keys, (
+            "the owed TP1 leg must stay owed until the unified recovery",
+        )
+        assert position_key in engine.pending_closes
+        assert position_key in engine._unstaged_closes
+        assert engine.durability_risk is True
+
+        # (d) store recovery (PostgreSQL healed), then (e) RESTART: only
+        #     durable state survives — the row is the still-OPEN state.
+        store.stage_close = original_stage
+        store.update_position = original_update
+        restarted = _restart(contour, settings, clock)
+        restored = _position(restarted, pos.symbol)
+        assert restored.status == POSITION_STATUS_OPEN
+        assert restored.tp1_executed is False
+        assert restored.remaining_size == pytest.approx(
+            restored.position_size, rel=1e-9,
+        )
+        assert restarted.engine.dirty_leg_keys == ()
+        assert restarted.engine.durability_risk is False
+        assert store.list_close_legs(position_key) == []
+
+        # (f) reconciliation: TP1 re-executes durably exactly once, then
+        #     the protective STOP lands through the unified recovery.
+        restarted.run_cycle({pos.symbol: entry * 0.945})
+        legs = store.list_close_legs(position_key)
+        assert [leg.exit_reason for leg in legs] == ["TAKE_PROFIT_1"]
+        cycle = restarted.run_cycle({pos.symbol: entry}, bars=stop_bars)
+        assert cycle["exit_reasons"] == ["STOP_LOSS"]
+        assert cycle["pending_closes"] == 0
+
+        # exactly-once legs, conservation, outbox drained
+        legs = store.list_close_legs(position_key)
+        assert sorted(leg.exit_reason for leg in legs) == [
+            "STOP_LOSS", "TAKE_PROFIT_1",
+        ]
+        assert [leg.leg_seq for leg in legs] == [1, 3]
+        final = store.get_position(position_key)
+        assert final.status == POSITION_STATUS_CLOSED
+        closed_qty = sum(leg.quantity for leg in legs)
+        assert round(final.position_size - final.remaining_size, 9) == round(
+            closed_qty, 9,
+        )
+        assert store.list_pending_closes() == []
+        assert restarted.engine.durability_risk is False
+        assert restarted.engine.dirty_leg_keys == ()
+        assert restarted.engine.accounting_consistent is True
+
+        # req 7: balance BEFORE (reference) and AFTER recovery coincide,
+        # and every close leg matches the reference exactly.
+        assert restarted.engine.balance == pytest.approx(
+            ref_balance, abs=1e-9,
+        ), "recovered balance must equal the failure-free reference"
+        final_legs = _legs_by_reason(store, position_key)
+        for reason in ("TAKE_PROFIT_1", "STOP_LOSS"):
+            assert final_legs[reason].quantity == pytest.approx(
+                ref_legs[reason].quantity, rel=1e-12,
+            ), reason
+            assert final_legs[reason].net_pnl == pytest.approx(
+                ref_legs[reason].net_pnl, abs=1e-9,
+            ), reason
+        _assert_durable_consistent(store, position_key)
+        _assert_ledger_consistent(restarted)
+
+        # a further cycle books nothing twice
+        balance_before = restarted.engine.balance
+        restarted.run_cycle({pos.symbol: entry})
+        assert len(store.list_close_legs(position_key)) == 2
+        assert restarted.engine.balance == pytest.approx(
+            balance_before, abs=1e-12,
+        )
+
+    def test_leg_only_insert_refuses_a_non_closed_durable_row(self):
+        """Store-level guard (req 4): commit_partial_exit() must refuse a
+        leg-only insert when the DURABLE row is still OPEN, even if handed
+        a CLOSED snapshot."""
+        settings = _settings()
+        contour, store, clock = _contour(settings)
+        pos = _open_one(contour, store, clock)
+        entry = pos.entry_price
+        # build the CLOSED snapshot exactly like a pending terminal close
+        contour.run_cycle({pos.symbol: entry * 0.945})     # TP1 committed
+        legs = store.list_close_legs(pos.position_key)
+        assert len(legs) == 1
+        snapshot = dataclasses.replace(
+            pos,
+            status=POSITION_STATUS_CLOSED,
+            remaining_size=0.0,
+            tp1_executed=True,
+            exit_reason="STOP_LOSS",
+            closed_at=clock(),
+        )
+        # the durable row is still OPEN -> leg-only must be refused
+        with pytest.raises(RuntimeError, match="LEG_ONLY_ROW_NOT_CLOSED"):
+            store.commit_partial_exit(snapshot, legs[0])
+        # and nothing landed
+        assert len(store.list_close_legs(pos.position_key)) == 1
+
+
+# ---------------------------------------------------------------------------
 # Static source contracts (no database required)
 # ---------------------------------------------------------------------------
 
