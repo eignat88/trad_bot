@@ -1505,6 +1505,468 @@ class TestRound3PendingSnapshotOwnsLegReplay:
 
 
 # ---------------------------------------------------------------------------
+# Round 5 (Codex r4552612002) — observed funding must survive a dirty-leg
+# terminal close: fault-injection scenarios A–D.  A/C/D are additionally
+# executed against real PostgreSQL in
+# ``test_me_long_v2_inverse_short_oos2_partial_restart_pg_it_v1.py``.
+# ---------------------------------------------------------------------------
+
+def _always_fail(message: str):
+    """Store-write fault: every call raises (simulated outage)."""
+
+    def _fail(*args, **kwargs):
+        raise RuntimeError(message)
+
+    return _fail
+
+
+def _scenario_a_control(settings: Settings) -> dict:
+    """Failure-free reference run of the scenario-A timeline.
+
+    entry -> TP1 committed -> +9h -> protective STOP in the cycle where
+    the rate (0.01%) is observed.  Every scenario-A-like fault run must
+    converge to these exact numbers.
+    """
+    contour, store, clock = _contour(settings)
+    pos = _open_one(contour, store, clock)
+    entry = pos.entry_price
+    stop_bars = {pos.symbol: {"high": pos.stop_price * 1.001,
+                              "low": entry * 0.99}}
+    contour.run_cycle({pos.symbol: entry * 0.945})        # TP1 committed
+    clock.advance(hours=9)
+    cycle = contour.run_cycle(
+        {pos.symbol: entry}, bars=stop_bars,
+        funding_rates_percent={pos.symbol: 0.01},
+    )
+    assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+    row = store.get_position(pos.position_key)
+    assert row.status == POSITION_STATUS_CLOSED
+    assert row.funding_periods_charged == 1, "control must settle due=1"
+    legs = _legs_by_reason(store, pos.position_key)
+    assert sorted(legs) == ["STOP_LOSS", "TAKE_PROFIT_1"]
+    return {
+        "balance": contour.engine.balance,
+        "funding_paid": row.funding_paid,
+        "funding_periods_charged": row.funding_periods_charged,
+        "net_pnl": row.net_pnl,
+        "entry_price": row.entry_price,
+        "position_size": row.position_size,
+        "position_key": pos.position_key,
+        "legs": legs,
+    }
+
+
+class TestRound5FundingSurvivesDirtyTerminalClose:
+    """Codex r4552612002 — funding lost when STOP closes over a dirty TP.
+
+    Scenario A: observed rate + dirty partial leg + protective STOP in
+    the same cycle must produce ONE consistent terminal snapshot (owed
+    legs + historically correct funding + terminal leg + outbox + final
+    remainder + fees/slippage + net PnL), staged before the update, with
+    obligations preserved on failure and restart-safe exactly-once.
+    """
+
+    def test_scenario_a_observed_funding_survives_dirty_tp_stop(self):
+        """A (mandatory): TP1 commit fails -> 9h pass -> rate observed ->
+        protective STOP in the SAME cycle -> staging -> restart ->
+        reconciliation.  Funding is NOT lost: the known backlog is folded
+        into the terminal snapshot with historically correct per-period
+        quantities (TP1's 50% was already closed before the boundary),
+        TP1 and STOP exist exactly once, the outbox is drained,
+        remaining_size=0, the final balance equals the failure-free
+        control, and a second restart changes nothing."""
+        settings = _settings()
+        control = _scenario_a_control(settings)
+
+        contour, store, clock = _contour(settings)
+        pos = _open_one(contour, store, clock)
+        entry = pos.entry_price
+        position_key = pos.position_key
+        stop_bars = {pos.symbol: {"high": pos.stop_price * 1.001,
+                                  "low": entry * 0.99}}
+        original_commit = store.commit_partial_exit
+
+        # (1) TP1 computed -> PostgreSQL write fails -> stays DIRTY.
+        store.commit_partial_exit = _always_fail("TP1 persistence failure")
+        contour.run_cycle({pos.symbol: entry * 0.945})
+        assert position_key in contour.engine.dirty_leg_keys
+
+        # (2) +9 hours: one funding interval is due; the rate arrives in
+        #     the very cycle that fires the protective STOP.
+        clock.advance(hours=9)
+        cycle = contour.run_cycle(
+            {pos.symbol: entry}, bars=stop_bars,
+            funding_rates_percent={pos.symbol: 0.01},
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        assert cycle["pending_closes"] == 0, cycle
+        engine = contour.engine
+
+        # (3) the terminal snapshot froze the OBSERVED funding (P2): the
+        #     dirty-leg guard deferred the in-cycle write, the close fold
+        #     settled it INTO the snapshot instead of losing it.
+        row = store.get_position(position_key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.funding_periods_charged == 1, (
+            "observed due period lost by the dirty-leg terminal close",
+        )
+        legs = _legs_by_reason(store, position_key)
+        assert sorted(legs) == ["STOP_LOSS", "TAKE_PROFIT_1"]
+        # historically correct quantity: TP1 closed 50% BEFORE the
+        # boundary (executed at t0 < t0+8h), so period 1 charges the
+        # REMAINING half only.
+        tp1_qty = legs["TAKE_PROFIT_1"].quantity
+        expected_qty = round(row.position_size - tp1_qty, 12)
+        expected_cost = -(row.entry_price * expected_qty * (0.01 / 100.0))
+        assert row.funding_paid == pytest.approx(expected_cost, abs=1e-9), (
+            "per-period funding must use the TP history quantity",
+        )
+        # exactly the control's numbers: no loss, no double-booking.
+        assert row.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        )
+        assert row.net_pnl == pytest.approx(control["net_pnl"], abs=1e-9)
+        assert engine.balance == pytest.approx(
+            control["balance"], abs=1e-9,
+        ), "balance must equal the failure-free control"
+        # outbox drained, exactly-once legs, conservation, no orphans.
+        assert store.list_pending_closes() == []
+        assert engine.pending_closes == {}
+        assert engine._uncommitted_deltas == {}
+        assert [leg.leg_seq for leg in store.list_close_legs(position_key)] \
+            == [1, 3]
+        assert row.remaining_size == 0.0
+        _assert_durable_consistent(store, position_key)
+        # the owed leg row survived staging even though commit stays down:
+        # the stale dirty marker stays visible until confirmed (never lost).
+        assert position_key in engine.dirty_leg_keys
+        store.commit_partial_exit = original_commit
+
+        # (4) RESTART: only durable state survives; reconciliation sees
+        #     the CLOSED row with the folded funding — nothing changes.
+        restarted = _restart(contour, settings, clock)
+        assert restarted.engine.dirty_leg_keys == ()
+        assert restarted.engine.durability_risk is False
+        balance_before = restarted.engine.balance
+        restarted.run_cycle({pos.symbol: entry})
+        restarted.run_cycle(
+            {pos.symbol: entry},
+            funding_rates_percent={pos.symbol: 0.01},
+        )
+        after = store.get_position(position_key)
+        assert after.funding_periods_charged == 1
+        assert after.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        )
+        assert len(store.list_close_legs(position_key)) == 2
+        assert store.list_pending_closes() == []
+        assert restarted.engine.balance == pytest.approx(
+            balance_before, abs=1e-12,
+        ), "a further cycle must book nothing twice"
+        assert restarted.engine.unsettled_funding_periods() == 0
+        _assert_ledger_consistent(restarted)
+        assert restarted.engine.accounting_consistent is True
+
+        # (5) SECOND restart: PnL, funding and fees are identical.
+        again = _restart(restarted, settings, clock)
+        again.run_cycle({pos.symbol: entry})
+        final = store.get_position(position_key)
+        assert final.net_pnl == pytest.approx(row.net_pnl, abs=1e-12)
+        assert final.funding_paid == pytest.approx(row.funding_paid, abs=1e-12)
+        assert final.funding_periods_charged == 1
+        assert again.engine.balance == pytest.approx(
+            restarted.engine.balance, abs=1e-12,
+        )
+        assert [leg.exit_reason
+                for leg in store.list_close_legs(position_key)] == [
+            "TAKE_PROFIT_1", "STOP_LOSS",
+        ]
+        _assert_durable_consistent(store, position_key)
+        _assert_ledger_consistent(again)
+
+    def test_scenario_b_unknown_rate_close_keeps_obligation_open(self):
+        """B (mandatory): the rate feed is DOWN when the STOP closes the
+        position over its dirty TP.  No zero is ever fabricated, the
+        due-but-unsettled obligation stays recorded and diagnosable on
+        the CLOSED row (unsettled periods reported through
+        ``unsettled_funding_periods()``/``snapshot()``), and no later
+        recovery ever retroactively books it (P2-1 #7) — so no
+        double-count either.
+
+        DOCUMENTED LIMITATION (not hidden by this test): funding still
+        unsettled AT a terminal close is NEVER settled after the close —
+        exit facts (net_pnl incl. funding_paid) are frozen by design.
+        The safe durable scheme is to settle the backlog BEFORE freezing
+        whenever a rate is observed (exactly what the round-5 close fold
+        does for known rates); for a genuinely UNKNOWN rate at close the
+        obligation stays an explicitly reported gap on the row — see the
+        implementation report, round 5, scenario B."""
+        settings = _settings()
+        contour, store, clock = _contour(settings)
+        pos = _open_one(contour, store, clock)
+        entry = pos.entry_price
+        position_key = pos.position_key
+        stop_bars = {pos.symbol: {"high": pos.stop_price * 1.001,
+                                  "low": entry * 0.99}}
+        original_commit = store.commit_partial_exit
+        store.commit_partial_exit = _always_fail("TP1 persistence failure")
+
+        contour.run_cycle({pos.symbol: entry * 0.945})
+        clock.advance(hours=9)
+        cycle = contour.run_cycle(
+            {pos.symbol: entry}, bars=stop_bars,
+            funding_rates_percent={},             # rate UNKNOWN at close
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        engine = contour.engine
+
+        row = store.get_position(position_key)
+        assert row.status == POSITION_STATUS_CLOSED
+        # (1) NEVER a fabricated zero: the counter does not advance and
+        #     no funding value is written at the close.
+        assert row.funding_periods_charged == 0, (
+            "an UNKNOWN rate must never book a period (zero or otherwise)",
+        )
+        assert row.funding_paid == 0.0
+        # (2) the obligation stays diagnosable — durable on the row and
+        #     reported through the contract methods.
+        assert engine.unsettled_funding_periods() == 1
+        assert position_key in engine._funding_unknown
+        # (3) the exit itself froze consistently with the open obligation.
+        assert sorted(_legs_by_reason(store, position_key)) == [
+            "STOP_LOSS", "TAKE_PROFIT_1",
+        ]
+        assert store.list_pending_closes() == []
+        assert engine.pending_closes == {}
+        assert row.remaining_size == 0.0
+        _assert_durable_consistent(store, position_key)
+        store.commit_partial_exit = original_commit
+
+        # (4) later recovery NEVER retroactively books it (P2-1 #7): a
+        #     restart with the rate back does not touch the CLOSED row —
+        #     no zero booking, no double-count, obligation still reported.
+        restarted = _restart(contour, settings, clock)
+        assert restarted.engine.unsettled_funding_periods() == 1, (
+            "the obligation must remain reported after a restart",
+        )
+        restarted.run_cycle(
+            {pos.symbol: entry},
+            funding_rates_percent={pos.symbol: 0.01},   # rate is BACK
+        )
+        after = store.get_position(position_key)
+        assert after.funding_periods_charged == 0, (
+            "a CLOSED position's exit facts are never rewritten",
+        )
+        assert after.funding_paid == 0.0
+        assert restarted.engine.unsettled_funding_periods() == 1
+        assert restarted.engine.snapshot()[
+            "unsettled_funding_periods"
+        ] == 1
+        _assert_durable_consistent(store, position_key)
+
+    def test_scenario_c_lost_ack_after_successful_terminal_commit(self):
+        """C (mandatory): scenario A plus a LOST ACKNOWLEDGEMENT after
+        the terminal COMMIT was applied.  Read-back verification proves
+        the facts identical — folded funding, net PnL, terminal leg — so
+        the state settles as committed: no pending close, no uncommitted
+        delta, no duplicated leg/period/balance operation, and the final
+        balance equals the failure-free control."""
+        settings = _settings()
+        control = _scenario_a_control(settings)
+
+        contour, store, clock = _contour(settings)
+        pos = _open_one(contour, store, clock)
+        entry = pos.entry_price
+        position_key = pos.position_key
+        stop_bars = {pos.symbol: {"high": pos.stop_price * 1.001,
+                                  "low": entry * 0.99}}
+        original_commit = store.commit_partial_exit
+        original_update = store.update_position
+
+        store.commit_partial_exit = _always_fail("TP1 persistence failure")
+
+        def lost_ack_update(position_row):
+            # the COMMIT succeeds inside the store, then the ACK is lost.
+            original_update(position_row)
+            if position_row.status == POSITION_STATUS_CLOSED:
+                raise RuntimeError(
+                    "simulated lost ACK after successful COMMIT",
+                )
+            return None
+
+        store.update_position = lost_ack_update
+
+        contour.run_cycle({pos.symbol: entry * 0.945})
+        clock.advance(hours=9)
+        cycle = contour.run_cycle(
+            {pos.symbol: entry}, bars=stop_bars,
+            funding_rates_percent={pos.symbol: 0.01},
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        engine = contour.engine
+
+        # read-back identity: the store carries exactly the snapshot
+        # (incl. the folded funding) despite the lost acknowledgement.
+        assert engine._confirmed_close(pos) is True
+        row = store.get_position(position_key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.funding_periods_charged == 1
+        assert row.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        )
+        assert row.net_pnl == pytest.approx(control["net_pnl"], abs=1e-9)
+
+        # no duplicate operations: nothing left to replay and no local
+        # delta that could double-count at the next reconcile.
+        assert engine.pending_closes == {}
+        assert engine._uncommitted_deltas == {}
+        assert store.list_pending_closes() == []
+        assert [leg.leg_seq for leg in store.list_close_legs(position_key)] \
+            == [1, 3]
+        assert engine.balance == pytest.approx(
+            control["balance"], abs=1e-9,
+        )
+        _assert_durable_consistent(store, position_key)
+        store.commit_partial_exit = original_commit
+        store.update_position = original_update
+
+        restarted = _restart(contour, settings, clock)
+        assert restarted.engine.durability_risk is False
+        balance_before = restarted.engine.balance
+        restarted.run_cycle(
+            {pos.symbol: entry},
+            funding_rates_percent={pos.symbol: 0.01},
+        )
+        assert restarted.engine.balance == pytest.approx(
+            balance_before, abs=1e-12,
+        )
+        assert len(store.list_close_legs(position_key)) == 2
+        after = store.get_position(position_key)
+        assert after.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        )
+        assert after.funding_periods_charged == 1
+        _assert_ledger_consistent(restarted)
+        assert restarted.engine.accounting_consistent is True
+
+    def test_scenario_d_store_outage_at_tp_and_staging_recovers_sequentially(
+        self,
+    ):
+        """D (mandatory): the store is unavailable during the partial TP,
+        then again during terminal staging.  The close defers with its
+        folded funding retained (no UPDATE attempted without staging);
+        after the store recovers the unified terminal-close recovery
+        replays owed legs + terminal + outbox SEQUENTIALLY in one
+        transaction, then the terminal UPDATE — conservation holds
+        (per-position_size == sum of leg quantities), funding equals the
+        failure-free control, and a restart changes nothing."""
+        settings = _settings()
+        control = _scenario_a_control(settings)
+
+        contour, store, clock = _contour(settings)
+        pos = _open_one(contour, store, clock)
+        entry = pos.entry_price
+        position_key = pos.position_key
+        stop_bars = {pos.symbol: {"high": pos.stop_price * 1.001,
+                                  "low": entry * 0.99}}
+        original_commit = store.commit_partial_exit
+        original_stage = store.stage_close
+        original_update = store.update_position
+
+        store.commit_partial_exit = _always_fail(
+            "PostgreSQL unavailable during partial TP",
+        )
+        update_calls = {"n": 0}
+
+        def spy_update(position_row):
+            update_calls["n"] += 1
+            return original_update(position_row)
+
+        store.update_position = spy_update
+
+        # (1) partial TP write fails -> DIRTY
+        contour.run_cycle({pos.symbol: entry * 0.945})
+        assert position_key in contour.engine.dirty_leg_keys
+
+        # (2) +9h, rate observed, protective STOP — but the store is now
+        #     also unavailable for terminal STAGING.
+        store.stage_close = _always_fail(
+            "PostgreSQL unavailable during terminal staging",
+        )
+        clock.advance(hours=9)
+        cycle = contour.run_cycle(
+            {pos.symbol: entry}, bars=stop_bars,
+            funding_rates_percent={pos.symbol: 0.01},
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        engine = contour.engine
+        # deferred correctly: snapshot + obligations retained, NO update
+        # attempted before staging was confirmed.
+        assert update_calls["n"] == 0, (
+            "terminal UPDATE ran although staging was not confirmed",
+        )
+        assert position_key in engine.pending_closes
+        assert position_key in engine._unstaged_closes
+        assert engine.durability_risk is True
+        # NOTE: ``_balance_trusted`` may already be True again — the entry
+        # gate re-runs reconcile_balance() (confirmed + retained deltas),
+        # which legitimately re-trusts the BALANCE.  The fail-closed state
+        # here is the close durability itself: _unstaged_closes above,
+        # _uncommitted_deltas below and the refusal logged by open_entries.
+        assert position_key in engine._uncommitted_deltas, (
+            "the folded funding must stay uncommitted until the write",
+        )
+        durable = store.get_position(position_key)
+        assert durable.status == POSITION_STATUS_OPEN
+        assert durable.funding_periods_charged == 0, (
+            "nothing may be durable before staging confirms",
+        )
+        assert store.list_close_legs(position_key) == []
+        assert store.list_pending_closes() == []
+
+        # (3) store recovery -> the unified recovery replays everything.
+        store.commit_partial_exit = original_commit
+        store.stage_close = original_stage
+        cycle = contour.run_cycle({pos.symbol: entry})
+        assert cycle["pending_closes"] == 0, cycle
+        assert update_calls["n"] >= 1
+
+        # sequential replay + conservation after recovery: TP1 leg and
+        # terminal leg exactly once each, funding folded, outbox drained.
+        row = store.get_position(position_key)
+        assert row.status == POSITION_STATUS_CLOSED
+        legs = store.list_close_legs(position_key)
+        assert [leg.leg_seq for leg in legs] == [1, 3]
+        assert row.funding_periods_charged == 1
+        assert row.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        )
+        assert row.remaining_size == 0.0
+        _assert_durable_consistent(store, position_key)   # conservation
+        assert store.list_pending_closes() == []
+        assert engine.pending_closes == {}
+        assert engine._uncommitted_deltas == {}
+        assert engine.durability_risk is False
+        assert engine.balance == pytest.approx(
+            control["balance"], abs=1e-9,
+        )
+        _assert_ledger_consistent(contour)
+
+        # (4) restart: nothing changes.
+        restarted = _restart(contour, settings, clock)
+        balance_before = restarted.engine.balance
+        restarted.run_cycle({pos.symbol: entry})
+        after = store.get_position(position_key)
+        assert after.net_pnl == pytest.approx(row.net_pnl, abs=1e-12)
+        assert after.funding_paid == pytest.approx(row.funding_paid, abs=1e-12)
+        assert len(store.list_close_legs(position_key)) == 2
+        assert restarted.engine.balance == pytest.approx(
+            balance_before, abs=1e-12,
+        )
+        assert restarted.engine.accounting_consistent is True
+
+
+# ---------------------------------------------------------------------------
 # Static source contracts (no database required)
 # ---------------------------------------------------------------------------
 
@@ -1520,15 +1982,56 @@ class TestHardeningSourceContracts:
             "funding must derive per-period quantities from the durable "
             "close-leg history",
         )
-        assert "executed_at < boundary" in source, (
-            "per-period outstanding quantity must be reconstructed at each "
-            "period's funding boundary with STRICTLY-before legs only — a "
-            "leg executed exactly at the boundary is accounted after that "
-            "boundary's accrual (unified funding-before-exit)"
+        assert "_funding_backlog" in source, (
+            "the per-period settlement must route through the shared "
+            "backlog computation (the terminal-close fold uses the exact "
+            "same rules)",
         )
         assert "historical quantity cannot be proven" in source
         assert "_dirty_legs" in source, (
             "settlement must be deferred while leg rows are owed",
+        )
+        # The per-period reconstruction itself lives in the shared helper
+        # (identical frozen rules for the in-cycle settlement and the
+        # terminal-close fold — P2, Codex r4552612002).
+        helper = inspect.getsource(InverseShortPaperEngine._funding_backlog)
+        assert "executed_at < boundary" in helper, (
+            "per-period outstanding quantity must be reconstructed at each "
+            "period's funding boundary with STRICTLY-before legs only - a "
+            "leg executed exactly at the boundary is accounted after that "
+            "boundary's accrual (unified funding-before-exit)",
+        )
+        assert "UNPROVABLE" in helper  # unprovable history is never booked
+
+    def test_close_fold_settles_observed_funding_before_freezing(self):
+        """P2 (Codex r4552612002): the terminal close must fold known
+        funding into its snapshot instead of freezing a stale counter."""
+        fold_source = inspect.getsource(
+            InverseShortPaperEngine._settle_funding_for_close,
+        )
+        assert "_funding_backlog" in fold_source, (
+            "the close fold must use the same per-period computation",
+        )
+        assert "_dirty_legs" in fold_source, (
+            "the fold must count the owed dirty legs staged with the "
+            "snapshot",
+        )
+        assert "funding_periods_charged = due_periods" in fold_source, (
+            "the counter must advance atomically with the folded accrual",
+        )
+        assert "return 0.0" in fold_source, (
+            "UNKNOWN/unprovable must book NOTHING (obligation stays open)",
+        )
+        close_source = inspect.getsource(InverseShortPaperEngine._close)
+        assert "_settle_funding_for_close" in close_source, (
+            "_close must settle observed funding BEFORE freezing the "
+            "terminal snapshot",
+        )
+        assert "funding_folded" in close_source
+        exits_source = inspect.getsource(InverseShortPaperEngine.check_exits)
+        assert exits_source.count("funding_rate_percent=funding_rate") == 4, (
+            "every terminal exit (STOP, defensive stage, TP3, TIMEOUT) "
+            "must pass the cycle's funding rate to _close",
         )
 
     def test_retry_dirty_funding_never_writes_ahead_of_the_leg_ledger(self):

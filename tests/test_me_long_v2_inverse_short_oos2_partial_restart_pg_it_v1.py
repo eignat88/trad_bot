@@ -1090,3 +1090,399 @@ class TestCodexRound3OnPostgres:
             final_balance, abs=1e-12,
         )
         store2.close()
+
+
+# ---------------------------------------------------------------------------
+# Round 5 (Codex r4552612002) — observed funding must survive a dirty-leg
+# terminal close.  Scenarios A/C/D additionally run on REAL PostgreSQL
+# (their unit/fault-injection twins live in
+# ``test_me_long_v2_inverse_short_oos2_durability_hardening_v1.py``).
+# ---------------------------------------------------------------------------
+
+def _always_fail(message: str):
+    """Store-write fault: every call raises (simulated outage)."""
+
+    def _fail(*args, **kwargs):
+        raise RuntimeError(message)
+
+    return _fail
+
+
+class TestCodexRound5OnPostgres:
+    """A/C/D on real PostgreSQL with migration 088.
+
+    Faults are injected at the store-method boundary (the same accepted
+    pattern as rounds 1-3): everything else — leg staging, terminal
+    UPDATE, outbox, read-back verification, restart — is the REAL
+    PostgreSQL code path with real transactions.
+    """
+
+    @staticmethod
+    def _reference_scenario(pg_conn) -> dict:
+        """Failure-free scenario-A timeline: entry -> TP1 committed ->
+        +9h -> protective STOP in the cycle where the rate (0.01%) is
+        observed.  Every fault run below converges to these facts."""
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = _contour(store, clock=clock)
+        event = _capture_event(store, age=timedelta(seconds=5))
+        contour.run_cycle({"BTCUSDT": 100.0})
+        position_key = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:{event}"
+        row = store.get_position(position_key)
+        assert row is not None
+        entry = row.entry_price
+        bars = {"BTCUSDT": {"high": row.stop_price * 1.001, "low": entry * 0.99}}
+        contour.run_cycle({"BTCUSDT": entry * 0.945})        # TP1 committed
+        clock.advance(hours=9)
+        cycle = contour.run_cycle(
+            {"BTCUSDT": entry}, bars=bars,
+            funding_rates_percent={"BTCUSDT": 0.01},
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        final = store.get_position(position_key)
+        assert final.status == "CLOSED"
+        assert final.funding_periods_charged == 1, (
+            "the control must settle exactly one due period",
+        )
+        legs = {leg.exit_reason: leg for leg in _legs(store, position_key)}
+        assert sorted(legs) == ["STOP_LOSS", "TAKE_PROFIT_1"]
+        facts = {
+            "funding_paid": final.funding_paid,
+            "funding_periods_charged": final.funding_periods_charged,
+            "net_pnl": final.net_pnl,
+            "entry_price": final.entry_price,
+            "position_size": final.position_size,
+            "balance": store.balance_components()["balance"],
+            "legs": legs,
+            "position_key": position_key,
+        }
+        store.close()
+        _cleanup(pg_conn)
+        return facts
+
+    @staticmethod
+    def _open_fault_position(store, clock, contour, *, candle_steps: int):
+        """Capture + enter the fault run's position (distinct identity)."""
+        event = _capture_event(
+            store, age=timedelta(seconds=5), candle_steps=candle_steps,
+        )
+        contour.run_cycle({"BTCUSDT": 100.0})
+        position_key = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:{event}"
+        row = store.get_position(position_key)
+        assert row is not None
+        bars = {"BTCUSDT": {"high": row.stop_price * 1.001,
+                            "low": row.entry_price * 0.99}}
+        return position_key, row, bars
+
+    def test_scenario_a_observed_funding_survives_dirty_tp_stop(
+        self, running, pg_conn,
+    ):
+        """A on real PostgreSQL: TP1 commit fails -> +9h -> rate observed
+        -> protective STOP in the SAME cycle -> terminal staging ->
+        restart -> reconciliation.  The CLOSED row carries the OBSERVED
+        funding with historically correct per-period quantity (TP1's 50%
+        closed before the boundary), TP1/STOP exactly once, outbox
+        drained, remaining_size=0, balance equals the failure-free
+        control, and a second restart changes nothing."""
+        ref = self._reference_scenario(pg_conn)
+
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = _contour(store, clock=clock)
+        position_key, row, bars = self._open_fault_position(
+            store, clock, contour, candle_steps=1,
+        )
+        entry = row.entry_price
+        original_commit = store.commit_partial_exit
+
+        # (1) TP1 computed -> write fails -> DIRTY
+        store.commit_partial_exit = _always_fail("TP1 persistence failure")
+        contour.run_cycle({"BTCUSDT": entry * 0.945})
+        assert position_key in contour.engine.dirty_leg_keys
+
+        # (2) +9h: one interval due; rate observed in the STOP cycle
+        clock.advance(hours=9)
+        cycle = contour.run_cycle(
+            {"BTCUSDT": entry}, bars=bars,
+            funding_rates_percent={"BTCUSDT": 0.01},
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        assert cycle["pending_closes"] == 0, cycle
+        engine = contour.engine
+
+        # (3) funding folded INTO the terminal snapshot, not lost
+        final = store.get_position(position_key)
+        assert final.status == "CLOSED"
+        assert final.funding_periods_charged == 1, (
+            "observed due period lost by the dirty-leg terminal close",
+        )
+        assert final.funding_paid == pytest.approx(
+            ref["funding_paid"], abs=1e-9,
+        ), "funding must equal the failure-free control"
+        assert final.net_pnl == pytest.approx(ref["net_pnl"], abs=1e-9)
+        legs = _legs(store, position_key)
+        assert [leg.leg_seq for leg in legs] == [1, 3]
+        closed_qty = sum(leg.quantity for leg in legs)
+        assert round(final.position_size - final.remaining_size, 9) == round(
+            closed_qty, 9,
+        ), "conservation: per-position_size == sum of leg quantities"
+        assert final.remaining_size == 0.0
+        assert store.list_pending_closes() == []
+        assert engine.pending_closes == {}
+        assert engine._uncommitted_deltas == {}
+        tp1_qty = ref["legs"]["TAKE_PROFIT_1"].quantity
+        expected_qty = round(ref["position_size"] - tp1_qty, 12)
+        assert final.funding_paid == pytest.approx(
+            -(ref["entry_price"] * expected_qty * (0.01 / 100.0)), abs=1e-9,
+        ), "per-period funding must use the TP history quantity"
+        assert store.balance_components()["balance"] == pytest.approx(
+            ref["balance"], abs=1e-6,
+        ), "balance must equal the failure-free control"
+        store.commit_partial_exit = original_commit
+
+        # (4) RESTART on a fresh connection: nothing changes
+        store.close()
+        store2 = _connect_store()
+        contour2 = _contour(store2, clock=clock)
+        assert contour2.engine.dirty_leg_keys == ()
+        assert contour2.engine.durability_risk is False
+        balance_before = store2.balance_components()["balance"]
+        contour2.run_cycle(
+            {"BTCUSDT": entry},
+            funding_rates_percent={"BTCUSDT": 0.01},
+        )
+        after = store2.get_position(position_key)
+        assert after.funding_periods_charged == 1
+        assert after.funding_paid == pytest.approx(
+            ref["funding_paid"], abs=1e-9,
+        )
+        assert len(_legs(store2, position_key)) == 2
+        assert store2.list_pending_closes() == []
+        assert store2.balance_components()["balance"] == pytest.approx(
+            balance_before, abs=1e-12,
+        ), "a further cycle must book nothing twice"
+        assert contour2.engine.unsettled_funding_periods() == 0
+        assert contour2.engine.accounting_consistent is True
+
+        # (5) SECOND restart: identical PnL, funding and fees
+        store2.close()
+        store3 = _connect_store()
+        contour3 = _contour(store3, clock=clock)
+        contour3.run_cycle({"BTCUSDT": entry})
+        final2 = store3.get_position(position_key)
+        assert final2.net_pnl == pytest.approx(final.net_pnl, abs=1e-12)
+        assert final2.funding_paid == pytest.approx(
+            final.funding_paid, abs=1e-12,
+        )
+        assert final2.funding_periods_charged == 1
+        assert store3.balance_components()["balance"] == pytest.approx(
+            balance_before, abs=1e-12,
+        )
+        assert [leg.exit_reason
+                for leg in _legs(store3, position_key)] == [
+            "TAKE_PROFIT_1", "STOP_LOSS",
+        ]
+        store3.close()
+
+    def test_scenario_c_lost_ack_after_successful_terminal_commit(
+        self, running, pg_conn,
+    ):
+        """C on real PostgreSQL: scenario A plus a LOST ACKNOWLEDGEMENT
+        after the terminal COMMIT was applied.  The engine's read-back
+        verification proves the stored facts identical (incl. the folded
+        funding), so the state settles as committed — no pending close,
+        no uncommitted delta, no duplicated leg/period/balance operation,
+        balance equals the failure-free control, restart stable."""
+        ref = self._reference_scenario(pg_conn)
+
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = _contour(store, clock=clock)
+        position_key, row, bars = self._open_fault_position(
+            store, clock, contour, candle_steps=1,
+        )
+        entry = row.entry_price
+        original_commit = store.commit_partial_exit
+        original_update = store.update_position
+
+        store.commit_partial_exit = _always_fail("TP1 persistence failure")
+
+        def lost_ack_update(position_row):
+            # the COMMIT succeeds inside PostgreSQL, then the ACK is lost.
+            original_update(position_row)
+            if position_row.status == "CLOSED":
+                raise RuntimeError(
+                    "simulated lost ACK after successful COMMIT",
+                )
+            return None
+
+        store.update_position = lost_ack_update
+
+        contour.run_cycle({"BTCUSDT": entry * 0.945})
+        clock.advance(hours=9)
+        cycle = contour.run_cycle(
+            {"BTCUSDT": entry}, bars=bars,
+            funding_rates_percent={"BTCUSDT": 0.01},
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        engine = contour.engine
+        position_obj = engine.open_positions.get(position_key) or \
+            store.get_position(position_key)
+
+        # read-back identity despite the lost acknowledgement
+        assert engine._confirmed_close(position_obj) is True
+        final = store.get_position(position_key)
+        assert final.status == "CLOSED"
+        assert final.funding_periods_charged == 1
+        assert final.funding_paid == pytest.approx(
+            ref["funding_paid"], abs=1e-9,
+        )
+        assert final.net_pnl == pytest.approx(ref["net_pnl"], abs=1e-9)
+
+        # no duplicates: nothing to replay, no local delta to double-count
+        assert engine.pending_closes == {}
+        assert engine._uncommitted_deltas == {}
+        assert store.list_pending_closes() == []
+        assert [leg.leg_seq for leg in _legs(store, position_key)] == [1, 3]
+        assert store.balance_components()["balance"] == pytest.approx(
+            ref["balance"], abs=1e-6,
+        )
+        store.commit_partial_exit = original_commit
+        store.update_position = original_update
+
+        # restart: everything already durable, nothing changes
+        store.close()
+        store2 = _connect_store()
+        contour2 = _contour(store2, clock=clock)
+        assert contour2.engine.durability_risk is False
+        balance_before = store2.balance_components()["balance"]
+        contour2.run_cycle(
+            {"BTCUSDT": entry},
+            funding_rates_percent={"BTCUSDT": 0.01},
+        )
+        after = store2.get_position(position_key)
+        assert after.funding_paid == pytest.approx(
+            ref["funding_paid"], abs=1e-9,
+        )
+        assert after.funding_periods_charged == 1
+        assert len(_legs(store2, position_key)) == 2
+        assert store2.balance_components()["balance"] == pytest.approx(
+            balance_before, abs=1e-12,
+        )
+        assert contour2.engine.accounting_consistent is True
+        store2.close()
+
+    def test_scenario_d_store_outage_at_tp_and_staging_recovers_sequentially(
+        self, running, pg_conn,
+    ):
+        """D on real PostgreSQL: store unavailable during the partial TP,
+        then again during terminal staging.  The close defers with its
+        folded funding retained (no UPDATE attempted without staging);
+        after recovery the unified terminal-close recovery replays owed
+        legs + terminal + outbox in ONE transaction, then the terminal
+        UPDATE — conservation holds, funding equals the failure-free
+        control, restart changes nothing."""
+        ref = self._reference_scenario(pg_conn)
+
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = _contour(store, clock=clock)
+        position_key, row, bars = self._open_fault_position(
+            store, clock, contour, candle_steps=1,
+        )
+        entry = row.entry_price
+        original_commit = store.commit_partial_exit
+        original_stage = store.stage_close
+        original_update = store.update_position
+
+        store.commit_partial_exit = _always_fail(
+            "PostgreSQL unavailable during partial TP",
+        )
+        update_calls = {"n": 0}
+
+        def spy_update(position_row):
+            update_calls["n"] += 1
+            return original_update(position_row)
+
+        store.update_position = spy_update
+
+        # (1) partial TP write fails -> DIRTY
+        contour.run_cycle({"BTCUSDT": entry * 0.945})
+        assert position_key in contour.engine.dirty_leg_keys
+
+        # (2) +9h, rate observed, STOP — store now unavailable for
+        #     terminal STAGING as well.
+        store.stage_close = _always_fail(
+            "PostgreSQL unavailable during terminal staging",
+        )
+        clock.advance(hours=9)
+        cycle = contour.run_cycle(
+            {"BTCUSDT": entry}, bars=bars,
+            funding_rates_percent={"BTCUSDT": 0.01},
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        engine = contour.engine
+        assert update_calls["n"] == 0, (
+            "terminal UPDATE ran although staging was not confirmed",
+        )
+        assert position_key in engine.pending_closes
+        assert position_key in engine._unstaged_closes
+        assert engine.durability_risk is True
+        assert position_key in engine._uncommitted_deltas, (
+            "the folded funding must stay uncommitted until the write",
+        )
+        durable = store.get_position(position_key)
+        assert durable.status == "OPEN"
+        assert durable.funding_periods_charged == 0, (
+            "nothing may be durable before staging confirms",
+        )
+        assert _legs(store, position_key) == []
+        assert store.list_pending_closes() == []
+
+        # (3) store recovery -> unified terminal-close recovery replays
+        #     everything (owed TP1 leg + terminal leg + outbox, then the
+        #     terminal UPDATE).
+        store.commit_partial_exit = original_commit
+        store.stage_close = original_stage
+        cycle = contour.run_cycle({"BTCUSDT": entry})
+        assert cycle["pending_closes"] == 0, cycle
+        assert update_calls["n"] >= 1
+
+        final = store.get_position(position_key)
+        assert final.status == "CLOSED"
+        legs = _legs(store, position_key)
+        assert [leg.leg_seq for leg in legs] == [1, 3]
+        assert final.funding_periods_charged == 1
+        assert final.funding_paid == pytest.approx(
+            ref["funding_paid"], abs=1e-9,
+        )
+        assert final.remaining_size == 0.0
+        closed_qty = sum(leg.quantity for leg in legs)
+        assert round(final.position_size - final.remaining_size, 9) == round(
+            closed_qty, 9,
+        ), "conservation: per-position_size == sum of leg quantities"
+        assert store.list_pending_closes() == []
+        assert engine.pending_closes == {}
+        assert engine._uncommitted_deltas == {}
+        assert engine.durability_risk is False
+        assert store.balance_components()["balance"] == pytest.approx(
+            ref["balance"], abs=1e-6,
+        ), "balance must equal the failure-free control"
+
+        # (4) RESTART: nothing changes
+        store.close()
+        store2 = _connect_store()
+        contour2 = _contour(store2, clock=clock)
+        balance_before = store2.balance_components()["balance"]
+        contour2.run_cycle({"BTCUSDT": entry})
+        after = store2.get_position(position_key)
+        assert after.net_pnl == pytest.approx(final.net_pnl, abs=1e-12)
+        assert after.funding_paid == pytest.approx(
+            final.funding_paid, abs=1e-12,
+        )
+        assert len(_legs(store2, position_key)) == 2
+        assert store2.balance_components()["balance"] == pytest.approx(
+            balance_before, abs=1e-12,
+        )
+        assert contour2.engine.accounting_consistent is True
+        store2.close()

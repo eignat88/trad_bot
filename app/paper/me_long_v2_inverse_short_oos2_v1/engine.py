@@ -996,7 +996,10 @@ class InverseShortPaperEngine:
                 # closes at the stop (realized TP legs are preserved).
                 gap = price > position.stop_price
                 reason = "STOP_LOSS_GAP" if gap else "STOP_LOSS"
-                terminal = self._close(position, position.stop_price, reason)
+                terminal = self._close(
+                    position, position.stop_price, reason,
+                    funding_rate_percent=funding_rate,
+                )
             else:
                 # P1-2 (Codex): the ladder may NEVER advance over an
                 # unconfirmed partial leg.  While this key still owns DIRTY
@@ -1042,7 +1045,10 @@ class InverseShortPaperEngine:
                         # Defensive (only reachable from a corrupted state):
                         # the leg would absorb the whole remainder — finish
                         # it as a TERMINAL close of that stage instead.
-                        terminal = self._close(position, level, stage)
+                        terminal = self._close(
+                            position, level, stage,
+                            funding_rate_percent=funding_rate,
+                        )
                         break
                 if terminal is None:
                     if (
@@ -1053,6 +1059,7 @@ class InverseShortPaperEngine:
                         # an earlier partial leg is still unconfirmed).
                         terminal = self._close(
                             position, position.tp3_price, "TAKE_PROFIT_3",
+                            funding_rate_percent=funding_rate,
                         )
                     elif self._clock() >= position.deadline_at:
                         # TIMEOUT closes the remaining quantity and keeps
@@ -1060,7 +1067,10 @@ class InverseShortPaperEngine:
                         # gated by an unconfirmed leg (the close flushes
                         # the owed leg rows first, staging them with its
                         # own snapshot when possible).
-                        terminal = self._close(position, price, "TIMEOUT")
+                        terminal = self._close(
+                            position, price, "TIMEOUT",
+                            funding_rate_percent=funding_rate,
+                        )
 
 
             if terminal is not None:
@@ -1190,55 +1200,10 @@ class InverseShortPaperEngine:
                 exc_info=True,
             )
             return
-        durable_reasons = {leg.exit_reason for leg in legs}
-        if (
-            (position.tp1_executed and "TAKE_PROFIT_1" not in durable_reasons)
-            or (position.tp2_executed and "TAKE_PROFIT_2" not in durable_reasons)
-        ):
-            # A stage flag without its durable leg row means the executed
-            # history cannot be reconstructed — never finalize a quantity
-            # we cannot prove (the obligation stays open on the row).
-            logger.error(
-                "me inverse short oos2 funding settlement DEFERRED (stage "
-                "flag without a durable close leg — historical quantity "
-                "UNPROVABLE; obligation stays open, NOTHING booked): "
-                "symbol=%s flags=(tp1=%s tp2=%s) durable_legs=%s",
-                position.symbol, bool(position.tp1_executed),
-                bool(position.tp2_executed), sorted(durable_reasons),
-            )
-            return
-
-        signed_rate = rate / 100.0
-        interval = timedelta(seconds=interval_seconds)
-        cost = 0.0
-        per_period: list[tuple[int, datetime, float, float]] = []
-        for period in range(
-            position.funding_periods_charged + 1, due_periods + 1,
-        ):
-            boundary = position.entered_at + interval * period
-            # P2 (Codex round 2): the unified funding-before-exit order —
-            # a leg executed EXACTLY at the period boundary is accounted
-            # AFTER this boundary's accrual (the accrual sees the pre-TP
-            # quantity; the leg only reduces the quantity from the NEXT
-            # boundary on).  Only legs STRICTLY before the boundary were
-            # already reflected at the accrual instant, so a settlement
-            # reconstructed from the durable ledger always equals the
-            # in-cycle funding-before-exit calculation — including a TP
-            # whose timestamp coincides with the boundary to the tick.
-            closed_before = sum(
-                leg.quantity for leg in legs if leg.executed_at < boundary
-            )
-            qty = round(position.position_size - closed_before, QTY_DECIMALS)
-            if qty < 0:
-                # Over-closure is impossible (legs are clamped to the
-                # remainder); guard against a corrupt ledger instead of
-                # ever booking a negative quantity.
-                qty = 0.0
-            period_cost = position.entry_price * qty * signed_rate
-            if position.direction == "SHORT":
-                period_cost = -period_cost
-            cost += period_cost
-            per_period.append((period, boundary, qty, period_cost))
+        computed = self._funding_backlog(position, rate, legs, due_periods)
+        if computed is None:
+            return  # UNPROVABLE — the reason is logged inside the helper
+        cost, per_period = computed
 
         position.funding_paid += cost
         position.funding_periods_charged = due_periods
@@ -1338,6 +1303,210 @@ class InverseShortPaperEngine:
             "me inverse short oos2 funding: %s periods=%d rate=%.6f%% cost=$%.4f",
             position.symbol, new_periods, rate, cost,
         )
+
+    # ------------------------------------------------------------------
+    # Shared funding-backlog computation + the terminal-close fold
+    # (P2, Codex r4552612002)
+    # ------------------------------------------------------------------
+    def _funding_backlog(
+        self,
+        position: InverseShortPosition,
+        rate: float,
+        legs: list[InverseShortCloseLeg],
+        due_periods: int,
+    ) -> tuple[float, list[tuple[int, datetime, float, float]]] | None:
+        """Compute the UNSETTLED funding backlog for ``position``.
+
+        Shared by the in-cycle settlement (``_apply_funding`` — durable
+        legs only) and the terminal-close fold
+        (``_settle_funding_for_close`` — durable legs PLUS the owed dirty
+        legs the close stages in the SAME transaction).  Returns
+        ``(cost, per_period)`` or ``None`` when the historical quantity
+        cannot be PROVEN from ``legs``: a stage flag without its leg row
+        means the executed history is unprovable, and an unprovable
+        quantity is never finalized (the obligation stays open on the row).
+
+        Frozen calculation rules (unchanged):
+          * per-period historical outstanding quantity from the leg
+            history with ``executed_at < boundary`` — a TP EXACTLY on the
+            boundary is accounted AFTER that boundary's accrual
+            (funding-before-exit);
+          * the first observed rate substitutes for the whole backlog,
+            exactly once, with the counter advancing atomically with the
+            accrual;
+          * an UNKNOWN/unusable rate never reaches this helper — callers
+            keep the obligation open (never a fabricated zero).
+        """
+        reasons = {leg.exit_reason for leg in legs}
+        if (
+            (position.tp1_executed and "TAKE_PROFIT_1" not in reasons)
+            or (position.tp2_executed and "TAKE_PROFIT_2" not in reasons)
+        ):
+            # A stage flag without its leg row means the executed history
+            # cannot be reconstructed — never finalize a quantity we
+            # cannot prove (the obligation stays open on the row).
+            logger.error(
+                "me inverse short oos2 funding settlement DEFERRED (stage "
+                "flag without a close leg — historical quantity "
+                "UNPROVABLE; obligation stays open, NOTHING booked): "
+                "symbol=%s flags=(tp1=%s tp2=%s) legs=%s",
+                position.symbol, bool(position.tp1_executed),
+                bool(position.tp2_executed), sorted(reasons),
+            )
+            return None
+
+        signed_rate = rate / 100.0
+        interval = timedelta(
+            seconds=float(self.settings.paper_funding_interval_hours) * 3600,
+        )
+        cost = 0.0
+        per_period: list[tuple[int, datetime, float, float]] = []
+        for period in range(
+            position.funding_periods_charged + 1, due_periods + 1,
+        ):
+            boundary = position.entered_at + interval * period
+            # P2 (Codex round 2): the unified funding-before-exit order —
+            # a leg executed EXACTLY at the period boundary is accounted
+            # AFTER this boundary's accrual (the accrual sees the pre-TP
+            # quantity; the leg only reduces the quantity from the NEXT
+            # boundary on).  Only legs STRICTLY before the boundary were
+            # already reflected at the accrual instant, so a settlement
+            # reconstructed from the ledger always equals the in-cycle
+            # funding-before-exit calculation — including a TP whose
+            # timestamp coincides with the boundary to the tick.
+            closed_before = sum(
+                leg.quantity for leg in legs if leg.executed_at < boundary
+            )
+            qty = round(position.position_size - closed_before, QTY_DECIMALS)
+            if qty < 0:
+                # Over-closure is impossible (legs are clamped to the
+                # remainder); guard against a corrupt ledger instead of
+                # ever booking a negative quantity.
+                qty = 0.0
+            period_cost = position.entry_price * qty * signed_rate
+            if position.direction == "SHORT":
+                period_cost = -period_cost
+            cost += period_cost
+            per_period.append((period, boundary, qty, period_cost))
+        return cost, per_period
+
+    def _settle_funding_for_close(
+        self,
+        position: InverseShortPosition,
+        funding_rate_percent: float | None,
+    ) -> float:
+        """Fold OBSERVED funding into a terminal close snapshot (P2).
+
+        A protective STOP/TIMEOUT may fire in the very cycle in which a
+        partial-leg commit is still unconfirmed (``_dirty_legs``): the
+        P1-2 guard in ``_apply_funding`` must keep deferring the
+        settlement there (a full-object write would persist the
+        unconfirmed TP), but the TERMINAL snapshot is only ever written
+        AFTER staging confirmed the owed leg rows and the outbox — so the
+        same known backlog is computed HERE and frozen into that snapshot
+        instead of being permanently lost at the close.
+
+        Rules preserved exactly:
+          * per-period historical quantity from the leg history — durable
+            legs PLUS the owed dirty legs (those rows become durable in
+            the SAME staging transaction as this snapshot), strict
+            ``executed_at < boundary`` (funding-before-exit);
+          * the first observed rate substitutes for the whole backlog,
+            exactly once, atomically with the counter;
+          * UNKNOWN/unusable rate → NOTHING booked: the obligation stays
+            open on the CLOSED row (reported, never a fabricated zero);
+          * unprovable history → NOT finalized, obligation stays open.
+
+        Returns the cost folded into the snapshot (0.0 when nothing was
+        settled).  The caller books ``-cost`` against the in-memory
+        balance (exactly like ``_apply_funding``) and keeps ``-cost``
+        inside the uncommitted close delta until the terminal write is
+        confirmed.
+        """
+        due_periods = self._due_funding_periods(position)
+        if due_periods <= position.funding_periods_charged:
+            return 0.0
+
+        rate: float | None
+        try:
+            rate = (
+                float(funding_rate_percent)
+                if funding_rate_percent is not None else None
+            )
+        except (TypeError, ValueError):
+            rate = None
+        if rate is not None and not math.isfinite(rate):
+            rate = None  # unusable feed value == UNKNOWN, never booked
+        if rate is None:
+            # Known-but-blocked vs genuinely UNKNOWN is exactly what this
+            # call distinguishes: _apply_funding deferred BEFORE its rate
+            # check (dirty leg), so the UNKNOWN marker is owned here.
+            if position.position_key not in self._funding_unknown:
+                self._funding_unknown.add(position.position_key)
+                logger.warning(
+                    "me inverse short oos2 funding rate UNKNOWN at terminal "
+                    "close; %d period(s) stay UNSETTLED on the CLOSED row "
+                    "(obligation preserved and reported, NEVER booked as "
+                    "zero): symbol=%s due=%d charged=%d",
+                    due_periods - position.funding_periods_charged,
+                    position.symbol, due_periods,
+                    position.funding_periods_charged,
+                )
+            return 0.0
+
+        try:
+            legs = self.store.list_close_legs(position.position_key)
+        except Exception:
+            logger.warning(
+                "me inverse short oos2 close funding fold DEFERRED (close-leg "
+                "history unreadable — historical quantity cannot be proven; "
+                "obligation stays open, NOTHING booked): symbol=%s due=%d "
+                "charged=%d",
+                position.symbol, due_periods,
+                position.funding_periods_charged, exc_info=True,
+            )
+            return 0.0
+        # Durable history PLUS the owed dirty legs of this key: those rows
+        # are staged in the SAME transaction as this terminal snapshot (the
+        # close passes them via stage_close(partial_legs=...)), so the
+        # quantity the CLOSED row freezes is exactly the quantity the leg
+        # ledger holds once staging commits — the dirty TP is NEVER
+        # claimed confirmed before that COMMIT, yet its known funding is
+        # never dropped either.
+        merged: dict[int, InverseShortCloseLeg] = {
+            leg.leg_seq: leg for leg in legs
+        }
+        for leg in self._dirty_legs.get(position.position_key, ()):
+            if leg.is_terminal:
+                continue
+            merged.setdefault(leg.leg_seq, leg)
+        computed = self._funding_backlog(
+            position, rate, list(merged.values()), due_periods,
+        )
+        if computed is None:
+            return 0.0  # UNPROVABLE — the reason is logged inside the helper
+        cost, per_period = computed
+
+        position.funding_paid += cost
+        position.funding_periods_charged = due_periods
+        self.balance -= cost
+        self._funding_unknown.discard(position.position_key)
+        for period, boundary, qty, period_cost in per_period:
+            logger.info(
+                "me inverse short oos2 funding period settled WITH the "
+                "terminal close: symbol=%s period=%d boundary=%s "
+                "outstanding_qty=%.12g cost=$%.6f rate=%.6f%%",
+                position.symbol, period, boundary.isoformat(),
+                qty, period_cost, rate,
+            )
+        logger.info(
+            "me inverse short oos2 close funding fold: symbol=%s periods=%d "
+            "rate=%.6f%% cost=$%.4f funding_paid=%.6f (settled INTO the "
+            "terminal snapshot — never a separate position write)",
+            position.symbol, due_periods, rate, cost,
+            position.funding_paid,
+        )
+        return cost
 
     def _confirmed_funding(
         self, position: InverseShortPosition,
@@ -1874,6 +2043,8 @@ class InverseShortPaperEngine:
         position: InverseShortPosition,
         exit_reference_price: float,
         reason: str,
+        *,
+        funding_rate_percent: float | None = None,
     ) -> InverseShortPosition:
         """TERMINAL close of the REMAINING quantity (Issue #276).
 
@@ -1899,6 +2070,18 @@ class InverseShortPaperEngine:
         # residual risk stays reported and blocks new entries).
         if position.position_key in self._dirty_legs:
             self._retry_dirty_legs()
+
+        # P2 (Codex r4552612002): settle OBSERVED funding INTO this
+        # terminal snapshot before it is frozen.  When a partial-leg
+        # commit is still unconfirmed the P1-2 guard has deferred the
+        # in-cycle settlement — but this snapshot is only written after
+        # staging confirmed the owed legs + outbox, so the known backlog
+        # is folded here with historically correct per-period quantities
+        # instead of being lost at the close.  UNKNOWN/unprovable stays
+        # OPEN and is reported below — never booked as zero.
+        funding_folded = self._settle_funding_for_close(
+            position, funding_rate_percent,
+        )
 
         closed_at = self._clock()
         slip = float(self.settings.slippage_percent)
@@ -2073,7 +2256,13 @@ class InverseShortPaperEngine:
         #    The documented degraded mode (stage_close() returned False:
         #    migration 088 absent, staging impossible by definition) keeps
         #    the UPDATE as the only durability left.
-        close_delta = terminal_delta
+        # The uncommitted close delta covers BOTH local balance moves the
+        # unconfirmed terminal write has not proven yet: the terminal leg
+        # delta AND the funding folded into this snapshot above (both were
+        # already booked against the in-memory balance).  Once the store
+        # carries this CLOSED row the whole key's delta is retired — the
+        # row's net_pnl/funding columns already contain both amounts.
+        close_delta = terminal_delta - funding_folded
         terminal_applied = False
         if not staged and not staging_degraded:
             self.pending_closes[position.position_key] = position
