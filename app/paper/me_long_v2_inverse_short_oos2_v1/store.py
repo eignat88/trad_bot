@@ -175,6 +175,27 @@ class InverseShortStore:
     def update_position(self, position: InverseShortPosition) -> None:
         raise NotImplementedError
 
+    def update_position_marks(self, position: InverseShortPosition) -> None:
+        """Persist ONLY the market-telemetry columns of a position (P1-1).
+
+        Writes exactly ``last_mark_price``, ``highest_since_entry``,
+        ``lowest_since_entry``, ``mfe`` and ``mae`` — and NOTHING else.
+        Trading state (``remaining_size``, ``tp1/tp2/tp3_executed``,
+        ``realized_legs_net``, ``entry_cost_allocated``, ``funding_paid``,
+        ``net_pnl``, ``status`` and every other accounting/financial
+        column) is NEVER touched through this method.
+
+        This is the durability contract that keeps a failed
+        ``commit_partial_exit()`` recoverable: mark persistence runs on
+        every cycle, so if it wrote the full object it would durably
+        persist an UNCONFIRMED partial execution (lower ``remaining_size``,
+        ``tp1_executed`` set) whose leg row does not exist — after a
+        restart that TP could never be recovered.  With a mark-only write
+        the durable row stays exactly what PostgreSQL confirmed, and the
+        restart loads the confirmed state.
+        """
+        raise NotImplementedError
+
     def load_open_positions(self) -> list[InverseShortPosition]:
         raise NotImplementedError
 
@@ -207,12 +228,24 @@ class InverseShortStore:
         self,
         position: InverseShortPosition,
         terminal_leg: InverseShortCloseLeg | None = None,
+        *,
+        partial_legs: Iterable[InverseShortCloseLeg] | None = None,
     ) -> bool:
         """Durably stage the EXACT terminal snapshot BEFORE the status flip.
 
         The outbox row AND the terminal leg row are staged as ONE idempotent
         transaction (upsert + leg upsert on ``(position_key, leg_seq)``), so
         the leg ledger can never lag the position flip.
+
+        ``partial_legs`` (P1-2): DIRTY partial TP rows still owed by this
+        key are staged in the SAME transaction when a protective/terminal
+        close runs while those legs are unconfirmed.  The terminal position
+        row carries their accounting (they applied in memory before the
+        close), so staging their rows atomically with the outbox snapshot
+        is what keeps the durable leg ledger from permanently losing a TP
+        the moment the process dies between the staging and a later leg
+        retry.  All staged legs are idempotent on ``(position_key,
+        leg_seq)`` — a replay verifies the existing row, never duplicates.
 
         Returns True when the snapshot is durable (outbox row written),
         False when durability is degraded (outbox/leg table absent, migration
@@ -222,6 +255,7 @@ class InverseShortStore:
         terminal UPDATE on subsequent cycles (P1 contract).
         """
         raise NotImplementedError
+
 
     def list_pending_closes(self) -> list[InverseShortPosition]:
         """Terminal snapshots staged but not yet confirmed CLOSED."""
@@ -375,6 +409,22 @@ class InMemoryInverseShortStore(InverseShortStore):
             self.immutability_repairs += 1
         self._positions[position.position_key] = replace(position)
 
+    def update_position_marks(self, position: InverseShortPosition) -> None:
+        # P1-1 parity with UPDATE_POSITION_MARKS_SQL: ONLY the telemetry
+        # columns are copied onto the durable row — every trading and
+        # financial field of the stored row stays byte-identical, so a
+        # failed partial-exit commit can never be laundered into the
+        # durable state by a later mark write.
+        stored = self._positions.get(position.position_key)
+        if stored is None:
+            raise KeyError(position.position_key)
+        stored.last_mark_price = position.last_mark_price
+        stored.highest_since_entry = position.highest_since_entry
+        stored.lowest_since_entry = position.lowest_since_entry
+        stored.mfe = position.mfe
+        stored.mae = position.mae
+
+
     def load_open_positions(self) -> list[InverseShortPosition]:
         return [
             replace(p) for p in self._positions.values()
@@ -418,6 +468,8 @@ class InMemoryInverseShortStore(InverseShortStore):
         self,
         position: InverseShortPosition,
         terminal_leg: InverseShortCloseLeg | None = None,
+        *,
+        partial_legs: Iterable[InverseShortCloseLeg] | None = None,
     ) -> bool:
         """Stage the exact terminal snapshot (process-local durability)."""
         if (
@@ -426,10 +478,16 @@ class InMemoryInverseShortStore(InverseShortStore):
             or position.closed_at is None
         ):
             raise ValueError("STAGE_CLOSE_NOT_TERMINAL")
+        # P1-2: owed dirty partial legs ride in the SAME staging step —
+        # same idempotent ledger, verified on conflict (facts mismatch
+        # raises instead of silently keeping a divergent row).
+        for leg in partial_legs or ():
+            self._record_close_leg(leg)
         self._pending_closes[position.position_key] = replace(position)
         if terminal_leg is not None:
             self._record_close_leg(terminal_leg)
         return True
+
 
     def list_pending_closes(self) -> list[InverseShortPosition]:
         return [
@@ -726,6 +784,25 @@ MARK_EVENT_ENTERED_SQL = f"""
         status_at = now(), updated_at = now()
     WHERE event_key = %s AND status = %s
 """
+
+# P1-1 — mark-only write path.  This statement is deliberately a DIFFERENT,
+# much smaller statement than UPDATE_POSITION_SQL: it cannot update a single
+# trading or financial column (no remaining_size, no TP flags, no realized
+# PnL, no entry cost, no funding, no net_pnl, no status), so persisting
+# dashboard telemetry after a FAILED commit_partial_exit() can never make an
+# unconfirmed partial execution durable.  Its only job is to keep the
+# dashboard's UNREALIZED PnL computable from the row alone.
+UPDATE_POSITION_MARKS_SQL = f"""
+    UPDATE {POSITION_TABLE} SET
+        highest_since_entry = %s,
+        lowest_since_entry = %s,
+        mfe = %s,
+        mae = %s,
+        last_mark_price = %s,
+        updated_at = now()
+    WHERE position_key = %s
+"""
+
 
 # P1-2 — sweep side of the admission race.  The disposition takes the
 # EVENT row lock in its own statement FIRST (MARK_EVENT_EXPIRED_LOCK_SQL,
@@ -1397,6 +1474,31 @@ class PgInverseShortStore(InverseShortStore):
                 f"POSITION_UPDATE_MATCHED_NO_ROWS:{position.position_key}"
             )
 
+    def update_position_marks(self, position: InverseShortPosition) -> None:
+        # P1-1: telemetry-only write — the parameter tuple touches exactly
+        # the five mark columns of UPDATE_POSITION_MARKS_SQL (no trading or
+        # financial value can be expressed through this method at all).
+        row = position.to_dict()
+        params = (
+            row.get("highest_since_entry"),
+            row.get("lowest_since_entry"),
+            row.get("mfe"),
+            row.get("mae"),
+            row.get("last_mark_price"),
+            position.position_key,
+        )
+        try:
+            result = self._execute_commit(UPDATE_POSITION_MARKS_SQL, params)
+            updated = result.rowcount
+        except Exception:
+            self._rollback()
+            raise
+        if updated == 0:
+            raise RuntimeError(
+                f"POSITION_MARKS_MATCHED_NO_ROWS:{position.position_key}"
+            )
+
+
     def load_open_positions(self) -> list[InverseShortPosition]:
         rows = self._query(
             "SELECT * FROM " + POSITION_TABLE +
@@ -1515,6 +1617,8 @@ class PgInverseShortStore(InverseShortStore):
         self,
         position: InverseShortPosition,
         terminal_leg: InverseShortCloseLeg | None = None,
+        *,
+        partial_legs: Iterable[InverseShortCloseLeg] | None = None,
     ) -> bool:
         if (
             position.status != POSITION_STATUS_CLOSED
@@ -1530,8 +1634,36 @@ class PgInverseShortStore(InverseShortStore):
         leg_params = (
             self._leg_params(terminal_leg) if terminal_leg is not None else None
         )
+        # P1-2: DIRTY partial legs owed by this key, staged in the SAME
+        # transaction as the outbox + terminal leg (idempotent replay, and
+        # a conflicting row must VERIFY like commit_partial_exit does —
+        # ON CONFLICT DO NOTHING alone never counts as confirmation).
+        partial_pairs = [
+            (leg, self._leg_params(leg))
+            for leg in (partial_legs or ())
+            if not leg.is_terminal
+        ]
 
         def operation() -> _QueryResult:
+            for leg, params in partial_pairs:
+                insert = self._execute_once(
+                    INSERT_CLOSE_LEG_SQL, params, fetch="none",
+                )
+                if insert.rowcount == 0:
+                    # Already durable — verify facts before treating the
+                    # conflict as this leg's replay (never guess).
+                    existing = self._execute_once(
+                        GET_CLOSE_LEG_SQL, (leg.position_key, leg.leg_seq),
+                        fetch="one",
+                    ).fetchone_dict()
+                    if existing is None or not self._leg_facts_match(
+                        existing, leg,
+                    ):
+                        self._conn.rollback()
+                        raise RuntimeError(
+                            f"LEG_CONFLICT_UNVERIFIABLE:{leg.position_key}:"
+                            f"{leg.leg_seq}"
+                        )
             if leg_params is not None:
                 # Terminal leg staged in the SAME transaction as the outbox
                 # snapshot: the leg ledger can never lag the position flip
@@ -1542,6 +1674,7 @@ class PgInverseShortStore(InverseShortStore):
             )
             self._conn.commit()
             return _QueryResult(columns=[], rows=[], rowcount=result.rowcount)
+
 
         try:
             result = self._with_reconnect(operation)

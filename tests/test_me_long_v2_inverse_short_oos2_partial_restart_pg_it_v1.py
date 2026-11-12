@@ -423,3 +423,286 @@ class TestPartialLadderOnPostgres:
         # and tied to the remaining notional.
         assert abs(second.funding_paid) > 0
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# Codex review hardening (PR #278: P1-1 / P1-2 / P2) — real PostgreSQL
+#
+# These are the REAL-database counterparts of the fault-injection scenarios
+# in test_me_long_v2_inverse_short_oos2_durability_hardening_v1.py.  They are
+# gated on TEST_DB_HOST / TEST_DB_UNIX_SOCK like the sibling suites: without
+# a test PostgreSQL they SKIP and must be reported as BLOCKED_BY_ENVIRONMENT
+# — never as PASS.
+# ---------------------------------------------------------------------------
+@_PG_ONLY
+class TestCodexDurabilityHardeningOnPostgres:
+    def test_mandatory_fault_injection_tp1_fail_retry_tp2_restart(
+        self, running,
+    ):
+        """Mandatory scenario on real PostgreSQL with migration 088:
+        TP1 calculated -> DB write fails -> retry -> TP1 confirmed -> TP2 ->
+        restart.  Exactly-once stages, 12.5% remainder, conservation, and
+        recovery that never blocks."""
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = _contour(store, clock=clock)
+        event_key = _capture_event(store, age=timedelta(seconds=5))
+        cycle = contour.run_cycle({"BTCUSDT": 100.0})
+        assert cycle["entries"] == 1, cycle
+        position_key = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:{event_key}"
+
+        row = store.get_position(position_key)
+        assert row is not None
+        size = row.position_size
+        tp2_price = row.tp2_price
+        bar = {"BTCUSDT": {"high": tp2_price, "low": tp2_price}}
+
+        # TP1's durable write fails exactly once
+        original = store.commit_partial_exit
+        calls = {"n": 0}
+
+        def flaky(position, leg):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("simulated COMMIT failure")
+            return original(position, leg)
+
+        store.commit_partial_exit = flaky
+
+        # cycle 1: one bar crosses BOTH TP1 and TP2
+        contour.run_cycle({"BTCUSDT": tp2_price}, bars=bar)
+        assert contour.engine.durability_risk
+        memory = contour.engine.open_positions[position_key]
+        assert memory.tp1_executed is True
+        assert memory.tp2_executed is False, (
+            "ladder advanced over an unconfirmed TP1 (P1-2 violation)",
+        )
+        durable = store.get_position(position_key)
+        assert durable is not None
+        assert durable.tp1_executed is False
+        assert durable.remaining_size == pytest.approx(size, rel=1e-9)
+        assert _legs(store, position_key) == []
+        # P1-1: mark persistence inside run_cycle must NOT have carried the
+        # unconfirmed TP1 into the durable row.
+        contour.engine.persist_marks()
+        durable = store.get_position(position_key)
+        assert durable.tp1_executed is False
+        assert durable.remaining_size == pytest.approx(size, rel=1e-9)
+
+        # cycle 2: retry confirms TP1 first, then TP2 commits exactly once
+        contour.run_cycle({"BTCUSDT": tp2_price}, bars=bar)
+        assert not contour.engine.durability_risk
+        assert contour.engine.dirty_leg_keys == ()
+        legs = _legs(store, position_key)
+        assert [leg.leg_seq for leg in legs] == [1, 2], (
+            "TP1 once, TP2 once, no missing stage",
+        )
+        after = store.get_position(position_key)
+        assert after is not None
+        assert after.tp1_executed and after.tp2_executed
+        assert after.remaining_size == pytest.approx(size * 0.125, rel=1e-9)
+        closed_qty = sum(leg.quantity for leg in legs)
+        assert round(after.position_size - after.remaining_size, 9) == round(
+            closed_qty, 9,
+        ), "quantity conservation on the durable rows"
+        assert contour.engine._uncommitted_deltas == {}
+        balance_before = store.balance_components()["balance"]
+
+        # RESTART: fresh connection + fresh engine over the same database
+        store2 = _connect_store()
+        contour2 = _contour(store2, clock=clock)
+        restored = store2.get_position(position_key)
+        assert restored is not None
+        assert restored.tp1_executed and restored.tp2_executed
+        assert restored.remaining_size == pytest.approx(size * 0.125, rel=1e-9)
+        cycle = contour2.run_cycle({"BTCUSDT": tp2_price}, bars=bar)
+        assert cycle is not None
+        assert not contour2.engine.durability_risk
+        assert contour2.engine.dirty_leg_keys == ()
+        assert contour2.engine.accounting_consistent
+        assert store2.balance_components()["balance"] == pytest.approx(
+            balance_before, abs=1e-6,
+        )
+        assert len(_legs(store2, position_key)) == 2, "still exactly one leg per stage"
+        store2.close()
+        store.close()
+
+    def test_mark_write_never_moves_trading_columns(self, running):
+        """P1-1 against the real UPDATE: update_position_marks touches
+        telemetry only, even when handed a mutated trading state."""
+        import dataclasses
+
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = _contour(store, clock=clock)
+        event_key = _capture_event(store, age=timedelta(seconds=5))
+        contour.run_cycle({"BTCUSDT": 100.0})
+        position_key = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:{event_key}"
+        row = store.get_position(position_key)
+        assert row is not None
+
+        mutated = dataclasses.replace(
+            row,
+            remaining_size=row.remaining_size * 0.5,
+            tp1_executed=True,
+            realized_legs_net=123.45,
+            entry_cost_allocated=1.0,
+            funding_paid=999.0,
+            net_pnl=-1.0,
+            status="CLOSED",
+            last_mark_price=row.entry_price * 0.9,
+            highest_since_entry=row.entry_price * 1.3,
+            lowest_since_entry=row.entry_price * 0.7,
+            mfe=7.0,
+            mae=8.0,
+        )
+        store.update_position_marks(mutated)
+
+        after = store.get_position(position_key)
+        assert after is not None
+        # trading / financial columns byte-identical
+        for column in (
+            "remaining_size", "tp1_executed", "tp2_executed", "tp3_executed",
+            "realized_legs_net", "entry_cost_allocated", "funding_paid",
+            "funding_periods", "net_pnl", "gross_pnl", "status",
+            "entered_at", "deadline_at", "position_size", "entry_price",
+        ):
+            assert getattr(after, column) == getattr(row, column), column
+        # telemetry moved
+        assert after.last_mark_price == pytest.approx(
+            row.entry_price * 0.9,
+        )
+        assert after.mfe == pytest.approx(7.0)
+        assert after.mae == pytest.approx(8.0)
+        store.close()
+
+    def test_backlog_funding_charges_the_historical_quantity(self, running):
+        """P2 on real PostgreSQL: a period that closed BEFORE the observed
+        rate is charged on the quantity outstanding at ITS boundary (full
+        size), not on the live remainder."""
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = _contour(store, clock=clock)
+        event_key = _capture_event(store, age=timedelta(seconds=5))
+        contour.run_cycle({"BTCUSDT": 100.0})
+        position_key = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:{event_key}"
+        row = store.get_position(position_key)
+        size = row.position_size
+
+        # period 1 boundary passes with UNKNOWN rate -> obligation open
+        clock.advance(hours=8, minutes=1)
+        contour.run_cycle({"BTCUSDT": 100.0}, funding_rates_percent={})
+        assert store.get_position(position_key).funding_periods_charged == 0
+
+        # TP1 AFTER the period-1 boundary
+        contour.run_cycle({"BTCUSDT": 100.0 * 0.945})
+        row = store.get_position(position_key)
+        assert row.tp1_executed
+        assert row.remaining_size == pytest.approx(size * 0.5, rel=1e-9)
+
+        # first observed rate: period 1 must charge the FULL historical size
+        clock.advance(hours=1)
+        contour.run_cycle(
+            {"BTCUSDT": 100.0 * 0.945},
+            funding_rates_percent={"BTCUSDT": 0.01},
+        )
+        settled = store.get_position(position_key)
+        assert settled.funding_periods_charged == 1
+        expected_full = -(settled.entry_price * size) * (0.01 / 100.0)
+        expected_live = -(settled.entry_price * settled.remaining_size) * (
+            0.01 / 100.0
+        )
+        assert settled.funding_paid == pytest.approx(expected_full, rel=1e-9), (
+            "the pre-TP1 period must be charged on the historical quantity"
+        )
+        assert settled.funding_paid != pytest.approx(expected_live, rel=1e-6)
+        store.close()
+
+    def test_dirty_leg_retry_survives_a_connection_drop(self, running):
+        """Scenario 6: PostgreSQL disconnect between the failed TP1 write
+        and its retry — the store reconnects and confirms exactly once."""
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = _contour(store, clock=clock)
+        event_key = _capture_event(store, age=timedelta(seconds=5))
+        contour.run_cycle({"BTCUSDT": 100.0})
+        position_key = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:{event_key}"
+        row = store.get_position(position_key)
+        tp1_price = row.target_price
+
+        original = store.commit_partial_exit
+
+        def flaky(position, leg):
+            raise RuntimeError("simulated COMMIT failure")
+
+        store.commit_partial_exit = flaky
+        contour.run_cycle({"BTCUSDT": tp1_price})
+        assert position_key in contour.engine.dirty_leg_keys
+
+        # hard connection drop (socket closed underneath the store)
+        store._conn.close()
+        store.commit_partial_exit = original
+
+        # next cycle: _with_reconnect re-establishes the session and the
+        # dirty-leg retry confirms TP1 exactly once.
+        contour.run_cycle({"BTCUSDT": tp1_price})
+        assert not contour.engine.durability_risk
+        assert contour.engine.dirty_leg_keys == ()
+        legs = _legs(store, position_key)
+        assert [leg.leg_seq for leg in legs] == [1]
+        durable = store.get_position(position_key)
+        assert durable is not None
+        assert durable.tp1_executed is True
+        assert durable.remaining_size == pytest.approx(
+            durable.position_size * 0.5, rel=1e-9,
+        )
+        store.close()
+
+    def test_second_session_mark_persistence_never_corrupts_leg_state(
+        self, running,
+    ):
+        """Scenario 12 on real PostgreSQL: another session persisting marks
+        concurrently with the leg commits never moves trading state and
+        never double-books legs/fees/PnL."""
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = _contour(store, clock=clock)
+        event_key = _capture_event(store, age=timedelta(seconds=5))
+        contour.run_cycle({"BTCUSDT": 100.0})
+        position_key = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:{event_key}"
+        row = store.get_position(position_key)
+        tp2_price = row.tp2_price
+
+        # second session over its OWN connection
+        store_b = _connect_store()
+        copy = store_b.get_position(position_key)
+        assert copy is not None
+        copy.last_mark_price = copy.entry_price * 0.97
+        copy.mfe = 3.0
+        store_b.update_position_marks(copy)
+
+        # session A continues the ladder
+        contour.run_cycle({"BTCUSDT": 100.0 * 0.945})
+        contour.run_cycle({"BTCUSDT": tp2_price})
+        legs = _legs(store, position_key)
+        assert [leg.leg_seq for leg in legs] == [1, 2], (
+            "exactly one durable execution per stage despite interleaved "
+            "mark writes from a second session",
+        )
+        final = store.get_position(position_key)
+        assert final.tp1_executed and final.tp2_executed
+        assert final.remaining_size == pytest.approx(
+            final.position_size * 0.125, rel=1e-9,
+        )
+        closed_qty = sum(leg.quantity for leg in legs)
+        assert round(final.position_size - final.remaining_size, 9) == round(
+            closed_qty, 9,
+        )
+        # session A's own mark write followed B's — the row's telemetry is
+        # current (MFE recomputed by A, not left at B's stale value), and
+        # B's stale full copy was never able to move trading state.
+        assert final.last_mark_price == pytest.approx(tp2_price)
+        assert final.mfe == pytest.approx(100.0 - tp2_price, rel=1e-9)
+        assert contour.engine._uncommitted_deltas == {}
+        store_b.close()
+        store.close()

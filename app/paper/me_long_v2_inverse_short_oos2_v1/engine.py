@@ -942,13 +942,20 @@ class InverseShortPaperEngine:
         # First finish any unfinished close (P1-3): its terminal snapshot is
         # replayed byte-for-byte and never re-evaluated below.
         self.flush_pending_closes()
-        # Then retry any DIRTY funding snapshot (P2): persisted even when no
-        # new funding interval has become due; a retry never re-accrues.
-        self._retry_dirty_funding()
-        # Then retry any DIRTY partial-TP leg (Issue #276): identical facts,
-        # same (position_key, leg_seq) identity — a retry never books a leg
-        # twice and never claims durability the database never accepted.
+        # Then retry DIRTY partial-TP legs (Issue #276 / P1-2): identical
+        # facts, same (position_key, leg_seq) identity — a retry never books
+        # a leg twice and never claims durability the database never
+        # accepted.  Legs go BEFORE funding: a confirmed leg commit carries
+        # the full current position state (funding included) and settles
+        # every local delta for the key at once, so the funding retry below
+        # only ever writes rows whose leg rows are already durable.
         self._retry_dirty_legs()
+        # Then retry any DIRTY funding snapshot (P2): persisted even when no
+        # new funding interval has become due; a retry never re-accrues and
+        # is skipped while this key still owes leg rows (never writes the
+        # position row ahead of its leg ledger).
+        self._retry_dirty_funding()
+
 
         closed: list[InverseShortPosition] = []
 
@@ -987,13 +994,41 @@ class InverseShortPaperEngine:
                 reason = "STOP_LOSS_GAP" if gap else "STOP_LOSS"
                 terminal = self._close(position, position.stop_price, reason)
             else:
+                # P1-2 (Codex): the ladder may NEVER advance over an
+                # unconfirmed partial leg.  While this key still owns DIRTY
+                # leg rows (a commit_partial_exit() that did not confirm),
+                # TP1/TP2/TP3 evaluation is deferred until the dirty-leg
+                # retry at the start of the next cycle confirms the owed
+                # leg — so a later stage can never fire on top of a leg
+                # whose expected remainder the durable row has not reached,
+                # and its replay can never dead-end in
+                # PARTIAL_EXIT_STATE_MISMATCH.  Protective exits (STOP
+                # above, TIMEOUT below) are NEVER gated: an open position
+                # keeps being protected while the ledger is unconfirmed.
+                ladder_blocked = position.position_key in self._dirty_legs
+                if ladder_blocked:
+                    logger.warning(
+                        "me inverse short oos2 ladder HELD (P1-2): a partial "
+                        "leg of this position is not yet durable, so no TP "
+                        "stage may advance over it this cycle "
+                        "(protective STOP/TIMEOUT still evaluated): key=%s "
+                        "owed_legs=%s",
+                        position.position_key[:48],
+                        [l.exit_reason for l in
+                         self._dirty_legs.get(position.position_key, ())],
+                    )
                 # Partial ladder: TP1 -> TP2 in falling-price order.  A bar
                 # that skips several levels fires every skipped stage in
-                # order, each exactly once at its own level price.
+                # order, each exactly once at its own level price.  The
+                # dirty set is re-read EVERY iteration: a TP1 whose commit
+                # just failed inside this very bar must block TP2 of the
+                # same bar immediately.
                 for stage, level_attr, flag_attr in (
                     ("TAKE_PROFIT_1", "target_price", "tp1_executed"),
                     ("TAKE_PROFIT_2", "tp2_price", "tp2_executed"),
                 ):
+                    if position.position_key in self._dirty_legs:
+                        break  # never advance the ladder over an unconfirmed leg
                     if getattr(position, flag_attr):
                         continue  # each stage fires at most ONCE
                     level = float(getattr(position, level_attr))
@@ -1006,15 +1041,23 @@ class InverseShortPaperEngine:
                         terminal = self._close(position, level, stage)
                         break
                 if terminal is None:
-                    if low <= position.tp3_price:
-                        # TP3 closes ALL remaining -> terminal.
+                    if (
+                        position.position_key not in self._dirty_legs
+                        and low <= position.tp3_price
+                    ):
+                        # TP3 closes ALL remaining -> terminal (held while
+                        # an earlier partial leg is still unconfirmed).
                         terminal = self._close(
                             position, position.tp3_price, "TAKE_PROFIT_3",
                         )
                     elif self._clock() >= position.deadline_at:
                         # TIMEOUT closes the remaining quantity and keeps
-                        # every realized TP leg's PnL.
+                        # every realized TP leg's PnL — protective, never
+                        # gated by an unconfirmed leg (the close flushes
+                        # the owed leg rows first, staging them with its
+                        # own snapshot when possible).
                         terminal = self._close(position, price, "TIMEOUT")
+
 
             if terminal is not None:
                 self.open_positions.pop(position_key, None)
@@ -1058,6 +1101,17 @@ class InverseShortPaperEngine:
             recorded on the closed row and is reported as an outstanding
             obligation — it is NEVER retroactively booked (that would
             rewrite realized PnL, review P2-1 #7).
+
+        Historical quantities (P2, Codex): each backlog period settles on
+        the quantity actually OUTSTANDING at that period's funding
+        instant — reconstructed from the DURABLE close-leg history
+        (``executed_at <= period boundary``), NOT from the live
+        ``remaining_size``.  A backlog spanning a partial exit therefore
+        charges the pre-exit periods on the pre-exit quantity and only the
+        post-exit periods on the reduced quantity.  When the history
+        cannot be read or does not prove the executed stages, the
+        calculation is NOT finalized (obligation stays open, counter does
+        not advance) — an unprovable quantity is never booked as valid.
         """
         interval_seconds = float(self.settings.paper_funding_interval_hours) * 3600
         if interval_seconds <= 0:
@@ -1069,6 +1123,22 @@ class InverseShortPaperEngine:
         new_periods = due_periods - position.funding_periods_charged
         if new_periods <= 0:
             self._funding_unknown.discard(position.position_key)
+            return
+
+        # --- P1-2: never settle (and therefore never PERSIST) funding for a
+        # key whose partial-leg rows are still owed.  The settlement write
+        # is a FULL-object position update: while a leg is unconfirmed it
+        # would durably advance the row past its ledger (the same defect
+        # class as P1-1 through another door).  The obligation simply stays
+        # open and settles with the confirmed leg commit or on a later
+        # cycle — never lost, never double-booked.
+        if position.position_key in self._dirty_legs:
+            logger.debug(
+                "me inverse short oos2 funding settlement deferred (partial "
+                "leg rows still owed; obligation stays open): symbol=%s "
+                "due=%d charged=%d",
+                position.symbol, due_periods, position.funding_periods_charged,
+            )
             return
 
         # --- rate tri-state: UNKNOWN never advances the counter ------------
@@ -1098,17 +1168,80 @@ class InverseShortPaperEngine:
             return
 
         # --- observed rate (0.0 included): settle the backlog exactly once -
-        # Issue #276: funding accrues on the REMAINING (outstanding) quantity
-        # only — a partially closed position funds only what is still open.
-        notional = position.entry_price * position.remaining_size
+        # P2 (Codex): funding accrues PER PERIOD on the quantity that was
+        # outstanding AT THAT PERIOD'S FUNDING INSTANT — reconstructed from
+        # the DURABLE close-leg history, never from the live remainder.
+        # Frozen substitution policy unchanged: still the first observed
+        # rate after recovery, applied to every unsettled period, exactly
+        # once (the counter advances atomically with the accrual).
+        try:
+            legs = self.store.list_close_legs(position.position_key)
+        except Exception:
+            logger.warning(
+                "me inverse short oos2 funding settlement DEFERRED (close-leg "
+                "history unreadable — historical quantity cannot be proven; "
+                "obligation stays open, NOTHING booked): symbol=%s due=%d "
+                "charged=%d",
+                position.symbol, due_periods, position.funding_periods_charged,
+                exc_info=True,
+            )
+            return
+        durable_reasons = {leg.exit_reason for leg in legs}
+        if (
+            (position.tp1_executed and "TAKE_PROFIT_1" not in durable_reasons)
+            or (position.tp2_executed and "TAKE_PROFIT_2" not in durable_reasons)
+        ):
+            # A stage flag without its durable leg row means the executed
+            # history cannot be reconstructed — never finalize a quantity
+            # we cannot prove (the obligation stays open on the row).
+            logger.error(
+                "me inverse short oos2 funding settlement DEFERRED (stage "
+                "flag without a durable close leg — historical quantity "
+                "UNPROVABLE; obligation stays open, NOTHING booked): "
+                "symbol=%s flags=(tp1=%s tp2=%s) durable_legs=%s",
+                position.symbol, bool(position.tp1_executed),
+                bool(position.tp2_executed), sorted(durable_reasons),
+            )
+            return
+
         signed_rate = rate / 100.0
-        cost = notional * signed_rate * new_periods
-        if position.direction == "SHORT":
-            cost = -cost
+        interval = timedelta(seconds=interval_seconds)
+        cost = 0.0
+        per_period: list[tuple[int, datetime, float, float]] = []
+        for period in range(
+            position.funding_periods_charged + 1, due_periods + 1,
+        ):
+            boundary = position.entered_at + interval * period
+            closed_before = sum(
+                leg.quantity for leg in legs if leg.executed_at <= boundary
+            )
+            qty = round(position.position_size - closed_before, QTY_DECIMALS)
+            if qty < 0:
+                # Over-closure is impossible (legs are clamped to the
+                # remainder); guard against a corrupt ledger instead of
+                # ever booking a negative quantity.
+                qty = 0.0
+            period_cost = position.entry_price * qty * signed_rate
+            if position.direction == "SHORT":
+                period_cost = -period_cost
+            cost += period_cost
+            per_period.append((period, boundary, qty, period_cost))
+
         position.funding_paid += cost
         position.funding_periods_charged = due_periods
         self.balance -= cost
         self._funding_unknown.discard(position.position_key)
+        for period, boundary, qty, period_cost in per_period:
+            # P2 audit trail: every settled period records WHICH quantity
+            # it was charged on and at which boundary — reproducible against
+            # the durable close-leg history after a restart.
+            logger.info(
+                "me inverse short oos2 funding period settled: symbol=%s "
+                "period=%d boundary=%s outstanding_qty=%.12g cost=$%.6f "
+                "rate=%.6f%%",
+                position.symbol, period, boundary.isoformat(),
+                qty, period_cost, rate,
+            )
         if new_periods > 1:
             # Backlog settlement after an outage — logged with the EXACT
             # policy so the substitution is explicit, never silent.
@@ -1134,12 +1267,13 @@ class InverseShortPaperEngine:
                 # Confirmed APPLIED: the persisted ledger already carries
                 # this accrual.  The local delta would DOUBLE-subtract on
                 # the next reconciliation, so it is settled NOW — the state
-                # IS confirmed.  The write carried the FULL current position
-                # state, so any dirty-leg ACCOUNTING rides along with it as
-                # well: only the dirty-leg ROWS (audit ledger) may remain
-                # owed.  No DIRTY funding snapshot is retained, and no
-                # reconciliation marker survives an unconfirmed state —
-                # because this state is no longer unconfirmed.
+                # IS confirmed.  (The write carries the full current
+                # position state; the P1-2 gate above guarantees NO dirty
+                # leg rows exist for this key here, so this write can never
+                # push the row past its leg ledger.)  No DIRTY funding
+                # snapshot is retained, and no reconciliation marker
+                # survives an unconfirmed state — because this state is no
+                # longer unconfirmed.
                 self._uncommitted_deltas.pop(position.position_key, None)
                 self._leg_deltas.pop(position.position_key, None)
                 self._dirty_funding.pop(position.position_key, None)
@@ -1181,8 +1315,9 @@ class InverseShortPaperEngine:
         else:
             # The row now carries the cumulative funding AND the full
             # current position state — local and store accounting for this
-            # key agree again (dirty-leg accounting rode along; only dirty
-            # leg ROWS, if any, remain owed and are retried separately).
+            # key agree again (the P1-2 gate above guarantees no dirty leg
+            # rows exist for this key, so the row never moved ahead of its
+            # leg ledger).
             self._uncommitted_deltas.pop(position.position_key, None)
             self._leg_deltas.pop(position.position_key, None)
             self._dirty_funding.pop(position.position_key, None)
@@ -1221,15 +1356,19 @@ class InverseShortPaperEngine:
         Runs EVERY cycle — including cycles where no new funding interval
         has become due.  The write carries the CURRENT in-memory position
         state (absolute values — a retry NEVER accrues anything twice and
-        never touches terminal close facts): keys with an unfinished close
-        are skipped, because their snapshot (funding included) is owned and
-        replayed by the pending-close/outbox mechanism.
+        never touches terminal close facts).
 
-        On success the store row carries the full current state again, so
-        the local uncommitted balance delta for that key is settled with it
-        (booked exactly once, never twice) and any dirty-leg ACCOUNTING is
-        carried along; only dirty leg ROWS may remain owed (retried by
-        ``_retry_dirty_legs``).
+        P1-2 (Codex) — a key whose DIRTY partial-TP leg rows are still
+        owed is SKIPPED: this is a FULL-object write, so persisting it now
+        would durably advance the position row (flags, remainder, realized
+        PnL) past a leg the leg ledger does not have — exactly the
+        "uncommitted trading state" defect of P1-1 through a second door.
+        Such keys settle through the dirty-leg retry instead (a confirmed
+        ``commit_partial_exit()`` carries funding and accounting in the
+        SAME transaction as its leg row), and this retry resumes on the
+        cycles after that confirmation.  Keys with an unfinished close are
+        skipped as before, because their snapshot (funding included) is
+        owned and replayed by the pending-close/outbox mechanism.
         """
         persisted = 0
         for position_key, snapshot in list(self._dirty_funding.items()):
@@ -1237,9 +1376,21 @@ class InverseShortPaperEngine:
                 # Terminal close owns this key; an OPEN snapshot must never
                 # be written over a pending terminal snapshot.
                 continue
+            if position_key in self._dirty_legs:
+                # P1-2: the position row must never move ahead of its leg
+                # rows — funding for this key settles together with the
+                # owed leg commit (retry runs again every cycle).
+                logger.debug(
+                    "me inverse short oos2 dirty funding retry deferred "
+                    "(leg rows still owed for this key): key=%s",
+                    position_key[:48],
+                )
+                continue
             # Prefer the LIVE object: it always contains the newest
             # accounting (legs, funding), so a confirmed write settles every
-            # local delta for the key in one row update.
+            # local delta for the key in one row update.  No dirty legs can
+            # exist for this key at this point (guarded above), so the write
+            # never carries trading state past its ledger rows.
             live = self.open_positions.get(position_key)
             to_write = live if live is not None else snapshot
             try:
@@ -1263,6 +1414,7 @@ class InverseShortPaperEngine:
                 to_write.funding_periods_charged,
             )
         return persisted
+
 
     def _due_funding_periods(self, position: InverseShortPosition) -> int:
         """Whole funding intervals elapsed for this position.
@@ -1836,8 +1988,24 @@ class InverseShortPaperEngine:
         #    PostgreSQL never accepted).
         staged = False
         staging_degraded = False
+        # P1-2: any DIRTY partial-leg rows still owed by this key are
+        # staged in the SAME transaction as the outbox + terminal leg.  The
+        # terminal row below carries their accounting (they applied in
+        # memory before this close), so staging them here is what keeps the
+        # durable leg ledger from losing a TP permanently when the process
+        # dies after the terminal UPDATE but before the dirty-leg retry.
+        # Best effort: a staging failure degrades exactly like before (the
+        # whole staging is retried by flush_pending_closes(); the dirty
+        # legs stay owed and reported).
+        owed_partial_legs = [
+            leg for leg in self._dirty_legs.get(position.position_key, ())
+            if not leg.is_terminal
+        ]
         try:
-            staged = bool(self.store.stage_close(position, terminal_leg))
+            staged = bool(self.store.stage_close(
+                position, terminal_leg, partial_legs=owed_partial_legs,
+            ))
+
         except Exception:
             logger.warning(
                 "me inverse short oos2 close staging failed (in-process snapshot "
@@ -1989,8 +2157,21 @@ class InverseShortPaperEngine:
                         self._staging_unavailable.add(position_key)
                     else:
                         try:
-                            if bool(self.store.stage_close(snapshot, terminal_leg)):
+                            # P1-2: the re-stage carries the owed DIRTY
+                            # partial legs of this key too (same idempotent
+                            # transaction) — the replay is byte-for-byte for
+                            # the snapshot and exactly-once for every leg.
+                            owed_partial_legs = [
+                                leg for leg in
+                                self._dirty_legs.get(position_key, ())
+                                if not leg.is_terminal
+                            ]
+                            if bool(self.store.stage_close(
+                                snapshot, terminal_leg,
+                                partial_legs=owed_partial_legs,
+                            )):
                                 self._unstaged_closes.discard(position_key)
+
                             else:
                                 # Outbox/leg table absent (migration 088):
                                 # staging can never succeed — fall through
@@ -2191,6 +2372,15 @@ class InverseShortPaperEngine:
         retried next cycle; a failure never aborts the cycle's exits or
         entries (the mark is dashboard telemetry, not a trading decision).
         Returns the number of positions whose mark was persisted.
+
+        P1-1 (Codex): the write goes through ``update_position_marks()``
+        ONLY — the mark-only store API.  ``update_position()`` (the FULL
+        object, including ``remaining_size`` / TP flags / realized PnL)
+        must never be reachable from here: if a ``commit_partial_exit()``
+        just failed and left this object ahead of the durable row, a
+        full-object write would make that unconfirmed partial execution
+        durable without its leg row, and after a restart the missed TP
+        could not be recovered.  A mark write may only move telemetry.
         """
         persisted = 0
         for key in list(self._marks_dirty):
@@ -2201,7 +2391,7 @@ class InverseShortPaperEngine:
                 self._marks_dirty.discard(key)
                 continue
             try:
-                self.store.update_position(position)
+                self.store.update_position_marks(position)
             except Exception:
                 logger.warning(
                     "me inverse short oos2 mark persistence failed (retry next "
@@ -2212,6 +2402,7 @@ class InverseShortPaperEngine:
             self._marks_dirty.discard(key)
             persisted += 1
         return persisted
+
 
     def snapshot(self, prices: dict[str, float] | None = None) -> dict[str, Any]:
         account = self.mark_to_market(prices)
