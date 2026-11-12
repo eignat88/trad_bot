@@ -1748,6 +1748,35 @@ def _dropin_scenario(tmp_path, env_files, *, venv_style="copy",
     return runtime, scanner, old, new, unit, dropin, process, effective
 
 
+def _two_venvs_one_interpreter(tmp_path) -> tuple[Path, Path, Path]:
+    """TWO different virtualenvs sharing ONE final interpreter.
+
+    ``checkout-a`` (the audited Scanner checkout) and ``checkout-b``
+    (foreign) each keep their OWN ``.venv/pyvenv.cfg``, while both
+    ``.venv/bin`` directories are LINKED to a single interpreter
+    directory inside ``checkout-a`` (directory symlink on Linux /
+    privilege-free junction on Windows) — the exact
+    ``python -> /usr/bin/python3.12`` shape under which a
+    resolve()-based identity key treats the two virtualenvs as the same
+    file.  Returns ``(root, foreign, shared_interpreter)``.
+    """
+    root = _make_scanner_checkout(tmp_path, "checkout-a")
+    foreign = _make_scanner_checkout(tmp_path, "checkout-b")
+    shared = root / "shared_bin"
+    shared.mkdir(parents=True, exist_ok=True)
+    interpreter = shared / "python"
+    interpreter.write_text(
+        "# shared interpreter fixture — never executed\n",
+        encoding="utf-8",
+    )
+    interpreter.chmod(0o755)
+    for checkout in (root, foreign):
+        bin_link = checkout / ".venv" / "bin"
+        shutil.rmtree(bin_link)
+        _link_dir_or_skip(bin_link, shared)
+    return root, foreign, interpreter
+
+
 def _assert_ready(result):
     assert result["ready_for_activation"] is True
     assert result["result"] == "READY_FOR_ACTIVATION"
@@ -2381,6 +2410,102 @@ class TestEffectiveSystemdDropIns:
         assert "scanner_unit_matches_checkout:SCANNER_UNIT_EXEC_PATH_MISMATCH" \
             in check["reason"]
         assert result["ready_for_activation"] is False
+
+
+    def test_foreign_venv_argv0_with_same_resolved_python_fails(
+        self, env_files, tmp_path,
+    ):
+        """P2 regression: ``argv[0]`` from ANOTHER virtualenv that
+        resolves to the SAME final interpreter (``/usr/bin/python3.12``
+        shape) must still be rejected — executable identity is compared
+        LEXICALLY, never through symlink resolution.  The resolve()-based
+        key used to call the two venvs identical, let the spoofed
+        ``argv[0]`` pass the identity check, and reported ready."""
+        runtime, scanner = env_files
+        root, foreign, _ = _two_venvs_one_interpreter(tmp_path)
+        unit = _write_scanner_unit(tmp_path / "scanner-unit.service", root,
+                                   scanner)
+        dropin_dir = Path(f"{unit}.d")
+        dropin_dir.mkdir(parents=True, exist_ok=True)
+        dropin = dropin_dir / "20-scanner-v2-release.conf"
+        dropin.write_text(
+            "[Service]\nExecStart=\n"
+            f"ExecStart={root.as_posix()}/.venv/bin/python "
+            f"{root.as_posix()}/scanner_runner.py\n"
+            f"WorkingDirectory={root.as_posix()}\n",
+            encoding="utf-8",
+        )
+        process = _scanner_process_fixture(root, unit=unit)
+        # The running process faithfully mirrors the spoofed unit, so the
+        # process-vs-unit subcheck passes and ONLY the executable
+        # identity check can catch the substitution:
+        process["cmdline"] = [
+            f"{foreign.as_posix()}/.venv/bin/python",
+            f"{root.as_posix()}/scanner_runner.py",
+        ]
+        effective = _effective_show(
+            unit,
+            fragment_path=str(unit),
+            exec_path=f"{root.as_posix()}/.venv/bin/python",
+            exec_start_argv=[
+                f"{foreign.as_posix()}/.venv/bin/python",
+                f"{root.as_posix()}/scanner_runner.py",
+            ],
+            working_directory=root.as_posix(),
+            environment_files=[scanner.as_posix()],
+            drop_in_paths=[str(dropin)],
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert "scanner_unit_matches_checkout:SCANNER_UNIT_EXEC_PATH_MISMATCH" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+        assert result["result"] == "NOT_READY"
+
+    def test_same_venv_with_correct_paths_passes(self, env_files, tmp_path):
+        """Positive guard: the SAME virtualenv with correct paths
+        (``path=`` and ``argv[0]`` identical) still yields all six PASS
+        even though the interpreter is reached through the standard
+        symlink/junction chain to the shared system interpreter —
+        symlink-based virtualenvs stay allowed."""
+        runtime, scanner = env_files
+        root, _foreign, _ = _two_venvs_one_interpreter(tmp_path)
+        unit = _write_scanner_unit(tmp_path / "scanner-unit.service", root,
+                                   scanner)
+        dropin_dir = Path(f"{unit}.d")
+        dropin_dir.mkdir(parents=True, exist_ok=True)
+        dropin = dropin_dir / "20-scanner-v2-release.conf"
+        dropin.write_text(
+            "[Service]\nExecStart=\n"
+            f"ExecStart={root.as_posix()}/.venv/bin/python "
+            f"{root.as_posix()}/scanner_runner.py\n"
+            f"WorkingDirectory={root.as_posix()}\n",
+            encoding="utf-8",
+        )
+        process = _scanner_process_fixture(root, unit=unit)
+        effective = _effective_show(
+            unit,
+            fragment_path=str(unit),
+            exec_path=f"{root.as_posix()}/.venv/bin/python",
+            exec_start_argv=[
+                f"{root.as_posix()}/.venv/bin/python",
+                f"{root.as_posix()}/scanner_runner.py",
+            ],
+            working_directory=root.as_posix(),
+            environment_files=[scanner.as_posix()],
+            drop_in_paths=[str(dropin)],
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=root, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        _assert_ready(result)
 
 
 class TestEffectiveUnitShowParsing:

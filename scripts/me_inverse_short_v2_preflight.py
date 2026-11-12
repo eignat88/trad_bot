@@ -76,7 +76,10 @@ The executed file is bound to the record's ``path=`` — validated against
 the Scanner virtualenv, never ``argv[0]`` alone; systemd ``@``-style
 ExecStart (where the second command-line token becomes ``argv[0]``) or
 any ``path=``/``argv[0]`` divergence is rejected as
-``SCANNER_UNIT_EXEC_PATH_MISMATCH``.
+``SCANNER_UNIT_EXEC_PATH_MISMATCH``.  Executable identity is compared
+LEXICALLY (never through symlink resolution): two virtualenvs that link
+to the same system interpreter are still two different interpreters,
+while the standard Linux symlink-based virtualenv itself stays allowed.
 
 Compatibility exports (used by ``scripts/me_inverse_short_v2_activate.py``):
 ``read_service_env``, ``PreflightRefused``.
@@ -572,6 +575,26 @@ def _path_key(value: str) -> str:
         return _path_text(value)
 
 
+def _path_lexical_key(value: str) -> str:
+    """Lexical path key for ExecStart executable identity — NO IO and NO
+    symlink resolution.
+
+    Two DIFFERENT virtualenvs whose ``python`` symlinks to the same
+    system interpreter (``/opt/a/.venv/bin/python`` and
+    ``/opt/b/.venv/bin/python`` both ending at ``/usr/bin/python3.12``)
+    must never compare equal here: a resolve()-based key would call them
+    identical and let a foreign-venv ``argv[0]`` pass as the executed
+    file.  Symlink resolution stays reserved for the virtualenv
+    membership checks, where following the standard Linux
+    ``.venv/bin/python -> python3 -> /usr/bin/python3.12`` chain is
+    required (``_validate_scanner_python_environment``).
+    """
+    try:
+        return os.path.normcase(os.path.normpath(_path_text(value)))
+    except (TypeError, ValueError, OSError):
+        return os.path.normcase(str(value))
+
+
 def _pending_dropins(scanner_unit_path: Path, loaded: list[str]) -> list[str]:
     """Drop-in ``*.conf`` files on disk that systemd has NOT loaded.
 
@@ -1006,11 +1029,15 @@ def _scanner_source_check(
         # systemd ``@`` prefix the SECOND command-line token becomes
         # argv[0] instead of the actual filename (systemd.service(5),
         # "Special executable prefixes"), so a substituted argv[0] must
-        # never stand in for the executable.
+        # never stand in for the executable.  The identity comparison is
+        # deliberately LEXICAL: a resolve()-based key would treat two
+        # virtualenvs that symlink to the SAME system interpreter as one
+        # file and let a foreign-venv argv[0] through.
         exec_path = str((eff.get("exec_start") or {}).get("path") or "")
         exec_diverges = (
             bool(exec_path) and bool(python_exe)
-            and _path_key(exec_path) != _path_key(python_exe)
+            and _path_lexical_key(exec_path)
+            != _path_lexical_key(python_exe)
         )
         structural: list[str] = []
         if not script.endswith("scanner_runner.py"):
