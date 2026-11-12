@@ -1041,6 +1041,272 @@ class TestP2HistoricalFundingQuantities:
 
 
 # ---------------------------------------------------------------------------
+# Codex review round 2 — P1: a terminal close is never "fully saved"
+# before its close-leg and outbox rows are durable
+# ---------------------------------------------------------------------------
+
+class TestRound2TerminalCloseNeverSavedWithoutLegs:
+    def test_partial_commit_and_stage_fail_terminal_update_would_succeed_then_restart(
+        self,
+    ):
+        """Mandatory combined-failure scenario (round 2, P1):
+        partial commit AND stage_close() both fail while update_position()
+        itself is healthy — the terminal UPDATE must not run (the position
+        may not be reported fully saved without its close-leg and outbox
+        rows), every obligation is retained, and a subsequent restart
+        restores the partial and terminal closes exactly once."""
+        settings = _settings()
+        contour, store, clock = _contour(settings)
+        pos = _open_one(contour, store, clock)
+        entry = pos.entry_price
+        full_size = pos.position_size
+
+        # (a) the partial-leg commit ALWAYS fails ...
+        def always_fail_leg(position, leg):
+            raise RuntimeError("partial leg write failed")
+
+        store.commit_partial_exit = always_fail_leg
+
+        # (b) staging ALWAYS fails ...
+        original_stage = store.stage_close
+
+        def always_fail_stage(*args, **kwargs):
+            raise RuntimeError("close-leg/outbox staging failed")
+
+        store.stage_close = always_fail_stage
+
+        # (c) ... while update_position() itself is perfectly healthy: the
+        # spy proves it must not even be attempted.
+        update_calls = {"n": 0}
+        original_update = store.update_position
+
+        def spy_update(position_row):
+            update_calls["n"] += 1
+            return original_update(position_row)
+
+        store.update_position = spy_update
+
+        # TP1 applies in memory, fails durably (dirty leg).
+        contour.run_cycle({pos.symbol: entry * 0.945})
+        assert pos.position_key in contour.engine.dirty_leg_keys
+
+        # The protective STOP fires while BOTH writes are down.
+        bars = {pos.symbol: {"high": pos.stop_price * 1.001,
+                             "low": entry * 0.99}}
+        cycle = contour.run_cycle({pos.symbol: entry}, bars=bars)
+        assert cycle["exit_reasons"] == ["STOP_LOSS"]
+
+        # The terminal UPDATE was NEVER attempted: the position may not be
+        # reported fully saved before its close-leg and outbox rows are
+        # durable — even though update_position() would have succeeded.
+        assert update_calls["n"] == 0, (
+            "terminal update_position() ran while staging was unconfirmed",
+        )
+        durable = store.get_position(pos.position_key)
+        assert durable.status == POSITION_STATUS_OPEN, (
+            "position claimed fully saved without close-leg/outbox rows",
+        )
+        assert durable.remaining_size == pytest.approx(full_size, rel=1e-9)
+        assert store.list_close_legs(pos.position_key) == []
+        assert store.list_pending_closes() == []      # nothing staged yet
+
+        # Every obligation to restore the partial AND terminal closes is
+        # retained in-process for the stage-before-update retry.
+        engine = contour.engine
+        assert pos.position_key in engine._unstaged_closes
+        assert pos.position_key in engine.pending_closes
+        assert pos.position_key in engine._terminal_legs
+        assert pos.position_key in engine.dirty_leg_keys
+        assert engine.durability_risk is True
+        assert cycle["pending_closes"] == 1
+
+        # ---- the process dies here: only the DURABLE state survives ----
+        store.stage_close = original_stage
+        store.commit_partial_exit = (
+            lambda p, l: InMemoryInverseShortStore.commit_partial_exit(store, p, l)
+        )
+        restarted = _restart(contour, settings, clock)
+
+        # The durable row is the still-OPEN pre-close state: nothing was
+        # claimed saved that the ledger does not carry.
+        restored = _position(restarted, pos.symbol)
+        assert restored.status == POSITION_STATUS_OPEN
+        assert restored.tp1_executed is False
+        assert restored.remaining_size == pytest.approx(full_size, rel=1e-9)
+        assert restarted.engine.dirty_leg_keys == ()
+        assert restarted.engine.durability_risk is False
+
+        # Partial close restored exactly once ...
+        restarted.run_cycle({pos.symbol: entry * 0.945})
+        legs = store.list_close_legs(pos.position_key)
+        assert [leg.exit_reason for leg in legs] == ["TAKE_PROFIT_1"]
+        assert restored.tp1_executed is True
+        assert restored.remaining_size == pytest.approx(full_size * 0.5, rel=1e-9)
+        _assert_durable_consistent(store, pos.position_key)
+
+        # ... then the terminal close lands exactly once, WITH its leg and
+        # outbox rows confirmed in the same transaction.
+        cycle = restarted.run_cycle({pos.symbol: entry}, bars=bars)
+        assert cycle["exit_reasons"] == ["STOP_LOSS"]
+        assert cycle["pending_closes"] == 0
+        legs = store.list_close_legs(pos.position_key)
+        assert sorted(leg.exit_reason for leg in legs) == [
+            "STOP_LOSS", "TAKE_PROFIT_1",
+        ]
+        assert [leg.leg_seq for leg in legs] == [1, 3]
+        assert store.list_pending_closes() == []      # staged AND cleared
+        assert restarted.engine.durability_risk is False
+        assert restarted.engine.dirty_leg_keys == ()
+        _assert_durable_consistent(store, pos.position_key)
+        _assert_ledger_consistent(restarted)
+
+    def test_degraded_staging_mode_keeps_the_documented_update_exception(
+        self,
+    ):
+        """Migration-088-absent mode (stage_close returns False, no raise)
+        is the documented exception: the terminal UPDATE is the only
+        durability left and still runs."""
+        settings = _settings()
+        contour, store, clock = _contour(settings)
+        pos = _open_one(contour, store, clock)
+        entry = pos.entry_price
+
+        store.stage_close = lambda *args, **kwargs: False   # degraded, no raise
+
+        bars = {pos.symbol: {"high": pos.stop_price * 1.001,
+                             "low": entry * 0.99}}
+        cycle = contour.run_cycle({pos.symbol: entry}, bars=bars)
+        assert cycle["exit_reasons"] == ["STOP_LOSS"]
+        durable = store.get_position(pos.position_key)
+        assert durable.status == POSITION_STATUS_CLOSED
+        assert cycle["pending_closes"] == 0
+        assert contour.engine.durability_risk is False
+        assert contour.engine.unstaged_close_keys == ()
+
+    def test_staged_close_still_flips_immediately(self):
+        """The common path is unchanged: confirmed staging + successful
+        update = a fully saved close in one cycle."""
+        settings = _settings()
+        contour, store, clock = _contour(settings)
+        pos = _open_one(contour, store, clock)
+        entry = pos.entry_price
+        bars = {pos.symbol: {"high": pos.stop_price * 1.001,
+                             "low": entry * 0.99}}
+        cycle = contour.run_cycle({pos.symbol: entry}, bars=bars)
+        assert cycle["exit_reasons"] == ["STOP_LOSS"]
+        assert cycle["pending_closes"] == 0
+        assert store.get_position(pos.position_key).status == (
+            POSITION_STATUS_CLOSED
+        )
+        legs = store.list_close_legs(pos.position_key)
+        assert [leg.exit_reason for leg in legs] == ["STOP_LOSS"]
+        assert store.list_pending_closes() == []
+        assert contour.engine.durability_risk is False
+        _assert_durable_consistent(store, pos.position_key)
+        _assert_ledger_consistent(contour)
+
+
+# ---------------------------------------------------------------------------
+# Codex review round 2 — P2: unified funding-before-exit at an EXACT
+# boundary timestamp (normal vs restored calculation must agree)
+# ---------------------------------------------------------------------------
+
+class TestRound2ExactBoundaryFundingOrder:
+    def test_partial_tp_at_exact_boundary_normal_equals_restored(self):
+        """A partial TP executed EXACTLY on the funding boundary is
+        accounted AFTER the accrual for that boundary: the normal in-cycle
+        calculation (funding settles first, then the TP fires at the very
+        same timestamp) and the calculation restored from the durable leg
+        ledger after a restart must be exactly equal — and both charge the
+        FULL pre-TP quantity for that period, never the live remainder."""
+        settings = _settings()
+
+        # --- A: NORMAL — the rate is observed in the boundary cycle ------
+        a, a_store, a_clock = _contour(settings)
+        a_pos = _open_one(a, a_store, a_clock)
+        a_clock.advance(hours=8)              # EXACTLY the period-1 boundary
+        a.run_cycle(
+            {a_pos.symbol: a_pos.entry_price * 0.945},
+            funding_rates_percent={a_pos.symbol: 0.01},
+        )
+        assert a_pos.tp1_executed is True
+        assert a_pos.funding_periods_charged == 1
+        legs_a = a_store.list_close_legs(a_pos.position_key)
+        assert [leg.exit_reason for leg in legs_a] == ["TAKE_PROFIT_1"]
+        boundary = a_pos.entered_at + timedelta(hours=8)
+        assert legs_a[0].executed_at == boundary, (
+            "the TP must sit EXACTLY on the funding boundary",
+        )
+        # funding-before-exit: the accrual ran BEFORE the TP in that cycle,
+        # so period 1 was charged on the FULL pre-TP quantity.
+        expected_full = -(
+            a_pos.entry_price * a_pos.position_size
+        ) * (0.01 / 100.0)
+        assert a_pos.funding_paid == pytest.approx(expected_full, rel=1e-12)
+
+        # --- B: RESTORED — same TP on the same instant, rate arrives one
+        # hour later, and the settlement happens after a RESTART from the
+        # durable ledger.
+        b, b_store, b_clock = _contour(settings)
+        b_pos = _open_one(b, b_store, b_clock)
+        assert b_pos.entered_at == a_pos.entered_at    # identical t0
+        b_clock.advance(hours=8)
+        b.run_cycle(
+            {b_pos.symbol: b_pos.entry_price * 0.945},
+            funding_rates_percent={},                  # UNKNOWN at the boundary
+        )
+        assert b_pos.tp1_executed is True
+        assert b_pos.funding_periods_charged == 0      # obligation preserved
+        legs_b = b_store.list_close_legs(b_pos.position_key)
+        assert legs_b[0].executed_at == boundary       # exact timestamp match
+
+        # RESTART with the unsettled obligation, then the rate arrives.
+        b2 = _restart(b, settings, b_clock)
+        b2.run_cycle(
+            {b_pos.symbol: b_pos.entry_price * 0.945},
+            funding_rates_percent={b_pos.symbol: 0.01},
+        )
+        restored = _position(b2, b_pos.symbol)
+        assert restored.funding_periods_charged == 1
+
+        # --- the comparison: normal == restored, both on the FULL size ---
+        assert restored.funding_paid == pytest.approx(
+            a_pos.funding_paid, rel=1e-12,
+        ), "restored calculation must equal the normal funding-before-exit one"
+        assert restored.funding_paid == pytest.approx(expected_full, rel=1e-12)
+        live_remainder = -(
+            restored.entry_price * restored.remaining_size
+        ) * (0.01 / 100.0)
+        assert restored.funding_paid != pytest.approx(
+            live_remainder, rel=1e-6,
+        ), "an exact-boundary TP must NOT reduce that period's quantity"
+
+        # replay of the settled period books nothing twice
+        b2.run_cycle(
+            {b_pos.symbol: b_pos.entry_price * 0.945},
+            funding_rates_percent={b_pos.symbol: 0.01},
+        )
+        assert restored.funding_paid == pytest.approx(expected_full, rel=1e-12)
+        assert restored.funding_periods_charged == 1
+        _assert_durable_consistent(b_store, b_pos.position_key)
+        _assert_ledger_consistent(b2)
+
+    def test_funding_retry_runs_before_the_leg_retry(self):
+        """Unified funding-before-exit order restored in check_exits():
+        the dirty-FUNDING retry precedes the dirty-LEG retry (exits)."""
+        source = inspect.getsource(InverseShortPaperEngine.check_exits)
+        funding_pos = source.index("_retry_dirty_funding()")
+        legs_pos = source.index("_retry_dirty_legs()")
+        assert funding_pos < legs_pos, (
+            "funding retry must run before the leg (exit) retry",
+        )
+        # and the in-loop settlement still precedes the exit ladder
+        funding_loop = source.index("self._apply_funding(position")
+        ladder = source.index("ladder_blocked")
+        assert funding_loop < ladder
+
+
+# ---------------------------------------------------------------------------
 # Static source contracts (no database required)
 # ---------------------------------------------------------------------------
 
@@ -1056,9 +1322,11 @@ class TestHardeningSourceContracts:
             "funding must derive per-period quantities from the durable "
             "close-leg history",
         )
-        assert "executed_at <= boundary" in source, (
+        assert "executed_at < boundary" in source, (
             "per-period outstanding quantity must be reconstructed at each "
-            "period's funding boundary",
+            "period's funding boundary with STRICTLY-before legs only — a "
+            "leg executed exactly at the boundary is accounted after that "
+            "boundary's accrual (unified funding-before-exit)"
         )
         assert "historical quantity cannot be proven" in source
         assert "_dirty_legs" in source, (

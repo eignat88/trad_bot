@@ -942,19 +942,23 @@ class InverseShortPaperEngine:
         # First finish any unfinished close (P1-3): its terminal snapshot is
         # replayed byte-for-byte and never re-evaluated below.
         self.flush_pending_closes()
-        # Then retry DIRTY partial-TP legs (Issue #276 / P1-2): identical
-        # facts, same (position_key, leg_seq) identity — a retry never books
-        # a leg twice and never claims durability the database never
-        # accepted.  Legs go BEFORE funding: a confirmed leg commit carries
-        # the full current position state (funding included) and settles
-        # every local delta for the key at once, so the funding retry below
-        # only ever writes rows whose leg rows are already durable.
-        self._retry_dirty_legs()
         # Then retry any DIRTY funding snapshot (P2): persisted even when no
         # new funding interval has become due; a retry never re-accrues and
         # is skipped while this key still owes leg rows (never writes the
-        # position row ahead of its leg ledger).
+        # position row ahead of its leg ledger).  Funding goes BEFORE the
+        # leg retry and the exit ladder — the unified funding-before-exit
+        # order shared by every other path (the in-loop evaluation below
+        # settles funding first, then evaluates exits), so a settlement
+        # can never observe a leg whose accrual it should have preceded.
         self._retry_dirty_funding()
+        # Then retry DIRTY partial-TP legs (Issue #276 / P1-2): identical
+        # facts, same (position_key, leg_seq) identity — a retry never books
+        # a leg twice and never claims durability the database never
+        # accepted.  A leg confirmed here carries the full current position
+        # state (funding included) and settles every local delta for the
+        # key at once, so the ladder below only ever advances over rows the
+        # leg ledger already holds.
+        self._retry_dirty_legs()
 
 
         closed: list[InverseShortPosition] = []
@@ -1212,8 +1216,17 @@ class InverseShortPaperEngine:
             position.funding_periods_charged + 1, due_periods + 1,
         ):
             boundary = position.entered_at + interval * period
+            # P2 (Codex round 2): the unified funding-before-exit order —
+            # a leg executed EXACTLY at the period boundary is accounted
+            # AFTER this boundary's accrual (the accrual sees the pre-TP
+            # quantity; the leg only reduces the quantity from the NEXT
+            # boundary on).  Only legs STRICTLY before the boundary were
+            # already reflected at the accrual instant, so a settlement
+            # reconstructed from the durable ledger always equals the
+            # in-cycle funding-before-exit calculation — including a TP
+            # whose timestamp coincides with the boundary to the tick.
             closed_before = sum(
-                leg.quantity for leg in legs if leg.executed_at <= boundary
+                leg.quantity for leg in legs if leg.executed_at < boundary
             )
             qty = round(position.position_size - closed_before, QTY_DECIMALS)
             if qty < 0:
@@ -2027,55 +2040,83 @@ class InverseShortPaperEngine:
                 # succeed, so retries are skipped — the terminal UPDATE below
                 # is the only durability left in this documented mode.
                 self._staging_unavailable.add(position.position_key)
-        # 2) Flip the row to CLOSED.  On failure the terminal snapshot is
-        #    retained and replayed byte-for-byte (same position_key, closed_at,
-        #    exit_reason, exit_price, PnL and funding) by flush_pending_closes().
-        #    close_delta is EXACTLY the amount just booked into the memory
-        #    ledger; it becomes a local uncommitted delta until the store
-        #    ledger commits it (never booked twice).
+        # 2) Flip the row to CLOSED — ONLY once the staging above is
+        #    confirmed (P1, Codex round 2): the position may not be
+        #    reported fully saved before its close-leg and outbox rows are
+        #    durable.  A staging failure (exception) therefore DEFERS the
+        #    terminal UPDATE instead of running it: the snapshot joins
+        #    pending_closes with a local uncommitted delta (exactly like a
+        #    failed UPDATE) and flush_pending_closes() restages first —
+        #    owed partial legs + terminal leg + outbox in one idempotent
+        #    transaction — then applies the UPDATE on a later cycle.  A
+        #    restart in between re-executes the exit from the still-OPEN
+        #    durable row, so partial and terminal closes are restored
+        #    exactly once and no durable record can ever be lost.
+        #    The documented degraded mode (stage_close() returned False:
+        #    migration 088 absent, staging impossible by definition) keeps
+        #    the UPDATE as the only durability left.
         close_delta = terminal_delta
         terminal_applied = False
-        try:
-            self.store.update_position(position)
-            terminal_applied = True
-        except Exception:
-            verdict = self._confirmed_close(position)
-            if verdict is True:
-                # AMBIGUOUS COMMIT (review P2): PostgreSQL APPLIED the
-                # terminal UPDATE but the acknowledgement was lost.  Settle
-                # the local state exactly like a confirmed commit: NO
-                # uncommitted close delta (the store ledger already carries
-                # this PnL — booking it again would double-count at the
-                # next reconcile_balance()) and NO pending close (nothing
-                # is left to replay).
+        if not staged and not staging_degraded:
+            self.pending_closes[position.position_key] = position
+            self._uncommitted_deltas[position.position_key] = (
+                self._uncommitted_deltas.get(position.position_key, 0.0)
+                + close_delta
+            )
+            self._balance_trusted = False
+            logger.warning(
+                "me inverse short oos2 close UPDATE DEFERRED (close-leg/outbox "
+                "staging NOT confirmed — position NOT fully saved; snapshot "
+                "retained for stage-before-update retry, a restart re-executes "
+                "the exit from the still-OPEN row): key=%s reason=%s net=%.4f "
+                "durability_risk=True",
+                position.position_key[:48], reason, net_pnl,
+            )
+        else:
+            try:
+                self.store.update_position(position)
                 terminal_applied = True
-                logger.warning(
-                    "me inverse short oos2 terminal close CONFIRMED applied "
-                    "despite a lost acknowledgement (no uncommitted close "
-                    "delta booked): key=%s reason=%s net=%.4f",
-                    position.position_key[:48], reason, net_pnl,
-                )
-            else:
-                # NOT applied, or the outcome could not be verified: keep
-                # the pending close + local delta (fail closed) and refuse
-                # NEW entries until a successful reconciliation proves the
-                # ledger consistent (review P2: never assume either way).
-                self.pending_closes[position.position_key] = position
-                self._uncommitted_deltas[position.position_key] = (
-                    self._uncommitted_deltas.get(position.position_key, 0.0)
-                    + close_delta
-                )
-                self._balance_trusted = False
-                logger.exception(
-                    "me inverse short oos2 close persistence failed (write NOT "
-                    "confirmed by PostgreSQL); terminal snapshot retained "
-                    "for retry and new entries blocked until a "
-                    "reconciliation succeeds (outbox staged=%s, "
-                    "durability_risk=%s): key=%s reason=%s net=%.4f",
-                    staged, not staged, position.position_key[:48], reason,
-                    net_pnl,
-                )
+            except Exception:
+                verdict = self._confirmed_close(position)
+                if verdict is True:
+                    # AMBIGUOUS COMMIT (review P2): PostgreSQL APPLIED the
+                    # terminal UPDATE but the acknowledgement was lost.  Settle
+                    # the local state exactly like a confirmed commit: NO
+                    # uncommitted close delta (the store ledger already carries
+                    # this PnL — booking it again would double-count at the
+                    # next reconcile_balance()) and NO pending close (nothing
+                    # is left to replay).
+                    terminal_applied = True
+                    logger.warning(
+                        "me inverse short oos2 terminal close CONFIRMED applied "
+                        "despite a lost acknowledgement (no uncommitted close "
+                        "delta booked): key=%s reason=%s net=%.4f",
+                        position.position_key[:48], reason, net_pnl,
+                    )
+                else:
+                    # NOT applied, or the outcome could not be verified: keep
+                    # the pending close + local delta (fail closed) and refuse
+                    # NEW entries until a successful reconciliation proves the
+                    # ledger consistent (review P2: never assume either way).
+                    self.pending_closes[position.position_key] = position
+                    self._uncommitted_deltas[position.position_key] = (
+                        self._uncommitted_deltas.get(position.position_key, 0.0)
+                        + close_delta
+                    )
+                    self._balance_trusted = False
+                    logger.exception(
+                        "me inverse short oos2 close persistence failed (write NOT "
+                        "confirmed by PostgreSQL); terminal snapshot retained "
+                        "for retry and new entries blocked until a "
+                        "reconciliation succeeds (outbox staged=%s, "
+                        "durability_risk=%s): key=%s reason=%s net=%.4f",
+                        staged, not staged, position.position_key[:48], reason,
+                        net_pnl,
+                    )
         if terminal_applied:
+            # The gate above guarantees this only runs when staging was
+            # confirmed (or the documented degraded mode): the staging
+            # obligations can be retired together with the accounting ones.
             # The row now carries the FULL terminal accounting (cumulative
             # legs + funding + close facts): local and store agree for this
             # key — every local delta (funding AND leg components) settles.
