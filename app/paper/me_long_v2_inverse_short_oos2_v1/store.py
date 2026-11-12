@@ -1,0 +1,1796 @@
+"""Persistence for the ME_LONG_V2_INVERSE_SHORT_OOS2_V1 prospective paper contour.
+
+Two implementations behind ONE small interface:
+
+``InverseShortStore`` / ``InMemoryInverseShortStore``
+    Process-local, transaction-free store used by unit tests and by the
+    pre-activation dry-run.  It enforces exactly the same invariants as the
+    PostgreSQL store (activation guard, idempotent event keys, immutable
+    ``entered_at`` / ``deadline_at``) so dry-run behaviour is representative.
+
+``PgInverseShortStore``
+    PostgreSQL implementation over a DEDICATED connection (never the scanner
+    or paper runner transaction), writing only to the contour's own tables:
+
+        dds.me_long_v2_inverse_short_oos2_v1_activation
+        dds.me_long_v2_inverse_short_oos2_v1_event
+        dds.me_long_v2_inverse_short_oos2_v1_position
+        dds.me_long_v2_inverse_short_oos2_v1_close_leg   (partial TP legs + terminal legs)
+        dds.me_long_v2_inverse_short_oos2_v1_close_outbox   (durable close staging)
+
+Isolation invariants enforced here:
+  * events are idempotent on ``event_key`` (``ON CONFLICT DO NOTHING``);
+  * positions are idempotent on the NAMESPACED ``position_key``;
+  * position creation is ADMITTED BY PostgreSQL ITSELF (P1-2): the entry
+    TTL at database time, activation/fingerprint identity, strict
+    post-freeze, CAPTURED status and "no existing row" are all enforced
+    inside ``INSERT_POSITION_SQL`` under row locks — never by Python
+    alone — and the TTL sweep refuses to dispose of an event whose
+    position already exists (no EXPIRED-with-position state);
+  * the position UPDATE statement never touches ``entered_at`` /
+    ``deadline_at`` (or any entry column) — restart recovery reads back the
+    original entry time and the original deadline verbatim.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from dataclasses import replace
+from datetime import datetime, timezone
+from typing import Any, Callable, Iterable
+
+from .activation import (
+    PERMISSION_NEW_ENTRIES,
+    REASON_EXIT_ONLY,
+    evaluate_activation,
+)
+from .models import (
+    EVENT_STATUS_CAPTURED,
+    EVENT_STATUS_CAPACITY_REJECTED,
+    EVENT_STATUS_ENTERED,
+    EVENT_STATUS_EXPIRED,
+    ActivationRecord,
+    InverseShortCloseLeg,
+    InverseShortEvent,
+    InverseShortPosition,
+    POSITION_STATUS_CLOSED,
+    POSITION_STATUS_OPEN,
+    leg_seq_for,
+)
+from .protocol import ENTRY_MAX_AGE_MINUTES, EXPERIMENT_ID, protocol_fingerprint
+
+logger = logging.getLogger(__name__)
+
+SCHEMA = "dds"
+EVENT_TABLE = f"{SCHEMA}.me_long_v2_inverse_short_oos2_v1_event"
+POSITION_TABLE = f"{SCHEMA}.me_long_v2_inverse_short_oos2_v1_position"
+ACTIVATION_TABLE = f"{SCHEMA}.me_long_v2_inverse_short_oos2_v1_activation"
+# Durable close outbox (P1-3): terminal snapshots staged BEFORE the position
+# row flips to CLOSED, so an exit can never lose its facts to a failed/lost
+# UPDATE or a restart.  Populated only while a close is being persisted.
+CLOSE_OUTBOX_TABLE = f"{SCHEMA}.me_long_v2_inverse_short_oos2_v1_close_outbox"
+# Durable close-leg ledger (Issue #276): PARTIAL TP legs (position stays
+# OPEN) and the TERMINAL leg, identified by (position_key, leg_seq) — the
+# exactly-once unit of partial-exit accounting.
+CLOSE_LEG_TABLE = f"{SCHEMA}.me_long_v2_inverse_short_oos2_v1_close_leg"
+
+# Honest save_event outcomes.
+SAVE_CAPTURED = "CAPTURED"
+SAVE_DUPLICATE = "DUPLICATE"
+SAVE_NOT_ACTIVE = "NOT_ACTIVE"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def contour_balance_components(
+    positions: Iterable[InverseShortPosition],
+    initial_balance: float,
+) -> dict[str, float]:
+    """Reconstruct the contour balance from its own append-only ledger.
+
+    ``balance = initial + Σ_closed net_pnl − Σ_open(entry costs + funding − realized legs)``
+
+    Exact under the engine's accounting (entry costs are booked at entry,
+    funding at settlement, each close leg — partial or terminal — books its
+    own ``(gross − exit fee − exit slippage)``), so a restart with no
+    account snapshot restores the same balance the process had before,
+    INCLUDING every partial TP realized while the position stayed OPEN.
+    """
+    closed_net = 0.0
+    open_costs = 0.0
+    for position in positions:
+        if position.status == POSITION_STATUS_CLOSED:
+            closed_net += position.net_pnl
+        else:
+            open_costs += position.entry_fee + position.entry_slippage_cost
+            open_costs += position.funding_paid
+            # Committed partial TP legs realized into the balance already
+            # (Issue #276) — credit them back against the open costs.
+            open_costs -= position.realized_legs_net
+    return {
+        "initial_balance": float(initial_balance),
+        "closed_net_pnl": closed_net,
+        "open_costs": open_costs,
+        "balance": initial_balance + closed_net - open_costs,
+    }
+
+
+class InverseShortStore:
+    """Interface of the contour's persistence layer."""
+
+    # -- activation -------------------------------------------------------
+    def load_activation(self) -> ActivationRecord | None:
+        raise NotImplementedError
+
+    # -- events -----------------------------------------------------------
+    def save_event(self, event: InverseShortEvent) -> str:
+        raise NotImplementedError
+
+    def get_event(self, event_key: str) -> InverseShortEvent | None:
+        raise NotImplementedError
+
+    def list_events(self, status: str | None = None) -> list[InverseShortEvent]:
+        raise NotImplementedError
+
+    def mark_event_entered(self, event_key: str, position_key: str) -> None:
+        raise NotImplementedError
+
+    def mark_event_expired(
+        self,
+        event_key: str,
+        status: str,
+        *,
+        reason: str,
+        decided_at: datetime,
+    ) -> bool:
+        """OOS2 terminal disposition: CAPTURED -> EXPIRED / CAPACITY_REJECTED.
+
+        Idempotent by construction (``UPDATE ... WHERE status='CAPTURED'``):
+        a second call — or a call after the event was already ENTERED — is a
+        silent no-op that returns False.  ``reason`` (e.g. ``ENTRY_TTL`` /
+        ``ENTRY_CAP``) and ``decided_at`` are persisted on the row so the
+        refusal cause and timestamp survive restarts.
+
+        P1-2: an event whose position row already exists is never disposed
+        of (returns False) — EXPIRED-with-position is impossible; in
+        PostgreSQL this is enforced transactionally under the event row
+        lock, so the refusal also holds against a concurrent admission.
+        """
+        raise NotImplementedError
+
+    # -- positions --------------------------------------------------------
+    def save_position(self, position: InverseShortPosition) -> bool:
+        """Atomically admit ONE position; True only when it was created.
+
+        The PostgreSQL implementation performs the final admission itself
+        (entry TTL at DB time, activation/fingerprint identity, strict
+        post-freeze, event still CAPTURED, no existing row) — the caller's
+        Python-side checks are a fast path, never the authority.
+        """
+        raise NotImplementedError
+
+    def update_position(self, position: InverseShortPosition) -> None:
+        raise NotImplementedError
+
+    def load_open_positions(self) -> list[InverseShortPosition]:
+        raise NotImplementedError
+
+    def has_position(self, position_key: str) -> bool:
+        raise NotImplementedError
+
+    def get_position(
+        self, position_key: str,
+    ) -> InverseShortPosition | None:
+        """Read ONE committed position row by key (review P1).
+
+        Used to resolve an ambiguous COMMIT: after an ``ON CONFLICT DO
+        NOTHING`` INSERT or a funding UPDATE whose acknowledgement was
+        lost, the stored row is the only authority on what PostgreSQL
+        actually applied.  Returns ``None`` when no row exists.
+        """
+        raise NotImplementedError
+
+    def list_positions(self, status: str | None = None) -> list[InverseShortPosition]:
+        raise NotImplementedError
+
+    def balance_components(self) -> dict[str, float]:
+        raise NotImplementedError
+
+    def net_pnl_summary(self) -> dict[str, float]:
+        raise NotImplementedError
+
+    # -- durable close outbox (P1-3) + close legs (Issue #276) ------------
+    def stage_close(
+        self,
+        position: InverseShortPosition,
+        terminal_leg: InverseShortCloseLeg | None = None,
+    ) -> bool:
+        """Durably stage the EXACT terminal snapshot BEFORE the status flip.
+
+        The outbox row AND the terminal leg row are staged as ONE idempotent
+        transaction (upsert + leg upsert on ``(position_key, leg_seq)``), so
+        the leg ledger can never lag the position flip.
+
+        Returns True when the snapshot is durable (outbox row written),
+        False when durability is degraded (outbox/leg table absent, migration
+        088 not applied) — the caller keeps the in-process snapshot either
+        way.  An exception means the write did NOT commit: the engine must
+        retain the snapshot and retry staging BEFORE attempting the
+        terminal UPDATE on subsequent cycles (P1 contract).
+        """
+        raise NotImplementedError
+
+    def list_pending_closes(self) -> list[InverseShortPosition]:
+        """Terminal snapshots staged but not yet confirmed CLOSED."""
+        raise NotImplementedError
+
+    def clear_pending_close(self, position_key: str) -> None:
+        """Drop the staged snapshot after the status flip is confirmed."""
+        raise NotImplementedError
+
+    # -- partial TP legs (Issue #276) --------------------------------------
+    def commit_partial_exit(
+        self,
+        position: InverseShortPosition,
+        leg: InverseShortCloseLeg,
+    ) -> bool:
+        """Commit ONE partial TP leg atomically: leg row + position state.
+
+        ONE transaction (leg INSERT ON CONFLICT DO NOTHING + the absolute
+        position UPDATE), one COMMIT.  Exactly-once: a conflicting leg row
+        means the leg is ALREADY durable — the existing row is verified
+        against these facts and against the position state, and the call
+        resolves as a success WITHOUT re-booking anything.  A leg whose facts
+        differ, or a missing position row, raises instead of guessing.
+
+        Raises when nothing committed — the caller retains the leg in memory
+        (DIRTY) and retries with identical facts until it confirms.
+        """
+        raise NotImplementedError
+
+    def get_close_leg(
+        self, position_key: str, leg_seq: int,
+    ) -> InverseShortCloseLeg | None:
+        """Read ONE committed close leg (ambiguous-COMMIT verification)."""
+        raise NotImplementedError
+
+    def list_close_legs(
+        self, position_key: str | None = None,
+    ) -> list[InverseShortCloseLeg]:
+        """All committed close legs (partial TP executions + terminal legs)."""
+        raise NotImplementedError
+
+    def close(self) -> None:  # pragma: no cover - trivial
+        return None
+
+
+class InMemoryInverseShortStore(InverseShortStore):
+    """Process-local store with the same invariants as the PG store."""
+
+    def __init__(
+        self,
+        activation: ActivationRecord | None = None,
+        *,
+        initial_balance: float = 10_000.0,
+    ) -> None:
+        self._activation = activation
+        self._events: dict[str, InverseShortEvent] = {}
+        self._positions: dict[str, InverseShortPosition] = {}
+        self.initial_balance = float(initial_balance)
+        self.immutability_repairs = 0
+        # Durable-close mirror: terminal snapshots staged but not confirmed.
+        self._pending_closes: dict[str, InverseShortPosition] = {}
+        # Durable-leg mirror (Issue #276): (position_key, leg_seq) -> leg.
+        self._close_legs: dict[tuple[str, int], InverseShortCloseLeg] = {}
+
+    # -- activation -------------------------------------------------------
+    def set_activation(self, activation: ActivationRecord | None) -> None:
+        self._activation = activation
+
+    def load_activation(self) -> ActivationRecord | None:
+        return self._activation
+
+    # -- events -----------------------------------------------------------
+    def save_event(self, event: InverseShortEvent) -> str:
+        # Same atomic guard as the PG INSERT ... WHERE EXISTS clause.
+        active, _ = evaluate_activation(self._activation, enabled=True)
+        if active is None:
+            return SAVE_NOT_ACTIVE
+        if not active.allows(PERMISSION_NEW_ENTRIES):
+            # EXIT_ONLY (DRAINING): no NEW source event rows, even when a
+            # caller bypasses capture_with_status (defence in depth).
+            logger.debug("me inverse short oos2 save_event refused: %s", REASON_EXIT_ONLY)
+            return SAVE_NOT_ACTIVE
+        if event.event_key in self._events:
+            return SAVE_DUPLICATE
+        self._events[event.event_key] = replace(event, lineage=dict(event.lineage))
+        return SAVE_CAPTURED
+
+    def get_event(self, event_key: str) -> InverseShortEvent | None:
+        return self._events.get(event_key)
+
+    def list_events(self, status: str | None = None) -> list[InverseShortEvent]:
+        events = list(self._events.values())
+        if status is not None:
+            events = [e for e in events if e.status == status]
+        return sorted(events, key=lambda e: (e.signal_time, e.event_key))
+
+    def mark_event_entered(self, event_key: str, position_key: str) -> None:
+        event = self._events.get(event_key)
+        if event is None:
+            raise KeyError(event_key)
+        event.status = EVENT_STATUS_ENTERED
+        event.position_key = position_key
+        event.status_reason = None
+        event.status_at = _utc_now()
+
+    def mark_event_expired(
+        self,
+        event_key: str,
+        status: str,
+        *,
+        reason: str,
+        decided_at: datetime,
+    ) -> bool:
+        if status not in (EVENT_STATUS_EXPIRED, EVENT_STATUS_CAPACITY_REJECTED):
+            raise ValueError(f"INVALID_TERMINAL_EVENT_STATUS:{status}")
+        event = self._events.get(event_key)
+        if event is None:
+            raise KeyError(event_key)
+        if event.status != EVENT_STATUS_CAPTURED:
+            return False  # already terminal (ENTERED / previously disposed)
+        # P1-2 parity with the PostgreSQL store: an event whose position
+        # already exists is never disposed of (no EXPIRED-with-position).
+        if any(
+            position.event_key == event_key
+            for position in self._positions.values()
+        ):
+            return False
+        event.status = status
+        event.status_reason = reason
+        event.status_at = decided_at
+        return True
+
+    # -- positions --------------------------------------------------------
+    def save_position(self, position: InverseShortPosition) -> bool:
+        if position.position_key in self._positions:
+            return False
+        self._positions[position.position_key] = replace(position)
+        return True
+
+    def update_position(self, position: InverseShortPosition) -> None:
+        stored = self._positions.get(position.position_key)
+        if stored is None:
+            raise KeyError(position.position_key)
+        # entered_at / deadline_at are IMMUTABLE: a divergence is repaired
+        # back to the stored values, never persisted forward.
+        if position.entered_at != stored.entered_at:
+            position.entered_at = stored.entered_at
+            self.immutability_repairs += 1
+        if position.deadline_at != stored.deadline_at:
+            position.deadline_at = stored.deadline_at
+            self.immutability_repairs += 1
+        self._positions[position.position_key] = replace(position)
+
+    def load_open_positions(self) -> list[InverseShortPosition]:
+        return [
+            replace(p) for p in self._positions.values()
+            if p.status == POSITION_STATUS_OPEN
+        ]
+
+    def has_position(self, position_key: str) -> bool:
+        return position_key in self._positions
+
+    def get_position(
+        self, position_key: str,
+    ) -> InverseShortPosition | None:
+        position = self._positions.get(position_key)
+        return replace(position) if position is not None else None
+
+    def list_positions(self, status: str | None = None) -> list[InverseShortPosition]:
+        positions = [replace(p) for p in self._positions.values()]
+        if status is not None:
+            positions = [p for p in positions if p.status == status]
+        return sorted(positions, key=lambda p: p.entered_at)
+
+    def balance_components(self) -> dict[str, float]:
+        return contour_balance_components(
+            self._positions.values(), self.initial_balance,
+        )
+
+    def net_pnl_summary(self) -> dict[str, float]:
+        closed = [p for p in self._positions.values() if p.status == POSITION_STATUS_CLOSED]
+        net = sum(p.net_pnl for p in closed)
+        wins = sum(1 for p in closed if p.net_pnl > 0)
+        losses = sum(1 for p in closed if p.net_pnl <= 0)
+        return {
+            "closed_trades": float(len(closed)),
+            "wins": float(wins),
+            "losses": float(losses),
+            "net_pnl": net,
+        }
+
+    # -- durable close outbox (P1-3) --------------------------------------
+    def stage_close(
+        self,
+        position: InverseShortPosition,
+        terminal_leg: InverseShortCloseLeg | None = None,
+    ) -> bool:
+        """Stage the exact terminal snapshot (process-local durability)."""
+        if (
+            position.status != POSITION_STATUS_CLOSED
+            or not position.exit_reason
+            or position.closed_at is None
+        ):
+            raise ValueError("STAGE_CLOSE_NOT_TERMINAL")
+        self._pending_closes[position.position_key] = replace(position)
+        if terminal_leg is not None:
+            self._record_close_leg(terminal_leg)
+        return True
+
+    def list_pending_closes(self) -> list[InverseShortPosition]:
+        return [
+            replace(self._pending_closes[key])
+            for key in sorted(self._pending_closes)
+        ]
+
+    def clear_pending_close(self, position_key: str) -> None:
+        self._pending_closes.pop(position_key, None)
+
+    # -- partial TP legs (Issue #276) --------------------------------------
+    def _record_close_leg(self, leg: InverseShortCloseLeg) -> bool:
+        """Idempotent leg ledger insert; False when the leg already exists."""
+        identity = (leg.position_key, leg.leg_seq)
+        if identity in self._close_legs:
+            existing = self._close_legs[identity]
+            if existing.to_dict() != leg.to_dict():
+                raise RuntimeError(
+                    f"LEG_FACTS_MISMATCH:{leg.position_key}:{leg.leg_seq}"
+                )
+            return False
+        self._close_legs[identity] = replace(leg)
+        return True
+
+    def commit_partial_exit(
+        self,
+        position: InverseShortPosition,
+        leg: InverseShortCloseLeg,
+    ) -> bool:
+        if leg.is_terminal:
+            raise RuntimeError("PARTIAL_EXIT_TERMINAL_LEG")
+        if leg.exit_reason not in ("TAKE_PROFIT_1", "TAKE_PROFIT_2"):
+            raise RuntimeError(f"PARTIAL_EXIT_INVALID_STAGE:{leg.exit_reason}")
+        if leg.leg_seq != leg_seq_for(leg.exit_reason):
+            raise RuntimeError("PARTIAL_EXIT_LEG_SEQ_MISMATCH")
+        if leg.quantity <= 0 or leg.remaining_after < 0:
+            raise RuntimeError("PARTIAL_EXIT_INVALID_QUANTITY")
+        if position.status != POSITION_STATUS_OPEN:
+            # LEG-ONLY completion (Issue #276): the CLOSED row is final, only
+            # the missing partial leg row is owed — never rewrite it.
+            stage_flag = (
+                position.tp1_executed if leg.leg_seq == 1
+                else position.tp2_executed
+            )
+            if not (
+                stage_flag
+                and position.remaining_size == 0
+                and position.entry_cost_allocated + 1e-9
+                >= leg.entry_cost_share
+            ):
+                raise RuntimeError("PARTIAL_EXIT_NOT_OPEN")
+            self._record_close_leg(leg)
+            return True
+        if round(leg.remaining_after, 12) != round(position.remaining_size, 12):
+            raise RuntimeError("PARTIAL_EXIT_STATE_MISMATCH")
+        inserted = self._record_close_leg(leg)
+        # Mirror the PG contract: the position row carries the absolute
+        # post-leg state atomically with the leg row.
+        stored = self._positions.get(position.position_key)
+        if stored is None:
+            raise KeyError(position.position_key)
+        if position.entered_at != stored.entered_at:
+            position.entered_at = stored.entered_at
+            self.immutability_repairs += 1
+        if position.deadline_at != stored.deadline_at:
+            position.deadline_at = stored.deadline_at
+            self.immutability_repairs += 1
+        self._positions[position.position_key] = replace(position)
+        return inserted
+
+    def get_close_leg(
+        self, position_key: str, leg_seq: int,
+    ) -> InverseShortCloseLeg | None:
+        leg = self._close_legs.get((position_key, leg_seq))
+        return replace(leg) if leg is not None else None
+
+    def list_close_legs(
+        self, position_key: str | None = None,
+    ) -> list[InverseShortCloseLeg]:
+        identities = sorted(self._close_legs)
+        return [
+            replace(self._close_legs[identity])
+            for identity in identities
+            if position_key is None or identity[0] == position_key
+        ]
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL implementation
+# ---------------------------------------------------------------------------
+
+_EVENT_COLUMNS = (
+    "event_key", "strategy_id", "protocol_version", "protocol_hash",
+    "source_scanner", "source_scanner_version", "source_direction",
+    "source_setup_id", "symbol", "direction", "entry_timeframe",
+    "signal_time", "captured_at", "activation_freeze_ts",
+    "signal_candle_open_time", "source_reference_price",
+    "source_invalidation_price", "source_target_price", "source_target_2",
+    "source_score", "market_regime", "capture_route", "status",
+    "position_key", "status_reason", "status_at", "lineage",
+)
+
+_POSITION_COLUMNS = (
+    "position_key", "event_key", "strategy_id", "symbol", "direction",
+    "source_scanner", "source_setup_id", "market_regime", "source_score",
+    "entry_market_price", "entry_price", "entry_fee", "entry_slippage",
+    "stop_price", "target_price", "tp2_price", "tp3_price",
+    "position_size", "remaining_size", "risk_usdt",
+    "balance_before", "entered_at", "deadline_at", "status",
+    "tp1_executed", "tp2_executed", "tp3_executed",
+    "realized_legs_net", "entry_cost_allocated",
+    "funding_paid", "funding_periods", "highest_since_entry",
+    "lowest_since_entry", "mfe", "mae", "last_mark_price",
+    "exit_price", "exit_reason",
+    "exit_fee", "slippage", "gross_pnl", "net_pnl", "closed_at",
+    "duration_sec",
+)
+
+# Durable close-leg ledger (Issue #276): partial TP legs AND terminal legs,
+# identified by UNIQUE (position_key, leg_seq) — the exactly-once identity.
+_CLOSE_LEG_COLUMNS = (
+    "position_key", "leg_seq", "event_key", "symbol", "exit_reason",
+    "is_terminal", "quantity", "remaining_after", "reference_price",
+    "fill_price", "gross_pnl", "exit_fee", "exit_slippage",
+    "entry_cost_share", "funding_paid_to_date", "net_pnl",
+    "cumulative_realized_net", "executed_at", "status_after",
+)
+
+_EVENT_VALUES_SQL = ", ".join(
+    "%s::jsonb" if column == "lineage" else "%s" for column in _EVENT_COLUMNS
+)
+_POSITION_VALUES_SQL = ", ".join("%s" for _ in _POSITION_COLUMNS)
+
+INSERT_EVENT_SQL = f"""
+    INSERT INTO {EVENT_TABLE} ({", ".join(_EVENT_COLUMNS)})
+    SELECT {_EVENT_VALUES_SQL}
+    WHERE EXISTS (
+        SELECT 1 FROM {ACTIVATION_TABLE}
+        WHERE experiment_id = %s
+          AND status = 'RUNNING'
+          AND protocol_fingerprint = %s
+          AND freeze_ts IS NOT NULL
+    )
+    ON CONFLICT (event_key) DO NOTHING
+"""
+
+# P1-final — lock-first admission protocol (why the INSERT must NOT be the
+# first statement of the transaction).
+#
+# ``INSERT_POSITION_SQL`` judges age against ``statement_timestamp()`` — the
+# instant THIS command started.  A one-statement admission that starts
+# BEFORE the row locks are available and then WAITS for ``FOR UPDATE`` would
+# still be judged by its pre-wait start time: an entry could be admitted
+# after the 120-minute TTL had actually elapsed.  ``save_position`` therefore
+# acquires BOTH row locks in their own statements FIRST and only then issues
+# the admission INSERT, all in one transaction:
+#
+#   1. lock the EVENT row      (blocks here for as long as needed)
+#   2. lock the ACTIVATION row (blocks here for as long as needed)
+#   3. INSERT ... WHERE EXISTS (gates + TTL vs statement_timestamp())
+#   4. COMMIT  (rollback ends a refusal and releases the locks)
+#
+# Because every wait happens in steps 1-2, step 3's ``statement_timestamp()``
+# is strictly AFTER the locks are in hand — the TTL is judged at the moment
+# the decision is actually made, with no predicate-vs-lock evaluation-order
+# question left inside a single statement.
+#
+# Lock order is always event THEN activation — the same order a second
+# admission uses, while the sweep locks only the event row and the drain
+# locks only the activation row — so admission/sweep/drain cannot deadlock
+# with each other.  The inner ``FOR UPDATE OF ev, act`` stays in the INSERT
+# as a defensive re-lock (a no-op under the protocol) for anybody who would
+# execute ``INSERT_POSITION_SQL`` directly.
+LOCK_EVENT_FOR_ADMISSION_SQL = f"""
+    SELECT status
+    FROM {EVENT_TABLE}
+    WHERE event_key = %s AND status = %s
+    FOR UPDATE
+"""
+
+LOCK_ACTIVATION_FOR_ADMISSION_SQL = f"""
+    SELECT status
+    FROM {ACTIVATION_TABLE}
+    WHERE experiment_id = %s
+    FOR UPDATE
+"""
+
+# P1-2 — the entry TTL admission gate lives INSIDE the INSERT.
+#
+# Creating a position is the final admission decision, so PostgreSQL must
+# decide it atomically, not Python.  One statement, one transaction, four
+# gates (all re-checked against the row at lock time):
+#
+#   1. TTL: ``ev.signal_time > statement_timestamp()
+#      - interval '<ENTRY_MAX_AGE_MINUTES> minutes'`` — age STRICTLY below
+#      the TTL (119m59.999s admits, exactly 120m and anything older
+#      refuse).
+#   2. identity: ``ev.protocol_hash == act.protocol_fingerprint ==
+#      <this code's protocol_fingerprint()>`` — an event captured under a
+#      different fingerprint can never be admitted, and neither can a
+#      mismatched activation row.
+#   3. activation: ``act.status = 'RUNNING'`` (NEW_ENTRIES permission),
+#      ``freeze_ts`` present, strict ``ev.signal_time > act.freeze_ts``
+#      (prospective-only; no backfill by construction).
+#   4. idempotency: ``ON CONFLICT (position_key) DO NOTHING`` — a position
+#      row can only ever exist once.
+#
+# Clock semantics (why ``statement_timestamp()`` — and why the lock-first
+# protocol above is REQUIRED for it to be correct):
+#   * ``statement_timestamp()`` = the instant THIS admission command
+#     started.  It is FIXED for the whole command, so it is only a valid
+#     decision time BECAUSE ``save_position`` issues the command AFTER the
+#     event and activation row locks are already held (all waiting happens
+#     in the earlier lock statements).  Within the command every row and
+#     subquery then evaluates the boundary against that post-lock instant:
+#     deterministic AND current — no mechanical switch to
+#     ``clock_timestamp()`` is needed, and none would be safer, because
+#     intra-statement evaluation order would then decide the outcome.
+#   * ``now()`` (``transaction_timestamp()``) = transaction start = the
+#     FIRST lock statement, i.e. PRE-wait: using it for the TTL gate would
+#     reintroduce exactly the stale-clock admission this protocol removes.
+#     Forbidden here (asserted by the SQL-contract tests).
+#   * ``clock_timestamp()`` = the actual clock DURING execution: it moves
+#     within one command, so the same row could pass or fail depending on
+#     evaluation order — non-deterministic, untestable.  Not used.
+#
+# Concurrency: the real waiting happens in
+# ``LOCK_EVENT_FOR_ADMISSION_SQL`` / ``LOCK_ACTIVATION_FOR_ADMISSION_SQL``
+# (event row then activation row, that fixed order until commit); the
+# statement below re-locks the same rows (no-op) and the sweep
+# (``mark_event_expired``) locks the same event row first, while the
+# RUNNING → DRAINING transition updates the same activation row —
+# whichever transaction commits first wins and the loser re-evaluates
+# (EvalPlanQual) against the committed state and refuses.  Exactly one
+# valid outcome is possible: never EXPIRED-with-position, never a position
+# created after DRAINING is in force, never a duplicate (the UNIQUE
+# event/position keys back this up).
+INSERT_POSITION_SQL = f"""
+    INSERT INTO {POSITION_TABLE} ({", ".join(_POSITION_COLUMNS)})
+    SELECT {_POSITION_VALUES_SQL}
+    WHERE EXISTS (
+        SELECT 1
+        FROM {EVENT_TABLE} AS ev
+        JOIN {ACTIVATION_TABLE} AS act
+          ON act.experiment_id = %s
+        WHERE ev.event_key = %s
+          AND ev.status = %s
+          AND ev.protocol_hash = act.protocol_fingerprint
+          AND act.protocol_fingerprint = %s
+          AND act.status = 'RUNNING'
+          AND act.freeze_ts IS NOT NULL
+          AND ev.signal_time > act.freeze_ts
+          AND ev.signal_time > statement_timestamp()
+              - interval '{int(ENTRY_MAX_AGE_MINUTES)} minutes'
+        FOR UPDATE OF ev, act
+    )
+    ON CONFLICT (position_key) DO NOTHING
+"""
+
+# NOTE: entered_at / deadline_at and every entry column are deliberately
+# absent from the mutable column list — the original entry time and the
+# original deadline survive restarts untouched.
+UPDATE_POSITION_SQL = f"""
+    UPDATE {POSITION_TABLE} SET
+        remaining_size = %s,
+        tp1_executed = %s,
+        tp2_executed = %s,
+        tp3_executed = %s,
+        realized_legs_net = %s,
+        entry_cost_allocated = %s,
+        funding_paid = %s,
+        funding_periods = %s,
+        highest_since_entry = %s,
+        lowest_since_entry = %s,
+        mfe = %s,
+        mae = %s,
+        last_mark_price = %s,
+        status = %s,
+        exit_price = %s,
+        exit_reason = %s,
+        exit_fee = %s,
+        slippage = %s,
+        gross_pnl = %s,
+        net_pnl = %s,
+        closed_at = %s,
+        duration_sec = %s,
+        updated_at = now()
+    WHERE position_key = %s
+"""
+
+MARK_EVENT_ENTERED_SQL = f"""
+    UPDATE {EVENT_TABLE}
+    SET status = %s, position_key = %s, status_reason = NULL,
+        status_at = now(), updated_at = now()
+    WHERE event_key = %s AND status = %s
+"""
+
+# P1-2 — sweep side of the admission race.  The disposition takes the
+# EVENT row lock in its own statement FIRST (MARK_EVENT_EXPIRED_LOCK_SQL,
+# executed inside the same transaction), then evaluates the UPDATE below.
+# The NOT EXISTS guard runs against a FRESH READ COMMITTED snapshot, so a
+# position committed by a concurrent admission while the lock was being
+# acquired is visible: an event that already has a position can never be
+# disposed of as EXPIRED / CAPACITY_REJECTED (EXPIRED-with-position is
+# impossible by construction).  The WHERE status='CAPTURED' guard keeps the
+# transition exactly-once and keeps a concurrently-entered event from ever
+# being disposed of.
+#
+# Both interleavings against INSERT_POSITION_SQL resolve to exactly one
+# valid outcome (the two statements contend on the same event row):
+#   admission first -> sweep sees the committed position (or status
+#                      != CAPTURED) and refuses;
+#   sweep first     -> the admission's gate re-checks the committed row
+#                      (EvalPlanQual) and inserts nothing.
+MARK_EVENT_EXPIRED_LOCK_SQL = f"""
+    SELECT status FROM {EVENT_TABLE}
+    WHERE event_key = %s AND status = %s
+    FOR UPDATE
+"""
+
+MARK_EVENT_EXPIRED_SQL = f"""
+    UPDATE {EVENT_TABLE} AS ev
+    SET status = %s, status_reason = %s, status_at = %s, updated_at = now()
+    WHERE ev.event_key = %s AND ev.status = %s
+      AND NOT EXISTS (
+          SELECT 1 FROM {POSITION_TABLE} AS pos
+          WHERE pos.event_key = ev.event_key
+      )
+"""
+
+# Durable close outbox (P1-3): staged BEFORE the position row flips to
+# CLOSED.  Re-staging the same key is an idempotent overwrite (same terminal
+# facts), so a retry can never change the exit record.
+INSERT_CLOSE_OUTBOX_SQL = f"""
+    INSERT INTO {CLOSE_OUTBOX_TABLE}
+        (position_key, symbol, exit_reason, closed_at, snapshot)
+    VALUES (%s, %s, %s, %s, %s::jsonb)
+    ON CONFLICT (position_key) DO UPDATE SET
+        symbol = EXCLUDED.symbol,
+        exit_reason = EXCLUDED.exit_reason,
+        closed_at = EXCLUDED.closed_at,
+        snapshot = EXCLUDED.snapshot,
+        staged_at = now()
+"""
+
+LIST_CLOSE_OUTBOX_SQL = f"""
+    SELECT position_key, snapshot
+    FROM {CLOSE_OUTBOX_TABLE}
+    ORDER BY staged_at, position_key
+"""
+
+DELETE_CLOSE_OUTBOX_SQL = f"""
+    DELETE FROM {CLOSE_OUTBOX_TABLE} WHERE position_key = %s
+"""
+
+# -- durable close-leg ledger (Issue #276) -------------------------------
+# Exactly-once identity: UNIQUE (position_key, leg_seq).  An insert that
+# conflicts is a REPLAY (retried dirty leg, ambiguous COMMIT re-issued,
+# terminal leg re-staged) — resolved against the existing row, never
+# duplicated.
+INSERT_CLOSE_LEG_SQL = f"""
+    INSERT INTO {CLOSE_LEG_TABLE} ({", ".join(_CLOSE_LEG_COLUMNS)})
+    VALUES ({", ".join(["%s"] * len(_CLOSE_LEG_COLUMNS))})
+    ON CONFLICT (position_key, leg_seq) DO NOTHING
+"""
+
+GET_CLOSE_LEG_SQL = f"""
+    SELECT * FROM {CLOSE_LEG_TABLE}
+    WHERE position_key = %s AND leg_seq = %s
+"""
+
+LIST_CLOSE_LEGS_SQL = f"""
+    SELECT * FROM {CLOSE_LEG_TABLE}
+    ORDER BY executed_at, position_key, leg_seq
+"""
+
+LIST_CLOSE_LEGS_FOR_POSITION_SQL = f"""
+    SELECT * FROM {CLOSE_LEG_TABLE}
+    WHERE position_key = %s
+    ORDER BY leg_seq
+"""
+
+
+def _is_missing_relation(exc: Exception) -> bool:
+    """PostgreSQL 42P01 (undefined table) — outbox migration not applied yet.
+
+    The close path must stay functional on a database that only has
+    migration 088 (migration-safe rollout): durability degrades to the
+    in-process snapshot instead of failing the close.
+    """
+    if str(getattr(exc, "sqlstate", "") or "") == "42P01":
+        return True
+    text = str(exc).lower()
+    return "does not exist" in text and ("relation" in text or "table" in text)
+
+
+# ---------------------------------------------------------------------------
+# Connection-level vs. SQL-level error classification (review P1)
+# ---------------------------------------------------------------------------
+
+def _connection_error_classes() -> tuple[type[BaseException], ...]:
+    """Error classes that mean "the TRANSPORT is dead", never "SQL is wrong".
+
+    pg8000 v1.31 raises ``pg8000.exceptions.InterfaceError`` for EVERY
+    network failure — it wraps ``OSError`` as ``InterfaceError("network
+    error")`` / ``"communication error"``, raises it for connect failures
+    and for use of a closed connection.  In pg8000 ``InterfaceError`` and
+    ``DatabaseError`` are SIBLINGS (both derive from ``Error``), so the two
+    families never overlap and classification is unambiguous.  The builtin
+    socket-ish errors are included defensively (a wrapped transport error
+    must still be treated as a connection loss).  ``pg8000`` is imported
+    lazily: the in-memory store and its tests must work without it.
+    """
+    classes: list[type[BaseException]] = [
+        ConnectionError, OSError, EOFError, TimeoutError,
+    ]
+    try:
+        import pg8000.exceptions as pg_exceptions
+    except ImportError:  # pragma: no cover - pg8000 absent (in-memory only)
+        pg_exceptions = None  # type: ignore[assignment]
+    if pg_exceptions is not None:
+        interface = getattr(pg_exceptions, "InterfaceError", None)
+        if isinstance(interface, type) and issubclass(interface, BaseException):
+            classes.append(interface)
+    return tuple(classes)
+
+
+def is_connection_error(exc: BaseException) -> bool:
+    """True for connection/transport failures — False for SQL/constraint errors.
+
+    Only connection-level failures may trigger a reconnect-and-retry of the
+    statement.  SQL errors (pg8000 ``DatabaseError`` and its subclasses
+    ``IntegrityError`` / ``ProgrammingError`` / ``DataError`` /
+    ``NotSupportedError`` …) are NEVER retried and NEVER cause a reconnect:
+    the statement itself is at fault, so reconnecting would only mask the
+    bug.  A retry is only ever safe because every statement in this store is
+    idempotent (absolute-value UPDATEs, ``ON CONFLICT DO NOTHING`` inserts,
+    plain SELECTs) — it can never double-book funding, PnL or a close.
+    """
+    return isinstance(exc, _connection_error_classes())
+
+
+class _QueryResult:
+    """Materialized result of one statement.
+
+    The cursor is read (``description`` / rows / ``rowcount``) INSIDE
+    ``_execute`` before it is closed, so a caller can never observe a closed
+    cursor and a cursor can never leak (P1-1).
+    """
+
+    __slots__ = ("columns", "rows", "rowcount")
+
+    def __init__(self, columns: list[str], rows: list[tuple], rowcount: int) -> None:
+        self.columns = columns
+        self.rows = rows
+        self.rowcount = rowcount
+
+    def fetchone(self) -> tuple | None:
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self) -> list[tuple]:
+        return list(self.rows)
+
+    def fetchone_dict(self) -> dict[str, Any] | None:
+        row = self.fetchone()
+        return dict(zip(self.columns, row)) if row is not None else None
+
+    def fetchall_dicts(self) -> list[dict[str, Any]]:
+        return [dict(zip(self.columns, row)) for row in self.rows]
+
+
+class PgInverseShortStore(InverseShortStore):
+    """PostgreSQL store over a dedicated, SELF-HEALING connection.
+
+    All methods commit their own transaction and roll back on failure so the
+    shared connection is never left aborted.  Every write is idempotent.
+
+    Review P1 (PostgreSQL reconnection): a connection-level failure
+    (``is_connection_error`` — pg8000 ``InterfaceError`` / socket errors)
+    replaces ONLY the transport with a NEW connection (limited attempts,
+    exponential backoff) and then retries the SAME idempotent statement.
+    The store object — and with it the engine's ``open_positions``,
+    ``pending_closes``, ``dirty_funding``, accumulated PnL and staged
+    terminal snapshots — is never recreated.  SQL/constraint errors
+    (``DatabaseError`` family) propagate immediately without any reconnect.
+    A method returns success only after the statement AND its ``commit``
+    actually completed: nothing is ever claimed durable before the real
+    commit, and a commit lost to a dropped socket re-executes the whole
+    unit (the dead transaction died with the socket) instead of silently
+    reporting success.
+    """
+
+    def __init__(
+        self,
+        conn: Any,
+        *,
+        experiment_id: str = EXPERIMENT_ID,
+        initial_balance: float = 10_000.0,
+        expected_fingerprint: str | None = None,
+        connect_kwargs: dict[str, Any] | None = None,
+        connection_factory: Callable[..., Any] | None = None,
+        max_reconnect_attempts: int = 3,
+        reconnect_backoff: float = 0.25,
+        reconnect_backoff_max: float = 2.0,
+    ) -> None:
+        self._conn = conn
+        self._experiment_id = experiment_id
+        self.initial_balance = float(initial_balance)
+        self._expected_fingerprint = expected_fingerprint or protocol_fingerprint()
+        # Reconnection (review P1): with neither kwargs nor factory a
+        # connection loss can never be recovered in-process — every attempt
+        # fails honestly instead of pretending the transport is alive.
+        self._connect_kwargs: dict[str, Any] | None = (
+            dict(connect_kwargs) if connect_kwargs else None
+        )
+        self._connection_factory = connection_factory
+        self._max_reconnect_attempts = max(1, int(max_reconnect_attempts))
+        self._reconnect_backoff = max(0.0, float(reconnect_backoff))
+        self._reconnect_backoff_max = max(
+            self._reconnect_backoff, float(reconnect_backoff_max),
+        )
+        self._closed = False
+        # Observability for tests/ops: how many transports this store has
+        # swapped (0 = the original connection is still the live one).
+        self.reconnect_count = 0
+
+    # -- helpers ----------------------------------------------------------
+    def _rollback(self) -> None:
+        try:
+            self._conn.rollback()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("me inverse short oos2 store rollback failed", exc_info=True)
+
+    def _execute_once(
+        self, sql: str, params: tuple | list = (), *, fetch: str = "all",
+    ) -> _QueryResult:
+        """Execute one statement and MATERIALIZE its results (P1-1).
+
+        ``description``, rows and ``rowcount`` are read inside the ``try``
+        block BEFORE the cursor is closed in ``finally`` — a result is never
+        read from a closed cursor, and every cursor is closed exactly once.
+        ``fetch``: ``"all"`` / ``"one"`` (SELECT paths) or ``"none"``
+        (INSERT/UPDATE/DELETE paths — only ``rowcount`` is kept).
+
+        This is the RAW, non-retrying body; connection-loss recovery lives in
+        ``_with_reconnect`` / ``_reconnect`` around it (review P1).
+        """
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(sql, params)
+            description = cursor.description
+            columns = [d[0] for d in (description or [])]
+            if description is None:
+                rows: list[tuple] = []
+            elif fetch == "one":
+                row = cursor.fetchone()
+                rows = [row] if row is not None else []
+            elif fetch == "none":
+                rows = []
+            else:
+                rows = list(cursor.fetchall())
+            rowcount = int(getattr(cursor, "rowcount", 0) or 0)
+            return _QueryResult(columns=columns, rows=rows, rowcount=rowcount)
+        finally:
+            try:
+                cursor.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    def _reconnect(self) -> None:
+        """Swap a dead transport for a NEW connection (review P1).
+
+        Only ``self._conn`` changes — never the store object, never the
+        engine — so every in-process state (open positions, pending closes,
+        dirty funding, accumulated PnL, staged terminal snapshots) survives
+        untouched.  The dead socket is closed best-effort before the swap.
+        Raises (typically pg8000 ``InterfaceError``) when no connection can
+        be established; the bounded retry/backoff loop lives in
+        ``_with_reconnect``.
+        """
+        if self._connection_factory is None or not self._connect_kwargs:
+            raise ConnectionError(
+                "me inverse short oos2 store reconnect configuration unavailable "
+                "(no connect kwargs / connection factory provided)",
+            )
+        new_conn = self._connection_factory(**self._connect_kwargs)
+        try:
+            self._conn.close()
+        except Exception:  # pragma: no cover - dead socket, best effort
+            logger.debug("me inverse short oos2 store old connection close failed",
+                         exc_info=True)
+        self._conn = new_conn
+        self.reconnect_count += 1
+        logger.warning(
+            "me inverse short oos2 store RECONNECTED: transport replaced "
+            "(%d reconnect(s) so far); in-process engine state preserved",
+            self.reconnect_count,
+        )
+
+    def _with_reconnect(self, operation: Callable[[], Any]) -> Any:
+        """Run ONE idempotent unit, recovering the transport on connection loss.
+
+        * ``is_connection_error`` failures → limited reconnect with
+          exponential backoff, then the SAME unit is retried;
+        * SQL/constraint errors → re-raised immediately (no reconnect, no
+          retry — the statement, not the transport, is at fault);
+        * after ``max_reconnect_attempts`` connection failures the last error
+          is re-raised, so callers (engine) keep their dirty/pending state
+          and never claim recovery before a real commit;
+        * a deliberate ``close()`` disables reconnection entirely.
+        """
+        attempts = 0
+        while True:
+            try:
+                return operation()
+            except Exception as exc:
+                if self._closed or not is_connection_error(exc):
+                    raise
+                attempts += 1
+                if attempts > self._max_reconnect_attempts:
+                    logger.error(
+                        "me inverse short oos2 store connection recovery EXHAUSTED "
+                        "after %d attempt(s); operation NOT applied — the "
+                        "caller's idempotent retry resumes once PostgreSQL is "
+                        "reachable again: %s: %s",
+                        attempts - 1, type(exc).__name__, exc,
+                    )
+                    raise
+                delay = min(
+                    self._reconnect_backoff * (2 ** (attempts - 1)),
+                    self._reconnect_backoff_max,
+                )
+                logger.warning(
+                    "me inverse short oos2 store connection lost (%s: %s); "
+                    "reconnect %d/%d in %.2fs, then retry idempotent "
+                    "operation",
+                    type(exc).__name__, str(exc)[:160], attempts,
+                    self._max_reconnect_attempts, delay,
+                )
+                if delay > 0:
+                    time.sleep(delay)
+                try:
+                    self._reconnect()
+                except Exception as conn_exc:
+                    logger.warning(
+                        "me inverse short oos2 store reconnect attempt %d/%d "
+                        "failed: %s: %s",
+                        attempts, self._max_reconnect_attempts,
+                        type(conn_exc).__name__, str(conn_exc)[:160],
+                    )
+                    # Loop again: the unit runs on the still-dead transport,
+                    # fails fast and counts toward the same bounded budget.
+
+    def _execute(
+        self, sql: str, params: tuple | list = (), *, fetch: str = "all",
+    ) -> _QueryResult:
+        """Execute one statement with connection-loss recovery (review P1)."""
+        return self._with_reconnect(
+            lambda: self._execute_once(sql, params, fetch=fetch),
+        )
+
+    def _execute_commit(
+        self, sql: str, params: tuple | list = (), *, fetch: str = "none",
+    ) -> _QueryResult:
+        """Execute + COMMIT as ONE reconnect-retried unit (review P1).
+
+        A commit lost to a connection drop leaves the NEW session without
+        the statement (the old transaction died with the socket), so the
+        pair must be retried together — otherwise a write could be reported
+        durable without ever being committed (never claim recovery before
+        the actual commit).  The idempotency of every statement in this
+        store makes the retry safe: absolute-value UPDATEs and
+        ``ON CONFLICT DO NOTHING`` inserts can never double-book funding,
+        PnL or a terminal close.
+        """
+        def operation() -> _QueryResult:
+            result = self._execute_once(sql, params, fetch=fetch)
+            self._conn.commit()
+            return result
+
+        return self._with_reconnect(operation)
+
+    def _query(
+        self, sql: str, params: tuple | list = (), *, fetch: str = "all",
+    ) -> _QueryResult:
+        """Read helper: materialize, then promptly commit the read.
+
+        Execute and commit run as one reconnect-retried unit.  On failure the
+        transaction is rolled back, so a failed read never leaves the shared
+        connection with a hanging/aborted transaction.
+        """
+        def operation() -> _QueryResult:
+            result = self._execute_once(sql, params, fetch=fetch)
+            self._conn.commit()
+            return result
+
+        try:
+            return self._with_reconnect(operation)
+        except Exception:
+            self._rollback()
+            raise
+
+    # -- activation -------------------------------------------------------
+    def load_activation(self) -> ActivationRecord | None:
+        result = self._query(
+            "SELECT experiment_id, status, protocol_fingerprint, freeze_ts "
+            f"FROM {ACTIVATION_TABLE} WHERE experiment_id = %s",
+            (self._experiment_id,),
+            fetch="one",
+        )
+        row = result.fetchone()
+        if row is None:
+            return None
+        return ActivationRecord(
+            experiment_id=row[0],
+            status=row[1],
+            protocol_fingerprint=row[2] or "",
+            freeze_ts=row[3],
+        )
+
+    # -- events -----------------------------------------------------------
+    def save_event(self, event: InverseShortEvent) -> str:
+        active, reason = evaluate_activation(
+            self.load_activation(), enabled=True,
+            expected_fingerprint=self._expected_fingerprint,
+        )
+        if active is None:
+            logger.debug("me inverse short oos2 event refused: %s", reason)
+            return SAVE_NOT_ACTIVE
+        if not active.allows(PERMISSION_NEW_ENTRIES):
+            # EXIT_ONLY (DRAINING): no NEW source event rows, even when a
+            # caller bypasses capture_with_status (defence in depth).
+            logger.debug("me inverse short oos2 event refused: %s", REASON_EXIT_ONLY)
+            return SAVE_NOT_ACTIVE
+
+        row = event.to_dict()
+        lineage = json.dumps(row.pop("lineage") or {}, ensure_ascii=False)
+        params: list[Any] = [
+            row.get("event_key"), row.get("strategy_id"),
+            row.get("protocol_version"), row.get("protocol_hash"),
+            row.get("source_scanner"), row.get("source_scanner_version"),
+            row.get("source_direction"), row.get("source_setup_id"),
+            row.get("symbol"), row.get("direction"), row.get("entry_timeframe"),
+            row.get("signal_time"), row.get("captured_at"),
+            row.get("activation_freeze_ts"), row.get("signal_candle_open_time"),
+            row.get("source_reference_price"), row.get("source_invalidation_price"),
+            row.get("source_target_price"), row.get("source_target_2"),
+            row.get("source_score"), row.get("market_regime"),
+            row.get("capture_route"), row.get("status"), row.get("position_key"),
+            row.get("status_reason"), row.get("status_at"),
+            lineage,
+            # WHERE EXISTS guard:
+            self._experiment_id, self._expected_fingerprint,
+        ]
+        try:
+            result = self._execute_commit(INSERT_EVENT_SQL, tuple(params))
+            inserted = result.rowcount == 1
+        except Exception:
+            self._rollback()
+            logger.exception("me inverse short oos2 event insert failed")
+            raise
+        if inserted:
+            return SAVE_CAPTURED
+        # Guard failure (activation gone) vs. idempotent replay.
+        if self.get_event(event.event_key) is not None:
+            return SAVE_DUPLICATE
+        return SAVE_NOT_ACTIVE
+
+    def get_event(self, event_key: str) -> InverseShortEvent | None:
+        rows = self._query(
+            "SELECT * FROM " + EVENT_TABLE + " WHERE event_key = %s",
+            (event_key,),
+        ).fetchall_dicts()
+        return InverseShortEvent.from_dict(rows[0]) if rows else None
+
+    def list_events(self, status: str | None = None) -> list[InverseShortEvent]:
+        if status is None:
+            result = self._query(
+                "SELECT * FROM " + EVENT_TABLE + " ORDER BY signal_time, event_key",
+            )
+        else:
+            result = self._query(
+                "SELECT * FROM " + EVENT_TABLE +
+                " WHERE status = %s ORDER BY signal_time, event_key",
+                (status,),
+            )
+        return [
+            InverseShortEvent.from_dict(r) for r in result.fetchall_dicts()
+        ]
+
+    def mark_event_entered(self, event_key: str, position_key: str) -> None:
+        try:
+            self._execute_commit(
+                MARK_EVENT_ENTERED_SQL,
+                (EVENT_STATUS_ENTERED, position_key, event_key,
+                 EVENT_STATUS_CAPTURED),
+            )
+        except Exception:
+            self._rollback()
+            raise
+
+    def mark_event_expired(
+        self,
+        event_key: str,
+        status: str,
+        *,
+        reason: str,
+        decided_at: datetime,
+    ) -> bool:
+        """Atomically dispose of one CAPTURED event (P1-2, sweep side).
+
+        Two statements in ONE reconnect-retried transaction: lock the event
+        row (refusing immediately when it is no longer CAPTURED), then run
+        the guarded UPDATE whose fresh snapshot refuses when a position for
+        this event already exists.  The lock is what serializes this method
+        against a concurrent ``save_position`` admission.
+        """
+        if status not in (EVENT_STATUS_EXPIRED, EVENT_STATUS_CAPACITY_REJECTED):
+            raise ValueError(f"INVALID_TERMINAL_EVENT_STATUS:{status}")
+
+        def operation() -> _QueryResult:
+            # 1) Lock the event row; no row (missing / already terminal)
+            #    means nothing to dispose of — end the empty transaction.
+            lock = self._execute_once(
+                MARK_EVENT_EXPIRED_LOCK_SQL,
+                (event_key, EVENT_STATUS_CAPTURED),
+                fetch="one",
+            )
+            if lock.fetchone() is None:
+                self._conn.rollback()
+                return _QueryResult(columns=[], rows=[], rowcount=0)
+            # 2) Fresh snapshot under the held lock: refuses when a position
+            #    for this event already exists (no EXPIRED-with-position).
+            result = self._execute_once(
+                MARK_EVENT_EXPIRED_SQL,
+                (status, reason, decided_at, event_key, EVENT_STATUS_CAPTURED),
+                fetch="none",
+            )
+            self._conn.commit()
+            return result
+
+        try:
+            result = self._with_reconnect(operation)
+            return bool(result and result.rowcount == 1)
+        except Exception:
+            self._rollback()
+            raise
+
+    # -- positions --------------------------------------------------------
+    def _position_params(self, position: InverseShortPosition) -> tuple:
+        row = position.to_dict()
+        return tuple(row.get(column) for column in _POSITION_COLUMNS)
+
+    def _update_params(self, position: InverseShortPosition) -> tuple:
+        """Parameter tuple for UPDATE_POSITION_SQL (column order above).
+
+        Absolute values for every mutable accounting/quantity column: a
+        replayed or retried UPDATE can never move a row backwards (legs and
+        funding are cumulative counters of the SAME in-memory object), and
+        entry facts (prices, size, entered_at, deadline_at) are never
+        included — they are written exactly once by the admission INSERT.
+        """
+        row = position.to_dict()
+        return (
+            row.get("remaining_size"),
+            row.get("tp1_executed"),
+            row.get("tp2_executed"),
+            row.get("tp3_executed"),
+            row.get("realized_legs_net"),
+            row.get("entry_cost_allocated"),
+            row.get("funding_paid"), row.get("funding_periods"),
+            row.get("highest_since_entry"), row.get("lowest_since_entry"),
+            row.get("mfe"), row.get("mae"), row.get("last_mark_price"),
+            row.get("status"),
+            row.get("exit_price"), row.get("exit_reason"), row.get("exit_fee"),
+            row.get("slippage"), row.get("gross_pnl"), row.get("net_pnl"),
+            row.get("closed_at"), row.get("duration_sec"),
+            position.position_key,
+        )
+
+    def save_position(self, position: InverseShortPosition) -> bool:
+        """Atomically create the position — the final admission (P1-2, P1-final).
+
+        Lock-first protocol (see ``LOCK_EVENT_FOR_ADMISSION_SQL``): the event
+        row and the activation row are locked in THEIR OWN statements —
+        blocking there for as long as needed — and only then the guarded
+        INSERT runs, so its ``statement_timestamp()`` judges the entry TTL at
+        the actual decision instant and never at the start of a lock wait
+        (an admission must be refused once 120 minutes have elapsed, even
+        when the wait itself is what consumed the remainder of the TTL).
+
+        ``True`` only when THIS call inserted the row.  ``False`` means the
+        PostgreSQL admission gate refused (TTL reached at DB time, event no
+        longer CAPTURED, activation not RUNNING / fingerprint mismatch, or
+        the row already existed) — both cases are resolved by the caller's
+        adoption path (``has_position`` / ``get_position``), which is what
+        lets an ambiguous COMMIT (commit durable, acknowledgement lost)
+        recover without a duplicate INSERT and without a second fee.  A
+        connection loss retried by ``_with_reconnect`` re-runs the whole
+        unit: if the lost commit was in fact durable, the retried INSERT
+        conflicts into 0 rows and the caller adopts instead of duplicating.
+        """
+        params = self._position_params(position) + (
+            # WHERE EXISTS gate params: activation identity, event identity,
+            # event status and this code's frozen protocol fingerprint.
+            self._experiment_id,
+            position.event_key,
+            EVENT_STATUS_CAPTURED,
+            self._expected_fingerprint,
+        )
+
+        def operation() -> _QueryResult:
+            # 1) Lock the EVENT row (CAPTURED gate folded into the lock; a
+            #    concurrent EXPIRE is re-checked by EvalPlanQual once the
+            #    lock is granted).  No row -> nothing admissible.
+            lock_event = self._execute_once(
+                LOCK_EVENT_FOR_ADMISSION_SQL,
+                (position.event_key, EVENT_STATUS_CAPTURED),
+                fetch="one",
+            )
+            if lock_event.fetchone() is None:
+                self._conn.rollback()  # releases any partial lock state
+                return _QueryResult(columns=[], rows=[], rowcount=0)
+            # 2) Lock the ACTIVATION row — this is where a concurrent
+            #    RUNNING -> DRAINING transition is waited out; the status /
+            #    identity gates themselves stay in the INSERT below (single
+            #    source of truth).  No row -> refuse.
+            lock_activation = self._execute_once(
+                LOCK_ACTIVATION_FOR_ADMISSION_SQL,
+                (self._experiment_id,),
+                fetch="one",
+            )
+            if lock_activation.fetchone() is None:
+                self._conn.rollback()
+                return _QueryResult(columns=[], rows=[], rowcount=0)
+            # 3) Admission INSERT: it can no longer block on ev/act (this
+            #    transaction holds both locks), so its
+            #    statement_timestamp() IS the post-wait decision time.
+            result = self._execute_once(INSERT_POSITION_SQL, params, fetch="none")
+            # 4) One commit for locks + decision; a refusal already rolled
+            #    back above, which is what releases the row locks.
+            self._conn.commit()
+            return result
+
+        try:
+            result = self._with_reconnect(operation)
+            return bool(result and result.rowcount == 1)
+        except Exception:
+            self._rollback()
+            raise
+
+    def update_position(self, position: InverseShortPosition) -> None:
+        try:
+            result = self._execute_commit(
+                UPDATE_POSITION_SQL, self._update_params(position),
+            )
+            updated = result.rowcount
+        except Exception:
+            self._rollback()
+            raise
+        if updated == 0:
+            # A confirmed write MUST have matched the row: silently losing a
+            # close/funding update would corrupt the ledger.
+            raise RuntimeError(
+                f"POSITION_UPDATE_MATCHED_NO_ROWS:{position.position_key}"
+            )
+
+    def load_open_positions(self) -> list[InverseShortPosition]:
+        rows = self._query(
+            "SELECT * FROM " + POSITION_TABLE +
+            " WHERE status = %s ORDER BY entered_at",
+            (POSITION_STATUS_OPEN,),
+        ).fetchall_dicts()
+        return [InverseShortPosition.from_dict(r) for r in rows]
+
+    def has_position(self, position_key: str) -> bool:
+        result = self._query(
+            "SELECT 1 FROM " + POSITION_TABLE + " WHERE position_key = %s",
+            (position_key,),
+            fetch="one",
+        )
+        return result.fetchone() is not None
+
+    def get_position(
+        self, position_key: str,
+    ) -> InverseShortPosition | None:
+        result = self._query(
+            "SELECT * FROM " + POSITION_TABLE + " WHERE position_key = %s",
+            (position_key,),
+            fetch="one",
+        )
+        row = result.fetchone_dict()
+        if row is None:
+            return None
+        return InverseShortPosition.from_dict(row)
+
+    def list_positions(self, status: str | None = None) -> list[InverseShortPosition]:
+        if status is None:
+            result = self._query(
+                "SELECT * FROM " + POSITION_TABLE + " ORDER BY entered_at",
+            )
+        else:
+            result = self._query(
+                "SELECT * FROM " + POSITION_TABLE +
+                " WHERE status = %s ORDER BY entered_at",
+                (status,),
+            )
+        return [InverseShortPosition.from_dict(r) for r in result.fetchall_dicts()]
+
+    def balance_components(self) -> dict[str, float]:
+        # Issue #276: an OPEN position's committed partial legs already
+        # realized ``(gross − exit fee − exit slippage)`` into the contour
+        # balance — they must be credited back against its entry/funding
+        # costs, or a restart would forget every partial TP.
+        result = self._query(
+            "SELECT "
+            " COALESCE(SUM(CASE WHEN status = 'CLOSED' THEN net_pnl ELSE 0 END), 0),"
+            " COALESCE(SUM(CASE WHEN status = 'OPEN' THEN "
+            "   entry_fee + entry_slippage + funding_paid - realized_legs_net"
+            "   ELSE 0 END), 0)"
+            f" FROM {POSITION_TABLE}",
+            fetch="one",
+        )
+        row = result.fetchone() or (0.0, 0.0)
+        closed_net = float(row[0] or 0.0)
+        open_costs = float(row[1] or 0.0)
+        return {
+            "initial_balance": self.initial_balance,
+            "closed_net_pnl": closed_net,
+            "open_costs": open_costs,
+            "balance": self.initial_balance + closed_net - open_costs,
+        }
+
+    def net_pnl_summary(self) -> dict[str, float]:
+        result = self._query(
+            "SELECT COUNT(*), "
+            " COALESCE(SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END), 0),"
+            " COALESCE(SUM(CASE WHEN net_pnl <= 0 THEN 1 ELSE 0 END), 0),"
+            " COALESCE(SUM(net_pnl), 0)"
+            f" FROM {POSITION_TABLE} WHERE status = 'CLOSED'",
+            fetch="one",
+        )
+        row = result.fetchone() or (0, 0, 0, 0.0)
+        return {
+            "closed_trades": float(row[0] or 0),
+            "wins": float(row[1] or 0),
+            "losses": float(row[2] or 0),
+            "net_pnl": float(row[3] or 0.0),
+        }
+
+    # -- durable close outbox (P1-3) --------------------------------------
+    @staticmethod
+    def _leg_params(leg: InverseShortCloseLeg) -> tuple:
+        row = leg.to_dict()
+        return tuple(row.get(column) for column in _CLOSE_LEG_COLUMNS)
+
+    @staticmethod
+    def _leg_facts_match(existing: dict[str, Any], leg: InverseShortCloseLeg) -> bool:
+        """Tolerance-exact comparison of a stored leg row vs these facts."""
+        def _num(value: Any) -> float:
+            return float(value)
+
+        try:
+            return (
+                str(existing.get("exit_reason")) == leg.exit_reason
+                and bool(existing.get("is_terminal")) == bool(leg.is_terminal)
+                and str(existing.get("status_after")) == leg.status_after
+                and abs(_num(existing.get("quantity")) - float(leg.quantity)) <= 1e-9
+                and abs(_num(existing.get("remaining_after")) - float(leg.remaining_after)) <= 1e-9
+                and abs(_num(existing.get("reference_price")) - float(leg.reference_price)) <= 1e-9
+                and abs(_num(existing.get("fill_price")) - float(leg.fill_price)) <= 1e-9
+                and abs(_num(existing.get("gross_pnl")) - float(leg.gross_pnl)) <= 1e-9
+                and abs(_num(existing.get("exit_fee")) - float(leg.exit_fee)) <= 1e-9
+                and abs(_num(existing.get("exit_slippage")) - float(leg.exit_slippage)) <= 1e-9
+                and abs(_num(existing.get("entry_cost_share")) - float(leg.entry_cost_share)) <= 1e-9
+                and abs(_num(existing.get("net_pnl")) - float(leg.net_pnl)) <= 1e-9
+                and abs(_num(existing.get("cumulative_realized_net")) - float(leg.cumulative_realized_net)) <= 1e-9
+            )
+        except Exception:
+            return False
+
+    def stage_close(
+        self,
+        position: InverseShortPosition,
+        terminal_leg: InverseShortCloseLeg | None = None,
+    ) -> bool:
+        if (
+            position.status != POSITION_STATUS_CLOSED
+            or not position.exit_reason
+            or position.closed_at is None
+        ):
+            raise ValueError("STAGE_CLOSE_NOT_TERMINAL")
+        snapshot = json.dumps(position.to_dict(), ensure_ascii=False)
+        outbox_params = (
+            position.position_key, position.symbol, position.exit_reason,
+            position.closed_at, snapshot,
+        )
+        leg_params = (
+            self._leg_params(terminal_leg) if terminal_leg is not None else None
+        )
+
+        def operation() -> _QueryResult:
+            if leg_params is not None:
+                # Terminal leg staged in the SAME transaction as the outbox
+                # snapshot: the leg ledger can never lag the position flip
+                # (both upserts are idempotent — a re-stage changes nothing).
+                self._execute_once(INSERT_CLOSE_LEG_SQL, leg_params, fetch="none")
+            result = self._execute_once(
+                INSERT_CLOSE_OUTBOX_SQL, outbox_params, fetch="none",
+            )
+            self._conn.commit()
+            return _QueryResult(columns=[], rows=[], rowcount=result.rowcount)
+
+        try:
+            result = self._with_reconnect(operation)
+            staged = bool(result and result.rowcount == 1)
+            return staged
+        except Exception as exc:
+            self._rollback()
+            if _is_missing_relation(exc):
+                logger.warning(
+                    "me inverse short oos2 close staging unavailable (migration 088 "
+                    "not applied): terminal close durability degraded to "
+                    "in-process retry: key=%s",
+                    position.position_key[:48],
+                )
+                return False
+            raise
+
+    def list_pending_closes(self) -> list[InverseShortPosition]:
+        try:
+            result = self._query(LIST_CLOSE_OUTBOX_SQL)
+        except Exception as exc:
+            if _is_missing_relation(exc):
+                logger.warning(
+                    "me inverse short oos2 close outbox table missing (migration 088 "
+                    "not applied): no durable closes to resume",
+                )
+                return []
+            raise
+        pending: list[InverseShortPosition] = []
+        for row in result.fetchall_dicts():
+            raw = row.get("snapshot")
+            try:
+                data = json.loads(raw) if isinstance(raw, str) else raw
+                pending.append(InverseShortPosition.from_dict(data))
+            except Exception:
+                logger.error(
+                    "me inverse short oos2 close outbox row unreadable: key=%s",
+                    str(row.get("position_key"))[:48], exc_info=True,
+                )
+        return pending
+
+    def clear_pending_close(self, position_key: str) -> None:
+        try:
+            self._execute_commit(DELETE_CLOSE_OUTBOX_SQL, (position_key,))
+        except Exception as exc:
+            self._rollback()
+            if _is_missing_relation(exc):
+                return  # degraded mode: nothing staged, nothing to clear
+            raise
+
+    # -- partial TP legs (Issue #276) — one transaction, exactly-once ------
+    def commit_partial_exit(
+        self,
+        position: InverseShortPosition,
+        leg: InverseShortCloseLeg,
+    ) -> bool:
+        if leg.is_terminal:
+            raise RuntimeError("PARTIAL_EXIT_TERMINAL_LEG")
+        if leg.exit_reason not in ("TAKE_PROFIT_1", "TAKE_PROFIT_2"):
+            raise RuntimeError(f"PARTIAL_EXIT_INVALID_STAGE:{leg.exit_reason}")
+        if leg.leg_seq != leg_seq_for(leg.exit_reason):
+            raise RuntimeError("PARTIAL_EXIT_LEG_SEQ_MISMATCH")
+        if leg.quantity <= 0 or leg.remaining_after < 0:
+            raise RuntimeError("PARTIAL_EXIT_INVALID_QUANTITY")
+        # LEG-ONLY completion (Issue #276): when the position row is already
+        # CLOSED the terminal write is final — only the missing PARTIAL leg
+        # row is still owed (a dirty TP1/TP2 leg whose position later closed
+        # while the ledger was down).  The terminal row must already reflect
+        # the leg (stage flag on, remainder zero, cumulative realized
+        # covered); the position row itself is NEVER rewritten here.
+        leg_only = position.status != POSITION_STATUS_OPEN
+        if leg_only:
+            stage_flag = (
+                position.tp1_executed if leg.leg_seq == 1
+                else position.tp2_executed
+            )
+            if not (
+                stage_flag
+                and position.remaining_size == 0
+                and position.entry_cost_allocated + 1e-9
+                >= leg.entry_cost_share
+            ):
+                raise RuntimeError("PARTIAL_EXIT_NOT_OPEN")
+        elif round(leg.remaining_after, 12) != round(position.remaining_size, 12):
+            raise RuntimeError("PARTIAL_EXIT_STATE_MISMATCH")
+
+        leg_params = self._leg_params(leg)
+        update_params = self._update_params(position)
+
+        def operation() -> _QueryResult:
+            # 1) Leg row first: the exactly-once identity of this leg.
+            insert = self._execute_once(
+                INSERT_CLOSE_LEG_SQL, leg_params, fetch="none",
+            )
+            if insert.rowcount == 0:
+                # REPLAY — the leg is already durable (retried dirty leg,
+                # re-issued ambiguous COMMIT).  Verify the existing row's
+                # facts AND that the position state reflects the leg, then
+                # resolve as a success WITHOUT booking anything twice.
+                existing = self._execute_once(
+                    GET_CLOSE_LEG_SQL, (leg.position_key, leg.leg_seq),
+                    fetch="one",
+                ).fetchone_dict()
+                if existing is None or not self._leg_facts_match(existing, leg):
+                    self._conn.rollback()
+                    raise RuntimeError(
+                        f"LEG_CONFLICT_UNVERIFIABLE:{leg.position_key}:"
+                        f"{leg.leg_seq}"
+                    )
+                stored = self._execute_once(
+                    "SELECT * FROM " + POSITION_TABLE + " WHERE position_key = %s",
+                    (leg.position_key,), fetch="one",
+                ).fetchone_dict()
+                if stored is None:
+                    self._conn.rollback()
+                    raise RuntimeError(
+                        f"PARTIAL_EXIT_POSITION_MISSING:{leg.position_key}"
+                    )
+                reflects = (
+                    abs(float(stored.get("remaining_size") or 0.0)
+                        - float(position.remaining_size)) <= 1e-9
+                    and bool(stored.get("tp1_executed"))
+                    == bool(position.tp1_executed)
+                    and bool(stored.get("tp2_executed"))
+                    == bool(position.tp2_executed)
+                    and abs(float(stored.get("realized_legs_net") or 0.0)
+                            - float(position.realized_legs_net)) <= 1e-9
+                )
+                if not reflects:
+                    self._conn.rollback()
+                    raise RuntimeError(
+                        f"PARTIAL_EXIT_CONFLICT_INCONSISTENT:{leg.position_key}:"
+                        f"{leg.leg_seq}"
+                    )
+                self._conn.commit()
+                return _QueryResult(columns=[], rows=[], rowcount=0)
+
+            if leg_only:
+                # The terminal position row is already final — the leg row
+                # alone completes the ledger (single-statement commit).
+                self._conn.commit()
+                return _QueryResult(columns=[], rows=[], rowcount=1)
+
+            # 2) Position state — SAME transaction, absolute values.
+            update = self._execute_once(
+                UPDATE_POSITION_SQL, update_params, fetch="none",
+            )
+            if update.rowcount == 0:
+                self._conn.rollback()
+                raise RuntimeError(
+                    f"POSITION_UPDATE_MATCHED_NO_ROWS:{position.position_key}"
+                )
+            # 3) One COMMIT for leg row + position update: a partial TP is
+            #    either fully durable or not at all — never in between.
+            self._conn.commit()
+            return _QueryResult(columns=[], rows=[], rowcount=1)
+
+        try:
+            result = self._with_reconnect(operation)
+            return bool(result and result.rowcount >= 0)
+        except Exception:
+            self._rollback()
+            raise
+
+    def get_close_leg(
+        self, position_key: str, leg_seq: int,
+    ) -> InverseShortCloseLeg | None:
+        try:
+            result = self._query(
+                GET_CLOSE_LEG_SQL, (position_key, leg_seq), fetch="one",
+            )
+        except Exception as exc:
+            if _is_missing_relation(exc):
+                return None
+            raise
+        row = result.fetchone_dict()
+        return InverseShortCloseLeg.from_dict(row) if row else None
+
+    def list_close_legs(
+        self, position_key: str | None = None,
+    ) -> list[InverseShortCloseLeg]:
+        try:
+            if position_key is None:
+                result = self._query(LIST_CLOSE_LEGS_SQL)
+            else:
+                result = self._query(
+                    LIST_CLOSE_LEGS_FOR_POSITION_SQL, (position_key,),
+                )
+        except Exception as exc:
+            if _is_missing_relation(exc):
+                logger.warning(
+                    "me inverse short oos2 close leg table missing (migration "
+                    "088 not applied): no partial-exit ledger to read",
+                )
+                return []
+            raise
+        return [InverseShortCloseLeg.from_dict(r) for r in result.fetchall_dicts()]
+
+    def close(self) -> None:
+        # Deliberate shutdown: reconnection is disabled from here on — a
+        # closed store must never silently come back to life (review P1).
+        self._closed = True
+        try:
+            self._conn.close()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("me inverse short oos2 store close failed", exc_info=True)
+
+
+def connect_pg_store(
+    *,
+    host: str,
+    port: int,
+    database: str,
+    user: str,
+    password: str,
+    initial_balance: float = 10_000.0,
+    unix_sock: str | None = None,
+) -> PgInverseShortStore:
+    """Open a DEDICATED pg8000 connection for the contour.
+
+    The connection is never shared with the scanner/paper runners: contour
+    commits and rollbacks can never touch a production transaction.  The
+    connect parameters and factory are retained by the store so a lost
+    connection can be replaced in-process (review P1) without ever
+    recreating the engine.
+    """
+    import pg8000
+
+    kwargs: dict[str, Any] = {
+        "database": database,
+        "user": user,
+        "password": password,
+        # Bound EVERY socket operation — the initial connect AND each
+        # reconnect attempt (review P1): an unreachable host can never
+        # stall a trading cycle unboundedly, and a hung network write
+        # fails fast as a connection-level error the store recovers
+        # from.  The contour's own queries are single-row reads/writes
+        # on tiny tables, so a 10s cap never affects healthy operation.
+        "timeout": 10,
+    }
+    if unix_sock:
+        kwargs["unix_sock"] = unix_sock
+    else:
+        kwargs["host"] = host
+        kwargs["port"] = port
+    conn = pg8000.connect(**kwargs)
+    return PgInverseShortStore(
+        conn,
+        initial_balance=initial_balance,
+        connect_kwargs=kwargs,
+        connection_factory=pg8000.connect,
+    )

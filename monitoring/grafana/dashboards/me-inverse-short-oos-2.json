@@ -1,0 +1,471 @@
+{
+  "uid": "me-inverse-short-oos-2",
+  "title": "Trad Bot — ME Inverse SHORT OOS-2",
+  "description": "Prospective-only paper SHORT contour (Issue #276, ME_LONG_V2_INVERSE_SHORT_OOS2_V1). Source: MOMENTUM_EXHAUSTION_REVERSE_LONG_V2 LONG. Frozen protocol: entry TTL 120 minutes, max hold 7200 minutes, STOP_FIRST intrabar priority, SL -10%, partial ladder TP1 +5% -> 50% of original, TP2 +7% -> 75% of remaining (37.5% of original), TP3 +10% -> all remaining; OOS-2-LOCAL capacity 12. Protocol fingerprint: 1d1e7b4d87c6125183887c8f054a4edb1ff3f0711e70da1feeb9b7e249d7b7ec. Partial TP legs are legs of ONE trade, never separate closed trades.",
+  "tags": [
+    "trad_bot",
+    "OOS",
+    "ME",
+    "inverse-short",
+    "OOS2",
+    "issue276"
+  ],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "editable": true,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Activation / Freeze / Fingerprint",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 8,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT experiment_id, status, freeze_ts, protocol_fingerprint\nFROM dds.me_long_v2_inverse_short_oos2_v1_activation\nWHERE experiment_id = 'ME_LONG_V2_INVERSE_SHORT_OOS2_V1';",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "description": "Frozen identity of this contour: status must be RUNNING with both protocol_fingerprint and freeze_ts present before any capture or entry. Reviewed fingerprint: 1d1e7b4d87c6125183887c8f054a4edb1ff3f0711e70da1feeb9b7e249d7b7ec"
+    },
+    {
+      "id": 2,
+      "title": "Open Positions (of 12)",
+      "type": "stat",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 4,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT count(*) AS value FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN';",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 10
+              },
+              {
+                "color": "red",
+                "value": 12
+              }
+            ]
+          },
+          "max": 12
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        }
+      },
+      "description": "OOS-2 LOCAL capacity: at most 12 concurrent OPEN SHORT positions (protocol constant, never the global Settings.max_open_positions). Orange at 10+, red when full (12): further eligible events are refused with CAPACITY_REJECTED / ENTRY_CAP."
+    },
+    {
+      "id": 3,
+      "title": "Realized / Unrealized Net PnL (USDT)",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT 'Realized (closed positions + committed partial TP legs)' AS metric,\n       round(coalesce((SELECT sum(net_pnl) FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='CLOSED'), 0)\n            + coalesce((SELECT sum(realized_legs_net) FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN'), 0), 4) AS value_usdt\nUNION ALL\nSELECT 'Unrealized (open, last mark)',\n       round(coalesce((SELECT sum((entry_price - coalesce(last_mark_price, entry_price)) * remaining_size)\n                       FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN'), 0), 4)\nUNION ALL\nSELECT 'Equity PnL (realized + unrealized)',\n       round(coalesce((SELECT sum(net_pnl) FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='CLOSED'), 0)\n            + coalesce((SELECT sum(realized_legs_net) FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN'), 0)\n            + coalesce((SELECT sum((entry_price - coalesce(last_mark_price, entry_price)) * remaining_size)\n                        FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN'), 0), 4);",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "description": "Realized = terminal CLOSED net_pnl (full positions, partial legs included exactly once) plus committed partial TP legs of still-OPEN positions. Unrealized = (entry_price − last_mark_price) × remaining_size over OPEN positions (SHORT sign)."
+    },
+    {
+      "id": 4,
+      "title": "Open SHORT Positions",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT symbol, entered_at, deadline_at,\n       entry_price, remaining_size AS qty_left,\n       stop_price, target_price AS tp1, tp2_price, tp3_price,\n       tp1_executed, tp2_executed, tp3_executed,\n       round((entry_price - coalesce(last_mark_price, entry_price)) * remaining_size, 4) AS unrealized_usdt,\n       round(funding_paid, 6) AS funding_paid\nFROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN'\nORDER BY entered_at;",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "description": "Live SHORT positions. Entry facts (entered_at, deadline_at, prices, original size) are immutable; only remaining_size and the stage flags move as the ladder executes."
+    },
+    {
+      "id": 5,
+      "title": "TP Progress",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 5,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT symbol, status, entered_at, closed_at,\n       position_size AS original_qty, remaining_size,\n       round(100.0 * remaining_size / position_size, 2) AS remaining_pct,\n       tp1_executed, tp2_executed, tp3_executed,\n       CASE\n         WHEN tp3_executed THEN 'TP3 done (closed)'\n         WHEN tp2_executed THEN 'after TP2 (12.5% left)'\n         WHEN tp1_executed THEN 'after TP1 (50% left)'\n         ELSE 'not started (100%)'\n       END AS ladder_stage,\n       exit_reason\nFROM dds.me_long_v2_inverse_short_oos2_v1_position\nORDER BY entered_at DESC LIMIT 60;",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "description": "Partial take-profit ladder progress (Issue #276): TP1 closes 50% of the ORIGINAL quantity, TP2 closes 75% of the remainder (37.5% of original), TP3 closes all remaining (12.5%). Each stage fires at most once."
+    },
+    {
+      "id": 6,
+      "title": "Partial TP Executions (legs, NOT separate trades)",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 8,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT l.executed_at, l.symbol, l.exit_reason, l.leg_seq,\n       l.quantity, l.remaining_after, l.fill_price,\n       round(l.exit_fee, 6) AS exit_fee, round(l.net_pnl, 4) AS leg_net_pnl\nFROM dds.me_long_v2_inverse_short_oos2_v1_close_leg l\nWHERE NOT l.is_terminal\nORDER BY l.executed_at DESC LIMIT 100;",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "description": "One row per PARTIAL TP leg (TP1/TP2). A partial leg keeps the position OPEN, keeps its capacity slot and is counted inside that position's final PnL — these rows are NEVER separate closed trades."
+    },
+    {
+      "id": 7,
+      "title": "Closed Positions (full trades)",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 14,
+        "w": 8,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT symbol, entered_at, closed_at, exit_reason,\n       position_size AS original_qty, entry_price, exit_price,\n       round(net_pnl, 4) AS net_pnl\nFROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='CLOSED'\nORDER BY closed_at DESC LIMIT 50;",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "description": "One row per FINALIZED position (terminal exit: TP3 / STOP_LOSS / STOP_LOSS_GAP / TIMEOUT). A position that fired partial TPs before closing is still exactly ONE closed trade."
+    },
+    {
+      "id": 8,
+      "title": "Wins / Losses by symbol (closed positions)",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 14,
+        "w": 8,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT symbol,\n       count(*) AS closed_trades,\n       count(*) FILTER (WHERE net_pnl > 0) AS wins,\n       count(*) FILTER (WHERE net_pnl <= 0) AS losses,\n       round(sum(net_pnl), 4) AS net_pnl\nFROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='CLOSED'\nGROUP BY symbol ORDER BY net_pnl;",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "description": "Wins/losses count FINALIZED POSITIONS only — a partial TP is a leg of the same trade, never an extra win."
+    },
+    {
+      "id": 9,
+      "title": "Equity Curve (realized PnL over time)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 16,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT t AS time, sum(delta) OVER (ORDER BY t, kind) AS realized_pnl\nFROM (\n  SELECT closed_at AS t, 0 AS kind, net_pnl AS delta\n    FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='CLOSED'\n  UNION ALL\n  SELECT l.executed_at, 1, l.gross_pnl - l.exit_fee - l.exit_slippage\n    FROM dds.me_long_v2_inverse_short_oos2_v1_close_leg l\n    JOIN dds.me_long_v2_inverse_short_oos2_v1_position p ON p.position_key = l.position_key\n   WHERE NOT l.is_terminal AND p.status = 'OPEN'\n  UNION ALL\n  SELECT p.entered_at, 2, -(p.entry_fee + p.entry_slippage + p.funding_paid)\n    FROM dds.me_long_v2_inverse_short_oos2_v1_position p WHERE p.status = 'OPEN'\n) q\nORDER BY t;",
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "unit": "USDT",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Cumulative realized PnL from the contour's own balance ledger: finalized position net_pnl at close + committed partial TP legs of still-open positions − their entry costs/funding at entry. No amount is counted twice."
+    },
+    {
+      "id": 10,
+      "title": "Source Capture / Expired / Capacity Rejected / Errors",
+      "type": "stat",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 23,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT count(*) AS value FROM dds.me_long_v2_inverse_short_oos2_v1_event WHERE status='CAPTURED';",
+          "format": "table"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT count(*) AS value FROM dds.me_long_v2_inverse_short_oos2_v1_event WHERE status='EXPIRED';",
+          "format": "table"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT count(*) AS value FROM dds.me_long_v2_inverse_short_oos2_v1_event WHERE status='CAPACITY_REJECTED';",
+          "format": "table"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT count(*) AS value FROM dds.scanner_error\nWHERE error_type = 'ME_INVERSE_SHORT_OOS2_SOURCE_CAPTURE_ERROR';",
+          "format": "table"
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT count(*) AS value FROM dds.me_long_v2_inverse_short_oos2_v1_event WHERE status='ENTERED';",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        }
+      },
+      "description": "Source pipeline health (fail-open capture with counters): CAPTURED = eligible (age < 120 min TTL), ENTERED = source events that opened a position (event ledger), EXPIRED = terminal TTL refusal, CAPACITY_REJECTED = terminal TTL refusal while the 12-local capacity was binding (ENTRY_CAP), errors = ME_INVERSE_SHORT_OOS2_SOURCE_CAPTURE_ERROR rows in dds.scanner_error (scanner itself never affected)."
+    }
+  ]
+}
