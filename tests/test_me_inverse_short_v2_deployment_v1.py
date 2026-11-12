@@ -8,6 +8,15 @@ Covers, without touching any real database or systemd:
   ever reaches the (fake) connection, nothing is ever committed, and no
   credential/secret value can appear in the JSON report or the CLI
   output (exit code 0 only when ready);
+* the P1 effective-systemd audit — the preflight resolves the EFFECTIVE
+  unit configuration (base fragment + ordered drop-in overrides with
+  ``ExecStart=`` resets, as loaded by systemd) from mocked
+  ``systemctl show`` output and compares ExecStart/WorkingDirectory/
+  EnvironmentFiles/MainPID/FragmentPath and the running process against
+  it: a correct drop-in over an old base unit passes, a stale process, a
+  workdir/python/fragment mismatch or a V2 flag left on fails, and
+  missing/unconfirmable/pending systemd metadata is always
+  ``NOT_VERIFIED`` (never a false PASS, never a restart);
 * the P2 Scanner runtime audit — the preflight checks the EXPLICIT
   production Scanner checkout (``--scanner-root``), its systemd unit
   (``ExecStart``/``WorkingDirectory``/``EnvironmentFile``) and fixture
@@ -28,10 +37,12 @@ from __future__ import annotations
 import ast
 import importlib
 import json
+import shlex
 import shutil
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -331,6 +342,108 @@ def _scanner_process_fixture(
     }
 
 
+# ---------------------------------------------------------------------------
+# P1 fixtures: EFFECTIVE systemd configuration via mocked `systemctl show`
+# output in systemd's own display formats (never a real systemctl).
+# ---------------------------------------------------------------------------
+def _systemctl_show_text(
+    *, fragment_path: str, exec_start_argv: list[str] | None = None,
+    working_directory: str = "", environment_files: list[str] = (),
+    drop_in_paths: list[str] = (), main_pid: int = 4242,
+    load_state: str = "loaded", active_state: str = "active",
+    sub_state: str = "running", need_daemon_reload: bool = False,
+) -> str:
+    """Deterministic `systemctl show` output in the documented formats.
+
+    ExecStart is emitted as the structured record systemd prints — with a
+    timestamp CONTAINING SPACES, so a naive whitespace split of the whole
+    line would corrupt the argv extraction; EnvironmentFiles as one
+    ``<path> (ignore_errors=…)`` line per entry; DropInPaths as the
+    shell-quoted space-joined single line (systemd ``shell_maybe_quote`` —
+    ``shlex.quote`` here, so Windows backslashes survive the round-trip).
+    """
+    lines = [
+        f"LoadState={load_state}",
+        f"ActiveState={active_state}",
+        f"SubState={sub_state}",
+        f"MainPID={main_pid}",
+        f"FragmentPath={fragment_path}",
+        "DropInPaths=" + " ".join(
+            shlex.quote(drop_in) for drop_in in drop_in_paths
+        ),
+        f"NeedDaemonReload={'yes' if need_daemon_reload else 'no'}",
+    ]
+    if exec_start_argv:
+        lines.append(
+            "ExecStart={ path=" + exec_start_argv[0]
+            + " ; argv[]=" + " ".join(exec_start_argv)
+            + " ; ignore_errors=no"
+            + " ; start_time=[Wed 2026-11-11 12:00:00 MSK]"
+            + " ; stop_time=[n/a]"
+            + f" ; pid={main_pid}"
+            + " ; code=exited ; status=0/0 }"
+        )
+    lines.append(f"WorkingDirectory={working_directory}")
+    for env_file in environment_files:
+        lines.append(f"EnvironmentFiles={env_file} (ignore_errors=no)")
+    return "\n".join(lines) + "\n"
+
+
+def _fake_systemctl_runner(
+    text: str = "", *, returncode: int = 0,
+    error: BaseException | None = None,
+):
+    """A deterministic systemctl stand-in: records calls, returns ``text``."""
+    calls: list = []
+
+    def _runner(command, **kwargs):
+        calls.append((list(command), dict(kwargs)))
+        if error is not None:
+            raise error
+        return SimpleNamespace(returncode=returncode, stdout=text, stderr="")
+
+    _runner.calls = calls
+    return _runner
+
+
+# Captured at import: helper fixtures always use the REAL query+parser even
+# when a test monkeypatches ``preflight._query_effective_unit`` (which
+# ``run_preflight`` must see patched — this avoids recursive patching).
+_QUERY_EFFECTIVE_UNIT_ORIGINAL = preflight._query_effective_unit
+
+
+def _effective_from_unit(unit_path: Path, process=None, **overrides) -> dict:
+    """Effective config systemd WOULD report for this unit file (no drop-ins).
+
+    Drives the REAL parser (``_parse_effective_unit``) through the mocked
+    ``systemctl show`` runner, so every default scenario exercises the
+    effective-unit resolution path; scenarios with drop-ins build their own
+    show text explicitly.
+    """
+    directives = preflight._read_unit_directives(unit_path)
+    if directives is None:
+        show_text = _systemctl_show_text(
+            fragment_path="", exec_start_argv=None, load_state="not-found",
+            active_state="inactive", sub_state="dead", main_pid=0,
+        )
+    else:
+        exec_start = (directives.get("ExecStart") or [""])[0]
+        main_pid = 4242
+        if isinstance(process, dict) and process.get("pid"):
+            main_pid = int(process["pid"])
+        show_text = _systemctl_show_text(
+            fragment_path=str(unit_path),
+            exec_start_argv=exec_start.split() if exec_start else None,
+            working_directory=(directives.get("WorkingDirectory") or [""])[0],
+            environment_files=directives.get("EnvironmentFile") or [],
+            main_pid=main_pid,
+            **overrides,
+        )
+    return _QUERY_EFFECTIVE_UNIT_ORIGINAL(
+        unit_path, runner=_fake_systemctl_runner(show_text),
+    )
+
+
 @pytest.fixture
 def env_files(tmp_path):
     runtime = tmp_path / "v2-runtime.env"
@@ -349,19 +462,22 @@ def env_files(tmp_path):
 
 
 _PROCESS_AUTO = object()
+_EFFECTIVE_AUTO = object()
 
 
 def _run(runtime: Path, scanner: Path, results: list, *, repo_root=None,
          scanner_root: Path | None = None, scanner_unit_path: Path | None = None,
-         scanner_process=_PROCESS_AUTO):
-    """run_preflight with fixture Scanner checkout/unit/process metadata.
+         scanner_process=_PROCESS_AUTO, scanner_effective=_EFFECTIVE_AUTO):
+    """run_preflight with fixture Scanner checkout/unit/process/effective.
 
     ``scanner_root`` defaults to a REAL temporary Scanner checkout built
     next to the env files (sources + a valid fixture virtualenv — the
     interpreter validation needs an actual ``pyvenv.cfg`` layout);
     ``scanner_unit_path`` defaults to the unit installed next to the env
     files, pointing at that checkout; ``scanner_process`` defaults to
-    matching metadata — scenarios override each ingredient.
+    matching metadata and ``scanner_effective`` to the configuration
+    systemd would report for that unit — scenarios override each
+    ingredient.
     """
     if scanner_root is None:
         scanner_root = _make_scanner_checkout(
@@ -375,6 +491,10 @@ def _run(runtime: Path, scanner: Path, results: list, *, repo_root=None,
         scanner_process = _scanner_process_fixture(
             scanner_root, unit=scanner_unit_path,
         )
+    if scanner_effective is _EFFECTIVE_AUTO:
+        scanner_effective = _effective_from_unit(
+            scanner_unit_path, scanner_process,
+        )
     connect = _fake_connect_factory(results)
     result = preflight.run_preflight(
         runtime,
@@ -384,6 +504,7 @@ def _run(runtime: Path, scanner: Path, results: list, *, repo_root=None,
         scanner_root=scanner_root,
         scanner_unit_path=scanner_unit_path,
         scanner_process=scanner_process,
+        scanner_effective=scanner_effective,
     )
     return result, _fake_connect_factory.last_connection
 
@@ -1252,6 +1373,10 @@ class TestPreflightCli:
                 checkout, unit=unit,
             ),
         )
+        monkeypatch.setattr(
+            preflight, "_query_effective_unit",
+            lambda _unit_path=None, **_kwargs: _effective_from_unit(unit),
+        )
         code = preflight.main([
             "--env-file", str(runtime),
             "--scanner-env-file", str(scanner),
@@ -1551,3 +1676,727 @@ class TestRuntimePathIsolation:
         assert v2.DEFAULT_LOCK_FILE.name != v1.DEFAULT_LOCK_FILE.name
         assert v2.DEFAULT_HEARTBEAT_FILE.name != v1.DEFAULT_HEARTBEAT_FILE.name
         assert v2.DEFAULT_LOG_FILE.name != v1.DEFAULT_LOG_FILE.name
+
+
+# ---------------------------------------------------------------------------
+# 7. P1 — the EFFECTIVE systemd configuration (base fragment + ordered
+#    drop-in overrides) resolved from mocked `systemctl show` output.
+#    Nothing here runs a real systemctl, reads a real /proc or restarts
+#    anything: deterministic fixtures only.
+# ---------------------------------------------------------------------------
+def _effective_show(unit_path: Path, **show_kwargs) -> dict:
+    """Parse mocked `systemctl show` text through the REAL query+parser."""
+    show_text = _systemctl_show_text(**show_kwargs)
+    return preflight._query_effective_unit(
+        unit_path, runner=_fake_systemctl_runner(show_text),
+    )
+
+
+def _dropin_scenario(tmp_path, env_files, *, venv_style="copy"):
+    """Base unit → OLD release; effective config → NEW release (drop-in).
+
+    The drop-in file is REAL on disk — with an ``ExecStart=`` reset plus
+    the new ExecStart/WorkingDirectory — and is listed in the mocked
+    ``DropInPaths``, exactly like a staged Scanner switch.  Returns
+    ``(runtime, scanner, old, new, unit, dropin, process, effective)``.
+    """
+    runtime, scanner = env_files
+    old = _make_scanner_checkout(tmp_path, "old-release",
+                                 venv_style=venv_style)
+    new = _make_scanner_checkout(tmp_path, "v2-release",
+                                 venv_style=venv_style)
+    unit = _write_scanner_unit(tmp_path / "scanner-unit.service", old,
+                               scanner)
+    dropin_dir = Path(f"{unit}.d")
+    dropin_dir.mkdir(parents=True, exist_ok=True)
+    dropin = dropin_dir / "20-scanner-v2-release.conf"
+    dropin.write_text(
+        "[Service]\n"
+        "ExecStart=\n"
+        f"ExecStart={new.as_posix()}/.venv/bin/python "
+        f"{new.as_posix()}/scanner_runner.py\n"
+        f"WorkingDirectory={new.as_posix()}\n"
+        "Environment=ME_INVERSE_SHORT_V2_ENABLED=0\n",
+        encoding="utf-8",
+    )
+    process = _scanner_process_fixture(new, unit=unit)
+    effective = _effective_show(
+        unit,
+        fragment_path=str(unit),
+        exec_start_argv=[
+            f"{new.as_posix()}/.venv/bin/python",
+            f"{new.as_posix()}/scanner_runner.py",
+        ],
+        working_directory=new.as_posix(),
+        environment_files=[scanner.as_posix()],
+        drop_in_paths=[str(dropin)],
+    )
+    return runtime, scanner, old, new, unit, dropin, process, effective
+
+
+def _assert_ready(result):
+    assert result["ready_for_activation"] is True
+    assert result["result"] == "READY_FOR_ACTIVATION"
+    for name in preflight.CHECK_NAMES:
+        assert result["checks"][name]["status"] == preflight.STATUS_PASS, (
+            name, result["checks"][name],
+        )
+
+
+class TestEffectiveSystemdDropIns:
+    """P1 acceptance: effective unit with ordered drop-ins — a correct
+    drop-in over an old base unit passes, clear mismatches FAIL, and
+    missing/unconfirmable/pending systemd metadata is NOT_VERIFIED."""
+
+    def test_base_unit_old_but_effective_dropin_matches_root_passes(
+        self, env_files, tmp_path,
+    ):
+        runtime, scanner, old, new, unit, dropin, process, effective = \
+            _dropin_scenario(tmp_path, env_files)
+        # The BASE unit still points at the OLD release — the base-file-only
+        # comparison used to false-fail here (SCANNER_UNIT_CHECKOUT_MISMATCH);
+        # the effective drop-in is what systemd actually loaded:
+        base = unit.read_text(encoding="utf-8")
+        assert f"{old.as_posix()}/scanner_runner.py" in base
+        assert f"{new.as_posix()}/scanner_runner.py" not in base
+        assert effective["exec_start"]["argv"][0] == \
+            f"{new.as_posix()}/.venv/bin/python"
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        _assert_ready(result)
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert "SCANNER_UNIT_CHECKOUT_MISMATCH" not in check["reason"]
+        assert "with 1 drop-in override(s)" in check["detail"]
+
+    def test_multiple_sequential_dropins_pass(self, env_files, tmp_path):
+        """Several drop-ins in lexical load order (canary, release, SRR
+        capture): the effective config is their merge → PASS."""
+        runtime, scanner, old, new, unit, dropin, process, _ = \
+            _dropin_scenario(tmp_path, env_files)
+        dropin_dir = Path(f"{unit}.d")
+        canary = dropin_dir / "10-scanner-canary.conf"
+        canary.write_text(
+            "[Service]\nEnvironment=SCANNER_CANARY_INTERVAL=60\n",
+            encoding="utf-8",
+        )
+        capture = dropin_dir / "30-srr-capture.conf"
+        capture.write_text(
+            "[Service]\nEnvironment=ME_SHORT_A_CAPTURE_ENABLED=1\n",
+            encoding="utf-8",
+        )
+        effective = _effective_show(
+            unit,
+            fragment_path=str(unit),
+            exec_start_argv=[
+                f"{new.as_posix()}/.venv/bin/python",
+                f"{new.as_posix()}/scanner_runner.py",
+            ],
+            working_directory=new.as_posix(),
+            environment_files=[scanner.as_posix()],
+            drop_in_paths=[str(canary), str(dropin), str(capture)],
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        _assert_ready(result)
+        assert "with 3 drop-in override(s)" in \
+            result["checks"]["V2_SOURCE_CAPTURE_READY"]["detail"]
+
+    def test_execstart_reset_in_dropin_is_honored(self, env_files, tmp_path):
+        """The drop-in's ``ExecStart=`` reset + replacement is what systemd
+        loads: the effective ExecStart is the new command only."""
+        runtime, scanner, old, new, unit, dropin, process, effective = \
+            _dropin_scenario(tmp_path, env_files)
+        dropin_text = dropin.read_text(encoding="utf-8")
+        assert "ExecStart=\n" in dropin_text  # the reset line on disk
+        base = unit.read_text(encoding="utf-8")
+        assert f"{old.as_posix()}/scanner_runner.py" in base
+        assert effective["exec_start"]["argv"] == [
+            f"{new.as_posix()}/.venv/bin/python",
+            f"{new.as_posix()}/scanner_runner.py",
+        ]
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        _assert_ready(result)
+
+    def test_stale_scanner_on_old_release_fails(self, env_files, tmp_path):
+        """Old Scanner process running despite the proposed new drop-in —
+        never PASS (clear process/effective mismatch → FAIL)."""
+        runtime, scanner, old, new, unit, dropin, _, effective = \
+            _dropin_scenario(tmp_path, env_files)
+        stale_process = _scanner_process_fixture(old, unit=unit)
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=stale_process, scanner_effective=effective,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert "scanner_process_matches_unit:SCANNER_PROCESS_UNIT_MISMATCH" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+        assert result["result"] == "NOT_READY"
+
+    def test_effective_workdir_mismatch_fails(self, env_files, tmp_path):
+        runtime, scanner = env_files
+        new = _make_scanner_checkout(tmp_path, "v2-release")
+        elsewhere = _make_scanner_checkout(tmp_path, "elsewhere")
+        unit = _write_scanner_unit(tmp_path / "scanner-unit.service", new,
+                                   scanner)
+        dropin_dir = Path(f"{unit}.d")
+        dropin_dir.mkdir(parents=True, exist_ok=True)
+        dropin = dropin_dir / "20-scanner-v2-release.conf"
+        dropin.write_text(
+            f"[Service]\nWorkingDirectory={elsewhere.as_posix()}\n",
+            encoding="utf-8",
+        )
+        process = _scanner_process_fixture(new, unit=unit)
+        effective = _effective_show(
+            unit,
+            fragment_path=str(unit),
+            exec_start_argv=[
+                f"{new.as_posix()}/.venv/bin/python",
+                f"{new.as_posix()}/scanner_runner.py",
+            ],
+            working_directory=elsewhere.as_posix(),
+            environment_files=[scanner.as_posix()],
+            drop_in_paths=[str(dropin)],
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert "scanner_unit_matches_checkout:SCANNER_UNIT_CHECKOUT_MISMATCH" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_effective_python_from_other_checkout_fails(
+        self, env_files, tmp_path,
+    ):
+        runtime, scanner = env_files
+        new = _make_scanner_checkout(tmp_path, "v2-release")
+        other = _make_scanner_checkout(tmp_path, "other-checkout")
+        unit = _write_scanner_unit(tmp_path / "scanner-unit.service", new,
+                                   scanner)
+        dropin_dir = Path(f"{unit}.d")
+        dropin_dir.mkdir(parents=True, exist_ok=True)
+        dropin = dropin_dir / "20-scanner-v2-release.conf"
+        dropin.write_text(
+            "[Service]\nExecStart=\n"
+            f"ExecStart={other.as_posix()}/.venv/bin/python "
+            f"{new.as_posix()}/scanner_runner.py\n"
+            f"WorkingDirectory={new.as_posix()}\n",
+            encoding="utf-8",
+        )
+        process = _scanner_process_fixture(new, unit=unit)
+        effective = _effective_show(
+            unit,
+            fragment_path=str(unit),
+            exec_start_argv=[
+                f"{other.as_posix()}/.venv/bin/python",
+                f"{new.as_posix()}/scanner_runner.py",
+            ],
+            working_directory=new.as_posix(),
+            environment_files=[scanner.as_posix()],
+            drop_in_paths=[str(dropin)],
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert "scanner_unit_matches_checkout:SCANNER_PYTHON_OUTSIDE_CHECKOUT" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_old_effective_release_with_new_scanner_root_fails(
+        self, env_files, tmp_path,
+    ):
+        """Effective config still on the OLD release while --scanner-root
+        audits the candidate one → structural FAIL, never PASS."""
+        runtime, scanner = env_files
+        old = _make_scanner_checkout(tmp_path, "old-release")
+        new = _make_scanner_checkout(tmp_path, "v2-release")
+        unit = _write_scanner_unit(tmp_path / "scanner-unit.service", old,
+                                   scanner)
+        process = _scanner_process_fixture(old, unit=unit)
+        effective = _effective_from_unit(unit, process)
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert "scanner_unit_matches_checkout:SCANNER_UNIT_CHECKOUT_MISMATCH" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_dropin_environment_flag_does_not_substitute_env_file(
+        self, env_files, tmp_path,
+    ):
+        """An ``Environment=ME_INVERSE_SHORT_V2_ENABLED=0`` drop-in line
+        never substitutes for the Scanner .env check: without the flag in
+        the env FILE the result is NOT_VERIFIED, never PASS."""
+        runtime, scanner, old, new, unit, dropin, process, effective = \
+            _dropin_scenario(tmp_path, env_files)
+        assert "Environment=ME_INVERSE_SHORT_V2_ENABLED=0" in \
+            dropin.read_text(encoding="utf-8")
+        scanner.write_text(
+            "# scanner fragment WITHOUT the V2 flag\n"
+            "DB_HOST=127.0.0.1\n"
+            "DB_PORT=5432\n"
+            "DB_NAME=trad_bot\n"
+            "DB_USER=postgres\n"
+            f"DB_PASSWORD={RUNTIME_PASSWORD}\n",
+            encoding="utf-8",
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_NOT_VERIFIED
+        assert "scanner_flag:SCANNER_FLAG_NOT_CONFIGURED" in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_effective_environmentfiles_without_scanner_env_fails(
+        self, env_files, tmp_path,
+    ):
+        runtime, scanner, old, new, unit, dropin, process, _ = \
+            _dropin_scenario(tmp_path, env_files)
+        other_env = tmp_path / "other-scanner.env"
+        other_env.write_text(
+            f"ME_INVERSE_SHORT_V2_ENABLED=0\nDB_PASSWORD={RUNTIME_PASSWORD}\n",
+            encoding="utf-8",
+        )
+        effective = _effective_show(
+            unit,
+            fragment_path=str(unit),
+            exec_start_argv=[
+                f"{new.as_posix()}/.venv/bin/python",
+                f"{new.as_posix()}/scanner_runner.py",
+            ],
+            working_directory=new.as_posix(),
+            environment_files=[str(other_env)],
+            drop_in_paths=[str(dropin)],
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert "scanner_unit_env:SCANNER_UNIT_ENV_MISMATCH" in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_missing_systemd_metadata_is_not_verified(
+        self, env_files, tmp_path,
+    ):
+        runtime, scanner, old, new, unit, dropin, process, _ = \
+            _dropin_scenario(tmp_path, env_files)
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process,
+            scanner_effective={
+                "available": False,
+                "reason": "SCANNER_SYSTEMCTL_UNAVAILABLE",
+            },
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_NOT_VERIFIED
+        assert "scanner_effective_unit:SCANNER_SYSTEMCTL_UNAVAILABLE" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+        assert result["result"] != "READY_FOR_ACTIVATION"
+
+    def test_unconfirmable_mainpid_is_not_verified(self, env_files, tmp_path):
+        runtime, scanner, old, new, unit, dropin, process, _ = \
+            _dropin_scenario(tmp_path, env_files)
+        effective = _effective_show(
+            unit,
+            fragment_path=str(unit),
+            exec_start_argv=[
+                f"{new.as_posix()}/.venv/bin/python",
+                f"{new.as_posix()}/scanner_runner.py",
+            ],
+            working_directory=new.as_posix(),
+            environment_files=[scanner.as_posix()],
+            drop_in_paths=[str(dropin)],
+            main_pid=0,
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_NOT_VERIFIED
+        assert "scanner_process_matches_unit:SCANNER_MAINPID_UNCONFIRMABLE" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_pending_daemon_reload_is_not_verified(self, env_files, tmp_path):
+        runtime, scanner, old, new, unit, dropin, process, _ = \
+            _dropin_scenario(tmp_path, env_files)
+        effective = _effective_show(
+            unit,
+            fragment_path=str(unit),
+            exec_start_argv=[
+                f"{new.as_posix()}/.venv/bin/python",
+                f"{new.as_posix()}/scanner_runner.py",
+            ],
+            working_directory=new.as_posix(),
+            environment_files=[scanner.as_posix()],
+            drop_in_paths=[str(dropin)],
+            need_daemon_reload=True,
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_NOT_VERIFIED
+        assert "scanner_effective_unit:SCANNER_UNIT_RELOAD_PENDING" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_orphaned_dropin_is_not_verified(self, env_files, tmp_path):
+        """A drop-in listed as LOADED but missing on disk → NOT_VERIFIED."""
+        runtime, scanner, old, new, unit, dropin, process, _ = \
+            _dropin_scenario(tmp_path, env_files)
+        removed = Path(f"{unit}.d") / "99-removed.conf"  # never written
+        effective = _effective_show(
+            unit,
+            fragment_path=str(unit),
+            exec_start_argv=[
+                f"{new.as_posix()}/.venv/bin/python",
+                f"{new.as_posix()}/scanner_runner.py",
+            ],
+            working_directory=new.as_posix(),
+            environment_files=[scanner.as_posix()],
+            drop_in_paths=[str(dropin), str(removed)],
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_NOT_VERIFIED
+        assert "scanner_effective_unit:SCANNER_UNIT_DROPIN_ORPHANED" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_staged_dropin_without_daemon_reload_is_not_verified(
+        self, env_files, tmp_path,
+    ):
+        """A drop-in on disk that systemd has NOT loaded (classic staged
+        switch without daemon-reload) → NOT_VERIFIED, never PASS."""
+        runtime, scanner, old, new, unit, dropin, process, _ = \
+            _dropin_scenario(tmp_path, env_files)
+        staged = Path(f"{unit}.d") / "99-staged-not-loaded.conf"
+        staged.write_text("[Service]\nEnvironment=STAGED=1\n",
+                          encoding="utf-8")
+        effective = _effective_show(
+            unit,
+            fragment_path=str(unit),
+            exec_start_argv=[
+                f"{new.as_posix()}/.venv/bin/python",
+                f"{new.as_posix()}/scanner_runner.py",
+            ],
+            working_directory=new.as_posix(),
+            environment_files=[scanner.as_posix()],
+            drop_in_paths=[str(dropin)],  # the staged file is NOT loaded
+            need_daemon_reload=False,     # even when systemd hasn't noticed
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_NOT_VERIFIED
+        assert "scanner_effective_unit:SCANNER_UNIT_DROPIN_PENDING" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_fragment_path_mismatch_fails(self, env_files, tmp_path):
+        runtime, scanner, old, new, unit, dropin, process, _ = \
+            _dropin_scenario(tmp_path, env_files)
+        effective = _effective_show(
+            unit,
+            fragment_path=str(tmp_path / "lib-systemd-scanner.service"),
+            exec_start_argv=[
+                f"{new.as_posix()}/.venv/bin/python",
+                f"{new.as_posix()}/scanner_runner.py",
+            ],
+            working_directory=new.as_posix(),
+            environment_files=[scanner.as_posix()],
+            drop_in_paths=[str(dropin)],
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert "scanner_effective_unit:SCANNER_UNIT_FRAGMENT_MISMATCH" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_loadstate_not_found_is_not_verified(self, env_files, tmp_path):
+        runtime, scanner, old, new, unit, dropin, process, _ = \
+            _dropin_scenario(tmp_path, env_files)
+        effective = _effective_show(
+            unit,
+            fragment_path="",
+            exec_start_argv=None,
+            load_state="not-found",
+            active_state="inactive",
+            sub_state="dead",
+            main_pid=0,
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_NOT_VERIFIED
+        assert "scanner_effective_unit:SCANNER_UNIT_NOT_LOADED" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+    def test_symlink_venv_with_effective_dropin_passes(
+        self, env_files, tmp_path,
+    ):
+        """The standard Linux symlink venv through an effective drop-in
+        PASSES (runs on Linux; skipped where file symlinks are denied —
+        a skip never counts as success)."""
+        runtime, scanner, old, new, unit, dropin, process, effective = \
+            _dropin_scenario(tmp_path, env_files, venv_style="symlink")
+        exe = new.joinpath(".venv/bin/python")
+        assert exe.is_symlink()
+        resolved = exe.resolve()
+        assert not str(resolved).startswith(str(new.resolve()))
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        _assert_ready(result)
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert "pyvenv.cfg present" in check["detail"]
+
+    def test_foreign_venv_with_effective_dropin_fails(
+        self, env_files, tmp_path,
+    ):
+        """A foreign virtualenv substituted under the effective drop-in →
+        FAIL (never PASS)."""
+        runtime, scanner = env_files
+        new = _make_scanner_checkout(tmp_path, "v2-release")
+        foreign = _make_scanner_checkout(tmp_path, "foreign-checkout")
+        shutil.rmtree(new / ".venv")
+        _link_dir_or_skip(new / ".venv", foreign / ".venv")
+        unit = _write_scanner_unit(tmp_path / "scanner-unit.service", new,
+                                   scanner)
+        dropin_dir = Path(f"{unit}.d")
+        dropin_dir.mkdir(parents=True, exist_ok=True)
+        dropin = dropin_dir / "20-scanner-v2-release.conf"
+        dropin.write_text(
+            "[Service]\nExecStart=\n"
+            f"ExecStart={new.as_posix()}/.venv/bin/python "
+            f"{new.as_posix()}/scanner_runner.py\n"
+            f"WorkingDirectory={new.as_posix()}\n",
+            encoding="utf-8",
+        )
+        process = _scanner_process_fixture(new, unit=unit)
+        effective = _effective_show(
+            unit,
+            fragment_path=str(unit),
+            exec_start_argv=[
+                f"{new.as_posix()}/.venv/bin/python",
+                f"{new.as_posix()}/scanner_runner.py",
+            ],
+            working_directory=new.as_posix(),
+            environment_files=[scanner.as_posix()],
+            drop_in_paths=[str(dropin)],
+        )
+        result, _ = _run(
+            runtime, scanner, _happy_db_results(), repo_root=PROJECT_ROOT,
+            scanner_root=new, scanner_unit_path=unit,
+            scanner_process=process, scanner_effective=effective,
+        )
+        check = result["checks"]["V2_SOURCE_CAPTURE_READY"]
+        assert check["status"] == preflight.STATUS_FAIL
+        assert "scanner_unit_matches_checkout:SCANNER_VENV_SYMLINK_ESCAPE" \
+            in check["reason"]
+        assert result["ready_for_activation"] is False
+
+
+class TestEffectiveUnitShowParsing:
+    """The `systemctl show` parser itself: documented display formats,
+    explicit ambiguity handling, and a strictly read-only command."""
+
+    def test_execstart_parses_despite_spaced_timestamps(self):
+        text = _systemctl_show_text(
+            fragment_path="/etc/systemd/system/trad-bot-scanner.service",
+            exec_start_argv=[
+                "/opt/trad_bot/.venv/bin/python",
+                "/opt/trad_bot/scanner_runner.py",
+            ],
+            working_directory="/opt/trad_bot",
+            environment_files=["/opt/trad_bot/.env"],
+        )
+        parsed = preflight._parse_effective_unit(text)
+        assert parsed["available"] is True
+        assert parsed["exec_start"]["argv"] == [
+            "/opt/trad_bot/.venv/bin/python",
+            "/opt/trad_bot/scanner_runner.py",
+        ]
+        assert parsed["exec_start"]["path"] == \
+            "/opt/trad_bot/.venv/bin/python"
+        assert parsed["working_directory"] == "/opt/trad_bot"
+        assert parsed["environment_files"] == ["/opt/trad_bot/.env"]
+        assert parsed["fragment_path"] == \
+            "/etc/systemd/system/trad-bot-scanner.service"
+        assert parsed["main_pid"] == 4242
+        assert parsed["need_daemon_reload"] is False
+
+    def test_execstart_path_field_is_not_whitespace_split(self):
+        """The ``path=`` field may contain spaces: extraction is anchored
+        on the `` ; argv[]=`` separator, never on whitespace, and the
+        spaced timestamp must not leak into argv either."""
+        text = _systemctl_show_text(
+            fragment_path="/x.service",
+            exec_start_argv=[
+                "/opt/trad bot/.venv/bin/python",
+                "/opt/trad bot/scanner_runner.py",
+            ],
+        )
+        parsed = preflight._parse_effective_unit(text)
+        assert parsed["available"] is True
+        assert parsed["exec_start"]["path"] == \
+            "/opt/trad bot/.venv/bin/python"
+        argv = parsed["exec_start"]["argv"]
+        assert " ".join(argv) == (
+            "/opt/trad bot/.venv/bin/python /opt/trad bot/scanner_runner.py"
+        )
+        assert not any("MSK" in token or "2026" in token for token in argv)
+
+    def test_environmentfiles_lines_and_optional_prefix(self):
+        text = _systemctl_show_text(
+            fragment_path="/x.service",
+            exec_start_argv=["/p/py", "/p/scanner_runner.py"],
+            environment_files=["/opt/trad_bot/.env", "-/opt/extra.env"],
+        )
+        parsed = preflight._parse_effective_unit(text)
+        assert parsed["environment_files"] == [
+            "/opt/trad_bot/.env", "/opt/extra.env",
+        ]
+
+    def test_dropinpaths_shell_quoted_list(self):
+        text = _systemctl_show_text(
+            fragment_path="/x.service",
+            exec_start_argv=["/p/py", "/p/scanner_runner.py"],
+        ).replace(
+            "DropInPaths=\n",
+            'DropInPaths=/etc/a.conf "/etc/b c.conf"\n',
+        )
+        parsed = preflight._parse_effective_unit(text)
+        assert parsed["drop_in_paths"] == ["/etc/a.conf", "/etc/b c.conf"]
+
+    def test_malformed_execstart_is_never_passed(self):
+        parsed = preflight._parse_effective_unit(
+            "LoadState=loaded\nExecStart={ not a record }\n",
+        )
+        assert parsed["available"] is False
+        assert parsed["reason"] == "SCANNER_UNIT_EXEC_UNPARSABLE"
+
+    def test_multiple_execstart_entries_are_ambiguous(self):
+        text = _systemctl_show_text(
+            fragment_path="/x.service",
+            exec_start_argv=["/p/py", "/p/scanner_runner.py"],
+        )
+        exec_line = next(
+            line for line in text.splitlines()
+            if line.startswith("ExecStart=")
+        )
+        parsed = preflight._parse_effective_unit(text + exec_line + "\n")
+        assert parsed["available"] is False
+        assert parsed["reason"] == "SCANNER_UNIT_EXEC_AMBIGUOUS"
+
+    def test_not_found_load_state_is_not_loaded(self):
+        parsed = preflight._parse_effective_unit(_systemctl_show_text(
+            fragment_path="", exec_start_argv=None, load_state="not-found",
+            active_state="inactive", sub_state="dead", main_pid=0,
+        ))
+        assert parsed["available"] is False
+        assert parsed["reason"] == "SCANNER_UNIT_NOT_LOADED"
+
+    def test_query_is_a_read_only_systemctl_show(self):
+        runner = _fake_systemctl_runner(_systemctl_show_text(
+            fragment_path="/etc/systemd/system/trad-bot-scanner.service",
+            exec_start_argv=["/p/py", "/p/scanner_runner.py"],
+        ))
+        parsed = preflight._query_effective_unit(
+            Path("/etc/systemd/system/trad-bot-scanner.service"),
+            runner=runner,
+        )
+        assert parsed["available"] is True
+        assert len(runner.calls) == 1
+        command, kwargs = runner.calls[0]
+        assert command[:3] == [
+            "systemctl", "show", "trad-bot-scanner.service",
+        ]
+        assert "--no-pager" in command
+        properties = command[-1]
+        for prop in (
+            "LoadState", "ActiveState", "SubState", "MainPID",
+            "FragmentPath", "DropInPaths", "NeedDaemonReload", "ExecStart",
+            "WorkingDirectory", "EnvironmentFiles",
+        ):
+            assert prop in properties
+        # No mutation verb may ever appear in the command:
+        for verb in (
+            "start", "stop", "restart", "reload", "daemon-reload",
+            "enable", "disable", "mask", "kill", "reset-failed",
+        ):
+            assert verb not in command
+        assert kwargs.get("capture_output") is True
+        assert kwargs.get("text") is True
+
+    def test_query_failures_are_not_verified(self):
+        failing = preflight._query_effective_unit(
+            Path("/x.service"),
+            runner=_fake_systemctl_runner("", returncode=1),
+        )
+        assert failing["available"] is False
+        assert failing["reason"] == "SCANNER_SYSTEMCTL_SHOW_FAILED"
+        raising = preflight._query_effective_unit(
+            Path("/x.service"),
+            runner=_fake_systemctl_runner(
+                "", error=FileNotFoundError("systemctl"),
+            ),
+        )
+        assert raising["available"] is False
+        assert raising["reason"] == "SCANNER_SYSTEMCTL_UNAVAILABLE"

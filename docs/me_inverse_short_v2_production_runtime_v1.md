@@ -260,8 +260,10 @@ Safe sequence — any Scanner update or restart is a **separate
 operational GO**, never part of a V2 activation approval:
 
 1. Check the current production Scanner version
-   (`git -C /opt/trad_bot rev-parse HEAD`, `stat -c '%y' /opt/trad_bot/scanner_runner.py`,
-   `systemctl show trad-bot-scanner.service -p ExecStart,MainPID,FragmentPath`).
+   (`git -C /opt/trad_bot rev-parse HEAD`, `stat -c '%y' /opt/trad_bot/scanner_runner.py`)
+   and read the **effective** systemd configuration — base fragment plus
+   its ordered drop-in overrides, exactly what the running process was
+   started from (see "Effective unit verification" below).
 2. Confirm the required V2 source capture is present in the TARGET
    Scanner release (both hooks + `_capture_me_inverse_short_v2_source`
    delivery + `ROUTE_PRE_FILTER_SOURCE` routing — the preflight's
@@ -273,11 +275,14 @@ operational GO**, never part of a V2 activation approval:
    still `0`.
 5. Obtain a **separate, explicit GO** to install/restart the production
    Scanner (this document/task does NOT grant it).
-6. Only after that GO: install, restart ONLY `trad-bot-scanner.service`,
-   then verify the effective version of the RUNNING process
-   (`systemctl show … -p MainPID`, `/proc/<pid>/cmdline`,
-   start time vs source mtimes) — sources updated after process start
-   mean the process may still hold pre-update code.
+6. Only after that GO: stage the drop-in override (never edit the base
+   unit), `sudo systemctl daemon-reload`, restart ONLY
+   `trad-bot-scanner.service`, then verify the RUNNING process against
+   the effective unit (`systemctl show … -p MainPID`,
+   `/proc/<pid>/cmdline`, `/proc/<pid>/cwd`, start time vs source
+   mtimes) — sources updated after process start mean the process may
+   still hold pre-update code; an unconfirmable MainPID or a stale
+   process blocks readiness (`FAIL`/`NOT_VERIFIED`, never a PASS).
 7. Confirm V2 source routing on the running checkout (read-only
    preflight, see the command below: `V2_SOURCE_CAPTURE_READY=PASS`).
 8. Only after 1–7 allow the further V2 activation preflight (Step 10).
@@ -337,11 +342,69 @@ process): `{"status": "NOT_VERIFIED", "reason": "…:SCANNER_PROCESS_NOT_VERIFIA
 — `NOT_VERIFIED` never counts as satisfied; `ready_for_activation` stays
 `false`.
 
-* **STOP** if `--scanner-root` does not match the unit's
-  `ExecStart`/`WorkingDirectory`, if the running process cmdline/cwd
-  differs from the unit, if audited sources are newer than the process
-  start time, if the Scanner unit file is unreadable, or if the release
-  is ready while the Scanner checkout fails its source-routing audit.
+#### Effective unit verification (base unit + ordered drop-ins)
+
+The Scanner's unit file alone is NOT its configuration: the effective
+configuration is the base fragment plus every drop-in override in
+systemd's own load order, with `ExecStart=` resets applied. Read it
+read-only (this never starts, stops, restarts or reloads anything):
+
+```bash
+systemctl show trad-bot-scanner.service --no-pager \
+  --property=LoadState,ActiveState,SubState,MainPID,FragmentPath,DropInPaths,NeedDaemonReload,ExecStart,WorkingDirectory,EnvironmentFiles
+```
+
+* `FragmentPath` must be the audited `--scanner-unit` file, and
+  `DropInPaths` must list every loaded override in load order (the
+  existing canary config, ME SHORT A fill capture, SRR fill capture and
+  V1 inverse SHORT capture are all preserved — a new override is added
+  last in lexical order, the base unit is never rewritten).
+* `ExecStart`/`WorkingDirectory` must resolve to the SAME checkout that
+  `--scanner-root` audits — the release tree the drop-ins actually run
+  (the effective drop-ins currently run `/opt/trad_bot_pr267_release`;
+  after a reviewed switch it is the staged
+  `/opt/trad_bot_scanner_v2_release`). This is a release-based checkout:
+  a base unit left pointing at an old tree is overridden by a correct
+  drop-in, and a correct-looking base unit is overridden by a wrong one —
+  the preflight compares the EFFECTIVE values, never the base file alone.
+* `EnvironmentFiles` must include the audited
+  `--scanner-env-file` (`/opt/trad_bot/.env`). An
+  `Environment=ME_INVERSE_SHORT_V2_ENABLED=0` line inside a drop-in does
+  NOT satisfy this check and never substitutes for the env-file audit.
+* `LoadState` must be `loaded` and `NeedDaemonReload` must be `no`: a
+  pending daemon-reload, a drop-in listed as loaded but missing on disk,
+  or a staged drop-in not yet loaded means disk and loaded configuration
+  differ — the preflight reports `NOT_VERIFIED`, never `PASS`.
+* `MainPID` plus `/proc/<pid>/cmdline` and `/proc/<pid>/cwd` must match
+  the effective `ExecStart`/`WorkingDirectory`, and the process start
+  time must not predate the audited sources. An old process still
+  running the previous release is a clear mismatch (`FAIL`); an
+  unconfirmable MainPID or process metadata is `NOT_VERIFIED`.
+
+Switch/rollback order for the Scanner override (each Scanner install or
+restart remains a **separate** operational GO from any V2 activation):
+
+1. Stage the new drop-in file (e.g.
+   `/etc/systemd/system/trad-bot-scanner.service.d/zz-scanner-v2-release.conf`)
+   — the base unit and the existing drop-ins stay untouched.
+2. `sudo systemctl daemon-reload`, then restart ONLY
+   `trad-bot-scanner.service` (separate GO).
+3. Re-run the Step 9/Step 10 read-only preflight against the new
+   `--scanner-root` — **no V2 activation before it reports
+   `READY_FOR_ACTIVATION`**.
+4. Rollback = remove only the staged override (restoring the previous
+   drop-in set), `sudo systemctl daemon-reload`, restart ONLY the
+   Scanner (separate GO), and re-run the preflight — the previous
+   effective configuration is restored because the base unit was never
+   modified.
+
+* **STOP** if `--scanner-root` does not match the EFFECTIVE unit's
+  `ExecStart`/`WorkingDirectory` (base + ordered drop-ins), if the
+  running process cmdline/cwd/MainPID differs from the effective unit,
+  if audited sources are newer than the process start time, if the
+  Scanner unit file or the loaded drop-ins are unreadable or pending a
+  daemon-reload, or if the release is ready while the Scanner checkout
+  fails its source-routing audit.
 * **STOP** if the Scanner's Python virtualenv cannot be validated —
   interpreter path relative/traversing outside `--scanner-root`, venv or
   `bin` directory substituted by a link to a foreign environment, missing
@@ -377,7 +440,7 @@ that may proceed to an activation request. The six independent checks:
 |---|---|
 | `DB_READY` | dedicated credentials reach the DB; migration-087 schema present; read-only transaction only |
 | `V2_RUNTIME_CONFIG_READY` | RELEASE-side: dedicated env file present/valid, flag `0`, port/DB name sane, AND the release passes the static source audit (`runtime_code_ready` = the `V2_RUNTIME_CODE_READY` concept) |
-| `V2_SOURCE_CAPTURE_READY` | SCANNER-side: the ACTUAL checkout from `--scanner-root` is audited (pre-gate publication to BOTH hooks, fail-open, flag-only, no trading-gate dependency), agrees with the systemd unit (`ExecStart`/`WorkingDirectory`/Python env/`EnvironmentFile`), the running process matches the unit and predates no audited source, and the Scanner flag/DB tuple are consistent (two-process check) |
+| `V2_SOURCE_CAPTURE_READY` | SCANNER-side: the ACTUAL checkout from `--scanner-root` is audited (pre-gate publication to BOTH hooks, fail-open, flag-only, no trading-gate dependency), agrees with the EFFECTIVE systemd unit (base fragment + ordered drop-in overrides: `ExecStart`/`WorkingDirectory`/Python env/`EnvironmentFile`/`FragmentPath`/`MainPID`), the running process matches the effective unit and predates no audited source, and the Scanner flag/DB tuple are consistent (two-process check) |
 | `V2_ACTIVATION_READY` | `READY_TO_START`, fingerprint/freeze NULL, event/position/outbox empty |
 | `PROTOCOL_FINGERPRINT_VALID` | deployed fingerprint equals the reviewed pin; paper/prospective/no-backfill/direction invariants hold |
 | `V1_ISOLATION_VALID` | no V1 key in the V2 env; V2 unit paths/env/exec disjoint from the V1 unit; V1 capture hook still present in the ACTUAL Scanner checkout |
@@ -386,6 +449,13 @@ that may proceed to an activation request. The six independent checks:
   never auto-passes** — `READY_FOR_ACTIVATION` requires all six `PASS`.
 * The tool never writes, never activates, never restarts the Scanner,
   prints no credentials, and always rolls back its read-only transaction.
+* The unit-side comparison always uses the EFFECTIVE configuration
+  (`systemctl show`: `FragmentPath`, `DropInPaths`, `ExecStart`,
+  `WorkingDirectory`, `EnvironmentFiles`, `MainPID`, `LoadState`,
+  `NeedDaemonReload`) — a correct drop-in over an old base unit passes, a
+  wrong drop-in over a correct base unit fails, and pending disk edits
+  (daemon-reload required, staged-but-unloaded or orphaned drop-ins) are
+  `NOT_VERIFIED`, never `PASS`.
 * **STOP** if any check is not `PASS`, if the fingerprint pin differs, or
   if the report contains anything but `PASS` for a mandatory check.
 
@@ -448,6 +518,12 @@ sudo systemctl daemon-reload
   recovery exactly where it stopped).
 * Migration 087 is **not** rolled back on service uninstall: dropping
   tables destroys paper history and is a separate approved decision.
+* If a Scanner drop-in override was installed under an approved Step 9
+  switch, its rollback is its own **separate** GO: remove only that
+  override (the base unit and the pre-existing drop-ins were never
+  modified), `sudo systemctl daemon-reload`, restart ONLY
+  `trad-bot-scanner.service`, then re-run the Step 9/Step 10 read-only
+  preflight before anything else proceeds.
 
 ---
 

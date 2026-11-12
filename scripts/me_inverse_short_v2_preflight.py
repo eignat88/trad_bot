@@ -63,6 +63,16 @@ never restarts anything.  Exact identity of the *loaded* bytecode cannot
 be proven without an approved Scanner restart or additional diagnostics;
 the preflight says so instead of pretending (see runbook Step 9).
 
+systemd drop-in awareness (P1): the Scanner's unit configuration is the
+EFFECTIVE one — the base fragment plus its drop-in overrides in systemd's
+load order (including ``ExecStart=`` resets), read from ``systemctl show``
+(``FragmentPath`` / ``DropInPaths`` / ``ExecStart`` / ``WorkingDirectory``
+/ ``EnvironmentFiles`` / ``MainPID`` / ``LoadState`` / ``NeedDaemonReload``)
+— never inferred from the base unit file alone.  Pending disk edits
+(daemon-reload required, a staged-but-unloaded drop-in, an orphaned
+drop-in) and any missing/unparsable/ambiguous value are ``NOT_VERIFIED``,
+never ``PASS``; a clear path/process/fragment mismatch is ``FAIL``.
+
 Compatibility exports (used by ``scripts/me_inverse_short_v2_activate.py``):
 ``read_service_env``, ``PreflightRefused``.
 """
@@ -71,6 +81,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -141,6 +152,19 @@ SCANNER_AUDIT_FILES = (
 # Sentinel: "detect the running Scanner process at runtime" (tests inject
 # fixture process metadata explicitly instead — they never touch /proc).
 _AUTO_PROCESS = object()
+
+# Sentinel: "read the effective systemd configuration at runtime" (tests
+# inject fixture effective-config dicts instead — they never run systemctl).
+_AUTO_EFFECTIVE = object()
+
+# Properties of the read-only effective-unit query.  The EFFECTIVE
+# configuration of the Scanner unit = base fragment + its drop-in overrides
+# in systemd's load order (``ExecStart=`` resets included) — exactly the
+# configuration the running process was started from.
+SCANNER_UNIT_SHOW_PROPERTIES = (
+    "LoadState,ActiveState,SubState,MainPID,FragmentPath,DropInPaths,"
+    "NeedDaemonReload,ExecStart,WorkingDirectory,EnvironmentFiles"
+)
 
 # read_service_env failures that mean "configuration is violated" (FAIL)
 # versus "we cannot verify it here" (NOT_VERIFIED).
@@ -262,9 +286,10 @@ def _read_scanner_env_keys(path: Path) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Scanner unit / effective-runtime inspection (P2-1, P2-4) — READ-ONLY.
+# Scanner unit / effective-runtime inspection (P1, P2-1, P2-4) — READ-ONLY.
 # Nothing here starts, stops, restarts or reloads any unit; only the unit
-# FILE is read and (at runtime) `systemctl show` + /proc/<pid> metadata.
+# FILE is read and (at runtime) `systemctl show` (effective base + drop-in
+# configuration) + /proc/<pid> metadata.
 # ---------------------------------------------------------------------------
 def _unit_directives(text: str) -> dict[str, list[str]]:
     """Extract the directives this audit compares (all values, no secrets)."""
@@ -345,6 +370,179 @@ def _detect_scanner_process(unit_path: Path) -> dict[str, Any]:
     }
 
 
+# `systemctl show` renders every ExecStart entry as ONE structured record:
+#   { path=<exe> ; argv[]=<argv joined with single spaces> ;
+#     ignore_errors=<yes|no> ; start_time=[<timestamp>] ;
+#     stop_time=[<timestamp>] ; pid=<n> ; code=<state> ; status=<code> }
+# (the ExecStartEx spelling uses `flags=` instead of `ignore_errors=`).
+# The record is parsed FIELD BY FIELD on the ` ; ` separators with the
+# field names as anchors: the timestamp fields legitimately contain
+# spaces, so naively splitting the whole line on whitespace would corrupt
+# the extraction.  `argv[]` is systemd's own space-joined display
+# (strv_join) — splitting THAT one field back on spaces is its exact
+# inverse; a record we cannot parse is reported, never guessed (the
+# Scanner ExecStart contains no space-bearing arguments).
+_EXEC_START_ENTRY_RE = re.compile(
+    r"^\{\s*path=(?P<path>.*?)\s*;\s*argv\[\]=(?P<argv>.*?)\s*;\s*"
+    r"(?:ignore_errors|flags)=\w+\s*;\s*"
+    r"start_time=\[.*?\]\s*;\s*stop_time=\[.*?\]\s*;\s*"
+    r"pid=-?\d+\s*;\s*code=\w+\s*;\s*status=-?\d+",
+)
+
+
+def _parse_effective_unit(show_text: str) -> dict[str, Any]:
+    """Parse `systemctl show` output into the EFFECTIVE unit configuration.
+
+    Handles the documented display formats (repeated struct lines for
+    ExecStart/EnvironmentFiles, shell-quoted space-joined lists for
+    DropInPaths, ``Key=Value`` scalars).  Never throws and never guesses:
+    a missing/unloaded/unparsable/ambiguous value yields
+    ``{"available": False, "reason": ...}`` so every dependent subcheck
+    reports NOT_VERIFIED instead of a false PASS.
+    """
+    props: dict[str, list[str]] = {}
+    for line in show_text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        props.setdefault(key.strip(), []).append(value)
+
+    def _last(key: str, default: str = "") -> str:
+        values = props.get(key) or []
+        return values[-1] if values else default
+
+    load_state = _last("LoadState")
+    if load_state != "loaded":
+        return {
+            "available": False,
+            "reason": "SCANNER_UNIT_NOT_LOADED",
+            "detail": (
+                f"LoadState={load_state or 'unknown'} — systemd has no "
+                "effective configuration loaded for this unit"
+            ),
+        }
+
+    # Exactly one ExecStart entry with a non-empty argv (a Type=simple
+    # Scanner always has one; several entries would be an ambiguous
+    # command line → NOT_VERIFIED).
+    exec_entries: list[dict[str, Any]] = []
+    for raw_entry in props.get("ExecStart") or []:
+        raw_entry = raw_entry.strip()
+        if not raw_entry:
+            continue
+        matched = _EXEC_START_ENTRY_RE.match(raw_entry)
+        if matched is None:
+            return {
+                "available": False,
+                "reason": "SCANNER_UNIT_EXEC_UNPARSABLE",
+                "detail": "the ExecStart record does not match the systemd "
+                          "display format",
+            }
+        exec_entries.append({
+            "path": matched.group("path"),
+            "argv": matched.group("argv").split(),
+        })
+    if not exec_entries or not exec_entries[0]["argv"]:
+        return {
+            "available": False,
+            "reason": "SCANNER_UNIT_EXEC_MISSING",
+            "detail": "the effective unit declares no ExecStart command line",
+        }
+    if len(exec_entries) > 1:
+        return {
+            "available": False,
+            "reason": "SCANNER_UNIT_EXEC_AMBIGUOUS",
+            "detail": (
+                f"the effective unit has {len(exec_entries)} ExecStart "
+                "entries — not auditable as one Scanner command line"
+            ),
+        }
+
+    # EnvironmentFiles: one ``EnvironmentFiles=<path> (ignore_errors=yes|no)``
+    # line per entry (struct array).  The suffix is a known literal, so it
+    # is removed by that literal — never by whitespace splitting, which
+    # would truncate a path containing spaces.
+    environment_files: list[str] = []
+    for raw_file in props.get("EnvironmentFiles") or []:
+        raw_file = raw_file.strip()
+        if not raw_file:
+            continue
+        env_path = raw_file.split(" (ignore_errors=", 1)[0].strip()
+        # systemd may keep the optional-file ``-`` prefix on the path.
+        if env_path.startswith("-") and len(env_path) > 1 \
+                and env_path[1] in "/.":
+            env_path = env_path[1:]
+        environment_files.append(env_path)
+
+    # DropInPaths: one ``DropInPaths=<q> <q> ...`` line; systemd
+    # shell-quotes each element (shell_maybe_quote), so shlex.split is its
+    # exact inverse (and also handles the unquoted case).
+    drop_in_paths: list[str] = []
+    for raw_list in props.get("DropInPaths") or []:
+        try:
+            drop_in_paths.extend(shlex.split(raw_list))
+        except ValueError:
+            return {
+                "available": False,
+                "reason": "SCANNER_UNIT_DROPINS_UNPARSABLE",
+                "detail": "DropInPaths is not a parseable shell-quoted list",
+            }
+
+    try:
+        main_pid = int(_last("MainPID", "0") or 0)
+    except ValueError:
+        main_pid = 0
+    return {
+        "available": True,
+        "reason": "",
+        "load_state": load_state,
+        "active_state": _last("ActiveState"),
+        "sub_state": _last("SubState"),
+        "main_pid": main_pid,
+        "fragment_path": _last("FragmentPath"),
+        "drop_in_paths": drop_in_paths,
+        "need_daemon_reload":
+            _last("NeedDaemonReload", "no").strip().lower() == "yes",
+        "exec_start": exec_entries[0],
+        "working_directory": _last("WorkingDirectory"),
+        "environment_files": environment_files,
+    }
+
+
+def _query_effective_unit(
+    unit_path: Path, *, runner: Any = subprocess.run,
+) -> dict[str, Any]:
+    """Read the EFFECTIVE configuration of ``unit_path`` (read-only).
+
+    ``systemctl show`` returns the merged result of the base unit plus its
+    drop-in overrides in systemd's load order — ``ExecStart=`` resets
+    included — so drop-in semantics are honored by systemd itself instead
+    of being re-implemented here.  The command contains only the ``show``
+    verb and read-only properties: it can never start, stop, reload or
+    restart anything.  Tests inject ``runner`` with deterministic output.
+    """
+    try:
+        shown = runner(
+            ["systemctl", "show", unit_path.name, "--no-pager",
+             f"--property={SCANNER_UNIT_SHOW_PROPERTIES}"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return {
+            "available": False,
+            "reason": "SCANNER_SYSTEMCTL_UNAVAILABLE",
+            "detail": "systemctl is not runnable on this host",
+        }
+    if shown.returncode != 0:
+        return {
+            "available": False,
+            "reason": "SCANNER_SYSTEMCTL_SHOW_FAILED",
+            "detail": "systemctl show failed — the effective configuration "
+                      "is unreadable",
+        }
+    return _parse_effective_unit(shown.stdout or "")
+
+
 def _path_text(value: str) -> str:
     """Normalize a path spelling for unit/process comparisons (no IO)."""
     try:
@@ -361,6 +559,40 @@ def _path_key(value: str) -> str:
         return str(Path(value).resolve())
     except (OSError, ValueError):
         return _path_text(value)
+
+
+def _pending_dropins(scanner_unit_path: Path, loaded: list[str]) -> list[str]:
+    """Drop-in ``*.conf`` files on disk that systemd has NOT loaded.
+
+    Scans the audited unit's own drop-in directory plus the standard
+    system-wide drop-in directories for this unit name.  A file present
+    there but absent from the loaded ``DropInPaths`` is a pending disk
+    edit (the classic "staged drop-in without daemon-reload") — it is NOT
+    part of the effective configuration and must never read as ready.
+    """
+    loaded_keys = {_path_key(p) for p in loaded}
+    unit_name = scanner_unit_path.name
+    directories = (
+        Path(f"{scanner_unit_path}.d"),
+        Path("/run/systemd/system") / f"{unit_name}.d",
+        Path("/usr/lib/systemd/system") / f"{unit_name}.d",
+        Path("/lib/systemd/system") / f"{unit_name}.d",
+    )
+    pending: list[str] = []
+    for directory in directories:
+        try:
+            candidates = sorted(directory.glob("*.conf"))
+        except OSError:
+            continue
+        for candidate in candidates:
+            try:
+                if not candidate.is_file():
+                    continue
+            except OSError:
+                continue
+            if _path_key(str(candidate)) not in loaded_keys:
+                pending.append(str(candidate))
+    return pending
 
 
 # ---------------------------------------------------------------------------
@@ -599,19 +831,25 @@ def _scanner_source_check(
     *,
     scanner_unit_path: Path,
     process: dict[str, Any] | None,
+    effective: dict[str, Any] | None,
 ) -> dict[str, str]:
     """Scanner-side readiness (P2): the ACTUAL production Scanner, never the
     V2 release directory.
 
     Subchecks (compound — worst wins): ``scanner_checkout_resolved`` (an
     explicit ``--scanner-root`` checkout exists), ``scanner_unit_available``
-    (the installed systemd unit file is readable), ``scanner_unit_matches_
-    checkout`` (ExecStart script + Python environment + WorkingDirectory
-    resolve to this checkout), ``scanner_unit_env`` (the unit's
-    EnvironmentFile is the Scanner env audited here), ``scanner_source_
-    routing`` (``audit_source_path`` over THIS checkout — an old Scanner
-    fails even when the V2 release passes), ``scanner_process_matches_unit``
-    (read-only process metadata agrees with the unit; never restarted),
+    (the installed systemd unit file is readable), ``scanner_effective_
+    unit`` (the EFFECTIVE configuration systemd loaded — base fragment +
+    ordered drop-in overrides: fragment attribution, no pending daemon-
+    reload, every loaded drop-in present on disk, no staged-but-unloaded
+    drop-in), ``scanner_unit_matches_checkout`` (effective ExecStart script
+    + Python environment + WorkingDirectory resolve to this checkout),
+    ``scanner_unit_env`` (the effective EnvironmentFile list includes the
+    Scanner env audited here — an ``Environment=`` drop-in line never
+    substitutes for it), ``scanner_source_routing`` (``audit_source_path``
+    over THIS checkout — an old Scanner fails even when the V2 release
+    passes), ``scanner_process_matches_unit`` (read-only process metadata
+    agrees with the EFFECTIVE unit and its MainPID; never restarted),
     ``scanner_sources_effective`` (no audited source changed after the
     process started), plus the unchanged ``scanner_flag`` /
     ``db_consistency`` two-process env checks.  Anything unconfirmable is
@@ -636,7 +874,8 @@ def _scanner_source_check(
             "scanner_runner.py; Scanner readiness cannot be established",
         )
 
-    # 2) The installed systemd unit FILE of the Scanner.
+    # 2) The installed systemd unit FILE of the Scanner (the audited
+    #    FragmentPath target; the base file alone is NOT the configuration).
     directives = _read_unit_directives(scanner_unit_path)
     if directives is None:
         subs["scanner_unit_available"] = (
@@ -647,28 +886,106 @@ def _scanner_source_check(
     else:
         subs["scanner_unit_available"] = (
             STATUS_PASS, "",
-            "Scanner systemd unit parsed (ExecStart/WorkingDirectory/"
-            "EnvironmentFile)",
+            "Scanner systemd unit file readable (the effective base + "
+            "drop-in configuration is read separately via systemctl show)",
         )
 
+    eff = effective if isinstance(effective, dict) else {
+        "available": False,
+        "reason": "SCANNER_SYSTEMCTL_UNAVAILABLE",
+    }
+    eff_ok = bool(eff.get("available"))
+
+    # 3) The EFFECTIVE unit configuration: base fragment + ordered drop-in
+    #    overrides exactly as systemd loaded them.  ExecStart= resets and
+    #    drop-in order are honored by systemd itself (that is what
+    #    `systemctl show` returns); a pending daemon-reload or a drop-in
+    #    that is missing/loaded-but-absent/staged-but-unloaded means DISK
+    #    and loaded configuration differ — never PASS on that.
+    if not eff_ok:
+        subs["scanner_effective_unit"] = (
+            STATUS_NOT_VERIFIED,
+            str(eff.get("reason") or "SCANNER_SYSTEMCTL_UNAVAILABLE"),
+            str(eff.get("detail")
+                or "effective systemd configuration (base unit + drop-ins) "
+                "unavailable"),
+        )
+    else:
+        eff_fragment = str(eff.get("fragment_path") or "")
+        drop_ins = [str(p) for p in (eff.get("drop_in_paths") or [])]
+        if not eff_fragment:
+            subs["scanner_effective_unit"] = (
+                STATUS_NOT_VERIFIED, "SCANNER_UNIT_FRAGMENT_MISSING",
+                "the loaded unit reports no FragmentPath — the effective "
+                "configuration cannot be attributed to the audited file",
+            )
+        elif _path_key(eff_fragment) != _path_key(str(scanner_unit_path)):
+            subs["scanner_effective_unit"] = (
+                STATUS_FAIL, "SCANNER_UNIT_FRAGMENT_MISMATCH",
+                "systemd loaded a different fragment than --scanner-unit "
+                f"({eff_fragment} vs {scanner_unit_path})",
+            )
+        elif eff.get("need_daemon_reload"):
+            subs["scanner_effective_unit"] = (
+                STATUS_NOT_VERIFIED, "SCANNER_UNIT_RELOAD_PENDING",
+                "unit files changed on disk since the last daemon-reload — "
+                "the loaded effective configuration may not be the intended "
+                "one (never treated as ready)",
+            )
+        elif any(not Path(p).is_file() for p in drop_ins):
+            orphaned = next(p for p in drop_ins if not Path(p).is_file())
+            subs["scanner_effective_unit"] = (
+                STATUS_NOT_VERIFIED, "SCANNER_UNIT_DROPIN_ORPHANED",
+                f"drop-in {orphaned} is listed as loaded but missing on "
+                "disk",
+            )
+        else:
+            pending = _pending_dropins(scanner_unit_path, drop_ins)
+            if pending:
+                subs["scanner_effective_unit"] = (
+                    STATUS_NOT_VERIFIED, "SCANNER_UNIT_DROPIN_PENDING",
+                    f"drop-in {pending[0]} exists on disk but is not part "
+                    "of the loaded configuration (daemon-reload required "
+                    "before it can be trusted)",
+                )
+            else:
+                subs["scanner_effective_unit"] = (
+                    STATUS_PASS, "",
+                    f"effective unit loaded from {eff_fragment} with "
+                    f"{len(drop_ins)} drop-in override(s); ExecStart/"
+                    "WorkingDirectory/EnvironmentFiles resolved",
+                )
+
+    # 4) The EFFECTIVE unit must run THIS checkout: script path, Python
+    #    environment and WorkingDirectory.  scanner_runner.py merely
+    #    existing proves nothing when the unit executes a different tree —
+    #    and a base unit left pointing at an old release is overridden by a
+    #    correct drop-in (and vice versa), so this compares the EFFECTIVE
+    #    ExecStart/WorkingDirectory, never the base file alone.
     exec_parts: list[str] = []
     workdir = ""
-    unit_env = ""
-    if directives is not None:
-        exec_start = (directives.get("ExecStart") or [""])[0]
-        exec_parts = exec_start.split() if exec_start else []
-        workdir = (directives.get("WorkingDirectory") or [""])[0]
-        env_files = directives.get("EnvironmentFile") or []
-        unit_env = env_files[0] if env_files else ""
+    if eff_ok and isinstance(eff.get("exec_start"), dict):
+        exec_parts = [
+            str(token) for token in (eff["exec_start"].get("argv") or [])
+        ]
+        workdir = str(eff.get("working_directory") or "")
 
-    # 3) The unit must run THIS checkout: script path, Python environment
-    #    and WorkingDirectory.  scanner_runner.py merely existing proves
-    #    nothing when the unit executes a different tree.
-    if directives is None or not checkout_ok:
+    if not eff_ok:
+        subs["scanner_unit_matches_checkout"] = (
+            STATUS_NOT_VERIFIED, "SCANNER_EFFECTIVE_UNIT_UNAVAILABLE",
+            "effective unit configuration unavailable — ExecStart/"
+            "WorkingDirectory not verifiable",
+        )
+    elif not checkout_ok:
         subs["scanner_unit_matches_checkout"] = (
             STATUS_NOT_VERIFIED, "SCANNER_CHECKOUT_OR_UNIT_UNAVAILABLE",
             "unit or Scanner checkout unavailable — unit<->checkout "
             "consistency not verifiable",
+        )
+    elif not exec_parts:
+        subs["scanner_unit_matches_checkout"] = (
+            STATUS_NOT_VERIFIED, "SCANNER_UNIT_EXEC_MISSING",
+            "the effective unit declares no ExecStart command line",
         )
     else:
         script = exec_parts[-1] if exec_parts else ""
@@ -713,36 +1030,44 @@ def _scanner_source_check(
         else:
             subs["scanner_unit_matches_checkout"] = (
                 STATUS_PASS, "",
-                "unit ExecStart/WorkingDirectory resolve to the audited "
-                "Scanner checkout; " + (py_detail or "python environment "
-                                        "validated"),
+                "effective unit ExecStart/WorkingDirectory resolve to the "
+                "audited Scanner checkout; "
+                + (py_detail or "python environment validated"),
             )
 
-    # 4) The Scanner env audited here must be the unit's EnvironmentFile.
-    if directives is None:
+    # 5) The Scanner env audited here must be among the EFFECTIVE
+    #    EnvironmentFiles.  Drop-ins may APPEND files, but an
+    #    ``Environment=ME_INVERSE_SHORT_V2_ENABLED=0`` line in a drop-in
+    #    never substitutes for this check (the flag itself is read from
+    #    the env FILE further below).
+    env_files = [str(p) for p in (eff.get("environment_files") or [])]
+    if not eff_ok:
         subs["scanner_unit_env"] = (
             STATUS_NOT_VERIFIED, "SCANNER_UNIT_UNAVAILABLE",
-            "unit EnvironmentFile directive not verifiable",
+            "effective EnvironmentFile list not verifiable",
         )
-    elif not unit_env:
+    elif not env_files:
         subs["scanner_unit_env"] = (
             STATUS_NOT_VERIFIED, "SCANNER_UNIT_ENV_MISSING",
-            "unit has no EnvironmentFile; the audited Scanner env cannot "
-            "be attributed to it",
+            "effective unit has no EnvironmentFile; the audited Scanner "
+            "env cannot be attributed to it",
         )
-    elif _path_key(unit_env) != _path_key(str(scanner_env_path)):
+    elif _path_key(str(scanner_env_path)) not in {
+            _path_key(env_file) for env_file in env_files}:
         subs["scanner_unit_env"] = (
             STATUS_FAIL, "SCANNER_UNIT_ENV_MISMATCH",
-            "unit EnvironmentFile differs from --scanner-env-file; the "
-            "audited Scanner env is not the unit's",
+            "effective EnvironmentFile list does not include "
+            "--scanner-env-file; the audited Scanner env is not used by "
+            "the unit",
         )
     else:
         subs["scanner_unit_env"] = (
             STATUS_PASS, "",
-            "unit EnvironmentFile equals the audited --scanner-env-file",
+            "effective unit EnvironmentFile equals the audited "
+            "--scanner-env-file",
         )
 
-    # 5) V2 source routing on the SCANNER checkout (P2-2): publication,
+    # 6) V2 source routing on the SCANNER checkout (P2-2): publication,
     #    V1+V2 delivery, fail-open hook, flag independence, pre-filter
     #    route, permission parity, no trading-gate dependence.
     if not checkout_ok:
@@ -772,13 +1097,14 @@ def _scanner_source_check(
                 if failing else "",
             )
 
-    # 6) The RUNNING Scanner must match the unit (read-only metadata —
-    #    this tool never restarts anything; mismatch = definite FAIL,
-    #    unavailable = NOT_VERIFIED, never a silent PASS).
-    if directives is None:
+    # 7) The RUNNING Scanner must match the EFFECTIVE unit (read-only
+    #    metadata — this tool never restarts anything; mismatch = definite
+    #    FAIL, unavailable = NOT_VERIFIED, never a silent PASS).
+    if not eff_ok:
         subs["scanner_process_matches_unit"] = (
-            STATUS_NOT_VERIFIED, "SCANNER_UNIT_UNAVAILABLE",
-            "running Scanner cannot be checked without the unit file",
+            STATUS_NOT_VERIFIED, "SCANNER_EFFECTIVE_UNIT_UNAVAILABLE",
+            "running Scanner cannot be checked without the effective unit "
+            "configuration",
         )
     elif not process or not process.get("available"):
         reason = (process or {}).get("reason", "PROCESS_METADATA_UNAVAILABLE")
@@ -792,6 +1118,18 @@ def _scanner_source_check(
             STATUS_NOT_VERIFIED, "SCANNER_PROCESS_NOT_RUNNING",
             "the Scanner unit is not active — the audited sources are not "
             "provably executing",
+        )
+    elif str(eff.get("active_state") or "") != "active":
+        subs["scanner_process_matches_unit"] = (
+            STATUS_NOT_VERIFIED, "SCANNER_UNIT_NOT_ACTIVE",
+            "the effective unit is not active — no running Scanner to "
+            "verify against it",
+        )
+    elif int(eff.get("main_pid") or 0) <= 0:
+        subs["scanner_process_matches_unit"] = (
+            STATUS_NOT_VERIFIED, "SCANNER_MAINPID_UNCONFIRMABLE",
+            "the effective unit reports no MainPID — the running Scanner "
+            "cannot be confirmed",
         )
     else:
         cmdline = [str(token) for token in process.get("cmdline", [])]
@@ -822,6 +1160,12 @@ def _scanner_source_check(
             problems.append(
                 "loaded unit fragment differs from the audited unit file",
             )
+        try:
+            process_pid = int(process.get("pid") or 0)
+        except (TypeError, ValueError):
+            process_pid = 0
+        if process_pid != int(eff.get("main_pid") or 0):
+            problems.append("running pid differs from effective MainPID")
         if problems:
             subs["scanner_process_matches_unit"] = (
                 STATUS_FAIL, "SCANNER_PROCESS_UNIT_MISMATCH",
@@ -831,10 +1175,10 @@ def _scanner_source_check(
             subs["scanner_process_matches_unit"] = (
                 STATUS_PASS, "",
                 f"running Scanner (pid {process.get('pid')}) "
-                "cmdline/cwd/loaded-unit match the unit",
+                "cmdline/cwd/loaded-unit match the effective unit",
             )
 
-    # 7) Sources-on-disk vs the running process: files updated AFTER the
+    # 8) Sources-on-disk vs the running process: files updated AFTER the
     #    process start mean it may still hold pre-update code.
     if not checkout_ok:
         subs["scanner_sources_effective"] = (
@@ -879,7 +1223,7 @@ def _scanner_source_check(
                     "require an approved restart — see runbook Step 9)",
                 )
 
-    # 8) The Scanner process (second process) has the V2 flag configured
+    # 9) The Scanner process (second process) has the V2 flag configured
     #    and OFF at preflight time.
     scanner = _read_scanner_env_keys(scanner_env_path)
     if not scanner["available"]:
@@ -910,7 +1254,7 @@ def _scanner_source_check(
             STATUS_PASS, "", "Scanner flag configured and OFF at preflight",
         )
 
-    # 9) Two-process DB consistency: both environments must point at the
+    # 10) Two-process DB consistency: both environments must point at the
     #    same database (compared WITHOUT printing any value).
     scanner_keys = scanner["keys"]
     if runtime_values is None:
@@ -1158,6 +1502,7 @@ def run_preflight(
     scanner_root: Path | None = None,
     scanner_unit_path: Path | None = None,
     scanner_process: dict[str, Any] | None | object = _AUTO_PROCESS,
+    scanner_effective: dict[str, Any] | None | object = _AUTO_EFFECTIVE,
 ) -> dict[str, Any]:
     """Run ALL SIX checks; never activates, never writes, never prints secrets.
 
@@ -1166,8 +1511,10 @@ def run_preflight(
     reused as the Scanner source); ``scanner_unit_path`` is the installed
     systemd unit it must agree with; ``scanner_process`` is the running
     process metadata (default: read-only detection via
-    ``_detect_scanner_process`` — tests inject fixtures and never touch a
-    real systemd or /proc).
+    ``_detect_scanner_process``) and ``scanner_effective`` is the EFFECTIVE
+    unit configuration — base fragment + ordered drop-in overrides (default:
+    read-only ``systemctl show`` via ``_query_effective_unit``).  Tests
+    inject fixtures for both and never touch a real systemd or /proc.
     """
     repo_root = Path(repo_root) if repo_root is not None else _ROOT
     if scanner_env_path is None:
@@ -1182,6 +1529,8 @@ def run_preflight(
         scanner_unit_path = Path(scanner_unit_path)
     if scanner_process is _AUTO_PROCESS:
         scanner_process = _detect_scanner_process(scanner_unit_path)
+    if scanner_effective is _AUTO_EFFECTIVE:
+        scanner_effective = _query_effective_unit(scanner_unit_path)
     if connect is None:
         # dbapi flavour: exposes cursor()/autocommit/rollback for the
         # read-only transaction below (the native flavour does not).
@@ -1198,6 +1547,8 @@ def run_preflight(
         scanner_root, runtime_values, scanner_env_path,
         scanner_unit_path=scanner_unit_path,
         process=scanner_process if isinstance(scanner_process, dict) else None,
+        effective=scanner_effective if isinstance(scanner_effective, dict)
+        else None,
     )
     checks["DB_READY"], checks["V2_ACTIVATION_READY"] = _evaluate_db(
         runtime_values, connect,
