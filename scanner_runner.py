@@ -1994,7 +1994,7 @@ def run_scan_cycle(
 
                 # ── Generic research: resolve statuses + promote to signals ──
                 # Fail-open: never blocks scanner cycle.
-                if _research_observer is not None:
+                if not source_only and _research_observer is not None:
                     try:
                         rejections = symbol_stats.get("_research_rejections", [])
                         setup_ready = symbol_stats.get("_research_setup_ready", [])
