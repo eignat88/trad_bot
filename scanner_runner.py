@@ -2130,6 +2130,42 @@ def report_aborted_cycle(
         logger.debug("aborted cycle event persist failed", exc_info=True)
 
 
+
+def _postscan_housekeeping(
+    repository: ScannerRepository,
+    run_id: int | None,
+    *,
+    source_only: bool,
+) -> int:
+    """Run generic scanner postscan side effects only outside V2 SOURCE_ONLY.
+
+    The isolated V2 pre-filter feed writes its own ledger in the capture
+    hook. It does not use the shared funnel table, ordinary setup lifecycle,
+    or shared signal aggregation. On clean V2 hosts those legacy tables may
+    be absent, and a failed funnel INSERT poisons the scanner transaction.
+    Keep the ordinary scanner path unchanged when the opt-in flag is off.
+    """
+    if source_only:
+        return 0
+
+    # -- SIGNAL_FUNNEL_DIAGNOSTICS_V1: flush counters to DB --
+    # Fail-open: DB errors are logged but do not interrupt the cycle.
+    try:
+        flush_and_persist_all(repository)
+    except Exception:
+        logger.debug("signal funnel flush failed", exc_info=True)
+
+    repository.expire_setups()
+
+    # Aggregate signals
+    active_signals = 0
+    try:
+        active_signals = repository.aggregate_signals(run_id)
+    except Exception:
+        logger.exception("signal aggregation failed")
+    return active_signals
+
+
 def main() -> None:
     setup_logging()
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -2349,21 +2385,11 @@ def main() -> None:
                 report=report,
             )
 
-            # -- SIGNAL_FUNNEL_DIAGNOSTICS_V1: flush counters to DB --
-            # Fail-open: DB errors are logged but do not interrupt the cycle.
-            try:
-                flush_and_persist_all(repository)
-            except Exception:
-                logger.debug("signal funnel flush failed", exc_info=True)
-
-            repository.expire_setups()
-
-            # Aggregate signals
-            active_signals = 0
-            try:
-                active_signals = repository.aggregate_signals(run_id)
-            except Exception:
-                logger.exception("signal aggregation failed")
+            # V2 SOURCE_ONLY does not depend on shared signal funnel,
+            # ordinary setup expiry or signal aggregation tables.
+            active_signals = _postscan_housekeeping(
+                repository, run_id, source_only=source_only,
+            )
 
             elapsed = time.monotonic() - start
 
