@@ -1416,6 +1416,7 @@ def run_scan_cycle(
     skipped symbols and their reasons) for this cycle.
     """
     settings = settings or _load_runner_settings()
+    source_only = os.environ.get("ME_INVERSE_SHORT_V2_SOURCE_ONLY") == "1"
     # Issue #259 (research-only): reset the per-cycle API budget of the
     # SRR SHORT fill capture. In-memory counter only — no DB, no network,
     # no activation state, never raises into the cycle.
@@ -1571,6 +1572,25 @@ def run_scan_cycle(
                     stat["symbols_scanned"] += 1
                     for field in ("candidates_found", "setups_saved", "errors_count", "duration_ms"):
                         stat[field] += values[field]
+
+                if source_only:
+                    # Preserve the pre-gate source publication verbatim.
+                    # Suppress ordinary scanner setup routing and ALL unrelated
+                    # research metadata. The original V2 delivery site below
+                    # remains the ONE production source-capture call site.
+                    source_events = symbol_stats.get(
+                        "_me_inverse_short_source_events", []
+                    )
+                    symbol_stats = {
+                        "_me_inverse_short_source_events": source_events,
+                    }
+                    candidates = []
+                    if source_events:
+                        logger.info(
+                            "ME_INVERSE_SHORT_V2_SOURCE_ONLY source_events=%d "
+                            "symbol=%s (normal_setups=0)",
+                            len(source_events), symbol,
+                        )
 
                 for c in candidates:
                     # Shadow/control candidates must be persisted as DETECTED,
@@ -2116,6 +2136,19 @@ def main() -> None:
     signal.signal(signal.SIGINT, _handle_signal)
 
     settings = _load_runner_settings()
+    source_only = os.environ.get("ME_INVERSE_SHORT_V2_SOURCE_ONLY") == "1"
+    if source_only:
+        if settings.trading_mode != "paper":
+            raise RuntimeError("SOURCE_ONLY requires paper trading mode")
+        if os.environ.get("LIVE_TRADING_ENABLED", "false").lower() not in (
+            "false", "0", "no", "off"
+        ):
+            raise RuntimeError("SOURCE_ONLY requires live trading OFF")
+        if os.environ.get("ME_INVERSE_SHORT_V1_ENABLED", "0").lower() not in (
+            "", "false", "0", "no", "off"
+        ):
+            raise RuntimeError("SOURCE_ONLY requires V1 capture OFF")
+        logger.info("ME_INVERSE_SHORT_V2_SOURCE_ONLY=1: single source detector")
     client = BybitClient(settings)
     # Issue #253: the startup universe may be deferred by the SHARED limiter
     # (open breaker).  Wait it out here — still BEFORE the database and the
@@ -2163,7 +2196,9 @@ def main() -> None:
     repository.abort_stale_runs()
 
     # Generic research observer: fail-open, never blocks scanner
-    research_obs = _get_research_observer(repository)
+    research_obs = (
+        None if source_only else _get_research_observer(repository)
+    )
     if research_obs is not None:
         logger.info("generic research observer enabled: experiments=%s", list(research_obs._experiments.keys()))
 
@@ -2171,13 +2206,24 @@ def main() -> None:
     # Fail-closed initialization: prospective_obs = None ensures NameError cannot occur
     # even if the observer factory returns None due to missing registry or connection failure.
     prospective_obs: ProspectiveOOSObserver | None = None
-    prospective_obs = _get_prospective_observer(repository)
+    prospective_obs = (
+        None if source_only else _get_prospective_observer(repository)
+    )
     if prospective_obs is not None:
         logger.info("prospective OOS observer enabled: experiments=%s", list(prospective_obs._registry.keys()))
 
-    me_early_mae_v2_pipeline = _get_me_early_mae_v2_pipeline(repository)
+    me_early_mae_v2_pipeline = (
+        None if source_only else _get_me_early_mae_v2_pipeline(repository)
+    )
 
-    orchestrator = ScannerOrchestrator(repository=repository, research_observer=research_obs)
+    orchestrator = ScannerOrchestrator(
+        enabled_scanners=(
+            ["MOMENTUM_EXHAUSTION_REVERSE_LONG_V2"]
+            if source_only else None
+        ),
+        repository=repository,
+        research_observer=research_obs,
+    )
 
     # Sync scanner direction gates to config.scanner_direction_gate (canonical source)
     try:
@@ -2365,7 +2411,8 @@ def main() -> None:
                 logger.info("expectancy filter refreshed: %d records", len(expectancy_filter.records))
 
             # OOS evaluator: run every oos_evaluator_cycle_interval cycles
-            if (settings.oos_evaluator_cycle_interval > 0
+            if (not source_only
+                    and settings.oos_evaluator_cycle_interval > 0
                     and cycle % settings.oos_evaluator_cycle_interval == 0):
                 try:
                     _run_oos_evaluator(client, repository)
