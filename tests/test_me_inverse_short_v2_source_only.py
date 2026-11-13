@@ -136,3 +136,64 @@ def test_source_only_has_one_v2_delivery_call_site():
     assert source.count(
         "_capture_me_inverse_short_v2_source(repository, inv_candidate)"
     ) == 1
+
+
+
+def test_source_only_skips_shared_postscan_database_effects(monkeypatch):
+    """Clean V2-only deployments do not have legacy funnel/setup marts."""
+    def forbidden(*args, **kwargs):
+        pytest.fail("legacy postscan database write attempted in SOURCE_ONLY")
+
+    class Repository:
+        expire_setups = forbidden
+        aggregate_signals = forbidden
+
+    monkeypatch.setattr(runner, "flush_and_persist_all", forbidden)
+
+    assert runner._postscan_housekeeping(
+        Repository(), run_id=123, source_only=True
+    ) == 0
+
+
+def test_default_scanner_preserves_postscan_operations(monkeypatch):
+    """SOURCE_ONLY must not alter the legacy scanner's postscan behavior."""
+    called = []
+
+    class Repository:
+        def expire_setups(self):
+            called.append("expire")
+        def aggregate_signals(self, run_id):
+            called.append(("aggregate", run_id))
+            return 7
+
+    monkeypatch.setattr(
+        runner, "flush_and_persist_all",
+        lambda repository: called.append("funnel"),
+    )
+
+    assert runner._postscan_housekeeping(
+        Repository(), run_id=456, source_only=False
+    ) == 7
+    assert called == ["funnel", "expire", ("aggregate", 456)]
+
+
+def test_default_scanner_funnel_exception_stays_fail_open(monkeypatch):
+    """Keep original exception policy for the ordinary Scanner."""
+    called = []
+
+    def broken_funnel(repository):
+        called.append("funnel")
+        raise RuntimeError("test funnel failure")
+
+    class Repository:
+        def expire_setups(self):
+            called.append("expire")
+        def aggregate_signals(self, run_id):
+            called.append("aggregate")
+            return 0
+
+    monkeypatch.setattr(runner, "flush_and_persist_all", broken_funnel)
+    assert runner._postscan_housekeeping(
+        Repository(), run_id=1, source_only=False
+    ) == 0
+    assert called == ["funnel", "expire", "aggregate"]
