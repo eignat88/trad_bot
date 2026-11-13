@@ -1,7 +1,7 @@
 {
   "uid": "me-inverse-short-v2-oos",
   "title": "Trad Bot — ME Inverse SHORT V2 OOS",
-  "description": "Prospective-only paper SHORT research (V2). Source: MOMENTUM_EXHAUSTION_REVERSE_LONG_V2 LONG. Frozen entry TTL: 120 minutes from signal_time (EXPIRED / CAPACITY_REJECTED dispositions are terminal, reason + status_at persisted). V2 protocol fingerprint: 5a9047ca3621cefb4d53b45275ad6348887440568cb055f843f85e2eb1abdacc. Realized Net PnL excludes unrealized open-position PnL.",
+  "description": "Isolated ME_LONG_V2_INVERSE_SHORT_V2 prospective-only PAPER OOS. Existing ledger schema only. Counts, disposition, finalized PnL and read-only integrity; no historical funnel or live trading data.",
   "tags": [
     "trad_bot",
     "OOS",
@@ -11,7 +11,7 @@
   ],
   "timezone": "utc",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "30s",
   "time": {
     "from": "now-7d",
@@ -146,7 +146,7 @@
     },
     {
       "id": 3,
-      "title": "Captured (eligible, age < TTL)",
+      "title": "Pending Events (CAPTURED; age not guaranteed)",
       "type": "stat",
       "datasource": {
         "type": "postgres",
@@ -184,7 +184,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "CAPTURED is a ledger disposition, not proof that the 120-minute entry TTL is still valid. Stale events are resolved by DB-authoritative admission."
     },
     {
       "id": 4,
@@ -542,6 +543,358 @@
             "uid": "trad_bot_postgres"
           },
           "rawSql": "SELECT symbol, entered_at, closed_at, entry_price, exit_price, exit_reason, gross_pnl, net_pnl FROM dds.me_long_v2_inverse_short_v2_position WHERE status='CLOSED' ORDER BY closed_at DESC LIMIT 30;",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 13,
+      "title": "Frozen V2 Protocol and Prospective Boundary",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 6
+      },
+      "description": "Read-only activation identity; the original freeze_ts must never be overwritten.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT experiment_id, status, protocol_version, freeze_ts, protocol_fingerprint, updated_at FROM dds.me_long_v2_inverse_short_v2_activation WHERE experiment_id = 'ME_LONG_V2_INVERSE_SHORT_V2';",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 14,
+      "title": "Prospective Integrity",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 6
+      },
+      "description": "Strict prospective-only integrity; all violation counters should be zero. Empty lineage is an audit signal, not a trade outcome.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT count(*) AS total_events, count(*) FILTER (WHERE signal_time <= activation_freeze_ts) AS pre_freeze_violations, count(*) - count(DISTINCT event_key) AS duplicate_event_keys, count(*) FILTER (WHERE source_scanner <> 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V2' OR source_direction <> 'LONG' OR direction <> 'SHORT' OR capture_route <> 'PRE_FILTER_SOURCE') AS invalid_source_route, count(*) FILTER (WHERE lineage IS NULL OR lineage = '{}'::jsonb) AS empty_lineage FROM dds.me_long_v2_inverse_short_v2_event;",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 15,
+      "title": "New Source Events / Hour",
+      "type": "timeseries",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 30,
+        "w": 12,
+        "h": 8
+      },
+      "description": "New V2 source signals in selected Grafana time window; empty until the first genuine post-freeze event.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT date_trunc('hour', signal_time) AS \"time\", count(*)::double precision AS \"Source events\" FROM dds.me_long_v2_inverse_short_v2_event WHERE $__timeFilter(signal_time) GROUP BY 1 ORDER BY 1;",
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 16,
+      "title": "Cumulative Realized Net PnL (selected range)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 30,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Running total of CLOSED paper positions within the selected time range; excludes unrealized PnL.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "WITH per_hour AS (SELECT date_trunc('hour', closed_at) AS \"time\", sum(net_pnl)::double precision AS pnl FROM dds.me_long_v2_inverse_short_v2_position WHERE status = 'CLOSED' AND closed_at IS NOT NULL AND $__timeFilter(closed_at) GROUP BY 1) SELECT \"time\", sum(pnl) OVER (ORDER BY \"time\") AS \"Realized net PnL (USDT)\" FROM per_hour ORDER BY \"time\";",
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 17,
+      "title": "Open SHORT Positions — Details",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 38,
+        "w": 24,
+        "h": 8
+      },
+      "description": "Current OPEN V2 paper positions; no live exchange orders or unsupported market-price inference.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT symbol, entered_at, entry_price, position_size, stop_price, target_price, risk_usdt, entry_fee, deadline_at, funding_paid, status FROM dds.me_long_v2_inverse_short_v2_position WHERE status = 'OPEN' ORDER BY entered_at DESC LIMIT 100;",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 18,
+      "title": "Source Event Disposition Summary",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 46,
+        "w": 12,
+        "h": 7
+      },
+      "description": "All four V2 ledger dispositions. CAPTURED may include events awaiting DB-authoritative TTL adjudication.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT status, count(*)::bigint AS events, min(signal_time) AS oldest_signal, max(signal_time) AS newest_signal FROM dds.me_long_v2_inverse_short_v2_event GROUP BY status ORDER BY status;",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 19,
+      "title": "Terminal Entry Refusal Reasons",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 46,
+        "w": 12,
+        "h": 7
+      },
+      "description": "Terminal outcomes distinguish ENTRY_TTL and ENTRY_CAP; does not treat capacity refusals as closed trades.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT status, COALESCE(status_reason,'(none)') AS status_reason, count(*)::bigint AS events, max(status_at) AS last_decision_at FROM dds.me_long_v2_inverse_short_v2_event WHERE status IN ('EXPIRED','CAPACITY_REJECTED') GROUP BY status, status_reason ORDER BY events DESC;",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 20,
+      "title": "Win Rate — CLOSED (%)",
+      "type": "stat",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 53,
+        "w": 6,
+        "h": 5
+      },
+      "description": "Undefined (NULL) when no positions are finalized; paper results only.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT CASE WHEN count(*) = 0 THEN NULL ELSE round(100.0 * count(*) FILTER (WHERE net_pnl > 0) / count(*), 2) END AS value FROM dds.me_long_v2_inverse_short_v2_position WHERE status = 'CLOSED';",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 21,
+      "title": "Profit Factor — CLOSED",
+      "type": "stat",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 53,
+        "w": 6,
+        "h": 5
+      },
+      "description": "NULL if no closed trades or zero gross losses (infinite/undefined denominator).",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT CASE WHEN count(*) = 0 OR coalesce(sum(-net_pnl) FILTER (WHERE net_pnl < 0), 0) = 0 THEN NULL ELSE round((coalesce(sum(net_pnl) FILTER (WHERE net_pnl > 0), 0) / sum(-net_pnl) FILTER (WHERE net_pnl < 0))::numeric, 3) END AS value FROM dds.me_long_v2_inverse_short_v2_position WHERE status = 'CLOSED';",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 22,
+      "title": "Realized Net PnL by Symbol — CLOSED",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 53,
+        "w": 12,
+        "h": 8
+      },
+      "description": "One position is one finalized trade; no partial fill double-counting.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT symbol, count(*)::bigint AS closed_positions, count(*) FILTER (WHERE net_pnl > 0)::bigint AS wins, round(sum(net_pnl)::numeric, 4) AS net_pnl_usdt, round(avg(net_pnl)::numeric, 4) AS avg_net_pnl_usdt FROM dds.me_long_v2_inverse_short_v2_position WHERE status = 'CLOSED' GROUP BY symbol ORDER BY net_pnl_usdt DESC LIMIT 100;",
           "format": "table"
         }
       ],
