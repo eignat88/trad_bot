@@ -1,0 +1,25 @@
+name: ME Inverse SHORT V2 Grafana Contract CI
+
+on:
+  pull_request:
+    paths:
+      - 'monitoring/grafana/dashboards/me-inverse-short-v2-oos.json'
+      - 'tests/test_me_inverse_short_v2_grafana_contract.py'
+      - '.github/workflows/me-inverse-short-v2-grafana-ci.yml'
+  workflow_dispatch:
+
+jobs:
+  dashboard-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate Grafana V2 dashboard contracts
+        run: python -m unittest discover -s tests -p 'test_me_inverse_short_v2_grafana_contract.py' -v
