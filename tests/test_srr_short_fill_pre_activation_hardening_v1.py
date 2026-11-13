@@ -77,10 +77,13 @@ def test_migration_083_is_next_and_unique():
     numbers = sorted(int(p.name.split("_")[0]) for p in
                      (ROOT / "sql" / "migrations").glob("[0-9][0-9][0-9]_*.sql"))
     assert numbers.count(83) == 1
-    # 084-086 belong to the inverse-short follow-up PRs and 087 to the
-    # ME_LONG_V2_INVERSE_SHORT_V2 stale-entry-guard PR; no number is ever
-    # reused and the branch's newest migration carries the highest number.
-    assert numbers[-1] == 87
+    # 084-086 belong to the inverse-short follow-up PRs, 087 to the
+    # ME_LONG_V2_INVERSE_SHORT_V2 stale-entry-guard PR, 088 to the
+    # ME_LONG_V2_INVERSE_SHORT_OOS2_V1 ladder contour (Issue #276) and 089
+    # to its round-6 additive funding-obligation table (Issue #276,
+    # Codex r4555591322); no number is ever reused and the branch's newest
+    # migration carries the highest number.
+    assert numbers[-1] == 89
     assert MIGRATION.name == "083_srr_short_fill_coverage_v1.sql"
 
 
