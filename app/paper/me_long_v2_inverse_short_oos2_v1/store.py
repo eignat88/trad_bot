@@ -17,6 +17,7 @@ Two implementations behind ONE small interface:
         dds.me_long_v2_inverse_short_oos2_v1_position
         dds.me_long_v2_inverse_short_oos2_v1_close_leg   (partial TP legs + terminal legs)
         dds.me_long_v2_inverse_short_oos2_v1_close_outbox   (durable close staging)
+        dds.me_long_v2_inverse_short_oos2_v1_funding_obligation   (observed funding lost to unreadable history, round 6)
 
 Isolation invariants enforced here:
   * events are idempotent on ``event_key`` (``ON CONFLICT DO NOTHING``);
@@ -50,9 +51,12 @@ from .models import (
     EVENT_STATUS_CAPACITY_REJECTED,
     EVENT_STATUS_ENTERED,
     EVENT_STATUS_EXPIRED,
+    FUNDING_OBLIGATION_OPEN,
+    FUNDING_OBLIGATION_SETTLED,
     ActivationRecord,
     InverseShortCloseLeg,
     InverseShortEvent,
+    InverseShortFundingObligation,
     InverseShortPosition,
     POSITION_STATUS_CLOSED,
     POSITION_STATUS_OPEN,
@@ -74,6 +78,12 @@ CLOSE_OUTBOX_TABLE = f"{SCHEMA}.me_long_v2_inverse_short_oos2_v1_close_outbox"
 # OPEN) and the TERMINAL leg, identified by (position_key, leg_seq) — the
 # exactly-once unit of partial-exit accounting.
 CLOSE_LEG_TABLE = f"{SCHEMA}.me_long_v2_inverse_short_oos2_v1_close_leg"
+# Durable funding obligation (round 6, P2-funding): the OBSERVED funding
+# rate of a terminal close whose close-leg history was unreadable —
+# persisted so a known rate can never be lost with the process.
+FUNDING_OBLIGATION_TABLE = (
+    f"{SCHEMA}.me_long_v2_inverse_short_oos2_v1_funding_obligation"
+)
 
 # Honest save_event outcomes.
 SAVE_CAPTURED = "CAPTURED"
@@ -297,6 +307,55 @@ class InverseShortStore:
         """All committed close legs (partial TP executions + terminal legs)."""
         raise NotImplementedError
 
+    # -- durable funding obligations (round 6, P2-funding) ---------------
+    def save_funding_obligation(
+        self, obligation: InverseShortFundingObligation,
+    ) -> str:
+        """Persist an observed-rate funding obligation (idempotent upsert).
+
+        Returns ``"SAVED"`` when the row is durable (a replay of the same
+        observation is a verified no-op), ``"ABSENT"`` when the obligation
+        table does not exist (documented degraded mode — the caller keeps
+        the obligation in memory and reports the degradation loudly).
+        Connection errors RAISE: the caller must not treat an unknown
+        outcome as persisted.
+        """
+        raise NotImplementedError
+
+    def get_funding_obligation(
+        self, position_key: str,
+    ) -> InverseShortFundingObligation | None:
+        raise NotImplementedError
+
+    def list_funding_obligations(
+        self, status: str | None = FUNDING_OBLIGATION_OPEN,
+    ) -> list[InverseShortFundingObligation]:
+        raise NotImplementedError
+
+    def settle_funding_obligation(
+        self,
+        position_key: str,
+        *,
+        periods_due: int,
+        funding_paid: float,
+        funding_periods: int,
+        net_pnl: float,
+        settled_cost: float,
+        settled_at: datetime,
+    ) -> bool:
+        """Settle an obligation EXACTLY ONCE (single transaction).
+
+        Atomically: (1) guard the CLOSED position row — only when its
+        ``funding_periods`` is still behind ``periods_due`` — booking
+        ``funding_paid`` / ``funding_periods`` / ``net_pnl`` (the terminal
+        funding cost), then (2) flip the obligation OPEN -> SETTLED.
+        Either half failing rolls the whole thing back, so a replayed or
+        racing settlement can never double-accrue.  Returns False when the
+        guards refuse (already settled / already charged — the caller
+        re-reads instead of guessing).
+        """
+        raise NotImplementedError
+
     def close(self) -> None:  # pragma: no cover - trivial
         return None
 
@@ -319,6 +378,8 @@ class InMemoryInverseShortStore(InverseShortStore):
         self._pending_closes: dict[str, InverseShortPosition] = {}
         # Durable-leg mirror (Issue #276): (position_key, leg_seq) -> leg.
         self._close_legs: dict[tuple[str, int], InverseShortCloseLeg] = {}
+        # Durable funding-obligation mirror (round 6): position_key -> row.
+        self._funding_obligations: dict[str, InverseShortFundingObligation] = {}
 
     # -- activation -------------------------------------------------------
     def set_activation(self, activation: ActivationRecord | None) -> None:
@@ -584,6 +645,89 @@ class InMemoryInverseShortStore(InverseShortStore):
             for identity in identities
             if position_key is None or identity[0] == position_key
         ]
+
+    # -- durable funding obligations (round 6, P2-funding) ---------------
+    def save_funding_obligation(
+        self, obligation: InverseShortFundingObligation,
+    ) -> str:
+        """Idempotent upsert; a later retry only ADVANCES ``periods_due``.
+
+        Mirrors the PG contract: the FIRST observation wins (rate +
+        observed_at — the frozen first-observed-rate substitution policy),
+        a later observation may extend the covered window but never
+        replaces the observed rate.
+        """
+        existing = self._funding_obligations.get(obligation.position_key)
+        if existing is None:
+            self._funding_obligations[obligation.position_key] = replace(
+                obligation,
+            )
+            return "SAVED"
+        if existing.obligation_key == obligation.obligation_key:
+            return "SAVED"  # replay of the SAME observation window
+        if obligation.periods_due > existing.periods_due:
+            # Same position, later (wider) window: keep the FIRST observed
+            # rate/observation, extend coverage to the newer window.
+            self._funding_obligations[obligation.position_key] = replace(
+                existing,
+                obligation_key=obligation.obligation_key,
+                periods_due=obligation.periods_due,
+                legs_ref_max_seq=obligation.legs_ref_max_seq,
+            )
+        return "SAVED"
+
+    def get_funding_obligation(
+        self, position_key: str,
+    ) -> InverseShortFundingObligation | None:
+        obligation = self._funding_obligations.get(position_key)
+        return replace(obligation) if obligation is not None else None
+
+    def list_funding_obligations(
+        self, status: str | None = FUNDING_OBLIGATION_OPEN,
+    ) -> list[InverseShortFundingObligation]:
+        rows = [
+            replace(row) for row in self._funding_obligations.values()
+            if status is None or row.status == status
+        ]
+        return sorted(rows, key=lambda row: row.observed_at)
+
+    def settle_funding_obligation(
+        self,
+        position_key: str,
+        *,
+        periods_due: int,
+        funding_paid: float,
+        funding_periods: int,
+        net_pnl: float,
+        settled_cost: float,
+        settled_at: datetime,
+    ) -> bool:
+        obligation = self._funding_obligations.get(position_key)
+        if obligation is None or obligation.status != FUNDING_OBLIGATION_OPEN:
+            return False
+        stored = self._positions.get(position_key)
+        if stored is None or stored.status != POSITION_STATUS_CLOSED:
+            return False
+        if not stored.funding_periods_charged < periods_due:
+            # Already charged by another path (normal fold / earlier settle):
+            # the obligation is superseded, never double-booked.
+            self._funding_obligations[position_key] = replace(
+                obligation,
+                status=FUNDING_OBLIGATION_SETTLED,
+                settled_at=settled_at,
+                settled_cost=0.0,
+            )
+            return False
+        stored.funding_paid = float(funding_paid)
+        stored.funding_periods_charged = int(funding_periods)
+        stored.net_pnl = float(net_pnl)
+        self._funding_obligations[position_key] = replace(
+            obligation,
+            status=FUNDING_OBLIGATION_SETTLED,
+            settled_at=settled_at,
+            settled_cost=float(settled_cost),
+        )
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -898,6 +1042,85 @@ LIST_CLOSE_LEGS_FOR_POSITION_SQL = f"""
     SELECT * FROM {CLOSE_LEG_TABLE}
     WHERE position_key = %s
     ORDER BY leg_seq
+"""
+
+# -- durable funding obligation (round 6, P2-funding) ---------------------
+# Identity: position_key (PK) + deterministic obligation_key.  A replayed
+# close attempt upserts the SAME observation; a later, wider window may
+# extend periods_due but NEVER replaces the first observed rate/observed_at
+# (the frozen first-observed-rate substitution policy).  A SETTLED row is
+# never reopened.
+INSERT_FUNDING_OBLIGATION_SQL = f"""
+    INSERT INTO {FUNDING_OBLIGATION_TABLE}
+        (position_key, obligation_key, event_key, symbol,
+         observed_rate_percent, observed_at, entered_at, periods_due,
+         periods_charged_at_observation, legs_ref_max_seq, status)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
+    ON CONFLICT (position_key) DO UPDATE SET
+        obligation_key = EXCLUDED.obligation_key,
+        periods_due = EXCLUDED.periods_due,
+        legs_ref_max_seq = EXCLUDED.legs_ref_max_seq,
+        updated_at = now()
+    WHERE {FUNDING_OBLIGATION_TABLE}.status = 'OPEN'
+      AND EXCLUDED.periods_due > {FUNDING_OBLIGATION_TABLE}.periods_due
+"""
+
+GET_FUNDING_OBLIGATION_SQL = f"""
+    SELECT * FROM {FUNDING_OBLIGATION_TABLE}
+    WHERE position_key = %s
+"""
+
+LIST_FUNDING_OBLIGATIONS_SQL = f"""
+    SELECT * FROM {FUNDING_OBLIGATION_TABLE}
+"""
+
+LIST_FUNDING_OBLIGATIONS_BY_STATUS_SQL = f"""
+    SELECT * FROM {FUNDING_OBLIGATION_TABLE}
+    WHERE status = %s
+    ORDER BY observed_at, position_key
+"""
+
+# Exactly-once settlement, statement 1: the CLOSED position row only moves
+# while it is still behind the obligation's window — a monotone guard, so a
+# replayed or racing settlement can never double-accrue the same periods.
+SETTLE_POSITION_FUNDING_SQL = f"""
+    UPDATE {POSITION_TABLE} SET
+        funding_paid = %s,
+        funding_periods = %s,
+        net_pnl = %s,
+        updated_at = now()
+    WHERE position_key = %s
+      AND status = 'CLOSED'
+      AND funding_periods < %s
+"""
+
+# Exactly-once settlement, statement 2: the obligation flips OPEN ->
+# SETTLED in the SAME transaction (rowcount 0 aborts the settlement).
+SETTLE_FUNDING_OBLIGATION_SQL = f"""
+    UPDATE {FUNDING_OBLIGATION_TABLE} SET
+        status = 'SETTLED',
+        settled_at = %s,
+        settled_cost = %s,
+        updated_at = now()
+    WHERE position_key = %s AND status = 'OPEN'
+"""
+
+# Superseded window (the position was already charged by another path):
+# void the obligation so the recovery pass stops retrying it.
+VOID_FUNDING_OBLIGATION_SQL = f"""
+    UPDATE {FUNDING_OBLIGATION_TABLE} SET
+        status = 'SETTLED',
+        settled_at = %s,
+        settled_cost = 0,
+        updated_at = now()
+    WHERE position_key = %s AND status = 'OPEN'
+"""
+
+LOCK_CLOSED_POSITION_FOR_FUNDING_SQL = f"""
+    SELECT status, funding_periods
+    FROM {POSITION_TABLE}
+    WHERE position_key = %s
+    FOR UPDATE
 """
 
 
@@ -1904,6 +2127,158 @@ class PgInverseShortStore(InverseShortStore):
                 return []
             raise
         return [InverseShortCloseLeg.from_dict(r) for r in result.fetchall_dicts()]
+
+    # -- durable funding obligations (round 6, P2-funding) ---------------
+    def save_funding_obligation(
+        self, obligation: InverseShortFundingObligation,
+    ) -> str:
+        params = (
+            obligation.position_key,
+            obligation.obligation_key,
+            obligation.event_key,
+            obligation.symbol,
+            float(obligation.observed_rate_percent),
+            obligation.observed_at,
+            obligation.entered_at,
+            int(obligation.periods_due),
+            int(obligation.periods_charged_at_observation),
+            int(obligation.legs_ref_max_seq),
+        )
+        try:
+            result = self._execute_commit(
+                INSERT_FUNDING_OBLIGATION_SQL, params,
+            )
+        except Exception as exc:
+            self._rollback()
+            if _is_missing_relation(exc):
+                # Documented degraded mode (mirrors a missing close_outbox):
+                # the obligation table (migration 089) is not applied — the
+                # caller keeps the obligation in memory and reports it.
+                logger.warning(
+                    "me inverse short oos2 funding obligation table missing "
+                    "(migration 089 not applied): observed rate kept in "
+                    "memory only, reported as degraded: key=%s",
+                    obligation.position_key[:48],
+                )
+                return "ABSENT"
+            raise
+        if getattr(result, "rowcount", 0) == 1:
+            return "SAVED"
+        # rowcount 0 means "the row already carries this (or a wider)
+        # window / is already SETTLED" — verify before claiming persistence
+        # (ON CONFLICT ... DO UPDATE ... WHERE never guesses).
+        verify = self._query(
+            GET_FUNDING_OBLIGATION_SQL, (obligation.position_key,),
+            fetch="one",
+        )
+        if verify.fetchone_dict():
+            return "SAVED"
+        raise RuntimeError(
+            f"FUNDING_OBLIGATION_SAVE_UNVERIFIED:{obligation.position_key}",
+        )
+
+    def get_funding_obligation(
+        self, position_key: str,
+    ) -> InverseShortFundingObligation | None:
+        try:
+            result = self._query(
+                GET_FUNDING_OBLIGATION_SQL, (position_key,), fetch="one",
+            )
+        except Exception as exc:
+            if _is_missing_relation(exc):
+                return None
+            raise
+        row = result.fetchone_dict()
+        return InverseShortFundingObligation.from_dict(row) if row else None
+
+    def list_funding_obligations(
+        self, status: str | None = FUNDING_OBLIGATION_OPEN,
+    ) -> list[InverseShortFundingObligation]:
+        try:
+            if status is None:
+                result = self._query(LIST_FUNDING_OBLIGATIONS_SQL)
+            else:
+                result = self._query(
+                    LIST_FUNDING_OBLIGATIONS_BY_STATUS_SQL, (status,),
+                )
+        except Exception as exc:
+            if _is_missing_relation(exc):
+                logger.warning(
+                    "me inverse short oos2 funding obligation table missing "
+                    "(migration 089 not applied): no obligations to recover",
+                )
+                return []
+            raise
+        return [
+            InverseShortFundingObligation.from_dict(r)
+            for r in result.fetchall_dicts()
+        ]
+
+    def settle_funding_obligation(
+        self,
+        position_key: str,
+        *,
+        periods_due: int,
+        funding_paid: float,
+        funding_periods: int,
+        net_pnl: float,
+        settled_cost: float,
+        settled_at: datetime,
+    ) -> bool:
+        def operation() -> _QueryResult:
+            # 1) Lock the CLOSED row: serializes concurrent settlers and
+            #    proves the position exists and is final.
+            locked = self._execute_once(
+                LOCK_CLOSED_POSITION_FOR_FUNDING_SQL, (position_key,),
+                fetch="one",
+            )
+            row = locked.fetchone_dict()
+            if row is None or row.get("status") != POSITION_STATUS_CLOSED:
+                self._conn.rollback()
+                return _QueryResult(columns=[], rows=[], rowcount=0)
+            charged = int(row.get("funding_periods") or 0)
+            if charged >= int(periods_due):
+                # Superseded: another path already charged this window (the
+                # normal fold or an earlier settlement).  Void the
+                # obligation in the same transaction so the recovery pass
+                # stops retrying — never double-book.
+                self._execute_once(
+                    VOID_FUNDING_OBLIGATION_SQL, (settled_at, position_key),
+                    fetch="none",
+                )
+                self._conn.commit()
+                return _QueryResult(columns=[], rows=[], rowcount=0)
+            # 2) Position funding/net_pnl with the monotone guard.
+            booked = self._execute_once(
+                SETTLE_POSITION_FUNDING_SQL,
+                (
+                    float(funding_paid), int(funding_periods),
+                    float(net_pnl), position_key, int(periods_due),
+                ),
+                fetch="none",
+            )
+            if booked.rowcount != 1:
+                self._conn.rollback()
+                return _QueryResult(columns=[], rows=[], rowcount=0)
+            # 3) Obligation flips OPEN -> SETTLED in the SAME transaction:
+            #    rowcount 0 here aborts the whole settlement.
+            flipped = self._execute_once(
+                SETTLE_FUNDING_OBLIGATION_SQL,
+                (settled_at, float(settled_cost), position_key),
+                fetch="none",
+            )
+            if flipped.rowcount != 1:
+                self._conn.rollback()
+                return _QueryResult(columns=[], rows=[], rowcount=0)
+            self._conn.commit()
+            return _QueryResult(columns=[], rows=[], rowcount=1)
+
+        try:
+            result = self._with_reconnect(operation)
+            return bool(result and result.rowcount == 1)
+        except Exception:
+            self._rollback()
+            raise
 
     def close(self) -> None:
         # Deliberate shutdown: reconnection is disabled from here on — a

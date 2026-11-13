@@ -70,8 +70,10 @@ from .models import (
     EVENT_STATUS_CAPTURED,
     EVENT_STATUS_CAPACITY_REJECTED,
     EVENT_STATUS_EXPIRED,
+    FUNDING_OBLIGATION_OPEN,
     InverseShortCloseLeg,
     InverseShortEvent,
+    InverseShortFundingObligation,
     InverseShortPosition,
     LEG_SEQ_TERMINAL,
     POSITION_STATUS_CLOSED,
@@ -154,6 +156,27 @@ class InverseShortPaperEngine:
         # pending positions and never books any PnL twice.
         self._uncommitted_deltas: dict[str, float] = {}
         self._balance_trusted: bool = True
+        # AMBIGUOUS write outcomes (round 6, Codex P1): keys whose LAST
+        # financial write (terminal close / funding accrual / partial leg)
+        # raised while the durable read-back could NOT classify it —
+        # PostgreSQL may have APPLIED it with a lost acknowledgement.
+        # Three states are distinguished per rule:
+        #   CONFIRMED    -> resolved by read-back, markers retired;
+        #   PROVEN_ABSENT-> the delta in ``_uncommitted_deltas`` is SAFE to
+        #                  add (durable provably lacks it) and the key stays
+        #                  a recovery obligation;
+        #   AMBIGUOUS    -> the whole key's delta is QUARANTINED: reconcile
+        #                  NEVER adds it (a confirmed COMMIT must not be
+        #                  counted twice), ``accounting_consistent`` stays
+        #                  False and new entries are refused until a durable
+        #                  read-back classifies the outcome.
+        # An AMBIGUOUS key is NEVER treated as PROVEN_ABSENT.
+        self._ambiguous_keys: set[str] = set()
+        # Durable funding obligations tracked in-process for this cycle
+        # (round 6, P2-funding): the durable copy lives in the obligation
+        # table; this set only remembers DEGRADED keys (table absent) whose
+        # observed rate exists nowhere else — reported loudly every cycle.
+        self._funding_obligation_degraded: set[str] = set()
         # Funding rate UNKNOWN (review P2-1): keys with due-but-unsettled
         # intervals while no rate was observed.  Tracked only for honest
         # one-shot warning logs; the durable unsettled state itself lives on
@@ -344,14 +367,46 @@ class InverseShortPaperEngine:
         return dict(self._uncommitted_deltas)
 
     @property
+    def ambiguous_write_keys(self) -> tuple[str, ...]:
+        """Keys whose last financial write outcome is still UNKNOWN (P1).
+
+        While non-empty the engine reconciles ONLY confirmed + proven-absent
+        deltas, keeps ``accounting_consistent`` False and refuses new
+        entries: an ambiguous COMMIT is never assumed failed, never assumed
+        applied, and never double-counted.
+        """
+        return tuple(sorted(self._ambiguous_keys))
+
+    @property
+    def funding_obligation_keys(self) -> tuple[str, ...]:
+        """Durable funding obligations awaiting recovery (round 6)."""
+        try:
+            return tuple(
+                sorted(
+                    row.position_key
+                    for row in self.store.list_funding_obligations(
+                        FUNDING_OBLIGATION_OPEN,
+                    )
+                )
+            )
+        except Exception:  # noqa: BLE001 - reporting only, never fatal
+            return tuple(sorted(self._funding_obligation_degraded))
+
+    @property
     def accounting_consistent(self) -> bool:
         """The contour balance is trustworthy (P2).
 
         False while a balance-recovery marker is owed (realized PnL of a
-        recovered close not yet reconciled into the memory ledger) or after
-        a failed reconciliation — new entries are refused meanwhile.
+        recovered close not yet reconciled into the memory ledger), after a
+        failed reconciliation, or while ANY write outcome is still AMBIGUOUS
+        (round 6, P1 rule 2: an unreadable read-back never claims
+        consistency) — new entries are refused meanwhile.
         """
-        return self._balance_trusted and not self._pending_from_store
+        return (
+            self._balance_trusted
+            and not self._pending_from_store
+            and not self._ambiguous_keys
+        )
 
     @property
     def balance_recovery_pending(self) -> tuple[str, ...]:
@@ -500,6 +555,35 @@ class InverseShortPaperEngine:
                 "staged; recovery is NOT guaranteed if the process terminates "
                 "before a durable write succeeds: keys=%s",
                 len(self._unstaged_closes), self.unstaged_close_keys,
+            )
+            return opened
+        if self.pending_closes:
+            # Round 6 (Codex P1 rule 3): an unresolved FINANCIAL write — a
+            # terminal snapshot whose status flip PostgreSQL has not
+            # confirmed — blocks new entries even when a reconciliation
+            # proves the numeric balance consistent: a correct balance does
+            # not make the write resolved.  The flush retry runs before this
+            # gate every cycle, so a healthy store clears this within one
+            # cycle; a failing store keeps entries refused (fail closed).
+            logger.warning(
+                "me inverse short oos2 entries refused (fail closed): %d "
+                "unresolved terminal close write(s) still owed to PostgreSQL: "
+                "keys=%s",
+                len(self.pending_closes),
+                ", ".join(sorted(self.pending_closes))[:200],
+            )
+            return opened
+        if self._ambiguous_keys:
+            # Round 6 (Codex P1 rule 1/2): a lost acknowledgement whose
+            # durable read-back could not classify the outcome — entries
+            # stay refused until CONFIRMED or PROVEN_ABSENT (defence in
+            # depth: accounting_consistent already reflects this set).
+            logger.error(
+                "me inverse short oos2 entries refused (fail closed): %d "
+                "write(s) with an AMBIGUOUS durable outcome awaiting read-back "
+                "classification: keys=%s",
+                len(self._ambiguous_keys),
+                ", ".join(sorted(self._ambiguous_keys))[:200],
             )
             return opened
         if not self.accounting_consistent:
@@ -959,6 +1043,14 @@ class InverseShortPaperEngine:
         # key at once, so the ladder below only ever advances over rows the
         # leg ledger already holds.
         self._retry_dirty_legs()
+        # Then settle DURABLE funding obligations (round 6, P2): the
+        # observed rate persisted at a close whose leg history was
+        # unreadable is booked exactly once here, from the durable leg
+        # ledger, guarded by the obligation status + funding_periods —
+        # never re-accrued, never lost to a restart.  Runs AFTER the dirty
+        # retries so a key whose own write is still owed keeps owning its
+        # accounting until that write confirms.
+        self._retry_funding_obligations()
 
 
         closed: list[InverseShortPosition] = []
@@ -1255,6 +1347,7 @@ class InverseShortPaperEngine:
                 self._uncommitted_deltas.pop(position.position_key, None)
                 self._leg_deltas.pop(position.position_key, None)
                 self._dirty_funding.pop(position.position_key, None)
+                self._ambiguous_keys.discard(position.position_key)
                 logger.warning(
                     "me inverse short oos2 funding write CONFIRMED applied "
                     "despite a lost acknowledgement (verified against "
@@ -1264,28 +1357,54 @@ class InverseShortPaperEngine:
                     position.funding_periods_charged,
                     exc_info=True,
                 )
-            else:
-                # Genuinely not applied — or UNVERIFIABLE while the store
-                # is unreachable (an unreadable state is never treated as
-                # confirmed): keep the exact snapshot as DIRTY and the
-                # local delta uncommitted until a write actually commits.
+            elif confirmed is not None:
+                # PROVEN ABSENT (round 6, P1): the read-back succeeded and
+                # the row differs — the write did NOT apply, so the local
+                # delta is SAFE to add on reconciliation and the exact
+                # snapshot stays DIRTY for retry (a recovery obligation,
+                # never dropped).
                 self._uncommitted_deltas[position.position_key] = (
                     self._uncommitted_deltas.get(position.position_key, 0.0)
                     - cost
                 )
-                # DIRTY (review P2): freeze the EXACT funding snapshot so
-                # every later cycle retries it — independent of new
-                # intervals — without ever re-accruing or changing any
-                # value.
                 self._dirty_funding[position.position_key] = (
                     dataclasses.replace(position)
                 )
+                self._ambiguous_keys.discard(position.position_key)
                 logger.warning(
-                    "me inverse short oos2 funding persistence failed (write NOT "
-                    "confirmed by PostgreSQL; exact funding snapshot "
-                    "retained in memory as DIRTY for retry on later cycles; "
-                    "NOT durable until a write commits and never claimed "
-                    "durable): key=%s funding_paid=%.6f periods=%d",
+                    "me inverse short oos2 funding persistence failed (write "
+                    "PROVEN not applied by read-back; exact funding snapshot "
+                    "retained in memory as DIRTY for retry; delta safe to "
+                    "reconcile): key=%s funding_paid=%.6f periods=%d",
+                    position.position_key[:48], position.funding_paid,
+                    position.funding_periods_charged,
+                    exc_info=True,
+                )
+            else:
+                # AMBIGUOUS (round 6, P1): the read-back itself was
+                # unavailable — the write MAY have committed with a lost
+                # acknowledgement.  The delta is booked for completeness but
+                # the WHOLE key is quarantined: reconcile never adds it
+                # (rule 5: a confirmed COMMIT is never counted twice),
+                # accounting_consistent stays False (rule 2) and entries
+                # stay refused (rule 3) until a durable read-back classifies
+                # the outcome.  An ambiguous outcome is NEVER treated as
+                # proven absent (rule: AMBIGUOUS != PROVEN_ABSENT).
+                self._uncommitted_deltas[position.position_key] = (
+                    self._uncommitted_deltas.get(position.position_key, 0.0)
+                    - cost
+                )
+                self._dirty_funding[position.position_key] = (
+                    dataclasses.replace(position)
+                )
+                self._ambiguous_keys.add(position.position_key)
+                self._balance_trusted = False
+                logger.warning(
+                    "me inverse short oos2 funding persistence AMBIGUOUS "
+                    "(write outcome UNKNOWN — read-back unavailable; delta "
+                    "QUARANTINED, accounting untrusted, entries refused "
+                    "until a durable read-back classifies it): key=%s "
+                    "funding_paid=%.6f periods=%d",
                     position.position_key[:48], position.funding_paid,
                     position.funding_periods_charged,
                     exc_info=True,
@@ -1299,6 +1418,9 @@ class InverseShortPaperEngine:
             self._uncommitted_deltas.pop(position.position_key, None)
             self._leg_deltas.pop(position.position_key, None)
             self._dirty_funding.pop(position.position_key, None)
+            # A successful write also resolves any earlier AMBIGUOUS outcome
+            # for this key: the durable row is now provably current.
+            self._ambiguous_keys.discard(position.position_key)
         logger.info(
             "me inverse short oos2 funding: %s periods=%d rate=%.6f%% cost=$%.4f",
             position.symbol, new_periods, rate, cost,
@@ -1394,7 +1516,7 @@ class InverseShortPaperEngine:
         self,
         position: InverseShortPosition,
         funding_rate_percent: float | None,
-    ) -> float:
+    ) -> float | None:
         """Fold OBSERVED funding into a terminal close snapshot (P2).
 
         A protective STOP/TIMEOUT may fire in the very cycle in which a
@@ -1415,13 +1537,18 @@ class InverseShortPaperEngine:
             exactly once, atomically with the counter;
           * UNKNOWN/unusable rate → NOTHING booked: the obligation stays
             open on the CLOSED row (reported, never a fabricated zero);
-          * unprovable history → NOT finalized, obligation stays open.
+          * HISTORY_UNAVAILABLE with a KNOWN rate (round 6, P2): the rate
+            is persisted as a DURABLE funding obligation BEFORE the
+            protective close commits — never kept in process memory only —
+            and a recovery pass settles it exactly once when the leg
+            history is readable again.  An approximate (quantity-unproven)
+            funding amount is NEVER written.
 
         Returns the cost folded into the snapshot (0.0 when nothing was
-        settled).  The caller books ``-cost`` against the in-memory
-        balance (exactly like ``_apply_funding``) and keeps ``-cost``
-        inside the uncommitted close delta until the terminal write is
-        confirmed.
+        settled — including a persisted obligation) or ``None`` when the
+        observed rate could NOT be persisted (the obligation write itself
+        failed): the caller must then DEFER the whole close instead of
+        finalizing it and losing the known funding.
         """
         due_periods = self._due_funding_periods(position)
         if due_periods <= position.funding_periods_charged:
@@ -1457,14 +1584,24 @@ class InverseShortPaperEngine:
         try:
             legs = self.store.list_close_legs(position.position_key)
         except Exception:
+            # HISTORY_UNAVAILABLE with a KNOWN rate (round 6, P2): the
+            # observed rate must NOT be lost with this close — persist the
+            # durable obligation first.  If even that write fails, return
+            # None so the caller defers the WHOLE close (protective exit
+            # retried next cycle) instead of finalizing a close whose known
+            # funding exists nowhere durable.
             logger.warning(
                 "me inverse short oos2 close funding fold DEFERRED (close-leg "
                 "history unreadable — historical quantity cannot be proven; "
-                "obligation stays open, NOTHING booked): symbol=%s due=%d "
-                "charged=%d",
+                "persisting the OBSERVED rate as a durable funding "
+                "obligation): symbol=%s due=%d charged=%d rate=%.6f%%",
                 position.symbol, due_periods,
-                position.funding_periods_charged, exc_info=True,
+                position.funding_periods_charged, rate, exc_info=True,
             )
+            if not self._persist_funding_obligation(
+                position, rate, due_periods, legs_ref_max_seq=-1,
+            ):
+                return None
             return 0.0
         # Durable history PLUS the owed dirty legs of this key: those rows
         # are staged in the SAME transaction as this terminal snapshot (the
@@ -1484,13 +1621,28 @@ class InverseShortPaperEngine:
             position, rate, list(merged.values()), due_periods,
         )
         if computed is None:
-            return 0.0  # UNPROVABLE — the reason is logged inside the helper
+            # UNPROVABLE history with a KNOWN rate (round 6, P2): same
+            # durable-obligation path — the rate survives, the quantity
+            # stays unproven and is never approximated.
+            legs_ref_max_seq = max(
+                (leg.leg_seq for leg in merged.values()), default=-1,
+            )
+            if not self._persist_funding_obligation(
+                position, rate, due_periods,
+                legs_ref_max_seq=legs_ref_max_seq,
+            ):
+                return None
+            return 0.0
         cost, per_period = computed
 
         position.funding_paid += cost
         position.funding_periods_charged = due_periods
         self.balance -= cost
         self._funding_unknown.discard(position.position_key)
+        # A folded settlement SUPERSEDES any obligation persisted by an
+        # earlier deferred attempt of this close: the recovery pass voids
+        # it via the monotone funding_periods guard (never double-books).
+        self._funding_obligation_degraded.discard(position.position_key)
         for period, boundary, qty, period_cost in per_period:
             logger.info(
                 "me inverse short oos2 funding period settled WITH the "
@@ -1507,6 +1659,218 @@ class InverseShortPaperEngine:
             position.funding_paid,
         )
         return cost
+
+    def _persist_funding_obligation(
+        self,
+        position: InverseShortPosition,
+        rate: float,
+        due_periods: int,
+        *,
+        legs_ref_max_seq: int,
+    ) -> bool:
+        """Persist the OBSERVED rate as a durable funding obligation (P2).
+
+        Returns True when the obligation is durable (or the obligation
+        table is absent — documented degraded mode, tracked and reported
+        via ``_funding_obligation_degraded``), False when the write itself
+        failed: the caller must then defer the close, because a known
+        funding rate may never live only in process memory.
+        """
+        obligation = InverseShortFundingObligation(
+            position_key=position.position_key,
+            obligation_key=InverseShortFundingObligation.make_obligation_key(
+                position.position_key,
+                position.entered_at,
+                due_periods,
+                position.funding_periods_charged,
+            ),
+            symbol=position.symbol,
+            event_key=position.event_key,
+            observed_rate_percent=float(rate),
+            observed_at=self._clock(),
+            entered_at=position.entered_at,
+            periods_due=int(due_periods),
+            periods_charged_at_observation=int(
+                position.funding_periods_charged,
+            ),
+            legs_ref_max_seq=int(legs_ref_max_seq),
+        )
+        try:
+            outcome = self.store.save_funding_obligation(obligation)
+        except Exception:
+            logger.warning(
+                "me inverse short oos2 funding obligation persist FAILED "
+                "(observed rate NOT yet durable — the close must not "
+                "finalize; retried next cycle): key=%s rate=%.6f%% due=%d",
+                position.position_key[:48], rate, due_periods,
+                exc_info=True,
+            )
+            return False
+        if outcome == "SAVED":
+            self._funding_obligation_degraded.discard(position.position_key)
+            logger.warning(
+                "me inverse short oos2 funding obligation PERSISTED "
+                "(observed rate survives the close; recovery settles it "
+                "exactly once when the leg history is readable): key=%s "
+                "rate=%.6f%% observed_at=%s due=%d charged=%d legs_ref=%d",
+                position.position_key[:48], rate,
+                obligation.observed_at.isoformat(), due_periods,
+                position.funding_periods_charged, legs_ref_max_seq,
+            )
+            return True
+        # ABSENT: migration 089 not applied — documented degraded mode.
+        self._funding_obligation_degraded.add(position.position_key)
+        logger.error(
+            "me inverse short oos2 funding obligation TABLE ABSENT "
+            "(migration 089 not applied): observed rate kept IN-MEMORY only "
+            "and reported every cycle as degraded — install migration 089 "
+            "to make it restart-safe: key=%s rate=%.6f%% due=%d",
+            position.position_key[:48], rate, due_periods,
+        )
+        return True
+
+    def _retry_funding_obligations(self) -> int:
+        """Settle durable funding obligations EXACTLY ONCE (round 6, P2).
+
+        Runs every cycle after the dirty retries.  For each OPEN
+        obligation row (durable — survives restarts, never process-local):
+
+        * the position row must exist and be CLOSED (an OPEN row means its
+          own close path still owns the accounting — wait);
+        * the backlog is recomputed from the DURABLE leg ledger at the
+          FROZEN observed rate (the first-observed-rate substitution
+          policy is frozen inside the row) for the FROZEN window
+          ``periods_charged_at_observation + 1 .. periods_due``;
+        * settlement is ONE guarded transaction: the CLOSED row only moves
+          while it is still behind the window (monotone
+          ``funding_periods`` guard) and the obligation flips OPEN ->
+          SETTLED in the same transaction — a replayed, restarted or
+          racing settlement can never double-accrue (rule: exactly once);
+        * a window already charged by another path (the normal fold, an
+          earlier settlement) VOIDES the obligation with cost 0 instead of
+          booking anything;
+        * a history read failure simply retries next cycle — the
+          obligation row is durable, so the observed rate is never lost.
+
+        The engine balance drops by the settled cost in the same step
+        (the durable net_pnl drops with it), then a reconciliation
+        confirms the pair.
+        """
+        settled = 0
+        try:
+            obligations = self.store.list_funding_obligations(
+                FUNDING_OBLIGATION_OPEN,
+            )
+        except Exception:
+            logger.warning(
+                "me inverse short oos2 funding obligation list failed "
+                "(retry next cycle; obligations stay durable)",
+                exc_info=True,
+            )
+            return 0
+        for obligation in obligations:
+            key = obligation.position_key
+            if (
+                key in self.pending_closes
+                or key in self._dirty_funding
+                or key in self._dirty_legs
+            ):
+                # This key's own write path owns its accounting — the
+                # obligation is settled after that path confirms (or
+                # voided by the funding_periods guard).
+                continue
+            try:
+                stored = self.store.get_position(key)
+            except Exception:
+                logger.warning(
+                    "me inverse short oos2 funding obligation position read "
+                    "failed (retry next cycle): key=%s", key[:48],
+                    exc_info=True,
+                )
+                continue
+            if stored is None:
+                logger.error(
+                    "me inverse short oos2 funding obligation OWNS NO "
+                    "POSITION ROW (manual investigation required; obligation "
+                    "kept, nothing booked): key=%s",
+                    key[:48],
+                )
+                continue
+            if stored.status != POSITION_STATUS_CLOSED:
+                # The close has not committed yet — its fold path owns the
+                # window (a folded charge voids this obligation later via
+                # the funding_periods guard).  Terminal obligations always
+                # settle against a CLOSED row.
+                continue
+            try:
+                legs = self.store.list_close_legs(key)
+            except Exception:
+                logger.debug(
+                    "me inverse short oos2 funding obligation history "
+                    "unreadable (retry next cycle): key=%s",
+                    key[:48], exc_info=True,
+                )
+                continue
+            computed = self._funding_backlog(
+                stored,
+                obligation.observed_rate_percent,
+                legs,
+                obligation.periods_due,
+            )
+            if computed is None:
+                # Quantity still unprovable — never approximate; retry when
+                # the leg ledger becomes complete.
+                continue
+            cost, _per_period = computed
+            try:
+                ok = self.store.settle_funding_obligation(
+                    key,
+                    periods_due=obligation.periods_due,
+                    funding_paid=stored.funding_paid + cost,
+                    funding_periods=obligation.periods_due,
+                    net_pnl=stored.net_pnl - cost,
+                    settled_cost=cost,
+                    settled_at=self._clock(),
+                )
+            except Exception:
+                # Ambiguous funding COMMIT (round 6, P2): the store may or
+                # may not have applied the settlement before the lost ack.
+                # Force a confirming resync — reconcile rebuilds the balance
+                # from the durable ledger (applied or not) so the engine can
+                # never drift from it — and let the obligation row decide
+                # next cycle (SETTLED -> done, still OPEN -> guarded retry,
+                # never a second accrual).
+                self._balance_trusted = False
+                logger.warning(
+                    "me inverse short oos2 funding obligation settlement "
+                    "failed (retry next cycle; guard prevents double "
+                    "booking): key=%s cost=%.6f",
+                    key[:48], cost, exc_info=True,
+                )
+                continue
+            if not ok:
+                # Superseded (window already charged) or a lost race: the
+                # store voided/kept the obligation — re-read next cycle,
+                # never book here.
+                logger.info(
+                    "me inverse short oos2 funding obligation not settled "
+                    "(already charged by another path or raced; nothing "
+                    "booked): key=%s", key[:48],
+                )
+                continue
+            self.balance -= cost
+            self._balance_trusted = False  # force a confirming resync
+            self._funding_obligation_degraded.discard(key)
+            settled += 1
+            logger.warning(
+                "me inverse short oos2 funding obligation SETTLED exactly "
+                "once from the durable leg ledger: key=%s rate=%.6f%% "
+                "periods=%d cost=$%.6f funding_paid=%.6f net_pnl=%.6f",
+                key[:48], obligation.observed_rate_percent,
+                obligation.periods_due, cost,
+                stored.funding_paid + cost, stored.net_pnl - cost,
+            )
+        return settled
 
     def _confirmed_funding(
         self, position: InverseShortPosition,
@@ -1578,9 +1942,55 @@ class InverseShortPaperEngine:
             try:
                 self.store.update_position(to_write)
             except Exception:
-                logger.debug(
-                    "me inverse short oos2 dirty funding retry failed again "
-                    "(state retained): key=%s funding_paid=%.6f periods=%d",
+                # Round 6 (P1): classify the outcome instead of assuming
+                # failure — this retry may have COMMITTED with a lost
+                # acknowledgement (the full-object write carries EVERY
+                # unconfirmed component of this key, so an unknown outcome
+                # quarantines the whole key).
+                confirmed = self._confirmed_funding(to_write)
+                if confirmed is not None and (
+                    confirmed[0] == to_write.funding_paid
+                    and confirmed[1] == to_write.funding_periods_charged
+                ):
+                    # CONFIRMED APPLIED: retire the dirty snapshot and every
+                    # local delta for the key — the durable row already
+                    # carries them (never counted twice).
+                    self._dirty_funding.pop(position_key, None)
+                    self._uncommitted_deltas.pop(position_key, None)
+                    self._leg_deltas.pop(position_key, None)
+                    self._ambiguous_keys.discard(position_key)
+                    persisted += 1
+                    logger.warning(
+                        "me inverse short oos2 dirty funding retry CONFIRMED "
+                        "applied despite a lost acknowledgement: key=%s "
+                        "funding_paid=%.6f periods=%d",
+                        position_key[:48], to_write.funding_paid,
+                        to_write.funding_periods_charged, exc_info=True,
+                    )
+                    continue
+                if confirmed is not None:
+                    # PROVEN ABSENT: the read-back succeeded and differs —
+                    # the delta is safe to reconcile, the snapshot stays
+                    # owed for the next retry (recovery obligation kept).
+                    self._ambiguous_keys.discard(position_key)
+                    logger.debug(
+                        "me inverse short oos2 dirty funding retry PROVEN not "
+                        "applied (state retained): key=%s funding_paid=%.6f "
+                        "periods=%d",
+                        position_key[:48], to_write.funding_paid,
+                        to_write.funding_periods_charged, exc_info=True,
+                    )
+                    continue
+                # AMBIGUOUS: the read-back was unavailable — quarantine the
+                # key's delta (never added while the outcome is unknown) and
+                # keep everything owed; entries stay refused until a durable
+                # read-back classifies it.
+                self._ambiguous_keys.add(position_key)
+                self._balance_trusted = False
+                logger.warning(
+                    "me inverse short oos2 dirty funding retry AMBIGUOUS "
+                    "(outcome UNKNOWN — delta QUARANTINED, accounting "
+                    "untrusted): key=%s funding_paid=%.6f periods=%d",
                     position_key[:48], to_write.funding_paid,
                     to_write.funding_periods_charged, exc_info=True,
                 )
@@ -1588,6 +1998,8 @@ class InverseShortPaperEngine:
             self._dirty_funding.pop(position_key, None)
             self._uncommitted_deltas.pop(position_key, None)
             self._leg_deltas.pop(position_key, None)
+            # A successful write also resolves any earlier AMBIGUOUS outcome.
+            self._ambiguous_keys.discard(position_key)
             persisted += 1
             logger.info(
                 "me inverse short oos2 dirty funding persisted on retry: "
@@ -1665,9 +2077,18 @@ class InverseShortPaperEngine:
         * ``None`` — the outcome could not be verified at all (row missing
           or the read failed).
 
+        Round 6 (P1 rule 9): a ``True`` verdict additionally requires the
+        OTHER halves of the operation — the terminal leg row, every owed
+        partial leg row and the close-outbox row — so a half-applied state
+        (position flipped but a leg/outbox row missing) is never reported
+        as confirmed.  The leg/outbox half is skipped ONLY in the
+        documented degraded mode (migration 088 absent — nothing was ever
+        staged there, the position row is the only durable half).
+
         An unreadable row is NEVER treated as applied: ``False`` and
-        ``None`` both keep the pending close + local delta and block new
-        entries until a reconciliation proves consistency.
+        ``None`` both keep the pending close + local delta (``None`` also
+        quarantines the key) and block new entries until a reconciliation
+        proves consistency.
         """
         try:
             stored = self.store.get_position(snapshot.position_key)
@@ -1713,6 +2134,87 @@ class InverseShortPaperEngine:
                 ",".join(mismatches)[:200],
             )
             return False
+        # -- Rule 9 (round 6): terminal confirmation covers EVERY half ----
+        if snapshot.position_key in self._staging_unavailable:
+            # Documented degraded mode (migration 088 absent): staging can
+            # never succeed, so no leg/outbox rows exist or ever will — the
+            # position row is the only durable half by definition.
+            return True
+        try:
+            terminal_leg = self.store.get_close_leg(
+                snapshot.position_key, LEG_SEQ_TERMINAL,
+            )
+            owed_partial_seqs = [
+                leg.leg_seq for leg in
+                self._dirty_legs.get(snapshot.position_key, ())
+                if not leg.is_terminal
+            ]
+            partial_rows = [
+                self.store.get_close_leg(snapshot.position_key, seq)
+                for seq in owed_partial_seqs
+            ]
+            outbox_keys = {
+                row.position_key
+                for row in self.store.list_pending_closes()
+            }
+        except Exception:
+            logger.warning(
+                "me inverse short oos2 terminal confirmation UNVERIFIABLE "
+                "(leg/outbox read failed — outcome stays unknown, never "
+                "treated as applied): key=%s",
+                snapshot.position_key[:48], exc_info=True,
+            )
+            return None
+        if terminal_leg is None:
+            logger.error(
+                "me inverse short oos2 terminal confirmation INCOMPLETE: "
+                "position row is CLOSED but the terminal leg row is ABSENT "
+                "(outcome treated as unknown): key=%s",
+                snapshot.position_key[:48],
+            )
+            return None
+        expected_terminal = self._terminal_legs.get(snapshot.position_key)
+        if expected_terminal is not None:
+            facts_match = (
+                terminal_leg.exit_reason == expected_terminal.exit_reason
+                and terminal_leg.quantity == expected_terminal.quantity
+                and terminal_leg.fill_price == expected_terminal.fill_price
+                and terminal_leg.gross_pnl == expected_terminal.gross_pnl
+                and terminal_leg.net_pnl == expected_terminal.net_pnl
+            )
+            if not facts_match:
+                logger.error(
+                    "me inverse short oos2 terminal confirmation MISMATCH: "
+                    "terminal leg row differs from the staged snapshot "
+                    "(outcome treated as unknown): key=%s",
+                    snapshot.position_key[:48],
+                )
+                return None
+        for seq, row in zip(owed_partial_seqs, partial_rows):
+            if row is None:
+                logger.error(
+                    "me inverse short oos2 terminal confirmation INCOMPLETE: "
+                    "owed partial leg row is ABSENT (outcome treated as "
+                    "unknown): key=%s leg_seq=%s",
+                    snapshot.position_key[:48], seq,
+                )
+                return None
+        if snapshot.position_key not in outbox_keys:
+            # The outbox row is ABSENT.  Two legal explanations, both
+            # already proven by the checks above:
+            #   * staging is ATOMIC (owed legs + terminal leg + outbox in
+            #     ONE transaction), so a present terminal leg row proves
+            #     the outbox row WAS staged together with it;
+            #   * ``clear_pending_close`` runs ONLY after a confirmed
+            #     terminal_applied cleanup — so an absent row here means
+            #     the close was already confirmed and cleaned up.
+            # Anything else (leg row missing too) was rejected above.
+            logger.debug(
+                "me inverse short oos2 terminal confirmation: outbox row "
+                "already cleared after a confirmed close (terminal leg row "
+                "proves the staging): key=%s",
+                snapshot.position_key[:48],
+            )
         return True
 
     # ------------------------------------------------------------------
@@ -1834,17 +2336,21 @@ class InverseShortPaperEngine:
                 self._leg_deltas.pop(position_key, None)
                 self._uncommitted_deltas.pop(position_key, None)
                 self._dirty_funding.pop(position_key, None)
+                # The write carried the FULL current position state, so it
+                # also resolves any earlier AMBIGUOUS outcome for this key.
+                self._ambiguous_keys.discard(position_key)
                 logger.warning(
                     "me inverse short oos2 partial TP leg CONFIRMED applied "
                     "despite a lost acknowledgement (no delta booked, no dirty "
                     "state retained): key=%s stage=%s qty=%.12g",
                     position_key[:48], stage, qty,
                 )
-            else:
-                # NOT applied (or unverifiable): the exact leg row is
-                # retained and replayed every cycle until PostgreSQL accepts
-                # it; the local accounting delta stays uncommitted and new
-                # entries are refused meanwhile (fail closed).
+            elif verdict is False:
+                # PROVEN ABSENT (round 6, P1): read-back succeeded and the
+                # leg row is genuinely missing — the delta is SAFE to add on
+                # reconciliation, the exact leg stays owed for replay (a
+                # recovery obligation, never dropped) and new entries stay
+                # refused while the leg is dirty.
                 legs = self._dirty_legs.setdefault(position_key, [])
                 if not any(l.leg_seq == leg.leg_seq for l in legs):
                     legs.append(leg)
@@ -1857,9 +2363,37 @@ class InverseShortPaperEngine:
                 )
                 logger.warning(
                     "me inverse short oos2 partial TP leg persistence failed "
-                    "(write NOT confirmed by PostgreSQL; exact leg retained in "
-                    "memory as DIRTY for retry, NOT durable, new entries "
-                    "refused): key=%s stage=%s qty=%.12g net=%.4f",
+                    "(write PROVEN not applied by read-back; exact leg retained "
+                    "in memory as DIRTY for replay; delta safe to reconcile, "
+                    "new entries refused): key=%s stage=%s qty=%.12g net=%.4f",
+                    position_key[:48], stage, qty, net_leg,
+                    exc_info=True,
+                )
+            else:
+                # AMBIGUOUS (round 6, P1): read-back unavailable — the leg
+                # transaction MAY have committed with a lost acknowledgement.
+                # The delta is booked but the WHOLE key is quarantined:
+                # reconcile never adds it while unknown (a confirmed commit
+                # is never counted twice), accounting stays untrusted and
+                # entries stay refused until a durable read-back classifies
+                # the outcome.  AMBIGUOUS is NEVER treated as proven absent.
+                legs = self._dirty_legs.setdefault(position_key, [])
+                if not any(l.leg_seq == leg.leg_seq for l in legs):
+                    legs.append(leg)
+                self._leg_deltas[position_key] = (
+                    self._leg_deltas.get(position_key, 0.0) + leg_delta
+                )
+                self._uncommitted_deltas[position_key] = (
+                    self._uncommitted_deltas.get(position_key, 0.0)
+                    + leg_delta
+                )
+                self._ambiguous_keys.add(position_key)
+                self._balance_trusted = False
+                logger.warning(
+                    "me inverse short oos2 partial TP leg persistence AMBIGUOUS "
+                    "(outcome UNKNOWN — delta QUARANTINED, accounting "
+                    "untrusted, entries refused until read-back): key=%s "
+                    "stage=%s qty=%.12g net=%.4f",
                     position_key[:48], stage, qty, net_leg,
                     exc_info=True,
                 )
@@ -1880,6 +2414,9 @@ class InverseShortPaperEngine:
         self._leg_deltas.pop(position_key, None)
         self._uncommitted_deltas.pop(position_key, None)
         self._dirty_funding.pop(position_key, None)
+        # A committed leg write also resolves any earlier AMBIGUOUS outcome
+        # for this key (the position row moved to its current state).
+        self._ambiguous_keys.discard(position_key)
         logger.info(
             "me inverse short oos2 partial TP leg: symbol=%s stage=%s "
             "ref=%.6f fill=%.6f qty=%.12g remaining=%.12g gross=%.4f "
@@ -1951,6 +2488,51 @@ class InverseShortPaperEngine:
             return False
         return True
 
+    def _leg_row_state(self, leg: InverseShortCloseLeg) -> bool | None:
+        """Is THIS leg row durable with exact facts?  (round 6, P1)
+
+        Unlike :meth:`_confirmed_leg` this checks ONLY the leg ledger row —
+        never the position row's reflection of memory.  When several owed
+        legs are retried in one loop, an earlier leg's committed row is
+        compared against a position that memory has already advanced past
+        the later legs, so the position-reflection check would misclassify
+        a genuinely durable leg as absent.  The leg row and its position
+        update commit in ONE transaction, so row presence alone is the
+        accounting truth for "this contribution is durable".
+
+        Returns True (present, exact facts), False (provably absent) or
+        None (unreadable / fact mismatch — never guessed).
+        """
+        try:
+            stored = self.store.get_close_leg(leg.position_key, leg.leg_seq)
+        except Exception:
+            logger.warning(
+                "me inverse short oos2 leg row read failed (outcome stays "
+                "UNKNOWN): key=%s stage=%s",
+                leg.position_key[:48], leg.exit_reason, exc_info=True,
+            )
+            return None
+        if stored is None:
+            return False
+        facts_match = (
+            stored.exit_reason == leg.exit_reason
+            and stored.quantity == leg.quantity
+            and stored.reference_price == leg.reference_price
+            and stored.fill_price == leg.fill_price
+            and stored.gross_pnl == leg.gross_pnl
+            and stored.exit_fee == leg.exit_fee
+            and stored.net_pnl == leg.net_pnl
+        )
+        if not facts_match:
+            logger.error(
+                "me inverse short oos2 leg row MISMATCH at the same identity "
+                "(invariant violation — outcome treated as UNKNOWN): key=%s "
+                "stage=%s",
+                leg.position_key[:48], leg.exit_reason,
+            )
+            return None
+        return True
+
     def _retry_dirty_legs(self) -> int:
         """Persist retained DIRTY partial-TP legs (Issue #276).
 
@@ -2017,9 +2599,89 @@ class InverseShortPaperEngine:
                 for leg in legs:
                     self.store.commit_partial_exit(position, leg)
             except Exception:
+                # Round 6 (P1): classify the outcome instead of assuming
+                # failure — an earlier leg of THIS loop (or a previous
+                # retry) may already be durable with a lost acknowledgement.
+                unknown = False
+                confirmed_legs: list[InverseShortCloseLeg] = []
+                for leg in legs:
+                    state = self._leg_row_state(leg)
+                    if state is None:
+                        unknown = True
+                        break
+                    if state:
+                        confirmed_legs.append(leg)
+                if unknown:
+                    # AMBIGUOUS: some owed leg's durable state could not be
+                    # read — quarantine the whole key (its delta is never
+                    # added while the outcome is unknown), keep every leg
+                    # owed, entries stay refused until a read-back
+                    # classifies it.  AMBIGUOUS is never treated as absent.
+                    self._ambiguous_keys.add(position_key)
+                    self._balance_trusted = False
+                    logger.warning(
+                        "me inverse short oos2 dirty leg retry AMBIGUOUS "
+                        "(leg outcome UNKNOWN — delta QUARANTINED, accounting "
+                        "untrusted): key=%s stages=%s",
+                        position_key[:48],
+                        [l.exit_reason for l in legs],
+                        exc_info=True,
+                    )
+                    continue
+                if confirmed_legs and len(confirmed_legs) == len(legs):
+                    # Every owed leg is durable: the successful writes
+                    # carried the full current position state — settle
+                    # every local delta and dirty marker for the key.
+                    self._dirty_legs.pop(position_key, None)
+                    self._leg_deltas.pop(position_key, None)
+                    self._uncommitted_deltas.pop(position_key, None)
+                    self._dirty_funding.pop(position_key, None)
+                    self._ambiguous_keys.discard(position_key)
+                    persisted += 1
+                    logger.info(
+                        "me inverse short oos2 dirty leg(s) persisted on "
+                        "retry: key=%s stages=%s",
+                        position_key[:48],
+                        [l.exit_reason for l in legs],
+                    )
+                    continue
+                if confirmed_legs:
+                    # MIXED: some legs durable, some genuinely absent —
+                    # retire the confirmed legs from the owed list and take
+                    # THEIR contribution back out of the local deltas (the
+                    # durable ledger already carries it), so reconciliation
+                    # keeps adding exactly what PostgreSQL still lacks.
+                    confirmed_seqs = {leg.leg_seq for leg in confirmed_legs}
+                    remaining = [
+                        leg for leg in legs if leg.leg_seq not in confirmed_seqs
+                    ]
+                    if remaining:
+                        self._dirty_legs[position_key] = remaining
+                    else:  # pragma: no cover - guarded by the branch above
+                        self._dirty_legs.pop(position_key, None)
+                    for leg in confirmed_legs:
+                        carried = leg.net_pnl + leg.entry_cost_share
+                        if position_key in self._uncommitted_deltas:
+                            self._uncommitted_deltas[position_key] -= carried
+                        if position_key in self._leg_deltas:
+                            self._leg_deltas[position_key] -= carried
+                    logger.warning(
+                        "me inverse short oos2 dirty leg retry PARTIALLY "
+                        "persisted (confirmed legs retired from the owed "
+                        "list and their contribution removed from the local "
+                        "delta): key=%s confirmed=%s still_owed=%s",
+                        position_key[:48],
+                        sorted(confirmed_seqs),
+                        [l.exit_reason for l in remaining],
+                        exc_info=True,
+                    )
+                    continue
+                # Nothing durable yet (every leg provably absent): keep the
+                # legs and deltas exactly as they are for the next retry.
                 logger.debug(
                     "me inverse short oos2 dirty leg retry failed again "
-                    "(legs retained): key=%s stages=%s",
+                    "(legs retained; read-back PROVES none applied): key=%s "
+                    "stages=%s",
                     position_key[:48],
                     [l.exit_reason for l in legs],
                     exc_info=True,
@@ -2030,6 +2692,8 @@ class InverseShortPaperEngine:
             self._uncommitted_deltas.pop(position_key, None)
             # The successful write carried the current funding facts too.
             self._dirty_funding.pop(position_key, None)
+            # ... and resolves any earlier AMBIGUOUS outcome for this key.
+            self._ambiguous_keys.discard(position_key)
             persisted += 1
             logger.info(
                 "me inverse short oos2 dirty leg(s) persisted on retry: "
@@ -2045,8 +2709,13 @@ class InverseShortPaperEngine:
         reason: str,
         *,
         funding_rate_percent: float | None = None,
-    ) -> InverseShortPosition:
+    ) -> InverseShortPosition | None:
         """TERMINAL close of the REMAINING quantity (Issue #276).
+
+        Returns the CLOSED snapshot, or ``None`` when the close was
+        DEFERRED because the observed funding rate could not yet be made
+        durable (round 6, P2) — the caller then keeps the position OPEN
+        for protective re-evaluation on the next cycle.
 
         PnL model (cumulative, exact against the balance ledger): every
         committed TP leg already booked its own
@@ -2082,6 +2751,23 @@ class InverseShortPaperEngine:
         funding_folded = self._settle_funding_for_close(
             position, funding_rate_percent,
         )
+        if funding_folded is None:
+            # Round 6 (P2): the OBSERVED funding rate could not be made
+            # durable (the obligation write failed) — finalizing the close
+            # NOW would lose the known funding forever.  NOTHING has been
+            # persisted yet (no staging, no fold, no balance move), so the
+            # whole close is simply DEFERRED: the position stays OPEN in
+            # memory, STOP/TIMEOUT re-evaluate it next cycle and the
+            # protective exit completes as soon as the store accepts the
+            # obligation.  Entries are unaffected (the position still holds
+            # its capacity slot).
+            logger.warning(
+                "me inverse short oos2 terminal close DEFERRED (observed "
+                "funding rate not durable yet; protective exit retried next "
+                "cycle): key=%s reason=%s",
+                position.position_key[:48], reason,
+            )
+            return None
 
         closed_at = self._clock()
         slip = float(self.settings.slippage_percent)
@@ -2182,8 +2868,9 @@ class InverseShortPaperEngine:
         if unsettled > 0:
             logger.warning(
                 "me inverse short oos2 close executed with %d UNSETTLED funding "
-                "period(s) (rate UNKNOWN at exit): obligation preserved on "
-                "the row and reported, NOT booked as zero; exit facts frozen: "
+                "period(s) (rate UNKNOWN or history unprovable at exit): "
+                "obligation preserved on the row and reported, NOT booked as "
+                "zero; exit facts frozen: "
                 "key=%s reason=%s closed_at=%s",
                 unsettled, position.position_key[:48], reason,
                 closed_at.isoformat(),
@@ -2300,11 +2987,14 @@ class InverseShortPaperEngine:
                         "delta booked): key=%s reason=%s net=%.4f",
                         position.position_key[:48], reason, net_pnl,
                     )
-                else:
-                    # NOT applied, or the outcome could not be verified: keep
-                    # the pending close + local delta (fail closed) and refuse
-                    # NEW entries until a successful reconciliation proves the
-                    # ledger consistent (review P2: never assume either way).
+                elif verdict is False:
+                    # PROVEN ABSENT (round 6, P1): read-back succeeded and the
+                    # row provably does NOT carry this close — the delta is
+                    # SAFE to add on reconciliation and the pending close
+                    # stays a recovery obligation (replayed by flush until
+                    # PostgreSQL accepts it).  Entries stay refused while the
+                    # write is unresolved (rule 3), but no quarantine is
+                    # needed: the outcome is KNOWN.
                     self.pending_closes[position.position_key] = position
                     self._uncommitted_deltas[position.position_key] = (
                         self._uncommitted_deltas.get(position.position_key, 0.0)
@@ -2312,12 +3002,40 @@ class InverseShortPaperEngine:
                     )
                     self._balance_trusted = False
                     logger.exception(
-                        "me inverse short oos2 close persistence failed (write NOT "
-                        "confirmed by PostgreSQL); terminal snapshot retained "
-                        "for retry and new entries blocked until a "
-                        "reconciliation succeeds (outbox staged=%s, "
-                        "durability_risk=%s): key=%s reason=%s net=%.4f",
-                        staged, not staged, position.position_key[:48], reason,
+                        "me inverse short oos2 close persistence failed (write "
+                        "PROVEN not applied by read-back); terminal snapshot "
+                        "retained for replay and new entries blocked until the "
+                        "close commits (outbox staged=%s): key=%s reason=%s "
+                        "net=%.4f",
+                        staged, position.position_key[:48], reason,
+                        net_pnl,
+                    )
+                else:
+                    # AMBIGUOUS (round 6, P1 rule 1): the read-back itself
+                    # was unavailable — PostgreSQL may have APPLIED this
+                    # close with a lost acknowledgement.  The pending close
+                    # and local delta are kept, but the whole key is
+                    # QUARANTINED: reconcile never adds its delta while the
+                    # outcome is unknown (rule 5: a confirmed COMMIT is
+                    # never counted twice), accounting_consistent stays
+                    # False (rule 2) and entries stay refused (rule 3) until
+                    # a durable read-back classifies the write as CONFIRMED
+                    # or PROVEN_ABSENT — an unknown outcome is NEVER treated
+                    # as proven absent.
+                    self.pending_closes[position.position_key] = position
+                    self._uncommitted_deltas[position.position_key] = (
+                        self._uncommitted_deltas.get(position.position_key, 0.0)
+                        + close_delta
+                    )
+                    self._balance_trusted = False
+                    self._ambiguous_keys.add(position.position_key)
+                    logger.exception(
+                        "me inverse short oos2 close persistence AMBIGUOUS "
+                        "(write outcome UNKNOWN — read-back unavailable; "
+                        "delta QUARANTINED, accounting untrusted, entries "
+                        "refused until a durable read-back classifies it; "
+                        "outbox staged=%s): key=%s reason=%s net=%.4f",
+                        staged, position.position_key[:48], reason,
                         net_pnl,
                     )
         if terminal_applied:
@@ -2332,6 +3050,9 @@ class InverseShortPaperEngine:
             # The terminal write also commits any DIRTY funding snapshot
             # (funding_paid rides along in the same row update).
             self._dirty_funding.pop(position.position_key, None)
+            # ... and resolves any earlier AMBIGUOUS outcome for this key:
+            # the durable row is now provably this snapshot.
+            self._ambiguous_keys.discard(position.position_key)
             # Any DIRTY partial legs of this key are retried against the
             # now-committed row: their accounting effects are already inside
             # the terminal write, so only the missing LEG ROWS are inserted
@@ -2369,6 +3090,200 @@ class InverseShortPaperEngine:
     # ------------------------------------------------------------------
     # Durable close persistence (P1) + accounting reconciliation (P2)
     # ------------------------------------------------------------------
+    def _resolve_ambiguous_writes(self) -> None:
+        """Classify every AMBIGUOUS write outcome by durable read-back (P1).
+
+        Runs every cycle at the top of ``flush_pending_closes`` (the first
+        step of every exit cycle) — BEFORE reconciliation, so a stale
+        quarantine never outlives the read-back that classifies it.
+
+        Per key, the source owning the unconfirmed write decides the
+        read-back:
+
+        * a pending terminal close  -> ``_confirmed_close`` — position row
+          facts PLUS the terminal leg, the owed partial legs and the
+          close-outbox row (rule 9: terminal confirmation covers every
+          half of the operation);
+        * a dirty funding snapshot  -> ``_confirmed_funding``;
+        * dirty partial legs        -> per-leg ``_leg_row_state``.
+
+        Three outcomes, never conflated:
+
+        * **CONFIRMED** — durable state provably carries the write: every
+          local marker and delta for the key retires (rule 5: a confirmed
+          COMMIT is never counted twice);
+        * **PROVEN_ABSENT** — the read-back succeeded and the write is
+          genuinely missing: the quarantine lifts (the retained delta is
+          safe to add) while the pending close / dirty snapshot stays a
+          recovery obligation (rule 6);
+        * **still unknown** — the key STAYS quarantined: delta not added,
+          accounting untrusted, entries refused (rules 1–3).
+        """
+        for key in list(self._ambiguous_keys):
+            try:
+                if key in self.pending_closes:
+                    snapshot = self.pending_closes[key]
+                    verdict = self._confirmed_close(snapshot)
+                    if verdict is True:
+                        # CONFIRMED APPLIED — converge exactly like a
+                        # committed flush (same retirement order).
+                        self.pending_closes.pop(key, None)
+                        self._uncommitted_deltas.pop(key, None)
+                        self._leg_deltas.pop(key, None)
+                        self._dirty_funding.pop(key, None)
+                        if key in self._dirty_legs:
+                            self._retry_dirty_legs()
+                        self._unstaged_closes.discard(key)
+                        self._staging_unavailable.discard(key)
+                        self._terminal_legs.pop(key, None)
+                        self._ambiguous_keys.discard(key)
+                        try:
+                            self.store.clear_pending_close(key)
+                        except Exception:  # idempotent outbox replay
+                            logger.debug(
+                                "me inverse short oos2 outbox clear failed "
+                                "after ambiguous-close resolution: key=%s",
+                                key[:48], exc_info=True,
+                            )
+                        logger.warning(
+                            "me inverse short oos2 AMBIGUOUS close resolved "
+                            "CONFIRMED by durable read-back (delta retired, "
+                            "nothing double-counted): key=%s reason=%s "
+                            "net=%.4f",
+                            key[:48], snapshot.exit_reason, snapshot.net_pnl,
+                        )
+                    elif verdict is False:
+                        # PROVEN ABSENT — lift the quarantine: the retained
+                        # delta is safe, the close stays owed for replay.
+                        self._ambiguous_keys.discard(key)
+                        self._balance_trusted = False
+                        logger.warning(
+                            "me inverse short oos2 AMBIGUOUS close resolved "
+                            "PROVEN ABSENT by durable read-back (delta "
+                            "reconcilable, close replay retained): key=%s",
+                            key[:48],
+                        )
+                    continue
+                if key in self._dirty_funding:
+                    snapshot = self._dirty_funding[key]
+                    confirmed = self._confirmed_funding(snapshot)
+                    if confirmed is not None and (
+                        confirmed[0] == snapshot.funding_paid
+                        and confirmed[1] == snapshot.funding_periods_charged
+                    ):
+                        self._uncommitted_deltas.pop(key, None)
+                        self._leg_deltas.pop(key, None)
+                        self._dirty_funding.pop(key, None)
+                        self._ambiguous_keys.discard(key)
+                        logger.warning(
+                            "me inverse short oos2 AMBIGUOUS funding write "
+                            "resolved CONFIRMED by durable read-back (delta "
+                            "retired): key=%s funding_paid=%.6f",
+                            key[:48], snapshot.funding_paid,
+                        )
+                    elif confirmed is not None:
+                        self._ambiguous_keys.discard(key)
+                        self._balance_trusted = False
+                        logger.warning(
+                            "me inverse short oos2 AMBIGUOUS funding write "
+                            "resolved PROVEN ABSENT by durable read-back "
+                            "(dirty snapshot retained): key=%s",
+                            key[:48],
+                        )
+                    continue
+                if key in self._dirty_legs:
+                    legs = list(self._dirty_legs[key])
+                    unknown = False
+                    confirmed_seqs: set[int] = set()
+                    for leg in legs:
+                        state = self._leg_row_state(leg)
+                        if state is None:
+                            unknown = True
+                            break
+                        if state:
+                            confirmed_seqs.add(leg.leg_seq)
+                    if unknown:
+                        continue  # stays quarantined (rule 1)
+                    if legs and len(confirmed_seqs) == len(legs):
+                        # Every owed leg is durable — full retirement.
+                        self._dirty_legs.pop(key, None)
+                        self._leg_deltas.pop(key, None)
+                        self._uncommitted_deltas.pop(key, None)
+                        self._dirty_funding.pop(key, None)
+                        self._ambiguous_keys.discard(key)
+                        logger.warning(
+                            "me inverse short oos2 AMBIGUOUS leg writes "
+                            "resolved CONFIRMED by durable read-back: key=%s "
+                            "legs=%s",
+                            key[:48], sorted(confirmed_seqs),
+                        )
+                        continue
+                    # All outcomes are KNOWN now (no None above).
+                    if confirmed_seqs:
+                        # Mixed: retire the durable legs from the owed list
+                        # and take their contribution back out of the local
+                        # deltas (the ledger already carries them).
+                        remaining = [
+                            leg for leg in legs
+                            if leg.leg_seq not in confirmed_seqs
+                        ]
+                        if remaining:
+                            self._dirty_legs[key] = remaining
+                        else:  # pragma: no cover - guarded above
+                            self._dirty_legs.pop(key, None)
+                        for leg in legs:
+                            if leg.leg_seq in confirmed_seqs:
+                                carried = leg.net_pnl + leg.entry_cost_share
+                                if key in self._uncommitted_deltas:
+                                    self._uncommitted_deltas[key] -= carried
+                                if key in self._leg_deltas:
+                                    self._leg_deltas[key] -= carried
+                        logger.warning(
+                            "me inverse short oos2 AMBIGUOUS leg writes "
+                            "resolved PARTIALLY CONFIRMED (durable legs "
+                            "retired, absent legs stay owed): key=%s "
+                            "confirmed=%s still_owed=%s",
+                            key[:48], sorted(confirmed_seqs),
+                            [leg.exit_reason for leg in remaining],
+                        )
+                    else:
+                        logger.warning(
+                            "me inverse short oos2 AMBIGUOUS leg writes "
+                            "resolved PROVEN ABSENT by durable read-back "
+                            "(legs retained for replay): key=%s",
+                            key[:48],
+                        )
+                    # Every leg's outcome is classified: lift the quarantine
+                    # (the remaining delta covers only proven-absent legs).
+                    self._ambiguous_keys.discard(key)
+                    self._balance_trusted = False
+                    continue
+                # Quarantined with no owning source: if no delta remains
+                # there is nothing to protect — drop the quarantine loudly
+                # instead of blocking entries forever (defence in depth).
+                if key not in self._uncommitted_deltas:
+                    logger.error(
+                        "me inverse short oos2 orphan AMBIGUOUS key with no "
+                        "delta/markers dropped (nothing left to protect): "
+                        "key=%s",
+                        key[:48],
+                    )
+                    self._ambiguous_keys.discard(key)
+                else:
+                    logger.error(
+                        "me inverse short oos2 AMBIGUOUS key has a delta but "
+                        "no pending close / dirty funding / dirty legs — "
+                        "stays quarantined (fail closed, manual "
+                        "investigation required): key=%s delta=%+.6f",
+                        key[:48], self._uncommitted_deltas.get(key, 0.0),
+                    )
+            except Exception:
+                logger.warning(
+                    "me inverse short oos2 ambiguous-write classification "
+                    "attempt failed (key stays AMBIGUOUS): key=%s",
+                    key[:48], exc_info=True,
+                )
+
     def flush_pending_closes(self) -> int:
         """Persist retained terminal closes with their ORIGINAL facts.
 
@@ -2386,6 +3301,11 @@ class InverseShortPaperEngine:
         are NEVER discarded on a failed read.
         """
         flushed = 0
+        # Round 6 (P1): classify AMBIGUOUS write outcomes by durable
+        # read-back BEFORE anything else — a stale quarantine is released
+        # (or retired) as soon as PostgreSQL can be asked, and an
+        # unresolved one keeps accounting untrusted for the whole cycle.
+        self._resolve_ambiguous_writes()
         for position_key, snapshot in list(self.pending_closes.items()):
             # -- P1: stage-before-update retry for unstaged snapshots ----
             if position_key in self._unstaged_closes:
@@ -2449,7 +3369,8 @@ class InverseShortPaperEngine:
             try:
                 self.store.update_position(snapshot)
             except Exception:
-                if self._confirmed_close(snapshot) is True:
+                verdict = self._confirmed_close(snapshot)
+                if verdict is True:
                     # AMBIGUOUS COMMIT (review P2): the replayed terminal
                     # UPDATE was applied although its acknowledgement was
                     # lost — converge exactly like a committed replay (the
@@ -2462,19 +3383,43 @@ class InverseShortPaperEngine:
                         position_key[:48], snapshot.exit_reason,
                         snapshot.net_pnl,
                     )
-                else:
-                    # NOT confirmed: retain the snapshot + local delta and
-                    # refuse NEW entries until a reconciliation succeeds.
+                elif verdict is False:
+                    # PROVEN ABSENT (round 6, P1): read-back succeeded and
+                    # the row does not carry this close — the retained delta
+                    # is SAFE to reconcile (durable provably lacks it) and
+                    # the snapshot stays a recovery obligation replayed on
+                    # the next cycle.  No quarantine: the outcome is known.
                     self._balance_trusted = False
                     logger.warning(
-                        "me inverse short oos2 close flush failed (terminal "
-                        "snapshot retained, write NOT confirmed by "
-                        "PostgreSQL; new entries blocked until a "
-                        "reconciliation succeeds): key=%s reason=%s "
+                        "me inverse short oos2 close flush failed (write "
+                        "PROVEN not applied by read-back; terminal snapshot "
+                        "retained for replay, new entries blocked while the "
+                        "close is unresolved): key=%s reason=%s "
                         "closed_at=%s net=%.4f durability_risk=%s",
                         position_key[:48], snapshot.exit_reason,
                         snapshot.closed_at.isoformat() if snapshot.closed_at else None,
                         snapshot.net_pnl, position_key in self._unstaged_closes,
+                        exc_info=True,
+                    )
+                    continue
+                else:
+                    # AMBIGUOUS (round 6, P1 rule 1): the read-back was
+                    # unavailable — the replay MAY have committed with a
+                    # lost acknowledgement.  The snapshot and delta stay
+                    # retained, but the key is QUARANTINED: reconcile never
+                    # adds its delta while unknown, accounting stays
+                    # untrusted and entries stay refused until a durable
+                    # read-back classifies it (never treated as absent).
+                    self._balance_trusted = False
+                    self._ambiguous_keys.add(position_key)
+                    logger.warning(
+                        "me inverse short oos2 close flush AMBIGUOUS (write "
+                        "outcome UNKNOWN — delta QUARANTINED, accounting "
+                        "untrusted, entries refused until read-back): key=%s "
+                        "reason=%s closed_at=%s net=%.4f",
+                        position_key[:48], snapshot.exit_reason,
+                        snapshot.closed_at.isoformat() if snapshot.closed_at else None,
+                        snapshot.net_pnl,
                         exc_info=True,
                     )
                     continue
@@ -2486,6 +3431,9 @@ class InverseShortPaperEngine:
             # The replayed terminal snapshot includes the cumulative funding,
             # so any DIRTY funding marker for this key is now confirmed too.
             self._dirty_funding.pop(position_key, None)
+            # ... and any earlier AMBIGUOUS outcome for this key is now
+            # resolved by the durable row itself.
+            self._ambiguous_keys.discard(position_key)
             # Dirty partial-leg ROWS of this key are retried against the now
             # committed row (their accounting already rode along with the
             # terminal write): the leg ledger can never lag the position flip.
@@ -2552,22 +3500,31 @@ class InverseShortPaperEngine:
                 )
 
     def reconcile_balance(self) -> bool:
-        """Deterministic ledger reconciliation (P2).
+        """Deterministic ledger reconciliation (P2 + round 6 P1).
 
-        ``balance = confirmed_balance + Σ uncommitted_deltas``
+        ``balance = confirmed_balance + Σ PROVEN-ABSENT uncommitted_deltas``
 
         * ``confirmed_balance`` — the CONFIRMED store ledger balance (last
           successful ``balance_components()`` read: initial + closed net −
           open costs, exactly as persisted);
         * ``uncommitted_deltas`` — LOCAL uncommitted accounting per
           position_key (close deltas and funding costs booked in memory but
-          not yet committed by the store).
+          not yet committed by the store), EXCLUDING every key whose last
+          write outcome is still AMBIGUOUS (round 6, P1 rule 5: a COMMIT
+          that may already be durable must never be added on top — the
+          quarantined amount is released only when a durable read-back
+          proves the write absent, or retired when it proves it applied).
 
-        Because the deltas are added back, a resync never overwrites
-        realized PnL that belongs to other pending positions, and it can be
-        retried at any time without recalculating any close or booking PnL
-        twice.  Returns False (keeping the memory ledger and all recovery
-        markers intact) when the store read fails.
+        Because only proven-absent deltas are added, a resync never
+        overwrites realized PnL that belongs to other pending positions and
+        can be retried at any time without recalculating any close or
+        booking PnL twice (rule 10: repeated reconciliation is idempotent —
+        the result is a pure function of the durable read plus the two
+        buckets).  While any key is ambiguous the read succeeds but
+        ``_balance_trusted`` stays False (rule 2: consistency is never
+        claimed for an unclassified write).  Returns False (keeping the
+        memory ledger and all recovery markers intact) when the store read
+        fails.
         """
         try:
             components = self.store.balance_components()
@@ -2584,16 +3541,27 @@ class InverseShortPaperEngine:
             )
             return False
         self.confirmed_balance = confirmed
-        restored = confirmed + sum(self._uncommitted_deltas.values())
+        additive_total = sum(
+            delta for key, delta in self._uncommitted_deltas.items()
+            if key not in self._ambiguous_keys
+        )
+        quarantined_total = sum(
+            delta for key, delta in self._uncommitted_deltas.items()
+            if key in self._ambiguous_keys
+        )
+        restored = confirmed + additive_total
         if restored != self.balance:
             logger.info(
                 "me inverse short oos2 balance resync: $%.4f -> $%.4f "
-                "(confirmed=$%.4f uncommitted=%+.4f)",
+                "(confirmed=$%.4f proven_absent=%+.4f quarantined=%+.4f)",
                 self.balance, restored, confirmed,
-                sum(self._uncommitted_deltas.values()),
+                additive_total, quarantined_total,
             )
         self.balance = restored
-        self._balance_trusted = True
+        # Rule 2: an AMBIGUOUS write outcome keeps the ledger untrusted even
+        # when the durable read itself succeeded — entries stay refused and
+        # the state is reported as not-consistent until classification.
+        self._balance_trusted = not self._ambiguous_keys
         return True
 
     # ------------------------------------------------------------------
@@ -2711,6 +3679,21 @@ class InverseShortPaperEngine:
             # not yet in the durable leg ledger — retried every cycle, never
             # claimed durable, entries refused meanwhile.
             "dirty_legs": len(self._dirty_legs),
+            # AMBIGUOUS write outcomes (round 6, P1): a lost acknowledgement
+            # whose durable read-back has not classified the outcome — the
+            # ledger is never claimed consistent and entries stay refused
+            # until CONFIRMED or PROVEN_ABSENT.
+            "ambiguous_writes": len(self._ambiguous_keys),
+            "ambiguous_write_keys": list(self.ambiguous_write_keys),
+            # Durable funding obligations (round 6, P2): observed rates
+            # persisted at closes whose leg history was unreadable — settled
+            # exactly once by the recovery pass; the degraded count reports
+            # keys whose obligation exists ONLY in process memory (migration
+            # 089 missing) and must never be mistaken for durable.
+            "funding_obligations": len(self.funding_obligation_keys),
+            "funding_obligations_degraded": len(
+                self._funding_obligation_degraded,
+            ),
             "gross_exposure_pct": round(
                 (gross_exposure / equity * 100.0) if equity else 0.0, 4,
             ),

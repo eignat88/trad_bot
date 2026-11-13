@@ -87,6 +87,7 @@ from test_me_long_v2_inverse_short_oos2_pg_admission_it_v1 import (  # noqa: E40
     _read_activation,
     _restore_activation,
     _write_activation,
+    ensure_funding_obligation_table,
 )
 
 PINNED_V1_FINGERPRINT = (
@@ -178,6 +179,10 @@ def pg_conn():
         if not cursor.fetchone()[0]:
             conn.close()
             pytest.skip("V2 tables missing after migration 088 attempt")
+
+    # Round 6 (P2-funding): the additive obligation table (089) rides
+    # along with every OOS-2 fixture — apply-once, raise on defect.
+    ensure_funding_obligation_table(conn)
 
     global _original_activation
     _original_activation = _read_activation(conn)

@@ -137,7 +137,7 @@
             "type": "postgres",
             "uid": "trad_bot_postgres"
           },
-          "rawSql": "SELECT 'Realized (closed positions + committed partial TP legs)' AS metric,\n       round(coalesce((SELECT sum(net_pnl) FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='CLOSED'), 0)\n            + coalesce((SELECT sum(realized_legs_net) FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN'), 0), 4) AS value_usdt\nUNION ALL\nSELECT 'Unrealized (open, last mark)',\n       round(coalesce((SELECT sum((entry_price - coalesce(last_mark_price, entry_price)) * remaining_size)\n                       FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN'), 0), 4)\nUNION ALL\nSELECT 'Equity PnL (realized + unrealized)',\n       round(coalesce((SELECT sum(net_pnl) FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='CLOSED'), 0)\n            + coalesce((SELECT sum(realized_legs_net) FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN'), 0)\n            + coalesce((SELECT sum((entry_price - coalesce(last_mark_price, entry_price)) * remaining_size)\n                        FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN'), 0), 4);",
+          "rawSql": "-- Equity/PnL semantics (round 6): derived from the SAME open-cost accounting as contour_balance_components(): balance = initial + closed net_pnl - open(entry_fee + entry_slippage + funding_paid - realized_legs_net). Entry costs count ONCE per position over the FULL original quantity (booked at entry), settled funding only after durable settlement, partial TP legs are never separate trades (realized_legs_net only), a CLOSED row counts exactly once via net_pnl. Unrealized is market-reference (entry_market_price - mark) x remaining_size, exactly like the engine's mark_to_market. The FLAG rows below report UNRESOLVED funding (never booked into the PnL rows above).\nSELECT 'Realized (closed positions + committed partial TP legs)' AS metric,\n       round(coalesce((SELECT sum(net_pnl) FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='CLOSED'), 0)\n            + coalesce((SELECT sum(realized_legs_net) FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN'), 0), 4) AS value_usdt\nUNION ALL\nSELECT 'Unrealized (open, market-reference last mark)',\n       round(coalesce((SELECT sum((entry_market_price - coalesce(last_mark_price, entry_market_price)) * remaining_size)\n                       FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN'), 0), 4)\nUNION ALL\nSELECT 'Equity PnL (engine accounting: realized + full entry costs + settled funding + market-reference unrealized)',\n       round(coalesce((SELECT sum(net_pnl) FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='CLOSED'), 0)\n            + coalesce((SELECT sum(realized_legs_net - entry_fee - entry_slippage - funding_paid)\n                        FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN'), 0)\n            + coalesce((SELECT sum((entry_market_price - coalesce(last_mark_price, entry_market_price)) * remaining_size)\n                        FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN'), 0), 4)\nUNION ALL\nSELECT 'FLAG: unsettled funding periods (frozen 8h interval, excluded from the rows above)',\n       round(coalesce((SELECT sum(GREATEST(floor(extract(epoch from (coalesce(closed_at, now()) - entered_at)) / 28800) - funding_periods, 0))\n                       FROM dds.me_long_v2_inverse_short_oos2_v1_position), 0), 4)\nUNION ALL\nSELECT 'FLAG: durable funding obligations not yet settled (count)',\n       round(coalesce((SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v1_funding_obligation WHERE status='OPEN'), 0), 4)\nUNION ALL\nSELECT 'FLAG: staged terminal closes awaiting durable replay (count)',\n       round(coalesce((SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v1_close_outbox), 0), 4);",
           "format": "table"
         }
       ],
@@ -150,7 +150,7 @@
       "options": {
         "showHeader": true
       },
-      "description": "Realized = terminal CLOSED net_pnl (full positions, partial legs included exactly once) plus committed partial TP legs of still-OPEN positions. Unrealized = (entry_price − last_mark_price) × remaining_size over OPEN positions (SHORT sign)."
+      "description": "Realized = terminal CLOSED net_pnl (full positions, entry costs + settled funding + partial legs counted exactly once) plus committed partial TP legs of still-OPEN positions. Unrealized = market-reference (entry_market_price − last_mark_price) × remaining_size over OPEN positions (SHORT sign), identical to the engine's mark_to_market. Equity PnL adds the OPEN positions' full entry fee + entry slippage + settled funding (booked once, on the FULL original quantity) — the same open-cost accounting as contour_balance_components(), so it equals engine equity − starting balance. FLAG rows surface UNRESOLVED funding (unsettled periods and durable obligations) that is deliberately NOT booked into the PnL rows above."
     },
     {
       "id": 4,
@@ -173,7 +173,7 @@
             "type": "postgres",
             "uid": "trad_bot_postgres"
           },
-          "rawSql": "SELECT symbol, entered_at, deadline_at,\n       entry_price, remaining_size AS qty_left,\n       stop_price, target_price AS tp1, tp2_price, tp3_price,\n       tp1_executed, tp2_executed, tp3_executed,\n       round((entry_price - coalesce(last_mark_price, entry_price)) * remaining_size, 4) AS unrealized_usdt,\n       round(funding_paid, 6) AS funding_paid\nFROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN'\nORDER BY entered_at;",
+          "rawSql": "SELECT symbol, entered_at, deadline_at,\n       entry_price, remaining_size AS qty_left,\n       stop_price, target_price AS tp1, tp2_price, tp3_price,\n       tp1_executed, tp2_executed, tp3_executed,\n       round((entry_market_price - coalesce(last_mark_price, entry_market_price)) * remaining_size, 4) AS unrealized_usdt,\n       round(entry_fee + entry_slippage + funding_paid, 6) AS open_costs_usdt,\n       round(realized_legs_net, 6) AS realized_legs_net,\n       round(funding_paid, 6) AS funding_paid\nFROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN'\nORDER BY entered_at;",
           "format": "table"
         }
       ],
@@ -186,7 +186,7 @@
       "options": {
         "showHeader": true
       },
-      "description": "Live SHORT positions. Entry facts (entered_at, deadline_at, prices, original size) are immutable; only remaining_size and the stage flags move as the ladder executes."
+      "description": "Live SHORT positions. Entry facts (entered_at, deadline_at, prices, original size) are immutable; only remaining_size and the stage flags move as the ladder executes. unrealized_usdt is market-reference (entry_market_price − last_mark, engine semantics); open_costs_usdt = entry_fee + entry_slippage + funding_paid is what the equity accounting subtracts on the FULL original quantity."
     },
     {
       "id": 5,

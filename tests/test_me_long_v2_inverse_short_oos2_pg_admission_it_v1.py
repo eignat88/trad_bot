@@ -65,6 +65,7 @@ from app.paper.me_long_v2_inverse_short_oos2_v1.store import (
     ACTIVATION_TABLE,
     CLOSE_OUTBOX_TABLE,
     EVENT_TABLE,
+    FUNDING_OBLIGATION_TABLE,
     MARK_EVENT_EXPIRED_LOCK_SQL,
     MARK_EVENT_EXPIRED_SQL,
     POSITION_TABLE,
@@ -77,6 +78,31 @@ from app.scanners.models import SetupCandidate, SetupState
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_087 = REPO_ROOT / "sql" / "migrations" / "088_me_long_v2_inverse_short_oos2_v1.sql"
+# Round 6 (P2-funding): the additive funding-obligation table.  Applied
+# right after 088 by every OOS-2 PostgreSQL fixture (tests only — the
+# production database never receives either migration in this task).
+MIGRATION_089 = (
+    REPO_ROOT / "sql" / "migrations"
+    / "089_me_long_v2_inverse_short_oos2_v1_funding_obligation.sql"
+)
+
+
+def ensure_funding_obligation_table(conn) -> None:
+    """Apply migration 089 when the obligation table is absent.
+
+    Raises on failure: 089 is a plain additive CREATE TABLE, so an error
+    here is a real defect that must fail the suite loudly (the
+    obligation-dependent tests cannot run without it), never a silent skip.
+    """
+    cursor = conn.cursor()
+    cursor.execute("SELECT to_regclass(%s)", (FUNDING_OBLIGATION_TABLE,))
+    if cursor.fetchone()[0]:
+        return
+    cursor.execute(MIGRATION_089.read_text(encoding="utf-8"))
+    conn.commit()
+    cursor.execute("SELECT to_regclass(%s)", (FUNDING_OBLIGATION_TABLE,))
+    if not cursor.fetchone()[0]:
+        raise RuntimeError("migration 089 did not create the obligation table")
 
 PINNED_V2_FINGERPRINT = (
     "1d1e7b4d87c6125183887c8f054a4edb1ff3f0711e70da1feeb9b7e249d7b7ec"
@@ -335,8 +361,10 @@ _original_activation: tuple | None = None
 
 def _cleanup(conn) -> None:
     cursor = conn.cursor()
-    # FK order: outbox -> position -> event.
-    for table in (CLOSE_OUTBOX_TABLE, POSITION_TABLE, EVENT_TABLE):
+    # obligation rows first (no FK, but they reference positions logically),
+    # then outbox -> position -> event.
+    for table in (FUNDING_OBLIGATION_TABLE, CLOSE_OUTBOX_TABLE,
+                  POSITION_TABLE, EVENT_TABLE):
         cursor.execute(f"DELETE FROM {table}")  # noqa: S608 - fixed names
     conn.commit()
 
@@ -366,6 +394,10 @@ def pg_conn():
         if not cursor.fetchone()[0]:
             conn.close()
             pytest.skip("V2 tables missing after migration 088 attempt")
+
+    # Round 6 (P2-funding): the additive obligation table (089) rides
+    # along with every OOS-2 fixture — apply-once, raise on defect.
+    ensure_funding_obligation_table(conn)
 
     global _original_activation
     _original_activation = _read_activation(conn)

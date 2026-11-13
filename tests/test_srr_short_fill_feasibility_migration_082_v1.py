@@ -49,14 +49,15 @@ def test_migration_number_is_next_and_not_taken():
     # contour) and 086 (inverse-short close outbox); 087 is the
     # ME_LONG_V2_INVERSE_SHORT_V2 contour migration (stale-entry guard,
     # owner decision Q2 variant B); 088 is the ME_LONG_V2_INVERSE_SHORT_OOS2_V1
-    # ladder contour migration (Issue #276).  Every one of those numbers must
-    # appear EXACTLY once — an old number is never reused — and the branch's
-    # newest migration carries the highest number.
-    for taken in (82, 83, 84, 85, 86, 87, 88):
+    # ladder contour migration (Issue #276) and 089 its round-6 additive
+    # funding-obligation table (Issue #276, Codex r4555591322).  Every one
+    # of those numbers must appear EXACTLY once — an old number is never
+    # reused — and the branch's newest migration carries the highest number.
+    for taken in (82, 83, 84, 85, 86, 87, 88, 89):
         assert numbers.count(taken) == 1, (
             f"migration number {taken:03d} must be unique"
         )
-    assert numbers[-1] == 88
+    assert numbers[-1] == 89
 
 
 def test_migration_is_transactional_and_idempotent():

@@ -214,6 +214,18 @@ sudo -u postgres psql -d trad_bot -c \
   this task applies NO migration at all.**
 * **STOP** if migration 085/086 (V1) or 087 (V2) are absent — 088 does not
   replace them and V1/V2 must remain untouched.
+* **Migration 089 (additive, round 6):**
+  `sql/migrations/089_me_long_v2_inverse_short_oos2_v1_funding_obligation.sql`
+  — one `CREATE TABLE IF NOT EXISTS` for the durable funding-obligation
+  ledger (no FK to V1/V2, no backfill, no change to 088; Issue #276,
+  Codex r4555591322: an observed rate whose historical quantity cannot be
+  proven must survive a restart instead of living only in process memory).
+  Apply it in the same approved window, AFTER 088, in numeric order —
+  `ON_ERROR_STOP=1`, same review/verify pattern as above. Without 089 the
+  contour still runs: obligation persistence degrades to the documented
+  in-memory-only mode (the protective close is never blocked, but the
+  observed rate survives only until process exit). The dedicated IT
+  database applies 088 + 089 automatically through its test fixtures.
 
 ### Step 5 — Runtime environment file (activation OFF)
 

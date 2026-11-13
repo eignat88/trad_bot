@@ -15,14 +15,34 @@ Validates monitoring/grafana/dashboards/me-inverse-short-oos-2.json:
   * the dashboard description embeds the CURRENT protocol fingerprint.
 
 JSON structure is checked directly (no Grafana instance in CI).
+
+Round 6 (Codex r4555636165): ``TestDashboardSqlOnPostgres`` additionally
+executes the REAL panel ``rawSql`` on PostgreSQL 17 against engine-built
+snapshots for every required scenario (OPEN pre-TP / after funding / after
+TP1 / after TP1+TP2 / after several funding periods / CLOSED by TP3, STOP,
+TIMEOUT / ambiguous terminal COMMIT / UNKNOWN or unresolved funding) and
+compares the Equity PnL row with the engine's own financial result on the
+SAME snapshot — field-presence checks alone are not enough.
 """
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 from app.paper.me_long_v2_inverse_short_oos2_v1.protocol import (
     protocol_fingerprint,
+)
+from test_me_long_v2_inverse_short_oos2_pg_admission_it_v1 import (
+    _PG_ONLY,
+    _Clock,
+    _capture_event,
+    _connect_store,
+    _contour,
+    pg_conn,  # noqa: F401 - fixture: real PostgreSQL scenario snapshots
+    running,  # noqa: F401 - fixture: activation RUNNING + pinned fingerprint
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -205,3 +225,477 @@ class TestDashboardQueries:
         assert "status='CAPACITY_REJECTED'" in joined
         assert "ME_INVERSE_SHORT_OOS2_SOURCE_CAPTURE_ERROR" in joined
         assert len(sqls) == 5
+
+
+# ---------------------------------------------------------------------------
+# Round 6 (Codex r4555636165) — REAL PostgreSQL execution of the panel SQL
+# against engine-built snapshots: on the SAME snapshot the dashboard's
+# Equity PnL row must equal the engine's financial result (tolerance:
+# the SQL rounds to 4 decimals).
+# ---------------------------------------------------------------------------
+
+def _pnl_panel_sql() -> str:
+    """The REAL rawSql of the \"Realized / Unrealized Net PnL\" panel."""
+    dashboard = _load()
+    panel = next(
+        p for p in dashboard["panels"]
+        if p["title"] == "Realized / Unrealized Net PnL (USDT)"
+    )
+    return panel["targets"][0]["rawSql"]
+
+
+def _dash_metrics(conn) -> dict[str, float]:
+    """Execute the panel SQL on PostgreSQL (live SQL, not a field check)."""
+    cursor = conn.cursor()
+    cursor.execute(_pnl_panel_sql())
+    rows = cursor.fetchall()
+    conn.rollback()
+    return {str(metric): float(value) for metric, value in rows}
+
+
+def _metric(metrics: dict[str, float], prefix: str) -> float:
+    return next(v for k, v in metrics.items() if k.startswith(prefix))
+
+
+def _engine_equity_pnl(contour, prices) -> float:
+    """The engine's own equity result for the SAME snapshot."""
+    account = contour.engine.mark_to_market(prices)
+    return float(account["equity"]) - float(contour.engine.initial_balance)
+
+
+def _open_scenario(candle_steps: int = 0):
+    """Fresh store + contour + one ENTERED position at reference 100."""
+    store = _connect_store()
+    clock = _Clock(datetime.now(timezone.utc))
+    contour = _contour(store, clock=clock)
+    event = _capture_event(
+        store, age=timedelta(seconds=5), candle_steps=candle_steps,
+    )
+    contour.run_cycle({"BTCUSDT": 100.0})
+    position_key = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:{event}"
+    row = store.get_position(position_key)
+    assert row is not None, "the entry must be durable on PostgreSQL"
+    return store, clock, contour, position_key
+
+
+def _open_equity(row, account) -> float:
+    """Engine-equivalent equity for an OPEN row: realized legs − full
+    entry costs − settled funding + market-reference unrealized."""
+    return (
+        row.realized_legs_net
+        - row.entry_fee
+        - row.entry_slippage_cost
+        - row.funding_paid
+        + account["unrealized_pnl"]
+    )
+
+
+@_PG_ONLY
+class TestDashboardSqlOnPostgres:
+    """Scenario suite: dashboard SQL vs engine, one snapshot each."""
+
+    # -- OPEN scenarios ------------------------------------------------
+
+    def test_open_pre_tp_flat_price(self, pg_conn, running):
+        """OPEN, mark == entry: entry costs (full quantity) + funding
+        (0) + unrealized — dashboard == engine."""
+        store, clock, contour, key = _open_scenario()
+        try:
+            contour.run_cycle({"BTCUSDT": 100.0})   # flat mark
+            row = store.get_position(key)
+            account = contour.engine.mark_to_market({"BTCUSDT": 100.0})
+            metrics = _dash_metrics(pg_conn)
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _engine_equity_pnl(contour, {"BTCUSDT": 100.0}), abs=5e-4,
+            )
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _open_equity(row, account), abs=5e-4,
+            )
+            assert _metric(metrics, "Realized") == pytest.approx(
+                row.realized_legs_net, abs=5e-4,
+            )
+            assert _metric(metrics, "Unrealized") == pytest.approx(
+                account["unrealized_pnl"], abs=5e-4,
+            )
+            assert _metric(metrics, "FLAG: unsettled") == 0
+            assert _metric(metrics, "FLAG: durable funding") == 0
+            assert _metric(metrics, "FLAG: staged terminal") == 0
+        finally:
+            store.close()
+
+    def test_open_after_8h_funding_settle_finding_repro(
+        self, pg_conn, running,
+    ):
+        """r4555636165 repro: mark $100 unchanged, 8h, rate −0.01% — the
+        dashboard equity MUST carry the settled funding (the engine did:
+        its −0.575125 vs the dashboard's −0.250125 gap)."""
+        store, clock, contour, key = _open_scenario()
+        try:
+            clock.advance(hours=8)
+            contour.run_cycle(
+                {"BTCUSDT": 100.0},
+                funding_rates_percent={"BTCUSDT": -0.01},
+            )
+            row = store.get_position(key)
+            assert row.status == "OPEN"
+            assert row.funding_periods_charged == 1
+            assert row.funding_paid != 0.0, "the observed rate settled"
+            account = contour.engine.mark_to_market({"BTCUSDT": 100.0})
+            metrics = _dash_metrics(pg_conn)
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _engine_equity_pnl(contour, {"BTCUSDT": 100.0}), abs=5e-4,
+            )
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _open_equity(row, account), abs=5e-4,
+            ), "settled funding must be inside the dashboard equity"
+            # nothing unresolved: the interval is charged
+            assert _metric(metrics, "FLAG: unsettled") == 0
+            assert _metric(metrics, "FLAG: durable funding") == 0
+        finally:
+            store.close()
+
+    def test_open_after_tp1(self, pg_conn, running):
+        store, clock, contour, key = _open_scenario()
+        try:
+            contour.run_cycle({"BTCUSDT": 94.5})     # TP1 committed
+            row = store.get_position(key)
+            assert row.status == "OPEN" and row.tp1_executed
+            account = contour.engine.mark_to_market({"BTCUSDT": 94.5})
+            metrics = _dash_metrics(pg_conn)
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _engine_equity_pnl(contour, {"BTCUSDT": 94.5}), abs=5e-4,
+            )
+            # partial TP legs are NOT separate trades: Realized carries
+            # exactly the committed leg net (once), never + closed trades
+            assert _metric(metrics, "Realized") == pytest.approx(
+                row.realized_legs_net, abs=5e-4,
+            )
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _open_equity(row, account), abs=5e-4,
+            )
+        finally:
+            store.close()
+
+    def test_open_after_tp1_and_tp2(self, pg_conn, running):
+        store, clock, contour, key = _open_scenario()
+        try:
+            contour.run_cycle({"BTCUSDT": 94.5})     # TP1
+            contour.run_cycle({"BTCUSDT": 92.5})     # TP2
+            row = store.get_position(key)
+            assert row.status == "OPEN" and row.tp2_executed
+            account = contour.engine.mark_to_market({"BTCUSDT": 92.5})
+            metrics = _dash_metrics(pg_conn)
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _engine_equity_pnl(contour, {"BTCUSDT": 92.5}), abs=5e-4,
+            )
+            assert _metric(metrics, "Realized") == pytest.approx(
+                row.realized_legs_net, abs=5e-4,
+            )
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _open_equity(row, account), abs=5e-4,
+            )
+        finally:
+            store.close()
+
+    def test_open_after_tp1_then_three_funding_periods(
+        self, pg_conn, running,
+    ):
+        """TP1 committed, +25h (3 frozen-8h intervals) settled on the
+        remaining quantity — dashboard == engine, no unresolved flags."""
+        store, clock, contour, key = _open_scenario()
+        try:
+            contour.run_cycle({"BTCUSDT": 94.5})     # TP1 committed
+            clock.advance(hours=25)
+            contour.run_cycle(
+                {"BTCUSDT": 94.5},
+                funding_rates_percent={"BTCUSDT": 0.01},
+            )
+            row = store.get_position(key)
+            assert row.status == "OPEN"
+            assert row.funding_periods_charged == 3
+            assert row.funding_paid != 0.0
+            account = contour.engine.mark_to_market({"BTCUSDT": 94.5})
+            metrics = _dash_metrics(pg_conn)
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _engine_equity_pnl(contour, {"BTCUSDT": 94.5}), abs=5e-4,
+            )
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _open_equity(row, account), abs=5e-4,
+            )
+            assert _metric(metrics, "FLAG: unsettled") == 0
+        finally:
+            store.close()
+
+    # -- CLOSED scenarios ----------------------------------------------
+
+    def test_closed_by_tp3(self, pg_conn, running):
+        store, clock, contour, key = _open_scenario()
+        try:
+            contour.run_cycle({"BTCUSDT": 94.5})     # TP1
+            contour.run_cycle({"BTCUSDT": 92.5})     # TP2
+            contour.run_cycle({"BTCUSDT": 89.0})     # TP3 terminal
+            row = store.get_position(key)
+            assert row.status == "CLOSED"
+            assert row.exit_reason.startswith("TAKE_PROFIT")
+            assert [leg.leg_seq for leg in _legs(pg_conn, key)] == [1, 2, 3]
+            metrics = _dash_metrics(pg_conn)
+            # a CLOSED row counts exactly ONCE via net_pnl, no open terms
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                row.net_pnl, abs=5e-4,
+            )
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _engine_equity_pnl(contour, {}), abs=5e-4,
+            )
+            assert _metric(metrics, "Unrealized") == 0
+            assert _metric(metrics, "FLAG: unsettled") == 0
+        finally:
+            store.close()
+
+    def test_closed_by_stop(self, pg_conn, running):
+        store, clock, contour, key = _open_scenario()
+        try:
+            contour.run_cycle({"BTCUSDT": 94.5})     # TP1 committed
+            row0 = store.get_position(key)
+            bars = {
+                "BTCUSDT": {
+                    "high": row0.stop_price * 1.001,
+                    "low": row0.entry_price * 0.99,
+                },
+            }
+            cycle = contour.run_cycle({"BTCUSDT": row0.entry_price}, bars=bars)
+            assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+            row = store.get_position(key)
+            assert row.status == "CLOSED"
+            assert [leg.leg_seq for leg in _legs(pg_conn, key)] == [1, 3]
+            metrics = _dash_metrics(pg_conn)
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                row.net_pnl, abs=5e-4,
+            )
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _engine_equity_pnl(contour, {}), abs=5e-4,
+            )
+        finally:
+            store.close()
+
+    def test_closed_by_timeout_with_full_funding(self, pg_conn, running):
+        """+121h: 15 intervals settle on the full remaining quantity and
+        THEN the protective close fires — one CLOSED row, exactly once."""
+        store, clock, contour, key = _open_scenario()
+        try:
+            clock.advance(hours=121)
+            cycle = contour.run_cycle(
+                {"BTCUSDT": 100.0},
+                funding_rates_percent={"BTCUSDT": 0.01},
+            )
+            assert cycle["exit_reasons"] == ["TIMEOUT"], cycle
+            row = store.get_position(key)
+            assert row.status == "CLOSED"
+            assert row.funding_periods_charged == 15
+            assert row.funding_paid != 0.0
+            metrics = _dash_metrics(pg_conn)
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                row.net_pnl, abs=5e-4,
+            )
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _engine_equity_pnl(contour, {}), abs=5e-4,
+            )
+            assert _metric(metrics, "FLAG: unsettled") == 0
+            assert _metric(metrics, "FLAG: durable funding") == 0
+        finally:
+            store.close()
+
+    # -- unresolved scenarios ------------------------------------------
+
+    def test_ambiguous_terminal_commit_is_flagged(
+        self, pg_conn, running,
+    ):
+        """Terminal COMMIT applied with a lost acknowledgement + failed
+        read-back: the dashboard shows ONLY durable facts (the applied
+        CLOSED row), the lingering close-outbox row raises the explicit
+        FLAG, and the engine reports the unresolved write (never a silent
+        confirmed claim)."""
+        store, clock, contour, key = _open_scenario()
+        try:
+            contour.run_cycle({"BTCUSDT": 94.5})     # TP1 committed
+            row0 = store.get_position(key)
+            entry = row0.entry_price
+            bars = {
+                "BTCUSDT": {"high": row0.stop_price * 1.001,
+                            "low": entry * 0.99},
+            }
+            original_update = store.update_position
+            original_get = store.get_position
+
+            def update_losing_ack(position):
+                original_update(position)   # PostgreSQL applied it
+                raise RuntimeError("terminal COMMIT ack lost")
+
+            def read_back_down(k):
+                if k == key:
+                    raise RuntimeError("durable read-back unavailable")
+                return original_get(k)
+
+            store.update_position = update_losing_ack
+            store.get_position = read_back_down
+            cycle = contour.run_cycle({"BTCUSDT": entry}, bars=bars)
+            assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+            engine = contour.engine
+
+            # engine-side unresolved flags (rule 1-2)
+            assert engine.ambiguous_write_keys == (key,)
+            assert engine.accounting_consistent is False
+            assert key in engine.pending_closes
+
+            durable = original_get(key)
+            assert durable.status == "CLOSED"
+            metrics = _dash_metrics(pg_conn)
+            # durable-only equity == the reconciled engine balance
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                durable.net_pnl, abs=5e-4,
+            )
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _engine_equity_pnl(contour, {}), abs=5e-4,
+            )
+            # the unresolved close is EXPLICIT: outbox row still staged
+            assert _metric(metrics, "FLAG: staged terminal") == 1
+
+            # heal -> read-back classifies CONFIRMED -> outbox cleared
+            store.update_position = original_update
+            store.get_position = original_get
+            contour.run_cycle({"BTCUSDT": entry})
+            assert engine.ambiguous_write_keys == ()
+            assert engine.pending_closes == {}
+            metrics = _dash_metrics(pg_conn)
+            assert _metric(metrics, "FLAG: staged terminal") == 0
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _engine_equity_pnl(contour, {}), abs=5e-4,
+            )
+        finally:
+            store.close()
+
+    def test_unknown_funding_is_flagged_never_booked(
+        self, pg_conn, running,
+    ):
+        """Rate UNKNOWN at a protective close: nothing booked, no
+        obligation invented, and the dashboard raises the unresolved-
+        funding FLAG instead of pretending the PnL is final."""
+        store, clock, contour, key = _open_scenario()
+        try:
+            clock.advance(hours=9)
+            row0 = store.get_position(key)
+            bars = {
+                "BTCUSDT": {"high": row0.stop_price * 1.001,
+                            "low": row0.entry_price * 0.99},
+            }
+            cycle = contour.run_cycle({"BTCUSDT": row0.entry_price}, bars=bars)
+            assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+            row = store.get_position(key)
+            assert row.status == "CLOSED"
+            assert row.funding_periods_charged == 0
+            assert row.funding_paid == 0.0, "no approximate booking"
+            assert store.get_funding_obligation(key) is None, (
+                "UNKNOWN rate is not an obligation (history was readable)",
+            )
+            assert not contour.engine.funding_obligation_keys
+            metrics = _dash_metrics(pg_conn)
+            # dashboard == engine (neither booked the unknown rate) ...
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                row.net_pnl, abs=5e-4,
+            )
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _engine_equity_pnl(contour, {}), abs=5e-4,
+            )
+            # ... and the gap is flagged, never silently finalized
+            assert _metric(metrics, "FLAG: unsettled") == 1
+            assert _metric(metrics, "FLAG: durable funding") == 0
+        finally:
+            store.close()
+
+    def test_history_unavailable_obligation_flagged_then_recovered(
+        self, pg_conn, running,
+    ):
+        """HISTORY_UNAVAILABLE close: the observed rate lives in the
+        DURABLE obligation — the dashboard flags both the unsettled
+        interval and the open obligation, and does NOT count the funding
+        until it is durably settled; after recovery the flag clears and
+        both sides converge."""
+        store, clock, contour, key = _open_scenario()
+        try:
+            clock.advance(hours=9)
+            row0 = store.get_position(key)
+            bars = {
+                "BTCUSDT": {"high": row0.stop_price * 1.001,
+                            "low": row0.entry_price * 0.99},
+            }
+            original_list = store.list_close_legs
+
+            def history_down(k):
+                raise RuntimeError("close-leg history unavailable")
+
+            store.list_close_legs = history_down
+            cycle = contour.run_cycle(
+                {"BTCUSDT": row0.entry_price}, bars=bars,
+                funding_rates_percent={"BTCUSDT": 0.01},
+            )
+            assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+            store.list_close_legs = original_list
+            row = store.get_position(key)
+            assert row.status == "CLOSED"
+            assert row.funding_periods_charged == 0, "not settled yet"
+            obligation = store.get_funding_obligation(key)
+            assert obligation is not None and obligation.status == "OPEN"
+
+            metrics = _dash_metrics(pg_conn)
+            # phase 1: the observed rate is EXCLUDED from Net PnL ...
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                row.net_pnl, abs=5e-4,
+            )
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _engine_equity_pnl(contour, {}), abs=5e-4,
+            )
+            # ... and both unresolved states are flagged explicitly
+            assert _metric(metrics, "FLAG: unsettled") == 1
+            assert _metric(metrics, "FLAG: durable funding") == 1
+
+            # recovery: history back -> settle exactly once
+            contour.run_cycle({"BTCUSDT": row0.entry_price})
+            settled = store.get_position(key)
+            assert settled.funding_periods_charged == 1
+            assert settled.funding_paid != 0.0
+            assert store.get_funding_obligation(key).status != "OPEN"
+
+            metrics = _dash_metrics(pg_conn)
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                settled.net_pnl, abs=5e-4,
+            )
+            assert _metric(metrics, "Equity PnL") == pytest.approx(
+                _engine_equity_pnl(contour, {}), abs=5e-4,
+            )
+            assert _metric(metrics, "FLAG: unsettled") == 0
+            assert _metric(metrics, "FLAG: durable funding") == 0
+            # idempotent: nothing changes on further cycles
+            for _ in range(3):
+                contour.run_cycle({"BTCUSDT": row0.entry_price})
+            assert store.get_position(key).funding_paid == pytest.approx(
+                settled.funding_paid, abs=1e-9,
+            )
+        finally:
+            store.close()
+
+
+def _legs(conn, position_key: str) -> list:
+    """Close-leg row numbers read through the raw test connection."""
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT leg_seq FROM dds.me_long_v2_inverse_short_oos2_v1_close_leg "
+        "WHERE position_key = %s ORDER BY leg_seq",
+        (position_key,),
+    )
+    rows = [seq for (seq,) in cursor.fetchall()]
+    conn.rollback()
+    return [_LegRef(seq) for seq in rows]
+
+
+class _LegRef:
+    def __init__(self, leg_seq: int):
+        self.leg_seq = leg_seq

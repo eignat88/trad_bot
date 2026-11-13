@@ -70,6 +70,18 @@ POSITION_STATUS_OPEN = "OPEN"
 POSITION_STATUS_CLOSED = "CLOSED"
 POSITION_STATUSES = (POSITION_STATUS_OPEN, POSITION_STATUS_CLOSED)
 
+# Durable funding obligation states (round 6, Codex P2-funding): an
+# obligation is written when the rate is KNOWN but the close-leg history
+# was unreadable at the terminal close, so the observed rate is never lost
+# with the process.  SETTLED means the gap was booked exactly once (or
+# superseded by a later settlement that already covered it).
+FUNDING_OBLIGATION_OPEN = "OPEN"
+FUNDING_OBLIGATION_SETTLED = "SETTLED"
+FUNDING_OBLIGATION_STATUSES = (
+    FUNDING_OBLIGATION_OPEN,
+    FUNDING_OBLIGATION_SETTLED,
+)
+
 # Durable close-leg identity (migration 088: UNIQUE (position_key, leg_seq)).
 # A leg can only ever be booked once — restart, replay and ambiguous COMMIT
 # all resolve against this key.
@@ -500,6 +512,102 @@ class InverseShortCloseLeg:
             ),
             executed_at=_dt(row["executed_at"]),
             status_after=row.get("status_after") or POSITION_STATUS_OPEN,
+        )
+
+
+@dataclass
+class InverseShortFundingObligation:
+    """Durable funding obligation of a terminal close (round 6, P2).
+
+    Written by ``_settle_funding_for_close`` when the OBSERVED funding
+    rate is known but the close-leg history was unreadable at the moment
+    of the terminal close (``HISTORY_UNAVAILABLE``): the protective close
+    still commits, but the known rate is persisted instead of being lost
+    with the process.  A later recovery pass settles the gap exactly once
+    from the durable leg ledger.
+
+    Identity: ``obligation_key`` is deterministic — position + observation
+    window — so a replayed close attempt upserts the SAME obligation and
+    can never create a second one.  ``periods_due`` may only ADVANCE
+    (a later retry observes more elapsed periods); the FIRST observed rate
+    is kept (the frozen substitution policy: the first observed rate after
+    recovery applies to the whole backlog, exactly once).
+    """
+
+    position_key: str
+    obligation_key: str
+    symbol: str
+    event_key: str
+    observed_rate_percent: float
+    observed_at: datetime
+    entered_at: datetime
+    periods_due: int
+    periods_charged_at_observation: int
+    legs_ref_max_seq: int
+    status: str = FUNDING_OBLIGATION_OPEN
+    settled_at: datetime | None = None
+    settled_cost: float | None = None
+
+    @property
+    def outstanding_periods(self) -> int:
+        """Periods this obligation still aims to cover at observation."""
+        return max(0, int(self.periods_due) - int(self.periods_charged_at_observation))
+
+    @staticmethod
+    def make_obligation_key(
+        position_key: str,
+        entered_at: datetime,
+        periods_due: int,
+        periods_charged: int,
+    ) -> str:
+        """Deterministic identity of one observation window."""
+        return (
+            f"{position_key}|{_iso(entered_at)}|{int(periods_due)}"
+            f"|{int(periods_charged)}"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "position_key": self.position_key,
+            "obligation_key": self.obligation_key,
+            "symbol": self.symbol,
+            "event_key": self.event_key,
+            "observed_rate_percent": self.observed_rate_percent,
+            "observed_at": _iso(self.observed_at),
+            "entered_at": _iso(self.entered_at),
+            "periods_due": int(self.periods_due),
+            "periods_charged_at_observation": int(
+                self.periods_charged_at_observation
+            ),
+            "legs_ref_max_seq": int(self.legs_ref_max_seq),
+            "status": self.status,
+            "settled_at": _iso(self.settled_at) if self.settled_at else None,
+            "settled_cost": self.settled_cost,
+        }
+
+    @classmethod
+    def from_dict(cls, row: dict[str, Any]) -> "InverseShortFundingObligation":
+        settled = row.get("settled_at")
+        return cls(
+            position_key=row["position_key"],
+            obligation_key=row["obligation_key"],
+            symbol=row.get("symbol") or "",
+            event_key=row.get("event_key") or "",
+            observed_rate_percent=float(row["observed_rate_percent"]),
+            observed_at=_dt(row["observed_at"]),
+            entered_at=_dt(row["entered_at"]),
+            periods_due=int(row["periods_due"]),
+            periods_charged_at_observation=int(
+                row.get("periods_charged_at_observation") or 0
+            ),
+            legs_ref_max_seq=int(row.get("legs_ref_max_seq") or -1),
+            status=row.get("status") or FUNDING_OBLIGATION_OPEN,
+            settled_at=_dt(settled) if settled else None,
+            settled_cost=(
+                float(row["settled_cost"])
+                if row.get("settled_cost") is not None
+                else None
+            ),
         )
 
 
