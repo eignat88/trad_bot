@@ -67,7 +67,7 @@ class DashboardContract(unittest.TestCase):
         for p in self.dashboard["panels"]:
             for t in p["targets"]:
                 sql = t["rawSql"].strip()
-                self.assertRegex(sql.upper(), r"^(SELECT|WITH)\\b", p["title"])
+                self.assertRegex(sql.upper(), r"^(SELECT|WITH)\b", p["title"])
                 self.assertNotRegex(
                     sql.upper(),
                     r"\b(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE|TRUNCATE|COPY|DO|CALL|GRANT|REVOKE)\b",
