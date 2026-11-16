@@ -1194,9 +1194,12 @@ def _capture_me_inverse_short_oos2_source(
     scanner decision is changed.  Fail-open: the whole body is wrapped and
     must never raise into the scanner cycle.
     """
+    # getattr: a non-candidate payload (defensive; the published list is
+    # typed SetupCandidate) must be ignored, never raise into the cycle.
     if (
-        candidate.scanner_name != "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2"
-        or candidate.direction != "LONG"
+        getattr(candidate, "scanner_name", None)
+        != "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2"
+        or getattr(candidate, "direction", None) != "LONG"
     ):
         return
 
@@ -1270,10 +1273,13 @@ def _capture_me_inverse_short_oos2_source(
                 status, candidate.symbol)
     except Exception:
         _me_inverse_short_oos2_source_stats["errors"] += 1
+        # getattr: a malformed published event must never re-raise here —
+        # the except path itself is part of the fail-open contract.
         logger.exception(
             "ME_LONG_V2_INVERSE_SHORT_OOS2_V1 source capture failed; scanner "
             "unaffected symbol=%s signal_time=%s",
-            candidate.symbol, candidate.detected_at)
+            getattr(candidate, "symbol", None),
+            getattr(candidate, "detected_at", None))
         _report_error("EXCEPTION")
 
 
