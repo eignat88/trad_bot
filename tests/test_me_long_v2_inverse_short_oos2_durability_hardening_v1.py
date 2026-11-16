@@ -1,13 +1,13 @@
-"""ME_LONG_V2_INVERSE_SHORT_OOS2_V1 — Codex review hardening regressions.
+"""ME_LONG_V2_INVERSE_SHORT_OOS2_V1 вЂ” Codex review hardening regressions.
 
 Fault-injection suite for the three review findings on PR #278:
 
-* **P1-1** — ``persist_marks()`` may only write MARK telemetry
+* **P1-1** вЂ” ``persist_marks()`` may only write MARK telemetry
   (``update_position_marks``): after a FAILED ``commit_partial_exit()``
-  the durable row must stay exactly what PostgreSQL confirmed — a mark
+  the durable row must stay exactly what PostgreSQL confirmed вЂ” a mark
   write never carries ``remaining_size`` / TP flags / realized PnL /
   funding / status forward.
-* **P1-2** — the ladder never advances over an unconfirmed partial leg:
+* **P1-2** вЂ” the ladder never advances over an unconfirmed partial leg:
   TP1's dirty row is retried and confirmed BEFORE TP2 (or TP3) may fire,
   so the mandatory fault-injection scenario
   ``TP1 calculated -> DB write fails -> retry -> TP1 confirmed -> TP2 ->
@@ -16,12 +16,12 @@ Fault-injection suite for the three review findings on PR #278:
   and no permanently blocked recovery.  Protective STOP/TIMEOUT stay
   active while the ledger is dirty, and a terminal close stages the owed
   partial leg rows with its own snapshot (no lost TP records on restart).
-* **P2** — funding settles PER PERIOD on the quantity outstanding at that
+* **P2** вЂ” funding settles PER PERIOD on the quantity outstanding at that
   period's funding instant, reconstructed from the DURABLE close-leg
   history; an unprovable history never finalizes a settlement, and an
   unsettled obligation survives restart exactly once.
 
-Everything here runs against the in-memory store — no PostgreSQL in this
+Everything here runs against the in-memory store вЂ” no PostgreSQL in this
 suite (the real-PostgreSQL fault-injection lives in
 ``test_me_long_v2_inverse_short_oos2_partial_restart_pg_it_v1.py``,
 gated on ``TEST_DB_HOST``).
@@ -31,6 +31,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -49,6 +50,10 @@ from app.paper.me_long_v2_inverse_short_oos2_v1.activation import (
 )
 from app.paper.me_long_v2_inverse_short_oos2_v1.engine import (
     InverseShortPaperEngine,
+)
+from app.paper.me_long_v2_inverse_short_oos2_v1.journal import (
+    PendingProtectiveClose,
+    ProtectiveCloseJournal,
 )
 from app.paper.me_long_v2_inverse_short_oos2_v1.models import (
     FUNDING_OBLIGATION_OPEN,
@@ -174,7 +179,7 @@ def _restart(
     restarted = InverseShortContour(
         settings, contour.store, clock=clock, activation_enabled=True,
         # Round 7 (P1): the SAME journal directory is replayed by the new
-        # engine — that is exactly what makes a retained protective close
+        # engine вЂ” that is exactly what makes a retained protective close
         # survive "restart before PostgreSQL recovery".
         journal_dir=(
             journal_dir if journal_dir is not None
@@ -222,7 +227,7 @@ def _position(
 
 
 def _assert_ledger_consistent(contour: InverseShortContour) -> None:
-    """balance == initial + Σclosed net + Σopen(realized legs − costs)."""
+    """balance == initial + ОЈclosed net + ОЈopen(realized legs в€’ costs)."""
     engine = contour.engine
     expected = engine.initial_balance
     for p in engine.store.list_positions():
@@ -239,7 +244,7 @@ def _assert_ledger_consistent(contour: InverseShortContour) -> None:
             assert p.remaining_size <= p.position_size + 1e-12
     expected += sum(
         delta for key, delta in engine._uncommitted_deltas.items()
-        # Round 6 (P1): an AMBIGUOUS key's delta is QUARANTINED — the
+        # Round 6 (P1): an AMBIGUOUS key's delta is QUARANTINED вЂ” the
         # engine balance deliberately does not carry it while the durable
         # outcome is unknown, so the identity must not either.
         if key not in engine._ambiguous_keys
@@ -255,7 +260,7 @@ def _assert_durable_consistent(
     """Section-6 accounting audit against the DURABLE rows only.
 
     quantity conservation, one durable execution per stage, OPEN/CLOSED
-    remainder rules — i.e. exactly what a restart would see.
+    remainder rules вЂ” i.e. exactly what a restart would see.
     """
     pos = store.get_position(position_key)
     assert pos is not None
@@ -271,7 +276,7 @@ def _assert_durable_consistent(
     if pos.status == POSITION_STATUS_OPEN:
         assert pos.remaining_size > 0, "OPEN row with zero remainder"
         assert round(pos.position_size - pos.remaining_size, 9) == closed_qty, (
-            "conservation: initial = remaining + Σ durable leg quantities",
+            "conservation: initial = remaining + ОЈ durable leg quantities",
         )
         assert bool(pos.tp1_executed) == any(
             leg.exit_reason == "TAKE_PROFIT_1" for leg in legs
@@ -283,7 +288,7 @@ def _assert_durable_consistent(
     else:
         assert pos.remaining_size == 0, "CLOSED row with a remainder"
         assert round(pos.position_size, 9) == closed_qty, (
-            "conservation: initial = Σ durable leg quantities (terminal "
+            "conservation: initial = ОЈ durable leg quantities (terminal "
             "leg absorbs the remainder)",
         )
         terminal = [leg for leg in legs if leg.is_terminal]
@@ -315,7 +320,7 @@ def _legs_by_reason(
 
 
 # ---------------------------------------------------------------------------
-# P1-1 — mark-only persistence
+# P1-1 вЂ” mark-only persistence
 # ---------------------------------------------------------------------------
 
 class TestP11MarkOnlyPersistence:
@@ -357,7 +362,7 @@ class TestP11MarkOnlyPersistence:
 
         # the full-object path was NEVER used during that cycle
         assert update_calls["n"] == 0, (
-            "persist_marks must not call update_position — a full-object "
+            "persist_marks must not call update_position вЂ” a full-object "
             "write would make the unconfirmed TP1 durable",
         )
 
@@ -391,7 +396,7 @@ class TestP11MarkOnlyPersistence:
         contour.run_cycle({pos.symbol: entry * 0.945})   # TP1 dirty
         assert pos.position_key in contour.engine.dirty_leg_keys
 
-        # RESTART — dirty state is process-local by contract
+        # RESTART вЂ” dirty state is process-local by contract
         restarted = _restart(contour, settings, clock)
         assert restarted.engine.dirty_leg_keys == ()
         loaded = _position(restarted, pos.symbol)
@@ -483,7 +488,7 @@ class TestP11MarkOnlyPersistence:
 
 
 # ---------------------------------------------------------------------------
-# P1-2 — ladder gated on durable confirmation
+# P1-2 вЂ” ladder gated on durable confirmation
 # ---------------------------------------------------------------------------
 
 class TestP12LadderDurabilityGate:
@@ -608,7 +613,7 @@ class TestP12LadderDurabilityGate:
         )
         assert pos.position_key in contour.engine.dirty_leg_keys
         # next cycle: retry confirms TP1, then the rest of the ladder
-        # (TP2 of the same bar, then TP3) fires normally — exactly once
+        # (TP2 of the same bar, then TP3) fires normally вЂ” exactly once
         # each, all durable.
         contour.run_cycle({pos.symbol: pos.tp3_price}, bars={pos.symbol: bar})
         assert pos.status == POSITION_STATUS_CLOSED
@@ -621,7 +626,7 @@ class TestP12LadderDurabilityGate:
         _assert_ledger_consistent(contour)
 
     def test_ambiguous_commit_is_adopted_without_dirty_state(self):
-        """COMMIT applied, acknowledgement lost: adopted on read-back —
+        """COMMIT applied, acknowledgement lost: adopted on read-back вЂ”
         nothing dirty, nothing double-booked, ladder continues."""
         settings = _settings()
         contour, store, clock = _contour(settings)
@@ -676,7 +681,7 @@ class TestP12LadderDurabilityGate:
 
     def test_protective_stop_stages_the_owed_leg_rows(self):
         """A STOP while TP1 is dirty stages TP1's row with its own
-        snapshot — the restart can never lose the executed TP record."""
+        snapshot вЂ” the restart can never lose the executed TP record."""
         settings = _settings()
         contour, store, clock = _contour(settings)
         pos = _open_one(contour, store, clock)
@@ -693,7 +698,7 @@ class TestP12LadderDurabilityGate:
         cycle = contour.run_cycle({pos.symbol: entry}, bars=bars)
         assert cycle["exit_reasons"] == ["STOP_LOSS"]
 
-        # TP1's leg row is durable ALREADY — staged with the terminal
+        # TP1's leg row is durable ALREADY вЂ” staged with the terminal
         # snapshot even though commit_partial_exit never succeeded.
         legs = store.list_close_legs(pos.position_key)
         assert sorted(leg.exit_reason for leg in legs) == [
@@ -792,7 +797,7 @@ class TestP12LadderDurabilityGate:
         assert pos.funding_paid == 0.0
         assert pos.funding_periods_charged == 0
         assert contour.engine._dirty_funding == {}
-        # only the LEG delta is uncommitted — funding added no delta of its
+        # only the LEG delta is uncommitted вЂ” funding added no delta of its
         # own (the settlement was deferred before any accrual)
         assert set(contour.engine._uncommitted_deltas) == {pos.position_key}
         durable = store.get_position(pos.position_key)
@@ -800,7 +805,7 @@ class TestP12LadderDurabilityGate:
         assert durable.remaining_size == pos.position_size
 
         # store heals: the dirty-leg retry confirms TP1 FIRST (start of
-        # cycle), the gate lifts and funding settles exactly once — on the
+        # cycle), the gate lifts and funding settles exactly once вЂ” on the
         # historical quantity (TP1 executed at t0, BEFORE the t0+8h
         # boundary -> the period is charged on the post-TP1 quantity).
         store.commit_partial_exit = (
@@ -833,7 +838,7 @@ class TestP12LadderDurabilityGate:
 
         for price in (entry * 0.945, entry * 0.929, entry * 0.899):
             contour.run_cycle({pos.symbol: price})
-            # extra mark persistence between cycles — telemetry only
+            # extra mark persistence between cycles вЂ” telemetry only
             contour.engine.mark_to_market({pos.symbol: price})
             contour.engine.persist_marks()
             _assert_durable_consistent(store, pos.position_key)
@@ -845,7 +850,7 @@ class TestP12LadderDurabilityGate:
 
 
 # ---------------------------------------------------------------------------
-# P2 — funding on historical (per-period) quantities
+# P2 вЂ” funding on historical (per-period) quantities
 # ---------------------------------------------------------------------------
 
 class TestP2HistoricalFundingQuantities:
@@ -982,7 +987,7 @@ class TestP2HistoricalFundingQuantities:
         _assert_ledger_consistent(restarted)
 
     def test_ambiguous_funding_commit_is_applied_exactly_once(self):
-        """COMMIT applied, acknowledgement lost: adopted on read-back —
+        """COMMIT applied, acknowledgement lost: adopted on read-back вЂ”
         no dirty delta, no double booking on the next cycle."""
         settings = _settings()
         contour, store, clock = _contour(settings)
@@ -1061,7 +1066,7 @@ class TestP2HistoricalFundingQuantities:
 
 
 # ---------------------------------------------------------------------------
-# Codex review round 2 — P1: a terminal close is never "fully saved"
+# Codex review round 2 вЂ” P1: a terminal close is never "fully saved"
 # before its close-leg and outbox rows are durable
 # ---------------------------------------------------------------------------
 
@@ -1071,7 +1076,7 @@ class TestRound2TerminalCloseNeverSavedWithoutLegs:
     ):
         """Mandatory combined-failure scenario (round 2, P1):
         partial commit AND stage_close() both fail while update_position()
-        itself is healthy — the terminal UPDATE must not run (the position
+        itself is healthy вЂ” the terminal UPDATE must not run (the position
         may not be reported fully saved without its close-leg and outbox
         rows), every obligation is retained, and a subsequent restart
         restores the partial and terminal closes exactly once."""
@@ -1118,7 +1123,7 @@ class TestRound2TerminalCloseNeverSavedWithoutLegs:
 
         # The terminal UPDATE was NEVER attempted: the position may not be
         # reported fully saved before its close-leg and outbox rows are
-        # durable — even though update_position() would have succeeded.
+        # durable вЂ” even though update_position() would have succeeded.
         assert update_calls["n"] == 0, (
             "terminal update_position() ran while staging was unconfirmed",
         )
@@ -1227,7 +1232,7 @@ class TestRound2TerminalCloseNeverSavedWithoutLegs:
 
 
 # ---------------------------------------------------------------------------
-# Codex review round 2 — P2: unified funding-before-exit at an EXACT
+# Codex review round 2 вЂ” P2: unified funding-before-exit at an EXACT
 # boundary timestamp (normal vs restored calculation must agree)
 # ---------------------------------------------------------------------------
 
@@ -1237,11 +1242,11 @@ class TestRound2ExactBoundaryFundingOrder:
         accounted AFTER the accrual for that boundary: the normal in-cycle
         calculation (funding settles first, then the TP fires at the very
         same timestamp) and the calculation restored from the durable leg
-        ledger after a restart must be exactly equal — and both charge the
+        ledger after a restart must be exactly equal вЂ” and both charge the
         FULL pre-TP quantity for that period, never the live remainder."""
         settings = _settings()
 
-        # --- A: NORMAL — the rate is observed in the boundary cycle ------
+        # --- A: NORMAL вЂ” the rate is observed in the boundary cycle ------
         a, a_store, a_clock = _contour(settings)
         a_pos = _open_one(a, a_store, a_clock)
         a_clock.advance(hours=8)              # EXACTLY the period-1 boundary
@@ -1264,7 +1269,7 @@ class TestRound2ExactBoundaryFundingOrder:
         ) * (0.01 / 100.0)
         assert a_pos.funding_paid == pytest.approx(expected_full, rel=1e-12)
 
-        # --- B: RESTORED — same TP on the same instant, rate arrives one
+        # --- B: RESTORED вЂ” same TP on the same instant, rate arrives one
         # hour later, and the settlement happens after a RESTART from the
         # durable ledger.
         b, b_store, b_clock = _contour(settings)
@@ -1327,7 +1332,7 @@ class TestRound2ExactBoundaryFundingOrder:
 
 
 # ---------------------------------------------------------------------------
-# Codex review round 3 — P1: a pending terminal snapshot OWNS its key's
+# Codex review round 3 вЂ” P1: a pending terminal snapshot OWNS its key's
 # leg rows; no independent dirty-leg replay until staging + terminal
 # UPDATE are both confirmed.
 # ---------------------------------------------------------------------------
@@ -1410,7 +1415,7 @@ class TestRound3PendingSnapshotOwnsLegReplay:
         assert store.list_pending_closes() == []
 
         # (c) next-cycle retry: TP1 commit recovered, staging STILL down.
-        #     The pending snapshot must exclude the independent replay —
+        #     The pending snapshot must exclude the independent replay вЂ”
         #     no leg-only insert against the still-OPEN durable row.
         store.commit_partial_exit = original_commit
         cycle = contour.run_cycle({pos.symbol: entry}, bars=stop_bars)
@@ -1433,7 +1438,7 @@ class TestRound3PendingSnapshotOwnsLegReplay:
         assert engine.durability_risk is True
 
         # (d) store recovery (PostgreSQL healed), then (e) RESTART: only
-        #     durable state survives — the row is the still-OPEN state.
+        #     durable state survives вЂ” the row is the still-OPEN state.
         store.stage_close = original_stage
         store.update_position = original_update
         restarted = _restart(contour, settings, clock)
@@ -1525,8 +1530,8 @@ class TestRound3PendingSnapshotOwnsLegReplay:
 
 
 # ---------------------------------------------------------------------------
-# Round 5 (Codex r4552612002) — observed funding must survive a dirty-leg
-# terminal close: fault-injection scenarios A–D.  A/C/D are additionally
+# Round 5 (Codex r4552612002) вЂ” observed funding must survive a dirty-leg
+# terminal close: fault-injection scenarios AвЂ“D.  A/C/D are additionally
 # executed against real PostgreSQL in
 # ``test_me_long_v2_inverse_short_oos2_partial_restart_pg_it_v1.py``.
 # ---------------------------------------------------------------------------
@@ -1577,7 +1582,7 @@ def _scenario_a_control(settings: Settings) -> dict:
 
 
 class TestRound5FundingSurvivesDirtyTerminalClose:
-    """Codex r4552612002 — funding lost when STOP closes over a dirty TP.
+    """Codex r4552612002 вЂ” funding lost when STOP closes over a dirty TP.
 
     Scenario A: observed rate + dirty partial leg + protective STOP in
     the same cycle must produce ONE consistent terminal snapshot (owed
@@ -1658,16 +1663,16 @@ class TestRound5FundingSurvivesDirtyTerminalClose:
         assert row.remaining_size == 0.0
         _assert_durable_consistent(store, position_key)
         # the owed leg row survived staging even though commit stays down:
-        # round 6 (P1) classifies by durable read-back — a PROVEN leg row
+        # round 6 (P1) classifies by durable read-back вЂ” a PROVEN leg row
         # fulfils the obligation, so the dirty marker is retired exactly
         # when durability is proven (never earlier, never lost: the row is
         # asserted above as legs [1, 3] and the accounting it carries is
-        # inside the CLOSED row — no double booking follows).
+        # inside the CLOSED row вЂ” no double booking follows).
         assert position_key not in engine.dirty_leg_keys
         store.commit_partial_exit = original_commit
 
         # (4) RESTART: only durable state survives; reconciliation sees
-        #     the CLOSED row with the folded funding — nothing changes.
+        #     the CLOSED row with the folded funding вЂ” nothing changes.
         restarted = _restart(contour, settings, clock)
         assert restarted.engine.dirty_leg_keys == ()
         assert restarted.engine.durability_risk is False
@@ -1714,16 +1719,16 @@ class TestRound5FundingSurvivesDirtyTerminalClose:
         due-but-unsettled obligation stays recorded and diagnosable on
         the CLOSED row (unsettled periods reported through
         ``unsettled_funding_periods()``/``snapshot()``), and no later
-        recovery ever retroactively books it (P2-1 #7) — so no
+        recovery ever retroactively books it (P2-1 #7) вЂ” so no
         double-count either.
 
         DOCUMENTED LIMITATION (not hidden by this test): funding still
-        unsettled AT a terminal close is NEVER settled after the close —
+        unsettled AT a terminal close is NEVER settled after the close вЂ”
         exit facts (net_pnl incl. funding_paid) are frozen by design.
         The safe durable scheme is to settle the backlog BEFORE freezing
         whenever a rate is observed (exactly what the round-5 close fold
         does for known rates); for a genuinely UNKNOWN rate at close the
-        obligation stays an explicitly reported gap on the row — see the
+        obligation stays an explicitly reported gap on the row вЂ” see the
         implementation report, round 5, scenario B."""
         settings = _settings()
         contour, store, clock = _contour(settings)
@@ -1752,7 +1757,7 @@ class TestRound5FundingSurvivesDirtyTerminalClose:
             "an UNKNOWN rate must never book a period (zero or otherwise)",
         )
         assert row.funding_paid == 0.0
-        # (2) the obligation stays diagnosable — durable on the row and
+        # (2) the obligation stays diagnosable вЂ” durable on the row and
         #     reported through the contract methods.
         assert engine.unsettled_funding_periods() == 1
         assert position_key in engine._funding_unknown
@@ -1767,7 +1772,7 @@ class TestRound5FundingSurvivesDirtyTerminalClose:
         store.commit_partial_exit = original_commit
 
         # (4) later recovery NEVER retroactively books it (P2-1 #7): a
-        #     restart with the rate back does not touch the CLOSED row —
+        #     restart with the rate back does not touch the CLOSED row вЂ”
         #     no zero booking, no double-count, obligation still reported.
         restarted = _restart(contour, settings, clock)
         assert restarted.engine.unsettled_funding_periods() == 1, (
@@ -1791,7 +1796,7 @@ class TestRound5FundingSurvivesDirtyTerminalClose:
     def test_scenario_c_lost_ack_after_successful_terminal_commit(self):
         """C (mandatory): scenario A plus a LOST ACKNOWLEDGEMENT after
         the terminal COMMIT was applied.  Read-back verification proves
-        the facts identical — folded funding, net PnL, terminal leg — so
+        the facts identical вЂ” folded funding, net PnL, terminal leg вЂ” so
         the state settles as committed: no pending close, no uncommitted
         delta, no duplicated leg/period/balance operation, and the final
         balance equals the failure-free control."""
@@ -1881,7 +1886,7 @@ class TestRound5FundingSurvivesDirtyTerminalClose:
         folded funding retained (no UPDATE attempted without staging);
         after the store recovers the unified terminal-close recovery
         replays owed legs + terminal + outbox SEQUENTIALLY in one
-        transaction, then the terminal UPDATE — conservation holds
+        transaction, then the terminal UPDATE вЂ” conservation holds
         (per-position_size == sum of leg quantities), funding equals the
         failure-free control, and a restart changes nothing."""
         settings = _settings()
@@ -1912,7 +1917,7 @@ class TestRound5FundingSurvivesDirtyTerminalClose:
         contour.run_cycle({pos.symbol: entry * 0.945})
         assert position_key in contour.engine.dirty_leg_keys
 
-        # (2) +9h, rate observed, protective STOP — but the store is now
+        # (2) +9h, rate observed, protective STOP вЂ” but the store is now
         #     also unavailable for terminal STAGING.
         store.stage_close = _always_fail(
             "PostgreSQL unavailable during terminal staging",
@@ -1932,7 +1937,7 @@ class TestRound5FundingSurvivesDirtyTerminalClose:
         assert position_key in engine.pending_closes
         assert position_key in engine._unstaged_closes
         assert engine.durability_risk is True
-        # NOTE: ``_balance_trusted`` may already be True again — the entry
+        # NOTE: ``_balance_trusted`` may already be True again вЂ” the entry
         # gate re-runs reconcile_balance() (confirmed + retained deltas),
         # which legitimately re-trusts the BALANCE.  The fail-closed state
         # here is the close durability itself: _unstaged_closes above,
@@ -2017,7 +2022,7 @@ class TestHardeningSourceContracts:
         )
         # The per-period reconstruction itself lives in the shared helper
         # (identical frozen rules for the in-cycle settlement and the
-        # terminal-close fold — P2, Codex r4552612002).
+        # terminal-close fold вЂ” P2, Codex r4552612002).
         helper = inspect.getsource(InverseShortPaperEngine._funding_backlog)
         assert "executed_at < boundary" in helper, (
             "per-period outstanding quantity must be reconstructed at each "
@@ -2087,9 +2092,9 @@ class TestHardeningSourceContracts:
 
 
 # ---------------------------------------------------------------------------
-# Round 6 (Codex r4555591304) — P1: an ambiguous terminal COMMIT must never
+# Round 6 (Codex r4555591304) вЂ” P1: an ambiguous terminal COMMIT must never
 # be double-counted, must block new entries and must resolve through a
-# durable read-back (mandatory scenarios A–E; PostgreSQL variants live in
+# durable read-back (mandatory scenarios AвЂ“E; PostgreSQL variants live in
 # ``test_me_long_v2_inverse_short_oos2_partial_restart_pg_it_v1.py``).
 # ---------------------------------------------------------------------------
 
@@ -2097,7 +2102,7 @@ def _inject_ambiguous_terminal(store, position_key: str, *, applied: bool):
     """Terminal UPDATE loses its ACK (optionally AFTER PostgreSQL applied
     it) and the durable read-back for THIS key is unavailable.
 
-    Returns ``(restore, original_get)`` — ``restore()`` puts the store back
+    Returns ``(restore, original_get)`` вЂ” ``restore()`` puts the store back
     and ``original_get`` reads the DURABLE truth through the simulated
     outage (test-side only, never through the engine).
     """
@@ -2147,7 +2152,7 @@ def _p1_control(settings: Settings) -> dict:
 
 
 class TestRound6P1AmbiguousCommit:
-    """Mandatory scenarios A–E for Codex thread r4555591304."""
+    """Mandatory scenarios AвЂ“E for Codex thread r4555591304."""
 
     @staticmethod
     def _ambiguous_stop_run(settings: Settings, *, applied: bool):
@@ -2172,7 +2177,7 @@ class TestRound6P1AmbiguousCommit:
     def test_a_commit_succeeded_ack_lost_readback_failed(self):
         """A: COMMIT applied, ACK lost, read-back FAILED -> no consistency
         claim, entries blocked, engine balance == durable balance (the
-        applied COMMIT is NEVER added on top — Codex repro gap = 0)."""
+        applied COMMIT is NEVER added on top вЂ” Codex repro gap = 0)."""
         settings = _settings()
         control = _p1_control(settings)
         contour, store, clock, pos, restore, original_get = (
@@ -2196,7 +2201,7 @@ class TestRound6P1AmbiguousCommit:
             control["net_pnl"], abs=1e-9,
         )
 
-        # rule 5: the applied COMMIT is never counted twice — the engine
+        # rule 5: the applied COMMIT is never counted twice вЂ” the engine
         # balance equals the DURABLE ledger exactly (repro: 6.22 gap = 0)
         assert engine.reconcile_balance() is True
         components = store.balance_components()
@@ -2231,7 +2236,7 @@ class TestRound6P1AmbiguousCommit:
 
     def test_b_readback_recovers_exact_balance_without_double_count(self):
         """B: after the durable read-back confirms the operation the engine
-        restores the CORRECT balance — identical to the failure-free
+        restores the CORRECT balance вЂ” identical to the failure-free
         reference, never durable + delta, and idempotent afterwards."""
         settings = _settings()
         control = _p1_control(settings)
@@ -2293,12 +2298,12 @@ class TestRound6P1AmbiguousCommit:
         assert key in engine.pending_closes
         delta = engine._uncommitted_deltas[key]
         assert delta != 0.0
-        # durable row still OPEN (only staging — legs + outbox — is durable)
+        # durable row still OPEN (only staging вЂ” legs + outbox вЂ” is durable)
         durable = store.get_position(key)
         assert durable.status == POSITION_STATUS_OPEN
         assert [leg.leg_seq for leg in store.list_close_legs(key)] == [1, 3]
 
-        # balance identity: durable ledger + the PROVEN-ABSENT delta —
+        # balance identity: durable ledger + the PROVEN-ABSENT delta вЂ”
         # the close is not in the durable ledger yet, so adding it once is
         # correct (the double-count defect would be durable ALREADY + delta)
         assert engine.reconcile_balance() is True
@@ -2375,7 +2380,7 @@ class TestRound6P1AmbiguousCommit:
         assert len(opened) == 1
 
     def test_e_ten_repeated_reconciliations_are_idempotent(self):
-        """E: ten repeated reconciliations change nothing — in the
+        """E: ten repeated reconciliations change nothing вЂ” in the
         AMBIGUOUS state (the quarantined delta is never added, consistency
         never claimed) and after classification (pure durable read + empty
         buckets == reference)."""
@@ -2386,7 +2391,7 @@ class TestRound6P1AmbiguousCommit:
         )
         engine = contour.engine
 
-        # phase 1 — AMBIGUOUS: ten reads, ten identical results
+        # phase 1 вЂ” AMBIGUOUS: ten reads, ten identical results
         durable = store.balance_components()["balance"]
         phase1 = []
         for _ in range(10):
@@ -2401,7 +2406,7 @@ class TestRound6P1AmbiguousCommit:
         ), "the quarantined delta must never be added, ten times in a row"
         assert all(s is False for _b, _c, s in phase1)
 
-        # phase 2 — classified: ten more, identical, == reference
+        # phase 2 вЂ” classified: ten more, identical, == reference
         restore()
         contour.run_cycle({pos.symbol: pos.entry_price})
         assert engine.ambiguous_write_keys == ()
@@ -2417,10 +2422,10 @@ class TestRound6P1AmbiguousCommit:
 
 
 # ---------------------------------------------------------------------------
-# Round 6 (Codex r4555591322) — P2-funding: HISTORY_UNAVAILABLE at a
+# Round 6 (Codex r4555591322) вЂ” P2-funding: HISTORY_UNAVAILABLE at a
 # protective close must persist the OBSERVED rate as a DURABLE obligation
 # (never process-local, never an approximate booking), and the recovery
-# pass settles it EXACTLY ONCE (mandatory scenarios A–F; PostgreSQL
+# pass settles it EXACTLY ONCE (mandatory scenarios AвЂ“F; PostgreSQL
 # variants in the partial-restart PG IT).
 # ---------------------------------------------------------------------------
 
@@ -2452,7 +2457,7 @@ def _timeout_control(settings: Settings) -> dict:
 
 
 class TestRound6FundingObligationRecovery:
-    """Mandatory scenarios A–F for Codex thread r4555591322."""
+    """Mandatory scenarios AвЂ“F for Codex thread r4555591322."""
 
     @staticmethod
     def _stop_bars(pos, entry):
@@ -2503,7 +2508,7 @@ class TestRound6FundingObligationRecovery:
         assert ob.periods_charged_at_observation == 0
         assert key in engine.funding_obligation_keys
         assert engine.snapshot()["funding_obligations"] == 1
-        # partial + terminal legs exactly once (staged with the close) —
+        # partial + terminal legs exactly once (staged with the close) вЂ”
         # read through the OUTAGE-FREE original reader (the fault is still
         # installed for the engine's own history reads)
         assert [leg.leg_seq for leg in original_list(key)] == [1, 3]
@@ -2550,7 +2555,7 @@ class TestRound6FundingObligationRecovery:
         _assert_ledger_consistent(contour)
 
     def test_b_history_unavailable_timeout_persists_obligation(self):
-        """B (mandatory): the same for the protective TIMEOUT close —
+        """B (mandatory): the same for the protective TIMEOUT close вЂ”
         15 due periods, observed rate durable, recovery settles exactly
         once to the control numbers."""
         settings = _settings()
@@ -2610,7 +2615,7 @@ class TestRound6FundingObligationRecovery:
 
     def test_c_restart_before_funding_recovery_keeps_the_obligation(self):
         """C (mandatory): a restart BETWEEN the protective close and the
-        funding recovery must not lose the observed rate — the DURABLE
+        funding recovery must not lose the observed rate вЂ” the DURABLE
         obligation is reloaded and settled exactly once after restart."""
         settings = _settings()
         control = _scenario_a_control(settings)
@@ -2632,7 +2637,7 @@ class TestRound6FundingObligationRecovery:
         )
         assert store.get_position(key).funding_periods_charged == 0
 
-        # history restored BEFORE the restart — only durable state matters
+        # history restored BEFORE the restart вЂ” only durable state matters
         store.list_close_legs = original_list
         restarted = _restart(contour, settings, clock)
         r_engine = restarted.engine
@@ -2671,7 +2676,7 @@ class TestRound6FundingObligationRecovery:
         assert again.engine.accounting_consistent is True
 
     def test_d_ambiguous_funding_settlement_never_double_accrues(self):
-        """D (mandatory): the obligation COMMIT applied with a lost ACK —
+        """D (mandatory): the obligation COMMIT applied with a lost ACK вЂ”
         the recovery pass must not book it twice; the balance resyncs from
         the durable facts and later cycles are no-ops."""
         settings = _settings()
@@ -2743,7 +2748,7 @@ class TestRound6FundingObligationRecovery:
     ):
         """E (mandatory): an UNKNOWN rate books NOTHING and creates NO
         obligation (gap stays on the row, no fabricated zero); a known rate
-        with unreadable history creates an obligation with the rate —
+        with unreadable history creates an obligation with the rate вЂ”
         the two states are never conflated."""
         settings = _settings()
 
@@ -2796,7 +2801,7 @@ class TestRound6FundingObligationRecovery:
         assert contour2.engine.snapshot()["funding_obligations"] == 1
 
     def test_f_partial_tp_exactly_at_the_funding_boundary(self):
-        """F (mandatory): TP1 executes EXACTLY at the funding boundary —
+        """F (mandatory): TP1 executes EXACTLY at the funding boundary вЂ”
         funding-before-exit keeps charging period 1 on the FULL original
         quantity, also when the settlement is deferred into a durable
         obligation and recovered later from the leg ledger."""
@@ -2843,7 +2848,7 @@ class TestRound6FundingObligationRecovery:
         )
         assert pos.tp1_executed is True, cycle
         # in-cycle settlement deferred (history unprovable): NOTHING
-        # booked yet, no obligation yet — the position stays OPEN with the
+        # booked yet, no obligation yet вЂ” the position stays OPEN with the
         # gap reported and the rate re-observed every cycle
         row_open = store.get_position(key)
         assert row_open.status == POSITION_STATUS_OPEN
@@ -2866,7 +2871,7 @@ class TestRound6FundingObligationRecovery:
         assert ob.periods_due == 1
 
         # the TP1 leg really executed EXACTLY at the boundary (read via
-        # the outage-free original reader — the fault is still installed)
+        # the outage-free original reader вЂ” the fault is still installed)
         tp1_leg = {
             leg.exit_reason: leg for leg in original_list(key)
         }["TAKE_PROFIT_1"]
@@ -2906,14 +2911,14 @@ class TestRound6FundingObligationRecovery:
 
 
 # ---------------------------------------------------------------------------
-# Round 7 (P1, Codex r4584484945) — a protective STOP/TIMEOUT whose OBSERVED
+# Round 7 (P1, Codex r4584484945) вЂ” a protective STOP/TIMEOUT whose OBSERVED
 # funding rate could not be persisted must be RETAINED as a durable
 # PENDING_PROTECTIVE_CLOSE, never dropped and never re-evaluated.
-# Mandatory scenarios A–F.
+# Mandatory scenarios AвЂ“F.
 # ---------------------------------------------------------------------------
 
 class TestRound7P1RetainedProtectiveClose:
-    """Mandatory scenarios A–F for Codex thread r4584484945."""
+    """Mandatory scenarios AвЂ“F for Codex thread r4584484945."""
 
     @staticmethod
     def _stop_bars(pos, entry):
@@ -2953,12 +2958,12 @@ class TestRound7P1RetainedProtectiveClose:
         )
         engine = contour.engine
 
-        # A1 — the protective exit FIRED and was reported (old HEAD: []).
+        # A1 вЂ” the protective exit FIRED and was reported (old HEAD: []).
         assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
-        # A2 — the position is TREATED AS PROTECTIVELY CLOSED: it left the
+        # A2 вЂ” the position is TREATED AS PROTECTIVELY CLOSED: it left the
         #      exit algorithm, so STOP/TP/TIMEOUT can never re-evaluate it.
         assert key not in engine.open_positions
-        # A3 — and it is RETAINED with the ORIGINAL frozen facts.
+        # A3 вЂ” and it is RETAINED with the ORIGINAL frozen facts.
         assert key in engine.pending_closes
         snap = engine.pending_closes[key]
         assert snap.exit_reason == "STOP_LOSS"
@@ -2968,7 +2973,7 @@ class TestRound7P1RetainedProtectiveClose:
         )
         assert snap.closed_at is not None
 
-        # A4 — nothing durable is claimed: the terminal UPDATE is withheld
+        # A4 вЂ” nothing durable is claimed: the terminal UPDATE is withheld
         #      (a CLOSED row must never freeze an unsettled period as 0
         #      while the rate lives outside PostgreSQL).
         row = store.get_position(key)
@@ -2976,7 +2981,7 @@ class TestRound7P1RetainedProtectiveClose:
         assert row.funding_periods_charged == 0
         assert store.get_funding_obligation(key) is None
 
-        # A5 — the OBSERVED rate + every terminal fact are frozen into the
+        # A5 вЂ” the OBSERVED rate + every terminal fact are frozen into the
         #      OOS-2-only local durable JOURNAL (atomic file on disk).
         assert key in engine.pending_protective_close_keys
         files = sorted(p.name for p in tmp_path.glob("*.json"))
@@ -3004,14 +3009,14 @@ class TestRound7P1RetainedProtectiveClose:
         on_disk = json.loads((tmp_path / files[0]).read_text("utf-8"))
         assert on_disk == record.to_dict()
 
-        # A6 — new entries are refused while the rate is not durable.
+        # A6 вЂ” new entries are refused while the rate is not durable.
         assert engine.open_entries({pos.symbol: entry}) == []
         snap_json = engine.snapshot()
         assert snap_json["pending_obligations"] == 1
         assert snap_json["pending_protective_closes"] == 1
         assert snap_json["pending_obligation_keys"] == [key]
 
-        # A7 — recovery: the store accepts the retained rate, the close
+        # A7 вЂ” recovery: the store accepts the retained rate, the close
         #      commits with the FROZEN facts and settles exactly once.
         store.list_close_legs = original_list
         store.save_funding_obligation = original_save
@@ -3040,7 +3045,7 @@ class TestRound7P1RetainedProtectiveClose:
         assert engine.balance == pytest.approx(
             store.balance_components()["balance"], abs=1e-9,
         )
-        # A8 — entries are unblocked again once everything is durable.
+        # A8 вЂ” entries are unblocked again once everything is durable.
         assert _capture(store, _candidate("ETHUSDT", 50.0, detected_at=clock())) \
             == "CAPTURED"
         assert contour.run_cycle({"ETHUSDT": 50.0})["entries"] == 1
@@ -3052,7 +3057,7 @@ class TestRound7P1RetainedProtectiveClose:
         """B (mandatory): next cycle the price NO LONGER touches the STOP
         (old HEAD: the position stayed in ``open_positions`` and the exit
         simply never fired again, losing the close).  The retained close
-        must complete with the ORIGINAL frozen trigger facts anyway — no
+        must complete with the ORIGINAL frozen trigger facts anyway вЂ” no
         recomputation from fresh inputs, ever."""
         settings = _settings()
         control = _scenario_a_control(settings)
@@ -3072,7 +3077,7 @@ class TestRound7P1RetainedProtectiveClose:
         frozen_record = contour.engine._journal_records[key].to_dict()
 
         # --- cycle 2: price well BELOW the stop (would never trigger), no
-        # bars, no funding rate — and the store is healthy again.
+        # bars, no funding rate вЂ” and the store is healthy again.
         store.list_close_legs = original_list
         store.save_funding_obligation = original_save
         cycle2 = contour.run_cycle({pos.symbol: entry * 0.98})
@@ -3105,7 +3110,7 @@ class TestRound7P1RetainedProtectiveClose:
 
     def test_c_observed_rate_survives_a_cycle_without_a_rate(self, tmp_path):
         """C (mandatory): the funding rate DISAPPEARS next cycle (no rate
-        delivered, history still unreadable) — the rate observed at the
+        delivered, history still unreadable) вЂ” the rate observed at the
         STOP is the one that is eventually charged, never re-derived from
         a fresh (absent) input and never dropped."""
         settings = _settings()
@@ -3163,7 +3168,7 @@ class TestRound7P1RetainedProtectiveClose:
     def test_d_restart_before_postgresql_recovery(self, tmp_path):
         """D (mandatory): RESTART while PostgreSQL still holds NOTHING of
         the close (row OPEN, no obligation).  The local journal must replay
-        the frozen terminal facts AND the observed rate — both when the
+        the frozen terminal facts AND the observed rate вЂ” both when the
         outbox half survived and when staging failed too (journal-only)."""
         settings = _settings()
         control = _scenario_a_control(settings)
@@ -3342,7 +3347,7 @@ class TestRound7P1RetainedProtectiveClose:
 
     def test_f_timeout_variant_retains_the_protective_close(self, tmp_path):
         """F (mandatory): the protective TIMEOUT variant of the same defect
-        — 15 due periods, both store faults, retained then recovered to the
+        вЂ” 15 due periods, both store faults, retained then recovered to the
         failure-free control numbers."""
         settings = _settings()
         control = _timeout_control(settings)
@@ -3367,7 +3372,7 @@ class TestRound7P1RetainedProtectiveClose:
         assert record.obligation["periods_due"] == 15
         assert engine.open_entries({pos.symbol: entry}) == []
 
-        # next cycle: price normal, NO rate delivered, store still broken —
+        # next cycle: price normal, NO rate delivered, store still broken вЂ”
         # the TIMEOUT close is never re-evaluated or lost.
         cycle2 = contour.run_cycle({pos.symbol: entry})
         assert cycle2["exit_reasons"] == []
@@ -3404,12 +3409,12 @@ class TestRound7P1RetainedProtectiveClose:
 
 
 # ---------------------------------------------------------------------------
-# Round 7 (P2, Codex r4584484952) — a funding settlement must never leave a
-# stale close outbox behind.  Mandatory scenarios A–F.
+# Round 7 (P2, Codex r4584484952) вЂ” a funding settlement must never leave a
+# stale close outbox behind.  Mandatory scenarios AвЂ“F.
 # ---------------------------------------------------------------------------
 
 class TestRound7P2StaleCloseOutbox:
-    """Mandatory scenarios A–F for Codex thread r4584484952."""
+    """Mandatory scenarios AвЂ“F for Codex thread r4584484952."""
 
     @staticmethod
     def _stop_bars(pos, entry):
@@ -3472,7 +3477,7 @@ class TestRound7P2StaleCloseOutbox:
     def test_a_settlement_retires_the_stale_outbox_atomically(self, tmp_path):
         """A (mandatory): terminal staging + CLOSED update succeed,
         ``clear_pending_close()`` fails, funding recovery then updates the
-        CLOSED row — the superseded snapshot must be retired TOGETHER with
+        CLOSED row вЂ” the superseded snapshot must be retired TOGETHER with
         that settlement (one transaction), and a restart must neither
         resume it nor replay it over the settled funding.  Entries must
         recover (never a permanent pending close)."""
@@ -3480,7 +3485,7 @@ class TestRound7P2StaleCloseOutbox:
         store, key, control = ctx["store"], ctx["key"], ctx["control"]
 
         # THE FIX: the settlement retired the superseded snapshot in the
-        # same step — a stale outbox can never be left behind.
+        # same step вЂ” a stale outbox can never be left behind.
         assert store.list_pending_closes() == [], (
             "funding settlement must retire the stale close outbox atomically",
         )
@@ -3517,7 +3522,7 @@ class TestRound7P2StaleCloseOutbox:
         self, tmp_path,
     ):
         """B (mandatory): the stale snapshot must NEVER overwrite the newer
-        confirmed state — neither through the engine (supersession is
+        confirmed state вЂ” neither through the engine (supersession is
         recognised and the snapshot retired) nor through a direct store
         write (the in-memory store now enforces the same monotone rule as
         the migration 089 PostgreSQL guard)."""
@@ -3526,7 +3531,7 @@ class TestRound7P2StaleCloseOutbox:
         stale = ctx["stale"]
         assert stale.funding_periods_charged == 0
 
-        # (i) a DIRECT write of the stale snapshot is rejected — this is
+        # (i) a DIRECT write of the stale snapshot is rejected вЂ” this is
         #     exactly what PostgreSQL's migration 089 guard already did and
         #     what the in-memory store used to accept silently.
         with pytest.raises(RuntimeError,
@@ -3559,7 +3564,7 @@ class TestRound7P2StaleCloseOutbox:
         self, tmp_path,
     ):
         """C (mandatory): a superseded snapshot is NEVER silently deleted
-        while unconfirmed terminal facts remain — the row must be CLOSED
+        while unconfirmed terminal facts remain вЂ” the row must be CLOSED
         with IDENTICAL terminal facts (only the funding columns may have
         advanced)."""
         # (i) row still OPEN (retained protective close): never retired.
@@ -3643,7 +3648,7 @@ class TestRound7P2StaleCloseOutbox:
 
     def test_e_migration_089_guards_are_not_weakened(self):
         """E (mandatory): the migration 089 closed-row guards are byte-for
-        byte intact — nothing was relaxed to make the new recovery pass."""
+        byte intact вЂ” nothing was relaxed to make the new recovery pass."""
         from app.paper.me_long_v2_inverse_short_oos2_v1 import (  # noqa: PLC0415
             store as store_module,
         )
@@ -3672,7 +3677,7 @@ class TestRound7P2StaleCloseOutbox:
         self, tmp_path,
     ):
         """F (mandatory): after the whole recovery the contour must match
-        the failure-free control EXACTLY — never fewer
+        the failure-free control EXACTLY вЂ” never fewer
         ``funding_periods_charged``, never a lost ``funding_paid``."""
         settings = _settings()
         ctx = self._settled_with_stale_outbox(settings, tmp_path)
@@ -3705,7 +3710,7 @@ class TestRound7P2StaleCloseOutbox:
 
     def test_g_identical_snapshot_is_never_retired(self, tmp_path):
         """G (extra, regression guard): a snapshot that still says exactly
-        what the durable CLOSED row says is NOT superseded — it must keep
+        what the durable CLOSED row says is NOT superseded вЂ” it must keep
         replaying through the normal path.  That is the round-6 durable
         replay contract (pending close resumes, entries blocked, one clean
         flush) and the supersession guard must never swallow it."""
@@ -3738,7 +3743,7 @@ class TestRound7P2StaleCloseOutbox:
 
         engine = contour.engine
         assert engine._retire_superseded_close(staged[0], source="test") is False, (
-            "an identical snapshot is NOT superseded — it must replay",
+            "an identical snapshot is NOT superseded вЂ” it must replay",
         )
         assert [p.position_key for p in store.list_pending_closes()] == [key], (
             "a non-superseded snapshot must never be silently deleted",
@@ -3759,3 +3764,741 @@ class TestRound7P2StaleCloseOutbox:
         )
         assert engine2.durability_risk is False
         _assert_ledger_consistent(restarted)
+
+
+# ---------------------------------------------------------------------------
+# Round 8 вЂ” Codex r4587604965 (failed recovery reads), r4587604973
+# (journal before stage) and r4587604985 (journal directory fsync)
+# ---------------------------------------------------------------------------
+
+class SimulatedCrash(BaseException):
+    """Process-kill model used by the crash-consistency scenarios.
+
+    ``BaseException`` on purpose: every degradation path in the engine is
+    ``except Exception``, so an ordinary Python exception would be swallowed
+    and turned into a graceful retry вЂ” that is NOT a crash.  Raising this
+    aborts the cycle at the exact injected instruction *after* that
+    instruction's durable effect has been applied, and the test then throws
+    the engine away and builds a fresh one over the SAME durable store вЂ”
+    the verifiable equivalent of killing the process at that point.
+    """
+
+
+def _double_outage(store) -> tuple:
+    """History UNREADABLE + obligation WRITE failing (both faults)."""
+    original_list = store.list_close_legs
+    original_save = store.save_funding_obligation
+    store.list_close_legs = _always_fail("close-leg history unreadable")
+    store.save_funding_obligation = _always_fail("obligation write failure")
+    return original_list, original_save
+
+
+def _kill_before_journal_write(journal) -> None:
+    """Die before the recovery record reaches the disk."""
+    original = journal.write
+
+    def die(record):
+        journal.write = original
+        raise SimulatedCrash("killed before the journal write")
+
+    journal.write = die
+
+
+def _kill_before_stage(store) -> None:
+    """Die after the recovery record is durable, before staging starts."""
+    original = store.stage_close
+
+    def die(*args, **kwargs):
+        store.stage_close = original
+        raise SimulatedCrash("killed before stage_close")
+
+    store.stage_close = die
+
+
+def _kill_after_stage(store) -> None:
+    """Die immediately after the staging transaction COMMITTED."""
+    original = store.stage_close
+
+    def stage_then_die(position, terminal_leg=None, *, partial_legs=None):
+        original(position, terminal_leg, partial_legs=partial_legs)
+        store.stage_close = original
+        raise SimulatedCrash("killed right after stage_close COMMIT")
+
+    store.stage_close = stage_then_die
+
+
+def _kill_after_closed_update(store) -> None:
+    """Die immediately after the terminal CLOSED UPDATE applied (lost ack)."""
+    original = store.update_position
+
+    def update_then_die(position):
+        result = original(position)
+        if getattr(position, "status", None) == POSITION_STATUS_CLOSED:
+            store.update_position = original
+            raise SimulatedCrash("killed after the CLOSED UPDATE")
+        return result
+
+    store.update_position = update_then_die
+
+
+def _kill_before_outbox_clear(store) -> None:
+    """Die after the CLOSED UPDATE, before the outbox row is retired."""
+    original = store.clear_pending_close
+
+    def die(key):
+        store.clear_pending_close = original
+        raise SimulatedCrash("killed before clear_pending_close")
+
+    store.clear_pending_close = die
+
+
+def _kill_before_journal_delete(journal) -> None:
+    """Die before the journal record is retired."""
+    original = journal.delete
+
+    def die(key):
+        journal.delete = original
+        raise SimulatedCrash("killed before the journal retire")
+
+    journal.delete = die
+
+
+def _lost_ack_then_crash(store, journal) -> None:
+    """Stage COMMITS, the acknowledgement is lost, then the process dies.
+
+    The engine sees ``stage_close`` fail (``except Exception``) and holds
+    the close вЂ” yet the outbox and leg rows are already durable.  The
+    process then dies before any retry, at the post-stage journal refresh.
+    """
+    original_stage = store.stage_close
+    original_write = journal.write
+    state = {"staged": False, "writes": 0}
+
+    def stage_losing_ack(position, terminal_leg=None, *, partial_legs=None):
+        original_stage(position, terminal_leg, partial_legs=partial_legs)
+        state["staged"] = True
+        raise RuntimeError("staging acknowledgement lost")
+
+    def write_then_die(record):
+        state["writes"] += 1
+        if state["staged"] and state["writes"] >= 2:
+            journal.write = original_write
+            raise SimulatedCrash("killed after the lost staging ack")
+        return original_write(record)
+
+    store.stage_close = stage_losing_ack
+    journal.write = write_then_die
+
+
+def _journal_record(key: str) -> PendingProtectiveClose:
+    """A self-contained journal payload used by the fsync scenarios."""
+    return PendingProtectiveClose(
+        position_key=key,
+        exit_reason="STOP_LOSS",
+        triggered_at=NOW.isoformat(),
+        reference_price=100.0,
+        fill_price=100.05,
+        quantity=0.5,
+        snapshot={"position_key": key, "status": "CLOSED"},
+        terminal_leg={"position_key": key, "leg_seq": 3, "is_terminal": True},
+        owed_partial_legs=[],
+        obligation={
+            "obligation_key": f"{key}:funding",
+            "position_key": key,
+            "symbol": "ETHUSDT",
+            "observed_rate_percent": 0.01,
+            "periods_due": 1,
+            "periods_charged_at_observation": 0,
+            "legs_ref_max_seq": 2,
+            "state": FUNDING_OBLIGATION_OPEN,
+        },
+        accounting_delta=1.25,
+        recovery_ids={"position_key": key},
+        written_at=NOW.isoformat(),
+        staged=False,
+    )
+
+
+def _round8_stop_setup(settings, tmp_path):
+    """entry -> TP1 committed -> +9h, ready to fire the protective STOP."""
+    control = _scenario_a_control(settings)
+    contour, store, clock = _contour(settings, journal_dir=tmp_path)
+    pos = _open_one(contour, store, clock)
+    entry = pos.entry_price
+    contour.run_cycle({pos.symbol: entry * 0.945})        # TP1 committed
+    clock.advance(hours=9)
+    return contour, store, clock, pos, pos.position_key, entry, control
+
+
+def _round8_stop_bars(pos, entry):
+    return {pos.symbol: {"high": pos.stop_price * 1.001, "low": entry * 0.99}}
+
+
+def _assert_round8_recovered(
+    restarted, store, key, pos, entry, control, *,
+    expect_journal_retired: bool = True,
+    expect_obligation: bool = True,
+) -> None:
+    """The financial invariants every Round 8 scenario must satisfy."""
+    engine = restarted.engine
+    # The STOP bars are passed so a scenario whose close was never staged
+    # (crash before the journal write) re-executes the ORIGINAL exit from
+    # the still-OPEN row вЂ” a retained close never sees them because the
+    # position has already left the exit algorithm.
+    restarted.run_cycle(
+        {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        funding_rates_percent={pos.symbol: 0.01},
+    )
+    row = store.get_position(key)
+    assert row.status == POSITION_STATUS_CLOSED, "the close must complete"
+    assert row.exit_reason == "STOP_LOSS", row.exit_reason
+    assert row.closed_at is not None
+    # frozen trigger: STOP_LOSS at the ORIGINAL stop price, never recomputed
+    assert row.exit_price == pytest.approx(
+        pos.stop_price * (1.0 + restarted.settings.slippage_percent),
+    )
+    # observed funding preserved, never zeroed
+    assert row.funding_periods_charged == 1, row.funding_periods_charged
+    assert row.funding_paid == pytest.approx(control["funding_paid"], abs=1e-9)
+    assert row.net_pnl == pytest.approx(control["net_pnl"], abs=1e-9)
+    ob = store.get_funding_obligation(key)
+    if expect_obligation:
+        assert ob is not None and ob.status == FUNDING_OBLIGATION_SETTLED, ob
+    else:
+        # No obligation row is ever acceptable ONLY when the crash happened
+        # before anything durable existed: the fresh exit re-reads the same
+        # observed rate, settles the period and needs no obligation.  What
+        # must never happen is a row left OPEN.
+        assert ob is None or ob.status == FUNDING_OBLIGATION_SETTLED, ob
+    # exactly one terminal leg, no orphan partials, no duplicates
+    legs = store.list_close_legs(key)
+    assert len([leg for leg in legs if leg.is_terminal]) == 1, legs
+    assert sorted(leg.exit_reason for leg in legs) == [
+        "STOP_LOSS", "TAKE_PROFIT_1",
+    ], legs
+    # clean recovery state
+    assert engine.pending_closes == {}, engine.pending_closes
+    assert store.list_pending_closes() == []
+    assert engine._pending_obligations == {}
+    if expect_journal_retired:
+        assert not engine.journal.exists(key), "journal must be retired"
+    assert engine.balance == pytest.approx(control["balance"], abs=1e-9)
+    assert engine.balance == pytest.approx(
+        store.balance_components()["balance"], abs=1e-9,
+    )
+    assert engine.durability_risk is False, engine.durability_risk
+    _assert_ledger_consistent(restarted)
+
+
+class TestRound8P1aFailedRecoveryRead:
+    """Mandatory scenarios AвЂ“F for Codex thread r4587604965."""
+
+    @staticmethod
+    def _retained(settings, tmp_path):
+        """A retained protective close: journal + outbox + OPEN row."""
+        contour, store, clock, pos, key, entry, control = (
+            _round8_stop_setup(settings, tmp_path)
+        )
+        original_list, original_save = _double_outage(store)
+        cycle = contour.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+            funding_rates_percent={pos.symbol: 0.01},
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        store.list_close_legs = original_list
+        store.save_funding_obligation = original_save
+        engine = contour.engine
+        assert engine.journal.exists(key), "the recovery record must exist"
+        assert engine.journal.read_all()[key].obligation is not None
+        assert store.get_position(key).status == POSITION_STATUS_OPEN
+        return contour, store, clock, pos, key, entry, control
+
+    def test_a_failed_read_is_never_treated_as_confirmed_absence(
+        self, tmp_path,
+    ):
+        """A: ``get_position()`` RAISES during journal replay вЂ” the record,
+        the frozen STOP/TIMEOUT facts and the observed funding must all be
+        KEPT, new entries must be refused, and the read must be retried
+        after the database comes back (old HEAD: the record was deleted as
+        an "orphan" and the observed rate was lost)."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, control = self._retained(
+            settings, tmp_path,
+        )
+        original_get = store.get_position
+        store.get_position = _always_fail("PostgreSQL read unavailable")
+
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine2 = restarted.engine
+
+        # 1) an unknown read NEVER deletes the durable record
+        assert engine2.journal.exists(key), (
+            "a failed read must not delete the journal record",
+        )
+        # 2) the observed funding obligation is preserved and retried
+        assert key in engine2._pending_obligations, "observed rate lost"
+        assert engine2._pending_obligations[
+            key
+        ].observed_rate_percent == pytest.approx(0.01)
+        # 3) the frozen close is preserved and the position stays protected
+        assert key in engine2.pending_closes, "frozen close lost"
+        assert key not in engine2.open_positions
+        assert engine2.pending_closes[key].exit_reason == "STOP_LOSS"
+        # 4) new entries are refused while the outcome is unknown
+        assert engine2.open_entries({pos.symbol: entry}) == []
+        assert engine2.durability_risk is True
+        # 5) no duplicate position / terminal leg was created
+        assert len([
+            leg for leg in store.list_close_legs(key) if leg.is_terminal
+        ]) == 1
+
+        # 6) PostgreSQL recovers -> the read-back is retried and completes
+        store.get_position = original_get
+        restarted.run_cycle({pos.symbol: entry * 0.98})
+        _assert_round8_recovered(restarted, store, key, pos, entry, control)
+
+    def test_b_found_row_restores_the_record_exactly(self, tmp_path):
+        """B (regression): a SUCCESSFUL read that finds the row keeps the
+        established restore path вЂ” obligation first, then the close."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, control = self._retained(
+            settings, tmp_path,
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine2 = restarted.engine
+        assert key in engine2._pending_obligations
+        assert key in engine2.pending_closes
+        assert engine2.journal.exists(key)
+        _assert_round8_recovered(restarted, store, key, pos, entry, control)
+
+    def test_c_confirmed_absent_is_the_only_state_that_retires_the_record(
+        self, tmp_path,
+    ):
+        """C: the record may be deleted ONLY after a successful read chain
+        proved there is no row AND no outbox, no leg and no obligation."""
+        settings = _settings()
+        contour, store, clock = _contour(settings, journal_dir=tmp_path)
+        fake_key = "ME_LONG_V2_INVERSE_SHORT_OOS2_V1:proven-absent"
+        journal = contour.engine.journal
+        journal.write(_journal_record(fake_key))
+        assert journal.exists(fake_key)
+
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        assert not restarted.engine.journal.exists(fake_key), (
+            "a proven orphan record must be retired",
+        )
+        assert fake_key not in restarted.engine._pending_obligations
+
+    def test_d_absent_row_with_a_live_outbox_is_not_confirmed_absent(
+        self, tmp_path,
+    ):
+        """D: ``get_position()`` answers "absent" while the staged outbox
+        still carries the close вЂ” that is NOT proof of absence, so the
+        record (and its obligation) must be kept."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, control = self._retained(
+            settings, tmp_path,
+        )
+        assert store.list_pending_closes(), "the outbox must be staged"
+        original_get = store.get_position
+        store.get_position = lambda *a, **kw: None
+
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine2 = restarted.engine
+        assert engine2.journal.exists(key), (
+            "an outbox row proves the close exists вЂ” never delete",
+        )
+        assert key in engine2._pending_obligations, "observed rate lost"
+        assert engine2.open_entries({pos.symbol: entry}) == []
+
+        store.get_position = original_get
+        _assert_round8_recovered(restarted, store, key, pos, entry, control)
+
+    def test_e_restart_while_both_journal_reads_are_down(self, tmp_path):
+        """E: restart with the position AND obligation reads unavailable вЂ”
+        everything is kept, entries stay shut, nothing is re-derived."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, control = self._retained(
+            settings, tmp_path,
+        )
+        original_get = store.get_position
+        original_ob = store.get_funding_obligation
+        store.get_position = _always_fail("PostgreSQL read unavailable")
+        store.get_funding_obligation = _always_fail(
+            "PostgreSQL read unavailable",
+        )
+
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine2 = restarted.engine
+        assert engine2.journal.exists(key)
+        assert key in engine2._pending_obligations
+        assert key in engine2.pending_closes
+        assert engine2.open_entries({pos.symbol: entry}) == []
+        assert engine2.durability_risk is True
+
+        store.get_position = original_get
+        store.get_funding_obligation = original_ob
+        _assert_round8_recovered(restarted, store, key, pos, entry, control)
+
+    def test_f_repeated_restarts_after_recovery_are_idempotent(
+        self, tmp_path,
+    ):
+        """F: recovery then a SECOND restart вЂ” the settlement is exactly
+        once, the journal stays retired and no duplicate leg appears."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, control = self._retained(
+            settings, tmp_path,
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        _assert_round8_recovered(restarted, store, key, pos, entry, control)
+
+        again = _restart(restarted, settings, clock, journal_dir=tmp_path)
+        engine3 = again.engine
+        assert engine3.pending_closes == {}
+        assert engine3._pending_obligations == {}
+        assert not engine3.journal.exists(key)
+        assert key not in engine3.open_positions
+        again.run_cycle({pos.symbol: entry * 0.97})
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.funding_periods_charged == 1
+        assert row.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        )
+        assert len([
+            leg for leg in store.list_close_legs(key) if leg.is_terminal
+        ]) == 1
+        assert again.engine.balance == pytest.approx(
+            control["balance"], abs=1e-9,
+        )
+        _assert_ledger_consistent(again)
+
+
+class TestRound8P1bJournalBeforeStage:
+    """Mandatory crash-point scenarios for Codex thread r4587604973."""
+
+    @staticmethod
+    def _crash_cycle(contour, store, pos, entry, kill):
+        original_list, original_save = _double_outage(store)
+        kill()
+        with pytest.raises(SimulatedCrash):
+            contour.run_cycle(
+                {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+                funding_rates_percent={pos.symbol: 0.01},
+            )
+        store.list_close_legs = original_list
+        store.save_funding_obligation = original_save
+
+    @staticmethod
+    def _retained_then_crash(settings, tmp_path, install):
+        """Retained close -> PostgreSQL recovers -> die DURING the recovery
+        cycle at the exact point ``install`` selects (the recovery cycle is
+        where the CLOSED UPDATE, the outbox clear and the journal retire
+        actually happen)."""
+        contour, store, clock, pos, key, entry, control = (
+            _round8_stop_setup(settings, tmp_path)
+        )
+        original_list, original_save = _double_outage(store)
+        cycle = contour.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+            funding_rates_percent={pos.symbol: 0.01},
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        store.list_close_legs = original_list
+        store.save_funding_obligation = original_save
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        assert restarted.engine.journal.exists(key), "record must exist"
+        install(restarted)
+        with pytest.raises(SimulatedCrash):
+            restarted.run_cycle({pos.symbol: entry})
+        return restarted, store, key, pos, entry, control
+
+    def _run(self, tmp_path, kill):
+        settings = _settings()
+        control = _scenario_a_control(settings)
+        contour, store, clock, pos, key, entry, control = (
+            _round8_stop_setup(settings, tmp_path)
+        )
+        self._crash_cycle(contour, store, pos, entry, kill)
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        return restarted, store, key, pos, entry, control
+
+    def test_a1_crash_before_the_journal_write(self, tmp_path):
+        """A1: die BEFORE the recovery record hits the disk вЂ” nothing durable
+        may claim to be final, so the still-OPEN row re-executes the exit."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, control = (
+            _round8_stop_setup(settings, tmp_path)
+        )
+        self._crash_cycle(contour, store, pos, entry,
+                          lambda: _kill_before_journal_write(
+                              contour.engine.journal,
+                          ))
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        # nothing durable exists at this point: no outbox row, no journal
+        # record and no obligation вЂ” the whole close is re-executed.
+        assert store.get_position(key).status == POSITION_STATUS_OPEN
+        assert not restarted.engine.journal.exists(key)
+        assert store.get_funding_obligation(key) is None
+        _assert_round8_recovered(
+            restarted, store, key, pos, entry, control,
+            expect_obligation=False,
+        )
+
+    def test_a2_crash_after_the_journal_write_before_staging(self, tmp_path):
+        """A2: the record is durable, staging never ran вЂ” the replay must
+        restore the frozen close and the observed rate, then stage."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, control = (
+            _round8_stop_setup(settings, tmp_path)
+        )
+        self._crash_cycle(contour, store, pos, entry,
+                          lambda: _kill_before_stage(store))
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        assert restarted.engine.journal.exists(key), "record must survive"
+        assert restarted.engine.journal.read_all()[key].obligation is not None
+        _assert_round8_recovered(restarted, store, key, pos, entry, control)
+
+    def test_a3_crash_immediately_after_the_stage_commit(self, tmp_path):
+        """A3 (the Codex repro): die right after ``stage_close`` COMMITTED.
+        The durable terminal snapshot may NEVER exist without its observed
+        funding obligation вЂ” restart must find the record and settle the
+        rate exactly once instead of closing at funding 0."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, control = (
+            _round8_stop_setup(settings, tmp_path)
+        )
+        self._crash_cycle(contour, store, pos, entry,
+                          lambda: _kill_after_stage(store))
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine2 = restarted.engine
+        assert engine2.journal.exists(key), (
+            "the observed obligation must be durable BEFORE the staging "
+            "commit вЂ” otherwise restart finalises the close at funding 0",
+        )
+        record = engine2.journal.read_all()[key]
+        assert record.obligation is not None, "observed rate missing"
+        assert record.obligation["observed_rate_percent"] == pytest.approx(0.01)
+        assert store.get_funding_obligation(key) is None, "not in PG yet"
+        _assert_round8_recovered(restarted, store, key, pos, entry, control)
+
+    def test_a4_staging_ack_lost_then_the_process_dies(self, tmp_path):
+        """A4: the staging transaction committed but the acknowledgement was
+        lost (the engine believes staging failed) and the process dies
+        before any retry вЂ” the recovery record must already be durable and
+        the restart must finish the close exactly once."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, control = (
+            _round8_stop_setup(settings, tmp_path)
+        )
+        original_list, original_save = _double_outage(store)
+        _lost_ack_then_crash(store, contour.engine.journal)
+        with pytest.raises(SimulatedCrash):
+            contour.run_cycle(
+                {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+                funding_rates_percent={pos.symbol: 0.01},
+            )
+        store.list_close_legs = original_list
+        store.save_funding_obligation = original_save
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        assert restarted.engine.journal.exists(key)
+        assert restarted.engine.journal.read_all()[key].obligation is not None
+        _assert_round8_recovered(restarted, store, key, pos, entry, control)
+
+    def test_a5_crash_after_the_closed_update(self, tmp_path):
+        """A5: die right after the terminal CLOSED UPDATE applied (lost ack)
+        вЂ” restart must recognise the committed close, keep the observed
+        rate and settle it exactly once."""
+        settings = _settings()
+        restarted, store, key, pos, entry, control = (
+            self._retained_then_crash(
+                settings, tmp_path,
+                lambda restarted: _kill_after_closed_update(restarted.store),
+            )
+        )
+        assert store.get_position(key).status == POSITION_STATUS_CLOSED
+        assert restarted.engine.journal.exists(key)
+        _assert_round8_recovered(restarted, store, key, pos, entry, control)
+
+    def test_a6_crash_before_the_outbox_clear(self, tmp_path):
+        """A6: die before the outbox row is retired вЂ” a stale snapshot must
+        never roll back the confirmed funding and the record must retire."""
+        settings = _settings()
+        restarted, store, key, pos, entry, control = (
+            self._retained_then_crash(
+                settings, tmp_path,
+                lambda restarted: _kill_before_outbox_clear(restarted.store),
+            )
+        )
+        assert store.get_position(key).status == POSITION_STATUS_CLOSED
+        assert restarted.engine.journal.exists(key)
+        _assert_round8_recovered(restarted, store, key, pos, entry, control)
+
+    def test_a7_crash_before_the_journal_delete(self, tmp_path):
+        """A7: die before the journal record is retired вЂ” a further restart
+        must finish the retire without re-booking anything."""
+        settings = _settings()
+        restarted, store, key, pos, entry, control = (
+            self._retained_then_crash(
+                settings, tmp_path,
+                lambda restarted: _kill_before_journal_delete(
+                    restarted.engine.journal,
+                ),
+            )
+        )
+        assert store.get_position(key).status == POSITION_STATUS_CLOSED
+        assert restarted.engine.journal.exists(key), (
+            "the record must survive the crash",
+        )
+        final = _restart(restarted, settings, restarted._clock,
+                         journal_dir=tmp_path)
+        _assert_round8_recovered(final, store, key, pos, entry, control)
+
+
+class TestRound8P2JournalDirectoryFsync:
+    """Mandatory scenarios for Codex thread r4587604985."""
+
+    KEY = "ME_LONG_V2_INVERSE_SHORT_OOS2_V1:fsync-probe"
+
+    @staticmethod
+    def _journal(tmp_path) -> ProtectiveCloseJournal:
+        # deliberately NOT the process working directory
+        return ProtectiveCloseJournal(
+            Path(tmp_path) / "release" / "var" / "me_inverse_short_oos2_journal",
+        )
+
+    def test_a_directory_fsync_targets_the_journal_directory(
+        self, tmp_path, monkeypatch,
+    ):
+        """A: the directory that is fsync'ed is ``self.directory`` вЂ” never
+        ``os.curdir`` (which in the supplied runtime is the release root,
+        a completely different directory)."""
+        monkeypatch.chdir(tmp_path)          # cwd != journal directory
+        journal = self._journal(tmp_path)
+        opened: list[str] = []
+        real_open = os.open
+
+        def recording_open(path, flags, *args, **kwargs):
+            opened.append(str(path))
+            # Windows cannot fsync a read-only handle, so the stand-in fd
+            # is opened for writing (the real code opens the DIRECTORY
+            # read-only; POSIX accepts that, Windows has no directory
+            # fsync at all).
+            return real_open(str(tmp_path / "handle.bin"), os.O_RDWR)
+
+        (tmp_path / "handle.bin").write_text("x", encoding="utf-8")
+        monkeypatch.setattr(os, "open", recording_open)
+        journal.write(_journal_record(self.KEY))
+
+        assert str(journal.directory) in opened, (
+            f"the journal directory must be fsync'ed, opened={opened}",
+        )
+        assert os.curdir not in opened and "." not in opened, (
+            "the process working directory must never be fsync'ed instead "
+            f"of the journal directory, opened={opened}",
+        )
+        assert journal.exists(self.KEY)
+
+    def test_b_file_fsync_failure_is_reported(self, tmp_path, monkeypatch):
+        """B: a failed payload fsync must surface to the caller."""
+        journal = self._journal(tmp_path)
+
+        def failing_fsync(fd):
+            raise OSError("payload fsync failed")
+
+        monkeypatch.setattr(os, "fsync", failing_fsync)
+        with pytest.raises(OSError):
+            journal.write(_journal_record(self.KEY))
+        assert not journal.exists(self.KEY)
+
+    def test_c_directory_fsync_failure_is_reported(self, tmp_path, monkeypatch):
+        """C: a failed DIRECTORY fsync must surface to the caller вЂ” the old
+        code swallowed it and reported the record as durable anyway."""
+        journal = self._journal(tmp_path)
+        (tmp_path / "handle.bin").write_text("x", encoding="utf-8")
+        real_open = os.open
+        opened_path: list[str] = []
+        real_fsync = os.fsync
+
+        def counting_fsync(fd):
+            # the payload fsync runs first; the FIRST fsync after the
+            # journal directory itself was opened is the directory fsync
+            if str(journal.directory) in opened_path:
+                raise OSError("directory fsync failed")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(
+            os, "open",
+            lambda path, flags, *a, **kw: (
+                opened_path.append(str(path))
+                or real_open(str(tmp_path / "handle.bin"), os.O_RDWR)
+            ),
+        )
+        monkeypatch.setattr(os, "fsync", counting_fsync)
+        with pytest.raises(OSError):
+            journal.write(_journal_record(self.KEY))
+        assert str(journal.directory) in opened_path
+
+    def test_d_atomic_replace_failure_is_reported(self, tmp_path, monkeypatch):
+        """D: a failed atomic replace must surface to the caller."""
+        journal = self._journal(tmp_path)
+
+        def failing_replace(src, dst):
+            raise OSError("atomic replace failed")
+
+        monkeypatch.setattr(os, "replace", failing_replace)
+        with pytest.raises(OSError):
+            journal.write(_journal_record(self.KEY))
+        assert not journal.exists(self.KEY)
+
+    def test_e_identical_facts_are_deduplicated(self, tmp_path):
+        """E: rewriting byte-identical facts keeps exactly one record."""
+        journal = self._journal(tmp_path)
+        journal.write(_journal_record(self.KEY))
+        journal.write(_journal_record(self.KEY))
+        files = list(journal.paths())
+        assert len(files) == 1, files
+        assert list(journal.read_all()) == [self.KEY]
+
+    def test_f_restart_after_a_completed_write_replays_the_record(
+        self, tmp_path,
+    ):
+        """F: a completed write is replayed by a brand-new journal object."""
+        journal = self._journal(tmp_path)
+        journal.write(_journal_record(self.KEY))
+        replayed = ProtectiveCloseJournal(journal.directory).read_all()
+        assert list(replayed) == [self.KEY]
+        assert replayed[self.KEY].obligation["observed_rate_percent"] == (
+            pytest.approx(0.01)
+        )
+
+    def test_g_corrupt_record_is_skipped_never_merged(self, tmp_path):
+        """G: a corrupt / torn payload is skipped, healthy records survive."""
+        journal = self._journal(tmp_path)
+        journal.write(_journal_record(self.KEY))
+        good_key = "ME_LONG_V2_INVERSE_SHORT_OOS2_V1:other"
+        journal.write(_journal_record(good_key))
+        (journal.directory / "deadbeef.json").write_text(
+            "{ not json", encoding="utf-8",
+        )
+        records = journal.read_all()
+        assert sorted(records) == sorted([self.KEY, good_key])
+
+    def test_h_incomplete_temporary_file_after_a_crash_is_ignored(
+        self, tmp_path,
+    ):
+        """H: a torn ``.json.tmp`` left by a crash between write and rename
+        is never replayed as a record and never blocks the next write."""
+        journal = self._journal(tmp_path)
+        journal.write(_journal_record(self.KEY))
+        torn = journal.paths()[0].with_name(
+            journal.paths()[0].name + ".tmp",
+        )
+        torn.write_text('{"position_key": "ME_LONG', encoding="utf-8")
+
+        records = journal.read_all()
+        assert list(records) == [self.KEY], "torn payload must be ignored"
+
+        journal.write(_journal_record(self.KEY))   # next write succeeds
+        assert list(journal.read_all()) == [self.KEY]
+        assert len(journal.paths()) == 1

@@ -2322,3 +2322,379 @@ class TestCodexRound7OnPostgres:
         assert contour2.engine.accounting_consistent is True
         assert contour2.engine.durability_risk is False
         store2.close()
+
+
+# ---------------------------------------------------------------------------
+# Round 8 (Codex, 16.11.2026) — three NEW findings on HEAD edbb7350:
+#   P1a r4587604965  a failed recovery READ must not become "confirmed
+#                    absent" and must never retire the journal record;
+#   P1b r4587604973  the observed obligation must be durable BEFORE the
+#                    staging COMMIT creates a terminal snapshot;
+#   P2  r4587604985  the journal DIRECTORY (not ``os.curdir``) is what gets
+#                    fsync'ed, and write/fsync failures reach the caller.
+# Unit twins live in ``..._durability_hardening_v1.py`` (classes
+# TestRound8P1a/P1b/P2); this block repeats them on real PostgreSQL.
+# ---------------------------------------------------------------------------
+
+
+class _ProcessDeath(BaseException):
+    """Simulated process death.
+
+    Deliberately NOT an ``Exception``: the engine only guards exit paths
+    with ``except Exception``, so a real process termination cannot be
+    swallowed by any handler.
+    """
+
+
+class TestCodexRound8OnPostgres:
+    """Round 8 P1/P2 scenarios against real PostgreSQL."""
+
+    # -- shared timeline: durable journal + committed staging, then death --
+
+    @staticmethod
+    def _die_after_staging_commit(pg_conn, journal_dir):
+        """STOP -> journal write (durable) -> staging COMMIT -> death."""
+        ref, store, clock, contour, position_key, entry, bars = (
+            TestCodexRound6OnPostgres._funding_open(pg_conn, candle_steps=1)
+        )
+        contour.engine.journal = ProtectiveCloseJournal(journal_dir)
+        contour.journal_dir = journal_dir
+        original_list = store.list_close_legs
+        original_save = store.save_funding_obligation
+        original_stage = store.stage_close
+        store.list_close_legs = _always_fail("close-leg history unreadable")
+        store.save_funding_obligation = _always_fail("obligation write failure")
+
+        def stage_then_die(position, terminal_leg=None, *, partial_legs=None):
+            # the transaction really commits, THEN the acknowledgement is
+            # lost to a process death (not to an Exception).
+            original_stage(position, terminal_leg, partial_legs=partial_legs)
+            raise _ProcessDeath("died right after the staging COMMIT")
+
+        store.stage_close = stage_then_die
+        with pytest.raises(_ProcessDeath):
+            contour.run_cycle(
+                {"BTCUSDT": entry}, bars=bars,
+                funding_rates_percent={"BTCUSDT": 0.01},
+            )
+        store.list_close_legs = original_list
+        store.save_funding_obligation = original_save
+        store.stage_close = original_stage
+        return ref, store, clock, contour, position_key, entry, bars
+
+    # -- P1a ---------------------------------------------------------------
+
+    def test_p1_a_failed_recovery_read_keeps_journal_and_observed_rate(
+        self, running, pg_conn, tmp_path,
+    ):
+        """P1a on PostgreSQL: the journal replay cannot read the position
+        row — the record, the frozen STOP facts and the observed funding
+        must all survive, new entries must be refused, and the read-back
+        must be retried until PostgreSQL answers."""
+        ctx = TestCodexRound7OnPostgres._retained_close(pg_conn, tmp_path)
+        store, clock, contour = ctx["store"], ctx["clock"], ctx["contour"]
+        key, entry, ref = ctx["position_key"], ctx["entry"], ctx["ref"]
+        assert list(tmp_path.glob("*.json")), "the record must exist"
+        assert store.get_position(key).status == "OPEN"
+
+        # ---- restart while the position READ is unavailable --------------
+        store.close()
+        store2 = _connect_store()
+        original_get = store2.get_position
+        store2.get_position = _always_fail("position row unreadable")
+        contour2 = InverseShortContour(
+            _settings(), store2, clock=clock, activation_enabled=True,
+            journal_dir=tmp_path,
+        )
+        engine2 = contour2.engine
+        # (1) an unknown read is NEVER proof of absence
+        assert engine2.journal.paths(), (
+            "a failed read must not retire the journal record",
+        )
+        assert engine2.journal.read_all()[key].obligation is not None
+        assert key in engine2._journal_unresolved, "read is retried"
+        # (2) the observed funding and the frozen close are both restored
+        assert key in engine2._pending_obligations, "observed rate lost"
+        assert key in engine2.pending_closes, "frozen close lost"
+        assert key not in engine2.open_positions
+        assert engine2.pending_closes[key].exit_reason == "STOP_LOSS"
+        # (3) fail closed: no new entries while the outcome is unknown
+        assert engine2.durability_risk is True
+        assert engine2.open_entries({"ETHUSDT": 100.0}) == []
+        # (4) PostgreSQL was never mutated by the failed read
+        assert [p.position_key for p in store2.list_pending_closes()] == [key]
+        assert store2.get_funding_obligation(key) is None, (
+            "nothing may be fabricated while the read is unknown",
+        )
+
+        # ---- read path restored -> read-back classifies and completes ----
+        store2.get_position = original_get
+        store2.close()
+        store3 = _connect_store()
+        contour3 = InverseShortContour(
+            _settings(), store3, clock=clock, activation_enabled=True,
+            journal_dir=tmp_path,
+        )
+        engine3 = contour3.engine
+        assert engine3._journal_unresolved == set(), "read-back classified"
+        assert engine3.journal.paths(), "row still OPEN -> record kept"
+        assert key in engine3._pending_obligations
+        assert engine3.open_entries({"ETHUSDT": 100.0}) == []
+
+        contour3.run_cycle({"BTCUSDT": entry * 0.98})
+        row = store3.get_position(key)
+        assert row.status == "CLOSED"
+        assert row.exit_reason == "STOP_LOSS"
+        assert row.funding_periods_charged == 1, "never fewer periods"
+        assert row.funding_paid == pytest.approx(
+            ref["funding_paid"], abs=1e-6,
+        ), "funding_paid must never be lost"
+        assert row.net_pnl == pytest.approx(ref["net_pnl"], abs=1e-6)
+        assert store3.get_funding_obligation(key).status == (
+            FUNDING_OBLIGATION_SETTLED
+        )
+        assert [leg.leg_seq for leg in store3.list_close_legs(key)] == [1, 3]
+        assert engine3.pending_closes == {}
+        assert store3.list_pending_closes() == []
+        assert engine3.journal.paths() == [], "retired after proven completion"
+        assert engine3.balance == pytest.approx(ref["balance"], abs=1e-6)
+        assert engine3.durability_risk is False
+        assert len(engine3.open_entries({"ETHUSDT": 100.0})) == 1, (
+            "entries unblock once the outcome is known",
+        )
+        store3.close()
+
+    # -- P1b ---------------------------------------------------------------
+
+    def test_p1_b_observed_obligation_is_durable_before_the_staging_commit(
+        self, running, pg_conn, tmp_path,
+    ):
+        """P1b on PostgreSQL: STOP -> journal -> staging COMMIT -> death.
+
+        After the crash the terminal snapshot may already be durable in
+        PostgreSQL, but the OBSERVED funding obligation must be durable
+        too (in the journal record) — otherwise the restart would finalise
+        the close with ``funding_paid = 0`` and zero periods."""
+        ref, store, clock, contour, key, entry, bars = (
+            self._die_after_staging_commit(pg_conn, tmp_path)
+        )
+        engine = contour.engine
+
+        # (1) the recovery record is on disk WITH the observed funding
+        assert engine.journal.exists(key), "the record must precede staging"
+        record = engine.journal.read_all()[key]
+        assert record.obligation is not None, "observed funding must be durable"
+        assert record.exit_reason == "STOP_LOSS", "frozen trigger kept"
+        assert record.triggered_at, "the frozen closed_at must be kept"
+        assert record.staged is True, "the staging transaction had committed"
+        # (2) the terminal snapshot IS durable in PostgreSQL (raw SQL)
+        cursor = pg_conn.cursor()
+        cursor.execute(
+            f"SELECT position_key FROM {CLOSE_OUTBOX_TABLE} "  # noqa: S608
+            "WHERE position_key = %s",
+            (key,),
+        )
+        assert cursor.fetchone() is not None, "the staging must have committed"
+        pg_conn.rollback()
+        # (3) the terminal UPDATE never ran: the row is still OPEN
+        assert store.get_position(key).status == "OPEN"
+        assert store.get_funding_obligation(key) is None, (
+            "PostgreSQL still has no obligation -> the journal is the only copy",
+        )
+
+        # ---- restart: both halves resume, entries stay refused ------------
+        store.close()
+        store2 = _connect_store()
+        contour2 = InverseShortContour(
+            _settings(), store2, clock=clock, activation_enabled=True,
+            journal_dir=tmp_path,
+        )
+        engine2 = contour2.engine
+        assert store2.get_position(key).status == "OPEN"
+        assert key in engine2.pending_closes, "the outbox half must resume"
+        assert key in engine2._pending_obligations, (
+            "the observed rate must be replayed from the journal",
+        )
+        assert key not in engine2.open_positions
+        assert engine2.journal.paths(), "the record outlives the crash"
+        assert engine2.open_entries({"ETHUSDT": 100.0}) == []
+
+        # ---- reconciliation -> funding recovery -> outbox retirement -------
+        contour2.run_cycle({"BTCUSDT": entry * 0.98})
+        row2 = store2.get_position(key)
+        assert row2.status == "CLOSED"
+        assert row2.exit_reason == "STOP_LOSS"
+        # the FROZEN trigger is replayed verbatim — never recomputed
+        assert row2.exit_price == pytest.approx(record.fill_price, abs=1e-9)
+        assert row2.closed_at is not None
+        # the frozen ``closed_at`` is replayed verbatim (compared without
+        # the timezone representation, which PostgreSQL may round-trip)
+        frozen_closed_at = datetime.fromisoformat(record.triggered_at)
+        assert row2.closed_at.replace(tzinfo=None) == (
+            frozen_closed_at.replace(tzinfo=None)
+        )
+        # exactly-once settlement against the failure-free reference
+        assert row2.funding_periods_charged == 1, "never fewer periods"
+        assert row2.funding_paid == pytest.approx(
+            ref["funding_paid"], abs=1e-6,
+        )
+        assert row2.funding_paid != 0.0, "the observed funding must persist"
+        assert row2.net_pnl == pytest.approx(ref["net_pnl"], abs=1e-6)
+        assert store2.get_funding_obligation(key).status == (
+            FUNDING_OBLIGATION_SETTLED
+        )
+        legs = store2.list_close_legs(key)
+        assert [leg.leg_seq for leg in legs] == [1, 3], legs
+        assert len([leg for leg in legs if leg.is_terminal]) == 1, legs
+        assert engine2.pending_closes == {}
+        assert store2.list_pending_closes() == [], "outbox retired"
+        assert engine2.journal.paths() == [], "record retired once proven"
+        assert engine2.balance == pytest.approx(ref["balance"], abs=1e-6)
+        assert engine2.balance == pytest.approx(
+            store2.balance_components()["balance"], abs=1e-6,
+        )
+        assert engine2.durability_risk is False
+
+        # ---- repeated restart after recovery is a no-op --------------------
+        store2.close()
+        store3 = _connect_store()
+        contour3 = InverseShortContour(
+            _settings(), store3, clock=clock, activation_enabled=True,
+            journal_dir=tmp_path,
+        )
+        engine3 = contour3.engine
+        assert engine3.pending_closes == {}
+        assert engine3._pending_obligations == {}
+        assert engine3.journal.paths() == []
+        assert store3.get_position(key).status == "CLOSED"
+        assert store3.get_position(key).funding_periods_charged == 1
+        assert len([
+            leg for leg in store3.list_close_legs(key) if leg.is_terminal
+        ]) == 1, "no duplicate terminal leg"
+        assert engine3.durability_risk is False
+        store3.close()
+
+    # -- P2 ----------------------------------------------------------------
+
+    def test_p2_d_journal_directory_is_synced_from_a_foreign_cwd(
+        self, running, pg_conn, tmp_path, monkeypatch,
+    ):
+        """P2 on PostgreSQL: the record lives under a release-style path
+        while the process runs from a DIFFERENT working directory — the
+        directory opened for the directory fsync is the JOURNAL directory
+        (and the parents it had to create), never ``os.curdir``, and a
+        restart from yet another cwd replays it."""
+        journal_dir = (
+            tmp_path / "release" / "var" / "me_inverse_short_oos2_journal"
+        )
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir(parents=True)
+        monkeypatch.chdir(elsewhere)          # cwd is NOT the journal dir
+        assert not journal_dir.exists(), "a fresh release layout"
+
+        ctx = TestCodexRound7OnPostgres._retained_close(pg_conn, journal_dir)
+        store, clock, contour = ctx["store"], ctx["clock"], ctx["contour"]
+        key, entry, ref = ctx["position_key"], ctx["entry"], ctx["ref"]
+        engine = contour.engine
+
+        # the record landed in the release path — never in the process cwd
+        assert list(journal_dir.glob("*.json")), "record in journal_dir"
+        assert not list(elsewhere.glob("*.json")), "nothing may land in cwd"
+
+        # the directory fsync targets the JOURNAL directory itself.  The
+        # probe wraps ONE identical-facts rewrite (sha-256 dedup -> the same
+        # path) and performs no database I/O while os.open is patched.
+        opened: list[str] = []
+        real_open = os.open
+        (tmp_path / "handle.bin").write_text("x", encoding="utf-8")
+
+        def recording_open(path, flags, *args, **kwargs):
+            opened.append(str(path))
+            # Windows cannot fsync a read-only handle; POSIX opens the real
+            # directory read-only, which is why the stand-in must be writable
+            return real_open(str(tmp_path / "handle.bin"), os.O_RDWR)
+
+        monkeypatch.setattr(os, "open", recording_open)
+        engine.journal.write(engine.journal.read_all()[key])
+        monkeypatch.setattr(os, "open", real_open)
+        assert opened, "the journal directory must be opened for the fsync"
+        assert str(journal_dir) in opened, opened
+        assert all(os.path.isabs(p) for p in opened), opened
+        assert os.curdir not in opened and "." not in opened, opened
+        assert engine.journal.exists(key), "the rewrite must stay atomic"
+
+        # ---- a restart from ANOTHER working directory replays it ----------
+        monkeypatch.chdir(tmp_path)
+        store.close()
+        store2 = _connect_store()
+        contour2 = InverseShortContour(
+            _settings(), store2, clock=clock, activation_enabled=True,
+            journal_dir=journal_dir,
+        )
+        engine2 = contour2.engine
+        assert key in engine2._pending_obligations, "replayed from the record"
+        assert key in engine2.pending_closes
+        assert engine2.open_entries({"ETHUSDT": 100.0}) == []
+
+        contour2.run_cycle({"BTCUSDT": entry * 0.98})
+        row = store2.get_position(key)
+        assert row.status == "CLOSED"
+        assert row.exit_reason == "STOP_LOSS"
+        assert row.funding_periods_charged == 1
+        assert row.funding_paid == pytest.approx(
+            ref["funding_paid"], abs=1e-6,
+        )
+        assert row.net_pnl == pytest.approx(ref["net_pnl"], abs=1e-6)
+        assert store2.get_funding_obligation(key).status == (
+            FUNDING_OBLIGATION_SETTLED
+        )
+        assert store2.list_pending_closes() == []
+        assert engine2.journal.paths() == []
+        assert engine2.balance == pytest.approx(ref["balance"], abs=1e-6)
+        assert engine2.durability_risk is False
+        store2.close()
+
+    # -- P2: failures must reach the caller ---------------------------------
+
+    def test_p2_e_journal_write_failures_reach_the_caller(self, tmp_path, monkeypatch):
+        """P2: a payload-fsync failure and an atomic-replace failure must
+        PROPAGATE — the journal never reports a record as durable when the
+        ``fsync`` failed (the old ``_fsync_dir`` swallowed every OSError)."""
+        from app.paper.me_long_v2_inverse_short_oos2_v1.journal import (
+            PendingProtectiveClose,
+        )
+
+        journal = ProtectiveCloseJournal(
+            tmp_path / "release" / "var" / "me_inverse_short_oos2_journal",
+        )
+        record = PendingProtectiveClose(
+            position_key="ME_LONG_V2_INVERSE_SHORT_OOS2_V1:round8",
+            exit_reason="STOP_LOSS",
+            triggered_at="2026-06-01T21:00:00+00:00",
+            reference_price=100.0,
+            fill_price=110.0,
+            quantity=0.01,
+            snapshot={},
+            terminal_leg={},
+            written_at="2026-06-01T21:00:00+00:00",
+        )
+
+        def exploding_fsync(fd):
+            raise OSError("fsync failure")
+
+        monkeypatch.setattr(os, "fsync", exploding_fsync)
+        with pytest.raises(OSError):
+            journal.write(record)
+        monkeypatch.undo()
+
+        journal2 = ProtectiveCloseJournal(
+            tmp_path / "release2" / "var" / "journal2",
+        )
+
+        def broken_replace(*args, **kwargs):
+            raise OSError("atomic replace failure")
+
+        monkeypatch.setattr(os, "replace", broken_replace)
+        with pytest.raises(OSError):
+            journal2.write(record)
+        monkeypatch.undo()

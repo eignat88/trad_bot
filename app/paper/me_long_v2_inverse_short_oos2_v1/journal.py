@@ -66,6 +66,26 @@ DEFAULT_JOURNAL_DIR = PROJECT_ROOT / "var" / "me_inverse_short_oos2_journal"
 
 _SUFFIX = ".json"
 
+#: Windows cannot flush a directory handle — logged once per process so the
+#: limitation is VISIBLE without flooding the log on every write.
+_DIRECTORY_FSYNC_UNSUPPORTED_LOGGED = False
+
+
+def _warn_directory_fsync_unsupported(directory: Path, exc: OSError) -> None:
+    """Report (once) that this platform has no directory-fsync primitive."""
+    global _DIRECTORY_FSYNC_UNSUPPORTED_LOGGED
+    if _DIRECTORY_FSYNC_UNSUPPORTED_LOGGED:
+        return
+    _DIRECTORY_FSYNC_UNSUPPORTED_LOGGED = True
+    logger.warning(
+        "me inverse short oos2 journal directory fsync is NOT available on "
+        "this platform (os.name=%s): a directory handle cannot be flushed "
+        "here (%s).  The record payload is still fsync'ed before the atomic "
+        "rename and the record is written; only the directory-ENTRY "
+        "durability guarantee is POSIX-only.  dir=%s",
+        os.name, exc, directory,
+    )
+
 
 @dataclass
 class PendingProtectiveClose:
@@ -164,18 +184,40 @@ class ProtectiveCloseJournal:
         digest = hashlib.sha256(position_key.encode("utf-8")).hexdigest()[:40]
         return self.directory / f"{digest}{_SUFFIX}"
 
-    def _ensure_dir(self) -> None:
+    def _ensure_dir(self) -> list[Path]:
+        """Create the journal directory; return the levels ``mkdir`` created.
+
+        Round 8 (P2, Codex r4587604985): the directory entries ``mkdir``
+        just created live inside their PARENTS, so those parents have to be
+        synchronised as well — otherwise a crash right after the very first
+        write can lose the whole journal tree before the rename ever
+        happens.  The list is shallowest-first, which is also the order the
+        parents must be flushed in.
+        """
+        if self.directory.exists():
+            return []
+        missing: list[Path] = []
+        probe = self.directory
+        while not probe.exists() and probe != probe.parent:
+            missing.append(probe)
+            probe = probe.parent
         self.directory.mkdir(parents=True, exist_ok=True)
+        return list(reversed(missing))
 
     # -- public API -------------------------------------------------------
     def write(self, record: PendingProtectiveClose) -> Path:
         """Atomically persist one record; returns the file path.
 
-        Raises on any failure — the CALLER decides how to degrade (it must
-        keep the key flagged as durability risk rather than pretend the
-        record survived).
+        The record is only reported as written once the payload ``fsync``
+        AND the directory entry of the final name are confirmed durable —
+        any ``OSError`` propagates to the CALLER, which decides how to
+        degrade (it must keep the key flagged as durability risk rather
+        than pretend the record survived).
         """
-        self._ensure_dir()
+        created = self._ensure_dir()
+        # The entry of a directory ``mkdir`` just created lives in ITS
+        # parent; flushing every level's parent covers the whole chain.
+        new_parents = [level.parent for level in created]
         path = self._path(record.position_key)
         payload = json.dumps(
             record.to_dict(), ensure_ascii=False, sort_keys=True,
@@ -184,23 +226,41 @@ class ProtectiveCloseJournal:
         with open(tmp, "w", encoding="utf-8") as handle:
             handle.write(payload)
             handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)          # atomic on POSIX and Windows
-        self._fsync_dir()
+            os.fsync(handle.fileno())        # payload durable BEFORE rename
+        os.replace(tmp, path)                # atomic on POSIX and Windows
+        for directory in new_parents:
+            self._fsync_directory(directory)
+        self._fsync_directory(self.directory)
         return path
 
-    @staticmethod
-    def _fsync_dir() -> None:
-        # Directory fsync is POSIX-only; on Windows os.replace() already
-        # provides the durability barrier we need.
+    def _fsync_directory(self, directory: Path) -> None:
+        """Synchronise ONE directory entry; failures PROPAGATE.
+
+        Round 8 (P2, Codex r4587604985): the previous implementation opened
+        ``os.curdir`` — the process working directory, which in the supplied
+        runtime is the release root while the records live under
+        ``var/me_inverse_short_oos2_journal`` — so the rename's directory
+        entry was never synchronised, and it swallowed every ``OSError``
+        (both the open and the ``fsync``), reporting a record as durable
+        when no directory synchronisation had happened at all.
+
+        Windows has no directory-fsync primitive whatsoever: a directory
+        handle can be opened with ``FILE_FLAG_BACKUP_SEMANTICS`` but
+        ``FlushFileBuffers`` rejects it with ``ERROR_ACCESS_DENIED``
+        (verified on this platform).  That limitation is REPORTED at
+        warning level — never hidden behind ``except OSError: return`` and
+        never presented as a completed synchronisation.  The payload is
+        still ``fsync``-ed before the atomic rename in every case.
+        """
         try:
-            fd = os.open(os.curdir, os.O_RDONLY)
-        except OSError:
-            return
+            fd = os.open(directory, os.O_RDONLY)
+        except OSError as exc:
+            if os.name == "nt" and isinstance(exc, PermissionError):
+                _warn_directory_fsync_unsupported(directory, exc)
+                return
+            raise
         try:
             os.fsync(fd)
-        except OSError:  # pragma: no cover - platform dependent
-            pass
         finally:
             os.close(fd)
 
