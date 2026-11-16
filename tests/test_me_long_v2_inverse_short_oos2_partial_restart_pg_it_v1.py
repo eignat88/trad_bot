@@ -2401,6 +2401,11 @@ class TestCodexRound8OnPostgres:
         store.close()
         store2 = _connect_store()
         original_get = store2.get_position
+        # a FRESH candidate on the engine's own clock: the entry TTL ages
+        # signals against it, so the block below is proven to be the
+        # recovery gate and not a missing/stale candidate
+        _capture_event(store2, age=timedelta(seconds=5), symbol="ETHUSDT",
+                       signal_at=clock())
         store2.get_position = _always_fail("position row unreadable")
         contour2 = InverseShortContour(
             _settings(), store2, clock=clock, activation_enabled=True,
@@ -2439,6 +2444,7 @@ class TestCodexRound8OnPostgres:
         assert engine3._journal_unresolved == set(), "read-back classified"
         assert engine3.journal.paths(), "row still OPEN -> record kept"
         assert key in engine3._pending_obligations
+        assert engine3.accounting_consistent is True
         assert engine3.open_entries({"ETHUSDT": 100.0}) == []
 
         contour3.run_cycle({"BTCUSDT": entry * 0.98})
@@ -2458,7 +2464,16 @@ class TestCodexRound8OnPostgres:
         assert store3.list_pending_closes() == []
         assert engine3.journal.paths() == [], "retired after proven completion"
         assert engine3.balance == pytest.approx(ref["balance"], abs=1e-6)
+        assert engine3.accounting_consistent is True
         assert engine3.durability_risk is False
+        # every fail-closed gate must be clear before entries may resume
+        assert not engine3._pending_obligations, "obligation still pending"
+        assert not engine3._ambiguous_keys, "ambiguous write not classified"
+        assert not engine3._dirty_funding, "funding write unconfirmed"
+        assert not engine3._dirty_legs, "leg write unconfirmed"
+        assert not engine3._journal_unresolved, "read never resolved"
+        assert not engine3._unstaged_closes, "staging never completed"
+        # the SAME fresh candidate now opens — the recovery gates are clear
         assert len(engine3.open_entries({"ETHUSDT": 100.0})) == 1, (
             "entries unblock once the outcome is known",
         )
@@ -2480,13 +2495,13 @@ class TestCodexRound8OnPostgres:
         )
         engine = contour.engine
 
-        # (1) the recovery record is on disk WITH the observed funding
+        # (1) the recovery record is on disk WITH the observed funding —
+        #     it was written BEFORE the staging transaction ran
         assert engine.journal.exists(key), "the record must precede staging"
         record = engine.journal.read_all()[key]
         assert record.obligation is not None, "observed funding must be durable"
         assert record.exit_reason == "STOP_LOSS", "frozen trigger kept"
         assert record.triggered_at, "the frozen closed_at must be kept"
-        assert record.staged is True, "the staging transaction had committed"
         # (2) the terminal snapshot IS durable in PostgreSQL (raw SQL)
         cursor = pg_conn.cursor()
         cursor.execute(
@@ -2496,6 +2511,13 @@ class TestCodexRound8OnPostgres:
         )
         assert cursor.fetchone() is not None, "the staging must have committed"
         pg_conn.rollback()
+        # The record's ``staged`` hint is still False: the pre-stage write
+        # never claims a staging it has not confirmed, and the process died
+        # before the post-stage refresh.  That is the CONSERVATIVE direction
+        # — on replay the hint is only consulted when the outbox row is
+        # missing, where restaging idempotently is exactly right; when the
+        # outbox row already resumed ``pending_closes`` it is not needed.
+        assert record.staged is False
         # (3) the terminal UPDATE never ran: the row is still OPEN
         assert store.get_position(key).status == "OPEN"
         assert store.get_funding_obligation(key) is None, (
