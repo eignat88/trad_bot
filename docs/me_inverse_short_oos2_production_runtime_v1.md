@@ -217,9 +217,21 @@ sudo -u postgres psql -d trad_bot -c \
 * **Migration 089 (additive, round 6):**
   `sql/migrations/089_me_long_v2_inverse_short_oos2_v1_funding_obligation.sql`
   — one `CREATE TABLE IF NOT EXISTS` for the durable funding-obligation
-  ledger (no FK to V1/V2, no backfill, no change to 088; Issue #276,
-  Codex r4555591322: an observed rate whose historical quantity cannot be
-  proven must survive a restart instead of living only in process memory).
+  ledger (no FK to V1/V2, no backfill, no change to the 088 tables;
+  Issue #276, Codex r4555591322: an observed rate whose historical
+  quantity cannot be proven must survive a restart instead of living only
+  in process memory) **plus a `CREATE OR REPLACE FUNCTION` of the OOS-2
+  guard** `dds.fn_me_long_v2_inverse_short_oos2_v1_guard()` — the 088
+  guard froze `net_pnl` on `CLOSED` rows unconditionally, which made the
+  funding settlement itself impossible (`closed position is terminal`).
+  The replacement keeps every 088 rule (entry facts immutable, ladder
+  monotonicity, TP flags permanent, no un-close) and allows a `CLOSED`
+  row's `funding_paid`/`net_pnl` to move ONLY together with an advancing
+  `funding_periods` counter — the counter may never run backwards, so a
+  stale terminal-snapshot replay and any double-count stay hard database
+  errors. No trigger is dropped or recreated (the existing
+  `trg_..._guard` simply executes the replaced function), no `ALTER
+  TABLE`, no DROP.
   Apply it in the same approved window, AFTER 088, in numeric order —
   `ON_ERROR_STOP=1`, same review/verify pattern as above. Without 089 the
   contour still runs: obligation persistence degrades to the documented

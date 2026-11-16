@@ -180,8 +180,9 @@ def pg_conn():
             conn.close()
             pytest.skip("V2 tables missing after migration 088 attempt")
 
-    # Round 6 (P2-funding): the additive obligation table (089) rides
-    # along with every OOS-2 fixture — apply-once, raise on defect.
+    # Round 6 (P2-funding): migration 089 (obligation table + guard
+    # refinement) rides along with every OOS-2 fixture — always applied
+    # (idempotent), raise on defect.
     ensure_funding_obligation_table(conn)
 
     global _original_activation

@@ -63,6 +63,7 @@ from app.paper.me_long_v2_inverse_short_oos2_v1.protocol import (
 from app.paper.me_long_v2_inverse_short_oos2_v1.runner import InverseShortContour
 from app.paper.me_long_v2_inverse_short_oos2_v1.store import (
     ACTIVATION_TABLE,
+    CLOSE_LEG_TABLE,
     CLOSE_OUTBOX_TABLE,
     EVENT_TABLE,
     FUNDING_OBLIGATION_TABLE,
@@ -88,16 +89,21 @@ MIGRATION_089 = (
 
 
 def ensure_funding_obligation_table(conn) -> None:
-    """Apply migration 089 when the obligation table is absent.
+    """Apply migration 089 (always — it is idempotent).
 
-    Raises on failure: 089 is a plain additive CREATE TABLE, so an error
-    here is a real defect that must fail the suite loudly (the
-    obligation-dependent tests cannot run without it), never a silent skip.
+    089 must run even when the obligation table already exists from an
+    earlier fixture: it also carries the CREATE OR REPLACE of the OOS-2
+    guard that lets the funding settlement book onto a CLOSED row, and a
+    database created before that refinement would otherwise keep the old
+    guard forever (the exact CI failure of round 6).  Every statement in
+    089 is idempotent (CREATE ... IF NOT EXISTS / CREATE OR REPLACE), so
+    re-running it is safe.
+
+    Raises on failure: an error here is a real defect that must fail the
+    suite loudly (the obligation-dependent tests cannot run without it),
+    never a silent skip.
     """
     cursor = conn.cursor()
-    cursor.execute("SELECT to_regclass(%s)", (FUNDING_OBLIGATION_TABLE,))
-    if cursor.fetchone()[0]:
-        return
     cursor.execute(MIGRATION_089.read_text(encoding="utf-8"))
     conn.commit()
     cursor.execute("SELECT to_regclass(%s)", (FUNDING_OBLIGATION_TABLE,))
@@ -362,9 +368,13 @@ _original_activation: tuple | None = None
 def _cleanup(conn) -> None:
     cursor = conn.cursor()
     # obligation rows first (no FK, but they reference positions logically),
-    # then outbox -> position -> event.
-    for table in (FUNDING_OBLIGATION_TABLE, CLOSE_OUTBOX_TABLE,
-                  POSITION_TABLE, EVENT_TABLE):
+    # then legs -> outbox -> position -> event.  close_leg rows must go too:
+    # tests within one 5-minute candle window reuse the same deterministic
+    # position_key, so a leftover leg from a previous test would make the
+    # next test's funding backlog believe the position was already closed
+    # (outstanding_qty=0) or corrupt its leg assertions.
+    for table in (FUNDING_OBLIGATION_TABLE, CLOSE_LEG_TABLE,
+                  CLOSE_OUTBOX_TABLE, POSITION_TABLE, EVENT_TABLE):
         cursor.execute(f"DELETE FROM {table}")  # noqa: S608 - fixed names
     conn.commit()
 
@@ -395,8 +405,9 @@ def pg_conn():
             conn.close()
             pytest.skip("V2 tables missing after migration 088 attempt")
 
-    # Round 6 (P2-funding): the additive obligation table (089) rides
-    # along with every OOS-2 fixture — apply-once, raise on defect.
+    # Round 6 (P2-funding): migration 089 (obligation table + guard
+    # refinement) rides along with every OOS-2 fixture — always applied
+    # (idempotent), raise on defect.
     ensure_funding_obligation_table(conn)
 
     global _original_activation
