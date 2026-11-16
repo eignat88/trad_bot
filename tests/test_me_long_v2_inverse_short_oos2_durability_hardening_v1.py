@@ -30,7 +30,9 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -149,6 +151,7 @@ def _contour(
     settings: Settings | None = None,
     clock: _Clock | None = None,
     store: InMemoryInverseShortStore | None = None,
+    journal_dir=None,
 ) -> tuple[InverseShortContour, InMemoryInverseShortStore, _Clock]:
     settings = settings or _settings()
     clock = clock or _Clock(NOW)
@@ -157,6 +160,7 @@ def _contour(
     )
     contour = InverseShortContour(
         settings, store, clock=clock, activation_enabled=True,
+        journal_dir=journal_dir,
     )
     assert contour.activated, contour.activation_reason
     return contour, store, clock
@@ -164,10 +168,18 @@ def _contour(
 
 def _restart(
     contour: InverseShortContour, settings: Settings, clock: _Clock,
+    journal_dir=None,
 ) -> InverseShortContour:
     """Simulate a process restart: a NEW engine over the SAME durable store."""
     restarted = InverseShortContour(
         settings, contour.store, clock=clock, activation_enabled=True,
+        # Round 7 (P1): the SAME journal directory is replayed by the new
+        # engine — that is exactly what makes a retained protective close
+        # survive "restart before PostgreSQL recovery".
+        journal_dir=(
+            journal_dir if journal_dir is not None
+            else getattr(contour, "journal_dir", None)
+        ),
     )
     assert restarted.activated, restarted.activation_reason
     return restarted
@@ -2891,3 +2903,802 @@ class TestRound6FundingObligationRecovery:
             c_row.funding_paid, abs=1e-12,
         )
         assert row3.funding_periods_charged == 1
+
+
+# ---------------------------------------------------------------------------
+# Round 7 (P1, Codex r4584484945) — a protective STOP/TIMEOUT whose OBSERVED
+# funding rate could not be persisted must be RETAINED as a durable
+# PENDING_PROTECTIVE_CLOSE, never dropped and never re-evaluated.
+# Mandatory scenarios A–F.
+# ---------------------------------------------------------------------------
+
+class TestRound7P1RetainedProtectiveClose:
+    """Mandatory scenarios A–F for Codex thread r4584484945."""
+
+    @staticmethod
+    def _stop_bars(pos, entry):
+        return {pos.symbol: {"high": pos.stop_price * 1.001,
+                             "low": entry * 0.99}}
+
+    @staticmethod
+    def _double_outage(store) -> tuple:
+        """History UNREADABLE + obligation WRITE failing (both faults)."""
+        original_list = store.list_close_legs
+        original_save = store.save_funding_obligation
+        store.list_close_legs = _always_fail("close-leg history unreadable")
+        store.save_funding_obligation = _always_fail("obligation write failure")
+        return original_list, original_save
+
+    def test_a_stop_with_unreadable_history_and_failed_obligation(
+        self, tmp_path,
+    ):
+        """A (mandatory): protective STOP + close-leg history UNREADABLE +
+        obligation write FAILING -> the close is RETAINED as a durable
+        pending protective close (frozen facts, position out of the exit
+        algorithm, terminal UPDATE withheld, observed rate journaled,
+        entries refused) instead of being dropped from ``open_positions``.
+        """
+        settings = _settings()
+        control = _scenario_a_control(settings)
+        contour, store, clock = _contour(settings, journal_dir=tmp_path)
+        pos = _open_one(contour, store, clock)
+        key = pos.position_key
+        entry = pos.entry_price
+        contour.run_cycle({pos.symbol: entry * 0.945})      # TP1 committed
+        clock.advance(hours=9)
+        original_list, original_save = self._double_outage(store)
+        cycle = contour.run_cycle(
+            {pos.symbol: entry}, bars=self._stop_bars(pos, entry),
+            funding_rates_percent={pos.symbol: 0.01},
+        )
+        engine = contour.engine
+
+        # A1 — the protective exit FIRED and was reported (old HEAD: []).
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        # A2 — the position is TREATED AS PROTECTIVELY CLOSED: it left the
+        #      exit algorithm, so STOP/TP/TIMEOUT can never re-evaluate it.
+        assert key not in engine.open_positions
+        # A3 — and it is RETAINED with the ORIGINAL frozen facts.
+        assert key in engine.pending_closes
+        snap = engine.pending_closes[key]
+        assert snap.exit_reason == "STOP_LOSS"
+        assert snap.remaining_size == 0.0
+        assert snap.exit_price == pytest.approx(
+            pos.stop_price * (1.0 + settings.slippage_percent),
+        )
+        assert snap.closed_at is not None
+
+        # A4 — nothing durable is claimed: the terminal UPDATE is withheld
+        #      (a CLOSED row must never freeze an unsettled period as 0
+        #      while the rate lives outside PostgreSQL).
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_OPEN, "terminal UPDATE withheld"
+        assert row.funding_periods_charged == 0
+        assert store.get_funding_obligation(key) is None
+
+        # A5 — the OBSERVED rate + every terminal fact are frozen into the
+        #      OOS-2-only local durable JOURNAL (atomic file on disk).
+        assert key in engine.pending_protective_close_keys
+        files = sorted(p.name for p in tmp_path.glob("*.json"))
+        assert files, "the journal record must exist on disk"
+        record = engine._journal_records[key]
+        assert record.exit_reason == "STOP_LOSS"
+        assert record.triggered_at == snap.closed_at.isoformat()
+        assert record.reference_price == pytest.approx(pos.stop_price)
+        assert record.fill_price == pytest.approx(snap.exit_price)
+        # the CLOSED remainder (the terminal leg's quantity), never the
+        # already-zero post-close remaining_size
+        assert record.quantity > 0.0, "the closed remainder must be frozen"
+        assert record.terminal_leg["is_terminal"] is True
+        assert record.terminal_leg["quantity"] == pytest.approx(record.quantity)
+        assert record.owed_partial_legs == [] or all(
+            int(leg["leg_seq"]) in (1, 2) for leg in record.owed_partial_legs
+        )
+        assert record.obligation is not None
+        assert record.obligation["observed_rate_percent"] == pytest.approx(0.01)
+        assert record.obligation["periods_due"] == 1
+        assert record.obligation["periods_charged_at_observation"] == 0
+        assert record.accounting_delta != 0.0
+        assert record.recovery_ids["position_key"] == key
+        # the on-disk payload is the same record (replay = byte-identical)
+        on_disk = json.loads((tmp_path / files[0]).read_text("utf-8"))
+        assert on_disk == record.to_dict()
+
+        # A6 — new entries are refused while the rate is not durable.
+        assert engine.open_entries({pos.symbol: entry}) == []
+        snap_json = engine.snapshot()
+        assert snap_json["pending_obligations"] == 1
+        assert snap_json["pending_protective_closes"] == 1
+        assert snap_json["pending_obligation_keys"] == [key]
+
+        # A7 — recovery: the store accepts the retained rate, the close
+        #      commits with the FROZEN facts and settles exactly once.
+        store.list_close_legs = original_list
+        store.save_funding_obligation = original_save
+        contour.run_cycle({pos.symbol: entry * 0.98})
+        row2 = store.get_position(key)
+        assert row2.status == POSITION_STATUS_CLOSED
+        assert row2.exit_reason == "STOP_LOSS"
+        assert row2.exit_price == pytest.approx(snap.exit_price)
+        assert row2.closed_at == snap.closed_at
+        # the frozen journal quantity is exactly the durable terminal leg
+        assert _legs_by_reason(store, key)["STOP_LOSS"].quantity == (
+            pytest.approx(record.quantity)
+        )
+        assert row2.funding_periods_charged == 1
+        assert row2.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        )
+        assert row2.net_pnl == pytest.approx(control["net_pnl"], abs=1e-9)
+        ob = store.get_funding_obligation(key)
+        assert ob is not None and ob.status == FUNDING_OBLIGATION_SETTLED
+        assert engine.pending_closes == {}
+        assert engine._pending_obligations == {}
+        assert engine.pending_protective_close_keys == ()
+        assert engine.journal.paths() == [], "journal record must be retired"
+        assert engine.balance == pytest.approx(control["balance"], abs=1e-9)
+        assert engine.balance == pytest.approx(
+            store.balance_components()["balance"], abs=1e-9,
+        )
+        # A8 — entries are unblocked again once everything is durable.
+        assert _capture(store, _candidate("ETHUSDT", 50.0, detected_at=clock())) \
+            == "CAPTURED"
+        assert contour.run_cycle({"ETHUSDT": 50.0})["entries"] == 1
+        _assert_ledger_consistent(contour)
+
+    def test_b_price_no_longer_touching_the_stop_never_loses_the_close(
+        self, tmp_path,
+    ):
+        """B (mandatory): next cycle the price NO LONGER touches the STOP
+        (old HEAD: the position stayed in ``open_positions`` and the exit
+        simply never fired again, losing the close).  The retained close
+        must complete with the ORIGINAL frozen trigger facts anyway — no
+        recomputation from fresh inputs, ever."""
+        settings = _settings()
+        control = _scenario_a_control(settings)
+        contour, store, clock = _contour(settings, journal_dir=tmp_path)
+        pos = _open_one(contour, store, clock)
+        key = pos.position_key
+        entry = pos.entry_price
+        contour.run_cycle({pos.symbol: entry * 0.945})
+        clock.advance(hours=9)
+        original_list, original_save = self._double_outage(store)
+        cycle1 = contour.run_cycle(
+            {pos.symbol: entry}, bars=self._stop_bars(pos, entry),
+            funding_rates_percent={pos.symbol: 0.01},
+        )
+        assert cycle1["exit_reasons"] == ["STOP_LOSS"]
+        frozen = dict(contour.engine.pending_closes[key].to_dict())
+        frozen_record = contour.engine._journal_records[key].to_dict()
+
+        # --- cycle 2: price well BELOW the stop (would never trigger), no
+        # bars, no funding rate — and the store is healthy again.
+        store.list_close_legs = original_list
+        store.save_funding_obligation = original_save
+        cycle2 = contour.run_cycle({pos.symbol: entry * 0.98})
+        assert cycle2["exit_reasons"] == [], (
+            "the retained position must not be re-evaluated at all",
+        )
+        assert key not in contour.engine.open_positions
+
+        # the COMMITTED close carries the ORIGINAL trigger, byte for byte
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.exit_reason == "STOP_LOSS"
+        assert row.exit_price == pytest.approx(frozen["exit_price"])
+        assert row.closed_at.isoformat() == frozen["closed_at"]
+        assert row.funding_periods_charged == 1
+        assert row.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        )
+        assert row.net_pnl == pytest.approx(control["net_pnl"], abs=1e-9)
+        assert contour.engine.balance == pytest.approx(
+            control["balance"], abs=1e-9,
+        )
+        # the frozen record was never mutated by the fresh cycle inputs
+        assert frozen_record["exit_reason"] == "STOP_LOSS"
+        assert frozen_record["obligation"]["observed_rate_percent"] == (
+            pytest.approx(0.01)
+        )
+        assert contour.engine.journal.paths() == []
+        _assert_ledger_consistent(contour)
+
+    def test_c_observed_rate_survives_a_cycle_without_a_rate(self, tmp_path):
+        """C (mandatory): the funding rate DISAPPEARS next cycle (no rate
+        delivered, history still unreadable) — the rate observed at the
+        STOP is the one that is eventually charged, never re-derived from
+        a fresh (absent) input and never dropped."""
+        settings = _settings()
+        control = _scenario_a_control(settings)
+        contour, store, clock = _contour(settings, journal_dir=tmp_path)
+        pos = _open_one(contour, store, clock)
+        key = pos.position_key
+        entry = pos.entry_price
+        contour.run_cycle({pos.symbol: entry * 0.945})
+        clock.advance(hours=9)
+        original_list, original_save = self._double_outage(store)
+        cycle1 = contour.run_cycle(
+            {pos.symbol: entry}, bars=self._stop_bars(pos, entry),
+            funding_rates_percent={pos.symbol: 0.01},
+        )
+        assert cycle1["exit_reasons"] == ["STOP_LOSS"]
+        engine = contour.engine
+        record = engine._journal_records[key]
+        assert record.obligation["observed_rate_percent"] == pytest.approx(0.01)
+        # deep snapshot (JSON round-trip) taken BEFORE the rate-less cycle
+        frozen = json.loads(json.dumps(record.to_dict()))
+
+        # cycle 2: history still unreadable, obligation STILL failing, and
+        # NO funding rate is delivered at all.
+        cycle2 = contour.run_cycle({pos.symbol: entry * 0.98})
+        assert cycle2["exit_reasons"] == []
+        assert key in engine.pending_closes, "the hold must persist"
+        assert key in engine._pending_obligations
+        assert store.get_funding_obligation(key) is None
+        assert store.get_position(key).status == POSITION_STATUS_OPEN
+        # the retained observation is byte-identical (never re-derived from
+        # the absent cycle-2 rate)
+        assert json.loads(json.dumps(engine._journal_records[key].to_dict())) \
+            == frozen
+        assert engine.open_entries({pos.symbol: entry}) == []
+
+        # cycle 3: everything restored -> the OBSERVED rate is persisted and
+        # charged for exactly one period at 0.01%.
+        store.list_close_legs = original_list
+        store.save_funding_obligation = original_save
+        contour.run_cycle({pos.symbol: entry})
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.funding_periods_charged == 1
+        assert row.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        )
+        ob = store.get_funding_obligation(key)
+        assert ob.observed_rate_percent == pytest.approx(0.01)
+        assert ob.status == FUNDING_OBLIGATION_SETTLED
+        assert engine.balance == pytest.approx(control["balance"], abs=1e-9)
+        assert engine.journal.paths() == []
+        _assert_ledger_consistent(contour)
+
+    def test_d_restart_before_postgresql_recovery(self, tmp_path):
+        """D (mandatory): RESTART while PostgreSQL still holds NOTHING of
+        the close (row OPEN, no obligation).  The local journal must replay
+        the frozen terminal facts AND the observed rate — both when the
+        outbox half survived and when staging failed too (journal-only)."""
+        settings = _settings()
+        control = _scenario_a_control(settings)
+
+        # --- variant 1: staging SUCCEEDED (outbox row exists) ----------
+        contour, store, clock = _contour(settings, journal_dir=tmp_path)
+        pos = _open_one(contour, store, clock)
+        key = pos.position_key
+        entry = pos.entry_price
+        contour.run_cycle({pos.symbol: entry * 0.945})
+        clock.advance(hours=9)
+        original_list, original_save = self._double_outage(store)
+        cycle1 = contour.run_cycle(
+            {pos.symbol: entry}, bars=self._stop_bars(pos, entry),
+            funding_rates_percent={pos.symbol: 0.01},
+        )
+        assert cycle1["exit_reasons"] == ["STOP_LOSS"]
+        assert [p.position_key for p in store.list_pending_closes()] == [key]
+
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        assert store.get_position(key).status == POSITION_STATUS_OPEN
+        assert key in engine.pending_closes, "outbox half must resume"
+        assert key in engine._pending_obligations, (
+            "the observed rate must be replayed from the journal",
+        )
+        assert key not in engine.open_positions
+        assert engine.open_entries({pos.symbol: entry}) == []
+        store.list_close_legs = original_list
+        store.save_funding_obligation = original_save
+        restarted.run_cycle({pos.symbol: entry * 0.98})
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.exit_reason == "STOP_LOSS"
+        assert row.funding_periods_charged == 1
+        assert row.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        )
+        assert restarted.engine.balance == pytest.approx(
+            control["balance"], abs=1e-9,
+        )
+        assert restarted.engine.journal.paths() == []
+
+        # --- variant 2: staging FAILED too -> the journal is the ONLY copy
+        settings2 = _settings()
+        contour2, store2, clock2 = _contour(settings2, journal_dir=tmp_path / "s")
+        pos2 = _open_one(contour2, store2, clock2)
+        key2 = pos2.position_key
+        entry2 = pos2.entry_price
+        contour2.run_cycle({pos2.symbol: entry2 * 0.945})
+        clock2.advance(hours=9)
+        ol2, os2 = self._double_outage(store2)
+        original_stage = store2.stage_close
+        store2.stage_close = _always_fail("outbox staging outage")
+        cycle = contour2.run_cycle(
+            {pos2.symbol: entry2}, bars=self._stop_bars(pos2, entry2),
+            funding_rates_percent={pos2.symbol: 0.01},
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        assert store2.list_pending_closes() == [], "nothing staged at all"
+        assert key2 in contour2.engine.pending_closes
+        assert key2 in contour2.engine._unstaged_closes
+
+        restarted2 = _restart(contour2, settings2, clock2, journal_dir=tmp_path / "s")
+        engine2 = restarted2.engine
+        assert key2 in engine2.pending_closes, "journal-only restore"
+        assert key2 in engine2._unstaged_closes, "the outbox half must be owed"
+        assert key2 in engine2._pending_obligations
+        assert key2 not in engine2.open_positions
+        store2.stage_close = original_stage
+        store2.list_close_legs = ol2
+        store2.save_funding_obligation = os2
+        restarted2.run_cycle({pos2.symbol: entry2 * 0.98})
+        row2 = store2.get_position(key2)
+        assert row2.status == POSITION_STATUS_CLOSED
+        assert row2.exit_reason == "STOP_LOSS"
+        assert row2.funding_periods_charged == 1
+        assert row2.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        )
+        assert restarted2.engine.journal.paths() == []
+
+    def test_e_duplicate_delivery_and_ambiguous_commit_book_once(
+        self, tmp_path,
+    ):
+        """E (mandatory): DUPLICATE delivery of the same terminal staging
+        plus an AMBIGUOUS terminal COMMIT (write applied, acknowledgement
+        lost) must book the close and the funding EXACTLY once, and a
+        later duplicate of the superseded snapshot must never be resumed."""
+        settings = _settings()
+        control = _scenario_a_control(settings)
+        contour, store, clock = _contour(settings, journal_dir=tmp_path)
+        pos = _open_one(contour, store, clock)
+        key = pos.position_key
+        entry = pos.entry_price
+        contour.run_cycle({pos.symbol: entry * 0.945})
+        clock.advance(hours=9)
+        original_list, original_save = self._double_outage(store)
+        cycle1 = contour.run_cycle(
+            {pos.symbol: entry}, bars=self._stop_bars(pos, entry),
+            funding_rates_percent={pos.symbol: 0.01},
+        )
+        assert cycle1["exit_reasons"] == ["STOP_LOSS"]
+        retained = contour.engine.pending_closes[key]   # PRE-settlement facts
+
+        # store healthy again, but the terminal UPDATE loses its ack AFTER
+        # the write was applied.
+        store.list_close_legs = original_list
+        store.save_funding_obligation = original_save
+        real_update = store.update_position
+
+        def _lost_ack(position):
+            real_update(position)
+            raise RuntimeError("terminal UPDATE acknowledgement lost")
+
+        store.update_position = _lost_ack
+        contour.run_cycle({pos.symbol: entry * 0.98})
+        store.update_position = real_update
+
+        engine = contour.engine
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.funding_periods_charged == 1, "AMBIGUOUS COMMIT confirmed"
+        assert row.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        )
+        assert row.net_pnl == pytest.approx(control["net_pnl"], abs=1e-9)
+        assert engine.pending_closes == {}
+        assert engine._uncommitted_deltas == {}
+        assert engine._ambiguous_keys == set()
+        assert engine.balance == pytest.approx(control["balance"], abs=1e-9)
+        assert engine.journal.paths() == []
+
+        # ten further cycles: exactly once, never re-booked
+        for _ in range(10):
+            contour.run_cycle({pos.symbol: entry * 0.98})
+        row_b = store.get_position(key)
+        assert row_b.funding_periods_charged == 1
+        assert row_b.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-12,
+        )
+        assert row_b.net_pnl == pytest.approx(control["net_pnl"], abs=1e-12)
+        assert contour.engine.balance == pytest.approx(
+            control["balance"], abs=1e-12,
+        )
+
+        # DUPLICATE DELIVERY: the ORIGINAL (pre-settlement) staging arrives
+        # again after everything already committed.
+        store.stage_close(retained, None)
+        assert [p.position_key for p in store.list_pending_closes()] == [key]
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        assert restarted.engine.pending_closes == {}, (
+            "a superseded duplicate must never be resumed",
+        )
+        assert store.list_pending_closes() == [], (
+            "the superseded duplicate must be retired",
+        )
+        row_c = store.get_position(key)
+        assert row_c.funding_periods_charged == 1
+        assert row_c.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-12,
+        )
+        assert restarted.engine.balance == pytest.approx(
+            control["balance"], abs=1e-9,
+        )
+        # one healthy cycle resyncs the ledger after the supersession retire
+        restarted.run_cycle({pos.symbol: entry * 0.98})
+        assert restarted.engine.accounting_consistent is True
+        assert restarted.engine.durability_risk is False
+        assert restarted.engine.balance == pytest.approx(
+            control["balance"], abs=1e-9,
+        )
+        assert restarted.engine.balance == pytest.approx(
+            store.balance_components()["balance"], abs=1e-9,
+        )
+
+    def test_f_timeout_variant_retains_the_protective_close(self, tmp_path):
+        """F (mandatory): the protective TIMEOUT variant of the same defect
+        — 15 due periods, both store faults, retained then recovered to the
+        failure-free control numbers."""
+        settings = _settings()
+        control = _timeout_control(settings)
+        contour, store, clock = _contour(settings, journal_dir=tmp_path)
+        pos = _open_one(contour, store, clock)
+        key = pos.position_key
+        entry = pos.entry_price
+        clock.advance(hours=121)
+        original_list, original_save = self._double_outage(store)
+        cycle1 = contour.run_cycle(
+            {pos.symbol: entry}, funding_rates_percent={pos.symbol: 0.01},
+        )
+        assert cycle1["exit_reasons"] == ["TIMEOUT"], cycle1
+        engine = contour.engine
+        assert key not in engine.open_positions
+        assert key in engine.pending_closes
+        assert engine.pending_closes[key].exit_reason == "TIMEOUT"
+        assert store.get_position(key).status == POSITION_STATUS_OPEN
+        assert store.get_funding_obligation(key) is None
+        record = engine._journal_records[key]
+        assert record.exit_reason == "TIMEOUT"
+        assert record.obligation["periods_due"] == 15
+        assert engine.open_entries({pos.symbol: entry}) == []
+
+        # next cycle: price normal, NO rate delivered, store still broken —
+        # the TIMEOUT close is never re-evaluated or lost.
+        cycle2 = contour.run_cycle({pos.symbol: entry})
+        assert cycle2["exit_reasons"] == []
+        assert key in engine.pending_closes
+
+        store.list_close_legs = original_list
+        store.save_funding_obligation = original_save
+        contour.run_cycle({pos.symbol: entry})
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.exit_reason == "TIMEOUT"
+        assert row.funding_periods_charged == 15
+        assert row.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        )
+        assert row.net_pnl == pytest.approx(control["net_pnl"], abs=1e-9)
+        assert store.get_funding_obligation(key).status == (
+            FUNDING_OBLIGATION_SETTLED
+        )
+        assert engine.balance == pytest.approx(control["balance"], abs=1e-9)
+        assert engine.balance == pytest.approx(
+            store.balance_components()["balance"], abs=1e-9,
+        )
+        assert engine.journal.paths() == []
+        assert engine.pending_protective_close_keys == ()
+        for _ in range(5):
+            contour.run_cycle({pos.symbol: entry})
+        row2 = store.get_position(key)
+        assert row2.funding_periods_charged == 15
+        assert row2.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-12,
+        )
+        _assert_ledger_consistent(contour)
+
+
+# ---------------------------------------------------------------------------
+# Round 7 (P2, Codex r4584484952) — a funding settlement must never leave a
+# stale close outbox behind.  Mandatory scenarios A–F.
+# ---------------------------------------------------------------------------
+
+class TestRound7P2StaleCloseOutbox:
+    """Mandatory scenarios A–F for Codex thread r4584484952."""
+
+    @staticmethod
+    def _stop_bars(pos, entry):
+        return {pos.symbol: {"high": pos.stop_price * 1.001,
+                             "low": entry * 0.99}}
+
+    @staticmethod
+    def _settled_with_stale_outbox(settings, journal_dir):
+        """STOP close whose ``clear_pending_close()`` FAILED, then settled.
+
+        Timeline (the defect): terminal staging + CLOSED update succeed ->
+        the outbox clear raises -> the pre-settlement snapshot survives ->
+        funding recovery advances the CLOSED row -> the snapshot is now
+        STALE financial state that a restart must never replay.
+        """
+        control = _scenario_a_control(settings)
+        contour, store, clock = _contour(settings, journal_dir=journal_dir)
+        pos = _open_one(contour, store, clock)
+        key = pos.position_key
+        entry = pos.entry_price
+        contour.run_cycle({pos.symbol: entry * 0.945})       # TP1 committed
+        clock.advance(hours=9)
+
+        original_list = store.list_close_legs
+        original_clear = store.clear_pending_close
+        store.list_close_legs = _always_fail("close-leg history unreadable")
+        store.clear_pending_close = _always_fail("clear_pending_close outage")
+        cycle = contour.run_cycle(
+            {pos.symbol: entry},
+            bars=TestRound7P2StaleCloseOutbox._stop_bars(pos, entry),
+            funding_rates_percent={pos.symbol: 0.01},
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        store.list_close_legs = original_list
+
+        # the CLOSED row committed but the clear FAILED -> stale snapshot
+        row_closed = store.get_position(key)
+        assert row_closed.status == POSITION_STATUS_CLOSED
+        assert row_closed.funding_periods_charged == 0
+        stale_rows = store.list_pending_closes()
+        assert [p.position_key for p in stale_rows] == [key], (
+            "clear_pending_close failed -> the snapshot must still be staged",
+        )
+        assert stale_rows[0].funding_periods_charged == 0
+
+        # funding recovery advances the CLOSED row
+        contour.run_cycle({pos.symbol: entry})
+        row_settled = store.get_position(key)
+        assert row_settled.funding_periods_charged == 1
+        assert row_settled.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        )
+        store.clear_pending_close = original_clear
+        return {
+            "control": control, "contour": contour, "store": store,
+            "clock": clock, "pos": pos, "key": key, "entry": entry,
+            "stale": stale_rows[0], "row_settled": row_settled,
+        }
+
+    def test_a_settlement_retires_the_stale_outbox_atomically(self, tmp_path):
+        """A (mandatory): terminal staging + CLOSED update succeed,
+        ``clear_pending_close()`` fails, funding recovery then updates the
+        CLOSED row — the superseded snapshot must be retired TOGETHER with
+        that settlement (one transaction), and a restart must neither
+        resume it nor replay it over the settled funding.  Entries must
+        recover (never a permanent pending close)."""
+        ctx = self._settled_with_stale_outbox(_settings(), tmp_path)
+        store, key, control = ctx["store"], ctx["key"], ctx["control"]
+
+        # THE FIX: the settlement retired the superseded snapshot in the
+        # same step — a stale outbox can never be left behind.
+        assert store.list_pending_closes() == [], (
+            "funding settlement must retire the stale close outbox atomically",
+        )
+
+        restarted = _restart(ctx["contour"], _settings(), ctx["clock"],
+                             journal_dir=tmp_path)
+        engine = restarted.engine
+        assert engine.pending_closes == {}, (
+            "a stale snapshot must never be resumed after a restart",
+        )
+        assert store.list_pending_closes() == []
+        row = store.get_position(key)
+        assert row.funding_periods_charged == 1, "settled funding must survive"
+        assert row.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        )
+        assert row.net_pnl == pytest.approx(control["net_pnl"], abs=1e-9)
+        assert engine.balance == pytest.approx(control["balance"], abs=1e-9)
+        assert engine.balance == pytest.approx(
+            store.balance_components()["balance"], abs=1e-9,
+        )
+        assert engine.durability_risk is False
+
+        # entries are NOT blocked forever by a pending close
+        restarted.run_cycle({ctx["pos"].symbol: ctx["entry"] * 0.98})
+        assert engine.accounting_consistent is True
+        assert engine.pending_closes == {}
+        assert _capture(store, _candidate("ETHUSDT", 50.0,
+                                          detected_at=ctx["clock"]())) \
+            == "CAPTURED"
+        assert restarted.run_cycle({"ETHUSDT": 50.0})["entries"] == 1
+
+    def test_b_stale_snapshot_can_never_overwrite_newer_confirmed_state(
+        self, tmp_path,
+    ):
+        """B (mandatory): the stale snapshot must NEVER overwrite the newer
+        confirmed state — neither through the engine (supersession is
+        recognised and the snapshot retired) nor through a direct store
+        write (the in-memory store now enforces the same monotone rule as
+        the migration 089 PostgreSQL guard)."""
+        ctx = self._settled_with_stale_outbox(_settings(), tmp_path)
+        store, key, control = ctx["store"], ctx["key"], ctx["control"]
+        stale = ctx["stale"]
+        assert stale.funding_periods_charged == 0
+
+        # (i) a DIRECT write of the stale snapshot is rejected — this is
+        #     exactly what PostgreSQL's migration 089 guard already did and
+        #     what the in-memory store used to accept silently.
+        with pytest.raises(RuntimeError,
+                           match="CLOSED_FUNDING_PERIODS_MAY_ONLY_ADVANCE"):
+            store.update_position(stale)
+        row = store.get_position(key)
+        assert row.funding_periods_charged == 1, "settled state untouched"
+        assert row.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        )
+
+        # (ii) even if the snapshot is staged again, the engine recognises
+        #      the supersession and retires it instead of replaying it.
+        store.stage_close(stale, None)
+        assert [p.position_key for p in store.list_pending_closes()] == [key]
+        restarted = _restart(ctx["contour"], _settings(), ctx["clock"],
+                             journal_dir=tmp_path)
+        assert restarted.engine.pending_closes == {}
+        assert store.list_pending_closes() == []
+        row2 = store.get_position(key)
+        assert row2.funding_periods_charged == 1
+        assert row2.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        )
+        assert restarted.engine.balance == pytest.approx(
+            control["balance"], abs=1e-9,
+        )
+
+    def test_c_snapshot_kept_while_terminal_facts_are_unconfirmed(
+        self, tmp_path,
+    ):
+        """C (mandatory): a superseded snapshot is NEVER silently deleted
+        while unconfirmed terminal facts remain — the row must be CLOSED
+        with IDENTICAL terminal facts (only the funding columns may have
+        advanced)."""
+        # (i) row still OPEN (retained protective close): never retired.
+        settings = _settings()
+        contour, store, clock = _contour(settings, journal_dir=tmp_path)
+        pos = _open_one(contour, store, clock)
+        key = pos.position_key
+        entry = pos.entry_price
+        contour.run_cycle({pos.symbol: entry * 0.945})
+        clock.advance(hours=9)
+        original_list = store.list_close_legs
+        original_save = store.save_funding_obligation
+        store.list_close_legs = _always_fail("close-leg history unreadable")
+        store.save_funding_obligation = _always_fail("obligation write failure")
+        cycle = contour.run_cycle(
+            {pos.symbol: entry}, bars=self._stop_bars(pos, entry),
+            funding_rates_percent={pos.symbol: 0.01},
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"]
+        engine = contour.engine
+        assert store.get_position(key).status == POSITION_STATUS_OPEN
+        open_snap = engine.pending_closes[key]
+        assert engine._retire_superseded_close(open_snap, source="test") is False
+        assert [p.position_key for p in store.list_pending_closes()] == [key], (
+            "an unconfirmed close must keep its staged snapshot",
+        )
+        store.list_close_legs = original_list
+        store.save_funding_obligation = original_save
+        contour.run_cycle({pos.symbol: entry * 0.98})
+        assert store.get_position(key).status == POSITION_STATUS_CLOSED
+
+        # (ii) row CLOSED but the snapshot describes a DIFFERENT close
+        #      (different exit facts) -> never mistaken for a stale twin.
+        ctx = self._settled_with_stale_outbox(_settings(), tmp_path / "b")
+        store2, key2 = ctx["store"], ctx["key"]
+        engine2 = ctx["contour"].engine
+        snap2 = ctx["stale"]
+        other_exit = dataclasses.replace(snap2, exit_price=snap2.exit_price * 3.0)
+        assert engine2._retire_superseded_close(other_exit, source="test") is False
+        other_reason = dataclasses.replace(snap2, exit_reason="TIMEOUT")
+        assert engine2._retire_superseded_close(other_reason,
+                                                source="test") is False
+        # (iii) the durable row is BEHIND the snapshot -> not supersession
+        ahead = dataclasses.replace(snap2, funding_periods_charged=99)
+        assert engine2._retire_superseded_close(ahead, source="test") is False
+        # only the genuinely superseded twin is retired
+        assert engine2._retire_superseded_close(snap2, source="test") is True
+
+    def test_d_clear_is_idempotent_and_recovery_is_a_noop(self, tmp_path):
+        """D (mandatory): ``clear_pending_close()`` is idempotent and a
+        repeated recovery (many restarts + many cycles) is a pure no-op."""
+        ctx = self._settled_with_stale_outbox(_settings(), tmp_path)
+        store, key, control = ctx["store"], ctx["key"], ctx["control"]
+
+        # idempotent: clearing an absent key is a no-op, never an error
+        for _ in range(5):
+            store.clear_pending_close(key)
+        assert store.list_pending_closes() == []
+
+        baseline = store.get_position(key)
+        # repeated restarts + cycles change NOTHING
+        for _ in range(3):
+            restarted = _restart(ctx["contour"], _settings(), ctx["clock"],
+                                 journal_dir=tmp_path)
+            restarted.run_cycle({ctx["pos"].symbol: ctx["entry"] * 0.98})
+            row = store.get_position(key)
+            assert row.funding_periods_charged == \
+                baseline.funding_periods_charged == 1
+            assert row.funding_paid == pytest.approx(
+                control["funding_paid"], abs=1e-12,
+            )
+            assert row.net_pnl == pytest.approx(control["net_pnl"], abs=1e-12)
+            assert restarted.engine.balance == pytest.approx(
+                control["balance"], abs=1e-12,
+            )
+            assert restarted.engine.pending_closes == {}
+            assert store.list_pending_closes() == []
+            assert restarted.engine.accounting_consistent is True
+            assert restarted.engine.durability_risk is False
+        _assert_ledger_consistent(restarted)
+
+    def test_e_migration_089_guards_are_not_weakened(self):
+        """E (mandatory): the migration 089 closed-row guards are byte-for
+        byte intact — nothing was relaxed to make the new recovery pass."""
+        from app.paper.me_long_v2_inverse_short_oos2_v1 import (  # noqa: PLC0415
+            store as store_module,
+        )
+
+        sql = store_module.SETTLE_POSITION_FUNDING_SQL
+        assert "status = 'CLOSED'" in sql, "the settlement must target CLOSED"
+        assert "funding_periods < %s" in sql, (
+            "the monotone funding_periods guard must stay in place",
+        )
+        migration = (
+            Path(__file__).resolve().parents[1] / "sql" / "migrations"
+            / "089_me_long_v2_inverse_short_oos2_v1_funding_obligation.sql"
+        ).read_text(encoding="utf-8")
+        assert "funding_periods may only advance on a closed position" in migration
+        assert "closed position is terminal" in migration
+        assert "RAISE EXCEPTION" in migration
+
+        # the engine still refuses to book an unprovable quantity
+        engine_src = inspect.getsource(InverseShortPaperEngine._close)
+        assert "funding_folded" in engine_src
+        assert "_settle_funding_for_close" in engine_src
+        exits_src = inspect.getsource(InverseShortPaperEngine.check_exits)
+        assert exits_src.count("funding_rate_percent=funding_rate") == 4
+
+    def test_f_no_regression_in_funding_periods_or_funding_paid(
+        self, tmp_path,
+    ):
+        """F (mandatory): after the whole recovery the contour must match
+        the failure-free control EXACTLY — never fewer
+        ``funding_periods_charged``, never a lost ``funding_paid``."""
+        settings = _settings()
+        ctx = self._settled_with_stale_outbox(settings, tmp_path)
+        store, key, control = ctx["store"], ctx["key"], ctx["control"]
+        assert store.list_pending_closes() == []
+
+        restarted = _restart(ctx["contour"], settings, ctx["clock"],
+                             journal_dir=tmp_path)
+        for _ in range(12):
+            restarted.run_cycle({ctx["pos"].symbol: ctx["entry"] * 0.98})
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.funding_periods_charged == control["funding_periods_charged"]
+        assert row.funding_periods_charged == 1, "never fewer periods"
+        assert row.funding_paid == pytest.approx(
+            control["funding_paid"], abs=1e-9,
+        ), "funding_paid must never be lost"
+        assert row.funding_paid != 0.0, "the settled funding must persist"
+        assert row.net_pnl == pytest.approx(control["net_pnl"], abs=1e-9)
+        assert restarted.engine.balance == pytest.approx(
+            control["balance"], abs=1e-9,
+        )
+        assert restarted.engine.balance == pytest.approx(
+            store.balance_components()["balance"], abs=1e-9,
+        )
+        assert restarted.engine.pending_closes == {}
+        assert restarted.engine.accounting_consistent is True
+        assert restarted.engine.durability_risk is False
+        _assert_ledger_consistent(restarted)

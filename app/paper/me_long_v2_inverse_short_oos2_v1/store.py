@@ -58,6 +58,7 @@ from .models import (
     InverseShortEvent,
     InverseShortFundingObligation,
     InverseShortPosition,
+    LEG_SEQ_TERMINAL,
     POSITION_STATUS_CLOSED,
     POSITION_STATUS_OPEN,
     leg_seq_for,
@@ -468,6 +469,38 @@ class InMemoryInverseShortStore(InverseShortStore):
         if position.deadline_at != stored.deadline_at:
             position.deadline_at = stored.deadline_at
             self.immutability_repairs += 1
+        # Round 7 (P2, Codex r4584484952): PostgreSQL parity for the
+        # migration 089 CLOSED-row guard.  On PostgreSQL a terminal row's
+        # funding window may only ADVANCE and ``funding_paid`` / ``net_pnl``
+        # may change only together with that advance — a rewind is a hard
+        # error.  Without this the in-memory store silently ACCEPTED a stale
+        # close-outbox snapshot (settled funding rolled back to zero) where
+        # PostgreSQL raises, so the two stores disagreed about the very same
+        # defect.  An identical re-write stays idempotent.
+        if (
+            stored.status == POSITION_STATUS_CLOSED
+            and position.status == POSITION_STATUS_CLOSED
+        ):
+            if (
+                position.funding_periods_charged
+                < stored.funding_periods_charged
+            ):
+                raise RuntimeError(
+                    "CLOSED_FUNDING_PERIODS_MAY_ONLY_ADVANCE:"
+                    f"{position.position_key}",
+                )
+            if (
+                position.funding_periods_charged
+                == stored.funding_periods_charged
+                and (
+                    position.funding_paid != stored.funding_paid
+                    or position.net_pnl != stored.net_pnl
+                )
+            ):
+                raise RuntimeError(
+                    "CLOSED_POSITION_IS_TERMINAL:"
+                    f"{position.position_key}",
+                )
         self._positions[position.position_key] = replace(position)
 
     def update_position_marks(self, position: InverseShortPosition) -> None:
@@ -717,6 +750,7 @@ class InMemoryInverseShortStore(InverseShortStore):
                 settled_at=settled_at,
                 settled_cost=0.0,
             )
+            self._retire_terminal_outbox(position_key)
             return False
         stored.funding_paid = float(funding_paid)
         stored.funding_periods_charged = int(funding_periods)
@@ -726,6 +760,46 @@ class InMemoryInverseShortStore(InverseShortStore):
             status=FUNDING_OBLIGATION_SETTLED,
             settled_at=settled_at,
             settled_cost=float(settled_cost),
+        )
+        # Round 7 (Codex r4584484952): the CLOSED row just advanced, so any
+        # close-outbox snapshot staged BEFORE the settlement is now superseded
+        # — retire it in the SAME step, never leave a stale snapshot behind
+        # for a restart to replay over the settled funding.
+        self._retire_terminal_outbox(position_key)
+        return True
+
+    def _retire_terminal_outbox(self, position_key: str) -> bool:
+        """Retire the staged outbox snapshot of a CONFIRMED terminal close.
+
+        Guarded exactly like the PostgreSQL transaction (round 7, P2):
+
+        * the position row must be ``CLOSED`` — the terminal facts are only
+          confirmed once the status flip is durable;
+        * the ``leg_seq = 3`` terminal leg row must exist — the outbox and
+          the leg ledger are staged in ONE transaction, so its presence
+          proves the staged snapshot really belongs to this confirmed close;
+
+        a snapshot is NEVER silently deleted while either half is missing.
+        Idempotent: retiring an already-retired key is a no-op.
+        """
+        stored = self._positions.get(position_key)
+        if stored is None or stored.status != POSITION_STATUS_CLOSED:
+            return False
+        if (position_key, LEG_SEQ_TERMINAL) not in self._close_legs:
+            logger.warning(
+                "me inverse short oos2 close outbox retire REFUSED (terminal "
+                "leg row absent — terminal facts unconfirmed, superseded "
+                "snapshot kept): key=%s",
+                position_key[:48],
+            )
+            return False
+        if position_key not in self._pending_closes:
+            return False
+        self._pending_closes.pop(position_key, None)
+        logger.info(
+            "me inverse short oos2 close outbox retired at funding "
+            "settlement (superseded snapshot can never be replayed): key=%s",
+            position_key[:48],
         )
         return True
 
@@ -2226,6 +2300,14 @@ class PgInverseShortStore(InverseShortStore):
         settled_at: datetime,
     ) -> bool:
         def operation() -> _QueryResult:
+            # 0) Round 7 (Codex r4584484952): decide whether the staged
+            #    close-outbox snapshot of this key may be retired WITH the
+            #    settlement.  The probe runs BEFORE any other statement, so
+            #    the only rollback it can ever cause costs nothing — no row
+            #    has been read or written yet.  It never raises: a database
+            #    without migration 088 simply has no outbox to retire and
+            #    the settlement proceeds exactly as before.
+            retire = self._retire_candidate(position_key)
             # 1) Lock the CLOSED row: serializes concurrent settlers and
             #    proves the position exists and is final.
             locked = self._execute_once(
@@ -2246,6 +2328,8 @@ class PgInverseShortStore(InverseShortStore):
                     VOID_FUNDING_OBLIGATION_SQL, (settled_at, position_key),
                     fetch="none",
                 )
+                if retire:
+                    self._retire_close_outbox(position_key)
                 self._conn.commit()
                 return _QueryResult(columns=[], rows=[], rowcount=0)
             # 2) Position funding/net_pnl with the monotone guard.
@@ -2270,6 +2354,21 @@ class PgInverseShortStore(InverseShortStore):
             if flipped.rowcount != 1:
                 self._conn.rollback()
                 return _QueryResult(columns=[], rows=[], rowcount=0)
+            # 4) THE FIX (round 7, P2): retire the terminal close-outbox row
+            #    in the SAME transaction as the funding advance.  Before this
+            #    the settlement moved funding_paid / funding_periods /
+            #    net_pnl on the CLOSED row while a stale outbox snapshot
+            #    (staged before the settlement, left behind by a failed
+            #    clear_pending_close) survived — a restart resumed it and
+            #    replayed the pre-settlement financial values over the newer
+            #    confirmed state, which the migration 089 guard rejects and
+            #    which the in-memory store silently applies (settled funding
+            #    rolled back, pending close never resolves, entries blocked
+            #    forever).  Now the snapshot is dropped atomically: either
+            #    the settlement AND the retirement commit together, or
+            #    neither does.
+            if retire:
+                self._retire_close_outbox(position_key)
             self._conn.commit()
             return _QueryResult(columns=[], rows=[], rowcount=1)
 
@@ -2279,6 +2378,59 @@ class PgInverseShortStore(InverseShortStore):
         except Exception:
             self._rollback()
             raise
+
+    def _retire_candidate(self, position_key: str) -> bool:
+        """May the staged outbox snapshot of this key legally be retired?
+
+        Rule 4 of the P2 contract: a superseded snapshot is NEVER silently
+        deleted while unconfirmed terminal facts remain.  True only when
+        BOTH durable halves of the terminal close are provably present:
+
+        * the ``close_outbox`` and ``close_leg`` relations exist at all
+          (migration 088 — a database without them has nothing staged);
+        * the ``leg_seq = 3`` terminal leg row exists — staging writes the
+          leg rows and the outbox snapshot in ONE transaction, so the leg
+          row proves the snapshot belongs to this confirmed close.
+
+        Never raises: a probe failure only skips the optional retire (the
+        engine-side supersession guard still protects the restart) and can
+        never block funding settlement.
+        """
+        try:
+            probe = self._execute_once(
+                "SELECT to_regclass(%s::text) IS NOT NULL, "
+                "to_regclass(%s::text) IS NOT NULL",
+                (CLOSE_OUTBOX_TABLE, CLOSE_LEG_TABLE), fetch="one",
+            )
+            row = probe.fetchone()
+            if row is None or not row[0] or not row[1]:
+                return False
+            leg = self._execute_once(
+                GET_CLOSE_LEG_SQL, (position_key, LEG_SEQ_TERMINAL),
+                fetch="one",
+            )
+            return leg.fetchone() is not None
+        except Exception:
+            self._rollback()
+            logger.debug(
+                "me inverse short oos2 close outbox retire probe failed "
+                "(retire skipped; settlement continues): key=%s",
+                position_key[:48], exc_info=True,
+            )
+            return False
+
+    def _retire_close_outbox(self, position_key: str) -> None:
+        """DELETE the superseded outbox row (caller owns the transaction)."""
+        result = self._execute_once(
+            DELETE_CLOSE_OUTBOX_SQL, (position_key,), fetch="none",
+        )
+        if result.rowcount:
+            logger.info(
+                "me inverse short oos2 close outbox retired atomically with "
+                "the funding settlement (superseded snapshot can never be "
+                "replayed): key=%s rows=%d",
+                position_key[:48], result.rowcount,
+            )
 
     def close(self) -> None:
         # Deliberate shutdown: reconnection is disabled from here on — a

@@ -23,6 +23,7 @@ database (same guard as the sibling admission suite).
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,6 +32,9 @@ import pytest
 
 from conftest import connect_test_db
 
+from app.paper.me_long_v2_inverse_short_oos2_v1.journal import (
+    ProtectiveCloseJournal,
+)
 from app.paper.me_long_v2_inverse_short_oos2_v1.models import (
     FUNDING_OBLIGATION_OPEN,
     FUNDING_OBLIGATION_SETTLED,
@@ -39,6 +43,9 @@ from app.paper.me_long_v2_inverse_short_oos2_v1.models import (
 )
 from app.paper.me_long_v2_inverse_short_oos2_v1.protocol import (
     protocol_fingerprint,
+)
+from app.paper.me_long_v2_inverse_short_oos2_v1.runner import (
+    InverseShortContour,
 )
 from app.paper.me_long_v2_inverse_short_oos2_v1.store import (
     ACTIVATION_TABLE,
@@ -1958,3 +1965,360 @@ class TestCodexRound6OnPostgres:
         )
         assert store.list_funding_obligations(FUNDING_OBLIGATION_OPEN) == []
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# Round 7 (Codex r4584484945 P1 retained protective close + r4584484952 P2
+# stale close outbox) — fault injection against REAL PostgreSQL with
+# migrations 088 + 089.  Unit twins live in
+# ``test_me_long_v2_inverse_short_oos2_durability_hardening_v1.py``.
+# The outbox retire and the 089 guard are only provable here: one real
+# PostgreSQL transaction, one real trigger.
+# ---------------------------------------------------------------------------
+
+class TestCodexRound7OnPostgres:
+    """Round 7 P1/P2 scenarios against real PostgreSQL."""
+
+    # -- shared timeline: STOP close whose ``clear_pending_close`` FAILED,
+    #    then the funding settlement that used to leave the stale snapshot.
+
+    @staticmethod
+    def _stale_outbox_timeline(pg_conn):
+        ref, store, clock, contour, position_key, entry, bars = (
+            TestCodexRound6OnPostgres._funding_open(pg_conn, candle_steps=1)
+        )
+        original_list = store.list_close_legs
+        original_clear = store.clear_pending_close
+        store.list_close_legs = _always_fail("close-leg history unreadable")
+        store.clear_pending_close = _always_fail("clear_pending_close outage")
+        cycle = contour.run_cycle(
+            {"BTCUSDT": entry}, bars=bars,
+            funding_rates_percent={"BTCUSDT": 0.01},
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        store.list_close_legs = original_list
+
+        # CLOSED row committed while the clear FAILED -> stale snapshot
+        row_closed = store.get_position(position_key)
+        assert row_closed.status == "CLOSED"
+        assert row_closed.funding_periods_charged == 0
+        stale_rows = store.list_pending_closes()
+        assert [p.position_key for p in stale_rows] == [position_key], (
+            "clear_pending_close failed -> the snapshot must still be staged",
+        )
+
+        # the funding recovery advances the CLOSED row
+        contour.run_cycle({"BTCUSDT": entry})
+        settled = store.get_position(position_key)
+        assert settled.funding_periods_charged == 1
+        assert settled.funding_paid == pytest.approx(
+            ref["funding_paid"], abs=1e-6,
+        )
+        store.clear_pending_close = original_clear
+        return ref, store, clock, contour, position_key, entry, stale_rows[0]
+
+    @staticmethod
+    def _outbox_keys(pg_conn, position_key) -> list[str]:
+        cursor = pg_conn.cursor()
+        cursor.execute(
+            f"SELECT position_key FROM {CLOSE_OUTBOX_TABLE} "  # noqa: S608
+            "WHERE position_key = %s",
+            (position_key,),
+        )
+        keys = [row[0] for row in cursor.fetchall()]
+        pg_conn.rollback()
+        return keys
+
+    # -- shared timeline: protective STOP whose OBSERVED rate could NOT be
+    #    persisted (both store faults) -> the close is RETAINED.
+
+    @staticmethod
+    def _retained_close(pg_conn, journal_dir):
+        ref, store, clock, contour, position_key, entry, bars = (
+            TestCodexRound6OnPostgres._funding_open(pg_conn, candle_steps=1)
+        )
+        # isolate the OOS-2 local durable journal for this test
+        contour.engine.journal = ProtectiveCloseJournal(journal_dir)
+        contour.journal_dir = journal_dir
+        original_list = store.list_close_legs
+        original_save = store.save_funding_obligation
+        store.list_close_legs = _always_fail("close-leg history unreadable")
+        store.save_funding_obligation = _always_fail("obligation write failure")
+        cycle = contour.run_cycle(
+            {"BTCUSDT": entry}, bars=bars,
+            funding_rates_percent={"BTCUSDT": 0.01},
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        return {
+            "ref": ref, "store": store, "clock": clock, "contour": contour,
+            "position_key": position_key, "entry": entry, "bars": bars,
+            "original_list": original_list, "original_save": original_save,
+        }
+
+    # -- P1 ---------------------------------------------------------------
+
+    def test_p1_a_retained_protective_close_survives_a_postgres_restart(
+        self, running, pg_conn, tmp_path,
+    ):
+        """A on PostgreSQL: STOP + unreadable history + failed obligation
+        write -> the close is RETAINED (row still OPEN, frozen facts in the
+        outbox AND in the local journal) and a RESTART before PostgreSQL
+        recovery restores BOTH halves; the rate then reaches PostgreSQL and
+        settles exactly once to the reference numbers."""
+        ctx = self._retained_close(pg_conn, tmp_path)
+        store, clock, contour = ctx["store"], ctx["clock"], ctx["contour"]
+        key, entry, ref = ctx["position_key"], ctx["entry"], ctx["ref"]
+        engine = contour.engine
+
+        row = store.get_position(key)
+        assert row.status == "OPEN", "terminal UPDATE withheld"
+        assert row.funding_periods_charged == 0
+        assert store.get_funding_obligation(key) is None
+        assert key in engine.pending_closes
+        assert key not in engine.open_positions
+        assert key in engine._pending_obligations
+        assert [p.position_key for p in store.list_pending_closes()] == [key]
+        assert list(tmp_path.glob("*.json")), "the local journal must exist"
+        assert engine.open_entries({"ETHUSDT": 100.0}) == []
+
+        # RESTART before PostgreSQL recovery: durable state + journal only
+        store.close()
+        store2 = _connect_store()
+        contour2 = InverseShortContour(
+            _settings(), store2, clock=clock, activation_enabled=True,
+            journal_dir=tmp_path,
+        )
+        engine2 = contour2.engine
+        assert store2.get_position(key).status == "OPEN"
+        assert key in engine2.pending_closes, "the outbox half must resume"
+        assert key in engine2._pending_obligations, (
+            "the observed rate must be replayed from the journal",
+        )
+        assert key not in engine2.open_positions
+        assert engine2.open_entries({"ETHUSDT": 100.0}) == []
+
+        # recovery: the retained rate reaches PostgreSQL, then settles once
+        contour2.run_cycle({"BTCUSDT": entry * 0.98})
+        row2 = store2.get_position(key)
+        assert row2.status == "CLOSED"
+        assert row2.exit_reason == "STOP_LOSS"
+        assert row2.funding_periods_charged == 1
+        assert row2.funding_paid == pytest.approx(
+            ref["funding_paid"], abs=1e-6,
+        )
+        assert row2.net_pnl == pytest.approx(ref["net_pnl"], abs=1e-6)
+        assert engine2.pending_closes == {}
+        assert store2.list_pending_closes() == []
+        assert engine2.journal.paths() == [], "the record must be retired"
+        assert engine2.balance == pytest.approx(ref["balance"], abs=1e-6)
+        assert engine2.balance == pytest.approx(
+            store2.balance_components()["balance"], abs=1e-6,
+        )
+        assert engine2.durability_risk is False
+        store2.close()
+
+    # -- P2 ---------------------------------------------------------------
+
+    def test_p2_a_settlement_retires_the_stale_outbox_atomically(
+        self, running, pg_conn,
+    ):
+        """A on PostgreSQL: the settlement retires the superseded snapshot
+        in the SAME transaction (raw-SQL proof), a restart resumes nothing
+        and the settled funding survives; entries are never blocked."""
+        ref, store, clock, contour, position_key, entry, stale = (
+            self._stale_outbox_timeline(pg_conn)
+        )
+        # raw-SQL proof: no stale snapshot survives the settlement
+        assert self._outbox_keys(pg_conn, position_key) == []
+
+        store.close()
+        store2 = _connect_store()
+        contour2 = _contour(store2, clock=clock)
+        engine2 = contour2.engine
+        assert engine2.pending_closes == {}
+        assert store2.list_pending_closes() == []
+        row = store2.get_position(position_key)
+        assert row.funding_periods_charged == 1, "settled funding must survive"
+        assert row.funding_paid == pytest.approx(ref["funding_paid"], abs=1e-6)
+        assert row.net_pnl == pytest.approx(ref["net_pnl"], abs=1e-6)
+        assert engine2.balance == pytest.approx(ref["balance"], abs=1e-6)
+
+        contour2.run_cycle({"BTCUSDT": entry})
+        assert engine2.pending_closes == {}
+        assert engine2.accounting_consistent is True
+        assert engine2.durability_risk is False
+        # entries are NOT blocked forever by a stale outbox
+        _capture_event(store2, age=timedelta(seconds=5), symbol="ETHUSDT",
+                       signal_at=clock())
+        opened = engine2.open_entries({"ETHUSDT": 100.0})
+        assert len(opened) == 1, "a stale outbox must never block entries"
+        store2.close()
+
+    def test_p2_b_stale_snapshot_replay_is_rejected_by_the_089_guard(
+        self, running, pg_conn,
+    ):
+        """B on PostgreSQL: replaying the superseded snapshot is a HARD
+        ERROR (migration 089) — the settled funding can never be rewound —
+        and staging it again is recognised as supersession on restart."""
+        ref, store, clock, contour, position_key, entry, stale = (
+            self._stale_outbox_timeline(pg_conn)
+        )
+        with pytest.raises(Exception) as excinfo:      # noqa: PT011 - pg error
+            store.update_position(stale)
+        assert "funding_periods may only advance on a closed position" in str(
+            excinfo.value,
+        ), str(excinfo.value)
+        row = store.get_position(position_key)
+        assert row.funding_periods_charged == 1, "settled state untouched"
+        assert row.funding_paid == pytest.approx(ref["funding_paid"], abs=1e-6)
+
+        # a duplicate delivery of the superseded snapshot is recognised and
+        # retired on restart instead of being replayed
+        store.stage_close(stale, None)
+        assert self._outbox_keys(pg_conn, position_key) == [position_key]
+        store.close()
+        store2 = _connect_store()
+        contour2 = _contour(store2, clock=clock)
+        assert contour2.engine.pending_closes == {}
+        assert store2.list_pending_closes() == []
+        contour2.run_cycle({"BTCUSDT": entry})
+        row2 = store2.get_position(position_key)
+        assert row2.funding_periods_charged == 1
+        assert row2.funding_paid == pytest.approx(ref["funding_paid"], abs=1e-6)
+        assert contour2.engine.balance == pytest.approx(ref["balance"], abs=1e-6)
+        assert contour2.engine.accounting_consistent is True
+        store2.close()
+
+    def test_p2_c_snapshot_kept_until_terminal_facts_are_confirmed(
+        self, running, pg_conn, tmp_path,
+    ):
+        """C on PostgreSQL: a superseded snapshot is NEVER silently deleted
+        while unconfirmed terminal facts remain — an OPEN row keeps its
+        staged snapshot, and only a snapshot of the SAME close with the
+        SAME terminal facts is ever retired."""
+        # (i) row still OPEN (retained protective close) -> never retired
+        ctx = self._retained_close(pg_conn, tmp_path)
+        store, clock, contour = ctx["store"], ctx["clock"], ctx["contour"]
+        key, entry = ctx["position_key"], ctx["entry"]
+        engine = contour.engine
+        assert store.get_position(key).status == "OPEN"
+        open_snap = engine.pending_closes[key]
+        assert engine._retire_superseded_close(open_snap, source="test") is False
+        assert [p.position_key for p in store.list_pending_closes()] == [key], (
+            "an unconfirmed close must keep its staged snapshot",
+        )
+
+        # recovery -> the row becomes CLOSED with the same terminal facts
+        store.list_close_legs = ctx["original_list"]
+        store.save_funding_obligation = ctx["original_save"]
+        contour.run_cycle({"BTCUSDT": entry * 0.98})
+        assert store.get_position(key).status == "CLOSED"
+
+        # (ii) a snapshot describing a DIFFERENT close is never mistaken
+        #      for a stale twin of this one
+        other_exit = dataclasses.replace(
+            open_snap, exit_price=open_snap.exit_price * 3.0,
+        )
+        assert engine._retire_superseded_close(other_exit,
+                                               source="test") is False
+        other_reason = dataclasses.replace(open_snap, exit_reason="TIMEOUT")
+        assert engine._retire_superseded_close(other_reason,
+                                               source="test") is False
+        # (iii) the durable row is BEHIND the snapshot -> not supersession
+        ahead = dataclasses.replace(open_snap, funding_periods_charged=99)
+        assert engine._retire_superseded_close(ahead, source="test") is False
+        store.close()
+
+    def test_p2_d_clear_is_idempotent_and_recovery_is_a_noop(
+        self, running, pg_conn,
+    ):
+        """D on PostgreSQL: ``clear_pending_close()`` is idempotent and a
+        repeated recovery (restarts + cycles) is a pure no-op."""
+        ref, store, clock, contour, position_key, entry, stale = (
+            self._stale_outbox_timeline(pg_conn)
+        )
+        for _ in range(3):
+            store.clear_pending_close(position_key)     # never raises
+        assert store.list_pending_closes() == []
+        baseline = store.get_position(position_key)
+        assert baseline.funding_periods_charged == 1
+
+        store.close()
+        for _ in range(2):
+            store = _connect_store()
+            contour2 = _contour(store, clock=clock)
+            contour2.run_cycle({"BTCUSDT": entry})
+            row = store.get_position(position_key)
+            assert row.funding_periods_charged == 1
+            assert row.funding_paid == pytest.approx(
+                ref["funding_paid"], abs=1e-9,
+            )
+            assert row.net_pnl == pytest.approx(ref["net_pnl"], abs=1e-9)
+            assert contour2.engine.balance == pytest.approx(
+                ref["balance"], abs=1e-6,
+            )
+            assert contour2.engine.pending_closes == {}
+            assert store.list_pending_closes() == []
+            assert contour2.engine.accounting_consistent is True
+            assert contour2.engine.durability_risk is False
+            store.close()
+
+    def test_p2_e_migration_089_guard_still_raises_on_a_raw_rewind(
+        self, running, pg_conn,
+    ):
+        """E on PostgreSQL: the migration 089 closed-row guard is byte-for
+        byte intact — a raw rewind of the funding window still raises."""
+        ref, store, clock, contour, position_key, entry, stale = (
+            self._stale_outbox_timeline(pg_conn)
+        )
+        assert store.get_position(position_key).funding_periods_charged == 1
+        cursor = pg_conn.cursor()
+        with pytest.raises(Exception) as excinfo:      # noqa: PT011 - pg error
+            cursor.execute(
+                f"UPDATE {POSITION_TABLE} "             # noqa: S608
+                "SET funding_periods = 0, funding_paid = 0, net_pnl = 0 "
+                "WHERE position_key = %s",
+                (position_key,),
+            )
+        assert "funding_periods may only advance on a closed position" in str(
+            excinfo.value,
+        ), str(excinfo.value)
+        pg_conn.rollback()
+        # the failed rewind changed nothing
+        row = store.get_position(position_key)
+        assert row.funding_periods_charged == 1
+        assert row.funding_paid == pytest.approx(ref["funding_paid"], abs=1e-6)
+        store.close()
+
+    def test_p2_f_no_regression_in_funding_periods_or_funding_paid(
+        self, running, pg_conn,
+    ):
+        """F on PostgreSQL: after the whole recovery the contour matches
+        the failure-free reference exactly — never fewer
+        ``funding_periods_charged``, never a lost ``funding_paid``."""
+        ref, store, clock, contour, position_key, entry, stale = (
+            self._stale_outbox_timeline(pg_conn)
+        )
+        assert store.list_pending_closes() == []
+        store.close()
+        store2 = _connect_store()
+        contour2 = _contour(store2, clock=clock)
+        for _ in range(6):
+            contour2.run_cycle({"BTCUSDT": entry})
+        row = store2.get_position(position_key)
+        assert row.status == "CLOSED"
+        assert row.funding_periods_charged == ref["funding_periods_charged"]
+        assert row.funding_periods_charged == 1, "never fewer periods"
+        assert row.funding_paid == pytest.approx(
+            ref["funding_paid"], abs=1e-6,
+        ), "funding_paid must never be lost"
+        assert row.funding_paid != 0.0, "the settled funding must persist"
+        assert row.net_pnl == pytest.approx(ref["net_pnl"], abs=1e-6)
+        assert contour2.engine.balance == pytest.approx(ref["balance"], abs=1e-6)
+        assert contour2.engine.balance == pytest.approx(
+            store2.balance_components()["balance"], abs=1e-6,
+        )
+        assert contour2.engine.pending_closes == {}
+        assert contour2.engine.accounting_consistent is True
+        assert contour2.engine.durability_risk is False
+        store2.close()

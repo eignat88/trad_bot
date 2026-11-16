@@ -56,6 +56,7 @@ import dataclasses
 import logging
 import math
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from app.config import Settings
@@ -66,6 +67,7 @@ from .activation import (
     is_post_freeze,
 )
 from .identity import position_key as build_position_key
+from .journal import PendingProtectiveClose, ProtectiveCloseJournal
 from .models import (
     EVENT_STATUS_CAPTURED,
     EVENT_STATUS_CAPACITY_REJECTED,
@@ -113,6 +115,7 @@ class InverseShortPaperEngine:
         clock: Callable[[], datetime] | None = None,
         activation: ActivationIdentity | None = None,
         require_activation: bool = True,
+        journal_dir: str | Path | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -214,6 +217,23 @@ class InverseShortPaperEngine:
         # still need a durable UPDATE (dashboard unrealized PnL, #276).
         self._marks_dirty: set[str] = set()
 
+        # -- Round 7 (P1, Codex r4584484945): retained protective closes ---
+        # An OBSERVED funding rate whose obligation write failed.  The rate
+        # is never dropped and never re-derived: it is retried against the
+        # store every cycle from here, and it is mirrored into the local
+        # durable journal so a crash before PostgreSQL accepts it still
+        # recovers it (mandatory test D: "restart before PostgreSQL
+        # recovery").  Entries stay refused while this set is non-empty.
+        self._pending_obligations: dict[str, InverseShortFundingObligation] = {}
+        #: Working copy of the durable journal records (disk wins at boot).
+        self._journal_records: dict[str, PendingProtectiveClose] = {}
+        #: Keys whose observed rate exists ONLY in process memory because
+        #: the journal write itself failed — an honestly-reported impossible
+        #: guarantee: ``durability_risk`` stays True and entries stay shut.
+        self._journal_failed: set[str] = set()
+        #: OOS-2-only local durable journal (atomic write / replay / dedup).
+        self.journal = ProtectiveCloseJournal(journal_dir)
+
         components = store.balance_components()
         self.confirmed_balance = float(
             components.get("balance", settings.initial_balance)
@@ -223,6 +243,7 @@ class InverseShortPaperEngine:
             components.get("initial_balance", settings.initial_balance)
         )
         self._load_open_positions()
+        self._replay_journal()
 
     # ------------------------------------------------------------------
     # Restart recovery
@@ -247,6 +268,13 @@ class InverseShortPaperEngine:
                     "me inverse short oos2 recovery refused invalid pending close: key=%s",
                     str(snapshot.position_key)[:48],
                 )
+                continue
+            # Round 7 (P2, Codex r4584484952): an outbox snapshot staged
+            # BEFORE a funding settlement is SUPERSEDED by the newer
+            # confirmed CLOSED row.  Recognising it here (instead of
+            # replaying it forever against the monotone migration 089
+            # guard) is what makes a stale close outbox recoverable.
+            if self._retire_superseded_close(snapshot, source="recovery"):
                 continue
             self.pending_closes[snapshot.position_key] = snapshot
             self._pending_from_store.add(snapshot.position_key)
@@ -350,11 +378,29 @@ class InverseShortPaperEngine:
     def durability_risk(self) -> bool:
         """Unresolved durability risk: a retained terminal snapshot exists
         only in process memory (staging never committed and the status
-        UPDATE has not committed either), OR a partial-TP leg applied in
-        memory is not yet in the durable leg ledger.  While True the engine
-        fails closed and reports the risk — recovery is NOT guaranteed if
-        the process terminates now."""
-        return bool(self._unstaged_closes) or bool(self._dirty_legs)
+        UPDATE has not committed either), a partial-TP leg applied in
+        memory is not yet in the durable leg ledger, OR an observed funding
+        rate of a retained protective close could not be written to the
+        local journal either (round 7 — an honestly-reported IMPOSSIBLE
+        guarantee: PostgreSQL refused the obligation AND the journal write
+        failed, so only process memory still holds the rate).  While True
+        the engine fails closed and reports the risk — recovery is NOT
+        guaranteed if the process terminates now."""
+        return (
+            bool(self._unstaged_closes)
+            or bool(self._dirty_legs)
+            or bool(self._journal_failed)
+        )
+
+    @property
+    def pending_protective_close_keys(self) -> tuple[str, ...]:
+        """Keys of retained protective closes mirrored into the local journal."""
+        return tuple(sorted(self._journal_records))
+
+    @property
+    def pending_obligation_keys(self) -> tuple[str, ...]:
+        """Observed funding rates NOT yet durable in the store (round 7 P1)."""
+        return tuple(sorted(self._pending_obligations))
 
     @property
     def dirty_leg_keys(self) -> tuple[str, ...]:
@@ -571,6 +617,22 @@ class InverseShortPaperEngine:
                 "keys=%s",
                 len(self.pending_closes),
                 ", ".join(sorted(self.pending_closes))[:200],
+            )
+            return opened
+        if self._pending_obligations:
+            # Round 7 (P1, Codex r4584484945): an OBSERVED funding rate that
+            # PostgreSQL has not accepted yet — whether its protective close
+            # is still pending or already committed — blocks new entries.
+            # A known rate may never live only in process memory/the local
+            # journal while the book keeps trading (the retry runs before
+            # this gate every cycle, so a healthy store clears it within one
+            # cycle).
+            logger.error(
+                "me inverse short oos2 entries refused (fail closed): %d "
+                "OBSERVED funding obligation(s) not yet durable in "
+                "PostgreSQL: keys=%s",
+                len(self._pending_obligations),
+                ", ".join(sorted(self._pending_obligations))[:200],
             )
             return opened
         if self._ambiguous_keys:
@@ -1547,8 +1609,12 @@ class InverseShortPaperEngine:
         Returns the cost folded into the snapshot (0.0 when nothing was
         settled — including a persisted obligation) or ``None`` when the
         observed rate could NOT be persisted (the obligation write itself
-        failed): the caller must then DEFER the whole close instead of
-        finalizing it and losing the known funding.
+        failed).  On ``None`` the caller must RETAIN the protective close
+        (round 7, Codex r4584484945): freeze the terminal facts, take the
+        position out of the exit algorithm, block new entries and retry the
+        identical observation every cycle — never finalize it (that would
+        lose the known funding) and never drop it (that would lose the
+        original STOP/TIMEOUT trigger).
         """
         due_periods = self._due_funding_periods(position)
         if due_periods <= position.funding_periods_charged:
@@ -1587,9 +1653,12 @@ class InverseShortPaperEngine:
             # HISTORY_UNAVAILABLE with a KNOWN rate (round 6, P2): the
             # observed rate must NOT be lost with this close — persist the
             # durable obligation first.  If even that write fails, return
-            # None so the caller defers the WHOLE close (protective exit
-            # retried next cycle) instead of finalizing a close whose known
-            # funding exists nowhere durable.
+            # None so the caller RETAINS the protective close (round 7,
+            # Codex r4584484945): frozen terminal facts, position taken out
+            # of the exit algorithm, entries blocked, the observation
+            # retried every cycle AND mirrored into the local durable
+            # journal — never finalized (that loses the known funding) and
+            # never dropped (that loses the original trigger).
             logger.warning(
                 "me inverse short oos2 close funding fold DEFERRED (close-leg "
                 "history unreadable — historical quantity cannot be proven; "
@@ -1673,8 +1742,12 @@ class InverseShortPaperEngine:
         Returns True when the obligation is durable (or the obligation
         table is absent — documented degraded mode, tracked and reported
         via ``_funding_obligation_degraded``), False when the write itself
-        failed: the caller must then defer the close, because a known
-        funding rate may never live only in process memory.
+        failed.  On failure the obligation is NOT dropped: round 7 (P1)
+        keeps it in ``_pending_obligations`` for a per-cycle retry AND
+        mirrors it into the local durable journal together with the frozen
+        terminal facts, so the caller can RETAIN the protective close
+        instead of discarding it — a known funding rate may never live
+        only in process memory.
         """
         obligation = InverseShortFundingObligation(
             position_key=position.position_key,
@@ -1698,16 +1771,23 @@ class InverseShortPaperEngine:
         try:
             outcome = self.store.save_funding_obligation(obligation)
         except Exception:
+            # Round 7 (P1): RETAIN the observation instead of losing it —
+            # retried against the store every cycle and journaled with the
+            # frozen close, so neither a restart nor a vanished funding
+            # feed can make the observed rate disappear.
+            self._pending_obligations[position.position_key] = obligation
             logger.warning(
                 "me inverse short oos2 funding obligation persist FAILED "
-                "(observed rate NOT yet durable — the close must not "
-                "finalize; retried next cycle): key=%s rate=%.6f%% due=%d",
+                "(observed rate RETAINED for retry + local journal, never "
+                "dropped; retried next cycle): key=%s rate=%.6f%% due=%d",
                 position.position_key[:48], rate, due_periods,
                 exc_info=True,
             )
             return False
         if outcome == "SAVED":
             self._funding_obligation_degraded.discard(position.position_key)
+            # Durable in the store now — the retained copy is redundant.
+            self._pending_obligations.pop(position.position_key, None)
             logger.warning(
                 "me inverse short oos2 funding obligation PERSISTED "
                 "(observed rate survives the close; recovery settles it "
@@ -2712,10 +2792,14 @@ class InverseShortPaperEngine:
     ) -> InverseShortPosition | None:
         """TERMINAL close of the REMAINING quantity (Issue #276).
 
-        Returns the CLOSED snapshot, or ``None`` when the close was
-        DEFERRED because the observed funding rate could not yet be made
-        durable (round 6, P2) — the caller then keeps the position OPEN
-        for protective re-evaluation on the next cycle.
+        Returns the CLOSED snapshot.  When the OBSERVED funding rate could
+        not be made durable (round 7, P1 — Codex r4584484945) the snapshot
+        is RETAINED as a pending protective close instead of being
+        finalized: staged into the outbox, frozen in ``pending_closes``,
+        mirrored into the local durable journal, taken out of
+        ``open_positions`` so STOP/TP/TIMEOUT can never re-evaluate it,
+        with the terminal UPDATE withheld until the rate reaches
+        PostgreSQL.  The protective exit itself is never dropped.
 
         PnL model (cumulative, exact against the balance ledger): every
         committed TP leg already booked its own
@@ -2751,23 +2835,36 @@ class InverseShortPaperEngine:
         funding_folded = self._settle_funding_for_close(
             position, funding_rate_percent,
         )
+        obligation_pending = False
         if funding_folded is None:
-            # Round 6 (P2): the OBSERVED funding rate could not be made
-            # durable (the obligation write failed) — finalizing the close
-            # NOW would lose the known funding forever.  NOTHING has been
-            # persisted yet (no staging, no fold, no balance move), so the
-            # whole close is simply DEFERRED: the position stays OPEN in
-            # memory, STOP/TIMEOUT re-evaluate it next cycle and the
-            # protective exit completes as soon as the store accepts the
-            # obligation.  Entries are unaffected (the position still holds
-            # its capacity slot).
+            # Round 7 (P1, Codex r4584484945): the OBSERVED funding rate
+            # could not be made durable (the obligation write failed).
+            # The OLD code returned None right here, which left the
+            # position in ``open_positions`` — the next cycle re-evaluated
+            # the exit with FRESH inputs, so the original STOP/TIMEOUT
+            # trigger, the frozen fill facts and the observed rate were all
+            # lost (reproduced on d13eaf8: exit_reasons == [], position
+            # still OPEN, no obligation anywhere).
+            #
+            # NOW nothing is dropped.  ``_persist_funding_obligation``
+            # already retained the observation in ``_pending_obligations``
+            # for a per-cycle retry, and the close is RETAINED below as a
+            # pending protective close: frozen terminal facts, position
+            # taken out of the exit algorithm (STOP/TP/TIMEOUT can never
+            # re-evaluate it), entries blocked, terminal UPDATE withheld
+            # until the rate is durable.  ``funding_folded = 0.0`` books
+            # NOTHING — the historical quantity is unproven, so no
+            # approximate funding value is ever written.
+            funding_folded = 0.0
+            obligation_pending = True
             logger.warning(
-                "me inverse short oos2 terminal close DEFERRED (observed "
-                "funding rate not durable yet; protective exit retried next "
-                "cycle): key=%s reason=%s",
+                "me inverse short oos2 terminal close RETAINED as a pending "
+                "protective close (observed funding rate not durable yet — "
+                "terminal facts frozen, position out of the exit algorithm, "
+                "new entries blocked, observation retried AND journaled; "
+                "the original trigger is never recomputed): key=%s reason=%s",
                 position.position_key[:48], reason,
             )
-            return None
 
         closed_at = self._clock()
         slip = float(self.settings.slippage_percent)
@@ -2951,22 +3048,54 @@ class InverseShortPaperEngine:
         # row's net_pnl/funding columns already contain both amounts.
         close_delta = terminal_delta - funding_folded
         terminal_applied = False
+        # TWO reasons to WITHHOLD the terminal UPDATE — both RETAIN the
+        # close (never drop it):
+        #   * ``staging``    — the outbox/leg rows are not durable yet (P1-3);
+        #   * ``obligation`` — the OBSERVED funding rate is not durable yet
+        #     (round 7, P1, Codex r4584484945): committing the row now would
+        #     freeze ``funding_periods_charged = 0`` on a CLOSED row while
+        #     the rate exists only in process memory, so the flush waits
+        #     until the obligation reached PostgreSQL (retried every cycle)
+        #     or the local journal proved it durable.  Nothing about the
+        #     exit is recomputed while it waits.
+        hold_reason: str | None = None
         if not staged and not staging_degraded:
+            hold_reason = "staging"
+        elif obligation_pending:
+            hold_reason = "obligation"
+        if hold_reason is not None:
             self.pending_closes[position.position_key] = position
             self._uncommitted_deltas[position.position_key] = (
                 self._uncommitted_deltas.get(position.position_key, 0.0)
                 + close_delta
             )
             self._balance_trusted = False
-            logger.warning(
-                "me inverse short oos2 close UPDATE DEFERRED (close-leg/outbox "
-                "staging NOT confirmed — position NOT fully saved; snapshot "
-                "retained for stage-before-update retry, a restart re-executes "
-                "the exit from the still-OPEN row): key=%s reason=%s net=%.4f "
-                "durability_risk=True",
-                position.position_key[:48], reason, net_pnl,
+            if hold_reason == "staging":
+                logger.warning(
+                    "me inverse short oos2 close UPDATE DEFERRED (close-leg/outbox "
+                    "staging NOT confirmed — position NOT fully saved; snapshot "
+                    "retained for stage-before-update retry, a restart re-executes "
+                    "the exit from the still-OPEN row): key=%s reason=%s net=%.4f "
+                    "durability_risk=True",
+                    position.position_key[:48], reason, net_pnl,
+                )
+            else:
+                logger.warning(
+                    "me inverse short oos2 close UPDATE DEFERRED (observed "
+                    "funding obligation not durable yet — the terminal UPDATE "
+                    "is withheld so a CLOSED row can never freeze an unsettled "
+                    "period as charged=0 while the rate lives outside "
+                    "PostgreSQL): key=%s reason=%s net=%.4f",
+                    position.position_key[:48], reason, net_pnl,
+                )
+        if obligation_pending:
+            # Round 7 (P1): mirror the frozen close + the observed rate into
+            # the OOS-2 local durable journal (atomic write), so a crash
+            # before PostgreSQL accepts either half still recovers them.
+            self._retain_protective_close(
+                position, terminal_leg, owed_partial_legs, close_delta,
             )
-        else:
+        if hold_reason is None:
             try:
                 self.store.update_position(position)
                 terminal_applied = True
@@ -3306,7 +3435,18 @@ class InverseShortPaperEngine:
         # (or retired) as soon as PostgreSQL can be asked, and an
         # unresolved one keeps accounting untrusted for the whole cycle.
         self._resolve_ambiguous_writes()
+        # Round 7 (P1): retry every retained OBSERVED funding rate against
+        # the store FIRST — a rate that reaches PostgreSQL here releases its
+        # own hold in the SAME cycle, so a retained protective close never
+        # waits an extra cycle for its own retry.
+        self._retry_pending_obligations()
         for position_key, snapshot in list(self.pending_closes.items()):
+            # Round 7 (P2, Codex r4584484952): a snapshot superseded by a
+            # NEWER confirmed CLOSED row (funding settled after it was
+            # staged, outbox clear failed) is RETIRED instead of replayed
+            # forever against the monotone migration 089 guard.
+            if self._retire_superseded_close(snapshot, source="flush"):
+                continue
             # -- P1: stage-before-update retry for unstaged snapshots ----
             if position_key in self._unstaged_closes:
                 if position_key not in self._staging_unavailable:
@@ -3334,6 +3474,21 @@ class InverseShortPaperEngine:
                                 self._dirty_legs.get(position_key, ())
                                 if not leg.is_terminal
                             ]
+                            # Round 7 (P1): a restored protective close also
+                            # replays the partial legs FROZEN in its journal
+                            # record when the in-memory dirty set no longer
+                            # carries them (restart).  Idempotent: a leg row
+                            # already in the ledger is a no-op, and the leg
+                            # ledger can therefore never lose a TP that the
+                            # retained snapshot's accounting already books.
+                            record = self._journal_records.get(position_key)
+                            if record is not None and record.owed_partial_legs:
+                                known = {leg.leg_seq for leg in owed_partial_legs}
+                                owed_partial_legs.extend(
+                                    InverseShortCloseLeg.from_dict(data)
+                                    for data in record.owed_partial_legs
+                                    if int(data.get("leg_seq", -1)) not in known
+                                )
                             if bool(self.store.stage_close(
                                 snapshot, terminal_leg,
                                 partial_legs=owed_partial_legs,
@@ -3366,6 +3521,23 @@ class InverseShortPaperEngine:
                             continue
                 # Degraded mode (no outbox table): the terminal UPDATE is the
                 # only durability left — attempt it below.
+            # Round 7 (P1, Codex r4584484945): a retained protective close
+            # whose OBSERVED funding rate is NOT durable yet must never be
+            # committed — the CLOSED row would freeze
+            # ``funding_periods_charged = 0`` while the rate lives only in
+            # process memory or the local journal.  The identical snapshot
+            # is replayed unchanged once the obligation reaches PostgreSQL
+            # (retried above every cycle); meanwhile the position stays out
+            # of ``open_positions``, so the original STOP/TIMEOUT is never
+            # recomputed and no new entry can be opened.
+            if position_key in self._pending_obligations:
+                logger.debug(
+                    "me inverse short oos2 close flush WITHHELD (observed "
+                    "funding obligation not durable yet; identical terminal "
+                    "snapshot retained): key=%s",
+                    position_key[:48],
+                )
+                continue
             try:
                 self.store.update_position(snapshot)
             except Exception:
@@ -3473,7 +3645,378 @@ class InverseShortPaperEngine:
                 "keys=%s",
                 len(self._unstaged_closes), self.unstaged_close_keys,
             )
+        # Round 7 (P1): retire journal records whose close AND observed
+        # obligation are both durable — a record is deleted only when
+        # nothing is left to replay, so an unresolved protective close can
+        # never lose its local copy.
+        self._sweep_journal()
         return flushed
+
+    # ------------------------------------------------------------------
+    # Round 7 (P1, Codex r4584484945): retained protective closes
+    # ------------------------------------------------------------------
+    def _retain_protective_close(
+        self,
+        position: InverseShortPosition,
+        terminal_leg: InverseShortCloseLeg,
+        owed_partial_legs: list[InverseShortCloseLeg],
+        accounting_delta: float,
+    ) -> None:
+        """Freeze one protective close into the OOS-2 local durable journal.
+
+        Every fact Codex listed for ``PENDING_PROTECTIVE_CLOSE`` is captured
+        verbatim from the ALREADY-COMPUTED close: ``position_key``,
+        ``exit_reason``, ``triggered_at`` (the frozen ``closed_at`` of the
+        original STOP/TIMEOUT — never re-derived), reference/fill price,
+        quantity, the executed partial legs, fees/slippage (inside the
+        snapshot), the observed funding rate + periods (inside the
+        obligation), the accounting delta and the recovery ids.
+
+        A failed write NEVER raises into the exit path (an exit is never
+        blocked by the journal): the key is flagged ``_journal_failed``,
+        ``durability_risk`` stays True, entries stay refused and the
+        impossible guarantee is reported every cycle instead of being
+        silently claimed.
+        """
+        key = position.position_key
+        obligation = self._pending_obligations.get(key)
+        record = PendingProtectiveClose(
+            position_key=key,
+            exit_reason=position.exit_reason,
+            triggered_at=(
+                position.closed_at.isoformat() if position.closed_at else None
+            ),
+            reference_price=float(terminal_leg.reference_price),
+            fill_price=float(terminal_leg.fill_price),
+            quantity=float(terminal_leg.quantity),
+            snapshot=position.to_dict(),
+            terminal_leg=terminal_leg.to_dict(),
+            owed_partial_legs=[leg.to_dict() for leg in owed_partial_legs],
+            obligation=obligation.to_dict() if obligation is not None else None,
+            accounting_delta=float(accounting_delta),
+            recovery_ids={
+                "position_key": key,
+                "event_key": position.event_key,
+                "obligation_key": (
+                    obligation.obligation_key if obligation is not None else None
+                ),
+            },
+            written_at=self._clock().isoformat(),
+            staged=key not in self._unstaged_closes,
+        )
+        self._journal_records[key] = record
+        try:
+            self.journal.write(record)
+        except Exception:
+            self._journal_failed.add(key)
+            logger.critical(
+                "me inverse short oos2 pending protective close JOURNAL WRITE "
+                "FAILED — the frozen exit facts and the observed funding rate "
+                "now exist ONLY in process memory (an IMPOSSIBLE guarantee, "
+                "reported as durability_risk with new entries refused): key=%s",
+                key[:48], exc_info=True,
+            )
+            return
+        self._journal_failed.discard(key)
+        logger.warning(
+            "me inverse short oos2 pending protective close JOURNALED "
+            "(atomic local copy of the frozen exit facts + observed rate): "
+            "key=%s reason=%s staged=%s obligation=%s",
+            key[:48], position.exit_reason, record.staged,
+            (obligation.obligation_key[:48] if obligation is not None else None),
+        )
+
+    def _retry_pending_obligations(self) -> int:
+        """Re-save every retained OBSERVED rate that PostgreSQL refused.
+
+        Runs at the top of every flush (round 7, P1).  A success retires
+        the in-memory copy — the store row becomes the single durable
+        source, settleable by ``_retry_funding_obligations()`` — and
+        releases that key's protective-close hold in the SAME cycle.  A
+        failure changes nothing: the IDENTICAL obligation is retried next
+        cycle and new entries stay refused the whole time.
+        """
+        saved = 0
+        for key, obligation in list(self._pending_obligations.items()):
+            try:
+                outcome = self.store.save_funding_obligation(obligation)
+            except Exception:
+                logger.debug(
+                    "me inverse short oos2 retained funding obligation retry "
+                    "FAILED (still retained, retried next cycle): key=%s",
+                    key[:48], exc_info=True,
+                )
+                continue
+            if outcome == "SAVED":
+                self._pending_obligations.pop(key, None)
+                self._funding_obligation_degraded.discard(key)
+                saved += 1
+                logger.warning(
+                    "me inverse short oos2 retained funding obligation "
+                    "PERSISTED (protective close released for flush): key=%s "
+                    "rate=%.6f%% due=%d",
+                    key[:48], obligation.observed_rate_percent,
+                    obligation.periods_due,
+                )
+            elif outcome == "ABSENT":
+                # Documented degraded mode (migration 089): the hold is
+                # released exactly like the original ABSENT path, and the
+                # missing-table condition is reported every cycle.
+                self._pending_obligations.pop(key, None)
+                self._funding_obligation_degraded.add(key)
+                logger.error(
+                    "me inverse short oos2 retained funding obligation TABLE "
+                    "ABSENT while retrying (migration 089): observed rate "
+                    "kept reported as degraded, hold released: key=%s",
+                    key[:48],
+                )
+            else:
+                raise RuntimeError(
+                    f"UNEXPECTED_FUNDING_OBLIGATION_OUTCOME:{outcome}",
+                )
+        return saved
+
+    def _replay_journal(self) -> None:
+        """Replay every durable protective-close record (boot, OOS-2 only).
+
+        Called once after ``_load_open_positions()``: the close-outbox half
+        (when PostgreSQL accepted the staging) is already resumed there, so
+        this pass only fills in the halves an outbox row can NEVER carry —
+        the OBSERVED funding obligation and the frozen terminal-leg facts —
+        plus the whole close when no outbox row exists at all (staging
+        failed before the crash).
+        """
+        try:
+            records = self.journal.read_all()
+        except Exception:
+            logger.error(
+                "me inverse short oos2 pending protective close journal READ "
+                "FAILED (replay deferred; the records are kept):",
+                exc_info=True,
+            )
+            return
+        if not records:
+            return
+        for key, record in records.items():
+            try:
+                self._restore_protective_close(record)
+            except Exception:
+                logger.error(
+                    "me inverse short oos2 pending protective close replay "
+                    "FAILED (record kept, retried next boot): key=%s",
+                    key[:48], exc_info=True,
+                )
+
+    def _restore_protective_close(self, record: PendingProtectiveClose) -> None:
+        key = record.position_key
+        try:
+            stored = self.store.get_position(key)
+        except Exception:
+            # The store cannot be read right now: restore CONSERVATIVELY —
+            # a duplicate pending close is idempotent (byte-identical
+            # snapshot, never a second booking) whereas dropping it would
+            # lose the frozen trigger for good.
+            logger.warning(
+                "me inverse short oos2 journal replay could not read the "
+                "position row — restoring the retained protective close "
+                "conservatively: key=%s",
+                key[:48], exc_info=True,
+            )
+            stored = None
+        if stored is None:
+            # Orphan: no durable row exists for this key at all, so the
+            # entry was never written (or was rolled back) — there is no
+            # position to protect and nothing to retry.  Drop the record.
+            logger.warning(
+                "me inverse short oos2 pending protective close journal "
+                "record ORPHANED (no durable position row — entry never "
+                "committed): key=%s",
+                key[:48],
+            )
+            self.journal.delete(key)
+            self._journal_records.pop(key, None)
+            return
+
+        # -- 1) The OBSERVED rate: restored whenever PostgreSQL lacks it ---
+        if record.obligation is not None:
+            try:
+                durable = self.store.get_funding_obligation(key)
+            except Exception:
+                durable = None
+            if durable is None:
+                self._pending_obligations[key] = (
+                    InverseShortFundingObligation.from_dict(record.obligation)
+                )
+                self._journal_records[key] = record
+                logger.warning(
+                    "me inverse short oos2 journal replay restored the "
+                    "OBSERVED funding obligation (PostgreSQL does not have "
+                    "it yet; retried every cycle): key=%s rate=%.6f%% due=%d",
+                    key[:48],
+                    self._pending_obligations[key].observed_rate_percent,
+                    self._pending_obligations[key].periods_due,
+                )
+
+        # -- 2) The terminal close itself --------------------------------
+        if stored.status == POSITION_STATUS_CLOSED:
+            # The close COMMITTED durably — only the rate may be missing,
+            # which step 1 already restored.  The record has served its
+            # purpose (or is kept alive by the restored obligation until
+            # the sweep sees it durable).
+            if key not in self._pending_obligations:
+                self.journal.delete(key)
+                self._journal_records.pop(key, None)
+                self._journal_failed.discard(key)
+                logger.info(
+                    "me inverse short oos2 pending protective close journal "
+                    "record retired (close + obligation both durable): key=%s",
+                    key[:48],
+                )
+            return
+
+        # Row still OPEN: the protective close is NOT durable anywhere in
+        # PostgreSQL — restore it exactly as it was frozen.
+        if key not in self.pending_closes:
+            snapshot = InverseShortPosition.from_dict(record.snapshot)
+            self.pending_closes[key] = snapshot
+            self._uncommitted_deltas[key] = (
+                self._uncommitted_deltas.get(key, 0.0)
+                + float(record.accounting_delta)
+            )
+            self._balance_trusted = False
+            if not record.staged:
+                # No outbox row carries it — the outbox half must be
+                # (re)staged before any terminal UPDATE can be attempted.
+                self._unstaged_closes.add(key)
+            self.open_positions.pop(key, None)
+            logger.warning(
+                "me inverse short oos2 journal replay RESTORED a pending "
+                "protective close (position removed from the exit "
+                "algorithm; original trigger never recomputed): key=%s "
+                "reason=%s triggered_at=%s delta=%.4f staged=%s",
+                key[:48], snapshot.exit_reason, record.triggered_at,
+                record.accounting_delta, record.staged,
+            )
+        # Frozen terminal-leg facts are needed to re-stage byte-for-byte
+        # after a restart (the outbox row alone never carries them back).
+        if record.terminal_leg:
+            self._terminal_legs.setdefault(
+                key, InverseShortCloseLeg.from_dict(record.terminal_leg),
+            )
+        self._journal_records[key] = record
+
+    def _sweep_journal(self) -> None:
+        """Retire journal records whose close AND rate are both durable.
+
+        A record is deleted ONLY when nothing is left to replay: the
+        protective close is no longer pending, no staging obligation
+        remains and the observed obligation reached PostgreSQL (or was
+        never retained).  Every other state keeps the record — an
+        unresolved protective close can never lose its local copy.
+        """
+        if not self._journal_records:
+            return
+        for key in list(self._journal_records):
+            if (
+                key in self._pending_obligations
+                or key in self.pending_closes
+                or key in self._unstaged_closes
+            ):
+                continue
+            if self.journal.delete(key):
+                self._journal_records.pop(key, None)
+                self._journal_failed.discard(key)
+                logger.info(
+                    "me inverse short oos2 pending protective close journal "
+                    "record retired (all halves durable): key=%s",
+                    key[:48],
+                )
+
+    def _retire_superseded_close(
+        self, snapshot: InverseShortPosition, *, source: str,
+    ) -> bool:
+        """Retire a close-outbox snapshot SUPERSEDED by a newer CLOSED row.
+
+        Round 7 (P2, Codex r4584484952).  The outbox snapshot is staged
+        BEFORE the status flip, so when the funding settlement later
+        advances ``funding_paid`` / ``funding_periods_charged`` /
+        ``net_pnl`` on the CLOSED row — or when ``clear_pending_close()``
+        failed and left the row behind — the snapshot is STALE.  Replaying
+        it would overwrite the newer confirmed state (silently rolling the
+        settled funding back in the in-memory store, hard-erroring on the
+        monotone migration 089 guard in PostgreSQL) and would leave the
+        pending close unresolved forever with entries blocked.
+
+        The snapshot is retired ONLY when the supersession is provable:
+
+        * the durable row exists and is ``CLOSED`` (terminal facts
+          confirmed — rule 4: an unconfirmed snapshot is never dropped);
+        * the terminal facts are IDENTICAL (``closed_at``, ``exit_reason``,
+          ``exit_price``, ``remaining_size``) — only the FUNDING columns
+          may differ, so a genuinely different close is never mistaken for
+          this one;
+        * the durable row is NOT behind the snapshot
+          (``funding_periods_charged`` may only have advanced).
+
+        Idempotent: retiring an already-retired key returns False, and a
+        failed store read falls through to the normal replay path.
+        """
+        key = snapshot.position_key
+        try:
+            stored = self.store.get_position(key)
+        except Exception:
+            logger.debug(
+                "me inverse short oos2 supersession check unavailable "
+                "(store read failed; snapshot replayed normally): key=%s",
+                key[:48], exc_info=True,
+            )
+            return False
+        if stored is None or stored.status != POSITION_STATUS_CLOSED:
+            return False  # not committed yet — the snapshot is not stale
+        if (
+            stored.closed_at != snapshot.closed_at
+            or stored.exit_reason != snapshot.exit_reason
+            or stored.exit_price != snapshot.exit_price
+            or stored.remaining_size != snapshot.remaining_size
+        ):
+            # A DIFFERENT close — never retire a snapshot of another exit.
+            return False
+        if stored.funding_periods_charged < snapshot.funding_periods_charged:
+            return False  # durable is BEHIND the snapshot: not supersession
+        # Supersession proven: converge exactly like a committed flush.
+        self.pending_closes.pop(key, None)
+        self._uncommitted_deltas.pop(key, None)
+        self._leg_deltas.pop(key, None)
+        self._dirty_funding.pop(key, None)
+        self._ambiguous_keys.discard(key)
+        self._unstaged_closes.discard(key)
+        self._staging_unavailable.discard(key)
+        self._terminal_legs.pop(key, None)
+        self._pending_from_store.discard(key)
+        # Force a fresh ledger read so the retired delta can never be
+        # double counted against the now-confirmed CLOSED row.
+        self._balance_trusted = False
+        try:
+            self.store.clear_pending_close(key)
+        except Exception:
+            # Idempotent: a leftover outbox row is re-detected and
+            # re-retired on the next cycle / next boot.
+            logger.debug(
+                "me inverse short oos2 superseded outbox retire failed "
+                "(idempotent retry active): key=%s",
+                key[:48], exc_info=True,
+            )
+        logger.warning(
+            "me inverse short oos2 SUPERSEDED close-outbox snapshot retired "
+            "(the CLOSED row already carries newer confirmed funding; the "
+            "stale snapshot is never replayed over it): source=%s key=%s "
+            "reason=%s durable_periods=%d snapshot_periods=%d "
+            "durable_funding_paid=%.6f snapshot_funding_paid=%.6f",
+            source, key[:48], snapshot.exit_reason,
+            stored.funding_periods_charged, snapshot.funding_periods_charged,
+            stored.funding_paid, snapshot.funding_paid,
+        )
+        return True
 
     def _retry_balance_recovery(self) -> None:
         """Retry owed balance reconciliations (P2).
@@ -3694,6 +4237,20 @@ class InverseShortPaperEngine:
             "funding_obligations_degraded": len(
                 self._funding_obligation_degraded,
             ),
+            # Round 7 (P1, Codex r4584484945): protective closes RETAINED
+            # with their frozen terminal facts + observed rate in the
+            # OOS-2-only local durable journal, and the observed rates
+            # PostgreSQL has not accepted yet (retried every cycle; a
+            # journal write failure keeps durability_risk true and entries
+            # refused — an impossible guarantee is reported, never claimed).
+            "pending_protective_closes": len(self._journal_records),
+            "pending_protective_close_keys": list(
+                self.pending_protective_close_keys,
+            ),
+            "pending_obligations": len(self._pending_obligations),
+            "pending_obligation_keys": list(self.pending_obligation_keys),
+            "journal_failed": sorted(self._journal_failed),
+            "journal_dir": str(self.journal.directory),
             "gross_exposure_pct": round(
                 (gross_exposure / equity * 100.0) if equity else 0.0, 4,
             ),

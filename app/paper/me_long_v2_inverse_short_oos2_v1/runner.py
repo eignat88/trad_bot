@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from app.config import Settings
@@ -61,6 +62,7 @@ class InverseShortContour:
         clock: Callable[[], datetime] | None = None,
         require_activation: bool = True,
         activation_enabled: bool | None = None,
+        journal_dir: str | Path | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -75,9 +77,16 @@ class InverseShortContour:
                 True if not require_activation else self._activation_enabled
             ),
         )
+        # Round 7 (P1, Codex r4584484945): the OOS-2-only local durable
+        # journal that freezes a protective close whose observed funding
+        # rate PostgreSQL refused.  ``None`` selects the default
+        # git-ignored location under ``var/``; tests inject their own
+        # directory so no record can ever leak between runs.
+        self.journal_dir = journal_dir
         self.engine = InverseShortPaperEngine(
             settings, store, clock=self._clock,
             activation=self.activation, require_activation=require_activation,
+            journal_dir=journal_dir,
         )
         logger.info(
             "me inverse short oos2 contour constructed: activated=%s mode=%s "
