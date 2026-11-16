@@ -2444,7 +2444,10 @@ class TestCodexRound8OnPostgres:
         assert engine3._journal_unresolved == set(), "read-back classified"
         assert engine3.journal.paths(), "row still OPEN -> record kept"
         assert key in engine3._pending_obligations
-        assert engine3.accounting_consistent is True
+        # the restored close still owes an uncommitted accounting delta, so
+        # the memory ledger is deliberately NOT trusted yet (fail closed) —
+        # exactly like the pre-recovery state of round 6 test_p1_d
+        assert engine3.accounting_consistent is False
         assert engine3.open_entries({"ETHUSDT": 100.0}) == []
 
         contour3.run_cycle({"BTCUSDT": entry * 0.98})
