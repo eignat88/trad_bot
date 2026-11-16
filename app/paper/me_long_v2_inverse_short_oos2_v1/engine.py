@@ -3955,8 +3955,15 @@ class InverseShortPaperEngine:
           ``exit_price``, ``remaining_size``) — only the FUNDING columns
           may differ, so a genuinely different close is never mistaken for
           this one;
+        * the terminal ``leg_seq = 3`` row exists in the durable leg
+          ledger, so the snapshot really belongs to a CONFIRMED close;
         * the durable row is NOT behind the snapshot
-          (``funding_periods_charged`` may only have advanced).
+          (``funding_periods_charged`` may only have advanced), and the
+          snapshot's financial state has actually been LEFT BEHIND by the
+          row — an IDENTICAL snapshot is NOT stale and is left to replay
+          through the normal path (that replay is a harmless no-op and is
+          exactly the durable-replay contract of round 6: pending close
+          resumes, entries stay blocked, one clean flush).
 
         Idempotent: retiring an already-retired key returns False, and a
         failed store read falls through to the normal replay path.
@@ -3983,6 +3990,28 @@ class InverseShortPaperEngine:
             return False
         if stored.funding_periods_charged < snapshot.funding_periods_charged:
             return False  # durable is BEHIND the snapshot: not supersession
+        try:
+            if self.store.get_close_leg(key, LEG_SEQ_TERMINAL) is None:
+                # Rule 4: terminal facts unconfirmed — the snapshot stays.
+                return False
+        except Exception:
+            logger.debug(
+                "me inverse short oos2 supersession leg check unavailable "
+                "(snapshot replayed normally): key=%s",
+                key[:48], exc_info=True,
+            )
+            return False
+        if (
+            int(stored.funding_periods_charged)
+            == int(snapshot.funding_periods_charged)
+            and abs(float(stored.funding_paid or 0.0)
+                    - float(snapshot.funding_paid or 0.0)) <= 1e-9
+            and abs(float(stored.net_pnl or 0.0)
+                    - float(snapshot.net_pnl or 0.0)) <= 1e-9
+        ):
+            # NOT stale: the row still says exactly what the snapshot says,
+            # so the replay below is a no-op — never silently delete it.
+            return False
         # Supersession proven: converge exactly like a committed flush.
         self.pending_closes.pop(key, None)
         self._uncommitted_deltas.pop(key, None)

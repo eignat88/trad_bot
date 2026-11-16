@@ -3702,3 +3702,60 @@ class TestRound7P2StaleCloseOutbox:
         assert restarted.engine.accounting_consistent is True
         assert restarted.engine.durability_risk is False
         _assert_ledger_consistent(restarted)
+
+    def test_g_identical_snapshot_is_never_retired(self, tmp_path):
+        """G (extra, regression guard): a snapshot that still says exactly
+        what the durable CLOSED row says is NOT superseded — it must keep
+        replaying through the normal path.  That is the round-6 durable
+        replay contract (pending close resumes, entries blocked, one clean
+        flush) and the supersession guard must never swallow it."""
+        settings = _settings()
+        control = _scenario_a_control(settings)
+        contour, store, clock = _contour(settings, journal_dir=tmp_path)
+        pos = _open_one(contour, store, clock)
+        key = pos.position_key
+        entry = pos.entry_price
+        contour.run_cycle({pos.symbol: entry * 0.945})        # TP1 committed
+        clock.advance(hours=9)
+
+        original_clear = store.clear_pending_close
+        store.clear_pending_close = _always_fail("clear_pending_close outage")
+        cycle = contour.run_cycle(
+            {pos.symbol: entry},
+            bars=self._stop_bars(pos, entry),
+            funding_rates_percent={pos.symbol: 0.01},
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        store.clear_pending_close = original_clear
+
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.funding_periods_charged == 1
+        staged = store.list_pending_closes()
+        assert [p.position_key for p in staged] == [key], (
+            "the failed clear must leave the snapshot staged",
+        )
+
+        engine = contour.engine
+        assert engine._retire_superseded_close(staged[0], source="test") is False, (
+            "an identical snapshot is NOT superseded — it must replay",
+        )
+        assert [p.position_key for p in store.list_pending_closes()] == [key], (
+            "a non-superseded snapshot must never be silently deleted",
+        )
+
+        # the durable replay resumes exactly like round 6 required
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine2 = restarted.engine
+        assert key in engine2.pending_closes, "the durable replay must resume"
+        assert engine2.accounting_consistent is False
+        restarted.run_cycle({pos.symbol: entry})
+        assert engine2.pending_closes == {}
+        assert store.list_pending_closes() == []
+        assert engine2.accounting_consistent is True
+        assert engine2.balance == pytest.approx(control["balance"], abs=1e-9)
+        assert engine2.balance == pytest.approx(
+            store.balance_components()["balance"], abs=1e-9,
+        )
+        assert engine2.durability_risk is False
+        _assert_ledger_consistent(restarted)
