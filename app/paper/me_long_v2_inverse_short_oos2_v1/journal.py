@@ -86,6 +86,31 @@ JOURNAL_ABSENT_CONFIRMED = "JOURNAL_ABSENT_CONFIRMED"
 #: be read: the caller must fail closed and retry, never treat it as empty.
 JOURNAL_READ_FAILED = "JOURNAL_READ_FAILED"
 
+#: Round 11 (P2, Codex r4597992776): the decoded payload is syntactically
+#: valid JSON but NOT a JSON object (``null`` / ``[]`` / ``"text"`` / ``123``
+#: / ``true``).  It can never be a recovery record, and it must never reach
+#: ``PendingProtectiveClose.from_dict()``.
+JOURNAL_INVALID_PAYLOAD_TYPE = "JOURNAL_INVALID_PAYLOAD_TYPE"
+
+#: Exceptions a malformed journal payload raises while it is decoded or
+#: folded into a record.  Explicit on purpose — never a bare
+#: ``except Exception``: every member is a *bad input* class, so catching it
+#: converts corrupt data into a REPORTED recovery failure instead of letting
+#: it escape :meth:`ProtectiveCloseJournal.read_checked`.  ``AttributeError``
+#: is exactly what a non-object payload used to raise (``data.get()`` on
+#: ``None``/``[]``/``"text"``/``123``/``true``), which aborted recovery before
+#: the fail-closed gate could be given a status; ``OverflowError`` covers an
+#: unrepresentable numeric field, ``RecursionError`` a pathologically nested
+#: corrupt file.
+_DESERIALIZATION_ERRORS = (
+    AttributeError,
+    KeyError,
+    OverflowError,
+    RecursionError,
+    TypeError,
+    ValueError,
+)
+
 
 class JournalReadError(RuntimeError):
     """The recovery journal could not be read (never "there is nothing")."""
@@ -343,10 +368,11 @@ class ProtectiveCloseJournal:
             Every record was read, parsed and integrity-checked.
         ``JOURNAL_READ_FAILED``
             The journal exists (or its existence cannot be determined) but
-            the listing, a file read, the JSON payload, the schema or the
-            file/payload key check failed.  ``records`` still carries every
-            record that DID load (replaying a healthy record is always
-            safe), ``failures`` names every file that did not, and the
+            the listing, a file read, the JSON payload, its TYPE (a
+            syntactically valid non-object such as ``null``/``[]``), the
+            schema or the file/payload key check failed.  ``records`` still
+            carries every record that DID load (replaying a healthy record is
+            always safe), ``reason`` names every file that did not, and the
             caller must keep its recovery gate CLOSED.  Nothing is ever
             deleted or rewritten here.
         """
@@ -372,22 +398,50 @@ class ProtectiveCloseJournal:
         for path in paths:
             try:
                 with open(path, "r", encoding="utf-8") as handle:
-                    record = PendingProtectiveClose.from_dict(json.load(handle))
+                    payload = json.load(handle)
             except FileNotFoundError:
                 continue  # retired concurrently — nothing to replay
-            except (ValueError, KeyError, TypeError) as exc:
-                # Corrupt / wrong-schema payload: an EXPLICIT recovery
-                # failure — never silently skipped, never deleted.
-                failures.append(
-                    f"{path.name}: corrupt record ({type(exc).__name__})",
-                )
-                continue
             except OSError as exc:
                 # Temporarily unreadable (EIO / EACCES / ...): the record is
                 # known to be there, so its absence from the replay is never
                 # evidence that it does not exist.
                 failures.append(
                     f"{path.name}: read failed ({type(exc).__name__}: {exc})",
+                )
+                continue
+            except _DESERIALIZATION_ERRORS as exc:
+                # Un-decodable payload: bad JSON, invalid UTF-8 bytes, an
+                # absurd nesting depth.  An EXPLICIT recovery failure — never
+                # silently skipped, never deleted.
+                failures.append(
+                    f"{path.name}: corrupt record ({type(exc).__name__})",
+                )
+                continue
+            if not isinstance(payload, dict):
+                # Round 11 (P2, Codex r4597992776): syntactically valid JSON
+                # that is NOT an object (``null`` / ``[]`` / ``"text"`` /
+                # ``123`` / ``true``) is a corrupt record, not a replayable
+                # one.  It used to reach from_dict() and raise AttributeError
+                # on ``data.get()``, and that exception ESCAPED this method —
+                # recovery aborted before the fail-closed gate could ever be
+                # given a status, healthy records next to it were never
+                # processed, and the runtime could die at startup or in a
+                # recovery cycle.  Only the payload TYPE is reported here;
+                # journal CONTENT is never echoed into diagnostics.
+                failures.append(
+                    f"{path.name}: {JOURNAL_INVALID_PAYLOAD_TYPE} "
+                    f"(json payload is {type(payload).__name__}, "
+                    "not an object)",
+                )
+                continue
+            try:
+                record = PendingProtectiveClose.from_dict(payload)
+            except _DESERIALIZATION_ERRORS as exc:
+                # Structurally valid object with a missing required field, a
+                # wrong field type or a schema/checksum mismatch: an EXPLICIT
+                # recovery failure naming the real error.
+                failures.append(
+                    f"{path.name}: corrupt record ({type(exc).__name__})",
                 )
                 continue
             if self._path(record.position_key) != path:

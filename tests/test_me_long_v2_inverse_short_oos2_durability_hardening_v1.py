@@ -6047,3 +6047,349 @@ class TestRound10P1JournalReadFailureFailsClosed:
         ) == "CAPTURED"
         reopened = restarted.run_cycle({"ETHUSDT": 100.0})
         assert reopened["entries"] == 1, reopened
+
+
+# ---------------------------------------------------------------------------
+# Round 11 (P2, Codex r4597992776): a syntactically VALID but NON-OBJECT
+# JSON payload must become a controlled JOURNAL_READ_FAILED — never an
+# unhandled AttributeError out of read_checked(), never an absence
+# confirmation, never a bypass of the Round 10 fail-closed gate.
+# ---------------------------------------------------------------------------
+class TestRound11P2NonObjectJsonPayload:
+    """Mandatory scenarios A–N for Codex thread r4597992776."""
+
+    @staticmethod
+    def _record_file(journal, key: str, payload_text: str) -> Path:
+        """Write a VALID record for ``key``, then overwrite that exact file
+        with the raw ``payload_text`` (the SHA-256 file name still belongs to
+        ``key``, so the payload/file-key check stays meaningful)."""
+        journal.write(_journal_record(key))
+        path = journal._path(key)
+        path.write_text(payload_text, encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _assert_failed(result, *, needle: str | None = None) -> None:
+        assert result.status == _journal_mod.JOURNAL_READ_FAILED, (
+            f"expected a controlled recovery failure, got {result.status!r} "
+            f"({result.reason!r})",
+        )
+        assert result.reason, "a failed read must carry a diagnostic reason"
+        if needle is not None:
+            assert needle in result.reason, result.reason
+
+    # -- A–E ----------------------------------------------------------------
+    @pytest.mark.parametrize(
+        ("payload", "case", "type_name", "leak"),
+        [
+            ("null", "A", "NoneType", "null"),
+            ("[]", "B", "list", "[]"),
+            ('"text"', "C", "str", "text"),
+            ("123", "D", "int", None),       # digits also occur in file names
+            ("true", "E_true", "bool", "true"),
+            ("false", "E_false", "bool", "false"),
+        ],
+    )
+    def test_non_object_json_is_a_controlled_recovery_failure(
+        self, tmp_path, payload, case, type_name, leak,
+    ):
+        """A–E: ``null`` / ``[]`` / ``"text"`` / ``123`` / ``true`` /
+        ``false`` reach JOURNAL_READ_FAILED with the payload TYPE recorded —
+        without any exception escaping ``read_checked()`` and without the
+        journal ever being declared absent."""
+        journal = ProtectiveCloseJournal(tmp_path)
+        key = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:round11_{case}"
+        path = self._record_file(journal, key, payload)
+
+        result = journal.read_checked()          # must NOT raise
+
+        self._assert_failed(result, needle="JOURNAL_INVALID_PAYLOAD_TYPE")
+        assert path.name in result.reason, "the offending file is named"
+        assert type_name in result.reason, (
+            "the actual payload type is part of the diagnostic",
+        )
+        if leak is not None:
+            assert leak not in result.reason, (
+                "journal CONTENT is never echoed into diagnostics",
+            )
+        assert result.records == {}
+        # never deleted, never rewritten, never reported absent
+        assert path.exists()
+        assert path.read_text(encoding="utf-8") == payload
+        with pytest.raises(_journal_mod.JournalReadError):
+            journal.read_all()
+
+    # -- F ------------------------------------------------------------------
+    def test_f_broken_json_syntax_is_a_controlled_failure(self, tmp_path):
+        """F: a syntactically broken file is an explicit recovery failure and
+        stays byte-identical on disk."""
+        journal = ProtectiveCloseJournal(tmp_path)
+        key = "ME_LONG_V2_INVERSE_SHORT_OOS2_V1:round11_F"
+        path = self._record_file(journal, key, "{broken json")
+
+        result = journal.read_checked()          # must NOT raise
+
+        self._assert_failed(result, needle="corrupt record")
+        assert result.records == {}
+        assert path.read_text(encoding="utf-8") == "{broken json"
+        with pytest.raises(_journal_mod.JournalReadError):
+            journal.read_all()
+
+    # -- G ------------------------------------------------------------------
+    @pytest.mark.parametrize(
+        "payload",
+        ["{}", json.dumps({"schema": _journal_mod.JOURNAL_SCHEMA})],
+        ids=["empty_object", "schema_without_position_key"],
+    )
+    def test_g_object_without_required_fields_fails_in_a_controlled_way(
+        self, tmp_path, payload,
+    ):
+        """G: a JSON object that misses the required fields is a controlled
+        failure — never an absence, never an unhandled exception."""
+        journal = ProtectiveCloseJournal(tmp_path)
+        key = "ME_LONG_V2_INVERSE_SHORT_OOS2_V1:round11_G"
+        path = self._record_file(journal, key, payload)
+
+        result = journal.read_checked()          # must NOT raise
+
+        self._assert_failed(result, needle="corrupt record")
+        assert result.records == {}
+        assert path.read_text(encoding="utf-8") == payload
+
+    # -- H ------------------------------------------------------------------
+    @pytest.mark.parametrize(
+        ("field", "value", "error"),
+        [
+            ("quantity", "not-a-number", "ValueError"),
+            ("snapshot", 5, "TypeError"),
+            ("owed_partial_legs", 5, "TypeError"),
+        ],
+    )
+    def test_h_wrong_field_types_are_a_controlled_failure(
+        self, tmp_path, field, value, error,
+    ):
+        """H: structurally valid JSON whose FIELDS carry the wrong types is a
+        controlled failure naming the real deserialization error."""
+        journal = ProtectiveCloseJournal(tmp_path)
+        key = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:round11_H_{field}"
+        record = _journal_record(key).to_dict()
+        record[field] = value
+        path = self._record_file(journal, key, json.dumps(record))
+
+        result = journal.read_checked()          # must NOT raise
+
+        self._assert_failed(result, needle="corrupt record")
+        assert error in result.reason, result.reason
+        assert result.records == {}
+        assert path.exists()
+
+    # -- I ------------------------------------------------------------------
+    def test_i_payload_file_key_mismatch_fails_integrity(self, tmp_path):
+        """I: a valid payload stored under a file named for a DIFFERENT key
+        is an integrity failure, not a replayable record."""
+        journal = ProtectiveCloseJournal(tmp_path)
+        key_a = "ME_LONG_V2_INVERSE_SHORT_OOS2_V1:round11_I_a"
+        key_b = "ME_LONG_V2_INVERSE_SHORT_OOS2_V1:round11_I_b"
+        journal.write(_journal_record(key_a))
+        path = journal._path(key_a)
+        path.write_text(
+            json.dumps(_journal_record(key_b).to_dict()), encoding="utf-8",
+        )
+
+        result = journal.read_checked()          # must NOT raise
+
+        self._assert_failed(result, needle="payload/file key mismatch")
+        assert result.records == {}
+        assert path.exists(), "the mismatching file is never deleted"
+
+    # -- J ------------------------------------------------------------------
+    def test_j_mixed_valid_and_invalid_records_stay_fail_closed(
+        self, tmp_path,
+    ):
+        """J: one healthy record next to a damaged one — the healthy record
+        may be restored, but the read as a whole NEVER reports success and
+        the contour stays fail-closed."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage = (
+            _round10_stop_setup(settings, tmp_path)
+        )
+        store.stage_close = stage            # the healthy record may finish
+        journal = contour.engine.journal
+        damaged = journal._path(
+            "ME_LONG_V2_INVERSE_SHORT_OOS2_V1:round11_J_damaged",
+        )
+        damaged.write_text("null", encoding="utf-8")
+
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+
+        # the healthy record IS available …
+        result = engine.journal.read_checked()
+        assert key in result.records
+        # … but the mixed read as a whole FAILED and is never "fully valid"
+        assert result.status == _journal_mod.JOURNAL_READ_FAILED
+        with pytest.raises(_journal_mod.JournalReadError):
+            engine.journal.read_all()
+
+        # … so the whole contour stays fail-closed
+        assert engine.journal_read_blocked is True
+        assert engine.durability_risk is True
+        assert engine.accounting_consistent is False
+        assert damaged.exists(), "the damaged file is never deleted"
+
+        cycle = restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert cycle["entries"] == 0, "new entries stay refused"
+        assert engine.journal_read_blocked is True
+        assert engine.durability_risk is True
+        assert engine.accounting_consistent is False
+        # the healthy half really did recover (partial ≠ fully valid)
+        assert store.get_position(key).status == POSITION_STATUS_CLOSED
+        assert journal.exists(key) is False, (
+            "the healthy record retires after its close is proven",
+        )
+        assert damaged.exists(), "the damaged file never retires"
+
+    # -- K ------------------------------------------------------------------
+    def test_k_repairing_the_payload_then_retrying_recovers(
+        self, tmp_path,
+    ):
+        """K: after the damaged file is repaired by hand, the next cycle's
+        retry re-reads it and the ORIGINAL frozen STOP completes."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage = (
+            _round10_stop_setup(settings, tmp_path)
+        )
+        store.stage_close = stage
+        journal = contour.engine.journal
+        path = journal._path(key)
+        original = path.read_bytes()
+        path.write_text("null", encoding="utf-8")
+
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        assert engine.journal_read_blocked is True
+        assert engine.durability_risk is True
+        assert engine.accounting_consistent is False
+
+        # manual repair (never automatic): the original bytes come back
+        path.write_bytes(original)
+        cycle = restarted.run_cycle(
+            {pos.symbol: entry}, bars=_quiescent_bar(pos, entry),
+        )
+        assert engine.journal_read_blocked is False
+        assert engine.journal_read_failure is None
+        assert cycle["exit_reasons"] == [], "never re-evaluated"
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.exit_reason == "STOP_LOSS"
+        assert row.exit_price == pytest.approx(
+            json.loads(original)["fill_price"], rel=1e-12,
+        ), "the frozen fill price, never recomputed"
+        assert engine.journal.exists(key) is False, "retired after recovery"
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True
+
+    # -- L ------------------------------------------------------------------
+    def test_l_repeated_restarts_keep_the_damaged_journal_blocked(
+        self, tmp_path,
+    ):
+        """L: every restart re-detects the damaged payload and keeps the
+        recovery gate — the snapshot is never silently lost."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage = (
+            _round10_stop_setup(settings, tmp_path)
+        )
+        journal = contour.engine.journal
+        path = journal._path(key)
+        path.write_text("[]", encoding="utf-8")
+
+        for attempt in range(3):
+            restarted = _restart(
+                contour, settings, clock, journal_dir=tmp_path,
+            )
+            engine = restarted.engine
+            assert engine.journal_read_blocked is True, attempt
+            assert engine.durability_risk is True, attempt
+            assert engine.accounting_consistent is False, attempt
+            assert engine.journal_read_failure, attempt
+            assert store.get_position(key).status == POSITION_STATUS_OPEN, (
+                attempt,
+            )
+            assert path.exists(), attempt          # never deleted
+            assert path.read_text(encoding="utf-8") == "[]", attempt
+
+    # -- M ------------------------------------------------------------------
+    def test_m_a_new_price_never_recomputes_the_frozen_stop(self, tmp_path):
+        """M: while the damaged journal blocks recovery no market data is
+        evaluated, and after the repair the close still comes from the
+        frozen STOP at a price where it would no longer fire."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage = (
+            _round10_stop_setup(settings, tmp_path)
+        )
+        store.stage_close = stage
+        journal = contour.engine.journal
+        path = journal._path(key)
+        original = path.read_bytes()
+        frozen_fill = json.loads(original)["fill_price"]
+        path.write_text("null", encoding="utf-8")
+
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        assert engine.journal_read_blocked is True
+
+        # a price that WOULD fire a fresh stop: nothing may be evaluated
+        blocked = restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert blocked["exit_reasons"] == [], (
+            "exit evaluation stays suspended — the STOP is never re-derived",
+        )
+        assert store.get_position(key).status == POSITION_STATUS_OPEN
+        assert store.list_close_legs(key) == []
+
+        path.write_bytes(original)
+        non_triggering = _quiescent_bar(pos, entry)
+        cycle = restarted.run_cycle(
+            {pos.symbol: entry}, bars=non_triggering,
+        )
+        assert cycle["exit_reasons"] == [], "from the snapshot, not data"
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.exit_reason == "STOP_LOSS"
+        assert row.exit_price == pytest.approx(frozen_fill, rel=1e-12)
+        assert engine.journal_read_blocked is False
+
+    # -- N ------------------------------------------------------------------
+    def test_n_valid_journal_replays_normally(self, tmp_path):
+        """N: a healthy journal is untouched by the new validation — the
+        replay completes exactly as before Round 11."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage = (
+            _round10_stop_setup(settings, tmp_path)
+        )
+        store.stage_close = stage
+
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        assert engine.journal_read_blocked is False
+        assert engine.journal_read_failure is None
+        assert engine.durability_risk is True, "the close is still unstaged"
+
+        result = engine.journal.read_checked()
+        assert result.status == _journal_mod.JOURNAL_LOADED
+        assert list(result.records) == [key]
+        assert result.reason is None
+
+        cycle = restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert cycle["exit_reasons"] == []
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.exit_reason == "STOP_LOSS"
+        assert engine.journal.exists(key) is False, "retired after recovery"
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True

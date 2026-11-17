@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import builtins
 import dataclasses
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -34,6 +35,9 @@ import pytest
 from conftest import connect_test_db
 
 from app.paper.me_long_v2_inverse_short_oos2_v1.journal import (
+    JOURNAL_INVALID_PAYLOAD_TYPE,
+    JOURNAL_READ_FAILED,
+    JournalReadError,
     ProtectiveCloseJournal,
 )
 from app.paper.me_long_v2_inverse_short_oos2_v1.models import (
@@ -3088,3 +3092,146 @@ class TestCodexRound10OnPostgres:
             store2.close()
         finally:
             restore_open()
+
+
+class TestCodexRound11OnPostgres:
+    """Round 11 P2 (Codex r4597992776) against real PostgreSQL 17.
+
+    Scenario (issue #276 §5): open a position -> protective STOP ->
+    PostgreSQL staging DOWN -> durable journal -> the durable record is then
+    replaced by a syntactically valid NON-OBJECT payload (``null``) ->
+    restart -> ``JOURNAL_READ_FAILED`` and a CLOSED recovery gate -> the
+    original valid record is restored by hand -> retry -> the frozen STOP is
+    recovered exactly once and the balance equals the failure-free
+    reference.
+
+    Only the journal payload and the store-method boundary are faked; the
+    leg staging, terminal UPDATE, outbox, read-back verification and every
+    restart are the REAL PostgreSQL code path with real transactions.
+    """
+
+    @staticmethod
+    def _non_object_payload(tmp_path, position_key) -> tuple[bytes, object]:
+        """Freeze the valid record's bytes, then replace the file with
+        ``null`` — returns ``(original_bytes, path)``."""
+        journal = ProtectiveCloseJournal(tmp_path)
+        path = journal._path(position_key)
+        original = path.read_bytes()
+        payload = json.loads(original.decode("utf-8"))
+        assert payload["exit_reason"] == "STOP_LOSS"
+        assert payload["staged"] is False
+        path.write_text("null", encoding="utf-8")
+        return original, path
+
+    def test_p2_non_object_journal_payload_fails_closed_then_recovers(
+        self, running, pg_conn, tmp_path,
+    ):
+        """§5 on real PostgreSQL: a ``null`` journal payload must become an
+        explicit recovery failure (never an unhandled AttributeError, never
+        an absence), keep the whole contour fail-closed, and — once the
+        original record is restored — recover the ORIGINAL stop with
+        exactly one terminal leg and the reference balance."""
+        ref = TestCodexRound10OnPostgres._failure_free_reference(pg_conn)
+
+        # ---- 1-4. STOP with PostgreSQL staging DOWN -> durable journal ---
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = InverseShortContour(
+            _settings(), store, clock=clock, activation_enabled=True,
+            journal_dir=tmp_path,
+        )
+        position_key, row, bars = TestCodexRound5OnPostgres._open_fault_position(  # noqa: E501
+            store, clock, contour, candle_steps=1,
+        )
+        entry = row.entry_price
+        original_stage = store.stage_close
+        store.stage_close = _always_fail("terminal staging failure (PG down)")
+        cycle = contour.run_cycle({"BTCUSDT": entry}, bars=bars)
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        store.stage_close = original_stage
+
+        assert store.get_position(position_key).status == "OPEN", (
+            "terminal UPDATE withheld until staging is durable",
+        )
+        record = contour.engine.journal.read_all()[position_key]
+        assert record.exit_reason == "STOP_LOSS"
+        original_payload, record_path = self._non_object_payload(
+            tmp_path, position_key,
+        )
+        assert record_path.read_text(encoding="utf-8") == "null"
+        store.close()
+
+        # ---- 7-9. restart with the non-object payload --------------------
+        store2 = _connect_store()
+        contour2 = InverseShortContour(
+            _settings(), store2, clock=clock, activation_enabled=True,
+            journal_dir=tmp_path,
+        )
+        engine2 = contour2.engine
+
+        # ---- 8. JOURNAL_READ_FAILED, never an unhandled exception --------
+        verdict = engine2.journal.read_checked()
+        assert verdict.status == JOURNAL_READ_FAILED, verdict
+        assert JOURNAL_INVALID_PAYLOAD_TYPE in (verdict.reason or ""), (
+            "the payload TYPE is the diagnostic",
+        )
+        assert "NoneType" in (verdict.reason or "")
+        assert verdict.records == {}
+        with pytest.raises(JournalReadError):
+            engine2.journal.read_all()
+
+        # ---- 9-10. closed recovery gate, no re-evaluation, no entries ----
+        assert engine2.journal_read_blocked is True
+        assert engine2.durability_risk is True
+        assert engine2.accounting_consistent is False
+        assert store2.get_position(position_key).status == "OPEN"
+        assert engine2.open_entries({"ETHUSDT": 100.0}) == []
+        assert record_path.exists(), "the damaged file is never deleted"
+        assert record_path.read_text(encoding="utf-8") == "null"
+
+        non_triggering = {
+            "BTCUSDT": {"high": row.stop_price * 0.5, "low": entry * 0.99},
+        }
+        blocked = contour2.run_cycle({"BTCUSDT": entry}, bars=non_triggering)
+        assert blocked["exit_reasons"] == [], (
+            "exit evaluation stays suspended — the STOP is never re-derived",
+        )
+        assert blocked["entries"] == 0
+        assert store2.get_position(position_key).status == "OPEN"
+        assert _legs(store2, position_key) == []
+        assert record_path.read_text(encoding="utf-8") == "null"
+
+        # ---- 11-12. restore the original record by hand -> retry ---------
+        record_path.write_bytes(original_payload)
+        cycle2 = contour2.run_cycle({"BTCUSDT": entry}, bars=non_triggering)
+        assert engine2.journal_read_blocked is False, (
+            "a clean read must open the recovery gate",
+        )
+        assert engine2.journal_read_failure is None
+        assert cycle2["exit_reasons"] == [], "from the snapshot, not data"
+
+        # ---- 13-14. recovered frozen STOP, exactly once, reference balance
+        final = store2.get_position(position_key)
+        assert final.status == "CLOSED"
+        assert final.exit_reason == "STOP_LOSS"
+        assert final.exit_price == pytest.approx(record.fill_price, rel=1e-9)
+        legs = _legs(store2, position_key)
+        assert [(leg.exit_reason, bool(leg.is_terminal)) for leg in legs] == [
+            ("STOP_LOSS", True),
+        ], "exactly one terminal leg"
+        assert final.remaining_size == 0.0
+        assert engine2.pending_closes == {}
+        assert store2.list_pending_closes() == []
+        assert engine2.journal.paths() == [], "retired after proven recovery"
+        assert engine2.durability_risk is False
+        assert engine2.accounting_consistent is True
+
+        assert final.exit_price == pytest.approx(ref["exit_price"], abs=1e-9)
+        assert final.net_pnl == pytest.approx(ref["net_pnl"], abs=1e-9)
+        assert store2.balance_components()["balance"] == pytest.approx(
+            ref["balance"], abs=1e-6,
+        ), "balance must equal the failure-free control"
+        assert engine2.balance == pytest.approx(
+            store2.balance_components()["balance"], abs=1e-6,
+        )
+        store2.close()
