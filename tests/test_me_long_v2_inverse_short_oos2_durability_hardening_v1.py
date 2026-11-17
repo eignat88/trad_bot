@@ -51,6 +51,7 @@ from app.paper.me_long_v2_inverse_short_oos2_v1.activation import (
 from app.paper.me_long_v2_inverse_short_oos2_v1.engine import (
     InverseShortPaperEngine,
 )
+from app.paper.me_long_v2_inverse_short_oos2_v1 import journal as _journal_mod
 from app.paper.me_long_v2_inverse_short_oos2_v1.journal import (
     PendingProtectiveClose,
     ProtectiveCloseJournal,
@@ -4509,7 +4510,10 @@ class TestRound8P2JournalDirectoryFsync:
         )
 
     def test_g_corrupt_record_is_skipped_never_merged(self, tmp_path):
-        """G: a corrupt / torn payload is skipped, healthy records survive."""
+        """G: a corrupt / torn payload is never merged; healthy records
+        still load — but Round 10 (Codex r4597065733) adds the other half:
+        the corruption must be an EXPLICIT recovery failure, not silence,
+        and the file is never deleted or rewritten by the reader."""
         journal = self._journal(tmp_path)
         journal.write(_journal_record(self.KEY))
         good_key = "ME_LONG_V2_INVERSE_SHORT_OOS2_V1:other"
@@ -4517,8 +4521,17 @@ class TestRound8P2JournalDirectoryFsync:
         (journal.directory / "deadbeef.json").write_text(
             "{ not json", encoding="utf-8",
         )
-        records = journal.read_all()
-        assert sorted(records) == sorted([self.KEY, good_key])
+        result = journal.read_checked()
+        assert result.status == _journal_mod.JOURNAL_READ_FAILED, (
+            "a corrupt record must be reported as a recovery failure",
+        )
+        assert sorted(result.records) == sorted([self.KEY, good_key])
+        assert "deadbeef.json" in (result.reason or "")
+        assert (journal.directory / "deadbeef.json").read_text(
+            encoding="utf-8",
+        ) == "{ not json", "the corrupt file is never deleted or rewritten"
+        with pytest.raises(_journal_mod.JournalReadError):
+            journal.read_all()
 
     def test_h_incomplete_temporary_file_after_a_crash_is_ignored(
         self, tmp_path,
@@ -5238,3 +5251,799 @@ class TestRound9P2AncestorDirectoryFsync:
         assert restored.accounting_delta == original.accounting_delta
         assert restored.recovery_ids == original.recovery_ids
         assert restored.obligation == original.obligation
+
+
+# ---------------------------------------------------------------------------
+# Codex review round 10 — P1 (r4597065733): a recovery journal that cannot
+# be READ is not a recovery journal that does not exist.
+#
+# The journal on disk is the ONLY durable copy of a protective STOP/TIMEOUT
+# when PostgreSQL staging was down.  Reading it must therefore be a gate:
+# read -> three-state verdict -> fail closed on anything but a clean read.
+# ---------------------------------------------------------------------------
+
+
+def _poison_journal_reads(monkeypatch, journal, exc_factory, *, once=False):
+    """Make every journal RECORD read raise; all other I/O is untouched.
+
+    The journal's own reader uses the builtin ``open`` for ``*.json``
+    payloads, so that is the seam.  Writes (mode ``w``), temporary files
+    (``*.tmp``) and everything outside the journal directory keep working —
+    which is exactly the fault model: the record is there, only its READ
+    fails.
+    """
+    import builtins as _builtins
+
+    real_open = _builtins.open
+    root = str(journal.directory)
+    state = {"raised": 0, "enabled": True}
+
+    def poisoned(file, mode="r", *args, **kwargs):
+        if state["enabled"]:
+            path, modes = str(file), str(mode)
+            reading = "r" in modes and not any(
+                flag in modes for flag in "wxa+"
+            )
+            if reading and path.startswith(root) and path.endswith(".json"):
+                state["raised"] += 1
+                if not (once and state["raised"] > 1):
+                    raise exc_factory()
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", poisoned)
+    return state
+
+
+def _poison_journal_listing(monkeypatch, journal, exc_factory):
+    """Make listing the journal directory raise (absence is never proved)."""
+    real_scandir = os.scandir
+    target = str(journal.directory)
+    state = {"enabled": True}
+
+    def poisoned(path=".", *args, **kwargs):
+        if state["enabled"] and str(path) == target:
+            raise exc_factory()
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", poisoned)
+    return state
+
+
+def _round10_stop_setup(
+    settings, tmp_path, *, advance_hours=0, funding_rate=None,
+    fail_obligation_write=False,
+):
+    """entry -> protective STOP journaled while PostgreSQL staging is down.
+
+    Returns ``(contour, store, clock, pos, key, entry, original_stage)``.
+    With ``advance_hours`` past the first 8h boundary a ``funding_rate`` of
+    ``None`` leaves the rate UNKNOWN (no obligation pending — the Round 9
+    premise), while a real rate produces an OBSERVED obligation — and
+    ``fail_obligation_write`` forces that observed rate to live ONLY in the
+    recovery journal, which is the premise of scenario J.
+    """
+    contour, store, clock = _contour(settings, journal_dir=tmp_path)
+    pos = _open_one(contour, store, clock)
+    entry = pos.entry_price
+    if advance_hours:
+        clock.advance(hours=advance_hours)
+    original_stage = store.stage_close
+    original_save = store.save_funding_obligation
+    store.stage_close = _always_fail("terminal staging failure")
+    if fail_obligation_write:
+        store.save_funding_obligation = _always_fail(
+            "obligation write failure",
+        )
+    rates = {pos.symbol: funding_rate} if funding_rate is not None else None
+    cycle = contour.run_cycle(
+        {pos.symbol: entry},
+        funding_rates_percent=rates,
+        bars=_round8_stop_bars(pos, entry),
+    )
+    if fail_obligation_write:
+        store.save_funding_obligation = original_save
+    assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+    key = pos.position_key
+    assert contour.engine.journal.exists(key)
+    assert store.get_position(key).status == POSITION_STATUS_OPEN
+    assert store.list_close_legs(key) == []
+    assert store.list_pending_closes() == []
+    return contour, store, clock, pos, key, entry, original_stage
+
+
+def _round10_control(
+    settings, tmp_path, *, advance_hours=0, funding_rate=None,
+    fail_obligation_write=False,
+):
+    """Failure-free reference for the same protective-stop timeline."""
+    contour, store, clock = _contour(
+        settings, journal_dir=tmp_path / "control",
+    )
+    pos = _open_one(contour, store, clock)
+    if advance_hours:
+        clock.advance(hours=advance_hours)
+    original_save = store.save_funding_obligation
+    if fail_obligation_write:
+        store.save_funding_obligation = _always_fail(
+            "obligation write failure",
+        )
+    rates = {pos.symbol: funding_rate} if funding_rate is not None else None
+    cycle = contour.run_cycle(
+        {pos.symbol: pos.entry_price},
+        funding_rates_percent=rates,
+        bars=_round8_stop_bars(pos, pos.entry_price),
+    )
+    if fail_obligation_write:
+        store.save_funding_obligation = original_save
+    assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+    assert store.get_position(pos.position_key).status == (
+        POSITION_STATUS_CLOSED
+    )
+    return contour, store, pos
+
+
+def _quiescent_bar(pos, entry):
+    """A bar on which STOP, TP1 and TP3 would all stay idle."""
+    return {pos.symbol: {"high": pos.stop_price * 0.9, "low": entry * 0.97}}
+
+
+class TestRound10P1JournalReadFailureFailsClosed:
+    """Mandatory scenarios A–L for Codex thread r4597065733."""
+
+    # -- A ------------------------------------------------------------------
+    def test_a_restart_with_an_unreadable_journal_keeps_the_gate_shut(
+        self, tmp_path, monkeypatch,
+    ):
+        """A: baseline reproduction — a STOP journaled with staging down and
+        then UNREADABLE at restart must keep the whole contour fail-closed."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage = (
+            _round10_stop_setup(settings, tmp_path)
+        )
+        frozen = contour.engine.journal.read_all()[key]
+        paths_before = list(contour.engine.journal.paths())
+        clock.advance(minutes=5)      # a FRESH signal candle, never a dup
+        assert _capture(
+            store, _candidate(pos.symbol, entry, detected_at=clock()),
+        ) == "CAPTURED"
+
+        state = _poison_journal_reads(
+            monkeypatch, contour.engine.journal,
+            lambda: OSError(5, "Input/output error"),
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+
+        # --- the book must report the risk, not a clean restart -----------
+        # (Codex fault injection on the baseline: durability_risk=False,
+        # accounting_consistent=True — that is the defect these assert.)
+        assert engine.durability_risk is True, (
+            "an unreadable recovery journal must register an unresolved "
+            "durability obligation",
+        )
+        assert engine.accounting_consistent is False, (
+            "an unknown journal state is never a consistent book",
+        )
+        assert store.get_position(key).status == POSITION_STATUS_OPEN
+        assert engine.journal.exists(key), "the record is never deleted"
+
+        # --- fail closed: no re-evaluation, no new entries ----------------
+        cycle = restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert cycle["exit_reasons"] == [], (
+            "exit evaluation must be suspended while the frozen facts are "
+            "unreadable — the STOP is never re-derived from market data",
+        )
+        assert cycle["entries"] == 0, "new entries must be refused"
+        assert cycle["durability_risk"] is True
+        assert cycle["accounting_consistent"] is False
+
+        # --- the recovery gate itself -------------------------------------
+        assert engine.journal_read_blocked is True, (
+            "an unreadable journal must register an unresolved recovery",
+        )
+        assert engine.journal_read_failure
+        assert engine._journal_unresolved == set(), (
+            "the gate must not depend on _journal_unresolved — that empty "
+            "set is exactly the original defect",
+        )
+
+        # --- the frozen facts survive byte-for-byte -----------------------
+        assert engine.journal.paths() == paths_before, (
+            "the unreadable record is still exactly where it was written",
+        )
+        state["enabled"] = False
+        reread = engine.journal.read_all().get(key)
+        state["enabled"] = True
+        assert reread is not None
+        assert reread.exit_reason == frozen.exit_reason
+        assert reread.triggered_at == frozen.triggered_at
+        assert reread.reference_price == frozen.reference_price
+        assert reread.fill_price == frozen.fill_price
+        assert reread.quantity == frozen.quantity
+        assert reread.recovery_ids == frozen.recovery_ids
+
+    # -- B ------------------------------------------------------------------
+    def test_b_temporary_read_failure_blocks_entries_and_keeps_the_file(
+        self, tmp_path, monkeypatch,
+    ):
+        """B: a transient ``OSError`` reports the risk, refuses entries, does
+        not claim accounting consistency and never deletes the record."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage = (
+            _round10_stop_setup(settings, tmp_path)
+        )
+        paths_before = list(contour.engine.journal.paths())
+        state = _poison_journal_reads(
+            monkeypatch, contour.engine.journal,
+            lambda: OSError(5, "Input/output error"),
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+
+        assert engine.durability_risk is True
+        assert engine.accounting_consistent is False
+        assert engine.journal_read_blocked is True
+        assert list(engine.journal.paths()) == paths_before, (
+            "an unreadable record is never deleted",
+        )
+        assert store.get_position(key).status == POSITION_STATUS_OPEN
+        assert state["raised"] >= 1
+
+        # entries stay refused on every subsequent cycle while unreadable
+        for step in range(3):
+            clock.advance(minutes=5)   # a FRESH signal candle each round
+            assert _capture(
+                store, _candidate(pos.symbol, entry, detected_at=clock()),
+            ) == "CAPTURED", step
+            cycle = restarted.run_cycle({pos.symbol: entry})
+            assert cycle["entries"] == 0, cycle
+            assert engine.journal_read_blocked is True
+
+    # -- C ------------------------------------------------------------------
+    def test_c_retry_after_the_filesystem_heals_restores_the_stop(
+        self, tmp_path, monkeypatch,
+    ):
+        """C: once the journal is readable again the retry re-reads the real
+        files and the ORIGINAL STOP is restored and completed."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage = (
+            _round10_stop_setup(settings, tmp_path)
+        )
+        store.stage_close = stage
+        state = _poison_journal_reads(
+            monkeypatch, contour.engine.journal,
+            lambda: OSError(5, "Input/output error"),
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        assert engine.durability_risk is True, (
+            "an unreadable recovery journal must report the durability risk",
+        )
+        assert engine.journal_read_blocked is True
+
+        state["enabled"] = False          # the filesystem recovers
+        cycle = restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert engine.journal_read_blocked is False, (
+            "a clean read must open the recovery gate",
+        )
+        assert engine.journal_read_failure is None
+        assert cycle["exit_reasons"] == [], "never re-evaluated"
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.exit_reason == "STOP_LOSS"
+        assert engine.journal.exists(key) is False, "retired after recovery"
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True
+
+    # -- D ------------------------------------------------------------------
+    def test_d_a_price_that_no_longer_triggers_the_stop_still_closes_it(
+        self, tmp_path, monkeypatch,
+    ):
+        """D: the restart market data no longer satisfies the STOP — the
+        close must still happen, driven by the frozen terminal facts only."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage = (
+            _round10_stop_setup(settings, tmp_path)
+        )
+        frozen = contour.engine.journal.read_all()[key]
+        full = pos.remaining_size
+        store.stage_close = stage
+        state = _poison_journal_reads(
+            monkeypatch, contour.engine.journal,
+            lambda: OSError(5, "Input/output error"),
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        assert restarted.engine.durability_risk is True, (
+            "an unreadable recovery journal must report the durability risk",
+        )
+        assert restarted.engine.journal_read_blocked is True
+
+        quiet = _quiescent_bar(pos, entry)
+        state["enabled"] = False
+        cycle = restarted.run_cycle({pos.symbol: entry}, bars=quiet)
+        assert cycle["exit_reasons"] == []
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED, (
+            "the frozen STOP must close the position even though the new "
+            "price would never trigger it",
+        )
+        assert row.exit_reason == "STOP_LOSS"
+        assert row.exit_price == pytest.approx(frozen.fill_price, rel=1e-12)
+        assert frozen.triggered_at is not None, "trigger instant preserved"
+        assert frozen.quantity == pytest.approx(row.position_size, rel=1e-12)
+        legs = store.list_close_legs(key)
+        assert [leg.exit_reason for leg in legs] == ["STOP_LOSS"]
+        assert len(legs) == 1, "exactly one terminal leg"
+
+    # -- E ------------------------------------------------------------------
+    @pytest.mark.parametrize(
+        "errno_code, message",
+        [(13, "Permission denied"), (5, "Input/output error")],
+        ids=["PermissionError", "EIO"],
+    )
+    def test_e_permission_error_and_eio_fail_closed_identically(
+        self, tmp_path, monkeypatch, errno_code, message,
+    ):
+        """E: access and I/O errors behave exactly like any other unreadable
+        journal — same gate, same refusals, same retry."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage = (
+            _round10_stop_setup(settings, tmp_path)
+        )
+        store.stage_close = stage
+        state = _poison_journal_reads(
+            monkeypatch, contour.engine.journal,
+            lambda: OSError(errno_code, message),
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        assert engine.durability_risk is True, (
+            "an unreadable recovery journal must report the durability risk",
+        )
+        assert engine.journal_read_blocked is True
+        assert engine.durability_risk is True
+        assert engine.accounting_consistent is False
+        assert engine.journal.exists(key)
+
+        cycle = restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert cycle["exit_reasons"] == []
+        assert cycle["entries"] == 0
+
+        state["enabled"] = False
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert engine.journal_read_blocked is False
+        assert store.get_position(key).status == POSITION_STATUS_CLOSED
+
+    # -- F ------------------------------------------------------------------
+    def test_f_a_failed_directory_listing_is_never_an_absence(
+        self, tmp_path, monkeypatch,
+    ):
+        """F: a directory listing failure must never be reported as an empty
+        journal — absence is not confirmed, the gate shuts, recovery waits."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage = (
+            _round10_stop_setup(settings, tmp_path)
+        )
+        store.stage_close = stage
+        state = _poison_journal_listing(
+            monkeypatch, contour.engine.journal,
+            lambda: OSError(5, "Input/output error"),
+        )
+
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        assert engine.durability_risk is True, (
+            "an unreadable directory listing must not be reported as a "
+            "clean, empty journal",
+        )
+        assert engine.accounting_consistent is False
+        assert engine.journal_read_blocked is True
+        assert engine.journal.exists(key)
+
+        result = engine.journal.read_checked()
+        assert result.status == _journal_mod.JOURNAL_READ_FAILED
+        assert result.records == {}
+        assert "listing failed" in (result.reason or "")
+
+        cycle = restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert cycle["exit_reasons"] == []
+        assert cycle["entries"] == 0
+
+        state["enabled"] = False
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert engine.journal_read_blocked is False
+        assert engine.journal_read_failure is None
+        assert store.get_position(key).status == POSITION_STATUS_CLOSED
+        assert engine.journal.exists(key) is False, "retired after recovery"
+
+    # -- G ------------------------------------------------------------------
+    def test_g_a_corrupt_record_is_an_explicit_recovery_failure(
+        self, tmp_path,
+    ):
+        """G: corrupt JSON / schema breach -> explicit recovery failure,
+        entries banned, and the file is never deleted or rewritten."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage = (
+            _round10_stop_setup(settings, tmp_path)
+        )
+        record_path = contour.engine.journal.paths()[0]
+        record_path.write_text("{ not json at all", encoding="utf-8")
+
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        assert engine.durability_risk is True, (
+            "an unreadable recovery journal must report the durability risk",
+        )
+        assert engine.journal_read_blocked is True
+        assert engine.journal_read_failure
+        assert "corrupt record" in engine.journal_read_failure
+        assert engine.durability_risk is True
+        assert engine.accounting_consistent is False
+
+        clock.advance(minutes=5)          # a FRESH signal candle
+        assert _capture(
+            store, _candidate(pos.symbol, entry, detected_at=clock()),
+        ) == "CAPTURED"
+        cycle = restarted.run_cycle({pos.symbol: entry})
+        assert cycle["entries"] == 0, "entries are banned"
+        assert cycle["exit_reasons"] == []
+        assert record_path.read_text(encoding="utf-8") == (
+            "{ not json at all"
+        ), "a corrupt record is never deleted or rewritten automatically"
+
+    # -- H ------------------------------------------------------------------
+    def test_h_repeated_restarts_keep_re_detecting_the_unreadable_journal(
+        self, tmp_path, monkeypatch,
+    ):
+        """H: several restarts while the journal is unreadable keep the
+        recovery unresolved on every one of them, and the frozen terminal
+        snapshot is never lost in between."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage = (
+            _round10_stop_setup(settings, tmp_path)
+        )
+        frozen = contour.engine.journal.read_all()[key]
+        store.stage_close = stage
+        state = _poison_journal_reads(
+            monkeypatch, contour.engine.journal,
+            lambda: OSError(5, "Input/output error"),
+        )
+
+        current = contour
+        for round_no in range(3):
+            current = _restart(current, settings, clock, journal_dir=tmp_path)
+            engine = current.engine
+            assert engine.durability_risk is True, f"restart {round_no}"
+            assert engine.journal_read_blocked is True, f"restart {round_no}"
+            assert engine.durability_risk is True, f"restart {round_no}"
+            assert engine.accounting_consistent is False, f"restart {round_no}"
+            cycle = current.run_cycle({pos.symbol: entry})
+            assert cycle["entries"] == 0, f"restart {round_no}"
+            assert cycle["exit_reasons"] == [], f"restart {round_no}"
+
+            state["enabled"] = False           # inspect without disturbing
+            record = engine.journal.read_checked().records.get(key)
+            state["enabled"] = True
+            assert record is not None, f"restart {round_no}: record lost"
+            assert record.exit_reason == frozen.exit_reason
+            assert record.triggered_at == frozen.triggered_at
+            assert record.fill_price == frozen.fill_price
+            assert record.quantity == frozen.quantity
+            assert record.owed_partial_legs == frozen.owed_partial_legs
+            assert record.obligation == frozen.obligation
+            assert store.get_position(key).status == POSITION_STATUS_OPEN
+
+        # only now does the filesystem come back
+        state["enabled"] = False
+        current.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert current.engine.journal_read_blocked is False
+        assert store.get_position(key).status == POSITION_STATUS_CLOSED
+        assert current.engine.journal.exists(key) is False
+
+    # -- I ------------------------------------------------------------------
+    def test_i_dirty_partial_tp_survives_a_journal_read_failure(
+        self, tmp_path, monkeypatch,
+    ):
+        """I: a dirty TP1 plus the protective STOP — both legs and their
+        quantities are preserved across an unreadable-journal restart."""
+        settings = _settings()
+        contour, store, clock = _contour(settings, journal_dir=tmp_path)
+        pos = _open_one(contour, store, clock)
+        entry = pos.entry_price
+        full = pos.remaining_size
+        original_stage, original_commit = store.stage_close, (
+            store.commit_partial_exit,
+        )
+        store.commit_partial_exit = _always_fail("partial leg write failed")
+        store.stage_close = _always_fail("terminal staging failure")
+
+        contour.run_cycle({pos.symbol: entry * 0.945})
+        assert pos.position_key in contour.engine.dirty_leg_keys
+        cycle = contour.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"]
+        key = pos.position_key
+        frozen = contour.engine.journal.read_all()[key]
+        assert frozen.owed_partial_legs, "the dirty TP1 is owed"
+
+        state = _poison_journal_reads(
+            monkeypatch, contour.engine.journal,
+            lambda: OSError(5, "Input/output error"),
+        )
+        store.commit_partial_exit, store.stage_close = (
+            original_commit, original_stage,
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        assert restarted.engine.durability_risk is True, (
+            "an unreadable recovery journal must report the durability risk",
+        )
+        assert restarted.engine.journal_read_blocked is True
+        assert restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )["entries"] == 0
+
+        state["enabled"] = False
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        legs = store.list_close_legs(key)
+        assert [leg.leg_seq for leg in legs] == [1, 3]
+        closed = sum(leg.quantity for leg in legs)
+        assert round(full - row.remaining_size, 9) == round(closed, 9)
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+    # -- J ------------------------------------------------------------------
+    def test_j_observed_funding_is_booked_exactly_once_after_recovery(
+        self, tmp_path, monkeypatch,
+    ):
+        """J: the OBSERVED funding settlement of a protective STOP (accrued
+        in-cycle, never yet durable in PostgreSQL — the position row flip was
+        withheld) travels inside the frozen terminal snapshot, survives an
+        UNREADABLE-journal restart and is applied exactly once on recovery."""
+        settings = _settings()
+
+        def run_timeline(journal_dir):
+            """entry -> dirty TP1 -> +9h -> protective STOP whose staging is
+            down (the observed funding sits only in memory + the journal)."""
+            contour, store, clock = _contour(
+                settings, journal_dir=journal_dir,
+            )
+            pos = _open_one(contour, store, clock)
+            entry = pos.entry_price
+            original_commit, original_stage = (
+                store.commit_partial_exit, store.stage_close,
+            )
+            store.commit_partial_exit = _always_fail(
+                "partial leg write failed",
+            )
+            contour.run_cycle({pos.symbol: entry * 0.945})   # TP1 DIRTY
+            clock.advance(hours=9)                  # 1 funding period due
+            store.stage_close = _always_fail("terminal staging failure")
+            contour.run_cycle(
+                {pos.symbol: entry},
+                funding_rates_percent={pos.symbol: 0.01},
+                bars=_round8_stop_bars(pos, entry),
+            )
+            store.commit_partial_exit = original_commit
+            store.stage_close = original_stage
+            return contour, store, clock, pos, entry
+
+        # ---- failure-free reference: identical timeline, healthy journal --
+        control, control_store, control_clock, control_pos, control_entry = (
+            run_timeline(tmp_path / "control")
+        )
+        for _ in range(3):                 # the healthy journal converges
+            control.run_cycle(
+                {control_pos.symbol: control_entry},
+                funding_rates_percent={control_pos.symbol: 0.01},
+                bars=_round8_stop_bars(control_pos, control_entry),
+            )
+            if control_store.get_position(
+                control_pos.position_key,
+            ).status == POSITION_STATUS_CLOSED:
+                break
+        control_row = control_store.get_position(control_pos.position_key)
+        assert control_row.status == POSITION_STATUS_CLOSED, control_row
+        control_balance = control.engine.balance
+        control_charged = control_row.funding_periods_charged
+
+        # ---- fault run ----------------------------------------------------
+        contour, store, clock, pos, entry = run_timeline(tmp_path)
+        key = pos.position_key
+        frozen = contour.engine.journal.read_all()[key]
+        # The observed funding settlement travels inside the FROZEN terminal
+        # snapshot — the durable position row was never written (the terminal
+        # UPDATE was withheld), so the journal is its only surviving copy.
+        assert frozen.snapshot.get("funding_periods") == 1, (
+            "the observed funding period must be frozen into the record",
+        )
+        assert frozen.snapshot.get("funding_paid") not in (0, 0.0), (
+            "the observed funding amount must be frozen into the record",
+        )
+        assert frozen.owed_partial_legs, "the dirty TP1 is still owed"
+
+        state = _poison_journal_reads(
+            monkeypatch, contour.engine.journal,
+            lambda: OSError(5, "Input/output error"),
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        assert restarted.engine.durability_risk is True, (
+            "an unreadable recovery journal must report the durability risk",
+        )
+        assert restarted.engine.journal_read_blocked is True
+
+        # while the journal is unreadable NOTHING may be booked or traded
+        blocked = restarted.run_cycle(
+            {pos.symbol: entry},
+            funding_rates_percent={pos.symbol: 0.01},
+            bars=_round8_stop_bars(pos, entry),
+        )
+        assert blocked["exit_reasons"] == []
+        assert blocked["entries"] == 0
+        assert store.get_position(key).funding_periods_charged == 0
+
+        state["enabled"] = False
+        for _ in range(3):                 # the journal is readable again
+            restarted.run_cycle(
+                {pos.symbol: entry},
+                funding_rates_percent={pos.symbol: 0.01},
+                bars=_round8_stop_bars(pos, entry),
+            )
+            if store.get_position(key).status == POSITION_STATUS_CLOSED:
+                break
+
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert restarted.engine.journal_read_blocked is False
+        assert restarted.engine._pending_obligations == {}, "rate durable"
+        assert row.funding_periods_charged == control_charged, (
+            "the observed funding is applied exactly once",
+        )
+        assert row.funding_paid == pytest.approx(
+            control_row.funding_paid, abs=1e-9,
+        ), "the observed funding amount is identical to the reference"
+        assert restarted.engine.balance == pytest.approx(
+            control_balance, abs=1e-9,
+        ), "an observed rate is never double-charged"
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+    # -- K ------------------------------------------------------------------
+    def test_k_journal_read_failure_after_an_ambiguous_commit_never_doubles(
+        self, tmp_path, monkeypatch,
+    ):
+        """K: re-reading the journal after an AMBIGUOUS staging COMMIT yields
+        exactly one terminal leg and one PnL."""
+        settings = _settings()
+        control, control_store, control_pos = _round10_control(settings, tmp_path)
+        control_balance = control.engine.balance
+
+        contour, store, clock, pos, key, entry, original_stage = (
+            _round10_stop_setup(settings, tmp_path)
+        )
+        committed = {"n": 0}
+
+        def commit_then_raise(*args, **kwargs):
+            original_stage(*args, **kwargs)          # COMMITTED
+            committed["n"] += 1
+            raise RuntimeError("staging acknowledgement lost")
+
+        store.stage_close = commit_then_raise
+        contour.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert committed["n"] == 1
+        assert store.list_pending_closes(), "the outbox row is durable"
+
+        store.stage_close = original_stage
+        state = _poison_journal_reads(
+            monkeypatch, contour.engine.journal,
+            lambda: OSError(5, "Input/output error"),
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        assert restarted.engine.durability_risk is True, (
+            "an unreadable recovery journal must report the durability risk",
+        )
+        assert restarted.engine.journal_read_blocked is True
+        assert restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )["exit_reasons"] == []
+
+        state["enabled"] = False
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        legs = store.list_close_legs(key)
+        assert [leg.exit_reason for leg in legs] == ["STOP_LOSS"]
+        assert len([leg for leg in legs if leg.is_terminal]) == 1
+        assert store.list_pending_closes() == []
+        assert restarted.engine.journal.exists(key) is False, "retired"
+        assert restarted.engine.balance == pytest.approx(
+            control_balance, abs=1e-9,
+        ), "a re-read after an ambiguous COMMIT must never double-book"
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+    # -- L ------------------------------------------------------------------
+    def test_l_full_recovery_restores_everything_and_reopens_entries(
+        self, tmp_path, monkeypatch,
+    ):
+        """L: after the journal is readable again — CLOSED, exactly one
+        terminal leg, outbox drained, record retired only after confirmation,
+        balance equal to the failure-free reference, and entries allowed only
+        while the book is fully consistent."""
+        settings = _settings()
+        control, control_store, control_pos = _round10_control(settings, tmp_path)
+        control_balance = control.engine.balance
+
+        contour, store, clock, pos, key, entry, stage = (
+            _round10_stop_setup(settings, tmp_path)
+        )
+        store.stage_close = stage
+        state = _poison_journal_reads(
+            monkeypatch, contour.engine.journal,
+            lambda: OSError(5, "Input/output error"),
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        assert engine.durability_risk is True, (
+            "an unreadable recovery journal must report the durability risk",
+        )
+        assert engine.journal_read_blocked is True
+
+        state["enabled"] = False
+        cycle = restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.exit_reason == "STOP_LOSS"
+        legs = store.list_close_legs(key)
+        assert [leg.exit_reason for leg in legs] == ["STOP_LOSS"]
+        assert len([leg for leg in legs if leg.is_terminal]) == 1
+        assert store.list_pending_closes() == [], "outbox drained"
+        assert engine.pending_closes == {}
+        assert engine._unstaged_closes == set()
+        assert engine.journal.exists(key) is False, (
+            "the record is retired only after a confirmed recovery",
+        )
+        assert engine._pending_obligations == {}
+        assert store.get_funding_obligation(key) is None
+        assert engine.journal_read_blocked is False
+        assert engine.journal_read_failure is None
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True
+        assert engine.balance == pytest.approx(control_balance, abs=1e-9)
+        assert engine.balance == pytest.approx(
+            store.balance_components()["balance"], abs=1e-9,
+        )
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+        # entries reopen ONLY now, with a fully consistent book
+        assert _capture(
+            store, _candidate("ETHUSDT", 100.0, detected_at=clock()),
+        ) == "CAPTURED"
+        reopened = restarted.run_cycle({"ETHUSDT": 100.0})
+        assert reopened["entries"] == 1, reopened

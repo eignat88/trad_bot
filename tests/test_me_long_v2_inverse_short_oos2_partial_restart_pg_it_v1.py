@@ -23,6 +23,7 @@ database (same guard as the sibling admission suite).
 """
 from __future__ import annotations
 
+import builtins
 import dataclasses
 import os
 from datetime import datetime, timedelta, timezone
@@ -2861,3 +2862,229 @@ class TestCodexRound9OnPostgres:
             store2.balance_components()["balance"], abs=1e-6,
         )
         store2.close()
+
+
+class TestCodexRound10OnPostgres:
+    """Round 10 P1 (Codex r4597065733) against real PostgreSQL 17.
+
+    Scenario (issue #276 §5): open a position -> protective STOP ->
+    PostgreSQL staging DOWN -> durable journal -> restart -> the journal
+    file itself temporarily UNREADABLE -> the closed recovery gate ->
+    file access restored -> bounded retry -> the frozen STOP restored ->
+    financial state identical to a failure-free reference run.
+
+    Faults are injected at the store-method boundary and at the file-read
+    boundary only; every leg, outbox, terminal UPDATE, read-back and
+    restart is the REAL PostgreSQL code path with real transactions.
+    """
+
+    @staticmethod
+    def _failure_free_reference(pg_conn) -> dict:
+        """Failure-free protective STOP: entry -> STOP fires -> the close
+        completes in the same cycle.  Every fact the fault run below
+        recovers must equal these."""
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = InverseShortContour(
+            _settings(), store, clock=clock, activation_enabled=True,
+        )
+        event = _capture_event(store, age=timedelta(seconds=5))
+        contour.run_cycle({"BTCUSDT": 100.0})
+        position_key = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:{event}"
+        row = store.get_position(position_key)
+        assert row is not None
+        entry = row.entry_price
+        bars = {
+            "BTCUSDT": {"high": row.stop_price * 1.001, "low": entry * 0.99},
+        }
+        cycle = contour.run_cycle({"BTCUSDT": entry}, bars=bars)
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        final = store.get_position(position_key)
+        assert final.status == "CLOSED"
+        assert final.exit_reason == "STOP_LOSS"
+        facts = {
+            "entry_price": final.entry_price,
+            "exit_price": final.exit_price,
+            "net_pnl": final.net_pnl,
+            "funding_periods_charged": final.funding_periods_charged,
+            "balance": store.balance_components()["balance"],
+            "legs": [
+                (leg.exit_reason, bool(leg.is_terminal))
+                for leg in _legs(store, position_key)
+            ],
+        }
+        store.close()
+        _cleanup(pg_conn)
+        return facts
+
+    @staticmethod
+    def _poison_journal_read(journal_dir) -> callable:
+        """Make every READ of a ``*.json`` recovery record inside
+        ``journal_dir`` fail with ``EIO`` (the temporary read failure Codex
+        injected at restart).  Returns an idempotent restore callable; only
+        the journal files are affected, so the real PostgreSQL driver and
+        every other file keep working normally."""
+        original_open = builtins.open
+        root = os.path.abspath(str(journal_dir))
+
+        def failing_open(file, mode="r", *args, **kwargs):
+            name = os.path.abspath(str(file))
+            reading = not any(flag in mode for flag in "wxa+")
+            if (
+                reading
+                and name.endswith(".json")
+                and os.path.dirname(name) == root
+            ):
+                raise OSError(5, "Input/output error")
+            return original_open(file, mode, *args, **kwargs)
+
+        builtins.open = failing_open
+        state = {"restored": False}
+
+        def restore() -> None:
+            if not state["restored"]:
+                state["restored"] = True
+                builtins.open = original_open
+
+        return restore
+
+    def test_p1_unreadable_journal_fails_closed_then_recovers(
+        self, running, pg_conn, tmp_path,
+    ):
+        """§5 on real PostgreSQL: a STOP whose staging failed leaves the
+        frozen facts ONLY in the journal; restarting while that journal is
+        unreadable must fail closed (risk reported, accounting unconfirmed,
+        no entries, no exit re-evaluation) and, once the file is readable
+        again, the ORIGINAL STOP must be restored and the resulting
+        financial state must equal the failure-free reference."""
+        ref = self._failure_free_reference(pg_conn)
+
+        # ---- 1. protective STOP with PostgreSQL staging DOWN -------------
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = InverseShortContour(
+            _settings(), store, clock=clock, activation_enabled=True,
+            journal_dir=tmp_path,
+        )
+        position_key, row, bars = TestCodexRound5OnPostgres._open_fault_position(  # noqa: E501
+            store, clock, contour, candle_steps=1,
+        )
+        entry = row.entry_price
+        original_stage = store.stage_close
+        store.stage_close = _always_fail("terminal staging failure (PG down)")
+        cycle = contour.run_cycle({"BTCUSDT": entry}, bars=bars)
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        store.stage_close = original_stage
+
+        assert store.get_position(position_key).status == "OPEN", (
+            "terminal UPDATE withheld until staging is durable",
+        )
+        assert _legs(store, position_key) == [], "nothing staged yet"
+        assert list(tmp_path.glob("*.json")), "the durable journal must exist"
+        record = contour.engine.journal.read_all()[position_key]
+        assert record.exit_reason == "STOP_LOSS"
+        assert record.staged is False, "an unconfirmed stage is never claimed"
+        assert record.recovery_ids.get("position_key") == position_key
+        assert contour.engine.durability_risk is True
+        assert contour.engine.journal_read_blocked is False
+        store.close()
+
+        # ---- 2. restart: PostgreSQL healthy, journal UNREADABLE ----------
+        restore_open = self._poison_journal_read(tmp_path)
+        try:
+            store2 = _connect_store()
+            contour2 = InverseShortContour(
+                _settings(), store2, clock=clock, activation_enabled=True,
+                journal_dir=tmp_path,
+            )
+            engine2 = contour2.engine
+            assert engine2.journal_read_blocked is True, (
+                "a failed journal read must be detected at runtime start",
+            )
+            assert engine2.durability_risk is True, (
+                "an unreadable recovery journal must report the durability "
+                "risk",
+            )
+            assert engine2.accounting_consistent is False, (
+                "accounting can never be declared consistent while the only "
+                "durable copy of the protective exit cannot be read",
+            )
+            assert store2.get_position(position_key).status == "OPEN"
+            assert engine2.open_entries({"ETHUSDT": 100.0}) == [], (
+                "no new entries while the journal is unreadable",
+            )
+
+            non_triggering = {
+                "BTCUSDT": {
+                    "high": row.stop_price * 0.5, "low": entry * 0.99,
+                },
+            }
+            blocked = contour2.run_cycle(
+                {"BTCUSDT": entry}, bars=non_triggering,
+            )
+            assert blocked["exit_reasons"] == [], (
+                "exit evaluation is suspended while the journal is "
+                "unreadable — the STOP is never re-evaluated from new data",
+            )
+            assert store2.get_position(position_key).status == "OPEN"
+            assert _legs(store2, position_key) == [], (
+                "nothing may be staged while the journal is unreadable",
+            )
+
+            # ---- 3. file access restored -> bounded retry -> recovery -----
+            restore_open()
+            cycle2 = contour2.run_cycle(
+                {"BTCUSDT": entry}, bars=non_triggering,
+            )
+            assert cycle2["exit_reasons"] == [], (
+                "the close comes from the frozen snapshot, not from a new "
+                "evaluation of the market",
+            )
+
+            final = store2.get_position(position_key)
+            assert final.status == "CLOSED"
+            assert final.exit_reason == "STOP_LOSS"
+            assert final.exit_price == pytest.approx(
+                record.fill_price, rel=1e-9,
+            ), "the frozen fill price, never recomputed"
+            assert engine2.journal_read_blocked is False
+            assert engine2.durability_risk is False
+            assert engine2.accounting_consistent is True
+            legs = _legs(store2, position_key)
+            recovered_legs = [
+                (leg.exit_reason, bool(leg.is_terminal)) for leg in legs
+            ]
+            assert recovered_legs == [("STOP_LOSS", True)], (
+                "exactly one terminal leg"
+            )
+            assert final.remaining_size == 0.0
+            assert engine2.pending_closes == {}
+            assert store2.list_pending_closes() == []
+            assert engine2._uncommitted_deltas == {}
+            assert engine2.journal.paths() == [], (
+                "the record is retired only after the close is proven",
+            )
+
+            # ---- 4. identical to the failure-free reference ---------------
+            assert final.entry_price == pytest.approx(
+                ref["entry_price"], abs=1e-9,
+            )
+            assert final.exit_price == pytest.approx(
+                ref["exit_price"], abs=1e-9,
+            ), "the recovered STOP equals the failure-free STOP"
+            assert final.net_pnl == pytest.approx(ref["net_pnl"], abs=1e-9)
+            assert final.funding_periods_charged == ref[
+                "funding_periods_charged"
+            ], "no funding period may be invented or lost"
+            assert recovered_legs == ref["legs"], (
+                "the same single terminal leg as the failure-free reference"
+            )
+            assert store2.balance_components()["balance"] == pytest.approx(
+                ref["balance"], abs=1e-6,
+            ), "balance must equal the failure-free control"
+            assert engine2.balance == pytest.approx(
+                store2.balance_components()["balance"], abs=1e-6,
+            )
+            store2.close()
+        finally:
+            restore_open()

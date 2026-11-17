@@ -67,7 +67,11 @@ from .activation import (
     is_post_freeze,
 )
 from .identity import position_key as build_position_key
-from .journal import PendingProtectiveClose, ProtectiveCloseJournal
+from .journal import (
+    JOURNAL_READ_FAILED,
+    PendingProtectiveClose,
+    ProtectiveCloseJournal,
+)
 from .models import (
     EVENT_STATUS_CAPTURED,
     EVENT_STATUS_CAPACITY_REJECTED,
@@ -269,6 +273,24 @@ class InverseShortPaperEngine:
         self._journal_unresolved: set[str] = set()
         #: OOS-2-only local durable journal (atomic write / replay / dedup).
         self.journal = ProtectiveCloseJournal(journal_dir)
+        #: Round 10 (P1, Codex r4597065733): the whole-contour RECOVERY
+        #: GATE.  True while the local recovery journal could NOT be read
+        #: (directory listing, file read, JSON, schema or integrity check
+        #: failed) or while a record that DID load failed to replay.
+        #:
+        #: The journal holding a record and the journal being readable are
+        #: different states: an unreadable journal is the ONLY durable copy
+        #: of a protective STOP/TIMEOUT, so it is never assumed empty, the
+        #: records on disk are never deleted, ``durability_risk`` reports
+        #: True, ``accounting_consistent`` reports False, new entries are
+        #: refused and exit evaluation is suspended (a frozen STOP must not
+        #: be re-derived from fresh market data while its facts are
+        #: unread).  The read is retried once per cycle from
+        #: ``flush_pending_closes()``; the gate opens only after a CLEAN
+        #: read and a complete replay.
+        self._journal_read_blocked: bool = False
+        #: Diagnostic reason kept for as long as the gate is shut.
+        self._journal_read_failure: str | None = None
 
         components = store.balance_components()
         self.confirmed_balance = float(
@@ -430,7 +452,29 @@ class InverseShortPaperEngine:
             or bool(self._dirty_legs)
             or bool(self._journal_failed)
             or bool(self._journal_unresolved)
+            # Round 10 (Codex r4597065733): a recovery journal that could
+            # not be READ is an unresolved durability obligation in its own
+            # right — the record on disk is unverified, so recovery is NOT
+            # guaranteed if the process terminates right now.
+            or self._journal_read_blocked
         )
+
+    @property
+    def journal_read_blocked(self) -> bool:
+        """Round 10: True while the recovery journal could not be read.
+
+        While True the contour fails closed: ``durability_risk`` True,
+        ``accounting_consistent`` False, new entries refused and exit
+        evaluation suspended.  Cleared only by a clean read (and a complete
+        replay) — never by the passage of time and never by a file that
+        merely failed to open.
+        """
+        return self._journal_read_blocked
+
+    @property
+    def journal_read_failure(self) -> str | None:
+        """Diagnostic reason for the closed recovery gate (``None`` if open)."""
+        return self._journal_read_failure
 
     @property
     def pending_protective_close_keys(self) -> tuple[str, ...]:
@@ -486,12 +530,16 @@ class InverseShortPaperEngine:
         recovered close not yet reconciled into the memory ledger), after a
         failed reconciliation, or while ANY write outcome is still AMBIGUOUS
         (round 6, P1 rule 2: an unreadable read-back never claims
-        consistency) — new entries are refused meanwhile.
+        consistency) — new entries are refused meanwhile.  Round 10
+        (Codex r4597065733): also False while the recovery journal could not
+        be read — an unknown journal state is never reported as a consistent
+        book, whatever the balance numbers say.
         """
         return (
             self._balance_trusted
             and not self._pending_from_store
             and not self._ambiguous_keys
+            and not self._journal_read_blocked
         )
 
     @property
@@ -634,6 +682,19 @@ class InverseShortPaperEngine:
         # An owed balance recovery is retried here first (a successful
         # resync unblocks entries within the same cycle).
         self._retry_balance_recovery()
+        if self._journal_read_blocked:
+            # Round 10 (P1, Codex r4597065733): the recovery journal could
+            # not be read, so no one can know which protective closes are
+            # still owed.  No specific position_key can be named — the whole
+            # OOS-2 contour stays shut until the journal is readable again.
+            # Financial state outranks PAPER_ONLY availability.
+            logger.critical(
+                "me inverse short oos2 entries refused (fail closed): the "
+                "recovery journal is UNREADABLE — durability risk unresolved, "
+                "accounting NOT confirmed and exit evaluation suspended: %s",
+                self._journal_read_failure,
+            )
+            return opened
         if self._journal_unresolved:
             # Round 8 (P1, Codex r4587604965): the durable row could not be
             # classified (read unavailable / not proof of absence) — entries
@@ -1167,6 +1228,24 @@ class InverseShortPaperEngine:
         # accounting until that write confirms.
         self._retry_funding_obligations()
 
+        if self._journal_read_blocked:
+            # Round 10 (P1, Codex r4597065733): the recovery journal could
+            # not be read.  Every retry above already ran — and the journal
+            # read itself is retried inside flush_pending_closes() at the
+            # top of this method — so if the gate is still shut, the frozen
+            # terminal facts are still unreadable and NO position may be
+            # re-evaluated: the row restored from PostgreSQL is the untouched
+            # pre-close OPEN state, and evaluating the STOP against today's
+            # bars would either re-trigger it at a different price or leave a
+            # protective exit that only ever existed on disk.  Exits resume
+            # in the same cycle in which a clean read restores the records.
+            logger.critical(
+                "me inverse short oos2 exit evaluation SUSPENDED (fail "
+                "closed): recovery journal unreadable — %d position(s) left "
+                "untouched rather than re-evaluated on fresh market data: %s",
+                len(self.open_positions), self._journal_read_failure,
+            )
+            return []
 
         closed: list[InverseShortPosition] = []
 
@@ -3570,7 +3649,14 @@ class InverseShortPaperEngine:
         # read was UNAVAILABLE is retried here every cycle until PostgreSQL
         # answers — the record is never deleted in the meantime and the
         # restored obligation/close keep entries refused.
-        if self._journal_unresolved:
+        # Round 10 (P1, Codex r4597065733): the retry is deliberately driven
+        # by the RECOVERY GATE and not only by ``_journal_unresolved`` —
+        # "the journal could not be read" is precisely the state that leaves
+        # ``_journal_unresolved`` empty, which is what made the original
+        # defect invisible.  The retry re-reads the actual files (one attempt
+        # per cycle, never a busy loop, never blocking) until a clean read
+        # restores every frozen fact and opens the gate.
+        if self._journal_unresolved or self._journal_read_blocked:
             self._replay_journal()
         # Round 8 (P1, Codex r4587604973): a durable-before-stage journal
         # write that failed is retried here, so a transient filesystem
@@ -3967,27 +4053,44 @@ class InverseShortPaperEngine:
         the OBSERVED funding obligation and the frozen terminal-leg facts —
         plus the whole close when no outbox row exists at all (staging
         failed before the crash).
+
+        Round 10 (P1, Codex r4597065733): the read verdict is THREE-state.
+        A journal that could not be read never becomes "empty" here — it
+        closes the whole-contour recovery gate (``_journal_read_blocked``),
+        which keeps ``durability_risk`` True, ``accounting_consistent``
+        False, new entries refused and exit evaluation suspended until a
+        later cycle re-reads the files cleanly.  Records that DID load are
+        still restored (replaying a healthy record is always safe), but the
+        gate only opens on a read with no failure at all **and** a complete
+        replay.  Nothing on disk is ever deleted or rewritten by this path.
         """
-        try:
-            records = self.journal.read_all()
-        except Exception:
-            logger.error(
-                "me inverse short oos2 pending protective close journal READ "
-                "FAILED (replay deferred; the records are kept):",
-                exc_info=True,
+        result = self.journal.read_checked()
+        blocked = result.status == JOURNAL_READ_FAILED
+        failure = result.reason
+        if blocked:
+            logger.critical(
+                "me inverse short oos2 recovery journal READ FAILED — "
+                "fail-closed recovery gate engaged (durability risk "
+                "unresolved, accounting unconfirmed, entries refused, exit "
+                "evaluation suspended; %d healthy record(s) still replayed): %s",
+                len(result.records), result.reason,
             )
-            return
-        if not records:
-            return
-        for key, record in records.items():
+        for key, record in result.records.items():
             try:
                 self._restore_protective_close(record)
             except Exception:
+                # A record that loaded but could not be replayed is just as
+                # much an unfinished recovery: the gate stays shut and the
+                # file stays on disk.
+                blocked = True
+                failure = f"journal replay failed for key {key[:48]}"
                 logger.error(
                     "me inverse short oos2 pending protective close replay "
-                    "FAILED (record kept, retried next boot): key=%s",
+                    "FAILED (record kept, retried next cycle): key=%s",
                     key[:48], exc_info=True,
                 )
+        self._journal_read_blocked = blocked
+        self._journal_read_failure = failure if blocked else None
 
     def _classify_journal_row(
         self, key: str,

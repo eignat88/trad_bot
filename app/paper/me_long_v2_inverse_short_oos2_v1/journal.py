@@ -70,6 +70,40 @@ _SUFFIX = ".json"
 #: limitation is VISIBLE without flooding the log on every write.
 _DIRECTORY_FSYNC_UNSUPPORTED_LOGGED = False
 
+# ---------------------------------------------------------------------------
+# Round 10 (P1, Codex r4597065733): the recovery journal READ verdict.
+#
+# "Unavailable" is NOT "absent".  A recovery loader that cannot tell those
+# two apart will happily report a clean restart while the only durable copy
+# of a protective STOP sits on disk unread.
+# ---------------------------------------------------------------------------
+
+#: The journal was listed and every record parsed and integrity-checked.
+JOURNAL_LOADED = "JOURNAL_LOADED"
+#: Listing succeeded and reported ENOENT — absence is PROVEN, not assumed.
+JOURNAL_ABSENT_CONFIRMED = "JOURNAL_ABSENT_CONFIRMED"
+#: The journal exists (or its existence cannot be determined) and could not
+#: be read: the caller must fail closed and retry, never treat it as empty.
+JOURNAL_READ_FAILED = "JOURNAL_READ_FAILED"
+
+
+class JournalReadError(RuntimeError):
+    """The recovery journal could not be read (never "there is nothing")."""
+
+
+@dataclass(frozen=True)
+class JournalReadResult:
+    """Outcome of one recovery-journal read (three states, Round 10)."""
+
+    status: str
+    records: dict[str, "PendingProtectiveClose"]
+    #: Human-readable diagnostic kept as long as the recovery gate is shut.
+    reason: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status != JOURNAL_READ_FAILED
+
 
 def _warn_directory_fsync_unsupported(directory: Path, exc: OSError) -> None:
     """Report (once) that this platform has no directory-fsync primitive."""
@@ -287,39 +321,105 @@ class ProtectiveCloseJournal:
         finally:
             os.close(fd)
 
-    def read_all(self) -> dict[str, PendingProtectiveClose]:
-        """Every durable record, keyed by ``position_key`` (deduplicated).
+    def read_checked(self) -> JournalReadResult:
+        """Round 10 (P1, Codex r4597065733): a THREE-state read verdict.
 
-        A corrupt / foreign / wrong-schema file is logged and SKIPPED — it
-        is never merged into the engine state, and it never aborts recovery
-        of the healthy records.
+        A recovery journal that could not be read is NOT a journal that does
+        not exist.  The previous implementation collapsed every I/O problem
+        into "no records": a failed directory probe returned ``{}``, and a
+        record whose ``open``/``read`` raised was logged and SKIPPED without
+        leaving any trace — so after a restart the database's untouched
+        ``OPEN`` row was restored, ``_journal_unresolved`` stayed empty,
+        ``durability_risk`` reported ``False`` and the protective exit that
+        this journal held was never retried, while subsequent cycles went on
+        to re-evaluate the position against fresh market data.
+
+        Statuses:
+
+        ``JOURNAL_ABSENT_CONFIRMED``
+            Listing the directory succeeded and reported ENOENT — the probe
+            ran and the absence is proven, so normal recovery continues.
+        ``JOURNAL_LOADED``
+            Every record was read, parsed and integrity-checked.
+        ``JOURNAL_READ_FAILED``
+            The journal exists (or its existence cannot be determined) but
+            the listing, a file read, the JSON payload, the schema or the
+            file/payload key check failed.  ``records`` still carries every
+            record that DID load (replaying a healthy record is always
+            safe), ``failures`` names every file that did not, and the
+            caller must keep its recovery gate CLOSED.  Nothing is ever
+            deleted or rewritten here.
         """
-        if not self.directory.exists():
-            return {}
+        try:
+            # ``os.scandir`` is the primitive every directory listing in this
+            # path bottoms out in, so one fault there is one unreadable
+            # listing — and it raises the real errno instead of letting a
+            # glob swallow it and report "no records".
+            with os.scandir(self.directory) as scan:
+                paths = sorted(
+                    Path(entry.path) for entry in scan
+                    if entry.path.endswith(_SUFFIX) and entry.is_file()
+                )
+        except FileNotFoundError:
+            return JournalReadResult(status=JOURNAL_ABSENT_CONFIRMED, records={})
+        except OSError as exc:
+            return JournalReadResult(
+                status=JOURNAL_READ_FAILED, records={},
+                reason=f"journal directory listing failed: {exc!r}",
+            )
         records: dict[str, PendingProtectiveClose] = {}
-        for path in sorted(self.directory.glob(f"*{_SUFFIX}")):
+        failures: list[str] = []
+        for path in paths:
             try:
                 with open(path, "r", encoding="utf-8") as handle:
                     record = PendingProtectiveClose.from_dict(json.load(handle))
             except FileNotFoundError:
                 continue  # retired concurrently — nothing to replay
-            except Exception:
-                logger.error(
-                    "me inverse short oos2 pending protective close journal "
-                    "record unreadable (skipped, never merged): file=%s",
-                    path.name, exc_info=True,
+            except (ValueError, KeyError, TypeError) as exc:
+                # Corrupt / wrong-schema payload: an EXPLICIT recovery
+                # failure — never silently skipped, never deleted.
+                failures.append(
+                    f"{path.name}: corrupt record ({type(exc).__name__})",
+                )
+                continue
+            except OSError as exc:
+                # Temporarily unreadable (EIO / EACCES / ...): the record is
+                # known to be there, so its absence from the replay is never
+                # evidence that it does not exist.
+                failures.append(
+                    f"{path.name}: read failed ({type(exc).__name__}: {exc})",
                 )
                 continue
             if self._path(record.position_key) != path:
-                logger.error(
-                    "me inverse short oos2 pending protective close journal "
-                    "record refused (file/payload key mismatch — dedup "
-                    "guard): file=%s key=%s",
-                    path.name, record.position_key[:48],
+                # Integrity (dedup) guard: the SHA-256 name and the payload
+                # key disagree, so neither can be trusted.
+                failures.append(
+                    f"{path.name}: payload/file key mismatch (integrity)",
                 )
                 continue
             records[record.position_key] = record
-        return records
+        if failures:
+            return JournalReadResult(
+                status=JOURNAL_READ_FAILED, records=records,
+                reason="; ".join(failures),
+            )
+        return JournalReadResult(status=JOURNAL_LOADED, records=records)
+
+    def read_all(self) -> dict[str, PendingProtectiveClose]:
+        """Every durable record, keyed by ``position_key`` (deduplicated).
+
+        Compatibility accessor over :meth:`read_checked`.  It returns ``{}``
+        only for a SUCCESSFULLY PROVEN absence and RAISES
+        :class:`JournalReadError` when the journal could not be read — a
+        caller may never mistake an I/O failure for "there is nothing to
+        replay" (Round 10, Codex r4597065733).
+        """
+        result = self.read_checked()
+        if result.status == JOURNAL_READ_FAILED:
+            raise JournalReadError(
+                result.reason or "recovery journal could not be read",
+            )
+        return result.records
 
     def delete(self, position_key: str) -> bool:
         """Idempotently retire one record; True when a file was removed."""
