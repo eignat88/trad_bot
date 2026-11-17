@@ -3286,7 +3286,10 @@ class TestCodexRound12OnPostgres:
             "observed_rate_percent": 0.01,
             "observed_at": datetime.now(timezone.utc).isoformat(),
             "entered_at": payload["snapshot"]["entered_at"],
-            "periods_due": 0,
+            # migration 089: CHECK (periods_due > 0) and
+            # CHECK (periods_charged_at_observation < periods_due) — the
+            # row must be storable exactly as a real observation would be.
+            "periods_due": 1,
             "periods_charged_at_observation": 0,
             "legs_ref_max_seq": -1,
             "status": FUNDING_OBLIGATION_OPEN,
@@ -3452,7 +3455,8 @@ class TestCodexRound12OnPostgres:
             if o.position_key == position_key
         ]
         assert len(obligations) == 1, "the funding observation exactly once"
-        assert int(obligations[0].periods_due) == 0
+        assert int(obligations[0].periods_due) == 1
+        assert int(obligations[0].periods_charged_at_observation) == 0
         assert int(final.funding_periods_charged) == int(
             ref["funding_periods_charged"],
         ), "funding is never charged twice"
