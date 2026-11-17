@@ -308,6 +308,21 @@ class InverseShortStore:
         """All committed close legs (partial TP executions + terminal legs)."""
         raise NotImplementedError
 
+    def close_leg_ledger_available(self) -> bool:
+        """Round 14: PROOF whether the close-leg ledger can exist at all.
+
+        True while leg rows are writable (the in-memory dict ledger, or the
+        ``close_leg`` relation exists on PostgreSQL), False ONLY when the
+        relation is provably absent (migration 088 not applied — the
+        documented degraded mode where the position row is the only durable
+        half).  The retirement proof uses it to tell "leg table absent
+        (legit degraded)" apart from "leg row missing (data loss)": an
+        absent leg row with an AVAILABLE ledger always refuses.  A probe
+        failure answers True — an unknown state is never treated as a
+        proven degraded mode.
+        """
+        raise NotImplementedError
+
     # -- durable funding obligations (round 6, P2-funding) ---------------
     def save_funding_obligation(
         self, obligation: InverseShortFundingObligation,
@@ -678,6 +693,13 @@ class InMemoryInverseShortStore(InverseShortStore):
             for identity in identities
             if position_key is None or identity[0] == position_key
         ]
+
+    def close_leg_ledger_available(self) -> bool:
+        """The dict-backed ledger has no schema: leg rows always exist to
+        be written.  The in-process degraded mode (``stage_close()``
+        answering False) is proven by the engine's own staging marker, not
+        by this store."""
+        return True
 
     # -- durable funding obligations (round 6, P2-funding) ---------------
     def save_funding_obligation(
@@ -2201,6 +2223,27 @@ class PgInverseShortStore(InverseShortStore):
                 return []
             raise
         return [InverseShortCloseLeg.from_dict(r) for r in result.fetchall_dicts()]
+
+    def close_leg_ledger_available(self) -> bool:
+        """PROOF of the migration-088 degraded mode: ``to_regclass``
+        answers whether the ``close_leg`` relation exists at all.
+
+        False only when the relation is provably absent — then the
+        position row is the only durable half by definition and the
+        retirement proof may skip the leg half.  A probe failure answers
+        True (fail closed): an unproven degraded mode never authorises a
+        retirement.
+        """
+        try:
+            probe = self._execute_once(
+                "SELECT to_regclass(%s::text) IS NOT NULL",
+                (CLOSE_LEG_TABLE,), fetch="one",
+            )
+            row = probe.fetchone()
+            return bool(row and row[0])
+        except Exception:
+            self._rollback()
+            return True
 
     # -- durable funding obligations (round 6, P2-funding) ---------------
     def save_funding_obligation(

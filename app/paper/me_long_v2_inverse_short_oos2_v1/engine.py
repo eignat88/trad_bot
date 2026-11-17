@@ -82,6 +82,8 @@ from .models import (
     InverseShortEvent,
     InverseShortFundingObligation,
     InverseShortPosition,
+    LEG_SEQ_TAKE_PROFIT_1,
+    LEG_SEQ_TAKE_PROFIT_2,
     LEG_SEQ_TERMINAL,
     POSITION_STATUS_CLOSED,
     POSITION_STATUS_OPEN,
@@ -151,6 +153,20 @@ class JournalRestoreError(RuntimeError):
     def diagnostic(self) -> str:
         """The fail-closed reason kept in ``journal_read_failure``."""
         return str(self)
+
+
+class JournalRetirementUnconfirmed(RuntimeError):
+    """Round 14 (P2, Codex r4601316564): Phase B refused a retirement.
+
+    Raised by the CLOSED branch of ``_restore_protective_close`` when the
+    durable retirement proof does NOT confirm this record's obligations.
+    The rollback inside Phase B restores the pre-attempt in-memory state,
+    ``_journal_restore_failed`` / ``_journal_unresolved`` stay set and the
+    caller turns the failure into the explicit unresolved recovery
+    obligation it is — the whole contour stays fail-closed
+    (``journal_read_blocked``) and the record on disk is never deleted.
+    Carries only its own constant message, never journal content.
+    """
 
 
 class SnapshotFinancialFieldError(ValueError):
@@ -343,6 +359,16 @@ class InverseShortPaperEngine:
         # degraded rollout mode).  The risk stays reported until the row
         # flip commits.
         self._staging_unavailable: set[str] = set()
+        # Round 14 (P2, Codex r4601316586): keys whose staging was proven
+        # DEGRADED (``stage_close()`` answered False — migration 088
+        # absent) at least once in THIS process.  Unlike
+        # ``_staging_unavailable`` it is never discarded on commit: the leg
+        # half of those closes can never exist, so the retirement proof
+        # skips it for the whole process lifetime.  A fresh process proves
+        # the mode through the store's ``to_regclass`` probe
+        # (``close_leg_ledger_available()``) — an absent leg row with an
+        # AVAILABLE ledger is data loss, never degraded mode.
+        self._staging_degraded: set[str] = set()
         # Deterministic accounting reconciliation (P2): the CONFIRMED ledger
         # balance (last successful store read) is kept strictly separate
         # from the LOCAL UNCOMMITTED deltas — per-position accounting booked
@@ -3389,6 +3415,10 @@ class InverseShortPaperEngine:
                 # succeed, so retries are skipped — the terminal UPDATE below
                 # is the only durability left in this documented mode.
                 self._staging_unavailable.add(position.position_key)
+                # Round 14: the leg half of this close can NEVER exist —
+                # the retirement proof keeps skipping it for this process
+                # (never discarded on commit, unlike the marker above).
+                self._staging_degraded.add(position.position_key)
         # 2) Flip the row to CLOSED — ONLY once the staging above is
         #    confirmed (P1, Codex round 2): the position may not be
         #    reported fully saved before its close-leg and outbox rows are
@@ -3940,6 +3970,11 @@ class InverseShortPaperEngine:
                                 # staging can never succeed — fall through
                                 # to the UPDATE.
                                 self._staging_unavailable.add(position_key)
+                                # Round 14: same documented degraded mode as
+                                # in ``_close`` — remembered for the whole
+                                # process so the retirement proof may skip
+                                # the leg half that can never exist.
+                                self._staging_degraded.add(position_key)
                         except Exception:
                             logger.warning(
                                 "me inverse short oos2 close staging retry failed; "
@@ -4570,6 +4605,144 @@ class InverseShortPaperEngine:
                 ) from exc
             owed.append(leg)
 
+        # -- Round 14 (P2, Codex r4601316573): frozen financial ARITHMETIC
+        #    The record may carry every required field and still not close:
+        #    the reproduced defect replayed a terminal leg with
+        #    ``net_pnl=12345.0`` (or a shifted ``gross_pnl``/``exit_fee``/
+        #    ``exit_slippage``/``entry_cost_share``) because only field
+        #    PRESENCE and two position-level identities were validated.
+        #    Every identity below is one the engine itself computed when the
+        #    record was frozen (``_close`` / ``_partial_close``) — no new
+        #    trading formula, no settings-dependent fee recomputation, and
+        #    never the payload in a log line: only the stable
+        #    ``JOURNAL_FINANCIAL_INVARIANT_MISMATCH:<field>`` code.
+        def _invariant(field: str) -> JournalRestoreError:
+            code = f"JOURNAL_FINANCIAL_INVARIANT_MISMATCH:{field}"
+            return JournalRestoreError(
+                key, "financial_invariant", ValueError(code), code=code,
+            )
+
+        try:
+            # (1) position net == gross - entry fee - exit fee - funding -
+            #     slippage — bit-identical operand order to ``_close``.
+            if not _isclose(
+                snapshot.net_pnl,
+                snapshot.gross_pnl
+                - snapshot.entry_fee
+                - snapshot.exit_fee
+                - snapshot.funding_paid
+                - snapshot.slippage_cost,
+            ):
+                raise _invariant("net_pnl")
+            # (2) realized legs == gross - exit fee - (slippage - entry
+            #     slippage) — the accumulated total vs its own components.
+            if not _isclose(
+                snapshot.realized_legs_net,
+                snapshot.gross_pnl
+                - snapshot.exit_fee
+                - snapshot.slippage_cost
+                + snapshot.entry_slippage_cost,
+            ):
+                raise _invariant("realized_legs_net")
+            # (3) terminal leg: net == gross - exit fee - exit slippage -
+            #     entry cost share (the ``_close`` terminal identity).
+            if not _isclose(
+                terminal_leg.net_pnl,
+                terminal_leg.gross_pnl
+                - terminal_leg.exit_fee
+                - terminal_leg.exit_slippage
+                - terminal_leg.entry_cost_share,
+            ):
+                raise _invariant("terminal_leg.net_pnl")
+            # (4) the terminal leg consumed the WHOLE remainder.
+            if not _isclose(terminal_leg.remaining_after, 0.0):
+                raise _invariant("terminal_leg.remaining_after")
+            # (5) every owed partial leg: the same identity, and the
+            #     cumulative chain — each leg continues the previous total
+            #     (bit-identical operand order to ``_partial_close``).
+            cumulative = 0.0
+            for index, leg in enumerate(owed):
+                if not _isclose(
+                    leg.net_pnl,
+                    leg.gross_pnl
+                    - leg.exit_fee
+                    - leg.exit_slippage
+                    - leg.entry_cost_share,
+                ):
+                    raise _invariant(
+                        f"owed_partial_legs[{index}].net_pnl",
+                    )
+                if not _isclose(
+                    leg.cumulative_realized_net,
+                    cumulative
+                    + (leg.gross_pnl - leg.exit_fee - leg.exit_slippage),
+                ):
+                    raise _invariant(
+                        f"owed_partial_legs[{index}].cumulative_realized_net",
+                    )
+                cumulative = leg.cumulative_realized_net
+            if owed and not _isclose(
+                terminal_leg.cumulative_realized_net,
+                cumulative
+                + (
+                    terminal_leg.gross_pnl
+                    - terminal_leg.exit_fee
+                    - terminal_leg.exit_slippage
+                ),
+            ):
+                raise _invariant("terminal_leg.cumulative_realized_net")
+            # (6) aggregates — ONLY while the record carries every partial
+            #     leg: a COMMITTED partial leg's facts are not frozen in
+            #     this record (its durable row is the single source), so an
+            #     equality against the position totals would be a guess.
+            #     With all legs known the position totals ARE their sum.
+            committed_partial = (
+                (snapshot.tp1_executed and 1 not in seen)
+                or (snapshot.tp2_executed and 2 not in seen)
+            )
+            if not committed_partial:
+                legs_all = [*owed, terminal_leg]
+                if not _isclose(
+                    snapshot.gross_pnl,
+                    sum(leg.gross_pnl for leg in legs_all),
+                ):
+                    raise _invariant("gross_pnl")
+                if not _isclose(
+                    snapshot.exit_fee,
+                    sum(leg.exit_fee for leg in legs_all),
+                ):
+                    raise _invariant("exit_fee")
+                if not _isclose(
+                    snapshot.slippage_cost,
+                    snapshot.entry_slippage_cost
+                    + sum(leg.exit_slippage for leg in legs_all),
+                ):
+                    raise _invariant("slippage")
+                if not _isclose(
+                    snapshot.realized_legs_net,
+                    sum(
+                        leg.gross_pnl - leg.exit_fee - leg.exit_slippage
+                        for leg in legs_all
+                    ),
+                ):
+                    raise _invariant("realized_legs_net")
+                if not _isclose(
+                    snapshot.entry_cost_allocated,
+                    sum(leg.entry_cost_share for leg in legs_all),
+                ):
+                    raise _invariant("entry_cost_share")
+                if not _isclose(
+                    snapshot.position_size,
+                    sum(leg.quantity for leg in legs_all),
+                ):
+                    raise _invariant("position_size")
+        except JournalRestoreError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise JournalRestoreError(
+                key, "financial_invariant", exc,
+            ) from exc
+
         # -- the observed funding obligation ---------------------------------
         obligation: InverseShortFundingObligation | None = None
         if record.obligation is not None:
@@ -4698,15 +4871,45 @@ class InverseShortPaperEngine:
                 # purpose (or is kept alive by the restored obligation until
                 # the sweep sees it durable).
                 if key not in self._pending_obligations:
-                    self.journal.delete(key)
-                    self._forget_journal_record(key)
-                    self._journal_unresolved.discard(key)
-                    logger.info(
-                        "me inverse short oos2 pending protective close journal "
-                        "record retired (close + obligation both durable): key=%s",
-                        key[:48],
+                    # Round 14 (P2, Codex r4601316564): a CLOSED durable row
+                    # alone is NOT the retirement proof.  The replay runs the
+                    # SAME positive proof as the sweep (the row carries this
+                    # record's frozen financial facts and every leg row is
+                    # durable) and fails closed when the proof refuses.  The
+                    # reproduced defect deleted the record on the status
+                    # alone: a second flush — or a restart — against a row
+                    # whose financials disagree dropped the recovery
+                    # obligation, reopened ``accounting_consistent`` and
+                    # retired the only durable copy of the frozen STOP.
+                    # The registration below is exactly what the proof
+                    # reads; it happens INSIDE the guarded block, so the
+                    # rollback above removes it again on refusal while
+                    # ``_journal_restore_failed`` / ``_journal_unresolved``
+                    # stay set and the caller keeps the whole contour
+                    # fail-closed (``journal_read_blocked``).
+                    self._journal_records[key] = record
+                    self._journal_snapshots[key] = snapshot
+                    if self._journal_retirement_confirmed(key):
+                        if self.journal.delete(key):
+                            self._forget_journal_record(key)
+                            self._journal_unresolved.discard(key)
+                            logger.info(
+                                "me inverse short oos2 pending protective "
+                                "close journal record retired (close + "
+                                "obligation durable, retirement proof "
+                                "confirmed): key=%s",
+                                key[:48],
+                            )
+                            return
+                        # The proof is green but the FILE could not be
+                        # deleted — an unknown outcome is never reported as
+                        # a finished recovery (retried every cycle).
+                        raise JournalRetirementUnconfirmed(
+                            "JOURNAL_RETIREMENT_DELETE_FAILED",
+                        )
+                    raise JournalRetirementUnconfirmed(
+                        "JOURNAL_RETIREMENT_UNCONFIRMED",
                     )
-                    return
                 # Kept only for the obligation: it is a validated, applied
                 # record, so the sweep may retire it once the rate is durable.
                 self._journal_records[key] = record
@@ -4957,7 +5160,10 @@ class InverseShortPaperEngine:
                 key[:48],
             )
             return False
-        if key not in self._staging_unavailable:
+        if (
+            key not in self._staging_unavailable
+            and key not in self._staging_degraded
+        ):
             try:
                 terminal_row = self.store.get_close_leg(key, LEG_SEQ_TERMINAL)
                 rows = {
@@ -4976,14 +5182,31 @@ class InverseShortPaperEngine:
                 )
                 return False
             if terminal_row is None:
-                # Documented migration-088 degraded mode (Round 12, still
-                # the only case where a terminal leg row may be absent):
-                # staging can never write one, the position row is the only
-                # durable half by definition, and the record's frozen
-                # financial facts were still confirmed against that row
-                # above.  Nothing here can be compared against an absent
-                # ledger, so the leg half of the proof is skipped exactly
-                # as before — never invented, never faked.
+                # Round 14 (P2, Codex r4601316586): a missing terminal leg
+                # row is degraded mode ONLY when the mode itself is proven —
+                # either this process closed the key with staging answering
+                # False (migration 088 absent), or the store PROVES the
+                # ``close_leg`` relation does not exist at all
+                # (``to_regclass``).  An absent leg row with an AVAILABLE
+                # ledger is data loss: the close is incomplete and the
+                # record is KEPT (the reproduced defect ``pass``-ed here).
+                if self.store.close_leg_ledger_available():
+                    self._journal_unresolved.add(key)
+                    logger.warning(
+                        "me inverse short oos2 journal retirement REFUSED — "
+                        "the terminal leg row is MISSING while the leg "
+                        "ledger is available (never degraded mode; the "
+                        "record is KEPT until the ledger is whole): key=%s",
+                        key[:48],
+                    )
+                    return False
+                # PROVEN migration-088 degraded mode: staging can never
+                # write a leg row, the position row is the only durable half
+                # by definition, and the record's frozen financial facts were
+                # still confirmed against that row above.  Nothing here can
+                # be compared against an absent ledger, so the leg half of
+                # the proof is skipped exactly as before — never invented,
+                # never faked.
                 pass
             elif any(row is None for row in rows.values()):
                 self._journal_unresolved.add(key)
@@ -4997,10 +5220,12 @@ class InverseShortPaperEngine:
                 )
                 return False
             else:
-                # Round 13 §3.5: the durable leg rows that DO exist must
-                # carry the FROZEN financial facts of this record — identity
-                # (seq, reason) alone would let a zeroed or shifted leg
-                # amount retire the record.
+                # Round 13 §3.5 + Round 14 (r4601316586): the durable leg
+                # rows that DO exist must carry EVERY frozen financial fact
+                # of this record — identity (seq, reason) alone would let a
+                # zeroed or shifted leg amount retire the record, and the
+                # baseline compared only net/fill/quantity.  Field names
+                # only — never the payload.
                 try:
                     terminal_leg = InverseShortCloseLeg.from_dict(
                         record.terminal_leg,
@@ -5022,39 +5247,137 @@ class InverseShortPaperEngine:
                         key[:48], exc_info=True,
                     )
                     return False
-                if (
-                    not _isclose(terminal_row.net_pnl, terminal_leg.net_pnl)
-                    or not _isclose(
-                        terminal_row.fill_price, terminal_leg.fill_price,
+                frozen_leg_fields = (
+                    "quantity",
+                    "remaining_after",
+                    "reference_price",
+                    "fill_price",
+                    "gross_pnl",
+                    "exit_fee",
+                    "exit_slippage",
+                    "entry_cost_share",
+                    "funding_paid_to_date",
+                    "net_pnl",
+                    "cumulative_realized_net",
+                )
+                mismatched = [
+                    field for field in frozen_leg_fields
+                    if not _isclose(
+                        getattr(terminal_row, field),
+                        getattr(terminal_leg, field),
                     )
-                    or not _isclose(
-                        terminal_row.quantity, terminal_leg.quantity,
-                    )
-                ):
+                ]
+                if mismatched:
                     self._journal_unresolved.add(key)
                     logger.warning(
                         "me inverse short oos2 journal retirement REFUSED — "
                         "the durable terminal leg does not match the frozen "
-                        "record financially (the record is KEPT): key=%s",
-                        key[:48],
+                        "record financially (%s); the record is KEPT: key=%s",
+                        ", ".join(mismatched), key[:48],
                     )
                     return False
                 for seq, row in rows.items():
                     leg = owed_legs[seq]
-                    if (
-                        not _isclose(row.net_pnl, leg.net_pnl)
-                        or not _isclose(row.fill_price, leg.fill_price)
-                        or not _isclose(row.quantity, leg.quantity)
-                    ):
+                    mismatched = [
+                        field for field in frozen_leg_fields
+                        if not _isclose(
+                            getattr(row, field), getattr(leg, field),
+                        )
+                    ]
+                    if mismatched:
                         self._journal_unresolved.add(key)
                         logger.warning(
                             "me inverse short oos2 journal retirement "
                             "REFUSED — the durable partial leg %d does not "
-                            "match the frozen record financially (the "
-                            "record is KEPT): key=%s",
-                            seq, key[:48],
+                            "match the frozen record financially (%s); the "
+                            "record is KEPT: key=%s",
+                            seq, ", ".join(mismatched), key[:48],
                         )
                         return False
+                # Round 14: every COMMITTED partial leg the frozen flags
+                # promise must be durable too — its facts are not frozen in
+                # this record (the durable row is the single source), so the
+                # existence check is what pins the record to the ledger.
+                committed_rows: dict[int, InverseShortCloseLeg] = {}
+                for seq, executed in (
+                    (LEG_SEQ_TAKE_PROFIT_1, snapshot.tp1_executed),
+                    (LEG_SEQ_TAKE_PROFIT_2, snapshot.tp2_executed),
+                ):
+                    if not executed or seq in rows:
+                        continue
+                    try:
+                        row = self.store.get_close_leg(key, seq)
+                    except Exception:
+                        self._journal_unresolved.add(key)
+                        logger.warning(
+                            "me inverse short oos2 journal retirement "
+                            "UNCONFIRMED (committed leg row could not be "
+                            "read — the record is KEPT): key=%s seq=%d",
+                            key[:48], seq, exc_info=True,
+                        )
+                        return False
+                    if row is None:
+                        self._journal_unresolved.add(key)
+                        logger.warning(
+                            "me inverse short oos2 journal retirement "
+                            "REFUSED — a committed partial leg row the "
+                            "frozen flags promise is MISSING (the record is "
+                            "KEPT until the ledger is whole): key=%s seq=%d",
+                            key[:48], seq,
+                        )
+                        return False
+                    committed_rows[seq] = row
+                # Round 14: with every leg readable the durable POSITION
+                # row must be exactly the sum of its durable legs — the
+                # complete aggregate the finding required (the baseline
+                # verified no aggregate at all).
+                all_legs = [terminal_row, *rows.values(), *committed_rows.values()]
+                aggregate_mismatch = (
+                    "gross_pnl" if not _isclose(
+                        stored.gross_pnl,
+                        sum(leg.gross_pnl for leg in all_legs),
+                    ) else None
+                ) or (
+                    "exit_fee" if not _isclose(
+                        stored.exit_fee,
+                        sum(leg.exit_fee for leg in all_legs),
+                    ) else None
+                ) or (
+                    "slippage" if not _isclose(
+                        stored.slippage_cost,
+                        stored.entry_slippage_cost
+                        + sum(leg.exit_slippage for leg in all_legs),
+                    ) else None
+                ) or (
+                    "realized_legs_net" if not _isclose(
+                        stored.realized_legs_net,
+                        sum(
+                            leg.gross_pnl
+                            - leg.exit_fee
+                            - leg.exit_slippage
+                            for leg in all_legs
+                        ),
+                    ) else None
+                ) or (
+                    "entry_cost_share" if not _isclose(
+                        stored.entry_cost_allocated,
+                        sum(leg.entry_cost_share for leg in all_legs),
+                    ) else None
+                ) or (
+                    "position_size" if not _isclose(
+                        stored.position_size,
+                        sum(leg.quantity for leg in all_legs),
+                    ) else None
+                )
+                if aggregate_mismatch:
+                    self._journal_unresolved.add(key)
+                    logger.warning(
+                        "me inverse short oos2 journal retirement REFUSED — "
+                        "the durable position row is not the sum of its "
+                        "durable legs (%s); the record is KEPT: key=%s",
+                        aggregate_mismatch, key[:48],
+                    )
+                    return False
         return True
 
     def _sweep_journal(self) -> None:

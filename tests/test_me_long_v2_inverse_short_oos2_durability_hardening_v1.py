@@ -59,6 +59,8 @@ from app.paper.me_long_v2_inverse_short_oos2_v1.journal import (
 from app.paper.me_long_v2_inverse_short_oos2_v1.models import (
     FUNDING_OBLIGATION_OPEN,
     FUNDING_OBLIGATION_SETTLED,
+    LEG_SEQ_TERMINAL,
+    LEG_SEQ_TAKE_PROFIT_1,
     POSITION_STATUS_CLOSED,
     POSITION_STATUS_OPEN,
     ActivationRecord,
@@ -7678,3 +7680,800 @@ class TestRound13RequiredFinancialSnapshotValidation:
         assert engine.durability_risk is False
         assert engine.accounting_consistent is True
         _assert_ledger_consistent(restarted)
+
+
+# ---------------------------------------------------------------------------
+# Round 14 (P2, Codex r4601316564 / r4601316573 / r4601316586): the CLOSED
+# replay never retires without the durable proof, Phase A validates the
+# frozen financial ARITHMETIC, and the retirement proof compares EVERY
+# frozen leg financial field — mandatory scenarios A–D.
+# ---------------------------------------------------------------------------
+class TestRound14RetirementProofAndFinancialInvariants:
+    """Mandatory scenarios A–D for Codex threads r4601316564/73/86.
+
+    The reproduced defects on the baseline (``43179a2``):
+
+    * **A (r4601316564)** — Phase B's CLOSED branch called
+      ``journal.delete(key)`` WITHOUT the durable proof the sweep
+      requires: a second flush (or a restart) against a CLOSED row whose
+      financials disagree retired the record anyway, dropped
+      ``_journal_unresolved`` and reopened ``accounting_consistent``.
+    * **B (r4601316573)** — Phase A validated field PRESENCE plus two
+      position-level identities but never the frozen arithmetic of the
+      legs: a terminal leg with ``net_pnl=12345.0`` (or a shifted
+      ``gross_pnl``/``exit_fee``/``exit_slippage``/``entry_cost_share``)
+      passed Phase A, was staged into the durable ledger and retired.
+    * **C (r4601316586)** — the retirement proof compared only
+      ``net_pnl``/``fill_price``/``quantity`` per leg: a durable terminal
+      leg with a shifted ``exit_fee`` (or any other frozen field) retired
+      the record, and a MISSING terminal leg was ``pass``-ed as degraded
+      mode without proving migration 088 was actually absent.
+    * **D** — the documented exceptions (ambiguous COMMIT, unreadable
+      journal, migration-088 degraded mode, confirmed-absent) keep their
+      exact existing behaviour.
+
+    Every negative test asserts the full fail-closed contract: no
+    unhandled exception, ``journal_read_blocked``/``durability_risk``
+    True, ``accounting_consistent`` False, entries refused, no
+    re-evaluation of the frozen STOP, the record preserved byte-for-byte,
+    and retirement only after the cause is removed (no deadlock).
+    """
+
+    # Round 12 machinery, reused unchanged (same damage + fail-closed
+    # contract so all rounds stay directly comparable).
+    @staticmethod
+    def _damaged_stop(settings, tmp_path, damage, **setup_kwargs):
+        return TestRound12AtomicJournalReplayAndSafeRetirement._damaged_stop(
+            settings, tmp_path, damage, **setup_kwargs,
+        )
+
+    # -- A: the CLOSED replay never retires without the durable proof -----
+    def test_a1_closed_replay_never_retires_against_a_living_mismatch(
+        self, tmp_path,
+    ):
+        """A1/A2: the SECOND flush against a CLOSED row whose financials
+        disagree keeps the record, the unresolved obligation and the gate —
+        never the baseline's proof-less ``journal.delete``."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage, path, original = (
+            self._damaged_stop(settings, tmp_path, lambda p: None)
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        real_get = store.get_position
+        state = {"tampered": True}
+
+        def tampered_get(position_key, *args, **kwargs):
+            row = real_get(position_key, *args, **kwargs)
+            if (
+                state["tampered"] and position_key == key
+                and row is not None and row.status == POSITION_STATUS_CLOSED
+            ):
+                return dataclasses.replace(row, net_pnl=0.0)
+            return row
+
+        store.get_position = tampered_get
+
+        # cycle 1: the close commits; the sweep refuses the mismatch.
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert real_get(key).status == POSITION_STATUS_CLOSED, (
+            "the close itself must commit",
+        )
+        assert path.exists(), "the sweep keeps the record over a mismatch"
+        assert key in engine._journal_unresolved
+        assert engine.durability_risk is True
+
+        # a fresh event so "entries refused" below is a REAL assertion
+        clock.advance(minutes=5)
+        assert _capture(
+            store, _candidate("ETHUSDT", 50.0, detected_at=clock()),
+        ) == "CAPTURED"
+
+        # cycle 2: the CLOSED replay must not retire against the mismatch
+        # (baseline defect: journal.delete + _journal_unresolved discarded).
+        blocked = restarted.run_cycle(
+            {pos.symbol: entry, "ETHUSDT": 50.0},
+            bars=_round8_stop_bars(pos, entry),
+        )
+        assert path.exists(), (
+            "a CLOSED replay never retires the record against a financial "
+            "mismatch",
+        )
+        assert key in engine._journal_unresolved, (
+            "the unresolved obligation is never dropped by the replay",
+        )
+        assert engine.journal_read_blocked is True, (
+            "the refusal must close the whole recovery gate",
+        )
+        assert engine.durability_risk is True
+        assert engine.accounting_consistent is False
+        reason = engine.journal_read_failure or ""
+        assert "JOURNAL_SNAPSHOT_RESTORE_FAILED" in reason, reason
+        assert "JournalRetirementUnconfirmed" in reason, reason
+        assert blocked["exit_reasons"] == [], "no re-evaluation of the STOP"
+        assert blocked["entries"] == 0, "new entries stay refused"
+
+        # C6: the verdict is byte-stable over a repeated flush
+        damaged = path.read_bytes()
+        engine.flush_pending_closes()
+        assert path.read_bytes() == damaged, "the file is never rewritten"
+        assert engine.journal_read_blocked is True
+        assert store.get_position(key).status == POSITION_STATUS_CLOSED
+
+        # A3/A5 (C7): the cause is removed -> the very same record retires
+        # through the proof, the gate reopens and the entry resumes.
+        state["tampered"] = False
+        store.get_position = real_get
+        recovered = restarted.run_cycle(
+            {pos.symbol: entry, "ETHUSDT": 50.0},
+            bars=_quiescent_bar(pos, entry),
+        )
+        assert engine.journal.exists(key) is False, (
+            "restorable after the mismatch is removed (no deadlock)",
+        )
+        assert engine.journal_read_blocked is False
+        assert engine.journal_read_failure is None
+        assert engine._journal_unresolved == set()
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True
+        assert recovered["entries"] == 1, "the gate really reopened"
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+    def test_a2_restart_against_a_closed_row_with_a_mismatch_fails_closed(
+        self, tmp_path,
+    ):
+        """A3: a RESTART against a CLOSED row whose financials disagree
+        fails closed at boot — the baseline deleted the record there."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage, path, original = (
+            self._damaged_stop(settings, tmp_path, lambda p: None)
+        )
+        first = _restart(contour, settings, clock, journal_dir=tmp_path)
+        real_get = store.get_position
+        state = {"tampered": True}
+
+        def tampered_get(position_key, *args, **kwargs):
+            row = real_get(position_key, *args, **kwargs)
+            if (
+                state["tampered"] and position_key == key
+                and row is not None and row.status == POSITION_STATUS_CLOSED
+            ):
+                return dataclasses.replace(row, net_pnl=0.0)
+            return row
+
+        store.get_position = tampered_get
+        first.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert real_get(key).status == POSITION_STATUS_CLOSED
+        assert path.exists(), "the sweep keeps the record over a mismatch"
+        clock.advance(minutes=5)
+        assert _capture(
+            store, _candidate("ETHUSDT", 50.0, detected_at=clock()),
+        ) == "CAPTURED"
+
+        # the mismatch SURVIVES a process restart: boot must fail closed
+        # (baseline: the boot replay deleted the record outright).
+        restarted = _restart(first, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        assert path.exists(), (
+            "a restart never retires a record whose financials disagree",
+        )
+        assert engine.journal_read_blocked is True, (
+            "the boot replay must close the recovery gate",
+        )
+        assert engine.durability_risk is True
+        assert engine.accounting_consistent is False
+        reason = engine.journal_read_failure or ""
+        assert "JOURNAL_SNAPSHOT_RESTORE_FAILED" in reason, reason
+        assert "JournalRetirementUnconfirmed" in reason, reason
+
+        cycle = restarted.run_cycle(
+            {pos.symbol: entry, "ETHUSDT": 50.0},
+            bars=_round8_stop_bars(pos, entry),
+        )
+        assert cycle["exit_reasons"] == [], "no re-evaluation of the STOP"
+        assert cycle["entries"] == 0, "new entries stay refused"
+        assert cycle["durability_risk"] is True
+        assert cycle["accounting_consistent"] is False
+        assert path.exists()
+
+        # repair -> the boot gate reopens, the record retires, no deadlock
+        state["tampered"] = False
+        store.get_position = real_get
+        recovered = restarted.run_cycle(
+            {pos.symbol: entry, "ETHUSDT": 50.0},
+            bars=_quiescent_bar(pos, entry),
+        )
+        assert engine.journal.exists(key) is False, (
+            "restorable after the mismatch is removed (no deadlock)",
+        )
+        assert engine.journal_read_blocked is False
+        assert engine.journal_read_failure is None
+        assert engine._journal_unresolved == set()
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True
+        assert recovered["entries"] == 1, "the gate really reopened"
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+    def test_a4_missing_terminal_leg_refuses_retirement_unless_degraded(
+        self, tmp_path,
+    ):
+        """A4/C5: a CLOSED row whose terminal leg row is GONE keeps the
+        record while the ledger is available — and retires only when the
+        degraded mode is PROVEN (store probe) or happened in-process."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage, path, original = (
+            self._damaged_stop(settings, tmp_path, lambda p: None)
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        store.get_close_leg = lambda *a, **k: None
+
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert store.get_position(key).status == POSITION_STATUS_CLOSED, (
+            "the close itself must commit",
+        )
+        assert path.exists(), (
+            "a missing terminal leg row is NEVER degraded mode while the "
+            "ledger is available",
+        )
+        assert key in engine._journal_unresolved
+        assert engine.durability_risk is True
+
+        # the replay fails closed too (the gate, not only the sweep)
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert engine.journal_read_blocked is True
+        assert engine.accounting_consistent is False
+        assert engine.durability_risk is True
+        assert path.exists()
+
+        # PROVEN degraded mode (migration 088 genuinely absent): the
+        # position row is the only durable half -> retirement allowed.
+        store.close_leg_ledger_available = lambda: False
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_quiescent_bar(pos, entry),
+        )
+        assert engine.journal.exists(key) is False, (
+            "a PROVEN migration-088 degraded mode retires as documented",
+        )
+        assert engine.journal_read_blocked is False
+        assert engine.journal_read_failure is None
+        assert engine._journal_unresolved == set()
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True
+        _assert_ledger_consistent(restarted)
+
+    # -- B: Phase A validates the frozen financial arithmetic --------------
+    @pytest.mark.parametrize(
+        ("case", "damage", "code"),
+        [
+            (
+                "B1-terminal-net",
+                lambda p: p["terminal_leg"].__setitem__("net_pnl", 12345.0),
+                "JOURNAL_FINANCIAL_INVARIANT_MISMATCH:terminal_leg.net_pnl",
+            ),
+            (
+                "B2-snapshot-gross",
+                lambda p: p["snapshot"].__setitem__(
+                    "gross_pnl", p["snapshot"]["gross_pnl"] + 100.0,
+                ),
+                "JOURNAL_FINANCIAL_INVARIANT_MISMATCH:net_pnl",
+            ),
+            (
+                "B3-terminal-gross",
+                lambda p: p["terminal_leg"].__setitem__(
+                    "gross_pnl", p["terminal_leg"]["gross_pnl"] + 100.0,
+                ),
+                "JOURNAL_FINANCIAL_INVARIANT_MISMATCH:terminal_leg.net_pnl",
+            ),
+            (
+                "B4-terminal-exit-fee",
+                lambda p: p["terminal_leg"].__setitem__(
+                    "exit_fee", p["terminal_leg"]["exit_fee"] + 0.01,
+                ),
+                "JOURNAL_FINANCIAL_INVARIANT_MISMATCH:terminal_leg.net_pnl",
+            ),
+            (
+                "B5-terminal-exit-slippage",
+                lambda p: p["terminal_leg"].__setitem__(
+                    "exit_slippage",
+                    p["terminal_leg"]["exit_slippage"] + 0.02,
+                ),
+                "JOURNAL_FINANCIAL_INVARIANT_MISMATCH:terminal_leg.net_pnl",
+            ),
+            (
+                "B6-terminal-entry-cost-share",
+                lambda p: p["terminal_leg"].__setitem__(
+                    "entry_cost_share",
+                    p["terminal_leg"]["entry_cost_share"] + 0.03,
+                ),
+                "JOURNAL_FINANCIAL_INVARIANT_MISMATCH:terminal_leg.net_pnl",
+            ),
+            (
+                "B7-terminal-remaining-after",
+                lambda p: p["terminal_leg"].__setitem__(
+                    "remaining_after", 5.0,
+                ),
+                "JOURNAL_FINANCIAL_INVARIANT_MISMATCH:"
+                "terminal_leg.remaining_after",
+            ),
+            (
+                "B8-terminal-gross-and-net",
+                lambda p: (
+                    p["terminal_leg"].__setitem__(
+                        "gross_pnl", p["terminal_leg"]["gross_pnl"] + 100.0,
+                    ),
+                    p["terminal_leg"].__setitem__(
+                        "net_pnl", p["terminal_leg"]["net_pnl"] + 100.0,
+                    ),
+                ),
+                "JOURNAL_FINANCIAL_INVARIANT_MISMATCH:gross_pnl",
+            ),
+        ],
+    )
+    def test_b_phase_a_rejects_broken_frozen_arithmetic(
+        self, tmp_path, case, damage, code,
+    ):
+        """B1–B8: a record whose frozen arithmetic does not close is
+        rejected in Phase A with the stable invariant code — nothing is
+        staged, nothing is committed, the verdict is byte-stable."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage, path, original = (
+            self._damaged_stop(settings, tmp_path, damage)
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        cycle = restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert engine.journal_read_blocked is True, case
+        assert engine.durability_risk is True, case
+        assert engine.accounting_consistent is False, case
+        reason = engine.journal_read_failure or ""
+        assert "JOURNAL_SNAPSHOT_RESTORE_FAILED" in reason, (case, reason)
+        assert "stage=financial_invariant" in reason, (case, reason)
+        assert code in reason, (case, reason)
+        assert path.exists(), case
+        assert store.get_position(key).status == POSITION_STATUS_OPEN, (
+            f"{case}: a record whose arithmetic does not close is never "
+            "applied",
+        )
+        assert cycle["exit_reasons"] == [], case
+        assert cycle["entries"] == 0, case
+        assert engine.pending_closes == {}, case
+        assert engine._journal_restore_failed == {key}, case
+
+        # second flush: byte-identical verdict, still refused
+        damaged = path.read_bytes()
+        engine.flush_pending_closes()
+        assert path.read_bytes() == damaged, case
+        assert engine.journal_read_blocked is True, case
+        assert store.get_position(key).status == POSITION_STATUS_OPEN, case
+        assert path.exists(), case
+
+    # -- C: the COMPLETE durable leg financial comparison ------------------
+    @pytest.mark.parametrize(
+        ("field", "delta"),
+        [
+            ("exit_fee", 0.01),
+            ("exit_slippage", 0.02),
+            ("gross_pnl", 100.0),
+            ("entry_cost_share", 0.03),
+            ("funding_paid_to_date", 7.0),
+            ("cumulative_realized_net", 0.05),
+            ("remaining_after", 5.0),
+            ("reference_price", 0.1),
+        ],
+        ids=[
+            "exit_fee", "exit_slippage", "gross_pnl", "entry_cost_share",
+            "funding_paid_to_date", "cumulative_realized_net",
+            "remaining_after", "reference_price",
+        ],
+    )
+    def test_c_terminal_leg_durable_field_mismatch_blocks_retirement(
+        self, tmp_path, field, delta,
+    ):
+        """C1/C2: a durable TERMINAL leg whose frozen field was shifted
+        keeps the record (baseline compared only net/fill/quantity) and the
+        very same record retires once the row matches again."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage, path, original = (
+            self._damaged_stop(settings, tmp_path, lambda p: None)
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        real_leg = store.get_close_leg
+        state = {"tampered": False}
+
+        def tampered_get_close_leg(position_key, leg_seq, *args, **kwargs):
+            leg = real_leg(position_key, leg_seq, *args, **kwargs)
+            if (
+                state["tampered"] and leg is not None
+                and int(leg.leg_seq) == LEG_SEQ_TERMINAL
+            ):
+                return dataclasses.replace(
+                    leg, **{field: getattr(leg, field) + delta},
+                )
+            return leg
+
+        store.get_close_leg = tampered_get_close_leg
+        state["tampered"] = True
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        state["tampered"] = False
+        store.get_close_leg = real_leg
+
+        assert store.get_position(key).status == POSITION_STATUS_CLOSED, (
+            "the close itself must commit",
+        )
+        assert path.exists(), (
+            f"a durable {field} mismatch never retires the record",
+        )
+        assert key in engine._journal_unresolved
+        assert engine.durability_risk is True
+
+        # C7: no deadlock — the same record retires after the cause leaves
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_quiescent_bar(pos, entry),
+        )
+        assert engine.journal.exists(key) is False, (
+            f"restorable after the {field} mismatch is removed",
+        )
+        assert engine.journal_read_blocked is False
+        assert engine._journal_unresolved == set()
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+    def test_c2_owed_partial_leg_durable_mismatch_blocks_retirement(
+        self, tmp_path,
+    ):
+        """C3: a durable OWED partial leg whose frozen exit fee was
+        shifted keeps the record — the owed legs are compared field by
+        field too, not only net/fill/quantity."""
+        settings = _settings()
+        contour, store, clock = _contour(settings, journal_dir=tmp_path)
+        pos = _open_one(contour, store, clock)
+        entry = pos.entry_price
+        key = pos.position_key
+        original_commit = store.commit_partial_exit
+        original_stage = store.stage_close
+
+        # (1) the TP1 commit fails -> the partial leg stays DIRTY in
+        #     memory and is owed by the protective-close record
+        store.commit_partial_exit = _always_fail("TP1 persistence failure")
+        contour.run_cycle({pos.symbol: entry * 0.945})
+        assert key in contour.engine.dirty_leg_keys
+
+        # (2) staging down as well -> the STOP is journaled with the dirty
+        #     TP1 owed and the terminal UPDATE is deferred (row stays OPEN)
+        store.stage_close = _always_fail("staging down for the whole run")
+        stop_cycle = contour.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert stop_cycle["exit_reasons"] == ["STOP_LOSS"], stop_cycle
+        path = contour.engine.journal._path(key)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["owed_partial_legs"], "the dirty TP1 is owed"
+        assert store.get_position(key).status == POSITION_STATUS_OPEN
+
+        store.commit_partial_exit = original_commit
+        store.stage_close = original_stage
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        real_leg = store.get_close_leg
+        state = {"tampered": False}
+
+        def tampered_get_close_leg(position_key, leg_seq, *args, **kwargs):
+            leg = real_leg(position_key, leg_seq, *args, **kwargs)
+            if state["tampered"] and leg is not None and int(leg.leg_seq) == 1:
+                return dataclasses.replace(leg, exit_fee=leg.exit_fee + 0.01)
+            return leg
+
+        store.get_close_leg = tampered_get_close_leg
+        state["tampered"] = True
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        state["tampered"] = False
+        store.get_close_leg = real_leg
+
+        assert store.get_position(key).status == POSITION_STATUS_CLOSED
+        assert path.exists(), "an owed-leg exit_fee mismatch never retires"
+        assert key in engine._journal_unresolved
+        assert engine.durability_risk is True
+
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_quiescent_bar(pos, entry),
+        )
+        assert engine.journal.exists(key) is False, (
+            "restorable after the owed-leg mismatch is removed",
+        )
+        assert engine.durability_risk is False
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+    def test_c3_missing_committed_partial_leg_blocks_retirement(
+        self, tmp_path,
+    ):
+        """C4: a COMMITTED partial leg (tp1_executed, not owed) whose
+        durable row is gone keeps the record — the retirement proof
+        requires every leg the flags promise, not only the owed ones."""
+        settings = _settings()
+        contour, store, clock = _contour(settings, journal_dir=tmp_path)
+        pos = _open_one(contour, store, clock)
+        entry = pos.entry_price
+        key = pos.position_key
+        engine = contour.engine
+
+        # TP1 fires and commits durably (no failures at all)
+        contour.run_cycle({pos.symbol: entry * 0.945})
+        assert store.get_close_leg(key, 1) is not None, "TP1 is durable"
+        assert key in engine.open_positions, "still open after the partial"
+
+        # the durable TP1 row disappears (data loss) before the STOP
+        real_leg = store.get_close_leg
+        store.get_close_leg = lambda position_key, leg_seq, *a, **k: (
+            None if int(leg_seq) == 1
+            else real_leg(position_key, leg_seq, *a, **k)
+        )
+        cycle = contour.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        store.get_close_leg = real_leg
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        assert store.get_position(key).status == POSITION_STATUS_CLOSED
+        assert engine.journal.exists(key), (
+            "a missing committed leg row never retires the record",
+        )
+        assert key in engine._journal_unresolved
+        assert engine.durability_risk is True
+
+        # the row reappears (repair) -> retirement proceeds, no deadlock
+        contour.run_cycle(
+            {pos.symbol: entry}, bars=_quiescent_bar(pos, entry),
+        )
+        assert engine.journal.exists(key) is False, (
+            "restorable after the missing leg row is back",
+        )
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(contour)
+
+    def test_c4_missing_owed_partial_leg_keeps_the_record(self, tmp_path):
+        """C4 (owed variant): an owed partial leg row that is still
+        missing keeps the record — the Round 8 refusal is unchanged by the
+        Round 14 restructure of the leg block."""
+        settings = _settings()
+        contour, store, clock = _contour(settings, journal_dir=tmp_path)
+        pos = _open_one(contour, store, clock)
+        entry = pos.entry_price
+        key = pos.position_key
+        original_commit = store.commit_partial_exit
+        original_stage = store.stage_close
+
+        # (1) the TP1 commit fails -> the partial leg stays DIRTY in
+        #     memory and is owed by the protective-close record
+        store.commit_partial_exit = _always_fail("TP1 persistence failure")
+        contour.run_cycle({pos.symbol: entry * 0.945})
+        assert key in contour.engine.dirty_leg_keys
+
+        # (2) staging down as well -> the STOP is journaled with the dirty
+        #     TP1 owed and the terminal UPDATE is deferred (row stays OPEN)
+        store.stage_close = _always_fail("staging down for the whole run")
+        stop_cycle = contour.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert stop_cycle["exit_reasons"] == ["STOP_LOSS"], stop_cycle
+        path = contour.engine.journal._path(key)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["owed_partial_legs"], "the dirty TP1 is owed"
+        assert store.get_position(key).status == POSITION_STATUS_OPEN
+
+        store.commit_partial_exit = original_commit
+        store.stage_close = original_stage
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        real_leg = store.get_close_leg
+        store.get_close_leg = lambda position_key, leg_seq, *a, **k: (
+            None if int(leg_seq) == 1 else real_leg(position_key, leg_seq, *a, **k)
+        )
+
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        store.get_close_leg = real_leg
+        assert store.get_position(key).status == POSITION_STATUS_CLOSED
+        assert path.exists(), "a missing owed leg row keeps the record"
+        assert key in engine._journal_unresolved
+        assert engine.durability_risk is True
+
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_quiescent_bar(pos, entry),
+        )
+        assert engine.journal.exists(key) is False, (
+            "restorable once every owed leg row is durable",
+        )
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+    # -- D: the documented exceptions are unchanged ------------------------
+    def test_d1_ambiguous_commit_is_still_classified_exactly_once(
+        self, tmp_path,
+    ):
+        """D1: the ambiguous-COMMIT exception (Round 6/13) is unchanged —
+        exactly one terminal leg with the frozen numbers, and the record
+        retires only after the confirming read-back."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage, path, original = (
+            self._damaged_stop(settings, tmp_path, lambda p: None)
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        frozen = json.loads(original.decode("utf-8"))["snapshot"]
+        real_update = store.update_position
+        state = {"ack_lost": False}
+
+        def update_then_lose_ack(snapshot, *args, **kwargs):
+            out = real_update(snapshot, *args, **kwargs)
+            if not state["ack_lost"]:
+                state["ack_lost"] = True
+                raise RuntimeError(
+                    "ambiguous COMMIT (ack lost after the write)",
+                )
+            return out
+
+        store.update_position = update_then_lose_ack
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        store.update_position = real_update
+        assert state["ack_lost"] is True, "the ambiguity really fired"
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        legs = store.list_close_legs(key)
+        assert [(leg.exit_reason, bool(leg.is_terminal)) for leg in legs] == [
+            ("STOP_LOSS", True),
+        ], legs
+        assert row.net_pnl == pytest.approx(frozen["net_pnl"], rel=1e-12)
+        assert engine.journal.exists(key) is False
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+    def test_d2_unreadable_journal_still_keeps_the_gate_shut(
+        self, tmp_path, monkeypatch,
+    ):
+        """D2: an UNREADABLE journal still closes the gate on its own
+        (Round 10), never deletes the record, and a later clean read
+        resumes the replay."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage = _round10_stop_setup(
+            settings, tmp_path,
+        )
+        paths_before = list(contour.engine.journal.paths())
+        state = _poison_journal_reads(
+            monkeypatch, contour.engine.journal,
+            lambda: OSError(5, "Input/output error"),
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        assert engine.journal.exists(key)
+        assert engine.journal_read_blocked is True
+        assert engine.durability_risk is True
+        assert engine.accounting_consistent is False
+        assert engine._journal_unresolved == set(), (
+            "the gate must not depend on _journal_unresolved",
+        )
+        cycle = restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert cycle["exit_reasons"] == [], "no re-evaluation of the STOP"
+        assert cycle["entries"] == 0, "new entries stay refused"
+        assert engine.journal.paths() == paths_before, (
+            "the unreadable record stays exactly where it was written",
+        )
+
+        state["enabled"] = False     # reads work again
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert engine.journal_read_blocked is False, "the gate reopens"
+        assert engine.journal.exists(key), (
+            "the still-OPEN row never retires the record",
+        )
+        assert store.get_position(key).status == POSITION_STATUS_OPEN
+        assert engine.durability_risk is True, (
+            "the deferred close is still an unresolved durability risk",
+        )
+
+    def test_d3_migration_088_degraded_mode_still_retires_the_journal(
+        self, tmp_path,
+    ):
+        """D3: the documented migration-088 degraded close (stage_close
+        answers False, no raise) keeps its exact behaviour with the Round
+        14 proof: the in-process degraded marker skips the leg half and the
+        record retires — no false durability risk, no deadlock."""
+        settings = _settings()
+        contour, store, clock = _contour(settings, journal_dir=tmp_path)
+        pos = _open_one(contour, store, clock)
+        entry = pos.entry_price
+        key = pos.position_key
+        engine = contour.engine
+        original_stage = store.stage_close
+        store.stage_close = lambda *args, **kwargs: False   # 088 absent
+
+        written: list[str] = []
+        real_write = engine.journal.write
+
+        def spy_write(record):
+            written.append(record.position_key)
+            return real_write(record)
+
+        engine.journal.write = spy_write
+        cycle = contour.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        engine.journal.write = real_write
+        store.stage_close = original_stage
+
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        assert key in written, "the degraded close writes its record"
+        assert store.get_position(key).status == POSITION_STATUS_CLOSED, (
+            "the degraded terminal UPDATE still commits",
+        )
+        assert store.list_close_legs(key) == [], "no leg table, no legs"
+        assert engine.journal.exists(key) is False, (
+            "the degraded close retires exactly as documented",
+        )
+        assert engine._journal_unresolved == set()
+        assert engine.journal_read_blocked is False
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True
+        # NOTE: no _assert_durable_consistent here — the documented
+        # degraded mode has NO leg rows by definition (quantity
+        # conservation lives in _assert_ledger_consistent instead).
+        _assert_ledger_consistent(contour)
+
+    def test_d4_confirmed_absent_still_retires_the_orphan_record(
+        self, tmp_path,
+    ):
+        """D4: the confirmed-absent proof (Round 8) is unchanged — a
+        synthetic orphan record is retired at boot through the read chain,
+        without ever reaching the new retirement proof."""
+        settings = _settings()
+        contour, store, clock = _contour(settings, journal_dir=tmp_path)
+        fake_key = "ME_LONG_V2_INVERSE_SHORT_OOS2_V1:proven-absent-r14"
+        journal = contour.engine.journal
+        journal.write(_journal_record(fake_key))
+        assert journal.exists(fake_key)
+
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        assert engine.journal.exists(fake_key) is False, (
+            "a proven orphan record must be retired",
+        )
+        assert engine.journal_read_blocked is False
+        assert engine.journal_read_failure is None
+        assert engine._journal_unresolved == set()
+        assert fake_key not in engine._pending_obligations
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True
