@@ -92,6 +92,13 @@ JOURNAL_READ_FAILED = "JOURNAL_READ_FAILED"
 #: ``PendingProtectiveClose.from_dict()``.
 JOURNAL_INVALID_PAYLOAD_TYPE = "JOURNAL_INVALID_PAYLOAD_TYPE"
 
+#: Round 12 (P2, Codex r4598420146): the record's OUTER payload is valid but
+#: one of its NESTED recovery facts (the frozen snapshot, the terminal leg,
+#: an owed partial leg or the observed funding obligation) cannot be parsed
+#: or contradicts the outer record.  Recovery must fail closed BEFORE any
+#: engine state is touched, so the file is never retired on a half restore.
+JOURNAL_SNAPSHOT_RESTORE_FAILED = "JOURNAL_SNAPSHOT_RESTORE_FAILED"
+
 #: Exceptions a malformed journal payload raises while it is decoded or
 #: folded into a record.  Explicit on purpose — never a bare
 #: ``except Exception``: every member is a *bad input* class, so catching it

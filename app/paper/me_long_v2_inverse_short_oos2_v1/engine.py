@@ -69,6 +69,7 @@ from .activation import (
 from .identity import position_key as build_position_key
 from .journal import (
     JOURNAL_READ_FAILED,
+    JOURNAL_SNAPSHOT_RESTORE_FAILED,
     PendingProtectiveClose,
     ProtectiveCloseJournal,
 )
@@ -114,6 +115,32 @@ JOURNAL_READ_CONFIRMED_ABSENT = "CONFIRMED_ABSENT"
 #: The outcome is unknown: the read raised, or it answered "absent" while
 #: durable obligations for the key still exist.  Never treated as absence.
 JOURNAL_READ_UNAVAILABLE = "READ_UNAVAILABLE"
+
+
+class JournalRestoreError(RuntimeError):
+    """Round 12 (P2, Codex r4598420146): a record could not be prepared.
+
+    Raised by the PREPARE phase of a journal replay — before a single byte
+    of engine state or PostgreSQL is touched — whenever the record's nested
+    recovery facts (frozen snapshot, terminal leg, owed partial legs, the
+    observed funding obligation) cannot be parsed or contradict the outer
+    record.  The diagnostic names the record, the failing stage and the
+    exception type, and never the journal content.
+    """
+
+    def __init__(self, key: str, stage: str, cause: BaseException) -> None:
+        self.key = key
+        self.stage = stage
+        self.cause = cause
+        super().__init__(
+            f"{key[:48]}: {JOURNAL_SNAPSHOT_RESTORE_FAILED} "
+            f"(stage={stage}, error={type(cause).__name__})",
+        )
+
+    @property
+    def diagnostic(self) -> str:
+        """The fail-closed reason kept in ``journal_read_failure``."""
+        return str(self)
 
 # Allowed exit reasons of this contour (CHECK constraint, migration 088).
 CONTOUR_EXIT_REASONS = frozenset(EXIT_REASONS)
@@ -271,6 +298,25 @@ class InverseShortPaperEngine:
         #: conservatively, new entries stay refused and the read is retried
         #: every cycle until PostgreSQL answers.
         self._journal_unresolved: set[str] = set()
+        #: Round 12 (P2, Codex r4598420146): ATOMIC REPLAY bookkeeping.
+        #:
+        #: ``_journal_restore_ok`` — keys whose record passed the FULL
+        #: prepare phase and was applied to engine state (or were retained
+        #: in-process with a fully parsed snapshot).  A record that is not
+        #: in this set has never been shown to be restorable, so it may
+        #: NEVER be retired from disk.
+        self._journal_restore_ok: set[str] = set()
+        #: Keys whose record FAILED prepare/apply in this process.  They are
+        #: retried every cycle and are never retired while they fail: the
+        #: only durable copy of the frozen STOP stays on disk.
+        self._journal_restore_failed: set[str] = set()
+        #: The parsed frozen snapshot of every restore-ok record — the
+        #: positive durable read-back (``_confirmed_close``) a retirement
+        #: has to pass runs against it.
+        self._journal_snapshots: dict[str, InverseShortPosition] = {}
+        #: Records whose retirement already carries its own durable proof
+        #: (confirmed-absent read chain, or a proven supersession).
+        self._journal_retirement_proven: set[str] = set()
         #: OOS-2-only local durable journal (atomic write / replay / dedup).
         self.journal = ProtectiveCloseJournal(journal_dir)
         #: Round 10 (P1, Codex r4597065733): the whole-contour RECOVERY
@@ -3971,6 +4017,13 @@ class InverseShortPaperEngine:
             ),
         )
         self._journal_records[key] = record
+        # Round 12: a freshly retained record is built from an already
+        # parsed, in-memory snapshot, so its prepare phase is complete by
+        # construction — it is eligible for retirement once the close and
+        # the rate are durably confirmed.
+        self._journal_snapshots[key] = position
+        self._journal_restore_ok.add(key)
+        self._journal_restore_failed.discard(key)
         try:
             self.journal.write(record)
         except Exception:
@@ -4078,17 +4131,45 @@ class InverseShortPaperEngine:
         for key, record in result.records.items():
             try:
                 self._restore_protective_close(record)
-            except Exception:
-                # A record that loaded but could not be replayed is just as
-                # much an unfinished recovery: the gate stays shut and the
-                # file stays on disk.
+            except JournalRestoreError as exc:
+                # Round 12 (P2): PREPARE failed — nothing in engine state
+                # was touched, so nothing has to be undone.  The record
+                # stays the only durable copy of the frozen STOP: the gate
+                # shuts, the key becomes an explicit unresolved recovery
+                # obligation (fail closed, retried every cycle) and the file
+                # is never retired.
                 blocked = True
-                failure = f"journal replay failed for key {key[:48]}"
+                failure = exc.diagnostic
+                self._journal_restore_failed.add(key)
+                self._journal_unresolved.add(key)
+                logger.error(
+                    "me inverse short oos2 journal replay PREPARE FAILED "
+                    "(no state touched; record KEPT, retried every cycle, "
+                    "durability risk unresolved, entries refused, exit "
+                    "evaluation suspended): key=%s stage=%s error=%s",
+                    key[:48], exc.stage, type(exc.cause).__name__,
+                    exc_info=True,
+                )
+            except Exception as exc:
+                # APPLY failed after a successful prepare — the rollback in
+                # _restore_protective_close restored the in-memory state and
+                # flagged the key unresolved, so the recovery is unfinished
+                # in exactly the same explicit way.
+                blocked = True
+                failure = (
+                    f"{key[:48]}: {JOURNAL_SNAPSHOT_RESTORE_FAILED} "
+                    f"(stage=apply, error={type(exc).__name__})"
+                )
+                self._journal_restore_failed.add(key)
+                self._journal_unresolved.add(key)
                 logger.error(
                     "me inverse short oos2 pending protective close replay "
-                    "FAILED (record kept, retried next cycle): key=%s",
-                    key[:48], exc_info=True,
+                    "FAILED (state rolled back, record kept, retried next "
+                    "cycle): key=%s error=%s",
+                    key[:48], type(exc).__name__, exc_info=True,
                 )
+            else:
+                self._journal_restore_failed.discard(key)
         self._journal_read_blocked = blocked
         self._journal_read_failure = failure if blocked else None
 
@@ -4147,12 +4228,195 @@ class InverseShortPaperEngine:
             return JOURNAL_READ_UNAVAILABLE, None
         return JOURNAL_READ_CONFIRMED_ABSENT, None
 
-    def _restore_protective_close(self, record: PendingProtectiveClose) -> None:
+    def _prepare_protective_close(
+        self, record: PendingProtectiveClose,
+    ) -> tuple[
+        InverseShortPosition,
+        InverseShortFundingObligation | None,
+        InverseShortCloseLeg | None,
+        list[InverseShortCloseLeg],
+    ]:
+        """Round 12 PHASE A (P2, Codex r4598420146): parse, cross-validate,
+        mutate NOTHING.
+
+        Everything a replay must know about a record — the frozen nested
+        snapshot, the terminal leg, every owed partial leg and the observed
+        funding obligation — is deserialized and checked for agreement with
+        the OUTER record here.  A failure raises
+        :class:`JournalRestoreError` before a single engine container is
+        touched, which is exactly what the reproduced defect needed: the
+        obligation and the journal record used to be registered first and
+        the snapshot deserialization raised afterwards, so the next flush
+        saw "nothing pending" and retired the only durable copy of the
+        STOP.
+
+        No side effects at all: no engine state, no PostgreSQL write, no
+        file deletion.  The diagnostic names the record, the failing stage
+        and the exception type — never journal content.
+        """
         key = record.position_key
+
+        # -- the frozen nested snapshot -------------------------------------
+        try:
+            snapshot = InverseShortPosition.from_dict(record.snapshot)
+        except Exception as exc:
+            raise JournalRestoreError(key, "snapshot", exc) from exc
+
+        # -- agreement between the outer record and its nested snapshot -----
+        try:
+            if snapshot.position_key != key:
+                raise ValueError("SNAPSHOT_POSITION_KEY_MISMATCH")
+            if snapshot.status != POSITION_STATUS_CLOSED:
+                raise ValueError("SNAPSHOT_NOT_TERMINAL")
+            if snapshot.exit_reason != record.exit_reason:
+                raise ValueError("SNAPSHOT_EXIT_REASON_MISMATCH")
+            if snapshot.closed_at is None:
+                raise ValueError("SNAPSHOT_CLOSED_AT_MISSING")
+            quantity = float(record.quantity)
+            if not math.isfinite(quantity) or quantity <= 0.0:
+                raise ValueError("RECORD_QUANTITY_INVALID")
+            for field in ("reference_price", "fill_price"):
+                value = float(getattr(record, field))
+                if not math.isfinite(value) or value <= 0.0:
+                    raise ValueError(f"RECORD_{field.upper()}_INVALID")
+            if not math.isfinite(float(record.accounting_delta)):
+                raise ValueError("RECORD_ACCOUNTING_DELTA_INVALID")
+        except (TypeError, ValueError) as exc:
+            raise JournalRestoreError(key, "snapshot_consistency", exc) from exc
+
+        # -- the frozen terminal leg (mandatory for a protective close) -----
+        if not record.terminal_leg:
+            raise JournalRestoreError(
+                key, "terminal_leg", ValueError("TERMINAL_LEG_MISSING"),
+            )
+        try:
+            terminal_leg = InverseShortCloseLeg.from_dict(record.terminal_leg)
+        except Exception as exc:
+            raise JournalRestoreError(key, "terminal_leg", exc) from exc
+        try:
+            if terminal_leg.position_key != key:
+                raise ValueError("TERMINAL_LEG_POSITION_KEY_MISMATCH")
+            if (
+                terminal_leg.leg_seq != LEG_SEQ_TERMINAL
+                or not terminal_leg.is_terminal
+            ):
+                raise ValueError("TERMINAL_LEG_NOT_TERMINAL")
+            if terminal_leg.exit_reason != record.exit_reason:
+                raise ValueError("TERMINAL_LEG_EXIT_REASON_MISMATCH")
+            if abs(float(terminal_leg.quantity) - quantity) > 1e-9:
+                raise ValueError("TERMINAL_LEG_QUANTITY_MISMATCH")
+            if (
+                abs(float(terminal_leg.fill_price) - float(record.fill_price))
+                > 1e-9
+            ):
+                raise ValueError("TERMINAL_LEG_FILL_PRICE_MISMATCH")
+            if (
+                abs(
+                    float(terminal_leg.reference_price)
+                    - float(record.reference_price),
+                )
+                > 1e-9
+            ):
+                raise ValueError("TERMINAL_LEG_REFERENCE_PRICE_MISMATCH")
+        except (TypeError, ValueError) as exc:
+            raise JournalRestoreError(key, "terminal_leg_consistency", exc) from exc
+
+        # -- the owed partial legs ------------------------------------------
+        owed: list[InverseShortCloseLeg] = []
+        seen: set[int] = set()
+        for index, data in enumerate(record.owed_partial_legs):
+            try:
+                leg = InverseShortCloseLeg.from_dict(data)
+            except Exception as exc:
+                raise JournalRestoreError(
+                    key, f"owed_partial_legs[{index}]", exc,
+                ) from exc
+            try:
+                if leg.position_key != key:
+                    raise ValueError("PARTIAL_LEG_POSITION_KEY_MISMATCH")
+                if leg.is_terminal or leg.leg_seq >= LEG_SEQ_TERMINAL:
+                    raise ValueError("PARTIAL_LEG_NOT_PARTIAL")
+                if leg.leg_seq in seen:
+                    raise ValueError("PARTIAL_LEG_SEQ_DUPLICATE")
+                seen.add(leg.leg_seq)
+            except (TypeError, ValueError) as exc:
+                raise JournalRestoreError(
+                    key, f"owed_partial_legs[{index}]_consistency", exc,
+                ) from exc
+            owed.append(leg)
+
+        # -- the observed funding obligation ---------------------------------
+        obligation: InverseShortFundingObligation | None = None
+        if record.obligation is not None:
+            try:
+                obligation = InverseShortFundingObligation.from_dict(
+                    record.obligation,
+                )
+            except Exception as exc:
+                raise JournalRestoreError(
+                    key, "funding_obligation", exc,
+                ) from exc
+            try:
+                if obligation.position_key != key:
+                    raise ValueError("OBLIGATION_POSITION_KEY_MISMATCH")
+                if int(obligation.periods_due) < 0:
+                    raise ValueError("OBLIGATION_PERIODS_DUE_INVALID")
+            except (TypeError, ValueError) as exc:
+                raise JournalRestoreError(
+                    key, "funding_obligation_consistency", exc,
+                ) from exc
+
+        return snapshot, obligation, terminal_leg, owed
+
+    def _forget_journal_record(self, key: str) -> None:
+        """Drop every in-memory trace of a RETIRED journal record."""
+        self._journal_records.pop(key, None)
+        self._journal_failed.discard(key)
+        self._journal_snapshots.pop(key, None)
+        self._journal_restore_ok.discard(key)
+        self._journal_restore_failed.discard(key)
+        self._journal_retirement_proven.discard(key)
+
+    def _restore_protective_close(self, record: PendingProtectiveClose) -> None:
+        """Round 12 PHASE B — apply a record that phase A fully prepared.
+
+        Phase A has already parsed and cross-validated every nested
+        recovery fact, so this method only mutates engine state.  The
+        mutations are captured and rolled back if any of them fails, and
+        the caller turns the failure into an explicit unresolved recovery
+        obligation — a partially restored state can therefore never LOOK
+        like a finished recovery.
+        """
+        key = record.position_key
+        # The row classification is READ-ONLY and comes first: a record
+        # whose position is provably GONE has nothing left to restore, so it
+        # is retired through the confirmed-absent proof (Round 8) without
+        # any further parsing.  Every record that DOES carry something to
+        # restore must pass phase A before a single byte of engine state is
+        # touched — that ordering is what makes the restore atomic.
         verdict, stored = self._classify_journal_row(key)
-        if verdict == JOURNAL_READ_FOUND:
+        if verdict == JOURNAL_READ_CONFIRMED_ABSENT:
+            # CONFIRMED_ABSENT — the ONLY state that may retire a record
+            # without a close to confirm: a successful read chain proved
+            # there is no position row, no outbox, no leg and no obligation
+            # left, so there is no recovery obligation to lose.
+            logger.warning(
+                "me inverse short oos2 pending protective close journal "
+                "record ORPHANED (a successful read chain proved no "
+                "position row, no outbox, no leg and no obligation): key=%s",
+                key[:48],
+            )
+            self.journal.delete(key)
+            self._forget_journal_record(key)
             self._journal_unresolved.discard(key)
-        elif verdict == JOURNAL_READ_UNAVAILABLE:
+            return
+
+        # ---- Phase A: prepare (no side effects whatsoever) ---------------
+        snapshot, obligation, terminal_leg, owed = (
+            self._prepare_protective_close(record)
+        )
+
+        if verdict == JOURNAL_READ_UNAVAILABLE:
             # Round 8 (P1, Codex r4587604965): an UNAVAILABLE read is never
             # "proof of absence".  Nothing is deleted: the frozen
             # STOP/TIMEOUT facts, the observed funding and the pending
@@ -4169,89 +4433,142 @@ class InverseShortPaperEngine:
                 key[:48],
             )
             stored = None
-        else:
-            # CONFIRMED_ABSENT — the ONLY state that may retire the record.
-            logger.warning(
-                "me inverse short oos2 pending protective close journal "
-                "record ORPHANED (a successful read chain proved no "
-                "position row, no outbox, no leg and no obligation): key=%s",
-                key[:48],
-            )
-            self.journal.delete(key)
-            self._journal_records.pop(key, None)
-            self._journal_failed.discard(key)
-            self._journal_unresolved.discard(key)
-            return
 
-        # -- 1) The OBSERVED rate: restored whenever PostgreSQL lacks it ---
-        if record.obligation is not None:
-            try:
-                durable = self.store.get_funding_obligation(key)
-            except Exception:
-                durable = None
-            if durable is None:
-                self._pending_obligations[key] = (
-                    InverseShortFundingObligation.from_dict(record.obligation)
-                )
+        # ---- Phase B: apply, with rollback -------------------------------
+        unset = object()
+        prior = (
+            self._pending_obligations.get(key, unset),
+            self._journal_records.get(key, unset),
+            self.pending_closes.get(key, unset),
+            self._uncommitted_deltas.get(key, unset),
+            self._journal_snapshots.get(key, unset),
+            self._terminal_legs.get(key, unset),
+            self.open_positions.get(key, unset),
+            key in self._unstaged_closes,
+            key in self._journal_restore_ok,
+            self._balance_trusted,
+        )
+        try:
+            # -- 1) The OBSERVED rate: restored whenever PostgreSQL lacks it
+            if obligation is not None:
+                try:
+                    durable = self.store.get_funding_obligation(key)
+                except Exception:
+                    durable = None
+                if durable is None:
+                    self._pending_obligations[key] = obligation
+                    logger.warning(
+                        "me inverse short oos2 journal replay restored the "
+                        "OBSERVED funding obligation (PostgreSQL does not have "
+                        "it yet; retried every cycle): key=%s rate=%.6f%% due=%d",
+                        key[:48],
+                        obligation.observed_rate_percent,
+                        obligation.periods_due,
+                    )
+
+            # -- 2) The terminal close itself ------------------------------
+            if stored is not None and stored.status == POSITION_STATUS_CLOSED:
+                # The close COMMITTED durably — only the rate may be missing,
+                # which step 1 already restored.  The record has served its
+                # purpose (or is kept alive by the restored obligation until
+                # the sweep sees it durable).
+                if key not in self._pending_obligations:
+                    self.journal.delete(key)
+                    self._forget_journal_record(key)
+                    self._journal_unresolved.discard(key)
+                    logger.info(
+                        "me inverse short oos2 pending protective close journal "
+                        "record retired (close + obligation both durable): key=%s",
+                        key[:48],
+                    )
+                    return
+                # Kept only for the obligation: it is a validated, applied
+                # record, so the sweep may retire it once the rate is durable.
                 self._journal_records[key] = record
+                self._journal_snapshots[key] = snapshot
+                self._journal_restore_ok.add(key)
+                return
+
+            # Row still OPEN — or the row state is UNKNOWN because the read
+            # was unavailable (never deletion): the protective close is NOT
+            # durable anywhere in PostgreSQL, so restore it exactly as it
+            # was frozen.
+            if key not in self.pending_closes:
+                self.pending_closes[key] = snapshot
+                self._uncommitted_deltas[key] = (
+                    self._uncommitted_deltas.get(key, 0.0)
+                    + float(record.accounting_delta)
+                )
+                self._balance_trusted = False
+                if not record.staged:
+                    # No outbox row carries it — the outbox half must be
+                    # (re)staged before any terminal UPDATE can be attempted.
+                    self._unstaged_closes.add(key)
+                self.open_positions.pop(key, None)
                 logger.warning(
-                    "me inverse short oos2 journal replay restored the "
-                    "OBSERVED funding obligation (PostgreSQL does not have "
-                    "it yet; retried every cycle): key=%s rate=%.6f%% due=%d",
-                    key[:48],
-                    self._pending_obligations[key].observed_rate_percent,
-                    self._pending_obligations[key].periods_due,
+                    "me inverse short oos2 journal replay RESTORED a pending "
+                    "protective close (position removed from the exit "
+                    "algorithm; original trigger never recomputed): key=%s "
+                    "reason=%s triggered_at=%s delta=%.4f staged=%s",
+                    key[:48], snapshot.exit_reason, record.triggered_at,
+                    record.accounting_delta, record.staged,
                 )
+            # Frozen terminal-leg facts are needed to re-stage byte-for-byte
+            # after a restart (the outbox row alone never carries them back).
+            self._terminal_legs.setdefault(key, terminal_leg)
+            self._journal_records[key] = record
+            self._journal_snapshots[key] = snapshot
+            self._journal_restore_ok.add(key)
+        except Exception:
+            # FIRST: the record becomes an EXPLICIT unresolved recovery
+            # obligation — fail closed, retried every cycle, never retired.
+            # This is set before any undo runs so even a failing rollback
+            # step can never leave a state that looks processed.
+            self._journal_restore_failed.add(key)
+            self._journal_unresolved.add(key)
+            # THEN roll back every in-memory mutation of THIS attempt: a
+            # partial apply must never survive.  Each step is guarded — a
+            # rollback is best-effort by nature and one failing step must
+            # not abort the others.
+            (
+                ob, rec, pc, delta, snap, tleg, openp,
+                unstaged, restore_ok, trusted,
+            ) = prior
 
-        # -- 2) The terminal close itself --------------------------------
-        if stored is not None and stored.status == POSITION_STATUS_CLOSED:
-            # The close COMMITTED durably — only the rate may be missing,
-            # which step 1 already restored.  The record has served its
-            # purpose (or is kept alive by the restored obligation until
-            # the sweep sees it durable).
-            if key not in self._pending_obligations:
-                self.journal.delete(key)
-                self._journal_records.pop(key, None)
-                self._journal_failed.discard(key)
-                self._journal_unresolved.discard(key)
-                logger.info(
-                    "me inverse short oos2 pending protective close journal "
-                    "record retired (close + obligation both durable): key=%s",
-                    key[:48],
-                )
-            return
+            def _undo(step) -> None:
+                try:
+                    step()
+                except Exception:
+                    logger.error(
+                        "me inverse short oos2 journal replay ROLLBACK step "
+                        "failed (the record stays an explicit unresolved "
+                        "obligation, so recovery still fails closed and is "
+                        "retried): key=%s",
+                        key[:48], exc_info=True,
+                    )
 
-        # Row still OPEN — or the row state is UNKNOWN because the read was
-        # unavailable (never deletion): the protective close is NOT durable
-        # anywhere in PostgreSQL, so restore it exactly as it was frozen.
-        if key not in self.pending_closes:
-            snapshot = InverseShortPosition.from_dict(record.snapshot)
-            self.pending_closes[key] = snapshot
-            self._uncommitted_deltas[key] = (
-                self._uncommitted_deltas.get(key, 0.0)
-                + float(record.accounting_delta)
-            )
-            self._balance_trusted = False
-            if not record.staged:
-                # No outbox row carries it — the outbox half must be
-                # (re)staged before any terminal UPDATE can be attempted.
-                self._unstaged_closes.add(key)
-            self.open_positions.pop(key, None)
-            logger.warning(
-                "me inverse short oos2 journal replay RESTORED a pending "
-                "protective close (position removed from the exit "
-                "algorithm; original trigger never recomputed): key=%s "
-                "reason=%s triggered_at=%s delta=%.4f staged=%s",
-                key[:48], snapshot.exit_reason, record.triggered_at,
-                record.accounting_delta, record.staged,
-            )
-        # Frozen terminal-leg facts are needed to re-stage byte-for-byte
-        # after a restart (the outbox row alone never carries them back).
-        if record.terminal_leg:
-            self._terminal_legs.setdefault(
-                key, InverseShortCloseLeg.from_dict(record.terminal_leg),
-            )
-        self._journal_records[key] = record
+            _undo(lambda: self._pending_obligations.pop(key, None)
+                  if ob is unset else self._pending_obligations.__setitem__(key, ob))
+            _undo(lambda: self._journal_records.pop(key, None)
+                  if rec is unset else self._journal_records.__setitem__(key, rec))
+            _undo(lambda: self.pending_closes.pop(key, None)
+                  if pc is unset else self.pending_closes.__setitem__(key, pc))
+            _undo(lambda: self._uncommitted_deltas.pop(key, None)
+                  if delta is unset
+                  else self._uncommitted_deltas.__setitem__(key, delta))
+            _undo(lambda: self._journal_snapshots.pop(key, None)
+                  if snap is unset
+                  else self._journal_snapshots.__setitem__(key, snap))
+            _undo(lambda: self._terminal_legs.pop(key, None)
+                  if tleg is unset else self._terminal_legs.__setitem__(key, tleg))
+            _undo(lambda: self.open_positions.pop(key, None)
+                  if openp is unset else self.open_positions.__setitem__(key, openp))
+            _undo(lambda: self._unstaged_closes.add(key)
+                  if unstaged else self._unstaged_closes.discard(key))
+            _undo(lambda: self._journal_restore_ok.add(key)
+                  if restore_ok else self._journal_restore_ok.discard(key))
+            _undo(lambda: setattr(self, "_balance_trusted", trusted))
+            raise
 
     def _retry_journal_writes(self) -> None:
         """Round 8 (P1, Codex r4587604973): retry a failed journal write.
@@ -4286,31 +4603,164 @@ class InverseShortPaperEngine:
                 key[:48],
             )
 
-    def _sweep_journal(self) -> None:
-        """Retire journal records whose close AND rate are both durable.
+    def _journal_retirement_confirmed(self, key: str) -> bool:
+        """Positive durable proof that a record's obligations are settled.
 
-        A record is deleted ONLY when nothing is left to replay: the
-        protective close is no longer pending, no staging obligation
-        remains and the observed obligation reached PostgreSQL (or was
-        never retained).  Every other state keeps the record — an
-        unresolved protective close can never lose its local copy.
+        Round 12 (P2, Codex r4598420146): the ABSENCE of pending operations
+        is not that proof.  This is the positive read-back instead:
+
+        * the PostgreSQL row exists and is ``CLOSED`` — the terminal close
+          is durable (rule 2), which is exactly what the reproduced defect
+          could NOT show: its row was still ``OPEN`` while the journal had
+          already been swept away;
+        * the row carries THIS record's frozen terminal facts (``closed_at``,
+          ``exit_reason``, ``exit_price``, ``remaining_size``) — a different
+          close is never retired against (rule 6, idempotency);
+        * every owed partial leg row the record carries is durable, unless
+          staging can never write one (the documented migration-088
+          degraded mode, where the position row is the only durable half);
+        * the record was fully prepared and applied (``_journal_restore_ok``,
+          checked by the caller) and nothing is in flight (pending
+          obligation / close / outbox — rules 3 and 4: the obligation hold
+          is only ever released after PostgreSQL accepted the rate).
+
+        A retirement carrying its own proof (confirmed-absent read chain,
+        proven supersession) is accepted without re-reading.  When the
+        answer is not ``True`` the record is KEPT and the unfinished
+        recovery becomes an explicit unresolved obligation, so the next
+        cycle classifies or replays it — never dropped, never silently
+        treated as done (rules 5 and 7: ledger consistency stays with the
+        existing deterministic ``reconcile_balance`` pass).
+        """
+        if key in self._journal_retirement_proven:
+            return True
+        snapshot = self._journal_snapshots.get(key)
+        record = self._journal_records.get(key)
+        if snapshot is None or record is None:
+            # The record was never applied — nothing may be confirmed.
+            self._journal_unresolved.add(key)
+            return False
+        try:
+            stored = self.store.get_position(key)
+        except Exception:
+            self._journal_unresolved.add(key)
+            logger.warning(
+                "me inverse short oos2 journal retirement UNCONFIRMED "
+                "(durable row could not be read — the record is KEPT and "
+                "the recovery stays an explicit unresolved obligation): "
+                "key=%s",
+                key[:48], exc_info=True,
+            )
+            return False
+        if stored is None or stored.status != POSITION_STATUS_CLOSED:
+            self._journal_unresolved.add(key)
+            logger.warning(
+                "me inverse short oos2 journal retirement REFUSED — the "
+                "terminal close is NOT durable yet (row is %s; the record "
+                "is KEPT and replayed): key=%s",
+                stored.status if stored is not None else "ABSENT", key[:48],
+            )
+            return False
+        if (
+            stored.closed_at != snapshot.closed_at
+            or stored.exit_reason != snapshot.exit_reason
+            or stored.exit_price != snapshot.exit_price
+            or stored.remaining_size != snapshot.remaining_size
+        ):
+            self._journal_unresolved.add(key)
+            logger.warning(
+                "me inverse short oos2 journal retirement REFUSED — the "
+                "durable row carries a DIFFERENT close than the frozen "
+                "record (never retired against another exit): key=%s",
+                key[:48],
+            )
+            return False
+        if record.owed_partial_legs and key not in self._staging_unavailable:
+            try:
+                terminal_row = self.store.get_close_leg(key, LEG_SEQ_TERMINAL)
+                rows = {
+                    int(data.get("leg_seq", -1)): self.store.get_close_leg(
+                        key, int(data.get("leg_seq", -1)),
+                    )
+                    for data in record.owed_partial_legs
+                }
+            except Exception:
+                self._journal_unresolved.add(key)
+                logger.warning(
+                    "me inverse short oos2 journal retirement UNCONFIRMED "
+                    "(leg ledger could not be read — the record is KEPT): "
+                    "key=%s",
+                    key[:48], exc_info=True,
+                )
+                return False
+            if terminal_row is None:
+                # Staging can never write a leg row here (documented
+                # migration-088 degraded mode): the position row is the
+                # only durable half by definition.
+                pass
+            elif any(row is None for row in rows.values()):
+                self._journal_unresolved.add(key)
+                logger.warning(
+                    "me inverse short oos2 journal retirement REFUSED — an "
+                    "owed partial leg row is still missing (the record is "
+                    "KEPT until every leg is durable): key=%s missing=%s",
+                    key[:48], sorted(
+                        [seq for seq, row in rows.items() if row is None],
+                    ),
+                )
+                return False
+        return True
+
+    def _sweep_journal(self) -> None:
+        """Retire journal records ONLY with a positive recovery proof.
+
+        Round 12 (P2, Codex r4598420146): the ABSENCE of pending operations
+        is NOT evidence of a finished recovery.  A record whose nested
+        snapshot failed to restore never registers its protective close, so
+        the old "nothing pending → delete" rule retired the only durable
+        copy of the STOP while the position stayed OPEN and the next cycle
+        re-opened the gate on a journal that had silently vanished.
+
+        A record is deleted now only when ALL of this holds:
+
+        1. its prepare/apply SUCCEEDED in this process
+           (``_journal_restore_ok``) — a record that never restored is
+           never retired;
+        2. no recovery failure is outstanding for it
+           (``_journal_restore_failed``);
+        3. nothing is in flight (pending obligation, pending close,
+           unstaged outbox);
+        4. a positive durable read-back confirms the terminal close, or the
+           retirement carries its own proof (confirmed-absent chain,
+           proven supersession).
+
+        Anything less keeps the file on disk and re-opens the explicit
+        unresolved obligation so the recovery is retried instead of lost.
         """
         if not self._journal_records:
             return
         for key in list(self._journal_records):
+            if key not in self._journal_restore_ok:
+                # Never retired without a confirmed full restore first.
+                continue
+            if key in self._journal_restore_failed:
+                # A failed restore keeps its only durable copy.
+                continue
             if (
                 key in self._pending_obligations
                 or key in self.pending_closes
                 or key in self._unstaged_closes
             ):
                 continue
+            if not self._journal_retirement_confirmed(key):
+                continue
             if self.journal.delete(key):
-                self._journal_records.pop(key, None)
-                self._journal_failed.discard(key)
+                self._forget_journal_record(key)
                 self._journal_unresolved.discard(key)
                 logger.info(
                     "me inverse short oos2 pending protective close journal "
-                    "record retired (all halves durable): key=%s",
+                    "record retired (recovery confirmed by durable "
+                    "read-back): key=%s",
                     key[:48],
                 )
 
@@ -4417,6 +4867,10 @@ class InverseShortPaperEngine:
                 "(idempotent retry active): key=%s",
                 key[:48], exc_info=True,
             )
+        # Round 12: supersession carries its OWN durable proof (identical
+        # terminal facts on a CLOSED row + the terminal leg row), so the
+        # journal sweep accepts this retirement without re-deriving it.
+        self._journal_retirement_proven.add(key)
         logger.warning(
             "me inverse short oos2 SUPERSEDED close-outbox snapshot retired "
             "(the CLOSED row already carries newer confirmed funding; the "

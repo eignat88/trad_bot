@@ -37,6 +37,7 @@ from conftest import connect_test_db
 from app.paper.me_long_v2_inverse_short_oos2_v1.journal import (
     JOURNAL_INVALID_PAYLOAD_TYPE,
     JOURNAL_READ_FAILED,
+    JOURNAL_SNAPSHOT_RESTORE_FAILED,
     JournalReadError,
     ProtectiveCloseJournal,
 )
@@ -3235,3 +3236,239 @@ class TestCodexRound11OnPostgres:
             store2.balance_components()["balance"], abs=1e-6,
         )
         store2.close()
+
+
+class TestCodexRound12OnPostgres:
+    """Round 12 P2 (Codex r4598420146) against real PostgreSQL 17.
+
+    Scenario (issue #276 §5): OPEN position -> protective STOP -> PostgreSQL
+    staging DOWN -> durable journal -> runtime ends -> the NESTED snapshot
+    of the durable record is damaged while its outer structure and its
+    funding obligation stay VALID -> restart -> a CONTROLLED recovery
+    failure (``JOURNAL_SNAPSHOT_RESTORE_FAILED``) with a closed gate ->
+    ``flush_pending_closes()`` -> the journal file physically exists ->
+    a second flush -> the gate is still shut and new entries stay refused ->
+    repeated restart keeps the same verdict -> the original record is
+    restored by HAND -> retry -> the FROZEN STOP is recovered without any
+    price re-computation -> terminal CLOSED -> exactly one terminal leg and
+    exactly one funding observation -> the balance equals the failure-free
+    reference -> ONLY THEN is the journal retired.
+
+    An ambiguous terminal COMMIT (the acknowledgement is lost AFTER the
+    UPDATE landed) is injected into the recovery itself: the terminal leg
+    must never be duplicated.  Only the store-method boundary and the
+    journal payload are faked; leg staging, the terminal UPDATE, the
+    outbox, the read-back verification and every restart are the REAL
+    PostgreSQL code path with real transactions.
+    """
+
+    @staticmethod
+    def _damaged_nested_payload(
+        tmp_path, position_key,
+    ) -> tuple[bytes, object]:
+        """Freeze the valid record's bytes, then damage ONLY the nested
+        snapshot (``snapshot.position_key`` removed) while keeping the
+        outer record and a structurally VALID funding obligation intact.
+        Returns ``(original_bytes, path)``."""
+        journal = ProtectiveCloseJournal(tmp_path)
+        path = journal._path(position_key)
+        original = path.read_bytes()
+        payload = json.loads(original.decode("utf-8"))
+        assert payload["exit_reason"] == "STOP_LOSS"
+        assert payload["staged"] is False
+        assert isinstance(payload["snapshot"], dict)
+        payload["snapshot"].pop("position_key", None)
+        payload["obligation"] = {
+            "obligation_key": f"{position_key}:round12",
+            "position_key": position_key,
+            "symbol": payload["snapshot"].get("symbol", "BTCUSDT"),
+            "event_key": "",
+            "observed_rate_percent": 0.01,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "entered_at": payload["snapshot"]["entered_at"],
+            "periods_due": 0,
+            "periods_charged_at_observation": 0,
+            "legs_ref_max_seq": -1,
+            "status": FUNDING_OBLIGATION_OPEN,
+        }
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return original, path
+
+    def test_p2_nested_snapshot_damage_fails_closed_then_recovers(
+        self, running, pg_conn, tmp_path,
+    ):
+        """§5 on real PostgreSQL: a damaged NESTED snapshot with a valid
+        outer record + funding obligation must become an explicit
+        ``JOURNAL_SNAPSHOT_RESTORE_FAILED`` — never a mutation of engine
+        state, never a deletion of the record — and, once the record is
+        restored by hand, recover the ORIGINAL frozen STOP exactly once
+        with the failure-free reference balance."""
+        ref = TestCodexRound10OnPostgres._failure_free_reference(pg_conn)
+
+        # ---- 1-4. STOP with PostgreSQL staging DOWN -> durable journal ---
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = InverseShortContour(
+            _settings(), store, clock=clock, activation_enabled=True,
+            journal_dir=tmp_path,
+        )
+        position_key, row, bars = TestCodexRound5OnPostgres._open_fault_position(  # noqa: E501
+            store, clock, contour, candle_steps=1,
+        )
+        entry = row.entry_price
+        original_stage = store.stage_close
+        store.stage_close = _always_fail("terminal staging failure (PG down)")
+        cycle = contour.run_cycle({"BTCUSDT": entry}, bars=bars)
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        store.stage_close = original_stage
+
+        assert store.get_position(position_key).status == "OPEN", (
+            "terminal UPDATE withheld until staging is durable",
+        )
+        record = contour.engine.journal.read_all()[position_key]
+        assert record.exit_reason == "STOP_LOSS"
+
+        # ---- 5-6. runtime ends; the NESTED snapshot is damaged in place --
+        original_payload, record_path = self._damaged_nested_payload(
+            tmp_path, position_key,
+        )
+        on_disk = json.loads(record_path.read_text(encoding="utf-8"))
+        assert on_disk["obligation"] is not None, "funding half is valid"
+        assert "position_key" not in on_disk["snapshot"], "snapshot damaged"
+        store.close()
+
+        # ---- 7-8. restart -> CONTROLLED failure, no engine mutation ------
+        store2 = _connect_store()
+        contour2 = InverseShortContour(
+            _settings(), store2, clock=clock, activation_enabled=True,
+            journal_dir=tmp_path,
+        )
+        engine2 = contour2.engine
+        assert engine2.journal_read_blocked is True
+        failure = engine2.journal_read_failure or ""
+        assert JOURNAL_SNAPSHOT_RESTORE_FAILED in failure, failure
+        assert "stage=snapshot" in failure, failure
+        assert engine2.durability_risk is True
+        assert engine2.accounting_consistent is False
+        assert store2.get_position(position_key).status == "OPEN"
+        assert engine2.pending_closes == {}, "nothing was registered"
+        assert position_key not in engine2._pending_obligations, (
+            "the funding obligation is not restored either",
+        )
+        assert _legs(store2, position_key) == []
+
+        # ---- 9. flush -> the journal file PHYSICALLY exists --------------
+        flushed = engine2.flush_pending_closes()
+        assert flushed == 0, "nothing may be flushed from a damaged record"
+        assert record_path.exists(), "the record survives the flush"
+        assert json.loads(record_path.read_text(encoding="utf-8")) == on_disk
+
+        # ---- 10-11. second flush -> gate shut, new entries banned --------
+        engine2.flush_pending_closes()
+        assert engine2.journal_read_blocked is True
+        assert engine2.durability_risk is True
+        assert engine2.accounting_consistent is False
+        assert record_path.exists(), "still never deleted"
+        assert engine2.open_entries({"ETHUSDT": 100.0}) == []
+        assert store2.get_funding_obligation(position_key) is None, (
+            "no funding row may appear from an unpreparable record",
+        )
+
+        non_triggering = {
+            "BTCUSDT": {"high": row.stop_price * 0.5, "low": entry * 0.99},
+        }
+        blocked = contour2.run_cycle({"BTCUSDT": entry}, bars=non_triggering)
+        assert blocked["exit_reasons"] == [], (
+            "exit evaluation stays suspended — the STOP is never re-derived",
+        )
+        assert blocked["entries"] == 0
+        assert store2.get_position(position_key).status == "OPEN"
+        assert _legs(store2, position_key) == []
+        assert record_path.exists()
+
+        # ---- repeated restart -> the SAME controlled verdict -------------
+        store2.close()
+        store3 = _connect_store()
+        contour3 = InverseShortContour(
+            _settings(), store3, clock=clock, activation_enabled=True,
+            journal_dir=tmp_path,
+        )
+        engine3 = contour3.engine
+        assert engine3.journal_read_blocked is True
+        assert JOURNAL_SNAPSHOT_RESTORE_FAILED in (
+            engine3.journal_read_failure or ""
+        ), engine3.journal_read_failure
+        assert record_path.exists()
+        engine3.flush_pending_closes()
+        assert engine3.journal_read_blocked is True
+        assert record_path.exists(), "a repeated restart never deletes it"
+
+        # ---- 12-13. hand repair -> retry -> frozen STOP, no recompute ----
+        # (with an ambiguous terminal COMMIT: the ack is lost AFTER the
+        #  UPDATE landed — the leg must never be duplicated)
+        record_path.write_bytes(original_payload)
+        real_update = store3.update_position
+        state = {"ack_lost": False}
+
+        def _update_then_lose_ack(snapshot):
+            outcome = real_update(snapshot)
+            if not state["ack_lost"]:
+                state["ack_lost"] = True
+                raise RuntimeError(
+                    "injected lost terminal acknowledgement (Round 12 PG)",
+                )
+            return outcome
+
+        store3.update_position = _update_then_lose_ack
+        try:
+            cycle3 = contour3.run_cycle({"BTCUSDT": entry}, bars=non_triggering)
+        finally:
+            store3.update_position = real_update
+        assert state["ack_lost"] is True, "the ambiguity really fired"
+        assert engine3.journal_read_blocked is False, (
+            "a clean read must open the recovery gate",
+        )
+        assert engine3.journal_read_failure is None
+        assert cycle3["exit_reasons"] == [], "from the snapshot, not data"
+
+        # ---- 14-17. CLOSED, exactly once, reference balance, retirement --
+        final = store3.get_position(position_key)
+        assert final.status == "CLOSED"
+        assert final.exit_reason == "STOP_LOSS"
+        assert final.exit_price == pytest.approx(record.fill_price, rel=1e-9)
+        legs = _legs(store3, position_key)
+        assert [(leg.exit_reason, bool(leg.is_terminal)) for leg in legs] == [
+            ("STOP_LOSS", True),
+        ], "exactly one terminal leg after an ambiguous COMMIT"
+        assert final.remaining_size == 0.0
+        assert engine3.pending_closes == {}
+        assert store3.list_pending_closes() == []
+
+        obligations = [
+            o for o in store3.list_funding_obligations()
+            if o.position_key == position_key
+        ]
+        assert len(obligations) == 1, "the funding observation exactly once"
+        assert int(obligations[0].periods_due) == 0
+        assert int(final.funding_periods_charged) == int(
+            ref["funding_periods_charged"],
+        ), "funding is never charged twice"
+
+        assert final.exit_price == pytest.approx(ref["exit_price"], abs=1e-9)
+        assert final.net_pnl == pytest.approx(ref["net_pnl"], abs=1e-9)
+        assert store3.balance_components()["balance"] == pytest.approx(
+            ref["balance"], abs=1e-6,
+        ), "balance must equal the failure-free control"
+        assert engine3.balance == pytest.approx(
+            store3.balance_components()["balance"], abs=1e-6,
+        )
+        assert [
+            (leg.exit_reason, bool(leg.is_terminal)) for leg in legs
+        ] == ref["legs"]
+
+        # ---- safe retirement: only AFTER the durable confirmation --------
+        assert engine3.journal.paths() == [], "retired after proven recovery"
+        assert engine3.durability_risk is False
+        assert engine3.accounting_consistent is True
+        assert store3.get_position(position_key).status == "CLOSED"
+        store3.close()
