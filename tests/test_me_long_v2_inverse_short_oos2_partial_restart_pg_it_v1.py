@@ -2923,6 +2923,61 @@ class TestCodexRound10OnPostgres:
         return facts
 
     @staticmethod
+    def _failure_free_reference_funded(pg_conn) -> dict:
+        """Failure-free control that ALSO charges exactly one funding
+        period before the STOP.
+
+        The injected obligation in the fault run below carries the frozen
+        window ``periods_charged_at_observation + 1 .. periods_due`` =
+        ``1..1``, so the normal close fold must have booked period 1 first
+        and the settlement may only VOID the observation (cost 0).  Every
+        fact of the recovered close has to equal this control to prove the
+        funding observation was never charged twice."""
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = InverseShortContour(
+            _settings(), store, clock=clock, activation_enabled=True,
+        )
+        event = _capture_event(store, age=timedelta(seconds=5))
+        contour.run_cycle({"BTCUSDT": 100.0})
+        position_key = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:{event}"
+        row = store.get_position(position_key)
+        assert row is not None
+        entry = row.entry_price
+        clock.advance(hours=8)              # exactly one funding period
+        contour.run_cycle(
+            {"BTCUSDT": entry},
+            funding_rates_percent={"BTCUSDT": 0.01},
+        )
+        funded = store.get_position(position_key)
+        assert funded.funding_periods_charged == 1
+        bars = {
+            "BTCUSDT": {
+                "high": funded.stop_price * 1.001, "low": entry * 0.99,
+            },
+        }
+        cycle = contour.run_cycle({"BTCUSDT": entry}, bars=bars)
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        final = store.get_position(position_key)
+        assert final.status == "CLOSED"
+        assert final.exit_reason == "STOP_LOSS"
+        facts = {
+            "entry_price": final.entry_price,
+            "exit_price": final.exit_price,
+            "net_pnl": final.net_pnl,
+            "funding_periods_charged": final.funding_periods_charged,
+            "funding_paid": final.funding_paid,
+            "balance": store.balance_components()["balance"],
+            "legs": [
+                (leg.exit_reason, bool(leg.is_terminal))
+                for leg in _legs(store, position_key)
+            ],
+        }
+        store.close()
+        _cleanup(pg_conn)
+        return facts
+
+    @staticmethod
     def _poison_journal_read(journal_dir) -> callable:
         """Make every READ of a ``*.json`` recovery record inside
         ``journal_dir`` fail with ``EIO`` (the temporary read failure Codex
@@ -3309,7 +3364,7 @@ class TestCodexRound12OnPostgres:
         state, never a deletion of the record — and, once the record is
         restored by hand, recover the ORIGINAL frozen STOP exactly once
         with the failure-free reference balance."""
-        ref = TestCodexRound10OnPostgres._failure_free_reference(pg_conn)
+        ref = self._failure_free_reference_funded(pg_conn)
 
         # ---- 1-4. STOP with PostgreSQL staging DOWN -> durable journal ---
         store = _connect_store()
@@ -3322,6 +3377,15 @@ class TestCodexRound12OnPostgres:
             store, clock, contour, candle_steps=1,
         )
         entry = row.entry_price
+        clock.advance(hours=8)              # exactly one funding period
+        contour.run_cycle(
+            {"BTCUSDT": entry},
+            funding_rates_percent={"BTCUSDT": 0.01},
+        )
+        row = store.get_position(position_key)
+        assert row.funding_periods_charged == 1, (
+            "the frozen funding window must already be folded exactly once",
+        )
         original_stage = store.stage_close
         store.stage_close = _always_fail("terminal staging failure (PG down)")
         cycle = contour.run_cycle({"BTCUSDT": entry}, bars=bars)
@@ -3451,15 +3515,25 @@ class TestCodexRound12OnPostgres:
         assert store3.list_pending_closes() == []
 
         obligations = [
-            o for o in store3.list_funding_obligations()
+            o
+            for status in (FUNDING_OBLIGATION_OPEN, FUNDING_OBLIGATION_SETTLED)
+            for o in store3.list_funding_obligations(status)
             if o.position_key == position_key
         ]
         assert len(obligations) == 1, "the funding observation exactly once"
         assert int(obligations[0].periods_due) == 1
         assert int(obligations[0].periods_charged_at_observation) == 0
+        # the window (period 1) was already folded by the normal close path,
+        # so the settlement may only VOID the observation: cost stays 0
+        assert float(getattr(obligations[0], "settled_cost", None) or 0.0) == (
+            0.0
+        ), "the observed obligation must never be booked a second time"
         assert int(final.funding_periods_charged) == int(
             ref["funding_periods_charged"],
         ), "funding is never charged twice"
+        assert final.funding_paid == pytest.approx(
+            ref["funding_paid"], abs=1e-9,
+        ), "the funding cost equals the failure-free control"
 
         assert final.exit_price == pytest.approx(ref["exit_price"], abs=1e-9)
         assert final.net_pnl == pytest.approx(ref["net_pnl"], abs=1e-9)
