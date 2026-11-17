@@ -7136,14 +7136,18 @@ class TestRound13RequiredFinancialSnapshotValidation:
         assert "JOURNAL_SNAPSHOT_RESTORE_FAILED" in reason, reason
         assert "JOURNAL_FINANCIAL_FIELD_MISSING:net_pnl" in reason, reason
 
-        # hand repair -> the FROZEN loss is restored exactly once
+        # hand repair -> the FROZEN loss is restored exactly once (the
+        # POSITION net — never the 0.0 substitute, and never one leg's
+        # amount: with a partial leg those legitimately differ)
+        frozen_net = json.loads(original.decode("utf-8"))["snapshot"]["net_pnl"]
         path.write_bytes(original)
         restarted.run_cycle({pos.symbol: entry}, bars=_quiescent_bar(pos, entry))
         row = store.get_position(key)
         assert row.status == POSITION_STATUS_CLOSED
-        assert row.net_pnl == pytest.approx(leg_net, rel=1e-12, abs=1e-9), (
+        assert row.net_pnl == pytest.approx(frozen_net, rel=1e-12, abs=1e-9), (
             "the frozen financial outcome, never 0.0",
         )
+        assert row.net_pnl != 0.0
         assert engine.journal.exists(key) is False
         assert engine.durability_risk is False
         assert engine.accounting_consistent is True

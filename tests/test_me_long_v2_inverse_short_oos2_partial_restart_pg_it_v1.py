@@ -3841,9 +3841,16 @@ class TestCodexRound13OnPostgres:
             "the frozen net_pnl, never a substituted zero",
         )
         assert final.net_pnl != 0.0
-        assert final.net_pnl == pytest.approx(frozen_leg_net_pnl, abs=1e-6), (
-            "net_pnl equals the frozen terminal leg of this record",
-        )
+        # §3.3: with a partial leg the position net may NEVER be compared
+        # to one leg alone — it is the frozen row-level identity instead
+        # (realized legs minus the allocated entry costs and funding)
+        assert final.net_pnl == pytest.approx(
+            final.realized_legs_net
+            - final.entry_cost_allocated
+            - final.funding_paid,
+            abs=1e-6,
+        ), "Gross/Net PnL consistent with legs and costs"
+        assert frozen_leg_net_pnl < 0.0, "the terminal leg keeps its loss"
         legs = _legs(store3, position_key)
         assert [(leg.exit_reason, bool(leg.is_terminal)) for leg in legs] == [
             ("TAKE_PROFIT_1", False), ("STOP_LOSS", True),
