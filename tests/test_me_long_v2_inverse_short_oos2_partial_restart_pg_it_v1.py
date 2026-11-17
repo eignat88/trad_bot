@@ -740,7 +740,7 @@ class TestCodexDurabilityHardeningOnPostgres:
 @_PG_ONLY
 class TestCodexRound2OnPostgres:
     def test_partial_commit_and_stage_failure_defers_update_then_restart_restores(
-        self, running,
+        self, running, tmp_path,
     ):
         """Combined failure on real PostgreSQL: partial commit AND
         stage_close() fail while update_position() itself is healthy —
@@ -749,6 +749,9 @@ class TestCodexRound2OnPostgres:
         store = _connect_store()
         clock = _Clock(datetime.now(timezone.utc))
         contour = _contour(store, clock=clock)
+        # isolate the OOS-2 local durable journal for this test
+        contour.engine.journal = ProtectiveCloseJournal(tmp_path)
+        contour.journal_dir = tmp_path
         event_key = _capture_event(store, age=timedelta(seconds=5))
         contour.run_cycle({"BTCUSDT": 100.0})
         position_key = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:{event_key}"
@@ -814,35 +817,45 @@ class TestCodexRound2OnPostgres:
 
         store2 = _connect_store()
         contour2 = _contour(store2, clock=clock)
+        contour2.engine.journal = ProtectiveCloseJournal(tmp_path)
+        contour2.journal_dir = tmp_path
         restored = store2.get_position(position_key)
         assert restored is not None
         assert restored.status == "OPEN"
         assert restored.tp1_executed is False
         assert restored.remaining_size == pytest.approx(size, rel=1e-9)
-        assert contour2.engine.dirty_leg_keys == ()
-        assert contour2.engine.durability_risk is False
+        engine2 = contour2.engine
+        assert engine2.dirty_leg_keys == ()
+        # Round 9 (P1, Codex r4590138816): the frozen protective close was
+        # journaled BEFORE staging, so the restart replays it as a RETAINED
+        # close instead of leaving a STOP to be re-derived from market
+        # data — while the DURABLE row is still the untouched pre-close
+        # state and the owed staging is still visible as a durability risk.
+        assert position_key in engine2.pending_closes
+        assert engine2.journal.paths(), "the recovery record survived"
+        assert engine2.durability_risk is True, "the staged snapshot is owed"
 
-        # Partial close restored exactly once.
-        contour2.run_cycle({"BTCUSDT": entry * 0.945})
-        legs = _legs(store2, position_key)
-        assert [leg.leg_seq for leg in legs] == [1]
-        assert legs[0].exit_reason == "TAKE_PROFIT_1"
-
-        # Terminal close lands exactly once WITH its leg + outbox rows.
+        # ONE recovery cycle replays the frozen snapshot: the owed partial
+        # leg and the terminal leg land in the SAME idempotent transaction
+        # and then the terminal UPDATE flips the row.
         cycle = contour2.run_cycle({"BTCUSDT": entry}, bars=bars)
-        assert cycle["exit_reasons"] == ["STOP_LOSS"]
+        assert cycle["exit_reasons"] == [], (
+            "a retained protective close must never be re-evaluated",
+        )
         assert cycle["pending_closes"] == 0
         legs = _legs(store2, position_key)
         assert [leg.leg_seq for leg in legs] == [1, 3]
         assert store2.list_pending_closes() == []
         final = store2.get_position(position_key)
         assert final is not None and final.status == "CLOSED"
+        assert final.tp1_executed is True
         closed_qty = sum(leg.quantity for leg in legs)
         assert round(final.position_size - final.remaining_size, 9) == round(
             closed_qty, 9,
         ), "quantity conservation across both restored closes"
         assert not contour2.engine.durability_risk
         assert contour2.engine.dirty_leg_keys == ()
+        assert engine2.journal.paths() == [], "retired after completion"
         assert contour2.engine.balance == pytest.approx(
             store2.balance_components()["balance"], abs=1e-6,
         )
@@ -952,7 +965,7 @@ class TestCodexRound2OnPostgres:
 @_PG_ONLY
 class TestCodexRound3OnPostgres:
     def test_fault_injection_pending_snapshot_leg_replay_restart_reconciliation(
-        self, running, pg_conn,
+        self, running, pg_conn, tmp_path,
     ):
         """Mandatory sequence on real PostgreSQL with migration 088:
         TP1 persistence failure -> STOP -> terminal staging failure ->
@@ -988,6 +1001,9 @@ class TestCodexRound3OnPostgres:
         store = _connect_store()
         clock = _Clock(datetime.now(timezone.utc))
         contour = _contour(store, clock=clock)
+        # isolate the OOS-2 local durable journal for this test
+        contour.engine.journal = ProtectiveCloseJournal(tmp_path)
+        contour.journal_dir = tmp_path
         # Distinct deterministic identity vs the reference run's signal
         # (candle step back): the two scenario signals never collide.
         event_key = _capture_event(
@@ -1060,18 +1076,28 @@ class TestCodexRound3OnPostgres:
 
         store2 = _connect_store()
         contour2 = _contour(store2, clock=clock)
+        contour2.engine.journal = ProtectiveCloseJournal(tmp_path)
+        contour2.journal_dir = tmp_path
         restored = store2.get_position(position_key)
         assert restored.status == "OPEN"
         assert restored.tp1_executed is False
-        assert contour2.engine.dirty_leg_keys == ()
-        assert contour2.engine.durability_risk is False
+        engine2 = contour2.engine
+        assert engine2.dirty_leg_keys == ()
+        # Round 9 (P1, Codex r4590138816): the frozen protective close was
+        # journaled BEFORE staging, so it survived the restart as a
+        # RETAINED close instead of existing only in process memory —
+        # while the DURABLE row is still the untouched pre-close state.
+        assert position_key in engine2.pending_closes
+        assert engine2.journal.paths(), "the recovery record survived"
+        assert engine2.durability_risk is True, "the staged snapshot is owed"
 
-        # (f) reconciliation: TP1 exactly once, then the protective STOP
-        contour2.run_cycle({"BTCUSDT": entry * 0.945})
-        legs = _legs(store2, position_key)
-        assert [leg.exit_reason for leg in legs] == ["TAKE_PROFIT_1"]
+        # (f) reconciliation: ONE recovery cycle replays the frozen
+        #     snapshot through the unified terminal-close recovery — owed
+        #     partial leg, terminal leg and outbox in one transaction.
         cycle = contour2.run_cycle({"BTCUSDT": entry}, bars=bars)
-        assert cycle["exit_reasons"] == ["STOP_LOSS"]
+        assert cycle["exit_reasons"] == [], (
+            "a retained protective close must never be re-evaluated",
+        )
         assert cycle["pending_closes"] == 0
 
         legs = _legs(store2, position_key)
