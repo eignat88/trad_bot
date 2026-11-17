@@ -3266,18 +3266,18 @@ class TestCodexRound12OnPostgres:
     def _damaged_nested_payload(
         tmp_path, position_key,
     ) -> tuple[bytes, object]:
-        """Freeze the valid record's bytes, then damage ONLY the nested
-        snapshot (``snapshot.position_key`` removed) while keeping the
-        outer record and a structurally VALID funding obligation intact.
+        """Build the VALID record (outer structure + a structurally VALID
+        funding obligation, nested snapshot intact), freeze those bytes as
+        the copy a HAND repair restores, then damage ONLY the nested
+        snapshot (``snapshot.position_key`` removed).
         Returns ``(original_bytes, path)``."""
         journal = ProtectiveCloseJournal(tmp_path)
         path = journal._path(position_key)
-        original = path.read_bytes()
-        payload = json.loads(original.decode("utf-8"))
+        payload = json.loads(path.read_bytes().decode("utf-8"))
         assert payload["exit_reason"] == "STOP_LOSS"
         assert payload["staged"] is False
         assert isinstance(payload["snapshot"], dict)
-        payload["snapshot"].pop("position_key", None)
+        # 1) the valid funding half is part of the VALID record
         payload["obligation"] = {
             "obligation_key": f"{position_key}:round12",
             "position_key": position_key,
@@ -3291,6 +3291,9 @@ class TestCodexRound12OnPostgres:
             "legs_ref_max_seq": -1,
             "status": FUNDING_OBLIGATION_OPEN,
         }
+        original = json.dumps(payload).encode("utf-8")
+        # 2) only the nested snapshot is damaged afterwards
+        payload["snapshot"].pop("position_key", None)
         path.write_text(json.dumps(payload), encoding="utf-8")
         return original, path
 
