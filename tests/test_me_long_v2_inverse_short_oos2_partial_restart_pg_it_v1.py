@@ -2923,61 +2923,6 @@ class TestCodexRound10OnPostgres:
         return facts
 
     @staticmethod
-    def _failure_free_reference_funded(pg_conn) -> dict:
-        """Failure-free control that ALSO charges exactly one funding
-        period before the STOP.
-
-        The injected obligation in the fault run below carries the frozen
-        window ``periods_charged_at_observation + 1 .. periods_due`` =
-        ``1..1``, so the normal close fold must have booked period 1 first
-        and the settlement may only VOID the observation (cost 0).  Every
-        fact of the recovered close has to equal this control to prove the
-        funding observation was never charged twice."""
-        store = _connect_store()
-        clock = _Clock(datetime.now(timezone.utc))
-        contour = InverseShortContour(
-            _settings(), store, clock=clock, activation_enabled=True,
-        )
-        event = _capture_event(store, age=timedelta(seconds=5))
-        contour.run_cycle({"BTCUSDT": 100.0})
-        position_key = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:{event}"
-        row = store.get_position(position_key)
-        assert row is not None
-        entry = row.entry_price
-        clock.advance(hours=8)              # exactly one funding period
-        contour.run_cycle(
-            {"BTCUSDT": entry},
-            funding_rates_percent={"BTCUSDT": 0.01},
-        )
-        funded = store.get_position(position_key)
-        assert funded.funding_periods_charged == 1
-        bars = {
-            "BTCUSDT": {
-                "high": funded.stop_price * 1.001, "low": entry * 0.99,
-            },
-        }
-        cycle = contour.run_cycle({"BTCUSDT": entry}, bars=bars)
-        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
-        final = store.get_position(position_key)
-        assert final.status == "CLOSED"
-        assert final.exit_reason == "STOP_LOSS"
-        facts = {
-            "entry_price": final.entry_price,
-            "exit_price": final.exit_price,
-            "net_pnl": final.net_pnl,
-            "funding_periods_charged": final.funding_periods_charged,
-            "funding_paid": final.funding_paid,
-            "balance": store.balance_components()["balance"],
-            "legs": [
-                (leg.exit_reason, bool(leg.is_terminal))
-                for leg in _legs(store, position_key)
-            ],
-        }
-        store.close()
-        _cleanup(pg_conn)
-        return facts
-
-    @staticmethod
     def _poison_journal_read(journal_dir) -> callable:
         """Make every READ of a ``*.json`` recovery record inside
         ``journal_dir`` fail with ``EIO`` (the temporary read failure Codex
@@ -3316,6 +3261,61 @@ class TestCodexRound12OnPostgres:
     outbox, the read-back verification and every restart are the REAL
     PostgreSQL code path with real transactions.
     """
+
+    @staticmethod
+    def _failure_free_reference_funded(pg_conn) -> dict:
+        """Failure-free control that ALSO charges exactly one funding
+        period before the STOP.
+
+        The injected obligation in the fault run below carries the frozen
+        window ``periods_charged_at_observation + 1 .. periods_due`` =
+        ``1..1``, so the normal close fold must have booked period 1 first
+        and the settlement may only VOID the observation (cost 0).  Every
+        fact of the recovered close has to equal this control to prove the
+        funding observation was never charged twice."""
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = InverseShortContour(
+            _settings(), store, clock=clock, activation_enabled=True,
+        )
+        event = _capture_event(store, age=timedelta(seconds=5))
+        contour.run_cycle({"BTCUSDT": 100.0})
+        position_key = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:{event}"
+        row = store.get_position(position_key)
+        assert row is not None
+        entry = row.entry_price
+        clock.advance(hours=8)              # exactly one funding period
+        contour.run_cycle(
+            {"BTCUSDT": entry},
+            funding_rates_percent={"BTCUSDT": 0.01},
+        )
+        funded = store.get_position(position_key)
+        assert funded.funding_periods_charged == 1
+        bars = {
+            "BTCUSDT": {
+                "high": funded.stop_price * 1.001, "low": entry * 0.99,
+            },
+        }
+        cycle = contour.run_cycle({"BTCUSDT": entry}, bars=bars)
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        final = store.get_position(position_key)
+        assert final.status == "CLOSED"
+        assert final.exit_reason == "STOP_LOSS"
+        facts = {
+            "entry_price": final.entry_price,
+            "exit_price": final.exit_price,
+            "net_pnl": final.net_pnl,
+            "funding_periods_charged": final.funding_periods_charged,
+            "funding_paid": final.funding_paid,
+            "balance": store.balance_components()["balance"],
+            "legs": [
+                (leg.exit_reason, bool(leg.is_terminal))
+                for leg in _legs(store, position_key)
+            ],
+        }
+        store.close()
+        _cleanup(pg_conn)
+        return facts
 
     @staticmethod
     def _damaged_nested_payload(
