@@ -3553,3 +3553,354 @@ class TestCodexRound12OnPostgres:
         assert engine3.accounting_consistent is True
         assert store3.get_position(position_key).status == "CLOSED"
         store3.close()
+
+
+class TestCodexRound13OnPostgres:
+    """Round 13 (P2, Codex r4599970100) on real PostgreSQL 17.
+
+    §5 of the finding: PAPER_ONLY OPEN → protective STOP → staging
+    failure → durable journal → runtime ends → ``snapshot.net_pnl``
+    deleted from the test journal copy → restart → STRICT financial
+    validation failure → journal exists, recovery gate closed → several
+    flush cycles → the position is NEVER closed with a substituted zero →
+    the original snapshot is restored by hand → the retry recovers the
+    FROZEN close (terminal leg, partial leg, funding, net PnL) → the
+    balance equals the failure-free reference → exactly-once → safe
+    retirement.
+
+    Only the journal payload is damaged; leg staging, the terminal
+    UPDATE, the outbox, the read-back verification and every restart are
+    the REAL PostgreSQL code path with real transactions.
+    """
+
+    @staticmethod
+    def _failure_free_reference_funded_partial(pg_conn) -> dict:
+        """Failure-free control: TP1 partial at t0, exactly one funding
+        period, then the STOP — the financial truth every fact of the
+        recovered close must equal."""
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = InverseShortContour(
+            _settings(), store, clock=clock, activation_enabled=True,
+        )
+        event = _capture_event(store, age=timedelta(seconds=5))
+        contour.run_cycle({"BTCUSDT": 100.0})
+        position_key = f"ME_LONG_V2_INVERSE_SHORT_OOS2_V1:{event}"
+        row = store.get_position(position_key)
+        assert row is not None
+        entry = row.entry_price
+        # TP1 at t0 (price falls through +5% for the inverse SHORT)
+        tp1_bars = {"BTCUSDT": {"high": entry * 1.05, "low": entry * 0.94}}
+        tp1_cycle = contour.run_cycle({"BTCUSDT": entry}, bars=tp1_bars)
+        partial = _legs(store, position_key)
+        assert len(partial) == 1, tp1_cycle
+        assert partial[0].exit_reason == "TAKE_PROFIT_1", partial
+        after_tp1 = store.get_position(position_key)
+        assert after_tp1.remaining_size < after_tp1.position_size, (
+            "TP1 really consumed part of the size",
+        )
+        clock.advance(hours=8)              # exactly one funding period
+        contour.run_cycle(
+            {"BTCUSDT": entry},
+            funding_rates_percent={"BTCUSDT": 0.01},
+        )
+        funded = store.get_position(position_key)
+        assert funded.funding_periods_charged == 1
+        bars = {
+            "BTCUSDT": {
+                "high": funded.stop_price * 1.001, "low": entry * 0.99,
+            },
+        }
+        cycle = contour.run_cycle({"BTCUSDT": entry}, bars=bars)
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        final = store.get_position(position_key)
+        assert final.status == "CLOSED"
+        assert final.exit_reason == "STOP_LOSS"
+        facts = {
+            "entry_price": final.entry_price,
+            "exit_price": final.exit_price,
+            "net_pnl": final.net_pnl,
+            "gross_pnl": final.gross_pnl,
+            "realized_legs_net": final.realized_legs_net,
+            "entry_cost_allocated": final.entry_cost_allocated,
+            "funding_periods_charged": final.funding_periods_charged,
+            "funding_paid": final.funding_paid,
+            "balance": store.balance_components()["balance"],
+            "legs": [
+                (
+                    leg.exit_reason,
+                    bool(leg.is_terminal),
+                    leg.quantity,
+                    leg.net_pnl,
+                )
+                for leg in _legs(store, position_key)
+            ],
+        }
+        assert [leg[0] for leg in facts["legs"]] == [
+            "TAKE_PROFIT_1", "STOP_LOSS",
+        ], "the control really carries a partial leg"
+        store.close()
+        _cleanup(pg_conn)
+        return facts
+
+    @staticmethod
+    def _damaged_financial_payload(
+        tmp_path, position_key,
+    ) -> tuple[bytes, object]:
+        """Freeze the VALID record bytes (outer structure + a structurally
+        VALID funding obligation, nested snapshot intact), then damage
+        ONLY ``snapshot.net_pnl`` — the reproduced defect.  Returns
+        ``(original_bytes, path)``."""
+        journal = ProtectiveCloseJournal(tmp_path)
+        path = journal._path(position_key)
+        payload = json.loads(path.read_bytes().decode("utf-8"))
+        assert payload["exit_reason"] == "STOP_LOSS"
+        assert payload["staged"] is False
+        assert isinstance(payload["snapshot"], dict)
+        assert payload["snapshot"]["net_pnl"] < 0.0, (
+            "the frozen close is a real loss before the damage",
+        )
+        # the valid funding half is part of the VALID record
+        payload["obligation"] = {
+            "obligation_key": f"{position_key}:round13",
+            "position_key": position_key,
+            "symbol": payload["snapshot"].get("symbol", "BTCUSDT"),
+            "event_key": "",
+            "observed_rate_percent": 0.01,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "entered_at": payload["snapshot"]["entered_at"],
+            # migration 089: CHECK (periods_due > 0) and
+            # CHECK (periods_charged_at_observation < periods_due)
+            "periods_due": 1,
+            "periods_charged_at_observation": 0,
+            "legs_ref_max_seq": -1,
+            "status": FUNDING_OBLIGATION_OPEN,
+        }
+        original = json.dumps(payload).encode("utf-8")
+        # only the required financial field is damaged afterwards
+        payload["snapshot"].pop("net_pnl", None)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return original, path
+
+    def test_financial_snapshot_damage_fails_closed_then_recovers(
+        self, running, pg_conn, tmp_path,
+    ):
+        """§5 on real PostgreSQL 17: deleting ``snapshot.net_pnl`` must
+        fail closed with an explicit financial diagnostic — never a CLOSED
+        row with a substituted 0.0, never a deleted journal — and the hand
+        repair must recover the frozen loss exactly, at the failure-free
+        balance."""
+        ref = self._failure_free_reference_funded_partial(pg_conn)
+
+        # ---- 1-4. STOP with PostgreSQL staging DOWN -> durable journal ---
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = InverseShortContour(
+            _settings(), store, clock=clock, activation_enabled=True,
+            journal_dir=tmp_path,
+        )
+        position_key, row, stop_bars = TestCodexRound5OnPostgres._open_fault_position(  # noqa: E501
+            store, clock, contour, candle_steps=1,
+        )
+        entry = row.entry_price
+        # TP1 first (same bars as the control), committed durably
+        tp1_cycle = contour.run_cycle(
+            {"BTCUSDT": entry},
+            bars={"BTCUSDT": {"high": entry * 1.05, "low": entry * 0.94}},
+        )
+        partial = _legs(store, position_key)
+        assert len(partial) == 1, tp1_cycle
+        assert partial[0].exit_reason == "TAKE_PROFIT_1", partial
+        clock.advance(hours=8)              # exactly one funding period
+        contour.run_cycle(
+            {"BTCUSDT": entry},
+            funding_rates_percent={"BTCUSDT": 0.01},
+        )
+        row = store.get_position(position_key)
+        assert row.funding_periods_charged == 1, (
+            "the frozen funding window must already be folded exactly once",
+        )
+        original_stage = store.stage_close
+        store.stage_close = _always_fail("terminal staging failure (PG down)")
+        cycle = contour.run_cycle({"BTCUSDT": entry}, bars=stop_bars)
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        store.stage_close = original_stage
+
+        assert store.get_position(position_key).status == "OPEN", (
+            "terminal UPDATE withheld until staging is durable",
+        )
+        record = contour.engine.journal.read_all()[position_key]
+        assert record.exit_reason == "STOP_LOSS"
+
+        # ---- 5-6. runtime ends; ONLY net_pnl is damaged in place ---------
+        original_payload, record_path = self._damaged_financial_payload(
+            tmp_path, position_key,
+        )
+        frozen_net_pnl = json.loads(original_payload.decode("utf-8"))[
+            "snapshot"
+        ]["net_pnl"]
+        frozen_leg_net_pnl = json.loads(original_payload.decode("utf-8"))[
+            "terminal_leg"
+        ]["net_pnl"]
+        on_disk = json.loads(record_path.read_text(encoding="utf-8"))
+        assert "net_pnl" not in on_disk["snapshot"], "the field is gone"
+        assert frozen_leg_net_pnl < 0.0, "the terminal leg keeps the loss"
+        assert on_disk["obligation"] is not None, "funding half is valid"
+        store.close()
+
+        # ---- 7-8. restart -> CONTROLLED financial failure, no mutation ---
+        store2 = _connect_store()
+        contour2 = InverseShortContour(
+            _settings(), store2, clock=clock, activation_enabled=True,
+            journal_dir=tmp_path,
+        )
+        engine2 = contour2.engine
+        assert engine2.journal_read_blocked is True
+        failure = engine2.journal_read_failure or ""
+        assert JOURNAL_SNAPSHOT_RESTORE_FAILED in failure, failure
+        assert "JOURNAL_FINANCIAL_FIELD_MISSING:net_pnl" in failure, failure
+        assert "stage=snapshot_financial" in failure, failure
+        assert engine2.durability_risk is True
+        assert engine2.accounting_consistent is False
+        assert store2.get_position(position_key).status == "OPEN"
+        assert engine2.pending_closes == {}, "nothing was registered"
+        assert position_key not in engine2._pending_obligations, (
+            "the funding obligation is not restored either",
+        )
+        # only the durably committed TP1 exists — the terminal leg never
+        legs_before = _legs(store2, position_key)
+        assert [leg.exit_reason for leg in legs_before] == ["TAKE_PROFIT_1"], (
+            legs_before,
+        )
+
+        # ---- 9-11. several flush cycles: gate shut, never closed ---------
+        damaged_bytes = record_path.read_bytes()
+        for cycle_no in range(3):
+            flushed = engine2.flush_pending_closes()
+            assert flushed == 0, cycle_no
+            assert engine2.journal_read_blocked is True, cycle_no
+            assert engine2.durability_risk is True, cycle_no
+            assert engine2.accounting_consistent is False, cycle_no
+            assert record_path.read_bytes() == damaged_bytes, cycle_no
+            row2 = store2.get_position(position_key)
+            assert row2.status == "OPEN", (
+                f"cycle {cycle_no}: a damaged snapshot closed the position "
+                f"as net_pnl={row2.net_pnl!r}",
+            )
+            assert engine2.open_entries({"ETHUSDT": 100.0}) == [], cycle_no
+            assert store2.get_funding_obligation(position_key) is None, (
+                "no funding row may appear from an unpreparable record",
+            )
+
+        non_triggering = {
+            "BTCUSDT": {"high": row.stop_price * 0.5, "low": entry * 0.99},
+        }
+        blocked = contour2.run_cycle({"BTCUSDT": entry}, bars=non_triggering)
+        assert blocked["exit_reasons"] == [], (
+            "exit evaluation stays suspended — the STOP is never re-derived",
+        )
+        assert blocked["entries"] == 0
+        assert store2.get_position(position_key).status == "OPEN"
+        assert record_path.exists()
+
+        # ---- repeated restart -> the SAME controlled verdict -------------
+        store2.close()
+        store3 = _connect_store()
+        contour3 = InverseShortContour(
+            _settings(), store3, clock=clock, activation_enabled=True,
+            journal_dir=tmp_path,
+        )
+        engine3 = contour3.engine
+        assert engine3.journal_read_blocked is True
+        assert "JOURNAL_FINANCIAL_FIELD_MISSING:net_pnl" in (
+            engine3.journal_read_failure or ""
+        ), engine3.journal_read_failure
+        assert record_path.exists()
+        engine3.flush_pending_closes()
+        assert engine3.journal_read_blocked is True
+        assert record_path.exists(), "a repeated restart never deletes it"
+        assert store3.get_position(position_key).status == "OPEN"
+
+        # ---- 12-13. hand repair -> retry -> frozen FINANCIAL result ------
+        record_path.write_bytes(original_payload)
+        cycle3 = contour3.run_cycle({"BTCUSDT": entry}, bars=non_triggering)
+        assert engine3.journal_read_blocked is False, (
+            "a clean read must open the recovery gate",
+        )
+        assert engine3.journal_read_failure is None
+        assert cycle3["exit_reasons"] == [], "from the snapshot, not data"
+
+        # ---- 14-17. CLOSED, exactly once, reference facts, retirement ----
+        final = store3.get_position(position_key)
+        assert final.status == "CLOSED"
+        assert final.exit_reason == "STOP_LOSS"
+        assert final.exit_price == pytest.approx(record.fill_price, rel=1e-9)
+        # the FROZEN financial outcome — never the 0.0 the baseline
+        # substituted for the removed field
+        assert final.net_pnl == pytest.approx(frozen_net_pnl, abs=1e-9), (
+            "the frozen net_pnl, never a substituted zero",
+        )
+        assert final.net_pnl != 0.0
+        assert final.net_pnl == pytest.approx(frozen_leg_net_pnl, abs=1e-6), (
+            "net_pnl equals the frozen terminal leg of this record",
+        )
+        legs = _legs(store3, position_key)
+        assert [(leg.exit_reason, bool(leg.is_terminal)) for leg in legs] == [
+            ("TAKE_PROFIT_1", False), ("STOP_LOSS", True),
+        ], "exactly the two durable legs, no duplication"
+        assert final.remaining_size == 0.0
+        assert engine3.pending_closes == {}
+        assert store3.list_pending_closes() == []
+
+        obligations = [
+            o
+            for status in (FUNDING_OBLIGATION_OPEN, FUNDING_OBLIGATION_SETTLED)
+            for o in store3.list_funding_obligations(status)
+            if o.position_key == position_key
+        ]
+        assert len(obligations) == 1, "the funding observation exactly once"
+        assert int(obligations[0].periods_due) == 1
+        assert int(obligations[0].periods_charged_at_observation) == 0
+        # the window (period 1) was already folded by the normal close path,
+        # so the settlement may only VOID the observation: cost stays 0
+        assert float(getattr(obligations[0], "settled_cost", None) or 0.0) == (
+            0.0
+        ), "the observed obligation must never be booked a second time"
+        assert int(final.funding_periods_charged) == int(
+            ref["funding_periods_charged"],
+        ), "funding is never charged twice"
+        assert final.funding_paid == pytest.approx(
+            ref["funding_paid"], abs=1e-9,
+        ), "the funding cost equals the failure-free control"
+
+        assert final.entry_price == pytest.approx(ref["entry_price"], abs=1e-9)
+        assert final.exit_price == pytest.approx(ref["exit_price"], abs=1e-9)
+        assert final.net_pnl == pytest.approx(ref["net_pnl"], abs=1e-9)
+        assert final.gross_pnl == pytest.approx(ref["gross_pnl"], abs=1e-9)
+        assert final.realized_legs_net == pytest.approx(
+            ref["realized_legs_net"], abs=1e-9,
+        )
+        assert final.entry_cost_allocated == pytest.approx(
+            ref["entry_cost_allocated"], abs=1e-9,
+        )
+        assert store3.balance_components()["balance"] == pytest.approx(
+            ref["balance"], abs=1e-6,
+        ), "balance must equal the failure-free control"
+        assert engine3.balance == pytest.approx(
+            store3.balance_components()["balance"], abs=1e-6,
+        )
+        # the PARTIAL leg and the terminal leg both match the control
+        ref_legs = ref["legs"]
+        assert len(legs) == len(ref_legs)
+        for leg, (reason, terminal, quantity, net_pnl) in zip(legs, ref_legs):
+            assert leg.exit_reason == reason
+            assert bool(leg.is_terminal) == terminal
+            assert leg.quantity == pytest.approx(quantity, abs=1e-9)
+            assert leg.net_pnl == pytest.approx(net_pnl, abs=1e-9), reason
+
+        # ---- safe retirement: only AFTER the durable confirmation --------
+        assert engine3.journal.paths() == [], "retired after proven recovery"
+        assert engine3.durability_risk is False
+        assert engine3.accounting_consistent is True
+        assert store3.get_position(position_key).status == "CLOSED"
+        store3.close()

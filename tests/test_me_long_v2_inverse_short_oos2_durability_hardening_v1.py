@@ -7060,3 +7060,617 @@ class TestRound12AtomicJournalReplayAndSafeRetirement:
         )
         assert store.get_position(key).status == POSITION_STATUS_CLOSED
         _assert_ledger_consistent(restarted)
+
+
+# ---------------------------------------------------------------------------
+# Round 13 (P2, Codex r4599970100): REQUIRED financial snapshot validation
+# and journal retirement integrity — mandatory scenarios A–R.
+# ---------------------------------------------------------------------------
+class TestRound13RequiredFinancialSnapshotValidation:
+    """Mandatory scenarios A–R for Codex thread r4599970100.
+
+    The reproduced defect: dropping ``snapshot.net_pnl`` made
+    ``InverseShortPosition.from_dict()`` default it to 0.0, so Phase A
+    accepted the record, recovery persisted a CLOSED row with
+    ``net_pnl=0.0`` against a terminal leg of ≈ -50.85, the journal was
+    deleted and ``accounting_consistent`` turned True.  Every negative
+    test below asserts the full fail-closed contract: no unhandled
+    exception, ``durability_risk=True``, ``accounting_consistent=False``,
+    entries refused, no re-exit-evaluation, journal preserved.
+    """
+
+    # Round 12 machinery, reused unchanged (same damage + fail-closed
+    # contract so both rounds stay directly comparable).
+    @staticmethod
+    def _damaged_stop(settings, tmp_path, damage, **setup_kwargs):
+        return TestRound12AtomicJournalReplayAndSafeRetirement._damaged_stop(
+            settings, tmp_path, damage, **setup_kwargs,
+        )
+
+    @staticmethod
+    def _assert_fail_closed(restarted, engine, store, pos, key, entry, path):
+        return (
+            TestRound12AtomicJournalReplayAndSafeRetirement._assert_fail_closed(
+                restarted, engine, store, pos, key, entry, path,
+            )
+        )
+
+    # -- the reproduced Codex scenario (§2 of the finding) -----------------
+    def test_a_codex_reproduced_zero_pnl_close_never_happens(self, tmp_path):
+        """Codex's exact reproduction: only ``snapshot.net_pnl`` is removed.
+        Before the fix the recovery closed the position with ``net_pnl=0.0``
+        while the terminal leg kept ≈ -50.85, deleted the journal and
+        reported ``accounting_consistent=True``.  After the fix the record
+        stays fail-closed until it is repaired by hand — and the repaired
+        recovery restores the FROZEN loss, never a substituted zero."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage, path, original = (
+            self._damaged_stop(
+                settings, tmp_path,
+                lambda p: p["snapshot"].pop("net_pnl", None),
+            )
+        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        leg_net = float(payload["terminal_leg"]["net_pnl"])
+        assert "net_pnl" not in payload["snapshot"], "the field really is gone"
+        assert leg_net < 0.0, "the frozen close is a real loss"
+
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        # trigger the replay first so the baseline failure is the DEFECT,
+        # not a missing diagnostic
+        restarted.run_cycle({pos.symbol: entry}, bars=_round8_stop_bars(pos, entry))
+        row = store.get_position(key)
+        assert not (
+            row.status == POSITION_STATUS_CLOSED and row.net_pnl == 0.0
+        ), (
+            f"recovered net_pnl={row.net_pnl!r} while the frozen terminal "
+            f"leg says {leg_net!r} — a damaged snapshot may never close "
+            "with a substituted zero",
+        )
+        assert path.exists(), "the journal is deleted over a lost PnL only"
+        assert engine.accounting_consistent is False
+        assert engine.durability_risk is True
+        assert store.get_position(key).status == POSITION_STATUS_OPEN
+        reason = engine.journal_read_failure or ""
+        assert "JOURNAL_SNAPSHOT_RESTORE_FAILED" in reason, reason
+        assert "JOURNAL_FINANCIAL_FIELD_MISSING:net_pnl" in reason, reason
+
+        # hand repair -> the FROZEN loss is restored exactly once
+        path.write_bytes(original)
+        restarted.run_cycle({pos.symbol: entry}, bars=_quiescent_bar(pos, entry))
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.net_pnl == pytest.approx(leg_net, rel=1e-12, abs=1e-9), (
+            "the frozen financial outcome, never 0.0",
+        )
+        assert engine.journal.exists(key) is False
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+    # -- A–H plus the audit-driven extras ---------------------------------
+    @pytest.mark.parametrize(
+        ("case", "damage", "code", "stage"),
+        [
+            (
+                "A_net_pnl_missing",
+                lambda p: p["snapshot"].pop("net_pnl", None),
+                "JOURNAL_FINANCIAL_FIELD_MISSING:net_pnl",
+                "snapshot_financial",
+            ),
+            (
+                "B_net_pnl_null",
+                lambda p: p["snapshot"].__setitem__("net_pnl", None),
+                "JOURNAL_FINANCIAL_FIELD_INVALID:net_pnl",
+                "snapshot_financial",
+            ),
+            (
+                "C_net_pnl_nan",
+                lambda p: p["snapshot"].__setitem__("net_pnl", float("nan")),
+                "JOURNAL_FINANCIAL_FIELD_INVALID:net_pnl",
+                "snapshot_financial",
+            ),
+            (
+                "D_net_pnl_infinite",
+                lambda p: p["snapshot"].__setitem__("net_pnl", float("inf")),
+                "JOURNAL_FINANCIAL_FIELD_INVALID:net_pnl",
+                "snapshot_financial",
+            ),
+            (
+                "E_net_pnl_wrong_type",
+                lambda p: p["snapshot"].__setitem__("net_pnl", "-50.85"),
+                "JOURNAL_FINANCIAL_FIELD_INVALID:net_pnl",
+                "snapshot_financial",
+            ),
+            (
+                "F_gross_pnl_missing",
+                lambda p: p["snapshot"].pop("gross_pnl", None),
+                "JOURNAL_FINANCIAL_FIELD_MISSING:gross_pnl",
+                "snapshot_financial",
+            ),
+            (
+                "G_funding_paid_missing",
+                lambda p: p["snapshot"].pop("funding_paid", None),
+                "JOURNAL_FINANCIAL_FIELD_MISSING:funding_paid",
+                "snapshot_financial",
+            ),
+            (
+                "H_realized_legs_net_missing",
+                lambda p: p["snapshot"].pop("realized_legs_net", None),
+                "JOURNAL_FINANCIAL_FIELD_MISSING:realized_legs_net",
+                "snapshot_financial",
+            ),
+            # audit-driven extras: every models.from_dict() default that a
+            # CLOSED recovery snapshot must carry explicitly
+            (
+                "X_exit_price_missing",
+                lambda p: p["snapshot"].pop("exit_price", None),
+                "JOURNAL_FINANCIAL_FIELD_MISSING:exit_price",
+                "snapshot_financial",
+            ),
+            (
+                "X_entry_cost_allocated_missing",
+                lambda p: p["snapshot"].pop("entry_cost_allocated", None),
+                "JOURNAL_FINANCIAL_FIELD_MISSING:entry_cost_allocated",
+                "snapshot_financial",
+            ),
+            (
+                "X_entry_slippage_missing",
+                lambda p: p["snapshot"].pop("entry_slippage", None),
+                "JOURNAL_FINANCIAL_FIELD_MISSING:entry_slippage",
+                "snapshot_financial",
+            ),
+            (
+                "X_funding_periods_negative",
+                lambda p: p["snapshot"].__setitem__("funding_periods", -1),
+                "JOURNAL_FINANCIAL_FIELD_INVALID:funding_periods",
+                "snapshot_financial",
+            ),
+            (
+                "X_remaining_size_nonzero",
+                lambda p: p["snapshot"].__setitem__(
+                    "remaining_size",
+                    p["snapshot"].get("position_size", 1.0),
+                ),
+                "JOURNAL_FINANCIAL_FIELD_INVALID:remaining_size",
+                "snapshot_financial_consistency",
+            ),
+            (
+                "X_terminal_leg_net_pnl_missing",
+                lambda p: p["terminal_leg"].pop("net_pnl", None),
+                "JOURNAL_FINANCIAL_FIELD_MISSING:terminal_leg.net_pnl",
+                "terminal_leg_financial",
+            ),
+        ],
+    )
+    def test_required_financial_field_fails_closed(
+        self, tmp_path, case, damage, code, stage,
+    ):
+        """A–H + audit extras: presence, type, null, NaN/±Infinity and
+        value checks run in Phase A — before the permissive deserializer,
+        before any engine state exists."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage_, path, original = (
+            self._damaged_stop(settings, tmp_path, damage)
+        )
+        damaged_bytes = path.read_bytes()
+        payload = json.loads(original.decode("utf-8"))
+        leg_net = float(payload["terminal_leg"]["net_pnl"])
+        assert leg_net < 0.0, "the frozen close is a real loss"
+
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        # behavioural contract first (so a baseline run fails on the
+        # behaviour, not on a missing diagnostic)
+        self._assert_fail_closed(
+            restarted, engine, store, pos, key, entry, path,
+        )
+        reason = engine.journal_read_failure or ""
+        assert code in reason, (case, reason)
+        assert f"stage={stage}" in reason, (case, reason)
+        # Phase A touched NOTHING
+        assert engine.pending_closes == {}, case
+        assert engine._journal_records == {}, case
+        assert key not in engine._pending_obligations, case
+        assert engine._journal_restore_ok == set(), case
+        # a second flush cycle cannot change the verdict either
+        engine.flush_pending_closes()
+        assert path.read_bytes() == damaged_bytes, "the record is byte-stable"
+        assert store.get_position(key).status == POSITION_STATUS_OPEN, (
+            f"{case}: a damaged snapshot may never produce a CLOSED row",
+        )
+
+    # -- I ----------------------------------------------------------------
+    def test_i_valid_financial_snapshot_recovers(self, tmp_path):
+        """I: an untouched, fully valid snapshot replays, closes and
+        retires — the strict validation never rejects healthy records."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage, path, original = (
+            self._damaged_stop(settings, tmp_path, lambda p: None)
+        )
+        frozen = json.loads(original.decode("utf-8"))["snapshot"]
+        assert frozen["net_pnl"] < 0.0, "a real losing STOP"
+
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        assert engine.journal_read_blocked is False, engine.journal_read_failure
+        assert engine.journal_read_failure is None
+        cycle = restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert cycle["exit_reasons"] == [], "from the snapshot, not data"
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.net_pnl == pytest.approx(frozen["net_pnl"], rel=1e-12)
+        assert row.gross_pnl == pytest.approx(frozen["gross_pnl"], rel=1e-12)
+        assert row.realized_legs_net == pytest.approx(
+            frozen["realized_legs_net"], rel=1e-12,
+        )
+        assert engine.journal.exists(key) is False, "retired after recovery"
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+    # -- J ----------------------------------------------------------------
+    def test_j_position_financial_mismatch_blocks_retirement(self, tmp_path):
+        """J: a durable row whose financial outcome disagrees with the
+        frozen record never retires the journal — and the record becomes
+        restorable again the moment the mismatch is gone (no deadlock)."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage, path, original = (
+            self._damaged_stop(settings, tmp_path, lambda p: None)
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        real_get = store.get_position
+        state = {"tampered": False}
+
+        def tampered_get(position_key, *args, **kwargs):
+            row = real_get(position_key, *args, **kwargs)
+            if state["tampered"] and position_key == key and row is not None:
+                return dataclasses.replace(row, net_pnl=0.0)
+            return row
+
+        store.get_position = tampered_get
+        state["tampered"] = True
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        state["tampered"] = False
+        store.get_position = real_get
+
+        assert real_get(key).status == POSITION_STATUS_CLOSED, (
+            "the close itself must commit",
+        )
+        assert path.exists(), "a financial mismatch never retires the record"
+        assert key in engine._journal_unresolved
+        assert engine.durability_risk is True
+        blocked = restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert blocked["entries"] == 0, "entries stay refused while unresolved"
+
+        # the cause is removed -> the very same record retires (no deadlock)
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_quiescent_bar(pos, entry),
+        )
+        assert engine.journal.exists(key) is False, (
+            "restorable after the error cause is removed",
+        )
+        assert engine.durability_risk is False
+        _assert_ledger_consistent(restarted)
+
+    # -- K ----------------------------------------------------------------
+    def test_k_partial_leg_mismatch_blocks_retirement(self, tmp_path):
+        """K: a durable PARTIAL leg whose financial amount disagrees with
+        the frozen record blocks retirement too (owed legs included)."""
+        settings = _settings()
+        contour, store, clock = _contour(settings, journal_dir=tmp_path)
+        pos = _open_one(contour, store, clock)
+        entry = pos.entry_price
+        key = pos.position_key
+        original_commit = store.commit_partial_exit
+        original_stage = store.stage_close
+
+        # (1) the TP1 commit fails -> the partial leg stays DIRTY in
+        #     memory and is owed by the protective-close record
+        store.commit_partial_exit = _always_fail("TP1 persistence failure")
+        tp1_cycle = contour.run_cycle({pos.symbol: entry * 0.945})
+        assert key in contour.engine.dirty_leg_keys, tp1_cycle
+
+        # (2) staging down as well -> the STOP is journaled with the dirty
+        #     TP1 owed and the terminal UPDATE is deferred (row stays OPEN)
+        store.stage_close = _always_fail("staging down for the whole run")
+        stop_cycle = contour.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert stop_cycle["exit_reasons"] == ["STOP_LOSS"], stop_cycle
+        path = contour.engine.journal._path(key)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["owed_partial_legs"], "the dirty TP1 is owed"
+        assert store.get_position(key).status == POSITION_STATUS_OPEN, (
+            "the deferred UPDATE keeps the row OPEN for the restart replay",
+        )
+
+        store.commit_partial_exit = original_commit
+        store.stage_close = original_stage
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        real_leg = store.get_close_leg
+        state = {"tampered": False}
+
+        def tampered_get_close_leg(position_key, leg_seq, *args, **kwargs):
+            leg = real_leg(position_key, leg_seq, *args, **kwargs)
+            if state["tampered"] and leg is not None and int(leg.leg_seq) == 1:
+                return dataclasses.replace(leg, net_pnl=leg.net_pnl + 5.0)
+            return leg
+
+        store.get_close_leg = tampered_get_close_leg
+        state["tampered"] = True
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        state["tampered"] = False
+        store.get_close_leg = real_leg
+
+        assert store.get_position(key).status == POSITION_STATUS_CLOSED
+        assert path.exists(), "a partial-leg mismatch never retires the record"
+        assert key in engine._journal_unresolved
+        assert engine.durability_risk is True
+
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_quiescent_bar(pos, entry),
+        )
+        assert engine.journal.exists(key) is False, (
+            "restorable after the leg mismatch is removed",
+        )
+        assert engine.durability_risk is False
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+    # -- L ----------------------------------------------------------------
+    def test_l_funding_mismatch_fails_closed_without_loss_or_duplication(
+        self, tmp_path,
+    ):
+        """L: a snapshot whose funding total contradicts its own frozen
+        terminal leg fails closed — nothing booked (no duplication) and
+        the record kept (no loss)."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage, path, original = (
+            self._damaged_stop(
+                settings, tmp_path,
+                lambda p: p["snapshot"].__setitem__(
+                    "funding_paid",
+                    float(p["snapshot"].get("funding_paid") or 0.0) + 7.0,
+                ),
+            )
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        self._assert_fail_closed(
+            restarted, engine, store, pos, key, entry, path,
+        )
+        reason = engine.journal_read_failure or ""
+        assert "JOURNAL_FINANCIAL_FIELD_INVALID:funding_paid" in reason, reason
+        assert "stage=snapshot_financial_consistency" in reason, reason
+        # no loss: the record survives; no duplication: nothing was booked
+        assert path.exists()
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_OPEN
+        assert row.funding_paid == 0.0, "funding is never booked twice"
+        assert row.funding_periods_charged == 0
+        assert key not in engine._pending_obligations
+
+    # -- M ----------------------------------------------------------------
+    def test_m_two_flush_cycles_keep_the_record(self, tmp_path):
+        """M: two consecutive flush cycles with an unresolved financial
+        error keep the journal and the closed gate."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage, path, original = (
+            self._damaged_stop(
+                settings, tmp_path,
+                lambda p: p["snapshot"].pop("net_pnl", None),
+            )
+        )
+        damaged = path.read_bytes()
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        for cycle_no in range(2):
+            assert engine.flush_pending_closes() == 0, cycle_no
+            assert engine.journal_read_blocked is True, cycle_no
+            assert engine.durability_risk is True, cycle_no
+            assert engine.accounting_consistent is False, cycle_no
+            assert path.read_bytes() == damaged, cycle_no
+            assert store.get_position(key).status == POSITION_STATUS_OPEN, (
+                cycle_no,
+            )
+
+    # -- N ----------------------------------------------------------------
+    def test_n_repeated_restarts_keep_the_fail_closed_verdict(self, tmp_path):
+        """N: every restart re-detects the financial damage and keeps it."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage, path, original = (
+            self._damaged_stop(
+                settings, tmp_path,
+                lambda p: p["snapshot"].pop("net_pnl", None),
+            )
+        )
+        for attempt in range(3):
+            restarted = _restart(
+                contour, settings, clock, journal_dir=tmp_path,
+            )
+            engine = restarted.engine
+            assert engine.journal_read_blocked is True, attempt
+            assert engine.durability_risk is True, attempt
+            assert engine.accounting_consistent is False, attempt
+            reason = engine.journal_read_failure or ""
+            assert "JOURNAL_FINANCIAL_FIELD_MISSING:net_pnl" in reason, attempt
+            assert path.exists(), attempt
+            assert store.get_position(key).status == POSITION_STATUS_OPEN, (
+                attempt,
+            )
+
+    # -- O ----------------------------------------------------------------
+    def test_o_manual_repair_restores_the_frozen_financial_result(
+        self, tmp_path,
+    ):
+        """O: after the hand repair the retry restores the frozen close —
+        the original net_pnl, never a recomputed or zeroed one."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage, path, original = (
+            self._damaged_stop(
+                settings, tmp_path,
+                lambda p: p["snapshot"].pop("net_pnl", None),
+            )
+        )
+        frozen = json.loads(original.decode("utf-8"))["snapshot"]
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        assert engine.journal_read_blocked is True
+
+        path.write_bytes(original)          # manual repair, never automatic
+        cycle = restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert cycle["exit_reasons"] == [], "from the snapshot, not data"
+        assert engine.journal_read_blocked is False
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.net_pnl == pytest.approx(frozen["net_pnl"], rel=1e-12)
+        assert row.net_pnl != 0.0, "the frozen loss, never a substituted 0.0"
+        assert row.exit_price == pytest.approx(
+            json.loads(original)["fill_price"], rel=1e-12,
+        )
+        assert engine.journal.exists(key) is False
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+    # -- P ----------------------------------------------------------------
+    def test_p_ambiguous_commit_keeps_the_frozen_result_exactly_once(
+        self, tmp_path,
+    ):
+        """P: an ambiguous terminal COMMIT (ack lost after the write) still
+        yields exactly one terminal leg with the frozen financial result."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage, path, original = (
+            self._damaged_stop(
+                settings, tmp_path,
+                lambda p: p["snapshot"].pop("net_pnl", None),
+            )
+        )
+        frozen = json.loads(original.decode("utf-8"))["snapshot"]
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        path.write_bytes(original)
+
+        real_update = store.update_position
+        state = {"ack_lost": False}
+
+        def update_then_lose_ack(snapshot, *args, **kwargs):
+            out = real_update(snapshot, *args, **kwargs)
+            if not state["ack_lost"]:
+                state["ack_lost"] = True
+                raise RuntimeError("ambiguous COMMIT (ack lost after the write)")
+            return out
+
+        store.update_position = update_then_lose_ack
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        store.update_position = real_update
+        assert state["ack_lost"] is True, "the ambiguity really fired"
+        # the retry cycle confirms the identical write
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        legs = store.list_close_legs(key)
+        assert [(leg.exit_reason, bool(leg.is_terminal)) for leg in legs] == [
+            ("STOP_LOSS", True),
+        ], legs
+        assert row.net_pnl == pytest.approx(frozen["net_pnl"], rel=1e-12)
+        assert engine.journal.exists(key) is False
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+    # -- Q ----------------------------------------------------------------
+    def test_q_a_new_price_never_re_evaluates_the_frozen_stop(self, tmp_path):
+        """Q: while the financial damage is unresolved, a NEW price that
+        would breach the STOP never re-evaluates the frozen exit."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage, path, original = (
+            self._damaged_stop(
+                settings, tmp_path,
+                lambda p: p["snapshot"].pop("net_pnl", None),
+            )
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        new_price_breach = {
+            pos.symbol: {"high": pos.stop_price * 1.05, "low": entry * 0.97},
+        }
+        cycle = restarted.run_cycle(
+            {pos.symbol: entry * 1.03}, bars=new_price_breach,
+        )
+        assert cycle["exit_reasons"] == [], "the STOP is never re-derived"
+        assert cycle["entries"] == 0, "entries stay refused"
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_OPEN
+        assert row.exit_price is None, "no exit may be invented from data"
+        assert path.exists()
+        assert engine.durability_risk is True
+        assert engine.accounting_consistent is False
+
+    # -- R ----------------------------------------------------------------
+    def test_r_retirement_waits_for_a_confirmed_read_back(self, tmp_path):
+        """R: a successful recovery retires the record ONLY after the
+        durable read-back confirms it — an unconfirmed row keeps the file."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry, stage, path, original = (
+            self._damaged_stop(settings, tmp_path, lambda p: None)
+        )
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        engine = restarted.engine
+        real_get = store.get_position
+        state = {"unconfirmed": False}
+
+        def unconfirmed_get(position_key, *args, **kwargs):
+            row = real_get(position_key, *args, **kwargs)
+            if (
+                state["unconfirmed"]
+                and position_key == key
+                and row is not None
+                and row.status == POSITION_STATUS_CLOSED
+            ):
+                return dataclasses.replace(row, status=POSITION_STATUS_OPEN)
+            return row
+
+        store.get_position = unconfirmed_get
+        state["unconfirmed"] = True
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        state["unconfirmed"] = False
+        store.get_position = real_get
+
+        assert real_get(key).status == POSITION_STATUS_CLOSED
+        assert path.exists(), "no retirement without a confirmed read-back"
+        assert engine.durability_risk is True
+
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_quiescent_bar(pos, entry),
+        )
+        assert engine.journal.exists(key) is False, (
+            "retired only after the confirmation",
+        )
+        assert engine.durability_risk is False
+        assert engine.accounting_consistent is True
+        _assert_ledger_consistent(restarted)

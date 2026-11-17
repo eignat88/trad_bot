@@ -128,19 +128,153 @@ class JournalRestoreError(RuntimeError):
     exception type, and never the journal content.
     """
 
-    def __init__(self, key: str, stage: str, cause: BaseException) -> None:
+    def __init__(
+        self,
+        key: str,
+        stage: str,
+        cause: BaseException,
+        code: str | None = None,
+    ) -> None:
         self.key = key
         self.stage = stage
         self.cause = cause
+        # Round 13 (P2, Codex r4599970100): a REQUIRED-financial-field
+        # failure carries its stable ``JOURNAL_FINANCIAL_FIELD_*`` code;
+        # every other failure keeps the Round 12 contract (the exception
+        # type name — never journal content).
         super().__init__(
             f"{key[:48]}: {JOURNAL_SNAPSHOT_RESTORE_FAILED} "
-            f"(stage={stage}, error={type(cause).__name__})",
+            f"(stage={stage}, error={code or type(cause).__name__})",
         )
 
     @property
     def diagnostic(self) -> str:
         """The fail-closed reason kept in ``journal_read_failure``."""
         return str(self)
+
+
+class SnapshotFinancialFieldError(ValueError):
+    """Round 13 (P2, Codex r4599970100): a REQUIRED financial field of the
+    frozen recovery snapshot (or of a frozen close leg) is missing or
+    unusable.
+
+    Carries only the stable, content-free diagnostic code required by the
+    review — ``JOURNAL_FINANCIAL_FIELD_MISSING:<field>`` or
+    ``JOURNAL_FINANCIAL_FIELD_INVALID:<field>`` — never the payload.
+    """
+
+    def __init__(self, field: str, kind: str) -> None:
+        self.field = field
+        self.kind = kind
+        super().__init__(f"JOURNAL_FINANCIAL_FIELD_{kind}:{field}")
+
+
+# ---------------------------------------------------------------------------
+# Round 13: the FROZEN financial contract of a recovery record.
+#
+# ``InverseShortPosition.from_dict()`` and ``InverseShortCloseLeg.from_dict``
+# PERMISSIVELY default every one of these fields (``row.get(...) or 0.0``).
+# That is correct for the ordinary PostgreSQL read path, where the column
+# always exists and a default never fires — and silent corruption for a
+# damaged journal record, where a dropped ``net_pnl`` would recover the
+# close as 0.0, retire the only durable copy of the real result and report
+# ``accounting_consistent=True`` (Codex reproduced exactly that: recovered
+# ``net_pnl=0.0`` vs terminal leg ≈ -50.85265, journal deleted).
+#
+# These fields are REQUIRED for recovery because they ARE the frozen
+# financial outcome of the close (presence + type + non-null + finite, and
+# for counts an integral non-negative integer):
+_SNAPSHOT_FINANCIAL_FIELDS: tuple[tuple[str, str], ...] = (
+    ("net_pnl", "FLOAT"),
+    ("gross_pnl", "FLOAT"),
+    ("exit_fee", "FLOAT"),
+    ("slippage", "FLOAT"),                 # Σ exit slippage + entry slippage
+    ("funding_paid", "FLOAT"),
+    ("funding_periods", "INT"),
+    ("realized_legs_net", "FLOAT"),
+    ("entry_cost_allocated", "FLOAT"),
+    ("entry_slippage", "FLOAT"),           # entry-cost half of the ledger
+    ("entry_fee", "FLOAT"),
+    ("balance_before", "FLOAT"),
+    ("remaining_size", "FLOAT"),
+    ("entry_price", "POSITIVE"),
+    ("position_size", "POSITIVE"),
+    ("exit_price", "POSITIVE"),            # a CLOSED snapshot always has one
+)
+# The frozen leg halves of the same contract (identity fields such as
+# position_key/exit_reason are already mandatory in from_dict()).
+_LEG_FINANCIAL_FIELDS: tuple[tuple[str, str], ...] = (
+    ("quantity", "POSITIVE"),
+    ("fill_price", "POSITIVE"),
+    ("gross_pnl", "FLOAT"),
+    ("exit_fee", "FLOAT"),
+    ("exit_slippage", "FLOAT"),
+    ("entry_cost_share", "FLOAT"),
+    ("funding_paid_to_date", "FLOAT"),
+    ("net_pnl", "FLOAT"),
+    ("cumulative_realized_net", "FLOAT"),
+)
+# Deliberately NOT required (their documented defaults stay untouched):
+# mfe/mae, highest/lowest_since_entry, last_mark_price, duration_sec,
+# tp2/tp3_price, source/market metadata and the ladder flags — analytics
+# and identity that recovery never books, and (for the ladder flags) state
+# reconstructed from the durable leg rows, not from this snapshot.
+#
+# Numeric tolerance of every frozen-fact comparison: strict enough that a
+# zeroed or shifted amount can never pass, loose enough for the engine's
+# own float accumulation order.
+_FROZEN_FINANCIAL_TOL = 1e-6
+
+
+def _isclose(a: Any, b: Any) -> bool:
+    """Tight agreement for frozen financial amounts (Round 13)."""
+    try:
+        return math.isclose(
+            float(a), float(b), rel_tol=1e-9, abs_tol=_FROZEN_FINANCIAL_TOL,
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def require_frozen_financial_fields(
+    payload: Any,
+    fields: tuple[tuple[str, str], ...],
+    prefix: str = "",
+) -> dict[str, Any]:
+    """Round 13 §3.1/§3.2 strict PRE-deserialization validation.
+
+    Every required field must be PRESENT with an allowed type — never
+    ``null``, never a bool where a number is meant, never NaN/±Infinity,
+    never a non-integral count — and a ``POSITIVE`` field must be > 0.
+    A defect raises :class:`SnapshotFinancialFieldError` carrying only the
+    field code (``MISSING``/``INVALID``), never the payload.
+
+    Returns the validated raw values, so no caller ever re-reads the
+    payload through a permissive ``get(field, 0.0)`` substitution.
+    """
+    facts: dict[str, Any] = {}
+    for field, kind in fields:
+        name = f"{prefix}{field}"
+        if not isinstance(payload, dict) or field not in payload:
+            raise SnapshotFinancialFieldError(name, "MISSING")
+        value = payload[field]
+        if value is None or isinstance(value, bool):
+            raise SnapshotFinancialFieldError(name, "INVALID")
+        if kind == "INT":
+            if not isinstance(value, int) or int(value) < 0:
+                raise SnapshotFinancialFieldError(name, "INVALID")
+            facts[name] = int(value)
+            continue
+        if not isinstance(value, (int, float)):
+            raise SnapshotFinancialFieldError(name, "INVALID")
+        number = float(value)
+        if not math.isfinite(number):
+            raise SnapshotFinancialFieldError(name, "INVALID")
+        if kind == "POSITIVE" and number <= 0.0:
+            raise SnapshotFinancialFieldError(name, "INVALID")
+        facts[name] = number
+    return facts
+
 
 # Allowed exit reasons of this contour (CHECK constraint, migration 088).
 CONTOUR_EXIT_REASONS = frozenset(EXIT_REASONS)
@@ -4257,6 +4391,22 @@ class InverseShortPaperEngine:
         key = record.position_key
 
         # -- the frozen nested snapshot -------------------------------------
+        # Round 13 (P2, Codex r4599970100): the REQUIRED financial fields
+        # are validated on the RAW payload BEFORE the permissive
+        # deserializer runs.  from_dict() would silently default a dropped
+        # ``net_pnl`` to 0.0 — the close would then be recovered, retired
+        # and reported consistent as a zero-PnL trade while the terminal
+        # leg kept ≈ -50.85.  A non-dict payload keeps the Round 12
+        # ``stage=snapshot`` diagnostic untouched.
+        if isinstance(record.snapshot, dict):
+            try:
+                require_frozen_financial_fields(
+                    record.snapshot, _SNAPSHOT_FINANCIAL_FIELDS,
+                )
+            except SnapshotFinancialFieldError as exc:
+                raise JournalRestoreError(
+                    key, "snapshot_financial", exc, code=str(exc),
+                ) from exc
         try:
             snapshot = InverseShortPosition.from_dict(record.snapshot)
         except Exception as exc:
@@ -4289,6 +4439,19 @@ class InverseShortPaperEngine:
             raise JournalRestoreError(
                 key, "terminal_leg", ValueError("TERMINAL_LEG_MISSING"),
             )
+        # Round 13: the leg's own financial half is part of the frozen
+        # contract — a defaulted ``net_pnl``/``cumulative_realized_net``
+        # would silently break every agreement check below.
+        if isinstance(record.terminal_leg, dict):
+            try:
+                require_frozen_financial_fields(
+                    record.terminal_leg, _LEG_FINANCIAL_FIELDS,
+                    prefix="terminal_leg.",
+                )
+            except SnapshotFinancialFieldError as exc:
+                raise JournalRestoreError(
+                    key, "terminal_leg_financial", exc, code=str(exc),
+                ) from exc
         try:
             terminal_leg = InverseShortCloseLeg.from_dict(record.terminal_leg)
         except Exception as exc:
@@ -4321,10 +4484,72 @@ class InverseShortPaperEngine:
         except (TypeError, ValueError) as exc:
             raise JournalRestoreError(key, "terminal_leg_consistency", exc) from exc
 
+        # -- Round 13 §3.3: financial agreement snapshot ↔ terminal leg -----
+        # Only invariants the engine itself already establishes when it
+        # freezes a terminal close (``engine._close()`` + the
+        # ``realized_net_to_date``/allocation contracts of the model) — no
+        # new PnL formula.  A snapshot that disagrees with its own frozen
+        # components is rejected in Phase A, so a zeroed ``net_pnl`` can
+        # never be applied and never reach the retirement proof.
+        try:
+            if snapshot.remaining_size != 0.0:
+                raise SnapshotFinancialFieldError("remaining_size", "INVALID")
+            if snapshot.exit_price is None or not _isclose(
+                snapshot.exit_price, terminal_leg.fill_price,
+            ):
+                raise SnapshotFinancialFieldError("exit_price", "INVALID")
+            if not _isclose(
+                snapshot.realized_legs_net,
+                terminal_leg.cumulative_realized_net,
+            ):
+                raise SnapshotFinancialFieldError(
+                    "realized_legs_net", "INVALID",
+                )
+            if not _isclose(
+                snapshot.funding_paid, terminal_leg.funding_paid_to_date,
+            ):
+                raise SnapshotFinancialFieldError("funding_paid", "INVALID")
+            if not _isclose(
+                snapshot.entry_cost_allocated,
+                snapshot.entry_fee + snapshot.entry_slippage_cost,
+            ):
+                raise SnapshotFinancialFieldError(
+                    "entry_cost_allocated", "INVALID",
+                )
+            if not _isclose(
+                snapshot.net_pnl,
+                snapshot.realized_legs_net
+                - snapshot.entry_fee
+                - snapshot.entry_slippage_cost
+                - snapshot.funding_paid,
+            ):
+                raise SnapshotFinancialFieldError("net_pnl", "INVALID")
+        except SnapshotFinancialFieldError as exc:
+            raise JournalRestoreError(
+                key, "snapshot_financial_consistency", exc, code=str(exc),
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise JournalRestoreError(
+                key, "snapshot_financial_consistency", exc,
+            ) from exc
+
         # -- the owed partial legs ------------------------------------------
         owed: list[InverseShortCloseLeg] = []
         seen: set[int] = set()
         for index, data in enumerate(record.owed_partial_legs):
+            # Round 13: owed legs carry frozen money too (they are staged
+            # from this payload) — validated before the permissive parser.
+            if isinstance(data, dict):
+                try:
+                    require_frozen_financial_fields(
+                        data, _LEG_FINANCIAL_FIELDS,
+                        prefix=f"owed_partial_legs[{index}].",
+                    )
+                except SnapshotFinancialFieldError as exc:
+                    raise JournalRestoreError(
+                        key, f"owed_partial_legs[{index}]_financial", exc,
+                        code=str(exc),
+                    ) from exc
             try:
                 leg = InverseShortCloseLeg.from_dict(data)
             except Exception as exc:
@@ -4616,6 +4841,14 @@ class InverseShortPaperEngine:
         * the row carries THIS record's frozen terminal facts (``closed_at``,
           ``exit_reason``, ``exit_price``, ``remaining_size``) — a different
           close is never retired against (rule 6, idempotency);
+        * Round 13: the row AND the durable leg ledger also carry this
+          record's frozen FINANCIAL facts — ``net_pnl``, ``gross_pnl``,
+          exit fees/slippage, ``funding_paid``/``funding_periods``,
+          ``realized_legs_net``, ``entry_cost_allocated`` and the terminal
+          plus every owed leg's amount — so a zeroed or shifted value (the
+          reproduced defect: ``net_pnl=0.0`` vs a ≈ -50.85 leg) can never
+          retire the record (the documented migration-088 degraded mode —
+          no leg rows exist at all — keeps the identity-only leg skip);
         * every owed partial leg row the record carries is durable, unless
           staging can never write one (the documented migration-088
           degraded mode, where the position row is the only durable half);
@@ -4675,7 +4908,56 @@ class InverseShortPaperEngine:
                 key[:48],
             )
             return False
-        if record.owed_partial_legs and key not in self._staging_unavailable:
+        # Round 13 §3.5 (P2, Codex r4599970100): the durable row must also
+        # carry THIS record's FROZEN financial facts — terminal identity
+        # alone is not a retirement proof.  A zeroed or shifted amount (the
+        # reproduced defect recovered net_pnl=0.0 against a ≈ -50.85 leg)
+        # is never a confirmed recovery: the record is KEPT and the recovery
+        # stays an explicit unresolved obligation.  Field names and the
+        # record id only — never the payload.
+        try:
+            facts = require_frozen_financial_fields(
+                record.snapshot, _SNAPSHOT_FINANCIAL_FIELDS,
+            )
+        except SnapshotFinancialFieldError as exc:
+            self._journal_unresolved.add(key)
+            logger.warning(
+                "me inverse short oos2 journal retirement REFUSED — the "
+                "frozen record's own financial fields are damaged (%s); "
+                "the record is KEPT: key=%s",
+                str(exc), key[:48],
+            )
+            return False
+        for field, column in (
+            ("net_pnl", "net_pnl"),
+            ("gross_pnl", "gross_pnl"),
+            ("exit_fee", "exit_fee"),
+            ("slippage", "slippage_cost"),
+            ("funding_paid", "funding_paid"),
+            ("realized_legs_net", "realized_legs_net"),
+            ("entry_cost_allocated", "entry_cost_allocated"),
+        ):
+            if not _isclose(facts[field], getattr(stored, column)):
+                self._journal_unresolved.add(key)
+                logger.warning(
+                    "me inverse short oos2 journal retirement REFUSED — the "
+                    "durable row's %s does not match the frozen record "
+                    "(never retired against another financial outcome): "
+                    "key=%s",
+                    field, key[:48],
+                )
+                return False
+        if int(stored.funding_periods_charged) != int(facts["funding_periods"]):
+            self._journal_unresolved.add(key)
+            logger.warning(
+                "me inverse short oos2 journal retirement REFUSED — the "
+                "durable row's funding periods do not match the frozen "
+                "record (funding is never lost and never duplicated): "
+                "key=%s",
+                key[:48],
+            )
+            return False
+        if key not in self._staging_unavailable:
             try:
                 terminal_row = self.store.get_close_leg(key, LEG_SEQ_TERMINAL)
                 rows = {
@@ -4694,9 +4976,14 @@ class InverseShortPaperEngine:
                 )
                 return False
             if terminal_row is None:
-                # Staging can never write a leg row here (documented
-                # migration-088 degraded mode): the position row is the
-                # only durable half by definition.
+                # Documented migration-088 degraded mode (Round 12, still
+                # the only case where a terminal leg row may be absent):
+                # staging can never write one, the position row is the only
+                # durable half by definition, and the record's frozen
+                # financial facts were still confirmed against that row
+                # above.  Nothing here can be compared against an absent
+                # ledger, so the leg half of the proof is skipped exactly
+                # as before — never invented, never faked.
                 pass
             elif any(row is None for row in rows.values()):
                 self._journal_unresolved.add(key)
@@ -4709,6 +4996,65 @@ class InverseShortPaperEngine:
                     ),
                 )
                 return False
+            else:
+                # Round 13 §3.5: the durable leg rows that DO exist must
+                # carry the FROZEN financial facts of this record — identity
+                # (seq, reason) alone would let a zeroed or shifted leg
+                # amount retire the record.
+                try:
+                    terminal_leg = InverseShortCloseLeg.from_dict(
+                        record.terminal_leg,
+                    )
+                    owed_by_seq = {
+                        int(data.get("leg_seq", -1)): data
+                        for data in record.owed_partial_legs
+                    }
+                    owed_legs = {
+                        seq: InverseShortCloseLeg.from_dict(owed_by_seq[seq])
+                        for seq in rows
+                    }
+                except Exception:
+                    self._journal_unresolved.add(key)
+                    logger.warning(
+                        "me inverse short oos2 journal retirement REFUSED — "
+                        "the frozen record's leg financials could not be "
+                        "parsed (the record is KEPT): key=%s",
+                        key[:48], exc_info=True,
+                    )
+                    return False
+                if (
+                    not _isclose(terminal_row.net_pnl, terminal_leg.net_pnl)
+                    or not _isclose(
+                        terminal_row.fill_price, terminal_leg.fill_price,
+                    )
+                    or not _isclose(
+                        terminal_row.quantity, terminal_leg.quantity,
+                    )
+                ):
+                    self._journal_unresolved.add(key)
+                    logger.warning(
+                        "me inverse short oos2 journal retirement REFUSED — "
+                        "the durable terminal leg does not match the frozen "
+                        "record financially (the record is KEPT): key=%s",
+                        key[:48],
+                    )
+                    return False
+                for seq, row in rows.items():
+                    leg = owed_legs[seq]
+                    if (
+                        not _isclose(row.net_pnl, leg.net_pnl)
+                        or not _isclose(row.fill_price, leg.fill_price)
+                        or not _isclose(row.quantity, leg.quantity)
+                    ):
+                        self._journal_unresolved.add(key)
+                        logger.warning(
+                            "me inverse short oos2 journal retirement "
+                            "REFUSED — the durable partial leg %d does not "
+                            "match the frozen record financially (the "
+                            "record is KEPT): key=%s",
+                            seq, key[:48],
+                        )
+                        return False
         return True
 
     def _sweep_journal(self) -> None:
