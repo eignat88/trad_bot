@@ -173,8 +173,12 @@ class ProtectiveCloseJournal:
     """Atomic, replayable, de-duplicated local journal (one file per key)."""
 
     def __init__(self, directory: str | Path | None = None) -> None:
+        # Absolute on purpose: every directory this journal fsyncs must be
+        # the REAL one, never a path resolved against the process working
+        # directory (which in the supplied runtime is the release root).
         self.directory = (
-            Path(directory) if directory is not None else DEFAULT_JOURNAL_DIR
+            Path(directory).absolute() if directory is not None
+            else DEFAULT_JOURNAL_DIR
         )
 
     # -- helpers ----------------------------------------------------------
@@ -184,40 +188,60 @@ class ProtectiveCloseJournal:
         digest = hashlib.sha256(position_key.encode("utf-8")).hexdigest()[:40]
         return self.directory / f"{digest}{_SUFFIX}"
 
-    def _ensure_dir(self) -> list[Path]:
-        """Create the journal directory; return the levels ``mkdir`` created.
+    def _ensure_dir(self) -> None:
+        """Create the journal directory if it does not exist yet.
 
-        Round 8 (P2, Codex r4587604985): the directory entries ``mkdir``
-        just created live inside their PARENTS, so those parents have to be
-        synchronised as well — otherwise a crash right after the very first
-        write can lose the whole journal tree before the rename ever
-        happens.  The list is shallowest-first, which is also the order the
-        parents must be flushed in.
+        Round 9 (P2, Codex r4590138839): creation only.  Whether the
+        entries this ``mkdir`` wrote are DURABLE is decided by
+        :meth:`_ancestor_chain` on every write — this method deliberately
+        reports nothing, because "the directory exists now" is not evidence
+        that a previously failed synchronisation ever completed.
         """
         if self.directory.exists():
-            return []
-        missing: list[Path] = []
-        probe = self.directory
-        while not probe.exists() and probe != probe.parent:
-            missing.append(probe)
-            probe = probe.parent
+            return
         self.directory.mkdir(parents=True, exist_ok=True)
-        return list(reversed(missing))
+
+    def _ancestor_chain(self) -> list[Path]:
+        """``self.directory`` followed by its ancestors, root excluded.
+
+        Round 9 (P2, Codex r4590138839): the first write creates the whole
+        tree and then fails while syncing a PARENT directory.  On the retry
+        ``_ensure_dir()`` sees an existing directory and creates nothing, so
+        the old code synchronised only the leaf and reported the record as
+        durable — although the newly created ancestor entries had never been
+        confirmed and a host crash could still lose the entire journal tree.
+
+        The chain is therefore recomputed and synchronised on EVERY write:
+        it is stateless (nothing to lose across a process restart), it
+        cannot be skipped by a de-duplicated rewrite of identical facts, and
+        it needs no separate fsync queue.  Leaf first: the record's own
+        directory entry, then the directories that entry lives in.
+
+        The FILESYSTEM ROOT is deliberately excluded: this journal never
+        creates it (the journal always sits at least one level below an
+        existing tree), and a volume root is not openable as a directory
+        handle on Windows at all.  Every directory whose entry ``mkdir``
+        could have created for this journal is still covered.
+        """
+        chain = [self.directory]
+        probe = self.directory.parent
+        while probe != probe.parent:      # stops before the filesystem root
+            chain.append(probe)
+            probe = probe.parent
+        return chain
 
     # -- public API -------------------------------------------------------
     def write(self, record: PendingProtectiveClose) -> Path:
         """Atomically persist one record; returns the file path.
 
         The record is only reported as written once the payload ``fsync``
-        AND the directory entry of the final name are confirmed durable —
-        any ``OSError`` propagates to the CALLER, which decides how to
-        degrade (it must keep the key flagged as durability risk rather
-        than pretend the record survived).
+        AND the directory entry of the final name AND every ancestor entry
+        this journal depends on are confirmed durable — any ``OSError``
+        propagates to the CALLER, which decides how to degrade (it must keep
+        the key flagged as durability risk rather than pretend the record
+        survived).
         """
-        created = self._ensure_dir()
-        # The entry of a directory ``mkdir`` just created lives in ITS
-        # parent; flushing every level's parent covers the whole chain.
-        new_parents = [level.parent for level in created]
+        self._ensure_dir()
         path = self._path(record.position_key)
         payload = json.dumps(
             record.to_dict(), ensure_ascii=False, sort_keys=True,
@@ -228,9 +252,8 @@ class ProtectiveCloseJournal:
             handle.flush()
             os.fsync(handle.fileno())        # payload durable BEFORE rename
         os.replace(tmp, path)                # atomic on POSIX and Windows
-        for directory in new_parents:
+        for directory in self._ancestor_chain():
             self._fsync_directory(directory)
-        self._fsync_directory(self.directory)
         return path
 
     def _fsync_directory(self, directory: Path) -> None:

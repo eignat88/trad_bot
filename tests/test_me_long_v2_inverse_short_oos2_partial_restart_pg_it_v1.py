@@ -2723,3 +2723,108 @@ class TestCodexRound8OnPostgres:
         with pytest.raises(OSError):
             journal2.write(record)
         monkeypatch.undo()
+
+
+# ---------------------------------------------------------------------------
+# Codex review round 9 (r4590138816): a protective close must be durable
+# even when NO funding obligation is pending.
+# ---------------------------------------------------------------------------
+class TestCodexRound9OnPostgres:
+    """Round 9 P1 against real PostgreSQL."""
+
+    @staticmethod
+    def _stop_without_obligation(journal_dir, *, candle_steps=1):
+        """Open -> protective STOP with staging DOWN, BEFORE the first
+        funding boundary: no obligation exists at all, so the only possible
+        durability of the frozen close is the local journal."""
+        store = _connect_store()
+        clock = _Clock(datetime.now(timezone.utc))
+        contour = _contour(store, clock=clock)
+        contour.engine.journal = ProtectiveCloseJournal(journal_dir)
+        contour.journal_dir = journal_dir
+        position_key, row, bars = TestCodexRound5OnPostgres._open_fault_position(
+            store, clock, contour, candle_steps=candle_steps,
+        )
+        entry = row.entry_price
+        original_stage = store.stage_close
+        store.stage_close = _always_fail("terminal staging failure (PG down)")
+        cycle = contour.run_cycle({"BTCUSDT": entry}, bars=bars)
+        assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+        return store, clock, contour, position_key, entry, bars, original_stage
+
+    def test_p1_protective_stop_without_an_obligation_is_durable_before_staging(
+        self, running, pg_conn, tmp_path,
+    ):
+        """P1 on PostgreSQL: a STOP before the first funding boundary (no
+        obligation anywhere) with ``stage_close`` failing must still leave a
+        durable recovery record; after a restart the ORIGINAL STOP executes
+        even at a price where the STOP would no longer fire, and the close
+        completes with exactly one terminal leg, no invented funding and a
+        retired journal record."""
+        store, clock, contour, key, entry, bars, original_stage = (
+            self._stop_without_obligation(tmp_path)
+        )
+        engine = contour.engine
+
+        row = store.get_position(key)
+        assert row.status == "OPEN", "terminal UPDATE withheld"
+        assert row.funding_periods_charged == 0
+        assert store.get_funding_obligation(key) is None, (
+            "no obligation may exist for a pre-boundary close",
+        )
+        assert engine._pending_obligations == {}
+        assert [p.position_key for p in store.list_pending_closes()] == []
+        assert _legs(store, key) == [], "nothing staged yet"
+        assert list(tmp_path.glob("*.json")), "the recovery record must exist"
+
+        record = engine.journal.read_all()[key]
+        assert record.exit_reason == "STOP_LOSS"
+        assert record.staged is False, "an unconfirmed stage is never claimed"
+        assert record.obligation is None, "no obligation may be invented"
+        assert record.owed_partial_legs == []
+        assert record.recovery_ids.get("position_key") == key
+        assert engine.durability_risk is True
+        assert engine.open_entries({"ETHUSDT": 100.0}) == []
+
+        # ---- restart with PostgreSQL back, price that would NOT fire -----
+        store.stage_close = original_stage
+        store.close()
+        store2 = _connect_store()
+        contour2 = InverseShortContour(
+            _settings(), store2, clock=clock, activation_enabled=True,
+            journal_dir=tmp_path,
+        )
+        engine2 = contour2.engine
+        assert store2.get_position(key).status == "OPEN"
+        assert key in engine2.pending_closes, "the record must be replayed"
+        assert key not in engine2.open_positions, (
+            "the position must leave the exit algorithm",
+        )
+        assert engine2.open_entries({"ETHUSDT": 100.0}) == []
+
+        non_triggering = {
+            "BTCUSDT": {"high": row.stop_price * 0.5, "low": entry * 0.99},
+        }
+        cycle = contour2.run_cycle({"BTCUSDT": entry}, bars=non_triggering)
+        assert cycle["exit_reasons"] == [], (
+            "the STOP must come from the retained snapshot, not from a new "
+            "evaluation of the market",
+        )
+        final = store2.get_position(key)
+        assert final.status == "CLOSED"
+        assert final.exit_reason == "STOP_LOSS"
+        assert final.exit_price == pytest.approx(record.fill_price, rel=1e-9)
+        assert final.funding_periods_charged == 0, "no period may be invented"
+        assert store2.get_funding_obligation(key) is None
+        legs = _legs(store2, key)
+        assert [leg.exit_reason for leg in legs] == ["STOP_LOSS"]
+        assert len([leg for leg in legs if leg.is_terminal]) == 1
+        assert engine2.pending_closes == {}
+        assert store2.list_pending_closes() == []
+        assert engine2.journal.paths() == [], "retired after proven completion"
+        assert engine2.durability_risk is False
+        assert engine2.accounting_consistent is True
+        assert engine2.balance == pytest.approx(
+            store2.balance_components()["balance"], abs=1e-6,
+        )
+        store2.close()

@@ -84,6 +84,25 @@ NOW = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
 # Fixtures / helpers (mirrors the ladder suite so scenarios are comparable)
 # ---------------------------------------------------------------------------
 
+
+@pytest.fixture(autouse=True)
+def _isolated_journal_directory(tmp_path, monkeypatch):
+    """Every test in this module gets its OWN journal directory.
+
+    Round 9 (P1, Codex r4590138816): a protective close now writes its
+    recovery record even when no funding obligation is pending, so a
+    fault-injection test that dies before its close completes legitimately
+    leaves a record behind.  Sharing the default ``var/`` directory would
+    let that record be replayed by the NEXT test in the same session; the
+    module therefore redirects the default to a per-test directory that
+    pytest discards with the test itself.
+    """
+    from app.paper.me_long_v2_inverse_short_oos2_v1 import journal as _journal
+
+    monkeypatch.setattr(
+        _journal, "DEFAULT_JOURNAL_DIR", tmp_path / "journal",
+    )
+
 class _Clock:
     def __init__(self, now: datetime) -> None:
         self.now = now
@@ -1152,36 +1171,51 @@ class TestRound2TerminalCloseNeverSavedWithoutLegs:
         )
         restarted = _restart(contour, settings, clock)
 
-        # The durable row is the still-OPEN pre-close state: nothing was
-        # claimed saved that the ledger does not carry.
-        restored = _position(restarted, pos.symbol)
-        assert restored.status == POSITION_STATUS_OPEN
-        assert restored.tp1_executed is False
-        assert restored.remaining_size == pytest.approx(full_size, rel=1e-9)
-        assert restarted.engine.dirty_leg_keys == ()
-        assert restarted.engine.durability_risk is False
+        # Round 9 (P1, Codex r4590138816): the frozen protective close was
+        # journaled BEFORE staging, so the restart replays it as a RETAINED
+        # close instead of leaving a STOP to be re-derived from fresh market
+        # data.  The DURABLE row is still the untouched pre-close state:
+        # nothing was claimed saved that the ledger does not carry.
+        engine2 = restarted.engine
+        assert pos.position_key in engine2.pending_closes
+        assert engine2.journal.exists(pos.position_key)
+        record = engine2.journal.read_all()[pos.position_key]
+        assert record.owed_partial_legs, "the owed TP1 leg rides the record"
+        assert record.staged is False
+        assert store.get_position(pos.position_key).status == (
+            POSITION_STATUS_OPEN
+        )
+        assert store.list_close_legs(pos.position_key) == []
+        assert store.list_pending_closes() == []
+        assert engine2.dirty_leg_keys == ()
+        assert engine2.durability_risk is True   # staged snapshot still owed
 
-        # Partial close restored exactly once ...
-        restarted.run_cycle({pos.symbol: entry * 0.945})
-        legs = store.list_close_legs(pos.position_key)
-        assert [leg.exit_reason for leg in legs] == ["TAKE_PROFIT_1"]
-        assert restored.tp1_executed is True
-        assert restored.remaining_size == pytest.approx(full_size * 0.5, rel=1e-9)
-        _assert_durable_consistent(store, pos.position_key)
-
-        # ... then the terminal close lands exactly once, WITH its leg and
-        # outbox rows confirmed in the same transaction.
+        # ONE recovery cycle replays the frozen snapshot: the owed partial
+        # leg and the terminal leg land in the SAME idempotent staging
+        # transaction and then the terminal UPDATE flips the row — the
+        # partial AND the terminal closes are restored exactly once and are
+        # never re-derived from a new market evaluation.
         cycle = restarted.run_cycle({pos.symbol: entry}, bars=bars)
-        assert cycle["exit_reasons"] == ["STOP_LOSS"]
+        assert cycle["exit_reasons"] == [], (
+            "a retained protective close must never be re-evaluated",
+        )
         assert cycle["pending_closes"] == 0
+        final = store.get_position(pos.position_key)
+        assert final.status == POSITION_STATUS_CLOSED
+        assert final.tp1_executed is True
+        # TP1 already sold half, the STOP retires the rest: nothing open.
+        assert final.remaining_size == pytest.approx(0.0, abs=1e-12)
         legs = store.list_close_legs(pos.position_key)
         assert sorted(leg.exit_reason for leg in legs) == [
             "STOP_LOSS", "TAKE_PROFIT_1",
         ]
         assert [leg.leg_seq for leg in legs] == [1, 3]
         assert store.list_pending_closes() == []      # staged AND cleared
-        assert restarted.engine.durability_risk is False
-        assert restarted.engine.dirty_leg_keys == ()
+        assert engine2.durability_risk is False
+        assert engine2.dirty_leg_keys == ()
+        assert not engine2.journal.exists(pos.position_key), (
+            "the recovery record is retired only after both halves confirm",
+        )
         _assert_durable_consistent(store, pos.position_key)
         _assert_ledger_consistent(restarted)
 
@@ -1438,30 +1472,32 @@ class TestRound3PendingSnapshotOwnsLegReplay:
         assert engine.durability_risk is True
 
         # (d) store recovery (PostgreSQL healed), then (e) RESTART: only
-        #     durable state survives вЂ” the row is the still-OPEN state.
+        #     durable state survives.
         store.stage_close = original_stage
         store.update_position = original_update
         restarted = _restart(contour, settings, clock)
-        restored = _position(restarted, pos.symbol)
-        assert restored.status == POSITION_STATUS_OPEN
-        assert restored.tp1_executed is False
-        assert restored.remaining_size == pytest.approx(
-            restored.position_size, rel=1e-9,
-        )
-        assert restarted.engine.dirty_leg_keys == ()
-        assert restarted.engine.durability_risk is False
+        engine2 = restarted.engine
+        # Round 9 (P1, Codex r4590138816): the frozen protective close was
+        # journaled BEFORE staging, so it survived the restart as a RETAINED
+        # close instead of existing only in process memory — while the
+        # DURABLE row is still the untouched pre-close state.
+        assert position_key in engine2.pending_closes
+        assert engine2.journal.exists(position_key)
+        record = engine2.journal.read_all()[position_key]
+        assert record.owed_partial_legs, "the owed TP1 leg rides the record"
+        assert store.get_position(position_key).status == POSITION_STATUS_OPEN
         assert store.list_close_legs(position_key) == []
+        assert engine2.dirty_leg_keys == ()
+        assert engine2.durability_risk is True   # staged snapshot still owed
 
-        # (f) reconciliation: TP1 re-executes durably exactly once, then
-        #     the protective STOP lands through the unified recovery.
-        restarted.run_cycle({pos.symbol: entry * 0.945})
-        legs = store.list_close_legs(position_key)
-        assert [leg.exit_reason for leg in legs] == ["TAKE_PROFIT_1"]
+        # (f) reconciliation: ONE recovery cycle replays the frozen snapshot
+        #     through the unified terminal-close recovery — owed partial leg,
+        #     terminal leg and outbox in the same idempotent transaction.
         cycle = restarted.run_cycle({pos.symbol: entry}, bars=stop_bars)
-        assert cycle["exit_reasons"] == ["STOP_LOSS"]
+        assert cycle["exit_reasons"] == [], (
+            "a retained protective close must never be re-evaluated",
+        )
         assert cycle["pending_closes"] == 0
-
-        # exactly-once legs, conservation, outbox drained
         legs = store.list_close_legs(position_key)
         assert sorted(leg.exit_reason for leg in legs) == [
             "STOP_LOSS", "TAKE_PROFIT_1",
@@ -4502,3 +4538,703 @@ class TestRound8P2JournalDirectoryFsync:
         journal.write(_journal_record(self.KEY))   # next write succeeds
         assert list(journal.read_all()) == [self.KEY]
         assert len(journal.paths()) == 1
+
+
+# ---------------------------------------------------------------------------
+# Codex review round 9 вЂ” P1 (r4590138816): a protective close must be
+# durable EVEN WHEN no funding obligation is pending.
+# ---------------------------------------------------------------------------
+
+
+def _round9_protective_setup(settings, tmp_path, *, advance_hours=0):
+    """entry -> protective STOP ready, with NO funding obligation pending.
+
+    ``advance_hours=0`` keeps the position BEFORE the first 8h funding
+    boundary, so ``_settle_funding_for_close`` books nothing and the close
+    runs with ``obligation_pending=False`` вЂ” the exact premise of the
+    finding.
+    """
+    contour, store, clock = _contour(settings, journal_dir=tmp_path)
+    pos = _open_one(contour, store, clock)
+    if advance_hours:
+        clock.advance(hours=advance_hours)
+    return contour, store, clock, pos, pos.position_key, pos.entry_price
+
+
+def _stop_control(settings, tmp_path, *, advance_hours=0):
+    """Failure-free reference run of the same protective-stop timeline."""
+    contour, store, clock = _contour(
+        settings, journal_dir=tmp_path / "control",
+    )
+    pos = _open_one(contour, store, clock)
+    if advance_hours:
+        clock.advance(hours=advance_hours)
+    cycle = contour.run_cycle(
+        {pos.symbol: pos.entry_price}, bars=_round8_stop_bars(
+            pos, pos.entry_price,
+        ),
+    )
+    assert cycle["exit_reasons"] == ["STOP_LOSS"], cycle
+    assert store.get_position(pos.position_key).status == POSITION_STATUS_CLOSED
+    assert contour.engine.journal.exists(pos.position_key) is False, (
+        "a completed close retires its own recovery record",
+    )
+    return contour, store, pos
+
+
+class TestRound9P1ProtectiveCloseWithoutObligation:
+    """Mandatory scenarios AвЂ“H for Codex thread r4590138816."""
+
+    def test_a_stop_before_the_first_boundary_is_journaled_with_pg_down(
+        self, tmp_path,
+    ):
+        """A: STOP before the first funding boundary + PostgreSQL down
+        (``stage_close`` raises) вЂ” a durable recovery record must exist
+        even though NO funding obligation is pending."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry = _round9_protective_setup(
+            settings, tmp_path,
+        )
+        full_size = pos.remaining_size
+        store.stage_close = _always_fail("terminal staging failure")
+
+        cycle = contour.run_cycle({pos.symbol: entry}, bars=_round8_stop_bars(
+            pos, entry,
+        ))
+        assert cycle["exit_reasons"] == ["STOP_LOSS"]
+
+        # --- the premise: there is no funding obligation anywhere --------
+        assert store.get_funding_obligation(key) is None
+        assert contour.engine._pending_obligations == {}
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_OPEN
+        assert row.funding_periods_charged == 0
+        assert store.list_pending_closes() == []
+        assert store.list_close_legs(key) == []
+
+        # --- yet the frozen protective close IS durable ------------------
+        record = contour.engine.journal.read_all().get(key)
+        assert record is not None, (
+            "a protective close must be journaled even with no obligation",
+        )
+        assert record.exit_reason == "STOP_LOSS"
+        assert record.staged is False
+        assert record.obligation is None, "no obligation may be invented"
+        assert record.owed_partial_legs == []
+        assert record.reference_price == pytest.approx(
+            pos.stop_price, rel=1e-12,
+        )
+        assert record.fill_price == pytest.approx(
+            pos.stop_price * (1.0 + settings.slippage_percent), rel=1e-12,
+        )
+        assert record.quantity == pytest.approx(full_size, rel=1e-12)
+        assert record.recovery_ids.get("position_key") == key
+        assert record.recovery_ids.get("event_key"), "idempotent replay ids"
+        assert contour.engine.durability_risk is True
+        assert key in contour.engine.unstaged_close_keys
+
+    def test_b_restart_with_a_non_triggering_price_executes_the_original_stop(
+        self, tmp_path,
+    ):
+        """B: after a restart a price at which the STOP would NOT fire must
+        still execute the ORIGINAL STOP вЂ” never a fresh market evaluation."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry = _round9_protective_setup(
+            settings, tmp_path,
+        )
+        original_stage = store.stage_close
+        store.stage_close = _always_fail("terminal staging failure")
+        contour.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert store.get_position(key).status == POSITION_STATUS_OPEN
+
+        # PostgreSQL is back, the process restarts.
+        store.stage_close = original_stage
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+
+        # A price at which the STOP would NOT fire (the high never reaches
+        # the stop price): only the retained snapshot can close this trade.
+        non_triggering = {
+            pos.symbol: {"high": pos.stop_price * 0.5, "low": entry * 0.99},
+        }
+        cycle = restarted.run_cycle({pos.symbol: entry}, bars=non_triggering)
+        assert cycle["exit_reasons"] == [], (
+            "the STOP must come from the retained snapshot, not from a new "
+            "evaluation of the market",
+        )
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.exit_reason == "STOP_LOSS"
+        assert row.exit_price == pytest.approx(
+            pos.stop_price * (1.0 + settings.slippage_percent), rel=1e-12,
+        )
+        assert row.funding_periods_charged == 0, "no period may be invented"
+        assert store.get_funding_obligation(key) is None
+        legs = store.list_close_legs(key)
+        assert [leg.exit_reason for leg in legs] == ["STOP_LOSS"]
+        assert len([leg for leg in legs if leg.is_terminal]) == 1
+        assert restarted.engine.journal.exists(key) is False, "retired"
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+    def test_c_unknown_rate_keeps_terminal_facts_without_a_fabricated_zero(
+        self, tmp_path,
+    ):
+        """C: an UNKNOWN funding rate never becomes a booked 0.00 вЂ” the
+        terminal facts stay intact and the STOP is still persisted."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry = _round9_protective_setup(
+            settings, tmp_path, advance_hours=8,
+        )
+        original_stage = store.stage_close
+        full_size = pos.remaining_size
+        store.stage_close = _always_fail("terminal staging failure")
+
+        # No funding_rates_percent is supplied -> the rate is UNKNOWN.
+        cycle = contour.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert cycle["exit_reasons"] == ["STOP_LOSS"]
+        assert store.get_funding_obligation(key) is None, (
+            "an UNKNOWN rate must never be persisted as a booked obligation",
+        )
+        assert contour.engine._pending_obligations == {}
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_OPEN
+        assert row.funding_periods_charged == 0, "no fabricated period"
+
+        record = contour.engine.journal.read_all().get(key)
+        assert record is not None, "the STOP must still be durable"
+        assert record.exit_reason == "STOP_LOSS"
+        assert record.obligation is None
+        assert record.fill_price == pytest.approx(
+            pos.stop_price * (1.0 + settings.slippage_percent), rel=1e-12,
+        )
+        assert record.quantity == pytest.approx(full_size, rel=1e-12)
+
+        # Recovery executes the frozen STOP and books nothing invented.
+        store.stage_close = original_stage
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.exit_reason == "STOP_LOSS"
+        assert row.funding_periods_charged == 0
+        assert row.exit_price == pytest.approx(
+            pos.stop_price * (1.0 + settings.slippage_percent), rel=1e-12,
+        )
+        assert store.get_funding_obligation(key) is None
+        assert restarted.engine.journal.exists(key) is False, "retired"
+        _assert_durable_consistent(store, key)
+
+    def test_d_timeout_is_journaled_without_an_obligation_and_survives(
+        self, tmp_path,
+    ):
+        """D: the same guarantee for TIMEOUT вЂ” no obligation, still durable,
+        and the original hold expiry closes after a restart."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry = _round9_protective_setup(
+            settings, tmp_path, advance_hours=MAX_HOLD_MINUTES / 60 + 1,
+        )
+        original_stage = store.stage_close
+        store.stage_close = _always_fail("terminal staging failure")
+
+        # Prices that trigger neither the STOP nor any TP: the hold expires.
+        flat = {
+            pos.symbol: {
+                "high": pos.entry_price * 1.0001,
+                "low": pos.entry_price * 0.9999,
+            },
+        }
+        cycle = contour.run_cycle({pos.symbol: entry}, bars=flat)
+        assert cycle["exit_reasons"] == ["TIMEOUT"], cycle
+
+        assert store.get_funding_obligation(key) is None
+        assert contour.engine._pending_obligations == {}
+        assert store.get_position(key).status == POSITION_STATUS_OPEN
+        record = contour.engine.journal.read_all().get(key)
+        assert record is not None, "a TIMEOUT must be journaled too"
+        assert record.exit_reason == "TIMEOUT"
+        assert record.staged is False
+        assert record.obligation is None
+
+        store.stage_close = original_stage
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars={
+                pos.symbol: {
+                    "high": pos.entry_price * 1.0001,
+                    "low": pos.entry_price * 0.9999,
+                },
+            },
+        )
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.exit_reason == "TIMEOUT"
+        # the FROZEN fill price of the retained snapshot, never a new one
+        assert row.exit_price == pytest.approx(record.fill_price, rel=1e-12)
+        legs = store.list_close_legs(key)
+        assert [leg.exit_reason for leg in legs] == ["TIMEOUT"]
+        assert restarted.engine.journal.exists(key) is False, "retired"
+        _assert_durable_consistent(store, key)
+
+    def test_e_dirty_partial_leg_is_preserved_with_the_protective_stop(
+        self, tmp_path,
+    ):
+        """E: a dirty TP1 leg and the terminal leg both survive a staging
+        outage and are replayed exactly once on recovery."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry = _round9_protective_setup(
+            settings, tmp_path,
+        )
+        original_commit = store.commit_partial_exit
+        original_stage = store.stage_close
+        store.commit_partial_exit = _always_fail("ledger down")
+        store.stage_close = _always_fail("terminal staging failure")
+
+        contour.run_cycle({pos.symbol: entry * 0.945})       # TP1 stays dirty
+        assert key in contour.engine.dirty_leg_keys
+        contour.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+
+        record = contour.engine.journal.read_all().get(key)
+        assert record is not None, "the protective close must be durable"
+        assert record.exit_reason == "STOP_LOSS"
+        assert record.owed_partial_legs, "the owed TP1 leg rides the record"
+        assert [int(leg["leg_seq"]) for leg in record.owed_partial_legs] == [1]
+        assert bool(record.terminal_leg.get("is_terminal")) is True
+
+        store.commit_partial_exit = original_commit
+        store.stage_close = original_stage
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        legs = store.list_close_legs(key)
+        assert sorted(leg.exit_reason for leg in legs) == [
+            "STOP_LOSS", "TAKE_PROFIT_1",
+        ]
+        assert [leg.leg_seq for leg in legs] == [1, 3]
+        assert len([leg for leg in legs if leg.is_terminal]) == 1
+        assert store.list_pending_closes() == []
+        assert restarted.engine.dirty_leg_keys == ()
+        assert restarted.engine.journal.exists(key) is False, "retired"
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+    def test_f_ambiguous_staging_commit_yields_exactly_one_terminal_leg(
+        self, tmp_path,
+    ):
+        """F: a staging COMMIT whose acknowledgement is lost converges to
+        exactly one terminal leg and never double-books PnL."""
+        settings = _settings()
+        control, control_store, control_pos = _stop_control(settings, tmp_path)
+        control_balance = control.engine.balance
+
+        contour, store, clock, pos, key, entry = _round9_protective_setup(
+            settings, tmp_path,
+        )
+        original_stage = store.stage_close
+        committed = {"n": 0}
+
+        def commit_then_raise(*args, **kwargs):
+            result = original_stage(*args, **kwargs)     # COMMITTED
+            committed["n"] += 1
+            raise RuntimeError("staging acknowledgement lost")
+
+        store.stage_close = commit_then_raise
+        contour.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert committed["n"] == 1
+        assert store.list_pending_closes(), "the outbox row is durable"
+        assert store.get_position(key).status == POSITION_STATUS_OPEN
+        record = contour.engine.journal.read_all()[key]
+        assert record.staged is False, "an unconfirmed stage is never claimed"
+
+        store.stage_close = original_stage
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        legs = store.list_close_legs(key)
+        assert [leg.exit_reason for leg in legs] == ["STOP_LOSS"]
+        assert len([leg for leg in legs if leg.is_terminal]) == 1
+        assert store.list_pending_closes() == []
+        assert restarted.engine.journal.exists(key) is False, "retired"
+        assert restarted.engine.balance == pytest.approx(
+            control_balance, abs=1e-9,
+        ), "an ambiguous commit must never double-book PnL"
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+    def test_g_repeated_restarts_before_the_restore_keep_the_frozen_facts(
+        self, tmp_path,
+    ):
+        """G: any number of restarts before PostgreSQL recovers keep the
+        journal record and every frozen fact byte-identical."""
+        settings = _settings()
+        contour, store, clock, pos, key, entry = _round9_protective_setup(
+            settings, tmp_path,
+        )
+        original_stage = store.stage_close
+        store.stage_close = _always_fail("terminal staging failure")
+        contour.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        original = contour.engine.journal.read_all()[key]
+
+        current = contour
+        for round_no in range(3):
+            store.stage_close = _always_fail("terminal staging failure")
+            current = _restart(current, settings, clock, journal_dir=tmp_path)
+            engine = current.engine
+            record = engine.journal.read_all().get(key)
+            assert record is not None, f"restart {round_no}: journal lost"
+            assert record.exit_reason == original.exit_reason
+            assert record.triggered_at == original.triggered_at
+            assert record.reference_price == original.reference_price
+            assert record.fill_price == original.fill_price
+            assert record.quantity == original.quantity
+            assert record.owed_partial_legs == original.owed_partial_legs
+            assert record.obligation == original.obligation
+            assert store.get_position(key).status == POSITION_STATUS_OPEN
+            assert key in engine.pending_closes, "never re-evaluated"
+            assert key not in engine.open_positions
+
+        # Only now does PostgreSQL come back.
+        store.stage_close = original_stage
+        current.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.exit_price == pytest.approx(original.fill_price, rel=1e-12)
+        assert current.engine.journal.exists(key) is False, "retired"
+        _assert_durable_consistent(store, key)
+
+    def test_h_recovery_completes_consistently_and_equals_the_baseline(
+        self, tmp_path,
+    ):
+        """H: recovery ends CLOSED with one terminal leg, a drained outbox,
+        a retired journal record, no pending obligation and a balance equal
+        to the failure-free baseline."""
+        settings = _settings()
+        control, control_store, control_pos = _stop_control(settings, tmp_path)
+        control_balance = control.engine.balance
+
+        contour, store, clock, pos, key, entry = _round9_protective_setup(
+            settings, tmp_path,
+        )
+        original_stage = store.stage_close
+        store.stage_close = _always_fail("terminal staging failure")
+        contour.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+        assert contour.engine.journal.exists(key)
+
+        store.stage_close = original_stage
+        restarted = _restart(contour, settings, clock, journal_dir=tmp_path)
+        restarted.run_cycle(
+            {pos.symbol: entry}, bars=_round8_stop_bars(pos, entry),
+        )
+
+        row = store.get_position(key)
+        assert row.status == POSITION_STATUS_CLOSED
+        assert row.exit_reason == "STOP_LOSS"
+        legs = store.list_close_legs(key)
+        assert [leg.exit_reason for leg in legs] == ["STOP_LOSS"]
+        assert len([leg for leg in legs if leg.is_terminal]) == 1
+
+        engine = restarted.engine
+        assert store.list_pending_closes() == [], "no outbox orphan"
+        assert engine.pending_closes == {}
+        assert engine._unstaged_closes == set()
+        assert engine.journal.exists(key) is False, "record retired"
+        assert engine._pending_obligations == {}, "nothing pending"
+        assert store.get_funding_obligation(key) is None
+        assert engine.durability_risk is False
+        assert engine.balance == pytest.approx(control_balance, abs=1e-9)
+        assert engine.balance == pytest.approx(
+            store.balance_components()["balance"], abs=1e-9,
+        )
+        _assert_durable_consistent(store, key)
+        _assert_ledger_consistent(restarted)
+
+
+# ---------------------------------------------------------------------------
+# Codex review round 9 вЂ” P2 (r4590138839): a failed parent-directory fsync
+# must never be forgotten by the next write.
+# ---------------------------------------------------------------------------
+
+
+class TestRound9P2AncestorDirectoryFsync:
+    """Mandatory scenarios AвЂ“H for Codex thread r4590138839."""
+
+    KEY = "ME_LONG_V2_INVERSE_SHORT_OOS2_V1:round9-p2"
+
+    @staticmethod
+    def _journal(tmp_path, *parts):
+        return ProtectiveCloseJournal(tmp_path.joinpath(*parts))
+
+    @staticmethod
+    def _chain(root):
+        """``root`` plus every ancestor, filesystem root excluded."""
+        chain = [root]
+        probe = root.parent
+        while probe != probe.parent:
+            chain.append(probe)
+            probe = probe.parent
+        return chain
+
+    @staticmethod
+    def _record_everything(monkeypatch):
+        """Record ``os.open`` paths and the fsync/replace ordering while a
+        flag is on, so unrelated filesystem traffic cannot pollute them."""
+        state = {"on": False, "opened": [], "events": []}
+        real_open, real_fsync, real_replace = os.open, os.fsync, os.replace
+
+        def open_recorder(path, flags, *args, **kwargs):
+            if state["on"]:
+                state["opened"].append(str(path))
+            return real_open(path, flags, *args, **kwargs)
+
+        def fsync_recorder(fd):
+            if state["on"]:
+                state["events"].append("fsync")
+            return real_fsync(fd)
+
+        def replace_recorder(src, dst):
+            if state["on"]:
+                state["events"].append("replace")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(os, "open", open_recorder)
+        monkeypatch.setattr(os, "fsync", fsync_recorder)
+        monkeypatch.setattr(os, "replace", replace_recorder)
+        return state
+
+    @staticmethod
+    def _record_synced(monkeypatch, journal):
+        synced: list[str] = []
+        monkeypatch.setattr(
+            journal, "_fsync_directory",
+            lambda directory: synced.append(str(directory)),
+        )
+        return synced
+
+    @staticmethod
+    def _failing_parent(journal, parent, once=True):
+        state = {"failed": False}
+
+        def flaky(directory):
+            if str(directory) == str(parent) and (not once or not state["failed"]):
+                state["failed"] = True
+                raise OSError("injected directory fsync failure")
+
+        return flaky, state
+
+    def test_a_first_write_syncs_the_leaf_and_every_created_parent(
+        self, tmp_path, monkeypatch,
+    ):
+        """A: create dirs -> temp file -> fsync temp -> atomic replace ->
+        sync the journal dir -> sync the needed parents -> only then does
+        the write report success."""
+        root = tmp_path / "a" / "b"
+        journal = self._journal(tmp_path, "a", "b")
+        state = self._record_everything(monkeypatch)
+
+        state["on"] = True
+        path = journal.write(_journal_record(self.KEY))
+        state["on"] = False
+
+        # payload fsync BEFORE the atomic rename, then directory syncs
+        assert state["events"][0] == "fsync"
+        assert state["events"][1] == "replace"
+        # every level of the required chain is opened for sync, leaf-first
+        chain = self._chain(root)
+        positions = [state["opened"].index(str(level)) for level in chain]
+        assert positions == sorted(positions), "leaf-first order required"
+        assert str(root) in state["opened"]
+        assert str(root.parent) in state["opened"]
+        assert str(tmp_path) in state["opened"]
+        assert path.exists() and path.name.endswith(".json")
+        assert journal.exists(self.KEY)
+
+    def test_b_a_failed_parent_sync_makes_the_write_raise(
+        self, tmp_path, monkeypatch,
+    ):
+        """B: a parent fsync failure means the write does NOT report
+        durability вЂ” the error reaches the caller."""
+        journal = self._journal(tmp_path, "jrn")
+        flaky, state = self._failing_parent(journal, tmp_path)
+        monkeypatch.setattr(journal, "_fsync_directory", flaky)
+
+        with pytest.raises(OSError):
+            journal.write(_journal_record(self.KEY))
+        assert state["failed"] is True
+
+    def test_c_retry_syncs_the_previously_unconfirmed_parent(
+        self, tmp_path, monkeypatch,
+    ):
+        """C: the first write fails on a parent; the retry must synchronise
+        that SAME parent even though the directory already exists."""
+        journal = self._journal(tmp_path, "deep", "jrn")
+        parent = tmp_path / "deep"
+        flaky, state = self._failing_parent(journal, parent)
+        monkeypatch.setattr(journal, "_fsync_directory", flaky)
+
+        with pytest.raises(OSError):
+            journal.write(_journal_record(self.KEY))
+        assert state["failed"] is True
+        assert journal.directory.exists(), "the tree was created"
+
+        synced = self._record_synced(monkeypatch, journal)
+        journal.write(_journal_record(self.KEY))     # identical facts, retry
+        assert str(parent) in synced, (
+            "the retry must re-synchronise the parent whose fsync never "
+            "completed, even though the directory already exists",
+        )
+        assert str(journal.directory) in synced
+
+    def test_d_an_identical_rewrite_still_synchronises_the_chain(
+        self, tmp_path, monkeypatch,
+    ):
+        """D: de-duplicating byte-identical facts must not bypass the fsync
+        obligations of the write being performed."""
+        journal = self._journal(tmp_path, "deep", "jrn")
+        journal.write(_journal_record(self.KEY))     # completes fully
+
+        synced = self._record_synced(monkeypatch, journal)
+        journal.write(_journal_record(self.KEY))     # identical facts
+        assert str(journal.directory) in synced
+        assert str(tmp_path / "deep") in synced, (
+            "an identical rewrite must still sync the ancestor chain",
+        )
+        assert str(tmp_path) in synced
+        assert list(journal.read_all()) == [self.KEY]
+
+    def test_a_relative_path_is_anchored_not_cwd_dependent(
+        self, tmp_path, monkeypatch,
+    ):
+        """E: the journal keeps correct absolute paths when it is started
+        from a different working directory."""
+        from app.paper.me_long_v2_inverse_short_oos2_v1 import journal as _mod
+
+        foreign = tmp_path / "elsewhere"
+        foreign.mkdir()
+        monkeypatch.chdir(foreign)
+
+        default = ProtectiveCloseJournal(None)
+        assert default.directory.is_absolute()
+        assert default.directory == _mod.DEFAULT_JOURNAL_DIR
+
+        relative = ProtectiveCloseJournal("var/relative_journal")
+        assert relative.directory.is_absolute(), (
+            "a relative journal path must be resolved at construction "
+            "time, never against a later process cwd",
+        )
+        assert relative.directory == foreign / "var" / "relative_journal"
+
+        state = self._record_everything(monkeypatch)
+        state["on"] = True
+        relative.write(_journal_record(self.KEY))
+        state["on"] = False
+        assert str(relative.directory) in state["opened"]
+        assert os.curdir not in state["opened"]
+        assert relative.exists(self.KEY)
+
+    def test_f_an_intermediate_level_failure_is_retried_too(
+        self, tmp_path, monkeypatch,
+    ):
+        """F: several ancestor levels, the failure at an INTERMEDIATE one вЂ”
+        the retry re-syncs that level as well."""
+        journal = self._journal(tmp_path, "lvl1", "lvl2", "jrn")
+        intermediate = tmp_path / "lvl1" / "lvl2"
+        flaky, state = self._failing_parent(journal, intermediate)
+        monkeypatch.setattr(journal, "_fsync_directory", flaky)
+
+        with pytest.raises(OSError):
+            journal.write(_journal_record(self.KEY))
+        assert state["failed"] is True
+
+        synced = self._record_synced(monkeypatch, journal)
+        journal.write(_journal_record(self.KEY))
+        assert str(intermediate) in synced, (
+            "the intermediate level that was never confirmed must be "
+            "synchronised by the retry",
+        )
+        assert str(tmp_path / "lvl1") in synced
+        assert str(tmp_path) in synced
+
+    def test_g_a_failed_payload_fsync_or_rename_is_never_reported(
+        self, tmp_path, monkeypatch,
+    ):
+        """G: a failed file fsync or a failed atomic rename never produces a
+        reported-durable record."""
+        journal = self._journal(tmp_path, "jrn")
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def fsync_boom(fd):
+            raise OSError("payload fsync failed")
+
+        monkeypatch.setattr(os, "fsync", fsync_boom)
+        with pytest.raises(OSError):
+            journal.write(_journal_record(self.KEY))
+        assert not journal.exists(self.KEY)
+
+        monkeypatch.setattr(os, "fsync", real_fsync)
+
+        def replace_boom(src, dst):
+            raise OSError("atomic replace failed")
+
+        monkeypatch.setattr(os, "replace", replace_boom)
+        with pytest.raises(OSError):
+            journal.write(_journal_record(self.KEY))
+        assert not journal.exists(self.KEY)
+        monkeypatch.setattr(os, "replace", real_replace)
+
+        # once the filesystem heals the very same write succeeds
+        journal.write(_journal_record(self.KEY))
+        assert list(journal.read_all()) == [self.KEY]
+
+    def test_h_a_restart_after_a_failed_sync_keeps_the_immutable_facts(
+        self, tmp_path, monkeypatch,
+    ):
+        """H: a restart after a failed parent sync replays the record with
+        every immutable fact intact and redoes the outstanding fsync."""
+        journal = self._journal(tmp_path, "deep", "jrn")
+        parent = tmp_path / "deep"
+        flaky, state = self._failing_parent(journal, parent)
+        monkeypatch.setattr(journal, "_fsync_directory", flaky)
+
+        original = _journal_record(self.KEY)
+        with pytest.raises(OSError):
+            journal.write(original)
+        assert state["failed"] is True
+
+        # ---- a brand-new journal object = a process restart ------------
+        restarted = ProtectiveCloseJournal(journal.directory)
+        synced = self._record_synced(monkeypatch, restarted)
+        restarted.write(original)
+        assert str(parent) in synced, (
+            "the outstanding parent fsync must be redone after a restart",
+        )
+
+        restored = restarted.read_all()[self.KEY]
+        assert restored.exit_reason == original.exit_reason
+        assert restored.triggered_at == original.triggered_at
+        assert restored.reference_price == original.reference_price
+        assert restored.fill_price == original.fill_price
+        assert restored.quantity == original.quantity
+        assert restored.accounting_delta == original.accounting_delta
+        assert restored.recovery_ids == original.recovery_ids
+        assert restored.obligation == original.obligation
