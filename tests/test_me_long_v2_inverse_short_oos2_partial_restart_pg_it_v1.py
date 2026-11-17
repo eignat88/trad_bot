@@ -816,9 +816,13 @@ class TestCodexRound2OnPostgres:
         store.close()
 
         store2 = _connect_store()
-        contour2 = _contour(store2, clock=clock)
-        contour2.engine.journal = ProtectiveCloseJournal(tmp_path)
-        contour2.journal_dir = tmp_path
+        # journal_dir must ride the CONSTRUCTOR: the replay of the durable
+        # recovery record runs inside __init__, so a journal swapped in
+        # afterwards would never see it.
+        contour2 = InverseShortContour(
+            _settings(), store2, clock=clock, activation_enabled=True,
+            journal_dir=tmp_path,
+        )
         restored = store2.get_position(position_key)
         assert restored is not None
         assert restored.status == "OPEN"
@@ -1075,9 +1079,12 @@ class TestCodexRound3OnPostgres:
         store.close()
 
         store2 = _connect_store()
-        contour2 = _contour(store2, clock=clock)
-        contour2.engine.journal = ProtectiveCloseJournal(tmp_path)
-        contour2.journal_dir = tmp_path
+        # journal_dir must ride the CONSTRUCTOR: the replay of the durable
+        # recovery record runs inside __init__.
+        contour2 = InverseShortContour(
+            _settings(), store2, clock=clock, activation_enabled=True,
+            journal_dir=tmp_path,
+        )
         restored = store2.get_position(position_key)
         assert restored.status == "OPEN"
         assert restored.tp1_executed is False
