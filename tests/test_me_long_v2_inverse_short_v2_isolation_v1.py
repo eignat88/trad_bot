@@ -404,7 +404,10 @@ class TestGrafanaDashboard:
         dash = self.dashboard
         assert dash["uid"] == "me-inverse-short-v2-oos"
         titles = [p["title"] for p in dash["panels"]]
-        assert any("Captured" in t for t in titles)
+        # Case-insensitive: main #284 renamed the panel to "Pending Events
+        # (CAPTURED; age not guaranteed)" (was "Captured (eligible, ...)");
+        # the contract is "a CAPTURED panel exists", not its exact casing.
+        assert any("captured" in t.lower() for t in titles)
         assert any("Entered" in t for t in titles)
         assert any("Expired" in t for t in titles)
         assert any("Capacity Rejected" in t for t in titles)
