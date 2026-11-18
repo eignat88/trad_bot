@@ -423,6 +423,8 @@ def _build_test_position(event) -> "object":
         event_key=event.event_key,
         symbol=event.symbol,
         direction="SHORT",
+        source_scanner=event.source_scanner,
+        source_setup_id=event.source_setup_id,
         entered_at=T0,
         deadline_at=T0 + timedelta(minutes=7200),
         entry_market_price=100.0,
@@ -812,3 +814,243 @@ class TestV3GuardConfig:
         )
         config = load_v3_guard_config(path, environ={})
         assert config.max_open_positions == 12
+
+
+# ---------------------------------------------------------------------------
+# 8. Codex review P1 — committed-position recovery is INDEPENDENT of capacity
+# ---------------------------------------------------------------------------
+class TestP1CommittedRecoveryBeyondCapacity:
+    """A LOST COMMIT ACKNOWLEDGEMENT must never strand a durable position.
+
+    When PostgreSQL applies the INSERT but the acknowledgement is lost, the
+    row is durable while ``open_positions`` never saw it.  Such a row must be
+    adopted under STOP/TP/TIMEOUT management even when all 12 slots are
+    occupied — and adoption must never re-charge entry fees (accounting
+    reconciliation stays intact).
+    """
+
+    SYMBOLS = [f"R{i:02d}USDT" for i in range(1, 15)]
+
+    @staticmethod
+    def _orphan_commit(store, symbol, *, detected_at):
+        """Simulate the lost-COMMIT state: the store INSERT is durable but
+        the engine was never told (event stays CAPTURED, no memory entry)."""
+        from app.paper.me_long_v2_inverse_short_v3.capture import (
+            event_from_candidate,
+        )
+        candidate = _candidate(symbol, detected_at=detected_at)
+        _capture(store, candidate)
+        event = event_from_candidate(
+            candidate,
+            capture_route="PRE_FILTER_SOURCE",
+            activation=_identity(),
+            captured_at=detected_at,
+        )
+        decision = store.admit_position(_build_test_position(event))
+        assert decision.outcome == ADMIT_INSERTED
+        return event
+
+    def test_lost_commit_is_adopted_even_at_full_capacity(self):
+        clock = _Clock(T0)
+        store = _store(clock)
+        engine = _engine(store, clock)
+        for symbol in self.SYMBOLS[:11]:
+            _capture(store, _candidate(symbol, detected_at=T0))
+        assert len(engine.open_entries({s: 100.0 for s in self.SYMBOLS})) == 11
+
+        # The 12th admission commits durably but its ACK is lost.
+        self._orphan_commit(store, self.SYMBOLS[11], detected_at=T0)
+        assert len(engine.open_positions) == 11  # unmanaged orphan
+        assert store.cross_contour_state().open_total == 12  # book FULL
+
+        balance_before = engine.balance
+        adopted = engine.open_entries({s: 100.0 for s in self.SYMBOLS})
+        # P1: recovery runs regardless of the full 12-slot portfolio.
+        assert [p.symbol for p in adopted] == [self.SYMBOLS[11]]
+        assert len(engine.open_positions) == 12
+        # No double fee: the orphan's entry costs are booked EXACTLY ONCE —
+        # via the confirmed ledger — so the balance moves by precisely the
+        # orphan's entry cost, and accounting reconciliation confirms.
+        balance_after_adoption = engine.balance
+        assert balance_after_adoption == pytest.approx(
+            balance_before - (0.055 + 0.05))
+        assert engine.accounting_consistent
+
+        # A second pass is idempotent: adoption never re-books anything.
+        assert engine.open_entries({s: 100.0 for s in self.SYMBOLS}) == []
+        assert engine.balance == balance_after_adoption
+
+        # Protective management attaches immediately: the orphan is closed
+        # by the STOP rule like any other position.
+        orphan = next(
+            p for p in engine.open_positions.values()
+            if p.symbol == self.SYMBOLS[11])
+        closed = engine.check_exits({self.SYMBOLS[11]: orphan.stop_price})
+        assert [p.exit_reason for p in closed] == ["STOP_LOSS"]
+        engine.flush_pending_closes()
+
+    def test_restart_restores_committed_row_when_every_slot_is_full(self):
+        from app.paper.me_long_v2_inverse_short_v3.models import (
+            POSITION_STATUS_CLOSED,
+        )
+
+        clock = _Clock(T0)
+        peer = InMemoryV2Ledger()
+        store = _store(clock, peer=peer)
+        # The V3 row commits while slots are free; then V2 fills EVERY slot.
+        self._orphan_commit(store, "RP1USDT", detected_at=T0)
+        for i in range(12):
+            peer.add(f"V2P{i}USDT", T0 - timedelta(hours=20))
+        assert store.cross_contour_state().open_total == 13  # all slots full
+
+        # RESTART: the constructor restores every committed V3 row —
+        # portfolio capacity is never consulted for recovery.
+        engine = _engine(store, clock)
+        assert [p.symbol for p in engine.open_positions.values()] == ["RP1USDT"]
+
+        orphan = next(iter(engine.open_positions.values()))
+        closed = engine.check_exits({"RP1USDT": orphan.stop_price})
+        assert [p.exit_reason for p in closed] == ["STOP_LOSS"]
+        engine.flush_pending_closes()
+        assert store.list_positions(
+            status=POSITION_STATUS_CLOSED)[0].symbol == "RP1USDT"
+
+    def test_slot_release_after_recovery_admits_the_deferred_signal(self):
+        clock = _Clock(T0)
+        store = _store(clock)
+        engine = _engine(store, clock)
+        for symbol in self.SYMBOLS[:11]:
+            _capture(store, _candidate(symbol, detected_at=T0))
+        assert len(engine.open_entries({s: 100.0 for s in self.SYMBOLS})) == 11
+        self._orphan_commit(store, self.SYMBOLS[11], detected_at=T0)
+        _capture(store, _candidate(self.SYMBOLS[12], detected_at=T0))
+
+        # At capacity: the orphan is ADOPTED and the eligible 13th signal
+        # merely WAITS (deferred, still CAPTURED) — never terminally rejected.
+        engine.open_entries({s: 100.0 for s in self.SYMBOLS})
+        assert len(engine.open_positions) == 12
+        pending = _events(store, status=EVENT_STATUS_CAPTURED)
+        assert [e.symbol for e in pending] == [self.SYMBOLS[12]]
+
+        # A confirmed close frees the slot — only then the waiter enters.
+        victim = next(
+            p for p in engine.open_positions.values()
+            if p.symbol == self.SYMBOLS[0])
+        engine.check_exits({self.SYMBOLS[0]: victim.stop_price})
+        engine.flush_pending_closes()
+        opened = engine.open_entries({s: 100.0 for s in self.SYMBOLS})
+        assert [p.symbol for p in opened] == [self.SYMBOLS[12]]
+
+
+# ---------------------------------------------------------------------------
+# 9. Codex review P2 — terminal symbol guards run even at full capacity
+# ---------------------------------------------------------------------------
+class TestP2TerminalGuardsAtFullCapacity:
+    """SYMBOL_ALREADY_OPEN / SYMBOL_COOLDOWN_12H must dispose pending events
+    TERMINALLY and atomically even when all 12 slots are taken; only
+    symbol+cooldown-ELIGIBLE signals may wait for a free slot until TTL."""
+
+    def _full_book(self, clock):
+        peer = InMemoryV2Ledger()
+        for i in range(12):
+            peer.add(f"V2P{i}USDT", clock.now - timedelta(hours=13))
+        return peer
+
+    def test_symbol_open_refusal_terminal_even_at_full_capacity(self):
+        clock = _Clock(T0)
+        peer = self._full_book(clock)
+        store = _store(clock, peer=peer)
+        engine = _engine(store, clock)
+        _capture(store, _candidate("V2P0USDT", detected_at=T0))
+        _capture(store, _candidate("CLEANUSDT", detected_at=T0))
+        engine.open_entries({"V2P0USDT": 100.0, "CLEANUSDT": 100.0})
+
+        rejected = _events(store, status=EVENT_STATUS_SYMBOL_REJECTED)
+        assert [e.symbol for e in rejected] == ["V2P0USDT"]
+        assert rejected[0].status_reason == EVENT_REASON_SYMBOL_ALREADY_OPEN
+        assert rejected[0].status_at is not None
+        # The eligible signal only waits; nothing opens at full capacity.
+        waiting = _events(store, status=EVENT_STATUS_CAPTURED)
+        assert [e.symbol for e in waiting] == ["CLEANUSDT"]
+        assert engine.open_positions == {}
+
+        # The V2 position closes a minute later: the OLD signal must NEVER
+        # open — it was disposed terminally at capacity.  TWO slots are
+        # freed so both the deferred waiter and the NEW signal fit.
+        from app.paper.me_long_v2_inverse_short_v3.models import (
+            POSITION_STATUS_CLOSED,
+        )
+        for sym in ("V2P0USDT", "V2P1USDT"):
+            victim = next(
+                p for p in peer._positions.values() if p.symbol == sym)
+            peer._positions[victim.position_key] = dataclasses.replace(
+                victim, status=POSITION_STATUS_CLOSED)
+
+        _capture(store, _candidate(
+            "V2P0USDT", detected_at=T0 + timedelta(minutes=30)))
+        opened = engine.open_entries({"V2P0USDT": 100.0, "CLEANUSDT": 100.0})
+        opened_symbols = {p.symbol for p in opened}
+        # Only the NEW signal (and the deferred waiter) enter on the freed
+        # slot(s) — the terminally rejected event is never replayed.
+        assert opened_symbols == {"V2P0USDT", "CLEANUSDT"}
+        statuses = {e.symbol: e.status for e in _events(store)}
+        assert statuses["CLEANUSDT"] == EVENT_STATUS_ENTERED
+        old_rejected = [
+            e for e in _events(store, status=EVENT_STATUS_SYMBOL_REJECTED)
+            if e.symbol == "V2P0USDT"]
+        assert len(old_rejected) == 1  # still rejected, never reopened
+
+    def test_cooldown_refusal_terminal_even_at_full_capacity(self):
+        from app.paper.me_long_v2_inverse_short_v3.models import (
+            POSITION_STATUS_CLOSED,
+        )
+
+        clock = _Clock(T0)
+        peer = self._full_book(clock)
+        # COOLUSDT history: entered 2h ago and already CLOSED — the slot is
+        # free but the 12h cooldown timer still runs.
+        peer.add("COOLUSDT", T0 - timedelta(hours=2),
+                 status=POSITION_STATUS_CLOSED)
+        store = _store(clock, peer=peer)
+        engine = _engine(store, clock)
+        _capture(store, _candidate("COOLUSDT", detected_at=T0))
+        engine.open_entries({"COOLUSDT": 100.0})
+
+        rejected = _events(store, status=EVENT_STATUS_SYMBOL_REJECTED)
+        assert [e.symbol for e in rejected] == ["COOLUSDT"]
+        assert rejected[0].status_reason == EVENT_REASON_SYMBOL_COOLDOWN
+        assert rejected[0].status_at is not None
+        assert engine.open_positions == {}
+
+    def test_only_guard_eligible_signals_wait_for_a_slot_until_ttl(self):
+        from app.paper.me_long_v2_inverse_short_v3.models import (
+            POSITION_STATUS_CLOSED,
+        )
+
+        clock = _Clock(T0)
+        peer = self._full_book(clock)
+        peer.add("COOLUSDT", T0 - timedelta(hours=2),
+                 status=POSITION_STATUS_CLOSED)
+        store = _store(clock, peer=peer)
+        engine = _engine(store, clock)
+        prices = {"V2P0USDT": 100.0, "COOLUSDT": 100.0, "CLEANUSDT": 100.0}
+        _capture(store, _candidate("V2P0USDT", detected_at=T0))
+        _capture(store, _candidate("COOLUSDT", detected_at=T0))
+        _capture(store, _candidate("CLEANUSDT", detected_at=T0))
+        engine.open_entries(prices)
+
+        statuses = {e.symbol: e.status for e in _events(store)}
+        assert statuses["V2P0USDT"] == EVENT_STATUS_SYMBOL_REJECTED
+        assert statuses["COOLUSDT"] == EVENT_STATUS_SYMBOL_REJECTED
+        # Only the guard-ELIGIBLE signal may wait for a free slot …
+        assert statuses["CLEANUSDT"] == EVENT_STATUS_CAPTURED
+        assert engine.open_positions == {}
+
+        # … and at TTL it ages out under the frozen CAPACITY_REJECTED
+        # (ENTRY_CAP) contract — while the terminal refusals never un-reject.
+        clock.advance(minutes=ENTRY_MAX_AGE_MINUTES + 1)
+        engine.open_entries(prices)
+        statuses = {e.symbol: e.status for e in _events(store)}
+        assert statuses["CLEANUSDT"] == EVENT_STATUS_CAPACITY_REJECTED
+        assert statuses["V2P0USDT"] == EVENT_STATUS_SYMBOL_REJECTED
+        assert statuses["COOLUSDT"] == EVENT_STATUS_SYMBOL_REJECTED

@@ -329,10 +329,16 @@ def _guard_not_production(conn) -> None:
 
 def _write_activation(conn, table, experiment_id, status, fingerprint, freeze_ts):
     cursor = conn.cursor()
+    # UPSERT (not UPDATE): the row may be absent — a prior test may have
+    # deleted it to simulate an unreadable peer ledger, and every test must
+    # be order-independent on a shared test database.
     cursor.execute(
-        f"UPDATE {table} SET status = %s, protocol_fingerprint = %s, "
-        f"freeze_ts = %s, updated_at = now() WHERE experiment_id = %s",
-        (status, fingerprint, freeze_ts, experiment_id),
+        f"INSERT INTO {table} (experiment_id, status, protocol_fingerprint, "
+        f"freeze_ts) VALUES (%s, %s, %s, %s) "
+        f"ON CONFLICT (experiment_id) DO UPDATE SET status = EXCLUDED.status, "
+        f"protocol_fingerprint = EXCLUDED.protocol_fingerprint, "
+        f"freeze_ts = EXCLUDED.freeze_ts, updated_at = now()",
+        (experiment_id, status, fingerprint, freeze_ts),
     )
     assert cursor.rowcount == 1, f"activation row missing: {experiment_id}"
     conn.commit()
@@ -367,9 +373,11 @@ def _seed_v2_position(conn, symbol: str, entered_at: datetime) -> str:
         INSERT INTO {V2_EVENT_TABLE} (
             event_key, protocol_version, protocol_hash, source_scanner,
             source_direction, symbol, signal_time, captured_at,
-            activation_freeze_ts, signal_candle_open_time, status
+            activation_freeze_ts, signal_candle_open_time, capture_route,
+            status
         ) VALUES (%s, '2', %s, 'MOMENTUM_EXHAUSTION_REVERSE_LONG_V2',
-                  'LONG', %s, %s, %s, %s, 300000, 'CAPTURED')
+                  'LONG', %s, %s, %s, %s, 300000, 'PRE_FILTER_SOURCE',
+                  'CAPTURED')
         ON CONFLICT (event_key) DO NOTHING
         """,
         (
@@ -565,7 +573,9 @@ class TestPgAdmission:
         ]
         admitted = 0
         for i in range(8):
-            event = _capture(store, f"CAP{i}USDT")
+            # Distinct symbols from the V2 seeds: these events test the CAP
+            # gate (not the symbol guard) over 5 OPEN V2 + 7 OPEN V3 rows.
+            event = _capture(store, f"VCAP{i}USDT")
             decision = store.admit_position(_build_position(event))
             if decision.outcome == ADMIT_INSERTED:
                 admitted += 1
@@ -636,7 +646,8 @@ class TestPgAdmission:
             INSERT INTO {POSITION_TABLE} (
                 position_key, event_key, symbol, direction, entry_market_price,
                 entry_price, stop_price, target_price, position_size,
-                balance_before, entered_at, deadline_at, status
+                balance_before, entered_at, deadline_at, status, closed_at,
+                exit_reason
             ) VALUES (%s, %s, 'COOLUSDT', 'SHORT', 100.0, 100.0, 110.0, 90.0,
                       0.5, 10000.0,
                       now() - interval '12 hours',
@@ -675,10 +686,14 @@ class TestPgAdmission:
             (V2_EXPERIMENT_ID,),
         )
         pg_conn.commit()
-        fresh = _capture(
-            store, "FDBCUSDT", detected_at=now - timedelta(minutes=25))
-        decision = store.admit_position(_build_position(fresh))
-        assert decision.outcome in (ADMIT_DEFERRED, ADMIT_NOT_ADMISSIBLE)
+        try:
+            fresh = _capture(
+                store, "FDBCUSDT", detected_at=now - timedelta(minutes=25))
+            decision = store.admit_position(_build_position(fresh))
+            assert decision.outcome in (ADMIT_DEFERRED, ADMIT_NOT_ADMISSIBLE)
+        finally:
+            # Restore the peer row so the suite stays order-independent.
+            _seed_v2_activation(pg_conn, "DRAINING")
 
     def test_ambiguous_commit_resolves_to_adoption(self, pg_conn, store, running):
         event = _capture(store, "ADOPTUSDT")
@@ -702,3 +717,100 @@ class TestPgAdmission:
         assert state.v2_status == "DRAINING"
         assert state.open_total == 2
         assert state.v2_no_new_admissions is True
+
+    def test_p1_adopt_resolves_even_at_full_capacity(self, pg_conn, store, running):
+        """Codex P1 (PG): a committed row resolves to ADOPT_EXISTING even
+        when every one of the 12 slots is taken — a committed position is
+        never a guard refusal and never re-books fees."""
+        now = datetime.now(timezone.utc)
+        positions = []
+        for i in range(12):
+            event = _capture(
+                store, f"ADOPT{i}USDT",
+                detected_at=now - timedelta(minutes=30 - i))
+            position = _build_position(event)
+            decision = store.admit_position(position)
+            assert decision.outcome == ADMIT_INSERTED
+            positions.append(position)
+        cursor = pg_conn.cursor()
+        cursor.execute(
+            f"SELECT COUNT(*) FROM {POSITION_TABLE} WHERE status = 'OPEN'")
+        assert cursor.fetchone()[0] == 12
+        pg_conn.rollback()
+
+        # The first admission stands for a lost COMMIT acknowledgement:
+        # re-admitting its position must resolve to ADOPT even though the
+        # book is FULL (never REFUSED_*, never DEFERRED).
+        decision = store.admit_position(positions[0])
+        assert decision.outcome == ADMIT_ADOPT
+        cursor.execute(
+            f"SELECT COUNT(*) FROM {POSITION_TABLE} WHERE status = 'OPEN'")
+        assert cursor.fetchone()[0] == 12
+        pg_conn.rollback()
+
+    def test_p2_terminal_symbol_guards_run_at_full_capacity(self, pg_conn, store, running):
+        """Codex P2 (PG): SYMBOL_ALREADY_OPEN / SYMBOL_COOLDOWN_12H dispose
+        pending events TERMINALLY and atomically even at the 12 cap; only
+        guard-eligible signals may wait for a free slot (DEFERRED) until TTL."""
+        now = datetime.now(timezone.utc)
+        for i in range(5):
+            _seed_v2_position(
+                pg_conn, f"FULL{i}USDT", now - timedelta(hours=13))
+        for i in range(7):
+            event = _capture(
+                store, f"FULLV{i}USDT",
+                detected_at=now - timedelta(minutes=30 - i))
+            assert store.admit_position(
+                _build_position(event)).outcome == ADMIT_INSERTED
+        assert store.cross_contour_state().open_total == 12  # FULL
+
+        # Symbol-already-open refusal at capacity: TERMINAL, atomic, with
+        # reason + timestamp — even though the V2 row is 13h old.
+        open_event = _capture(
+            store, "FULL0USDT", detected_at=now - timedelta(minutes=20))
+        decision = store.admit_position(_build_position(open_event))
+        assert decision.outcome == ADMIT_REFUSED_TERMINAL
+        assert decision.reason == REFUSAL_SYMBOL_ALREADY_OPEN
+        cursor = pg_conn.cursor()
+        cursor.execute(
+            f"SELECT status, status_reason, status_at FROM {EVENT_TABLE} "
+            f"WHERE event_key = %s", (open_event.event_key,))
+        status, reason, status_at = cursor.fetchone()
+        assert status == EVENT_STATUS_SYMBOL_REJECTED
+        assert reason == EVENT_REASON_SYMBOL_ALREADY_OPEN
+        assert status_at is not None
+
+        # Cooldown refusal at capacity: a CLOSED V2 row entered 2h ago —
+        # the slot is free but the 12h timer runs; still TERMINAL at cap.
+        _seed_v2_position(
+            pg_conn, "FULLCOOLUSDT", now - timedelta(hours=2))
+        cursor.execute(
+            f"UPDATE {V2_POSITION_TABLE} SET status = 'CLOSED', "
+            f"closed_at = now(), exit_reason = 'TIMEOUT' "
+            f"WHERE symbol = 'FULLCOOLUSDT'")
+        pg_conn.commit()
+        cool_event = _capture(
+            store, "FULLCOOLUSDT", detected_at=now - timedelta(minutes=18))
+        decision = store.admit_position(_build_position(cool_event))
+        assert decision.outcome == ADMIT_REFUSED_TERMINAL
+        assert decision.reason == REFUSAL_SYMBOL_COOLDOWN
+        cursor.execute(
+            f"SELECT status, status_reason FROM {EVENT_TABLE} "
+            f"WHERE event_key = %s", (cool_event.event_key,))
+        status, reason = cursor.fetchone()
+        pg_conn.rollback()
+        assert status == EVENT_STATUS_SYMBOL_REJECTED
+        assert reason == EVENT_REASON_SYMBOL_COOLDOWN
+
+        # Only the guard-ELIGIBLE signal waits for a free slot (DEFERRED,
+        # stays CAPTURED) — never terminally disposed at capacity.
+        clean_event = _capture(
+            store, "FULLCLEANUSDT", detected_at=now - timedelta(minutes=16))
+        decision = store.admit_position(_build_position(clean_event))
+        assert decision.outcome == ADMIT_DEFERRED
+        assert decision.reason == REFUSAL_ENTRY_CAP
+        cursor.execute(
+            f"SELECT status FROM {EVENT_TABLE} WHERE event_key = %s",
+            (clean_event.event_key,))
+        assert cursor.fetchone()[0] == EVENT_STATUS_CAPTURED
+        pg_conn.rollback()

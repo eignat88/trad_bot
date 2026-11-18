@@ -1568,7 +1568,23 @@ class PgInverseShortStore(InverseShortStore):
             self._execute_once(
                 ADMISSION_LOCK_SQL, (ADMISSION_LOCK_KEY,), fetch="one",
             )
-            # 2) V2 peer status — fail closed for entries when the V2 state
+            # 2) A row already committed for THIS position resolves to
+            #    ADOPT_EXISTING BEFORE any guard (review P1): a committed
+            #    position is never a guard refusal — guards gate NEW
+            #    admissions only — and never depends on the V2 peer state,
+            #    the portfolio capacity or any other gate below.  Inside the
+            #    advisory-lock critical section this read is race-free: a
+            #    concurrent admission of the same position_key serializes
+            #    behind this lock and observes the committed row here.
+            existing = self._execute_once(
+                "SELECT 1 FROM " + POSITION_TABLE + " WHERE position_key = %s",
+                (position.position_key,),
+                fetch="one",
+            )
+            if existing.fetchone() is not None:
+                self._conn.rollback()
+                return self._resolve_existing(position, "ALREADY_COMMITTED")
+            # 3) V2 peer status — fail closed for entries when the V2 state
             #    is unreadable or V2 could still admit concurrently.
             v2_row = self._execute_once(
                 V2_STATUS_FOR_ADMISSION_SQL, (V2_EXPERIMENT_ID,), fetch="one",

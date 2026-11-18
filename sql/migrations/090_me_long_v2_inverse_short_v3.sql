@@ -347,6 +347,10 @@ BEGIN
 END;
 $$;
 
+-- The trigger is DROPped first so re-applying this migration is idempotent
+-- (parity with migration 087's guard-trigger pattern).
+DROP TRIGGER IF EXISTS trg_me_long_v2_inverse_short_v3_guard
+    ON dds.me_long_v2_inverse_short_v3_position;
 CREATE TRIGGER trg_me_long_v2_inverse_short_v3_guard
 BEFORE UPDATE ON dds.me_long_v2_inverse_short_v3_position
 FOR EACH ROW

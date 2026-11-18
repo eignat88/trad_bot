@@ -424,7 +424,7 @@ class InverseShortPaperEngine:
 
         # ---- V2 entry admission (frozen spec: entry_max_age_minutes) ----
         # Dispose of CAPTURED events that reached the entry TTL BEFORE any
-        # other gate and BEFORE the capacity early-return below: a backlog
+        # other gate and BEFORE the capacity handling below: a backlog
         # must age out even while the book is full or an accounting gate is
         # down — otherwise stale events would silently accumulate.  Fail-soft
         # bookkeeping (never blocks exits, never raises); the per-event age
@@ -432,6 +432,21 @@ class InverseShortPaperEngine:
         # this sweep write failed.
         max_positions = MAX_OPEN_POSITIONS_TOTAL
         self._sweep_stale_events(max_positions)
+
+        # ---- Codex P1: committed-position RECOVERY (capacity-independent) --
+        # An admission whose INSERT PostgreSQL COMMITTED while the
+        # acknowledgement was lost leaves a durable OPEN row that is not in
+        # ``open_positions``.  Such a row MUST be adopted under STOP/TP/
+        # TIMEOUT management regardless of the portfolio capacity (it already
+        # occupies its slot) and regardless of EVERY new-entry gate below:
+        # peer state, accounting trust and close-durability risk exist to
+        # protect NEW admissions and may never strand a position PostgreSQL
+        # already accepted.  Adoption books nothing by hand — entry costs are
+        # folded in exactly once by the confirmed ledger — so accounting
+        # reconciliation is never violated and fees are never charged twice.
+        recovered = self._recover_committed_entries(prices)
+        if recovered:
+            opened.extend(recovered)
 
         # ---- Issue #285 cross-contour entry gates (fail closed) ----------
         # The V2 peer ledger must be readable AND V2 must admit nothing
@@ -491,15 +506,23 @@ class InverseShortPaperEngine:
 
         # Issue #285: the capacity cap is GLOBAL — it counts OPEN V2 + OPEN
         # V3, never this contour alone.  The authoritative re-check happens
-        # inside every admission transaction; this is the fast path.
+        # inside every admission transaction.  Codex P2: there is NO
+        # capacity early-return and NO capacity break below — pending events
+        # must still reach the store's TERMINAL symbol/cooldown guards (which
+        # take precedence over ENTRY_CAP and dispose atomically in the same
+        # transaction) even when the book is full; only otherwise-eligible
+        # events are DEFERRED at capacity and may wait for a free slot until
+        # their TTL.  Signal eligibility must never depend on unrelated
+        # portfolio capacity.
         total_open = guard_state.open_total
         if total_open >= max_positions:
             logger.info(
                 "me inverse short v3 global entry cap reached (%d OPEN "
-                "V2+V3): pending events age out under the frozen TTL sweep",
+                "V2+V3): terminal symbol/cooldown guard refusals still "
+                "dispose pending events; only eligible signals wait for a "
+                "free slot until TTL",
                 max_positions,
             )
-            return opened
 
         # Review P1: a pending-events/store failure must NEVER propagate out
         # of open_entries — entries simply fail closed for this cycle while
@@ -508,12 +531,12 @@ class InverseShortPaperEngine:
         try:
             events = self.store.list_events(status=EVENT_STATUS_CAPTURED)
             for index, event in enumerate(events):
-                if total_open >= max_positions:
-                    logger.info(
-                        "me inverse short v3 global entry cap reached "
-                        "(%d OPEN V2+V3)", max_positions,
-                    )
-                    break
+                # Codex P2: no capacity break here — every pending event
+                # reaches the store's decision gates, whose frozen order is
+                # NOT_ADMISSIBLE -> ENTRY_TTL -> SYMBOL_ALREADY_OPEN ->
+                # SYMBOL_COOLDOWN_12H -> ENTRY_CAP: symbol/cooldown refusals
+                # are TERMINAL and disposed atomically even at capacity,
+                # while only eligible events defer for a free slot.
                 # Review P2 (Codex): an earlier entry of THIS cycle may have
                 # adopted a committed position whose fresh reconciliation
                 # failed and cleared _balance_trusted — re-check accounting
@@ -546,6 +569,55 @@ class InverseShortPaperEngine:
                 exc_info=True,
             )
         return opened
+
+    def _recover_committed_entries(
+        self,
+        prices: dict[str, float],
+    ) -> list[InverseShortPosition]:
+        """Codex P1: adopt already-COMMITTED rows regardless of capacity.
+
+        A lost COMMIT acknowledgement leaves a durable OPEN row that this
+        process never added to ``open_positions``.  Every such row must be
+        brought under STOP/TP/TIMEOUT management immediately — completely
+        independent of portfolio capacity (the row already occupies its
+        slot) and of every NEW-entry gate below this call in
+        ``open_entries``.  The adoption branch of ``_open_event`` keeps the
+        original entry facts verbatim and books nothing by hand: entry costs
+        land exactly once via the confirmed ledger, so no fee is ever
+        charged twice and accounting reconciliation stays intact.  Fail-soft
+        throughout — a failed probe is retried on the next cycle.
+        """
+        recovered: list[InverseShortPosition] = []
+        seen: set[str] = set()
+        try:
+            events = self.store.list_events(status=EVENT_STATUS_CAPTURED)
+        except Exception:
+            logger.debug(
+                "me inverse short v3 committed-position recovery scan "
+                "failed (retried next cycle)",
+                exc_info=True,
+            )
+            return recovered
+        for event in events:
+            position_key = build_position_key(event.event_key)
+            if position_key in self.open_positions or position_key in seen:
+                continue
+            try:
+                committed = self.store.has_position(position_key)
+            except Exception:
+                logger.debug(
+                    "me inverse short v3 committed-position recovery probe "
+                    "failed (retried next cycle)",
+                    exc_info=True,
+                )
+                continue
+            if not committed:
+                continue
+            position = self._open_event(event, prices)
+            if position is not None:
+                seen.add(position_key)
+                recovered.append(position)
+        return recovered
 
     def _open_event(
         self,
@@ -646,6 +718,15 @@ class InverseShortPaperEngine:
                 logger.info(
                     "me inverse short v3 entry refused TERMINAL: reason=%s "
                     "key=%s symbol=%s (event disposed; no entry, no fee)",
+                    decision.reason, event.event_key[:16], event.symbol,
+                )
+            elif decision.outcome == ADMIT_DEFERRED:
+                # Codex P2: symbol/cooldown guards passed — the signal is
+                # ELIGIBLE and only waits for a free slot (or its TTL sweep).
+                logger.info(
+                    "me inverse short v3 entry deferred: reason=%s key=%s "
+                    "symbol=%s (guards passed; waits for a free slot until "
+                    "TTL)",
                     decision.reason, event.event_key[:16], event.symbol,
                 )
             else:
