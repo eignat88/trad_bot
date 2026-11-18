@@ -612,7 +612,27 @@ class InverseShortPaperEngine:
                 continue
             if not committed:
                 continue
-            position = self._open_event(event, prices)
+            # Per-event isolation (review P1): a PostgreSQL error while
+            # re-probing / reading / verifying ONE row must never interrupt
+            # the management of the remaining book.  The failed row is NOT
+            # considered recovered (no ``recovered``/``seen`` entry) and
+            # NOTHING is booked — entry costs only ever land via the
+            # idempotent confirmed-ledger reconciliation of a SUCCESSFUL
+            # adoption — so the recovery is retried on the next cycle with
+            # exactly-once fee semantics.
+            try:
+                position = self._open_event(event, prices)
+            except Exception:
+                logger.error(
+                    "me inverse short v3 committed-position recovery FAILED "
+                    "for one row (isolated: the rest of the book stays under "
+                    "STOP/TP/TIMEOUT management; the row is NOT considered "
+                    "recovered and NO fee is booked — retried next cycle): "
+                    "key=%s symbol=%s",
+                    position_key[:48], event.symbol,
+                    exc_info=True,
+                )
+                continue
             if position is not None:
                 seen.add(position_key)
                 recovered.append(position)

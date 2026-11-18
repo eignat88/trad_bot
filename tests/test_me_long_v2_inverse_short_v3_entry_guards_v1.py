@@ -986,6 +986,135 @@ class TestP1CommittedRecoveryBeyondCapacity:
         assert engine.accounting_consistent
 
 
+class _FlakyRecoveryStore:
+    """Store proxy simulating a PostgreSQL connection error on the SECOND
+    ``has_position()`` call for ONE key — the re-probe inside ``_open_event``
+    — while the recovery probe (first call) succeeds.  Mirrors the review
+    scenario: first has_position() OK, second raises."""
+
+    def __init__(self, store, fail_key: str) -> None:
+        self._store = store
+        self._fail_key = fail_key
+        self._calls: dict[str, int] = {}
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+    def has_position(self, position_key: str) -> bool:
+        count = self._calls.get(position_key, 0) + 1
+        self._calls[position_key] = count
+        if position_key == self._fail_key and count >= 2:
+            raise ConnectionError("simulated PostgreSQL connection error")
+        return self._store.has_position(position_key)
+
+
+def _pos_key(event) -> str:
+    from app.paper.me_long_v2_inverse_short_v3.identity import position_key
+    return position_key(event.event_key)
+
+
+# ---------------------------------------------------------------------------
+# 10. Codex review P1 (follow-up) — recovery errors are isolated per row
+# ---------------------------------------------------------------------------
+class TestP1RecoveryErrorIsolation:
+    """A PostgreSQL error during ONE committed-row recovery must never
+    interrupt the management of the remaining book: no position loses its
+    STOP/TP/TIMEOUT, the failed row is not considered recovered, and no fee
+    is ever booked by a failed attempt."""
+
+    _orphan_commit = staticmethod(
+        TestP1CommittedRecoveryBeyondCapacity._orphan_commit)
+
+    @pytest.mark.parametrize(
+        "exit_kind", ["STOP_LOSS", "TAKE_PROFIT_1", "TIMEOUT"])
+    def test_recovery_error_is_isolated_and_exits_still_close(self, exit_kind):
+        clock = _Clock(T0)
+        store = _store(clock)
+        engine = _engine(store, clock)
+        _capture(store, _candidate("KEEPUSDT", detected_at=T0))
+        assert len(engine.open_entries({"KEEPUSDT": 100.0})) == 1
+        keep = next(iter(engine.open_positions.values()))
+        event = self._orphan_commit(store, "DRNUSDT", detected_at=T0)
+
+        # First has_position() (recovery probe) succeeds, the second one
+        # (inside _open_event) raises a connection error.
+        engine.store = _FlakyRecoveryStore(store, fail_key=_pos_key(event))
+        if exit_kind == "STOP_LOSS":
+            prices = {"KEEPUSDT": keep.stop_price, "DRNUSDT": 100.0}
+        elif exit_kind == "TAKE_PROFIT_1":
+            prices = {"KEEPUSDT": keep.target_price, "DRNUSDT": 100.0}
+        else:  # TIMEOUT — past the frozen 7200-minute deadline
+            clock.advance(hours=121)
+            prices = {"KEEPUSDT": 100.0, "DRNUSDT": 100.0}
+
+        closed = engine.check_exits(prices)
+        # The recovery error must NOT interrupt the management contour:
+        # the OTHER position is closed by its STOP/TP/TIMEOUT in the SAME
+        # cycle.
+        assert [p.symbol for p in closed] == ["KEEPUSDT"]
+        assert [p.exit_reason for p in closed] == [exit_kind]
+        engine.flush_pending_closes()
+        # The failed row is NOT considered recovered.
+        assert all(
+            p.symbol != "DRNUSDT" for p in engine.open_positions.values())
+        assert engine.accounting_consistent
+
+    def test_recovery_error_books_nothing_and_retry_is_exactly_once(self):
+        clock = _Clock(T0)
+        store = _store(clock)
+        engine = _engine(store, clock)
+        event = self._orphan_commit(store, "DRNUSDT", detected_at=T0)
+        engine.store = _FlakyRecoveryStore(store, fail_key=_pos_key(event))
+        balance_before = engine.balance
+
+        assert engine.check_exits({"DRNUSDT": 100.0}) == []
+        # A failed recovery books NOTHING: no entry cost, no fee, no PnL.
+        assert engine.balance == balance_before
+        assert engine.open_positions == {}
+        assert engine.pending_closes == {}
+        assert engine.accounting_consistent
+
+        # A healthy retry adopts the row and books its entry costs
+        # EXACTLY ONCE (the failed attempt booked nothing).
+        engine.store = store
+        engine.check_exits({"DRNUSDT": 100.0})
+        assert "DRNUSDT" in [
+            p.symbol for p in engine.open_positions.values()]
+        assert engine.balance == pytest.approx(
+            balance_before - (0.055 + 0.05))
+
+    def test_recovery_error_isolates_multiple_orphans(self):
+        clock = _Clock(T0)
+        store = _store(clock)
+        engine = _engine(store, clock)
+        _capture(store, _candidate("KEEPUSDT", detected_at=T0))
+        assert len(engine.open_entries({"KEEPUSDT": 100.0})) == 1
+        keep = next(iter(engine.open_positions.values()))
+        ev_a = self._orphan_commit(store, "DRNAUSDT", detected_at=T0)
+        self._orphan_commit(store, "DRNBUSDT", detected_at=T0)
+        self._orphan_commit(store, "DRNCUSDT", detected_at=T0)
+        engine.store = _FlakyRecoveryStore(store, fail_key=_pos_key(ev_a))
+
+        closed = engine.check_exits(
+            {
+                "KEEPUSDT": keep.stop_price,
+                "DRNAUSDT": 100.0, "DRNBUSDT": 100.0, "DRNCUSDT": 100.0,
+            })
+        # The STOP close still happens this cycle …
+        assert [p.symbol for p in closed] == ["KEEPUSDT"]
+        managed = {p.symbol for p in engine.open_positions.values()}
+        # … the healthy orphans are recovered despite the failing one …
+        assert {"DRNBUSDT", "DRNCUSDT"} <= managed
+        # … and only the failing row stays out (retried next cycle).
+        assert "DRNAUSDT" not in managed
+
+        engine.flush_pending_closes()
+        engine.store = store
+        engine.check_exits({"DRNAUSDT": 100.0})
+        assert "DRNAUSDT" in [
+            p.symbol for p in engine.open_positions.values()]
+
+
 # ---------------------------------------------------------------------------
 # 9. Codex review P2 — terminal symbol guards run even at full capacity
 # ---------------------------------------------------------------------------
