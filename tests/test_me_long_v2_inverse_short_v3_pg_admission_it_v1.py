@@ -267,6 +267,8 @@ def _build_position(event, *, entered_at: datetime | None = None) -> InverseShor
         event_key=event.event_key,
         symbol=event.symbol,
         direction="SHORT",
+        source_scanner=event.source_scanner,
+        source_setup_id=event.source_setup_id,
         entered_at=entered,
         deadline_at=entered + timedelta(minutes=7200),
         entry_market_price=100.0,
@@ -814,3 +816,46 @@ class TestPgAdmission:
             (clean_event.event_key,))
         assert cursor.fetchone()[0] == EVENT_STATUS_CAPTURED
         pg_conn.rollback()
+
+    def test_p1_pg_drainging_lost_commit_managed_without_restart(
+            self, pg_conn, store, running):
+        """Codex follow-up (PG): COMMIT ok -> ack lost -> V3 flips to
+        DRAINING -> NO restart.  open_entries() is blocked by EXIT_ONLY, yet
+        the management contour must adopt the committed row in memory and
+        serve it under STOP/TP/TIMEOUT."""
+        from app.paper.me_long_v2_inverse_short_v3.engine import (
+            InverseShortPaperEngine,
+        )
+
+        now = datetime.now(timezone.utc)
+        engine = InverseShortPaperEngine(
+            Settings(), store, clock=lambda: now, activation=_identity(),
+        )
+        # The admission COMMITS durably — its acknowledgement is lost.
+        event = _capture(
+            store, "DRNPGUSDT", detected_at=now - timedelta(minutes=25))
+        position = _build_position(event)
+        assert store.admit_position(position).outcome == ADMIT_INSERTED
+
+        # V3 flips to DRAINING mid-run (refresh_activation swaps the
+        # identity in place) — the process never restarts.
+        identity, _reason = evaluate_activation(
+            ActivationRecord(
+                experiment_id=EXPERIMENT_ID,
+                status="DRAINING",
+                protocol_fingerprint=protocol_fingerprint(),
+                freeze_ts=now - timedelta(hours=3),
+            ),
+            enabled=True,
+        )
+        assert identity is not None and identity.exit_only
+        engine.activation = identity
+        # Entries are forbidden and stay forbidden …
+        assert engine.open_entries({"DRNPGUSDT": 100.0}) == []
+        assert engine.open_positions == {}
+        # … yet the management contour recovers and closes the row via STOP.
+        closed = engine.check_exits({"DRNPGUSDT": position.stop_price})
+        assert [p.symbol for p in closed] == ["DRNPGUSDT"]
+        assert [p.exit_reason for p in closed] == ["STOP_LOSS"]
+        engine.flush_pending_closes()
+        assert engine.accounting_consistent

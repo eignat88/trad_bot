@@ -433,20 +433,17 @@ class InverseShortPaperEngine:
         max_positions = MAX_OPEN_POSITIONS_TOTAL
         self._sweep_stale_events(max_positions)
 
-        # ---- Codex P1: committed-position RECOVERY (capacity-independent) --
-        # An admission whose INSERT PostgreSQL COMMITTED while the
-        # acknowledgement was lost leaves a durable OPEN row that is not in
-        # ``open_positions``.  Such a row MUST be adopted under STOP/TP/
-        # TIMEOUT management regardless of the portfolio capacity (it already
-        # occupies its slot) and regardless of EVERY new-entry gate below:
-        # peer state, accounting trust and close-durability risk exist to
-        # protect NEW admissions and may never strand a position PostgreSQL
-        # already accepted.  Adoption books nothing by hand — entry costs are
-        # folded in exactly once by the confirmed ledger — so accounting
-        # reconciliation is never violated and fees are never charged twice.
-        recovered = self._recover_committed_entries(prices)
-        if recovered:
-            opened.extend(recovered)
+        # ---- Codex P1: committed-position RECOVERY -------------------------
+        # Moved into the MANAGEMENT contour (check_exits) so it runs even
+        # when entries are forbidden (EXIT_ONLY / DRAINING): an admission
+        # whose INSERT PostgreSQL COMMITTED while the acknowledgement was
+        # lost leaves a durable OPEN row that is not in ``open_positions``,
+        # and it must be adopted under STOP/TP/TIMEOUT regardless of every
+        # new-entry gate below.  Adoption books nothing by hand — entry
+        # costs are folded in exactly once by the confirmed ledger — so
+        # accounting reconciliation is never violated and fees are never
+        # charged twice.  (A belt-and-braces adopt branch also remains in
+        # ``_open_event`` for the entry path.)
 
         # ---- Issue #285 cross-contour entry gates (fail closed) ----------
         # The V2 peer ledger must be readable AND V2 must admit nothing
@@ -580,8 +577,10 @@ class InverseShortPaperEngine:
         process never added to ``open_positions``.  Every such row must be
         brought under STOP/TP/TIMEOUT management immediately — completely
         independent of portfolio capacity (the row already occupies its
-        slot) and of every NEW-entry gate below this call in
-        ``open_entries``.  The adoption branch of ``_open_event`` keeps the
+        slot) and of every NEW-entry gate (peer state, accounting trust,
+        close-durability risk, EXIT_ONLY mode).  Called from the MANAGEMENT
+        contour (``check_exits``) so recovery runs even while new entries
+        are forbidden.  The adoption branch of ``_open_event`` keeps the
         original entry facts verbatim and books nothing by hand: entry costs
         land exactly once via the confirmed ledger, so no fee is ever
         charged twice and accounting reconciliation stays intact.  Fail-soft
@@ -1010,6 +1009,12 @@ class InverseShortPaperEngine:
         # Then retry any DIRTY funding snapshot (P2): persisted even when no
         # new funding interval has become due; a retry never re-accrues.
         self._retry_dirty_funding()
+        # Codex P1 follow-up: committed-position RECOVERY lives in the
+        # MANAGEMENT contour — a lost COMMIT acknowledgement may surface
+        # while the contour is EXIT_ONLY (DRAINING), where open_entries() is
+        # forbidden.  Every committed row must still be adopted under
+        # STOP/TP/TIMEOUT regardless of the permission to open NEW entries.
+        self._recover_committed_entries(prices)
 
         closed: list[InverseShortPosition] = []
 

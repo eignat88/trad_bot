@@ -129,12 +129,12 @@ def _activation(
     )
 
 
-def _identity() -> ActivationIdentity:
+def _identity(status: str = "RUNNING") -> ActivationIdentity:
     identity, _reason = (
         __import__(
             "app.paper.me_long_v2_inverse_short_v3.activation",
             fromlist=["evaluate_activation"],
-        ).evaluate_activation(_activation(), enabled=True)
+        ).evaluate_activation(_activation(status=status), enabled=True)
     )
     assert identity is not None
     return identity
@@ -940,6 +940,50 @@ class TestP1CommittedRecoveryBeyondCapacity:
         engine.flush_pending_closes()
         opened = engine.open_entries({s: 100.0 for s in self.SYMBOLS})
         assert [p.symbol for p in opened] == [self.SYMBOLS[12]]
+
+    def test_drainging_lost_commit_is_managed_without_restart(self):
+        """Codex follow-up: COMMIT ok -> ack lost -> V3 goes DRAINING ->
+        the process keeps running WITHOUT a restart.
+
+        ``open_entries()`` is forbidden in EXIT_ONLY mode — the committed row
+        must nevertheless be recovered in memory and served under STOP/TP/
+        TIMEOUT by the MANAGEMENT contour (``check_exits``), independently
+        of the permission to open new entries.
+        """
+        clock = _Clock(T0)
+        store = _store(clock)
+        engine = _engine(store, clock)
+        # A normal position keeps being managed across the transition.
+        _capture(store, _candidate("KEEPUSDT", detected_at=T0))
+        assert len(engine.open_entries({"KEEPUSDT": 100.0})) == 1
+
+        # The second admission commits durably — its ACKNOWLEDGEMENT is lost.
+        self._orphan_commit(store, "DRNUSDT", detected_at=T0)
+
+        # V3 flips to DRAINING mid-run (the runner's refresh_activation()
+        # swaps the identity in place) — NO restart happens.
+        engine.activation = _identity(status="DRAINING")
+        assert engine.activation.exit_only
+
+        # open_entries() is blocked by EXIT_ONLY and stays blocked ...
+        assert engine.open_entries({"DRNUSDT": 100.0, "KEEPUSDT": 100.0}) == []
+        assert "DRNUSDT" not in [
+            p.symbol for p in engine.open_positions.values()]
+
+        # ... yet the management contour recovers the committed row in
+        # memory and serves it under STOP/TP/TIMEOUT from then on.
+        assert engine.check_exits({"DRNUSDT": 100.0, "KEEPUSDT": 100.0}) == []
+        assert "DRNUSDT" in [
+            p.symbol for p in engine.open_positions.values()]
+        orphan = next(
+            p for p in engine.open_positions.values()
+            if p.symbol == "DRNUSDT")
+        closed = engine.check_exits(
+            {"DRNUSDT": orphan.stop_price, "KEEPUSDT": 100.0})
+        assert [p.symbol for p in closed] == ["DRNUSDT"]
+        assert [p.exit_reason for p in closed] == ["STOP_LOSS"]
+        engine.flush_pending_closes()
+        assert engine.accounting_consistent
 
 
 # ---------------------------------------------------------------------------
