@@ -129,6 +129,12 @@ ADMIT_ADOPT = "ADOPT_EXISTING"       # ambiguous COMMIT: adopt, never re-INSERT
 ADMIT_REFUSED_TERMINAL = "REFUSED_TERMINAL"  # SYMBOL_*: event disposed
 ADMIT_DEFERRED = "DEFERRED"          # cap / legacy state: event stays CAPTURED
 ADMIT_NOT_ADMISSIBLE = "NOT_ADMISSIBLE"      # TTL / identity / event state
+# Review P2-2: a SYMBOL_* terminal refusal is reported ONLY after its durable
+# disposition is verified.  When the disposition cannot be confirmed and no
+# committed position resolves to ADOPT_EXISTING, admission FAILS CLOSED under
+# this explicit consistency reason — a successful terminal refusal is never
+# claimed unverified.
+REFUSAL_DISPOSITION_UNCONFIRMED = "TERMINAL_DISPOSITION_UNCONFIRMED"
 
 
 @dataclass(frozen=True)
@@ -720,7 +726,7 @@ class InMemoryInverseShortStore(InverseShortStore):
         # SINGLE_ACTIVE_SYMBOL over the OOS-2 family -> TERMINAL refusal.
         if position.symbol in state.open_symbols:
             return self._refuse_symbol_locked(
-                position.event_key, REFUSAL_SYMBOL_ALREADY_OPEN, now,
+                position, REFUSAL_SYMBOL_ALREADY_OPEN, now,
             )
         # 12h per-symbol cooldown from the last COMMITTED entered_at
         # (legacy v1 or this contour, ANY status) -> TERMINAL refusal.
@@ -731,7 +737,7 @@ class InMemoryInverseShortStore(InverseShortStore):
             and now < last + timedelta(hours=SYMBOL_ENTRY_COOLDOWN_HOURS)
         ):
             return self._refuse_symbol_locked(
-                position.event_key, REFUSAL_SYMBOL_COOLDOWN, now,
+                position, REFUSAL_SYMBOL_COOLDOWN, now,
             )
         # OOS-2-family capacity: DEFERRED (event stays CAPTURED and ages out
         # under the frozen ENTRY_CAP / ENTRY_TTL sweep contract).
@@ -742,17 +748,34 @@ class InMemoryInverseShortStore(InverseShortStore):
         return AdmissionDecision(ADMIT_INSERTED)
 
     def _refuse_symbol_locked(
-        self, event_key: str, reason: str, decided_at: datetime,
+        self, position: InverseShortPosition, reason: str, decided_at: datetime,
     ) -> AdmissionDecision:
         """Atomic terminal refusal: dispose the event in the same critical
-        section — never left CAPTURED for a later replay (Issue #287)."""
-        self.mark_event_expired(
-            event_key,
+        section — never left CAPTURED for a later replay (Issue #287).
+
+        Review P2-2 symmetry with the PostgreSQL store: the terminal refusal
+        is reported ONLY when the disposition actually landed (``True``).  A
+        position already committed for this key/event resolves to
+        ``ADOPT_EXISTING`` (never ``EXPIRED-with-position``); anything else
+        FAILS CLOSED under the explicit consistency reason — a durable
+        terminal refusal is never claimed unverified.
+        """
+        disposed = self.mark_event_expired(
+            position.event_key,
             EVENT_STATUS_SYMBOL_REJECTED,
             reason=reason,
             decided_at=decided_at,
         )
-        return AdmissionDecision(ADMIT_REFUSED_TERMINAL, reason)
+        if disposed:
+            return AdmissionDecision(ADMIT_REFUSED_TERMINAL, reason)
+        if position.position_key in self._positions or any(
+            p.event_key == position.event_key
+            for p in self._positions.values()
+        ):
+            return AdmissionDecision(ADMIT_ADOPT)
+        return AdmissionDecision(
+            ADMIT_NOT_ADMISSIBLE, REFUSAL_DISPOSITION_UNCONFIRMED,
+        )
 
     def update_position(self, position: InverseShortPosition) -> None:
         stored = self._positions.get(position.position_key)
@@ -2275,8 +2298,27 @@ class PgInverseShortStore(InverseShortStore):
                     ),
                     fetch="none",
                 )
-                self._conn.commit()
-                return AdmissionDecision(ADMIT_REFUSED_TERMINAL, decision)
+                if disposed.rowcount == 1:
+                    self._conn.commit()
+                    return AdmissionDecision(ADMIT_REFUSED_TERMINAL, decision)
+                # Review P2-2: the durable disposition did NOT land
+                # (rowcount 0 — the NOT EXISTS position guard tripped, or
+                # the event row vanished).  A committed position for this
+                # key/event ALWAYS resolves to ADOPT_EXISTING
+                # (``_resolve_existing``: the position guard exists exactly
+                # so an event with a position is never disposed of — no
+                # EXPIRED-with-position); with no position either this is an
+                # explicit consistency failure and admission FAILS CLOSED —
+                # a durable terminal refusal is never claimed unverified.
+                # The event stays CAPTURED for the frozen ENTRY_TTL sweep
+                # contract.  A COMMIT failure above propagates into
+                # ``_with_reconnect``: the whole idempotent unit re-runs and
+                # ``WHERE status = 'CAPTURED'`` keeps the disposition
+                # exactly-once across retries.
+                self._conn.rollback()
+                return self._resolve_existing(
+                    position, REFUSAL_DISPOSITION_UNCONFIRMED,
+                )
 
             if decision == REFUSAL_ENTRY_CAP:
                 self._conn.rollback()

@@ -439,6 +439,7 @@ class ProductionRuntime:
         snapshot: MarketDataSnapshot,
         entry_symbols: set[str],
         db_errors: int,
+        entry_guard: dict[str, Any] | None = None,
     ) -> list[str]:
         """Honest, per-cause reasons why NO new entry happened this cycle."""
         refusals: list[str] = []
@@ -455,12 +456,22 @@ class ProductionRuntime:
         if result.get("pending_events_unavailable"):
             refusals.append("PENDING_EVENTS_UNAVAILABLE")
         refusals.extend(snapshot.entry_refusals(entry_symbols))
-        if (
-            # OOS-2 LOCAL capacity (Issue #276): the frozen protocol
-            # constant — never the global Settings.max_open_positions.
-            result.get("open_positions", 0) >= MAX_OPEN_POSITIONS
-        ):
-            refusals.append("ENTRY_CAP")
+        # OOS-2 FAMILY capacity (review P2-1): the authoritative admission
+        # gate counts OPEN logical positions across the family (legacy OOS-2
+        # v1 READ-ONLY + this contour) — never this engine's LOCAL open count
+        # alone and never the global Settings.max_open_positions.  With 10
+        # legacy OPEN + 2 local OPEN the 12-cap is exhausted and ENTRY_CAP
+        # must be reported; with 5 + 6 it is not.  An unreadable family view
+        # is a DISTINCT cause ("..._UNAVAILABLE"), never an invented zero —
+        # the admission itself stays fail-closed regardless (observability
+        # only).  V2/V3 are never part of this view (OOS-2 isolation).
+        if entry_guard is None:
+            entry_guard = self.contour.engine.entry_guard_snapshot()
+        if entry_guard.get("oos2_family_available"):
+            if int(entry_guard.get("open_total") or 0) >= MAX_OPEN_POSITIONS:
+                refusals.append("ENTRY_CAP")
+        else:
+            refusals.append("ENTRY_CAP_UNAVAILABLE")
         if db_errors:
             refusals.append("DB_ERRORS")
         return refusals
@@ -514,8 +525,12 @@ class ProductionRuntime:
         )
 
         # -- structured telemetry (Issue §3.7) ---------------------------
+        # One OOS-2-family guard read per cycle (review P2-1): the SAME
+        # family view the admission gate enforces, embedded in the record so
+        # the ENTRY_CAP refusal is verifiable against it.
+        entry_guard = self.contour.engine.entry_guard_snapshot()
         refusals = self._entry_refusals(
-            result, snapshot, entry_symbols, db_errors,
+            result, snapshot, entry_symbols, db_errors, entry_guard,
         )
         freeze_ts = None
         if identity is not None and identity.freeze_ts is not None:
@@ -547,6 +562,7 @@ class ProductionRuntime:
             "funding_pending": self.contour.engine.unsettled_funding_periods(),
             "api_errors": snapshot.api_errors,
             "db_errors": db_errors,
+            "entry_guard": entry_guard,
             "entry_refusals": refusals,
             "market_data_statuses": snapshot.summary(),
             "balance": result.get("balance"),
@@ -589,6 +605,7 @@ class ProductionRuntime:
             "funding_pending": self.contour.engine.unsettled_funding_periods(),
             "api_errors": 0,
             "db_errors": 1,
+            "entry_guard": None,
             "entry_refusals": [f"CYCLE_ERROR:{type(exc).__name__}"],
             "market_data_statuses": {},
             "balance": None,

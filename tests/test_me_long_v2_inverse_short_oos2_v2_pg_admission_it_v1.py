@@ -14,6 +14,7 @@ Environment (see ``tests/conftest.py``):
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import threading
 from datetime import datetime, timedelta, timezone
@@ -79,6 +80,9 @@ from app.paper.me_long_v2_inverse_short_oos2_v2.store import (  # noqa: E402
     ADMIT_INSERTED,
     ADMIT_NOT_ADMISSIBLE,
     ADMIT_REFUSED_TERMINAL,
+    MARK_EVENT_EXPIRED_SQL,
+    REFUSAL_DISPOSITION_UNCONFIRMED,
+    _QueryResult,
     connect_pg_store,
 )
 
@@ -863,6 +867,210 @@ class TestFailClosedAndAdoptionPg:
         decision = store.admit_position(_position(event))
         assert decision.outcome == ADMIT_NOT_ADMISSIBLE
         assert decision.reason == "PRE_FREEZE"
+
+
+# ---------------------------------------------------------------------------
+# Review P2-2: terminal refusal only after VERIFIED durable disposition
+# ---------------------------------------------------------------------------
+class TestTerminalRefusalDurableDispositionPg:
+    """``ADMIT_REFUSED_TERMINAL`` is returned ONLY after the event's durable
+    disposition is verified (``rowcount == 1`` + COMMIT).  A missed
+    disposition (rowcount 0) resolves to ``ADOPT_EXISTING`` when a committed
+    position exists, or FAILS CLOSED with an explicit consistency reason —
+    never a claimed terminal refusal, never ``EXPIRED-with-position``."""
+
+    def test_rowcount_one_commit_ok_reports_refused_terminal(
+        self, clean_db: _Db, store,
+    ):
+        first = _event("it287-disp-1")
+        _capture(store, first)
+        assert store.admit_position(_position(first)).outcome == ADMIT_INSERTED
+        second = _event("it287-disp-2", symbol=first.symbol)
+        _capture(store, second)
+        decision = store.admit_position(_position(second))
+        assert decision.outcome == ADMIT_REFUSED_TERMINAL
+        assert decision.reason == REFUSAL_SYMBOL_ALREADY_OPEN
+        row = _event_row(clean_db, second.event_key)
+        assert row["status"] == EVENT_STATUS_SYMBOL_REJECTED
+        assert row["reason"] == REFUSAL_SYMBOL_ALREADY_OPEN
+        assert row["status_at"] is not None
+        assert row["position_key"] is None
+        assert _count_positions(clean_db) == 1
+
+    def test_rowcount_zero_with_committed_position_resolves_to_adoption(
+        self, clean_db: _Db, store,
+    ):
+        """The disposition's NOT EXISTS position guard trips (rowcount 0)
+        exactly when a position for the event is already committed: the call
+        must resolve to ``ADOPT_EXISTING`` — never a false terminal refusal
+        and never EXPIRED-with-position."""
+        first = _event("it287-disp-pos-1")
+        _capture(store, first)
+        position = _position(first)
+        assert store.admit_position(position).outcome == ADMIT_INSERTED
+        # the known ambiguous state: the row committed but mark_event_entered
+        # was lost — the event is CAPTURED while its position row exists.
+        cursor = clean_db.cursor()
+        cursor.execute(
+            f"UPDATE {V2_TABLE}event SET status = 'CAPTURED', "
+            "position_key = NULL, status_reason = NULL WHERE event_key = %s",
+            (first.event_key,),
+        )
+        cursor.close()
+        # A redelivery under a DIFFERENT position key reaches the
+        # SYMBOL_ALREADY_OPEN refusal branch; the disposition matches 0 rows
+        # (the position guard) and must resolve to adoption.
+        redelivery = dataclasses.replace(
+            position,
+            position_key=build_position_key("it287-disp-pos-redelivery"),
+        )
+        decision = store.admit_position(redelivery)
+        assert decision.outcome == ADMIT_ADOPT
+        assert _count_positions(clean_db) == 1
+        row = _event_row(clean_db, first.event_key)
+        assert row["status"] == EVENT_STATUS_CAPTURED      # never disposed
+        assert row["position_key"] is None
+
+    def test_rowcount_zero_without_position_fails_closed_explicitly(
+        self, clean_db: _Db, store, monkeypatch,
+    ):
+        first = _event("it287-disp-fc-1")
+        _capture(store, first)
+        assert store.admit_position(_position(first)).outcome == ADMIT_INSERTED
+        second = _event("it287-disp-fc-2", symbol=first.symbol)
+        _capture(store, second)
+        # Fault injection: the disposition UPDATE reports 0 rows although
+        # the event is CAPTURED and has no position (a broken disposition).
+        real_execute = store._execute_once
+
+        def _faulty(sql, params=(), *, fetch="all"):
+            result = real_execute(sql, params, fetch=fetch)
+            if sql == MARK_EVENT_EXPIRED_SQL:
+                return _QueryResult(columns=[], rows=[], rowcount=0)
+            return result
+
+        monkeypatch.setattr(store, "_execute_once", _faulty)
+        decision = store.admit_position(_position(second))
+        assert decision.outcome == ADMIT_NOT_ADMISSIBLE
+        assert decision.reason == REFUSAL_DISPOSITION_UNCONFIRMED
+        assert decision.outcome != ADMIT_REFUSED_TERMINAL
+        # no false terminal state: the event stays CAPTURED (frozen
+        # pending -> TTL contract) and no position appears.
+        row = _event_row(clean_db, second.event_key)
+        assert row["status"] == EVENT_STATUS_CAPTURED
+        assert row["status_at"] is None
+        assert _count_positions(clean_db) == 1
+
+    def test_commit_failure_retries_without_double_disposition(
+        self, clean_db: _Db, store,
+    ):
+        """A COMMIT that dies BEFORE the disposition lands: the idempotent
+        unit re-runs on a fresh transport and disposes exactly once."""
+        first = _event("it287-disp-retry-1")
+        _capture(store, first)
+        assert store.admit_position(_position(first)).outcome == ADMIT_INSERTED
+        second = _event("it287-disp-retry-2", symbol=first.symbol)
+        _capture(store, second)
+
+        real_conn = store._conn
+        state = {"failed": False}
+
+        class _ConnProxy:
+            def __getattr__(self, name):
+                return getattr(real_conn, name)
+
+            def commit(self):
+                if not state["failed"]:
+                    state["failed"] = True
+                    real_conn.rollback()   # the transport died: xact aborted
+                    raise ConnectionError("synthetic commit failure")
+                return real_conn.commit()
+
+        store._conn = _ConnProxy()
+        decision = store.admit_position(_position(second))
+        assert state["failed"]
+        assert store.reconnect_count >= 1
+        assert decision.outcome == ADMIT_REFUSED_TERMINAL
+        assert decision.reason == REFUSAL_SYMBOL_ALREADY_OPEN
+        # exactly ONE durable disposition, no position, no orphan
+        row = _event_row(clean_db, second.event_key)
+        assert row["status"] == EVENT_STATUS_SYMBOL_REJECTED
+        assert row["reason"] == REFUSAL_SYMBOL_ALREADY_OPEN
+        assert row["status_at"] is not None
+        assert row["position_key"] is None
+        assert _count_positions(clean_db) == 1
+
+    def test_ambiguous_commit_retry_disposes_exactly_once(
+        self, clean_db: _Db, store,
+    ):
+        """The disposition COMMIT is durable but its acknowledgement is lost
+        (ambiguous COMMIT): the retried unit must not dispose twice, must not
+        open a position and must not claim a fresh unverified refusal."""
+        first = _event("it287-disp-amb-1")
+        _capture(store, first)
+        assert store.admit_position(_position(first)).outcome == ADMIT_INSERTED
+        second = _event("it287-disp-amb-2", symbol=first.symbol)
+        _capture(store, second)
+
+        real_conn = store._conn
+        state = {"failed": False}
+
+        class _ConnProxy:
+            def __getattr__(self, name):
+                return getattr(real_conn, name)
+
+            def commit(self):
+                real_conn.commit()         # the disposition IS durable ...
+                if not state["failed"]:
+                    state["failed"] = True
+                    raise ConnectionError("synthetic ack loss")
+                return None
+
+        store._conn = _ConnProxy()
+        decision = store.admit_position(_position(second))
+        assert state["failed"]
+        assert store.reconnect_count >= 1
+        # the retry resolved honestly instead of re-refusing unverified
+        assert decision.outcome == ADMIT_NOT_ADMISSIBLE
+        assert decision.reason == "EVENT_NOT_CAPTURED"
+        # the durable disposition stands EXACTLY once
+        row = _event_row(clean_db, second.event_key)
+        assert row["status"] == EVENT_STATUS_SYMBOL_REJECTED
+        assert row["reason"] == REFUSAL_SYMBOL_ALREADY_OPEN
+        assert row["status_at"] is not None
+        assert _count_positions(clean_db) == 1
+
+    def test_redelivery_after_terminal_refusal_is_idempotent(
+        self, clean_db: _Db, store,
+    ):
+        """Repeat delivery of the same event (same and fresh position keys):
+        no second disposition, no position, no entry — the event can never
+        open a position after its terminal refusal."""
+        first = _event("it287-disp-replay-1")
+        _capture(store, first)
+        assert store.admit_position(_position(first)).outcome == ADMIT_INSERTED
+        second = _event("it287-disp-replay-2", symbol=first.symbol)
+        _capture(store, second)
+        assert store.admit_position(_position(second)).outcome \
+            == ADMIT_REFUSED_TERMINAL
+        before = _event_row(clean_db, second.event_key)
+        for suffix in ("same", "fresh"):
+            attempt = _position(second)
+            if suffix == "fresh":
+                attempt = dataclasses.replace(
+                    attempt,
+                    position_key=build_position_key("it287-disp-replay-fresh"),
+                )
+            decision = store.admit_position(attempt)
+            assert decision.outcome == ADMIT_NOT_ADMISSIBLE
+            assert decision.reason == "EVENT_NOT_CAPTURED"
+        after = _event_row(clean_db, second.event_key)
+        assert after["status"] == before["status"] \
+            == EVENT_STATUS_SYMBOL_REJECTED
+        assert after["status_at"] == before["status_at"]   # no re-disposition
+        assert after["reason"] == before["reason"] \
+            == REFUSAL_SYMBOL_ALREADY_OPEN
+        assert _count_positions(clean_db) == 1
 
 
 # ---------------------------------------------------------------------------

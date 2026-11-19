@@ -53,10 +53,14 @@ from app.paper.me_long_v2_inverse_short_oos2_v2.config import (
 from app.paper.me_long_v2_inverse_short_oos2_v2.identity import (
     position_key as build_position_key,
 )
+from app.paper.me_long_v2_inverse_short_oos2_v2.market_data import (
+    MarketDataSnapshot,
+)
 from app.paper.me_long_v2_inverse_short_oos2_v2.models import (
     EVENT_STATUS_CAPTURED,
     EVENT_STATUS_CAPACITY_REJECTED,
     EVENT_STATUS_SYMBOL_REJECTED,
+    POSITION_STATUS_OPEN,
     ActivationRecord,
 )
 from app.paper.me_long_v2_inverse_short_oos2_v2.protocol import (
@@ -80,7 +84,11 @@ from app.paper.me_long_v2_inverse_short_oos2_v2.store import (
     ADMIT_INSERTED,
     ADMIT_NOT_ADMISSIBLE,
     ADMIT_REFUSED_TERMINAL,
+    REFUSAL_DISPOSITION_UNCONFIRMED,
     InMemoryLegacyOos2Ledger,
+)
+from app.paper.me_long_v2_inverse_short_oos2_v2.production_runtime import (
+    ProductionRuntime,
 )
 from app.scanners.models import SetupCandidate, SetupState
 
@@ -891,3 +899,204 @@ class TestMigration091Contract:
         assert "CREATE TABLE IF NOT EXISTS" in sql
         assert "DROP TRIGGER IF EXISTS" in sql
         assert "CREATE OR REPLACE FUNCTION" in sql
+
+
+# ---------------------------------------------------------------------------
+# Review P2-1: ENTRY_CAP telemetry uses the OOS-2 FAMILY capacity
+# ---------------------------------------------------------------------------
+def _result(**overrides) -> dict:
+    result = {
+        "activated": True,
+        "exit_only": False,
+        "durability_risk": False,
+        "accounting_consistent": True,
+        "pending_events_unavailable": False,
+        "open_positions": 0,
+    }
+    result.update(overrides)
+    return result
+
+
+class TestEntryCapTelemetryFamilyScope:
+    """``_entry_refusals`` must reflect the AUTHORITATIVE admission gate —
+    OPEN logical positions over the OOS-2 family (legacy v1 READ-ONLY +
+    this contour) — never this engine's LOCAL open count (review P2-1:
+    with family 12/12 but v2 local < 12 the telemetry was silent).
+    An unreadable family view is a DISTINCT ``..._UNAVAILABLE`` cause,
+    never an invented zero, and V2/V3 are never mixed in."""
+
+    @staticmethod
+    def _runtime(
+        legacy: InMemoryLegacyOos2Ledger, clock: _Clock,
+    ) -> tuple[ProductionRuntime, InMemoryInverseShortStore]:
+        settings = _settings()
+        store = InMemoryInverseShortStore(
+            _activation(), initial_balance=settings.initial_balance,
+            legacy=legacy, now=clock,
+        )
+        runtime = ProductionRuntime(
+            settings, store, provider=object(), clock=clock,
+            activation_enabled=True,
+        )
+        assert runtime.contour.activated, runtime.contour.activation_reason
+        return runtime, store
+
+    @staticmethod
+    def _refusals(runtime: ProductionRuntime, result=None, guard=None) -> list:
+        snapshot = MarketDataSnapshot(observed_at=runtime._clock())
+        return runtime._entry_refusals(
+            result or _result(), snapshot, set(), 0, guard,
+        )
+
+    def test_family_twelve_of_twelve_reports_entry_cap_at_local_two(self):
+        # 10 OPEN legacy v1 + 2 OPEN v2 = 12/12 while the LOCAL count is 2.
+        legacy = InMemoryLegacyOos2Ledger()
+        for i in range(10):
+            legacy.add(f"L{i:02d}USDT", NOW - timedelta(hours=30))
+        clock = _Clock(NOW)
+        runtime, store = self._runtime(legacy, clock)
+        _open_one(runtime.contour, store, clock, "BTCUSDT")
+        _open_one(runtime.contour, store, clock, "ETHUSDT")
+        guard = runtime.contour.engine.entry_guard_snapshot()
+        assert guard["oos2_family_available"] is True
+        assert guard["legacy_open"] == 10
+        assert guard["v2_open"] == 2
+        assert guard["open_total"] == MAX_OPEN_POSITIONS == 12
+        # the LOCAL count alone (2 < 12) would have stayed silent
+        refusals = self._refusals(runtime, _result(open_positions=2), guard)
+        assert "ENTRY_CAP" in refusals
+
+    def test_v2_local_twelve_open_reports_entry_cap(self):
+        legacy = InMemoryLegacyOos2Ledger()
+        clock = _Clock(NOW)
+        runtime, store = self._runtime(legacy, clock)
+        for i in range(MAX_OPEN_POSITIONS):
+            _open_one(runtime.contour, store, clock, f"SYM{i:02d}USDT")
+        guard = runtime.contour.engine.entry_guard_snapshot()
+        assert guard["legacy_open"] == 0
+        assert guard["v2_open"] == MAX_OPEN_POSITIONS
+        assert guard["open_total"] == MAX_OPEN_POSITIONS
+        refusals = self._refusals(
+            runtime, _result(open_positions=MAX_OPEN_POSITIONS), guard,
+        )
+        assert "ENTRY_CAP" in refusals
+
+    def test_family_eleven_of_twelve_never_reports_entry_cap(self):
+        # 5 legacy + 6 v2 = 11 < 12: no ENTRY_CAP, however the local count
+        # and the family count are read (no false refusal either way).
+        legacy = InMemoryLegacyOos2Ledger()
+        for i in range(5):
+            legacy.add(f"L{i:02d}USDT", NOW - timedelta(hours=30))
+        clock = _Clock(NOW)
+        runtime, store = self._runtime(legacy, clock)
+        for i in range(6):
+            _open_one(runtime.contour, store, clock, f"SYM{i:02d}USDT")
+        guard = runtime.contour.engine.entry_guard_snapshot()
+        assert guard["open_total"] == 11
+        refusals = self._refusals(runtime, _result(open_positions=6), guard)
+        assert "ENTRY_CAP" not in refusals
+        assert "ENTRY_CAP_UNAVAILABLE" not in refusals
+
+    def test_unavailable_family_is_unavailable_not_invented_zero(self):
+        legacy = InMemoryLegacyOos2Ledger()
+        for i in range(10):
+            legacy.add(f"L{i:02d}USDT", NOW - timedelta(hours=30))
+        clock = _Clock(NOW)
+        runtime, store = self._runtime(legacy, clock)
+        _open_one(runtime.contour, store, clock, "BTCUSDT")
+        legacy.unavailable = True
+        guard = runtime.contour.engine.entry_guard_snapshot()
+        assert guard["oos2_family_available"] is False
+        assert guard["open_total"] is None      # NEVER an invented zero
+        assert guard["legacy_open"] is None
+        assert guard["v2_open"] is None
+        refusals = self._refusals(runtime, _result(open_positions=1), guard)
+        assert "ENTRY_CAP_UNAVAILABLE" in refusals
+        assert "ENTRY_CAP" not in refusals
+
+    def test_tp_partial_still_counts_as_an_open_family_slot(self):
+        # A TP1 partial close keeps the OPEN row (and its family slot):
+        # 11 legacy + 1 partially-closed v2 = 12/12 -> ENTRY_CAP.
+        legacy = InMemoryLegacyOos2Ledger()
+        for i in range(11):
+            legacy.add(f"L{i:02d}USDT", NOW - timedelta(hours=30))
+        clock = _Clock(NOW)
+        runtime, store = self._runtime(legacy, clock)
+        position = _open_one(runtime.contour, store, clock, "BTCUSDT")
+        runtime.contour.run_cycle({"BTCUSDT": position.entry_price * 0.95})
+        stored = [p for p in store.list_positions() if p.symbol == "BTCUSDT"][0]
+        assert stored.status == POSITION_STATUS_OPEN
+        assert stored.remaining_size < stored.position_size   # TP1 partial
+        guard = runtime.contour.engine.entry_guard_snapshot()
+        assert guard["v2_open"] == 1
+        assert guard["open_total"] == MAX_OPEN_POSITIONS == 12
+        refusals = self._refusals(runtime, _result(open_positions=1), guard)
+        assert "ENTRY_CAP" in refusals
+
+
+# ---------------------------------------------------------------------------
+# Review P2-2: terminal refusal only after VERIFIED durable disposition
+# ---------------------------------------------------------------------------
+class TestTerminalRefusalDurableDispositionInMemory:
+    """In-memory symmetry with the PostgreSQL admission: ``REFUSED_TERMINAL``
+    is reported ONLY when the event's disposition actually landed.  A missed
+    disposition resolves to ``ADOPT_EXISTING`` when a committed position
+    exists (never ``EXPIRED-with-position``) and FAILS CLOSED with the
+    explicit consistency reason otherwise — never a false refusal."""
+
+    def test_verified_disposition_reports_refused_terminal(self):
+        contour, store, clock = _contour()
+        _open_one(contour, store, clock, "BTCUSDT")
+        clock.advance(minutes=5)
+        assert _capture(store, _candidate("BTCUSDT", detected_at=clock())) \
+            == "CAPTURED"
+        contour.run_cycle({"BTCUSDT": 100.0})
+        refused = _events(store, EVENT_STATUS_SYMBOL_REJECTED)
+        assert len(refused) == 1
+        assert refused[0].status_reason == REFUSAL_SYMBOL_ALREADY_OPEN
+        assert refused[0].status_at is not None
+
+    def test_missed_disposition_with_committed_position_adopts(self):
+        contour, store, clock = _contour()
+        first = _open_one(contour, store, clock, "BTCUSDT")
+        # The disposition can NEVER land for an event whose position is
+        # committed (P1-2 guard: no EXPIRED-with-position) — the refusal
+        # must resolve to ADOPT_EXISTING, not to a claimed terminal refusal.
+        redelivery = dataclasses.replace(
+            first, position_key=build_position_key("redelivery"),
+        )
+        decision = store._refuse_symbol_locked(
+            redelivery, REFUSAL_SYMBOL_ALREADY_OPEN, clock(),
+        )
+        assert decision.outcome == ADMIT_ADOPT
+        assert not _events(store, EVENT_STATUS_SYMBOL_REJECTED)
+        assert len(store.list_positions()) == 1
+
+    def test_missed_disposition_without_position_fails_closed(
+        self, monkeypatch,
+    ):
+        contour, store, clock = _contour()
+        first = _open_one(contour, store, clock, "BTCUSDT")
+        clock.advance(minutes=5)
+        assert _capture(store, _candidate("BTCUSDT", detected_at=clock())) \
+            == "CAPTURED"
+        event = _events(store, EVENT_STATUS_CAPTURED)[0]
+        attempt = dataclasses.replace(
+            first,
+            position_key=build_position_key(event.event_key),
+            event_key=event.event_key,
+            entered_at=clock(),
+        )
+        # Fault injection: the disposition reports success=False although
+        # the event is CAPTURED and has no position.
+        monkeypatch.setattr(store, "mark_event_expired", lambda *a, **k: False)
+        decision = store.admit_position(attempt)
+        assert decision.outcome == ADMIT_NOT_ADMISSIBLE
+        assert decision.reason == REFUSAL_DISPOSITION_UNCONFIRMED
+        assert decision.outcome != ADMIT_REFUSED_TERMINAL
+        # no false terminal state, no orphan, no position
+        assert not _events(store, EVENT_STATUS_SYMBOL_REJECTED)
+        assert [
+            e for e in _events(store) if e.event_key == event.event_key
+        ][0].status == EVENT_STATUS_CAPTURED
+        assert len(store.list_positions()) == 1
