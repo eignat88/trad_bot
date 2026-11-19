@@ -1773,6 +1773,36 @@ def _test_db_settings() -> dict | None:
     }
 
 
+# The inventory scenarios need the REAL migration-091 schema — the fixture
+# applies the OOS-2 family migrations itself.  088 is guarded (its CREATE
+# TRIGGER is not idempotent, same pattern as the pg_admission IT suite);
+# 089/091 are idempotent and run always.  CI starts from an empty database.
+_SCHEMA_MIGRATIONS = (
+    "089_me_long_v2_inverse_short_oos2_v1_funding_obligation.sql",
+    "091_me_long_v2_inverse_short_oos2_v2.sql",
+)
+_MIGRATION_088 = "088_me_long_v2_inverse_short_oos2_v1.sql"
+
+
+def _ensure_oos2_schema(conn) -> None:
+    cursor = conn.cursor()
+    cursor.execute("CREATE SCHEMA IF NOT EXISTS dds")
+    cursor.execute(
+        "SELECT to_regclass('dds.me_long_v2_inverse_short_oos2_v1_position')"
+    )
+    migrations = (
+        Path(__file__).resolve().parents[1] / "sql" / "migrations"
+    )
+    if cursor.fetchone()[0] is None:
+        cursor.execute(
+            (migrations / _MIGRATION_088).read_text(encoding="utf-8")
+        )
+    for name in _SCHEMA_MIGRATIONS:
+        cursor.execute((migrations / name).read_text(encoding="utf-8"))
+    conn.commit()
+    cursor.close()
+
+
 class TestLegacyInventoryPg:
     """``_evaluate_db`` against the REAL migration-091 schema and the REAL
     legacy OOS-2 v1 ledger (TEST_DB_* -> trad_bot_oos2_it_287).
@@ -1799,6 +1829,7 @@ class TestLegacyInventoryPg:
             return direct()
 
         conn = direct()
+        _ensure_oos2_schema(conn)
         cursor = conn.cursor()
         cursor.execute(
             "SELECT status, protocol_fingerprint, freeze_ts "
