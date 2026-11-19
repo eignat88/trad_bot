@@ -7,13 +7,19 @@ on:
       - requirements.txt
       - scanner_runner.py
       - app/paper/me_long_v2_inverse_short_oos2_v1/**
+      - app/paper/me_long_v2_inverse_short_oos2_v2/**
       - tests/test_me_long_v2_inverse_short_oos2_*.py
       - tests/test_me_inverse_short_oos2_*.py
       - sql/migrations/088_me_long_v2_inverse_short_oos2_v1.sql
+      - sql/migrations/091_me_long_v2_inverse_short_oos2_v2.sql
       - scripts/me_inverse_short_oos2_*.py
       - monitoring/grafana/dashboards/me-inverse-short-oos-2.json
       - deploy/env/me-inverse-short-oos2-runtime.env.example
+      - deploy/env/me-inverse-short-oos2-v2-runtime.env.example
+      - deploy/env/me-inverse-short-scanner.env.example
       - deploy/systemd/trad-bot-me-inverse-short-oos2-runtime.service
+      - deploy/systemd/trad-bot-me-inverse-short-oos2-v2-runtime.service
+      - docs/me_inverse_short_oos2_entry_guards_v1.md
       - .github/workflows/me-inverse-short-oos2-preflight-ci.yml
   workflow_dispatch:
 
@@ -51,6 +57,7 @@ jobs:
       PRODUCTION_DB_NAME: trad_bot
       TEST_DB_ALLOW_PRODUCTION: '0'
       ME_INVERSE_SHORT_OOS2_ENABLED: '0'
+      ME_INVERSE_SHORT_OOS2_V2_ENABLED: '0'
     steps:
       - name: Checkout PR code
         uses: actions/checkout@v5
@@ -105,6 +112,12 @@ jobs:
             tests/test_me_long_v2_inverse_short_oos2_pg_admission_it_v1.py \
             tests/test_me_long_v2_inverse_short_oos2_ttl_lockwait_pg_it_v1.py \
             tests/test_me_long_v2_inverse_short_oos2_partial_restart_pg_it_v1.py \
+            tests/test_me_inverse_short_oos2_v2_dashboard_v1.py \
+            tests/test_me_inverse_short_oos2_v2_deployment_v1.py \
+            tests/test_me_long_v2_inverse_short_oos2_v2_entry_guards_v1.py \
+            tests/test_me_long_v2_inverse_short_oos2_v2_isolation_v1.py \
+            tests/test_me_long_v2_inverse_short_oos2_v2_ladder_v1.py \
+            tests/test_me_long_v2_inverse_short_oos2_v2_pg_admission_it_v1.py \
             -rs --tb=short
 
 # Runs only on an ephemeral CI PostgreSQL service. No VPS, production
