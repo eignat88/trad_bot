@@ -450,11 +450,13 @@ class TestGrafanaDashboard:
         assert dash["uid"] == "me-inverse-short-oos-2"
         assert dash["title"] == "Trad Bot — ME Inverse SHORT OOS-2"
         panels = dash["panels"]
-        assert len(panels) == 10
+        # Issue #287 appends family-scope guard panels AFTER the frozen
+        # v1 panel set, which stays first and in order, unchanged.
+        assert len(panels) >= 10
         for panel in panels:
             assert panel["datasource"]["uid"] == "trad_bot_postgres", panel
-        # the exact required panel set, in dashboard order
-        assert [p["title"] for p in panels] == [
+        # the exact frozen v1 panel set, in dashboard order, unchanged
+        assert [p["title"] for p in panels[:10]] == [
             "Activation / Freeze / Fingerprint",
             "Open Positions (of 12)",
             "Realized / Unrealized Net PnL (USDT)",
