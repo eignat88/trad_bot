@@ -808,6 +808,19 @@ def test_every_frozen_and_allowlisted_path_routes_on(tmp_path, monkeypatch):
         # gate's UNGOVERNED set), so it must route the FULL PR gate
         # (NO_PHASE2) exactly like the two cross-PR paths above.
         "scanner_runner.py",
+        # Issue #287 (ME Inverse SHORT OOS-2 v2 entry guards): the same
+        # cross-PR mechanical class — CI workflow path wiring, the scanner
+        # env fragment's inert v2 flag documentation line, the OOS-2
+        # dashboard's additive guard panels (frozen v1 panels hash-pinned
+        # by tests/test_me_inverse_short_oos2_v2_dashboard_v1.py), the
+        # OOS-2 v1 isolation pin alignment, and the V3 preflight's
+        # append-only migration-number relaxation.  None is a Phase-2
+        # surface; all must route the FULL PR gate (NO_PHASE2).
+        ".github/workflows/me-inverse-short-oos2-preflight-ci.yml",
+        "deploy/env/me-inverse-short-scanner.env.example",
+        "monitoring/grafana/dashboards/me-inverse-short-oos-2.json",
+        "tests/test_me_long_v2_inverse_short_oos2_isolation_v1.py",
+        "scripts/me_inverse_short_v3_preflight.py",
     }
     for path in (*frozen, *allowed_modified):
         expected = NO_PHASE2 if path in external_allowlisted else PHASE2_ONLY

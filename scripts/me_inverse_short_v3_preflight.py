@@ -8,7 +8,7 @@ frozen contract before the runtime may start:
 
 STATIC (no database needed):
 
-  MIGRATION_090_PRESENT_AND_UNIQUE   migration 090 exists and is the newest
+  MIGRATION_090_PRESENT_AND_UNIQUE   migration 090 exists and is unique
   GUARD_CONFIG_STRICT                strict guard config == frozen 12/True/12
   FINGERPRINT_PIN                    current protocol fingerprint is pinned
   PROTOCOL_PARITY_V2                 geometry/TTL/fees identical to V2
@@ -133,9 +133,10 @@ def _check_migrations(root: Path) -> tuple[str, str]:
     numbers = [int(n.split("_")[0]) for n in names]
     if numbers.count(90) != 1:
         return FAIL, "migration number 090 must be unique"
-    if numbers[-1] != 90:
-        return FAIL, f"migration 090 must be the newest (found newest {numbers[-1]:03d})"
-    return PASS, f"{MIGRATION_090_NAME} present and newest"
+    # Append-only migration numbering: later migrations from other work
+    # packages (091+) are legitimate and never invalidate V3's own frozen
+    # migration — only a missing or duplicated 090 does.
+    return PASS, f"{MIGRATION_090_NAME} present and unique"
 
 
 def _check_guard_config() -> tuple[str, str]:

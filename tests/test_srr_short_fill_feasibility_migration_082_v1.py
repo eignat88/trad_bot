@@ -52,14 +52,15 @@ def test_migration_number_is_next_and_not_taken():
     # ladder contour migration (Issue #276) and 089 its round-6 additive
     # funding-obligation table (Issue #276, Codex r4555591322); 090 is the
     # ME_LONG_V2_INVERSE_SHORT_V3 entry-guards-and-capacity migration
-    # (Issue #285).  Every one of those numbers must appear EXACTLY once —
-    # an old number is never reused — and the branch's newest migration
-    # carries the highest number.
-    for taken in (82, 83, 84, 85, 86, 87, 88, 89, 90):
+    # (Issue #285); 091 is the ME_LONG_V2_INVERSE_SHORT_OOS2_V2
+    # entry-guards-and-capacity migration (Issue #287).  Every one of those
+    # numbers must appear EXACTLY once — an old number is never reused —
+    # and the branch's newest migration carries the highest number.
+    for taken in (82, 83, 84, 85, 86, 87, 88, 89, 90, 91):
         assert numbers.count(taken) == 1, (
             f"migration number {taken:03d} must be unique"
         )
-    assert numbers[-1] == 90
+    assert numbers[-1] == 91
 
 
 def test_migration_is_transactional_and_idempotent():

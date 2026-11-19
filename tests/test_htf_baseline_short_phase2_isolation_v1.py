@@ -836,6 +836,25 @@ def test_no_tracked_file_modified_against_base():
         # through the full PR gate — see its
         # test_every_frozen_and_allowlisted_path_routes_on).
         "tests/test_htf_baseline_short_phase2_scope_routing_v1.py",
+        # Issue #287 (ME Inverse SHORT OOS-2 v2 entry guards): mechanical
+        # cross-PR surface only.  The OOS-2 CI workflow gains the v2 paths
+        # and suites; the shared scanner env fragment documents the inert
+        # ME_INVERSE_SHORT_OOS2_V2_ENABLED=0 flag; the OOS-2 dashboard gets
+        # 8 ADDITIVE guard panels after its frozen v1 panel set (the frozen
+        # panels are hash-pinned by
+        # tests/test_me_inverse_short_oos2_v2_dashboard_v1.py); the OOS-2 v1
+        # isolation test keeps its 10-panel pin aligned with the additive
+        # dashboard contract; the migration-number pins move 90->91 (same
+        # mechanical bump the SRR entries above were allowlisted for, PR
+        # #286 precedent) — those two files are already listed; and the V3
+        # preflight's "090 must be the newest" expectation relaxes to
+        # "090 exists and is unique" because migration numbering is
+        # append-only.  No frozen strategy semantics change in any of them.
+        ".github/workflows/me-inverse-short-oos2-preflight-ci.yml",
+        "deploy/env/me-inverse-short-scanner.env.example",
+        "monitoring/grafana/dashboards/me-inverse-short-oos-2.json",
+        "tests/test_me_long_v2_inverse_short_oos2_isolation_v1.py",
+        "scripts/me_inverse_short_v3_preflight.py",
     )
 
     unexpected = []

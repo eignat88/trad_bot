@@ -1,7 +1,7 @@
 {
   "uid": "me-inverse-short-oos-2",
   "title": "Trad Bot — ME Inverse SHORT OOS-2",
-  "description": "Prospective-only paper SHORT contour (Issue #276, ME_LONG_V2_INVERSE_SHORT_OOS2_V1). Source: MOMENTUM_EXHAUSTION_REVERSE_LONG_V2 LONG. Frozen protocol: entry TTL 120 minutes, max hold 7200 minutes, STOP_FIRST intrabar priority, SL -10%, partial ladder TP1 +5% -> 50% of original, TP2 +7% -> 75% of remaining (37.5% of original), TP3 +10% -> all remaining; OOS-2-LOCAL capacity 12. Protocol fingerprint: 1d1e7b4d87c6125183887c8f054a4edb1ff3f0711e70da1feeb9b7e249d7b7ec. Partial TP legs are legs of ONE trade, never separate closed trades.",
+  "description": "Prospective-only paper SHORT contour (Issue #276, ME_LONG_V2_INVERSE_SHORT_OOS2_V1). Source: MOMENTUM_EXHAUSTION_REVERSE_LONG_V2 LONG. Frozen protocol: entry TTL 120 minutes, max hold 7200 minutes, STOP_FIRST intrabar priority, SL -10%, partial ladder TP1 +5% -> 50% of original, TP2 +7% -> 75% of remaining (37.5% of original), TP3 +10% -> all remaining; OOS-2-LOCAL capacity 12. Protocol fingerprint: 1d1e7b4d87c6125183887c8f054a4edb1ff3f0711e70da1feeb9b7e249d7b7ec. Partial TP legs are legs of ONE trade, never separate closed trades.\n\nGuard panels (Issue #287): family-scope (OOS-2 v1 + OOS-2 v2) entry guards вЂ” OPEN logical X/12, SINGLE_ACTIVE_SYMBOL occupancy, 12h cooldown state, terminal refusals, ENTRY_CAP pending / TTL expirations, TP stage, activation/fingerprint/freeze, outbox / funding / recovery.  Read-only; TP legs are never counted as separate trades; V1/V2/V3 contours are never mixed in.",
   "tags": [
     "trad_bot",
     "OOS",
@@ -466,6 +466,256 @@
         }
       },
       "description": "Source pipeline health (fail-open capture with counters): CAPTURED = eligible (age < 120 min TTL), ENTERED = source events that opened a position (event ledger), EXPIRED = terminal TTL refusal, CAPACITY_REJECTED = terminal TTL refusal while the 12-local capacity was binding (ENTRY_CAP), errors = ME_INVERSE_SHORT_OOS2_SOURCE_CAPTURE_ERROR rows in dds.scanner_error (scanner itself never affected)."
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Guard: OPEN logical X/12 (family v1+v2)",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 31
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT\n  (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN')\n  + (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v2_position WHERE status='OPEN') AS open_logical,\n  12 AS cap",
+          "format": "table"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "max": 12
+        },
+        "custom": {}
+      }
+    },
+    {
+      "id": 12,
+      "type": "table",
+      "title": "Guard: Occupied symbols (SINGLE_ACTIVE_SYMBOL)",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 39
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT contour, symbol, entered_at, deadline_at, remaining_size FROM (\n  SELECT 'OOS2_V1' AS contour, symbol, entered_at, deadline_at, remaining_size\n  FROM dds.me_long_v2_inverse_short_oos2_v1_position WHERE status='OPEN'\n  UNION ALL\n  SELECT 'OOS2_V2', symbol, entered_at, deadline_at, remaining_size\n  FROM dds.me_long_v2_inverse_short_oos2_v2_position WHERE status='OPEN'\n) t ORDER BY entered_at",
+          "format": "table"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {},
+        "custom": {}
+      }
+    },
+    {
+      "id": 13,
+      "type": "table",
+      "title": "Guard: Last accepted entry / 12h cooldown (family)",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT symbol,\n       max(entered_at) AS last_accepted_entered_at,\n       max(entered_at) + interval '12 hours' AS next_eligible_at,\n       greatest(interval '0 seconds', max(entered_at) + interval '12 hours' - now())\n         AS cooldown_remaining\nFROM (\n  SELECT symbol, entered_at FROM dds.me_long_v2_inverse_short_oos2_v1_position\n  UNION ALL\n  SELECT symbol, entered_at FROM dds.me_long_v2_inverse_short_oos2_v2_position\n) family\nGROUP BY symbol\nORDER BY last_accepted_entered_at DESC",
+          "format": "table"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {},
+        "custom": {}
+      }
+    },
+    {
+      "id": 14,
+      "type": "table",
+      "title": "Guard: Refusals & pending (SYMBOL_*, ENTRY_CAP, TTL)",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 55
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT * FROM (\n  SELECT 'SYMBOL_ALREADY_OPEN' AS disposition,\n         (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v1_event WHERE status_reason='SYMBOL_ALREADY_OPEN')\n       + (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v2_event WHERE status='SYMBOL_REJECTED'\n            AND status_reason='SYMBOL_ALREADY_OPEN') AS events\n  UNION ALL\n  SELECT 'SYMBOL_COOLDOWN_12H',\n         (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v1_event WHERE status_reason='SYMBOL_COOLDOWN_12H')\n       + (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v2_event WHERE status='SYMBOL_REJECTED'\n            AND status_reason='SYMBOL_COOLDOWN_12H')\n  UNION ALL\n  SELECT 'ENTRY_CAP_PENDING',\n         (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v1_event WHERE status='CAPTURED'\n            AND status_reason='ENTRY_CAP')\n       + (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v2_event WHERE status='CAPTURED'\n            AND status_reason='ENTRY_CAP')\n  UNION ALL\n  SELECT 'ENTRY_TTL_EXPIRED',\n         (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v1_event WHERE status='EXPIRED')\n       + (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v2_event WHERE status='EXPIRED')\n  UNION ALL\n  SELECT 'CAPACITY_REJECTED',\n         (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v1_event WHERE status='CAPACITY_REJECTED')\n       + (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v2_event WHERE status='CAPACITY_REJECTED')\n) guard_dispositions ORDER BY disposition",
+          "format": "table"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {},
+        "custom": {}
+      }
+    },
+    {
+      "id": 15,
+      "type": "table",
+      "title": "Guard: TP stage / outstanding qty (family, position rows only)",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 63
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT contour, symbol, status,\n       position_size AS original_qty, remaining_size,\n       round(100.0 * remaining_size / position_size, 2) AS remaining_pct,\n       tp1_executed, tp2_executed, tp3_executed\nFROM (\n  SELECT 'OOS2_V1' AS contour, symbol, status, position_size, remaining_size,\n         tp1_executed, tp2_executed, tp3_executed\n  FROM dds.me_long_v2_inverse_short_oos2_v1_position\n  UNION ALL\n  SELECT 'OOS2_V2', symbol, status, position_size, remaining_size,\n         tp1_executed, tp2_executed, tp3_executed\n  FROM dds.me_long_v2_inverse_short_oos2_v2_position\n) t ORDER BY status, symbol",
+          "format": "table"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {},
+        "custom": {}
+      }
+    },
+    {
+      "id": 16,
+      "type": "table",
+      "title": "Activation / Freeze / Fingerprint (family)",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 71
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT contour, experiment_id, status, freeze_ts, protocol_fingerprint FROM (\n  SELECT 'OOS2_V1' AS contour, experiment_id, status, freeze_ts, protocol_fingerprint\n  FROM dds.me_long_v2_inverse_short_oos2_v1_activation\n  UNION ALL\n  SELECT 'OOS2_V2', experiment_id, status, freeze_ts, protocol_fingerprint\n  FROM dds.me_long_v2_inverse_short_oos2_v2_activation\n) t ORDER BY contour",
+          "format": "table"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {},
+        "custom": {}
+      }
+    },
+    {
+      "id": 17,
+      "type": "table",
+      "title": "Outbox / funding / recovery (family)",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 79
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT contour, outbox_rows AS close_outbox_rows,\n       funding_total AS funding_obligations, funding_unsettled\nFROM (\n  SELECT 'OOS2_V1' AS contour,\n         (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v1_close_outbox) AS outbox_rows,\n         (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v1_funding_obligation) AS funding_total,\n         (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v1_funding_obligation\n            WHERE settled_at IS NULL) AS funding_unsettled\n  UNION ALL\n  SELECT 'OOS2_V2',\n         (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v2_close_outbox),\n         (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v2_funding_obligation),\n         (SELECT count(*) FROM dds.me_long_v2_inverse_short_oos2_v2_funding_obligation WHERE settled_at IS NULL)\n) t ORDER BY contour",
+          "format": "table"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {},
+        "custom": {}
+      }
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "Capture errors / failures (family)",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trad_bot_postgres"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 87
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trad_bot_postgres"
+          },
+          "rawSql": "SELECT count(*) AS value FROM dds.scanner_error\nWHERE error_type IN ('ME_INVERSE_SHORT_OOS2_SOURCE_CAPTURE_ERROR',\n                     'ME_INVERSE_SHORT_OOS2_V2_SOURCE_CAPTURE_ERROR')",
+          "format": "stat"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {},
+        "custom": {}
+      }
     }
   ]
 }
