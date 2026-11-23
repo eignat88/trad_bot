@@ -62,6 +62,22 @@ class JournalGapTests(unittest.TestCase):
         with self.assertRaises(monitor.JournalGapError):
             self.check("", selected=False)
 
+    def test_gap_audit_persists_hash_only(self):
+        with mock.patch.object(monitor, "db_query") as query:
+            monitor.record_source_gap("test.service", "s=private-cursor", "cursor_lost")
+        sent = query.call_args.args[0]
+        self.assertIn("monitoring.source_gap_audit", sent)
+        self.assertIn("ON CONFLICT", sent)
+        self.assertIn("detection_count", sent)
+        self.assertNotIn("s=private-cursor", sent)
+        self.assertIn("cursor_lost", sent)
+
+    def test_audit_database_failure_is_not_ignored_by_writer(self):
+        with mock.patch.object(monitor, "db_query",
+                               side_effect=RuntimeError("db offline")):
+            with self.assertRaises(RuntimeError):
+                monitor.record_source_gap("test.service", "s=private", "lost")
+
     def test_no_journal_processing_after_gap(self):
         with mock.patch.object(monitor, "verify_cursor_exists",
                                side_effect=monitor.JournalGapError("expired")), \
