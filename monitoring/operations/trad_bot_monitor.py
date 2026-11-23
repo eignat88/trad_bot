@@ -8,6 +8,7 @@ are committed in the same PostgreSQL transaction.
 import argparse
 import collections
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -100,6 +101,23 @@ def verify_cursor_exists(unit, cursor):
             proc.kill()
             proc.wait()
         proc.stdout.close()
+
+
+def record_source_gap(unit, cursor, failure_kind):
+    """Durably upsert a gap. Never persist the raw cursor or journald payload.
+
+    The audit transaction is independent of metric/cursor commit: a failed
+    audit must not cause the collector to resume ingestion.
+    """
+    fingerprint = hashlib.sha256(cursor.encode("utf-8")).hexdigest()
+    reason = safe_dimension(failure_kind, length=90)
+    sql = ("INSERT INTO monitoring.source_gap_audit "
+           "(unit_name, cursor_sha256, failure_kind) VALUES ("
+           + ",".join(map(sql_lit, (unit, fingerprint, reason))) + ") "
+           "ON CONFLICT (unit_name, cursor_sha256, failure_kind) "
+           "DO UPDATE SET last_seen_at=now(), "
+           "detection_count=monitoring.source_gap_audit.detection_count + 1;")
+    db_query(sql)
 
 
 def read_journal(unit, cursor):
@@ -242,9 +260,15 @@ def main():
                 commit_batch(unit, cursor, events, props)
                 print(f"monitor: {unit} {phase} lines={lines} events={sum(events.values())} "
                       f"truncated={truncated} state={props[0]} pid={props[1]}", flush=True)
-            except JournalGapError:
-                # Leave cursor and API counters untouched; never silently skip.
+            except JournalGapError as exc:
+                # No metrics, service sample or cursor writes after failed proof.
+                # Audit is a separate transaction and never resets the cursor.
                 print(f"monitor: {unit} SOURCE_GAP_DETECTED cursor_unverified", flush=True)
+                try:
+                    record_source_gap(unit, cursors[unit], type(exc).__name__)
+                except Exception as audit_exc:
+                    print(f"monitor: {unit} SOURCE_GAP_AUDIT_WRITE_FAILED "
+                          f"{type(audit_exc).__name__}", flush=True)
                 if args.once:
                     return 2
             except Exception as exc:
