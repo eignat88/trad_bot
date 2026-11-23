@@ -95,7 +95,7 @@ class JournalGapTests(unittest.TestCase):
         self.assertFalse(fresh)
 
     def test_status_only_does_not_advance_cursor(self):
-        with mock.patch.object(monitor, "db_query") as query, \\
+        with mock.patch.object(monitor, "db_query") as query, \
              mock.patch.object(monitor, "limiter_mode", return_value="UNKNOWN"):
             monitor.commit_status_only("retired.service", ("inactive", 0, 0, None))
         sql = query.call_args.args[0]
