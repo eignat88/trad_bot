@@ -13,6 +13,16 @@ Status: **OPEN / PARTIAL ACCEPTANCE**. This is a plan and operator evidence ledg
 - Systemd: Scanner ON (under separate #290), OOS2 V2 OFF, inverse V3 OFF, legacy OOS2 V1 disabled/inactive and PID-pinned state UNKNOWN. This is not a wire-rate limiter effectiveness test.
 - `monitoring.api_metric_sec` ~39MB and ~148k aggregate rows after ~69h. No retention timer discovered. Monitor reads via `journalctl --after-cursor`; `commit_batch` groups events and cursor in a PostgreSQL transaction. Malformed cursor returned exit 1 and no output. **Deleted-but-well-formed cursor path not tested.**
 
+## Post-deploy evidence and approved retention policy (2026-11-23)
+
+- Monitor-only candidate deployed on VPS at 2026-11-23 10:26:38 UTC. Production source SHA256 `8975b261ab41558f2b13e93a70e64df1c92acac2aea39f0925c8c3c48058fbd9` matched the reviewed PR candidate; rollback copy: `/root/trad_bot_monitor_pre293_20261123_102638.py`.
+- Post-deploy initial observation: active Scanner, OOS2 V2, Inverse V3 cursors fresh at 4.4s/3.0s/2.4s, unchanged trading PIDs and zero restarts; retired OOS2 V1 cursor stopped artificially advancing while its inactive service sample remained fresh and precisely one `INACTIVE_SOURCE_HISTORY_UNAVAILABLE` audit row was persisted; monitor error filter returned no matches.
+- **Owner-approved retention (2026-11-23):** `monitoring.api_metric_sec` = 30 days; `monitoring.service_sample` = 30 days; `monitoring.source_gap_audit` = no automatic removal; `monitoring.journal_cursor` = never remove by retention.
+- At approval, api_metric_sec ~40MB, 150918 estimated rows; service_sample 7160kB, ~31456 estimated rows; source_gap_audit 48kB, 1 row; journal_cursor 32kB, 4 rows. Records older than 30d: zero in both eligible tables. Both eligible tables already have dedicated descending B-tree indexes on their respective timestamp columns.
+- Added versioned `monitoring/operations/retention.py` (read-only dry-run default; explicit `--apply` for bounded deletes, max 2000 rows per batch, max 80 batches or 55 seconds per invocation, global lock, short PostgreSQL timeouts); isolated oneshot service and daily timer. **These retention files are PR-only until operator test and deployment.** There is no change to the previously deployed monitor and no timer enabled yet.
+- The service runs as `postgres`, since the observed peer-authenticated `tradbot_monitor` role has read+write permissions on monitoring tables but no need for a maintenance login. It only targets the two explicitly allowed monitoring relations.
+- For systemd deployment, first run syntax and mocked tests, then real `--dry-run` as postgres; verify zero eligible rows, journal_cursor / source_gap_audit unchanged; only then place file/service/timer, `systemd-analyze verify`, and enable timer with explicit user confirmation. No automatic vacuum full.
+
 ## Required implementation — source parity first
 
 The running source is `/opt/tradbot-monitor/trad_bot_monitor.py`. This file has **not** been located as a versioned source in repository `main`. Before any code change:
@@ -29,9 +39,9 @@ The running source is `/opt/tradbot-monitor/trad_bot_monitor.py`. This file has 
 - Atomic cursor+metric write, bounded line capture, at-least-once retries with idempotent recovery, restart behavior, and de-duplication must all be tested. Test malformed cursor; valid but rotated-away cursor; empty journal; restart; DB failure; 3000-line cap; journal read timeout; duplicate delivery.
 - Do not alter trading services, API consumer configs, limiter JSON/locks, OOS registry/freezes, paper/live processes, or any research eligibility data.
 
-## Retention contract — needs approval before implementation
+## Retention contract — owner approved 30 days; implementation staged
 
-- Choose explicit retention for `monitoring.api_metric_sec` and `monitoring.service_sample`, plus storage budget, before introducing deletion. Example candidate **30d (not approved)**; journal raw retention is independently constrained by `SystemMaxUse=300M`.
+- Choose explicit retention for `monitoring.api_metric_sec` and `monitoring.service_sample`, plus storage budget, before introducing deletion. **30 days (approved 2026-11-23)**; journal raw retention is independently constrained by `SystemMaxUse=300M`.
 - Maintenance job must use bounded batches, selective timestamp index, metrics about deleted count/oldest row and runtime, isolated service identity, dry-run mode, and deployment/rollback runbook; avoid interfering with ingestion.
 - Never delete `monitoring.journal_cursor` as part of retention. Keep audit gap records longer than aggregate retention as agreed.
 - Verify before/after table size, collector latency, locks, no unbounded SQL, and routine autovacuum behavior. No unconditional deletes on live DB before operator GO.
@@ -44,7 +54,7 @@ The running source is `/opt/tradbot-monitor/trad_bot_monitor.py`. This file has 
 - [ ] Verify 10006, HTTP429, pre-send SKIP, retries and ERROR categories against real or safe synthetic records; no intentional live Bybit rate limits.
 - [ ] Confirm collector limiter-state freshness and queue-wait stats **only if structured telemetry exists**.
 - [ ] Version-control deployed Grafana V3 JSON after exact VPS parity check, validate all 21 panels/query semantics; authenticated Grafana API verification of provisioned revision.
-- [ ] Review retention option and obtain separate operator GO before production maintenance.
+- [x] Owner approved 30-day retention for the two metrics tables; gap audit and cursor excluded. [ ] Run new retention script tests and dry-run; deploy timer separately.
 - [ ] Isolated monitor-only deployment, backup, rollback, health validation and evidence in #292. Keep #290 canary decision entirely separate.
 
 ## Safe next operator commands (READ-ONLY)
