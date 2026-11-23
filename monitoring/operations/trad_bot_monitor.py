@@ -11,6 +11,7 @@ import datetime as dt
 import json
 import os
 import re
+import select
 import subprocess
 import sys
 import time
@@ -67,8 +68,43 @@ def journal_last_cursor(unit):
             return c
     return None
 
+class JournalGapError(RuntimeError):
+    """Stored cursor could not be verified against the available journal."""
+
+
+def verify_cursor_exists(unit, cursor):
+    """Require an exact journal entry at --cursor; never assume seek implies match."""
+    cmd = ["journalctl", "-u", unit, "--cursor=" + cursor,
+           "-o", "json", "--no-pager", "-q"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    try:
+        ready, _, _ = select.select([proc.stdout], [], [], 12)
+        if not ready:
+            raise JournalGapError("cursor probe timed out")
+        line = proc.stdout.readline(1048577)
+        if len(line) > 1048576:
+            raise JournalGapError("cursor probe line too large")
+        try:
+            entry = json.loads(line)
+        except (ValueError, TypeError):
+            raise JournalGapError("cursor probe missing or malformed JSON")
+        if not isinstance(entry, dict) or entry.get("__CURSOR") != cursor:
+            raise JournalGapError("stored cursor missing from available journal")
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
+
+
 def read_journal(unit, cursor):
     """Stream at most MAX_LINES journal entries; never buffer full journal."""
+    verify_cursor_exists(unit, cursor)
     command = ["journalctl", "-u", unit, "--after-cursor=" + cursor,
                "-o", "json", "--no-pager", "-q"]
     proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -206,6 +242,11 @@ def main():
                 commit_batch(unit, cursor, events, props)
                 print(f"monitor: {unit} {phase} lines={lines} events={sum(events.values())} "
                       f"truncated={truncated} state={props[0]} pid={props[1]}", flush=True)
+            except JournalGapError:
+                # Leave cursor and API counters untouched; never silently skip.
+                print(f"monitor: {unit} SOURCE_GAP_DETECTED cursor_unverified", flush=True)
+                if args.once:
+                    return 2
             except Exception as exc:
                 # Never output raw journald payload or credential-bearing stderr.
                 print(f"monitor: {unit} ERROR {type(exc).__name__}", flush=True)
