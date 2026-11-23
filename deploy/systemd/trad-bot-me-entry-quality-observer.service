@@ -1,0 +1,31 @@
+[Unit]
+Description=ME Entry Quality V1 Prospective Source Observer
+After=postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=tradbot_me_entry_quality
+Group=tradbot_me_entry_quality
+
+WorkingDirectory=/opt/trad_bot_me_eq296_release
+
+Environment=PYTHONPATH=/opt/trad_bot_me_eq296_release
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=ME_EQ296_DSN=dbname=trad_bot user=tradbot_me_entry_quality host=/var/run/postgresql
+
+ExecStart=/opt/trad_bot_me_eq296_release/.venv/bin/python -B -m app.research.me_entry_quality_v1.runner --interval 30 --batch-limit 500
+
+Restart=on-failure
+SuccessExitStatus=3
+RestartSec=30
+TimeoutStopSec=15
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
