@@ -1,5 +1,6 @@
 """Safe offline checks for bounded monitoring retention (no PostgreSQL calls)."""
 import importlib.util
+import tempfile
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -12,6 +13,14 @@ spec.loader.exec_module(retention)
 
 
 class RetentionTests(unittest.TestCase):
+    def setUp(self):
+        # Never create the production lock when tests run as root.
+        tmp = tempfile.TemporaryDirectory(prefix="tradbot-retention-test-")
+        self.addCleanup(tmp.cleanup)
+        patcher = mock.patch.object(retention, "LOCK_FILE", str(Path(tmp.name) / "lock"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_table_allowlist(self):
         self.assertEqual(
             {table for table, _ in retention.TABLES},
