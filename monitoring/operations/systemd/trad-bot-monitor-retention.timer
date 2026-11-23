@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Trad Bot monitoring retention (30 days)
+
+[Timer]
+OnCalendar=*-*-* 03:20:00 UTC
+RandomizedDelaySec=15m
+Persistent=true
+Unit=trad-bot-monitor-retention.service
+
+[Install]
+WantedBy=timers.target
