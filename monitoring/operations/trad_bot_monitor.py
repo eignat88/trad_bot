@@ -103,21 +103,23 @@ def verify_cursor_exists(unit, cursor):
         proc.stdout.close()
 
 
-def record_source_gap(unit, cursor, failure_kind):
-    """Durably upsert a gap. Never persist the raw cursor or journald payload.
+def record_source_gap(unit, cursor, failure_kind, *, once=False):
+    """Persist a gap independently; never persist raw cursors or journal payload.
 
-    The audit transaction is independent of metric/cursor commit: a failed
-    audit must not cause the collector to resume ingestion.
+    For inactive/no-history sources, insert only once per cursor+reason.
+    Return True only on first insert in the once=True branch.
     """
     fingerprint = hashlib.sha256(cursor.encode("utf-8")).hexdigest()
     reason = safe_dimension(failure_kind, length=90)
     sql = ("INSERT INTO monitoring.source_gap_audit "
            "(unit_name, cursor_sha256, failure_kind) VALUES ("
            + ",".join(map(sql_lit, (unit, fingerprint, reason))) + ") "
-           "ON CONFLICT (unit_name, cursor_sha256, failure_kind) "
-           "DO UPDATE SET last_seen_at=now(), "
-           "detection_count=monitoring.source_gap_audit.detection_count + 1;")
-    db_query(sql)
+           "ON CONFLICT (unit_name, cursor_sha256, failure_kind) ")
+    if once:
+        return bool(db_query(sql + "DO NOTHING RETURNING gap_id;").strip())
+    db_query(sql + "DO UPDATE SET last_seen_at=now(), "
+             "detection_count=monitoring.source_gap_audit.detection_count + 1;")
+    return True
 
 
 def read_journal(unit, cursor):
@@ -198,6 +200,22 @@ def load_cursors():
     raw = db_query("SELECT unit_name, cursor_value FROM monitoring.journal_cursor;")
     return dict(line.split("|", 1) for line in raw.splitlines() if "|" in line)
 
+def commit_status_only(unit, props):
+    """Write service-state samples without advancing an unverified cursor."""
+    state, pid, restart_count, uptime = props
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    mode = limiter_mode(unit, pid)
+    sql = ("INSERT INTO monitoring.service_sample "
+           "(sampled_at, unit_name, active_state, main_pid, restart_count, "
+           "uptime_sec, limiter_enabled) VALUES ("
+           + ",".join((sql_lit(now), sql_lit(unit), sql_lit(state),
+                       str(pid), str(restart_count),
+                       str(uptime) if uptime is not None else "NULL",
+                       sql_lit(mode)))
+           + ") ON CONFLICT (sampled_at, unit_name) DO NOTHING;")
+    db_query(sql)
+
+
 def commit_batch(unit, cursor, events, props):
     # All metrics and cursor change within one transaction. If SQL fails,
     # retrying after old cursor is safe.
@@ -261,11 +279,25 @@ def main():
                 print(f"monitor: {unit} {phase} lines={lines} events={sum(events.values())} "
                       f"truncated={truncated} state={props[0]} pid={props[1]}", flush=True)
             except JournalGapError as exc:
-                # No metrics, service sample or cursor writes after failed proof.
-                # Audit is a separate transaction and never resets the cursor.
-                print(f"monitor: {unit} SOURCE_GAP_DETECTED cursor_unverified", flush=True)
+                # Never advance a cursor when its exact source entry is missing.
+                # A disabled inactive service with *no* journal entries differs
+                # from an active source: preserve cursor, audit once, sample state.
                 try:
-                    record_source_gap(unit, cursors[unit], type(exc).__name__)
+                    props = systemd_props(unit)
+                    inactive_no_history = (props[0] == "inactive" and props[1] == 0
+                                           and journal_last_cursor(unit) is None)
+                    if inactive_no_history:
+                        fresh = record_source_gap(
+                            unit, cursors[unit],
+                            "INACTIVE_SOURCE_HISTORY_UNAVAILABLE", once=True)
+                        commit_status_only(unit, props)
+                        if fresh:
+                            print(f"monitor: {unit} "
+                                  "INACTIVE_SOURCE_HISTORY_UNAVAILABLE", flush=True)
+                    else:
+                        print(f"monitor: {unit} SOURCE_GAP_DETECTED cursor_unverified",
+                              flush=True)
+                        record_source_gap(unit, cursors[unit], type(exc).__name__)
                 except Exception as audit_exc:
                     print(f"monitor: {unit} SOURCE_GAP_AUDIT_WRITE_FAILED "
                           f"{type(audit_exc).__name__}", flush=True)
