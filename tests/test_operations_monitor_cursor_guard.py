@@ -78,6 +78,31 @@ class JournalGapTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 monitor.record_source_gap("test.service", "s=private", "lost")
 
+    def test_inactive_gap_audit_insert_once(self):
+        with mock.patch.object(monitor, "db_query", return_value="18\n") as query:
+            fresh = monitor.record_source_gap("retired.service", "s=old",
+                 "INACTIVE_SOURCE_HISTORY_UNAVAILABLE", once=True)
+        self.assertTrue(fresh)
+        sql = query.call_args.args[0]
+        self.assertIn("DO NOTHING RETURNING gap_id", sql)
+        self.assertNotIn("detection_count + 1", sql)
+        self.assertNotIn("s=old", sql)
+
+    def test_inactive_gap_audit_duplicate_silent(self):
+        with mock.patch.object(monitor, "db_query", return_value=""):
+            fresh = monitor.record_source_gap("retired.service", "s=old",
+                 "INACTIVE_SOURCE_HISTORY_UNAVAILABLE", once=True)
+        self.assertFalse(fresh)
+
+    def test_status_only_does_not_advance_cursor(self):
+        with mock.patch.object(monitor, "db_query") as query, \\
+             mock.patch.object(monitor, "limiter_mode", return_value="UNKNOWN"):
+            monitor.commit_status_only("retired.service", ("inactive", 0, 0, None))
+        sql = query.call_args.args[0]
+        self.assertIn("monitoring.service_sample", sql)
+        self.assertNotIn("monitoring.journal_cursor", sql)
+        self.assertNotIn("monitoring.api_metric_sec", sql)
+
     def test_no_journal_processing_after_gap(self):
         with mock.patch.object(monitor, "verify_cursor_exists",
                                side_effect=monitor.JournalGapError("expired")), \
