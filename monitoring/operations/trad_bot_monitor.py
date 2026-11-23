@@ -154,7 +154,14 @@ def read_journal(unit, cursor):
             if "BYBIT_API_CALL" not in message and "BYBIT_API_SKIP" not in message:
                 continue
             fields = dict(LOG_FIELDS.findall(message))
-            event_kind = "CALL" if "BYBIT_API_CALL" in message else "SKIP"
+            # Real skip telemetry may contain both marker tokens (e.g. the
+            # CALL wrapper plus result=BYBIT_API_SKIP). Prefer the structured
+            # outcome over substring ordering; never count a pre-send skip
+            # as an outbound API call.
+            event_kind = ("SKIP" if fields.get("result") == "BYBIT_API_SKIP"
+                          or ("BYBIT_API_SKIP" in message and
+                              "BYBIT_API_CALL" not in message)
+                          else "CALL")
             second = int(timestamp) // 1_000_000
             endpoint = safe_dimension(fields.get("endpoint", ""))
             result = safe_dimension(fields.get("result", ""))
