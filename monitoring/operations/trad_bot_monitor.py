@@ -122,6 +122,15 @@ def record_source_gap(unit, cursor, failure_kind, *, once=False):
     return True
 
 
+def classify_event_kind(message, fields):
+    """Classify the actual API event, not a substring of its payload."""
+    if fields.get("result") == "BYBIT_API_SKIP":
+        return "SKIP"
+    if "BYBIT_API_SKIP" in message and "BYBIT_API_CALL" not in message:
+        return "SKIP"
+    return "CALL"
+
+
 def read_journal(unit, cursor):
     """Stream at most MAX_LINES journal entries; never buffer full journal."""
     verify_cursor_exists(unit, cursor)
@@ -154,14 +163,7 @@ def read_journal(unit, cursor):
             if "BYBIT_API_CALL" not in message and "BYBIT_API_SKIP" not in message:
                 continue
             fields = dict(LOG_FIELDS.findall(message))
-            # Real skip telemetry may contain both marker tokens (e.g. the
-            # CALL wrapper plus result=BYBIT_API_SKIP). Prefer the structured
-            # outcome over substring ordering; never count a pre-send skip
-            # as an outbound API call.
-            event_kind = ("SKIP" if fields.get("result") == "BYBIT_API_SKIP"
-                          or ("BYBIT_API_SKIP" in message and
-                              "BYBIT_API_CALL" not in message)
-                          else "CALL")
+            event_kind = classify_event_kind(message, fields)
             second = int(timestamp) // 1_000_000
             endpoint = safe_dimension(fields.get("endpoint", ""))
             result = safe_dimension(fields.get("result", ""))
