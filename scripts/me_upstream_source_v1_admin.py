@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ME_INVERSE_SHORT_V3_UPSTREAM_SOURCE_CAPTURE_V1 — administrative tool.
+"""ME_INVERSE_SHORT_V3_UPSTREAM_SOURCE_CAPTURE_V1 -- administrative tool.
 
 Research-only administrative contour of the Issue #305 upstream source
 capture.  The capture itself is OFF by default and starts only after BOTH
@@ -19,7 +19,7 @@ and ``research_me_upstream_coverage.coverage_audit``):
         naive timestamp, a freeze in the future or older than 2 minutes, an
         already-RUNNING activation, and any rewrite of an existing freeze.
   * ``--audit``
-        READ-ONLY upstream ↔ V3 coverage reconciliation, printed as JSON.
+        READ-ONLY upstream <-> V3 coverage reconciliation, printed as JSON.
   * ``--persist-audit``
         the same reconciliation, additionally persisted to
         ``research_me_upstream_coverage.coverage_audit``.
@@ -169,12 +169,12 @@ def cmd_activate(conn: Any, freeze_ts: datetime) -> None:
     if existing is not None:
         if existing[0] == "RUNNING":
             raise SystemExit(
-                "REFUSED: activation is already RUNNING — the freeze boundary "
+                "REFUSED: activation is already RUNNING -- the freeze boundary "
                 "is immutable and is never rewritten"
             )
         if existing[3] is not None:
             raise SystemExit(
-                "REFUSED: freeze_ts is already fixed — it is immutable"
+                "REFUSED: freeze_ts is already fixed -- it is immutable"
             )
 
     cur.execute(
