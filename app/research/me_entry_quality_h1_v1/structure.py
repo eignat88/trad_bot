@@ -239,7 +239,10 @@ def detect_bos_events(
                 else min(candidates, key=lambda item: item[1].price)
             )
             level_index, swing = chosen
-            used_levels.add(level_index)
+            # A close may cross several confirmed levels at once.  Publish
+            # only the nearest one, but retire ALL crossed levels: their
+            # first close-beyond is this candle, not a later one.
+            used_levels.update(idx for idx, _ in candidates)
             events.append(
                 BosEvent(
                     direction=direction,
