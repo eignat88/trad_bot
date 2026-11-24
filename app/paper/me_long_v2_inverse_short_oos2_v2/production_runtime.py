@@ -871,7 +871,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         logger.info(
             "me inverse short oos2 v2 runtime starting: flag_enabled=%s "
-            "activated=%s mode=%s reason=%s interval=%.1fs",
+            "activated=%s mode=%s reason=%s interval=%.1fs guards=%s",
             os.environ.get("ME_INVERSE_SHORT_OOS2_V2_ENABLED", "<unset>"),
             runtime.contour.activated,
             runtime.contour.activation_mode,
