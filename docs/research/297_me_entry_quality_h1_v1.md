@@ -54,7 +54,9 @@ moment of the ORIGINAL event; the later computation time is never consulted.
 Rejection / truncation policy (all explicit, all fail-closed):
 
 * unclosed / future candles are never used — they are truncated from the
-  usable series and reported in `dropped_unclosed`;
+  usable series and reported in `dropped_unclosed`; their payload (including
+  malformed OHLCV or off-grid opens) cannot invalidate a past ASOF; integrity
+  checks apply to the closed prefix available at that ASOF;
 * unsorted input → `OUT_OF_ORDER_CANDLE` (never silently reordered);
 * duplicate opens → `DUPLICATE_CANDLE` (identical) / `CONFLICTING_CANDLE`;
 * missing bucket between the first and last closed candle → `CANDLE_GAP`
@@ -188,7 +190,7 @@ real-data sensitivity belongs to the later H1-C/H1-D analysis phase.
 
 ## 10. Test matrix
 
-88 deterministic unit tests (`tests/test_me_entry_quality_h1_candles_v1.py`,
+90 deterministic unit tests (`tests/test_me_entry_quality_h1_candles_v1.py`,
 `..._structure_v1.py`, `..._classifier_v1.py`) cover H1-B scenarios 1-20 of
 Issue #297 — no PostgreSQL, no Bybit, no network.
 
