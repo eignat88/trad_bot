@@ -452,6 +452,19 @@ def provide_htf_candles(
 
     for index, row in enumerate(rows):
         if in_future_suffix:
+            # Future OHLCV is irrelevant at this ASOF, but a CLOSED row
+            # appearing after the future suffix is a source-order violation.
+            # Otherwise a complete historical prefix could hide disorder.
+            try:
+                suffix_open_ms = _lenient_open_ms(row, index)
+            except _RowError:
+                dropped_raw.append(row)
+                continue
+            if suffix_open_ms + tf_ms <= asof_ms:
+                parse_error = parse_error or _RowError(
+                    "OUT_OF_ORDER_CANDLE",
+                    f"row {index}: closed candle after unavailable future suffix",
+                )
             dropped_raw.append(row)
             continue
         try:
