@@ -808,6 +808,12 @@ def test_every_frozen_and_allowlisted_path_routes_on(tmp_path, monkeypatch):
         # gate's UNGOVERNED set), so it must route the FULL PR gate
         # (NO_PHASE2) exactly like the two cross-PR paths above.
         "scanner_runner.py",
+        # Issue #305 (independent upstream source coverage): app/scanners/
+        # orchestrator.py is the second tracked pre-existing file (pre-scoring
+        # upstream publication, additive only) — NOT a phase-2 surface, so it
+        # must route the FULL PR gate (NO_PHASE2) exactly like the other
+        # cross-PR paths above.
+        "app/scanners/orchestrator.py",
         # Issue #287 (ME Inverse SHORT OOS-2 v2 entry guards): the same
         # cross-PR mechanical class — CI workflow path wiring, the scanner
         # env fragment's inert v2 flag documentation line, the OOS-2
