@@ -330,3 +330,27 @@ def test_bos_is_gated_by_evaluation_asof():
         candles, swings, timeframe_ms=TF, evaluation_asof_ms=_close_of(16)
     )
     assert all(e.break_confirmed_at_ms <= _close_of(16) for e in late)
+
+
+def test_bos_retires_all_levels_crossed_by_first_close():
+    """A close over two highs retires both; the lower cannot fire later."""
+    candles = [
+        _bar(BASE_MS, 14.0, 9.0, close=13.0),
+        _bar(BASE_MS + TF, 14.0, 9.0, close=11.0),
+    ]
+    levels = [
+        Swing(formed_at_ms=BASE_MS - 5 * TF,
+              confirmed_at_ms=BASE_MS - TF,
+              price=10.0, swing_type=SWING_HIGH, index=0),
+        Swing(formed_at_ms=BASE_MS - 4 * TF,
+              confirmed_at_ms=BASE_MS - TF,
+              price=12.0, swing_type=SWING_HIGH, index=1),
+    ]
+    events = detect_bos_events(
+        candles, levels, timeframe_ms=TF,
+        evaluation_asof_ms=BASE_MS + 2 * TF,
+    )
+    bullish = [e for e in events if e.direction == BOS_BULLISH]
+    assert len(bullish) == 1
+    assert bullish[0].level_price == 12.0
+    assert bullish[0].break_open_ms == BASE_MS
