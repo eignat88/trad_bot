@@ -1,5 +1,5 @@
 -- Issue #296
--- Run only after migration 092 has been applied.
+-- Run only after migrations 092 and 093 have been applied.
 -- Execute as a PostgreSQL administrator.
 
 BEGIN;
@@ -45,6 +45,13 @@ TO tradbot_me_entry_quality;
 GRANT SELECT, INSERT
 ON research_me_entry_quality.source_event,
    research_me_entry_quality.processed_event
+TO tradbot_me_entry_quality;
+
+-- Fail-closed contour state ledger (append-only; BLOCKED rows only —
+-- the RESUMED path belongs to the administrative recovery contour).
+-- No UPDATE/DELETE anywhere in this schema for the observer role.
+GRANT SELECT, INSERT
+ON research_me_entry_quality.observer_state_event
 TO tradbot_me_entry_quality;
 
 -- Health telemetry.

@@ -9,17 +9,24 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Mapping
 
-from psycopg2.extras import Json, RealDictCursor
+try:  # pragma: no cover - driver present in deployment, optional in unit tests
+    from psycopg2.extras import Json, RealDictCursor
+except ImportError:  # noqa: F401
+    Json = RealDictCursor = None
 
 from .contracts import (
     EXPERIMENT_ID,
+    SourceIntegrityError,
     ValidatedSourceEvent,
     as_utc,
 )
+from .integrity import audit_source_integrity as _audit_source_integrity
 
-
-class SourceIntegrityError(RuntimeError):
-    pass
+# Re-exported for backwards import compatibility.
+__all__ = [
+    "PgObserverRepository",
+    "SourceIntegrityError",
+]
 
 
 class PgObserverRepository:
@@ -45,6 +52,78 @@ class PgObserverRepository:
 
     def rollback(self) -> None:
         self.connection.rollback()
+
+    def audit_source_integrity(
+        self,
+        *,
+        gap_grace_seconds: int,
+        as_of: Any = None,
+    ) -> dict:
+        # Read-only reconciliation against the V3 source ledger.
+        # Never repairs, backfills or modifies source data.
+        return _audit_source_integrity(
+            self.connection,
+            gap_grace_seconds=gap_grace_seconds,
+            as_of=as_of,
+        )
+
+    def load_contour_state(self) -> dict | None:
+        """Latest research-contour state (append-only state ledger)."""
+
+        with self.connection.cursor(
+            cursor_factory=RealDictCursor
+        ) as cur:
+            cur.execute(
+                """
+                SELECT state, reason_code, details, recorded_at
+                FROM research_me_entry_quality.observer_state_event
+                WHERE experiment_id = %s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (EXPERIMENT_ID,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def record_state(
+        self,
+        state: str,
+        reason_code: str,
+        details: Mapping[str, Any],
+    ) -> None:
+        """Append a contour-state event. Never updates or deletes rows.
+
+        The observer only ever records ``BLOCKED``. ``RESUMED`` is
+        written exclusively by the administrative recovery contour
+        (deploy/sql/296_observer_recovery.sql) — the observer role has
+        no UPDATE/DELETE rights anywhere in this schema.
+        """
+
+        if state not in ("BLOCKED", "RESUMED"):
+            raise ValueError("INVALID_CONTOUR_STATE")
+
+        if not reason_code:
+            raise ValueError("INVALID_STATE_REASON")
+
+        with self.connection.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO research_me_entry_quality.observer_state_event (
+                    experiment_id,
+                    state,
+                    reason_code,
+                    details
+                )
+                VALUES (%s, %s, %s, %s)
+                """,
+                (
+                    EXPERIMENT_ID,
+                    state,
+                    reason_code,
+                    Json(dict(details)),
+                ),
+            )
 
     def load_activation(self) -> dict | None:
         with self.connection.cursor(

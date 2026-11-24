@@ -2,6 +2,9 @@
 Description=ME Entry Quality V1 Prospective Source Observer
 After=postgresql.service
 Wants=postgresql.service
+# Bounded crash-loop protection for transient failures.
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -14,10 +17,15 @@ Environment=PYTHONPATH=/opt/trad_bot_me_eq296_release
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=ME_EQ296_DSN=dbname=trad_bot user=tradbot_me_entry_quality host=/var/run/postgresql
 
-ExecStart=/opt/trad_bot_me_eq296_release/.venv/bin/python -B -m app.research.me_entry_quality_v1.runner --interval 30 --batch-limit 500
+ExecStart=/opt/trad_bot_me_eq296_release/.venv/bin/python -B -m app.research.me_entry_quality_v1.runner --interval 30 --batch-limit 500 --audit-interval 300 --coverage-gap-grace 900
 
 Restart=on-failure
+# 3: not activated / not running / missing freeze_ts (operator action).
 SuccessExitStatus=3
+# 5: deterministic fail-closed BLOCKED state — never auto-restart on a
+# deterministic validation/integrity violation. Manual recovery only:
+# deploy/sql/296_observer_recovery.sql + systemctl start.
+RestartPreventExitStatus=5
 RestartSec=30
 TimeoutStopSec=15
 
