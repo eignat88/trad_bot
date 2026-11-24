@@ -1,0 +1,28 @@
+[Unit]
+Description=Trad Bot monitoring 30-day bounded retention
+After=postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+WorkingDirectory=/opt/tradbot-monitor
+ExecStart=/usr/bin/python3 /opt/tradbot-monitor/retention.py --apply --batch-size 2000 --max-batches 80 --max-seconds 55
+TimeoutStartSec=120
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+MemoryMax=128M
+CPUQuota=10%
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trad-bot-monitor-retention
