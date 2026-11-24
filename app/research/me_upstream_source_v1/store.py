@@ -21,14 +21,20 @@ Isolation invariants enforced here:
 
 * the store never writes ``dds.*``, ``research.*`` or any trading table —
   the V3 ledger is READ-ONLY input for the coverage reconciler only;
-* events are idempotent on ``source_event_key`` (``ON CONFLICT DO NOTHING``);
-* a re-delivery of the same key with a DIFFERENT IMMUTABLE lineage
-  (``comparable_lineage_hash``: identity / provenance / frozen feature
-  subset / price facts) raises :class:`SourceIntegrityError`
-  (``EVENT_KEY_LINEAGE_CONFLICT``) — never silently swallowed.  Re-detection
-  variance that is EXPECTED for one signal (a fresh ``setup_id`` and
-  ``detected_at`` per re-scan) is deliberately outside that subset and stays
-  a plain idempotent ``DUPLICATE`` (criterion 5);
+* events are idempotent on ``source_event_key`` (``ON CONFLICT DO NOTHING``)
+  and the first-capture snapshot is preserved verbatim — a redelivery never
+  overwrites it;
+* a re-delivery of the same key with a DIFFERENT IMMUTABLE SOURCE lineage
+  (``immutable_source_hash``: stable identity + immutable provenance only)
+  raises :class:`SourceIntegrityError` (``EVENT_KEY_LINEAGE_CONFLICT``) —
+  never silently swallowed.  VOLATILE detector facts (price / entry-stop-
+  target geometry / feature values) legitimately drift between re-detections
+  while the candle is still forming, and re-detection variance that is
+  EXPECTED for one signal (a fresh ``setup_id`` and ``detected_at`` per
+  re-scan) is likewise outside that subset — all of it stays a plain
+  idempotent ``DUPLICATE`` (criterion 5).  The cross-ledger snapshot
+  comparison (``comparable_lineage_hash``) is a SEPARATE mechanism used by
+  the coverage reconciler, not by this conflict check;
 * the event INSERT itself re-checks RUNNING activation + fingerprint +
   ``freeze_ts`` in SQL (defense in depth: an event can never land without a
   frozen activation, even if a caller bypasses the Python guard);
@@ -46,6 +52,7 @@ from .contracts import (
     REASON_EVENT_KEY_LINEAGE_CONFLICT,
     SourceIntegrityError,
     UpstreamSourceEvent,
+    immutable_source_hash,
 )
 from .protocol import EXPERIMENT_ID, protocol_fingerprint
 
@@ -108,7 +115,15 @@ def _utc_now() -> datetime:
 
 
 class UpstreamSourceStore:
-    """Interface of the capture's persistence layer."""
+    """Interface of the capture's persistence layer.
+
+    ``broken`` — set by an implementation when its underlying connection
+    fails (driver-level error).  Callers must then DISCARD the store and
+    reconnect rather than keep hammering a dead connection (bounded
+    retry/backoff lives on the caller side).
+    """
+
+    broken: bool = False
 
     def load_activation(self) -> Mapping[str, Any] | None:
         raise NotImplementedError
@@ -210,12 +225,14 @@ class InMemoryUpstreamSourceStore(UpstreamSourceStore):
             return SAVE_NOT_ACTIVE
         existing = self._events.get(event.source_event_key)
         if existing is not None:
-            # Idempotent re-delivery unless the IMMUTABLE lineage changed
-            # (re-detection variance of setup_id / detected_at is expected
-            # and never a conflict).
+            # Idempotent re-delivery unless the IMMUTABLE SOURCE fields
+            # changed (volatile price/geometry/feature drift inside the
+            # forming candle and re-detection variance of setup_id /
+            # detected_at are expected and never a conflict).  The stored
+            # first-capture snapshot is preserved — never overwritten.
             if (
-                existing["comparable_lineage_hash"]
-                != event.comparable_lineage_hash
+                existing["immutable_source_hash"]
+                != event.immutable_source_hash
             ):
                 raise SourceIntegrityError(REASON_EVENT_KEY_LINEAGE_CONFLICT)
             return SAVE_DUPLICATE
@@ -228,6 +245,7 @@ class InMemoryUpstreamSourceStore(UpstreamSourceStore):
             "lineage": dict(event.lineage),
             "lineage_hash": event.lineage_hash,
             "comparable_lineage_hash": event.comparable_lineage_hash,
+            "immutable_source_hash": event.immutable_source_hash,
         }
         self.writes += 1
         return SAVE_CAPTURED
@@ -328,10 +346,17 @@ class PgUpstreamSourceStore(UpstreamSourceStore):
         expected_fingerprint: str | None = None,
     ) -> None:
         self._conn = connection
+        self.broken = False
         self.expected_fingerprint = (
             expected_fingerprint if expected_fingerprint is not None
             else _default_fingerprint()
         )
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("me upstream source store close failed", exc_info=True)
 
     # -- helpers ----------------------------------------------------------
     def _rollback(self) -> None:
@@ -341,11 +366,17 @@ class PgUpstreamSourceStore(UpstreamSourceStore):
             logger.debug("me upstream source store rollback failed", exc_info=True)
 
     def _execute(self, sql: str, params: tuple | list = ()) -> Any:
-        cur = self._conn.cursor()
         try:
+            cur = self._conn.cursor()
             cur.execute(sql, params)
             return cur
         except Exception:
+            # A failed cursor/execute means this dedicated connection can no
+            # longer be trusted (driver-level break, aborted transaction or
+            # driver error).  Mark the store broken so the caller DISCARDS it
+            # and reconnects instead of hammering a dead connection; the
+            # caller-side retry/backoff keeps that bounded.
+            self.broken = True
             self._rollback()
             raise
 
@@ -433,7 +464,7 @@ class PgUpstreamSourceStore(UpstreamSourceStore):
             # guard refused the INSERT (NOT_ACTIVE) — distinguish honestly.
             cur = self._execute(
                 f"""
-                SELECT comparable_lineage_hash
+                SELECT lineage
                 FROM {EVENT_TABLE}
                 WHERE source_event_key = %s
                 """,
@@ -443,10 +474,18 @@ class PgUpstreamSourceStore(UpstreamSourceStore):
             self._conn.commit()
             if existing is None:
                 return SAVE_NOT_ACTIVE
-            # Idempotent re-delivery unless the IMMUTABLE lineage changed
-            # (expected re-detection variance of setup_id / detected_at is
-            # outside that subset and never a conflict).
-            if existing[0] != event.comparable_lineage_hash:
+            # Idempotent re-delivery unless the IMMUTABLE SOURCE fields
+            # changed (volatile price/geometry/feature drift inside the
+            # forming candle and expected re-detection variance of
+            # setup_id / detected_at are never a conflict).  The stored
+            # first-capture snapshot is preserved — never overwritten.
+            stored_lineage = existing[0]
+            if isinstance(stored_lineage, str):
+                stored_lineage = json.loads(stored_lineage)
+            if (
+                immutable_source_hash(stored_lineage)
+                != event.immutable_source_hash
+            ):
                 raise SourceIntegrityError(REASON_EVENT_KEY_LINEAGE_CONFLICT)
             return SAVE_DUPLICATE
 

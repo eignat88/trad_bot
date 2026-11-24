@@ -419,7 +419,7 @@ class TestIntegrityConflict:
 
         drifted = make_candidate(
             setup_id=uuid4(),
-            reference_price=999.0,  # immutable fact drift, SAME identity key
+            scanner_version="9.9.9",  # IMMUTABLE source drift, SAME identity
         )
         assert capture_with_status(store, drifted, env=ENABLED) == (
             CAPTURE_INTEGRITY_CONFLICT
@@ -432,6 +432,53 @@ class TestIntegrityConflict:
             CAPTURE_BLOCKED
         )
         assert event_count(conn) == 1
+
+    def test_forming_candle_drift_is_idempotent_duplicate(self, conn):
+        # RSI / price / geometry drift inside the forming candle (same
+        # identity key) is ordinary re-detection variance: DUPLICATE, first
+        # snapshot preserved verbatim, never an INTEGRITY_CONFLICT
+        # (Codex review P1 — contracts.py redelivery validation).
+        activate(conn)
+        store = PgUpstreamSourceStore(conn)
+        candidate = make_candidate()
+        assert capture_with_status(store, candidate, env=ENABLED) == CAPTURED
+        original = build_source_event(
+            candidate,
+            activation_freeze_ts=FREEZE,
+            captured_at=SIGNAL_TIME,
+        ).lineage
+
+        drifted = make_candidate(
+            setup_id=uuid4(),
+            detected_at=SIGNAL_TIME + timedelta(minutes=1),
+            reference_price=999.0,
+            entry_zone_low=998.0,
+            entry_zone_high=1002.0,
+            invalidation_price=55.0,
+            target_1=250.0,
+            target_2=300.0,
+            features={
+                "rsi_14": 60.0,
+                "rsi_delta_3": 3.5,
+                "entry_confirmation_rsi_rising": True,
+            },
+        )
+        assert capture_with_status(store, drifted, env=ENABLED) == (
+            CAPTURE_DUPLICATE
+        )
+        assert event_count(conn) == 1
+        assert state_rows(conn) == []  # no BLOCKED, no conflict
+
+        # The stored row is still the FIRST-capture snapshot.
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT lineage FROM research_me_upstream_coverage.source_event"
+            )
+            stored = cur.fetchone()[0]
+        assert json.dumps(stored, sort_keys=True) == json.dumps(
+            dict(original), sort_keys=True,
+        )
+        assert stored["source_features"]["rsi_14"] == 55.0
 
     def test_database_rejects_event_mutation(self, conn):
         activate(conn)

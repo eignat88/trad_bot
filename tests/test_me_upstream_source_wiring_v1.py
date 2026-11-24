@@ -365,6 +365,185 @@ class TestRunnerHook:
 
 
 # ---------------------------------------------------------------------------
+# Connection recovery (Codex review P2): invalidate -> bounded backoff ->
+# reconnect -> successful prospective capture.  Scanner lifecycle untouched.
+# ---------------------------------------------------------------------------
+
+class _Clock:
+    """Controllable monotonic clock for backoff timing."""
+
+    def __init__(self, now: float = 1000.0):
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def _reset_store_state(scanner_runner_module, monkeypatch, clock):
+    monkeypatch.setattr(scanner_runner_module, "_me_upstream_source_store", None)
+    monkeypatch.setattr(
+        scanner_runner_module, "_me_upstream_source_store_retry_at", 0.0,
+    )
+    monkeypatch.setattr(
+        scanner_runner_module, "_me_upstream_source_store_backoff_step", 0,
+    )
+    monkeypatch.setattr(scanner_runner_module, "time", clock)
+
+
+class TestConnectionRecovery:
+    def test_disconnect_reconnect_cycle_ends_in_successful_capture(
+        self, scanner_runner_module, monkeypatch,
+    ):
+        # disconnect -> invalidate -> bounded backoff -> reconnect -> the
+        # NEXT prospective capture lands normally.
+        from app.research.me_upstream_source_v1 import store as store_module
+
+        monkeypatch.setenv(ACTIVATION_FLAG, "1")
+        clock = _Clock()
+        _reset_store_state(scanner_runner_module, monkeypatch, clock)
+        made = []
+
+        def _connect(**kwargs):
+            store = InMemoryUpstreamSourceStore(_activation())
+            made.append(store)
+            return store
+
+        monkeypatch.setattr(store_module, "connect_pg_store", _connect)
+        repo = _FakeRepository()
+        candidate = _upstream_candidate()
+
+        # 1st delivery: connects and captures prospectively.
+        scanner_runner_module._capture_me_upstream_source_v1(repo, candidate)
+        assert len(made) == 1
+        assert len(made[0].events) == 1
+
+        # The connection DIES mid-cycle.
+        made[0].broken = True
+
+        # 2nd delivery: the dead store is discarded (closed, not reused),
+        # the failure is sunk — the scanner cycle never sees it.
+        scanner_runner_module._capture_me_upstream_source_v1(repo, candidate)
+        assert scanner_runner_module._me_upstream_source_store is None
+        assert len(made) == 1  # no reconnect yet: backoff window
+        assert len(repo.errors) == 1
+
+        # 3rd delivery INSIDE the backoff window: no connect attempt at all.
+        clock.now += 2.0
+        scanner_runner_module._capture_me_upstream_source_v1(repo, candidate)
+        assert len(made) == 1
+        assert len(repo.errors) == 2
+
+        # 4th delivery AFTER the bounded backoff: reconnects to a fresh
+        # store and the capture lands again.
+        clock.now += 10.0
+        scanner_runner_module._capture_me_upstream_source_v1(repo, candidate)
+        assert len(made) == 2
+        assert len(made[1].events) == 1
+        assert len(repo.errors) == 2  # no new errors: healthy again
+
+    def test_reconnect_backoff_is_bounded_and_does_not_hammer(
+        self, scanner_runner_module, monkeypatch,
+    ):
+        from app.research.me_upstream_source_v1 import store as store_module
+
+        clock = _Clock()
+        _reset_store_state(scanner_runner_module, monkeypatch, clock)
+        attempts = []
+
+        def _connect(**kwargs):
+            attempts.append(clock.now)
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(store_module, "connect_pg_store", _connect)
+        repo = _FakeRepository()
+        get = scanner_runner_module._get_me_upstream_source_store
+
+        assert get(repo) is None and len(attempts) == 1  # fail -> 5 s
+        clock.now += 4.0
+        assert get(repo) is None and len(attempts) == 1  # inside backoff
+        clock.now += 2.0
+        assert get(repo) is None and len(attempts) == 2  # fail -> 15 s
+        clock.now += 15.0
+        assert get(repo) is None and len(attempts) == 3  # fail -> 60 s
+        clock.now += 60.0
+        assert get(repo) is None and len(attempts) == 4  # cap: 60 s
+        clock.now += 60.0
+        assert get(repo) is None and len(attempts) == 5  # cap holds
+
+        ladder = scanner_runner_module._ME_UPSTREAM_STORE_BACKOFF_S
+        assert ladder[-1] == max(ladder)  # non-increasing hammering bound
+        assert len(attempts) == 5  # never more than one attempt per window
+
+    def test_reconnect_cycles_never_accumulate_stores_or_duplicate_writes(
+        self, scanner_runner_module, monkeypatch,
+    ):
+        # Memory + idempotency: N disconnect/reconnect cycles keep exactly
+        # ONE live store slot, every dead connection is CLOSED (no fd
+        # accumulation), counters are a fixed-size dict and re-delivered
+        # events never create a second event row (source_event_key
+        # idempotency — the first-capture snapshot is preserved).
+        from app.research.me_upstream_source_v1 import store as store_module
+
+        class _Store(InMemoryUpstreamSourceStore):
+            def __init__(self, activation):
+                super().__init__(activation)
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        monkeypatch.setenv(ACTIVATION_FLAG, "1")
+        clock = _Clock()
+        _reset_store_state(scanner_runner_module, monkeypatch, clock)
+        made = []
+
+        def _connect(**kwargs):
+            store = _Store(_activation())
+            made.append(store)
+            return store
+
+        monkeypatch.setattr(store_module, "connect_pg_store", _connect)
+        repo = _FakeRepository()
+        candidate = _upstream_candidate()
+
+        # Healthy cycle: connects once and captures.
+        scanner_runner_module._capture_me_upstream_source_v1(repo, candidate)
+        assert len(made) == 1 and len(made[0].events) == 1
+
+        for _ in range(5):
+            made[-1].broken = True  # the connection dies
+            # Delivery A: detects the dead store, invalidates it (closed),
+            # sinks the error — never raises into the scanner cycle.
+            scanner_runner_module._capture_me_upstream_source_v1(
+                repo, candidate,
+            )
+            assert scanner_runner_module._me_upstream_source_store is None
+            assert made[-1].closed is True
+            clock.now += 60.0  # past the bounded backoff window
+            # Delivery B: reconnects and captures ...
+            scanner_runner_module._capture_me_upstream_source_v1(
+                repo, candidate,
+            )
+            # ... and a re-delivery of the SAME event adds no second row.
+            scanner_runner_module._capture_me_upstream_source_v1(
+                repo, candidate,
+            )
+            live = scanner_runner_module._me_upstream_source_store
+            assert live is made[-1] and not live.broken
+            assert len(live.events) == 1
+
+        assert len(made) == 6  # one connection per healthy cycle, no more
+        assert all(s.closed for s in made[:-1])  # dead ones all closed
+        assert made[-1].closed is False
+        # Fixed-size diagnostics counters (bounded memory).
+        assert set(scanner_runner_module._me_upstream_source_stats) == {
+            "deliveries", "captured", "duplicates", "disabled", "not_active",
+            "pre_freeze", "blocked", "invalid", "integrity_conflicts",
+            "errors",
+        }
+
+
+# ---------------------------------------------------------------------------
 # Regression: existing capture hooks and trading runtime untouched
 # ---------------------------------------------------------------------------
 

@@ -79,21 +79,34 @@ source_event_key    = SHA256("ME_UPSTREAM_SOURCE_V1|" + normalized_identity)
 * `uq_me_upstream_coverage.uq_me_ups_event_identity UNIQUE(source_identity)`
   guarantees one ledger row per original identity.
 
-### Immutable lineage (conflict set) vs expected variance
+### Immutable source fields (conflict set) vs expected variance
 
-`comparable_lineage_hash` covers the **immutable original facts**: identity,
-scanner name/version, direction, signal candle open time, entry timeframe,
-price facts (reference/invalidation/targets/entry zone), the frozen
-9-feature detector subset (`rsi_14`, `rsi_delta_3`,
-`entry_confirmation_rsi_rising`, `swing_low_distance_atr`,
-`sweep_low_distance_atr`, `close_location`, `body_atr`, `volume_ratio`,
-`volume_surge`) and the pipeline fingerprint.
+Two SEPARATE comparisons (Codex review P1):
+
+* **Redelivery integrity check** — `immutable_source_hash` covers ONLY the
+  stable identity + immutable provenance: `source_identity`,
+  `source_scanner`, `source_scanner_version`, `source_direction`,
+  `source_entry_timeframe`, `source_signal_candle_open_time`,
+  `source_pipeline_fingerprint`. A redelivery of one `source_event_key`
+  that differs on ANY of these is a REAL integrity conflict →
+  `EVENT_KEY_LINEAGE_CONFLICT` → sticky `BLOCKED`.
+* **Cross-ledger snapshot comparison** — `comparable_lineage_hash` (the set
+  above + price facts / entry-stop-target geometry / the frozen
+  9-feature detector subset: `exhaustion_magnitude`, `body_ratio`,
+  `rsi_confirmation`, `volume_ratio`, `rr_ratio`, `stop_distance_atr`,
+  `rsi_14`, `rsi_delta_3`, `entry_confirmation_rsi_rising`). Drift on the
+  volatile subset is reported diagnostically (`snapshot_drifts`); only
+  drift on the immutable fields is a `lineage_mismatch` →
+  `INTEGRITY_CONFLICT`.
 
 Deliberately **outside** the conflict set: `source_setup_id` and
-`source_signal_time` — every re-detection of the same signal candle carries a
-fresh `setup_id`/`detected_at`; treating that as a conflict would break
-idempotent redelivery (acceptance criterion 5). A redelivery that changes an
-immutable fact fires `EVENT_KEY_LINEAGE_CONFLICT` → sticky `BLOCKED`.
+`source_signal_time` (a fresh `setup_id`/`detected_at` per re-detection)
+AND the volatile detector facts — price / geometry / feature values —
+which legitimately drift between re-detections while the signal candle is
+still forming (`SetupCandidate`: "detected_at and prices may change while
+that candle is still forming"). All of that stays an idempotent
+`DUPLICATE` with the **first-capture snapshot preserved verbatim**
+(acceptance criterion 5).
 
 ## 3. Research schema `research_me_upstream_coverage` (migration 094)
 
@@ -188,11 +201,11 @@ step (`save_coverage_audit`) — reconciliation itself never writes.
 
 | Suite | Scope | Result (this machine) |
 | --- | --- | --- |
-| `tests/test_me_upstream_source_identity_v1.py` | identity determinism, contracts, lineage hashes | PASS (48) |
-| `tests/test_me_upstream_source_capture_v1.py` | flag/activation/freeze/idempotency/redelivery-variance/conflict/fail-open (acceptance criteria 1–12) + PgUpstreamSourceStore SQL contract | PASS (42) |
-| `tests/test_me_upstream_source_coverage_v1.py` | matching + verdicts LAG/GAP/UNKNOWN/INTEGRITY_CONFLICT (pure + SQL path doubles) + activity-window-basis regressions (ingestion skew, delayed recovery, mismatched activity periods) | PASS (47) |
-| `tests/test_me_upstream_source_wiring_v1.py` | static audit: capture placement before scoring/gates; runtime publication; runner hook fail-open; regression of all 5 existing capture hooks; migration 094 audits; deploy safety | PASS (28) |
-| `tests/test_me_upstream_source_pg_integration_v1.py` | acceptance criteria 1–12 + activity-window regressions on **real PostgreSQL**, isolated scratch DB `me_ups305_it_*`, migration 094 + stand-in V3 table | prepared; **skipped** here (no local PostgreSQL server; opt-in `ME_UPS305_PG_INTEGRATION=1`) |
+| `tests/test_me_upstream_source_identity_v1.py` | identity determinism, contracts, lineage + immutable-source hashes | PASS (52) |
+| `tests/test_me_upstream_source_capture_v1.py` | flag/activation/freeze/idempotency/redelivery-variance (forming-candle drift)/conflict/fail-open (acceptance criteria 1–12) + PgUpstreamSourceStore SQL contract | PASS (48) |
+| `tests/test_me_upstream_source_coverage_v1.py` | matching + verdicts LAG/GAP/UNKNOWN/INTEGRITY_CONFLICT (pure + SQL path doubles) + activity-window-basis regressions (ingestion skew, delayed recovery, mismatched activity periods) + snapshot-drift vs immutable-mismatch split | PASS (49) |
+| `tests/test_me_upstream_source_wiring_v1.py` | static audit: capture placement before scoring/gates; runtime publication; runner hook fail-open; connection recovery (invalidate/bounded backoff/reconnect); regression of all 5 existing capture hooks; migration 094 audits; deploy safety | PASS (31) |
+| `tests/test_me_upstream_source_pg_integration_v1.py` | acceptance criteria 1–12 + activity-window regressions + forming-candle-drift duplicate on **real PostgreSQL**, isolated scratch DB `me_ups305_it_*`, migration 094 + stand-in V3 table | prepared; **skipped** here (no local PostgreSQL server; opt-in `ME_UPS305_PG_INTEGRATION=1`) — 26 scenarios |
 
 Static audits prove: publication is before scoring/dedup/geometry/gates/
 regime/expectancy; the capture package imports nothing from `app.paper` /

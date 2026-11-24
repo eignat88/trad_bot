@@ -51,7 +51,11 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
-from .contracts import as_utc, comparable_lineage_view
+from .contracts import (
+    as_utc,
+    comparable_lineage_view,
+    immutable_source_view,
+)
 from .identity import normalized_identity_values
 from .protocol import EXPERIMENT_ID
 from .store import (
@@ -144,7 +148,34 @@ def _lineage_differs(
     upstream_row: Mapping[str, Any],
     v3_row: Mapping[str, Any],
 ) -> bool:
-    """Compare the frozen comparable (ORIGINAL-fact) lineage subset."""
+    """Compare the IMMUTABLE SOURCE subset — integrity-relevant only.
+
+    Two first-captures of one identity may legitimately differ on volatile
+    detector facts (price / geometry / features) because the two capture
+    routes can observe different re-detections while the candle is forming.
+    Only drift on the immutable source fields (stable identity + immutable
+    provenance) is an integrity mismatch here; volatile drift is reported
+    separately via :func:`_snapshot_differs`.
+    """
+    upstream_view = immutable_source_view(upstream_row.get("lineage") or {})
+    v3_view = immutable_source_view(v3_row.get("lineage") or {})
+    for key in sorted(set(upstream_view) | set(v3_view)):
+        if not _values_equal(upstream_view.get(key), v3_view.get(key)):
+            return True
+    return False
+
+
+def _snapshot_differs(
+    upstream_row: Mapping[str, Any],
+    v3_row: Mapping[str, Any],
+) -> bool:
+    """Cross-ledger SNAPSHOT drift on the volatile detector facts.
+
+    Diagnostic only (``snapshot_drifts``): price/geometry/feature drift is
+    expected variance between re-detections and must never drive an
+    ``INTEGRITY_CONFLICT``.  The full comparable snapshot (immutable +
+    volatile subset) is what is compared.
+    """
     upstream_view = comparable_lineage_view(upstream_row.get("lineage") or {})
     v3_view = comparable_lineage_view(v3_row.get("lineage") or {})
     for key in sorted(set(upstream_view) | set(v3_view)):
@@ -207,6 +238,7 @@ def match_ledgers(
 
     matched = 0
     lineage_mismatches = 0
+    snapshot_drifts = 0
     v3_duplicate_identities = 0
     upstream_only_lag = 0
     upstream_only_gap = 0
@@ -229,8 +261,14 @@ def match_ledgers(
         matched += 1
         if len(counterparts) > 1:
             v3_duplicate_identities += 1
+        # Two SEPARATE cross-ledger comparisons: immutable source drift is
+        # an integrity mismatch (drives INTEGRITY_CONFLICT); volatile
+        # snapshot drift (price/geometry/features) is expected re-detection
+        # variance — counted diagnostically, never a conflict.
         if _lineage_differs(up_row, counterparts[0]):
             lineage_mismatches += 1
+        if _snapshot_differs(up_row, counterparts[0]):
+            snapshot_drifts += 1
 
     for identity, rows in v3_by_identity.items():
         if identity in upstream_by_identity:
@@ -260,6 +298,7 @@ def match_ledgers(
         "upstream_only": upstream_only_lag + upstream_only_gap,
         "v3_only": v3_only_lag + v3_only_gap,
         "lineage_mismatches": lineage_mismatches,
+        "snapshot_drifts": snapshot_drifts,
         "v3_duplicate_identities": v3_duplicate_identities,
         "outside_window_upstream": outside_upstream,
         "outside_window_v3": outside_v3,
@@ -572,6 +611,7 @@ def _empty_result(
         "v3_only_lag": 0,
         "v3_only_gap": 0,
         "lineage_mismatches": 0,
+        "snapshot_drifts": 0,
         "v3_duplicate_identities": 0,
         "duplicate_deliveries": 0,
         "capture_errors": 0,

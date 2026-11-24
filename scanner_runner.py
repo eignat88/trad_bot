@@ -1711,13 +1711,50 @@ def me_inverse_short_v3_source_wiring() -> dict:
 
 _me_upstream_source_store = None
 _me_upstream_source_store_retry_at = 0.0
+_me_upstream_source_store_backoff_step = 0
 
-# Runtime delivery counters for the upstream hook (diagnostics only).
+# Bounded reconnect backoff ladder (seconds) — caps the RECONNECT RATE so a
+# broken connection can never spin, block the trading cycle or accumulate
+# resources; the last entry repeats.  One connect attempt per delivery at
+# most, never more than connect_timeout=10 s (Codex review P2).
+_ME_UPSTREAM_STORE_BACKOFF_S = (5.0, 15.0, 60.0)
+
+# Runtime delivery counters for the upstream hook (diagnostics only — a
+# fixed-size dict, so hook state can never grow without bound).
 _me_upstream_source_stats: dict = {
     "deliveries": 0, "captured": 0, "duplicates": 0, "disabled": 0,
     "not_active": 0, "pre_freeze": 0, "blocked": 0, "invalid": 0,
     "integrity_conflicts": 0, "errors": 0,
 }
+
+
+def _invalidate_me_upstream_source_store() -> None:
+    """Discard a broken/dead cached store and schedule a bounded reconnect.
+
+    Exactly ONE store slot exists; invalidation closes the dead connection
+    (no fd/connection accumulation) and puts the next connect attempt
+    behind the bounded backoff ladder.  Re-delivered events can never write
+    duplicate rows: the upstream ledger is idempotent on ``source_event_key``
+    with the first-capture snapshot preserved.
+    """
+    global _me_upstream_source_store, _me_upstream_source_store_retry_at
+    global _me_upstream_source_store_backoff_step
+    dead = _me_upstream_source_store
+    _me_upstream_source_store = None
+    step = _me_upstream_source_store_backoff_step
+    _me_upstream_source_store_retry_at = time.monotonic() + (
+        _ME_UPSTREAM_STORE_BACKOFF_S[
+            min(step, len(_ME_UPSTREAM_STORE_BACKOFF_S) - 1)]
+    )
+    _me_upstream_source_store_backoff_step = min(
+        step + 1, len(_ME_UPSTREAM_STORE_BACKOFF_S) - 1,
+    )
+    if dead is not None:
+        try:
+            dead.close()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug(
+                "ME upstream source store close failed", exc_info=True)
 
 
 def _get_me_upstream_source_store(repository: ScannerRepository):
@@ -1726,13 +1763,24 @@ def _get_me_upstream_source_store(repository: ScannerRepository):
     Independent from the scanner's main transaction and from every other
     research/contour store: upstream commits/rollbacks can never touch a
     production transaction (and vice versa).
+
+    Connection recovery (Codex review P2): a cached store whose connection
+    broke is invalidated and replaced on a LATER cycle under the bounded
+    backoff ladder (5 s -> 15 s -> 60 s cap).  Scanner lifecycle is
+    untouched and the trading cycle is never blocked beyond one bounded
+    connect attempt per delivery.
     """
     global _me_upstream_source_store, _me_upstream_source_store_retry_at
+    global _me_upstream_source_store_backoff_step
     if _me_upstream_source_store is not None:
-        return _me_upstream_source_store
-    now = time.monotonic()
-    if now - _me_upstream_source_store_retry_at < 60.0:
+        if not getattr(_me_upstream_source_store, "broken", False):
+            return _me_upstream_source_store
+        # A dead connection must never be reused: discard it now.
+        _invalidate_me_upstream_source_store()
         return None
+    now = time.monotonic()
+    if now < _me_upstream_source_store_retry_at:
+        return None  # bounded backoff window: no connect attempt at all
     try:
         from app.research.me_upstream_source_v1.store import connect_pg_store
 
@@ -1744,10 +1792,19 @@ def _get_me_upstream_source_store(repository: ScannerRepository):
             password=repository._password,
             unix_sock=repository._unix_sock or None,
         )
+        _me_upstream_source_store_backoff_step = 0  # healthy: reset ladder
         return _me_upstream_source_store
     except Exception:
         _me_upstream_source_store = None
-        _me_upstream_source_store_retry_at = now
+        _me_upstream_source_store_retry_at = now + (
+            _ME_UPSTREAM_STORE_BACKOFF_S[
+                min(_me_upstream_source_store_backoff_step,
+                    len(_ME_UPSTREAM_STORE_BACKOFF_S) - 1)]
+        )
+        _me_upstream_source_store_backoff_step = min(
+            _me_upstream_source_store_backoff_step + 1,
+            len(_ME_UPSTREAM_STORE_BACKOFF_S) - 1,
+        )
         logger.debug(
             "ME upstream source capture store unavailable", exc_info=True)
         return None
@@ -1816,6 +1873,12 @@ def _capture_me_upstream_source_v1(
         if store is None:
             raise RuntimeError("me upstream source capture store unavailable")
         status = capture_with_status(store, candidate)
+        if getattr(store, "broken", False):
+            # The connection died during this delivery: discard the cached
+            # store so the NEXT cycle reconnects (bounded backoff) instead of
+            # hammering a dead connection.  Fail-open: the scanner cycle is
+            # unaffected either way (Codex review P2).
+            _invalidate_me_upstream_source_store()
         _status_counter = {
             CAPTURED: "captured",
             CAPTURE_DUPLICATE: "duplicates",

@@ -20,6 +20,7 @@ Plain pytest: no network, no DB.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
@@ -401,12 +402,8 @@ def test_c6_lineage_conflict_sticky_blocked_and_no_new_writes():
     ) == CAPTURED
 
     # SAME source_event_key (same scanner/symbol/direction/timeframe/candle),
-    # DIFFERENT immutable lineage (rsi_14 changed).
-    conflicting = make_candidate(features={
-        "rsi_14": 60.0,
-        "rsi_delta_3": 1.25,
-        "entry_confirmation_rsi_rising": True,
-    })
+    # DIFFERENT IMMUTABLE SOURCE provenance (scanner_version changed).
+    conflicting = make_candidate(scanner_version="9.9.9")
     assert capture_with_status(
         store, conflicting, env=ENABLED, clock=fixed_clock
     ) == CAPTURE_INTEGRITY_CONFLICT
@@ -437,16 +434,96 @@ def test_c6_lineage_conflict_sticky_blocked_and_no_new_writes():
     assert len(store.events) == 1
 
 
-def test_c6_reference_price_lineage_conflict_still_conflicts():
+# --- forming-candle volatility: ordinary drift is NEVER a conflict -------
+#
+# SetupCandidate: "detected_at and prices may change while that candle is
+# still forming".  RSI / price / entry-stop-target geometry drifting between
+# re-detections of one signal candle is ordinary variance: idempotent
+# DUPLICATE, the first-capture snapshot preserved verbatim, never a
+# conflict (Codex review P1 — contracts.py redelivery integrity validation).
+
+def test_c6_forming_candle_rsi_drift_is_duplicate_not_conflict():
     store = make_store()
     assert capture_with_status(
         store, make_candidate(), env=ENABLED, clock=fixed_clock
     ) == CAPTURED
-    drifted_price = make_candidate(reference_price=99_999.0)
+    drifted = make_candidate(features={
+        "rsi_14": 60.0,          # was 55.0
+        "rsi_delta_3": 3.5,      # was 1.25
+        "entry_confirmation_rsi_rising": True,
+    })
     assert capture_with_status(
-        store, drifted_price, env=ENABLED, clock=fixed_clock
-    ) == CAPTURE_INTEGRITY_CONFLICT
+        store, drifted, env=ENABLED, clock=fixed_clock
+    ) == CAPTURE_DUPLICATE
     assert len(store.events) == 1
+    assert not [s for s in store.states if s["state"] == "BLOCKED"]
+
+
+def test_c6_forming_candle_price_drift_is_duplicate_not_conflict():
+    store = make_store()
+    assert capture_with_status(
+        store, make_candidate(), env=ENABLED, clock=fixed_clock
+    ) == CAPTURED
+    drifted = make_candidate(
+        reference_price=99_999.0,
+        entry_zone_low=99_000.0,
+        entry_zone_high=100_000.0,
+    )
+    assert capture_with_status(
+        store, drifted, env=ENABLED, clock=fixed_clock
+    ) == CAPTURE_DUPLICATE
+    assert len(store.events) == 1
+    assert not [s for s in store.states if s["state"] == "BLOCKED"]
+
+
+def test_c6_forming_candle_geometry_drift_is_duplicate_not_conflict():
+    store = make_store()
+    assert capture_with_status(
+        store, make_candidate(), env=ENABLED, clock=fixed_clock
+    ) == CAPTURED
+    drifted = make_candidate(
+        invalidation_price=55.0,   # was 97.5
+        target_1=250.0,            # was 103.0
+        target_2=300.0,
+    )
+    assert capture_with_status(
+        store, drifted, env=ENABLED, clock=fixed_clock
+    ) == CAPTURE_DUPLICATE
+    assert len(store.events) == 1
+    assert not [s for s in store.states if s["state"] == "BLOCKED"]
+
+
+def test_c6_first_capture_snapshot_survives_redelivery_drift():
+    # The first-capture snapshot is the record: redelivery drift never
+    # overwrites it (append-only store semantics).
+    store = make_store()
+    first = make_candidate()
+    assert capture_with_status(
+        store, first, env=ENABLED, clock=fixed_clock
+    ) == CAPTURED
+    original = dict(build_event(first).lineage)
+    drifted = make_candidate(
+        reference_price=99_999.0,
+        invalidation_price=55.0,
+        target_1=250.0,
+        features={
+            "rsi_14": 60.0,
+            "rsi_delta_3": 3.5,
+            "entry_confirmation_rsi_rising": True,
+        },
+    )
+    assert capture_with_status(
+        store, drifted, env=ENABLED, clock=fixed_clock
+    ) == CAPTURE_DUPLICATE
+
+    row = next(iter(store.events.values()))
+    lineage = row["lineage"]
+    # Byte-for-byte the FIRST snapshot survives — drift never overwrites.
+    assert lineage == original
+    assert lineage["source_features"]["rsi_14"] == 55.0
+    assert lineage["source_invalidation_price"] == original[
+        "source_invalidation_price"
+    ] != 55.0
 
 
 def test_c6_store_save_event_raises_source_integrity_error_on_conflict():
@@ -454,16 +531,25 @@ def test_c6_store_save_event_raises_source_integrity_error_on_conflict():
     event_a = build_event(make_candidate())
     assert store.save_event(event_a) == SAVE_CAPTURED
 
-    event_b = build_event(make_candidate(features={
-        "rsi_14": 60.0,
-        "rsi_delta_3": 1.25,
-        "entry_confirmation_rsi_rising": True,
-    }))
+    # REAL conflict: same key, different IMMUTABLE SOURCE provenance.
+    event_b = build_event(make_candidate(scanner_version="9.9.9"))
     assert event_b.source_event_key == event_a.source_event_key
-    assert event_b.lineage_hash != event_a.lineage_hash
+    assert event_b.immutable_source_hash != event_a.immutable_source_hash
     with pytest.raises(SourceIntegrityError) as excinfo:
         store.save_event(event_b)
     assert REASON_EVENT_KEY_LINEAGE_CONFLICT in excinfo.value.args
+
+    # Volatile drift of the SAME key stays an idempotent DUPLICATE even
+    # though the full lineage hash differs (forming-candle variance).
+    event_c = build_event(make_candidate(features={
+        "rsi_14": 60.0,
+        "rsi_delta_3": 3.5,
+        "entry_confirmation_rsi_rising": True,
+    }))
+    assert event_c.source_event_key == event_a.source_event_key
+    assert event_c.lineage_hash != event_a.lineage_hash
+    assert event_c.immutable_source_hash == event_a.immutable_source_hash
+    assert store.save_event(event_c) == SAVE_DUPLICATE
 
     # Byte-identical re-delivery is a DUPLICATE, never a conflict.
     assert store.save_event(event_a) == SAVE_DUPLICATE
@@ -768,9 +854,10 @@ class TestRedeliveryVariance:
         assert len(store.events) == 1
         assert store.states == []  # no BLOCKED, no conflict
 
-    def test_immutable_fact_drift_is_still_a_conflict(self):
-        # A re-delivery that changes an IMMUTABLE fact (price / features /
-        # scanner version) keeps firing the conflict path.
+    def test_forming_candle_fact_drift_is_duplicate_not_conflict(self):
+        # Price / geometry / feature drift inside the forming candle — even
+        # with a fresh setup_id + detected_at — is ordinary re-detection
+        # variance: idempotent DUPLICATE, never a conflict.
         store = make_store()
         assert capture_with_status(
             store, make_candidate(), env=ENABLED, clock=fixed_clock,
@@ -779,6 +866,31 @@ class TestRedeliveryVariance:
             setup_id=uuid4(),
             detected_at=SIGNAL_TIME + timedelta(minutes=2),
             reference_price=999.0,
+            invalidation_price=55.0,
+            target_1=250.0,
+            features={
+                "rsi_14": 60.0,
+                "rsi_delta_3": 3.5,
+                "entry_confirmation_rsi_rising": True,
+            },
+        )
+        assert capture_with_status(
+            store, drifted, env=ENABLED, clock=fixed_clock,
+        ) == "DUPLICATE"
+        assert len(store.events) == 1
+        assert store.states == []  # no BLOCKED, no conflict
+
+    def test_immutable_source_drift_is_still_a_conflict(self):
+        # A re-delivery that changes an IMMUTABLE SOURCE field (scanner
+        # provenance of the same identity) keeps firing the conflict path.
+        store = make_store()
+        assert capture_with_status(
+            store, make_candidate(), env=ENABLED, clock=fixed_clock,
+        ) == "CAPTURED"
+        drifted = make_candidate(
+            setup_id=uuid4(),
+            detected_at=SIGNAL_TIME + timedelta(minutes=2),
+            scanner_version="9.9.9",
         )
         assert capture_with_status(
             store, drifted, env=ENABLED, clock=fixed_clock,
@@ -838,9 +950,11 @@ class TestPgStoreSqlContract:
         assert "freeze_ts IS NOT NULL" in sql
         assert conn.commits == 1
 
-    def test_save_event_duplicate_on_same_comparable_hash(self):
+    def test_save_event_duplicate_on_same_immutable_source_hash(self):
         event = build_event(make_candidate())
-        conn = _FakeConnection(fetchone_script=[None, (event.comparable_lineage_hash,)])
+        # The duplicate probe SELECTs the stored first-capture lineage and
+        # compares its IMMUTABLE SOURCE subset (not the snapshot hash).
+        conn = _FakeConnection(fetchone_script=[None, (dict(event.lineage),)])
         store = PgUpstreamSourceStore(conn)
         assert store.save_event(event) == "DUPLICATE"
         # The duplicate probe only SELECTs from the own-schema ledger.
@@ -848,13 +962,41 @@ class TestPgStoreSqlContract:
         assert "research_me_upstream_coverage.source_event" in select_sql
         assert select_sql.strip().startswith("SELECT")
 
-    def test_save_event_conflict_on_comparable_lineage_drift(self):
+    def test_save_event_duplicate_when_volatile_snapshot_drifts(self):
+        # A stored snapshot with different price/features (forming-candle
+        # drift) but the SAME immutable source fields is a DUPLICATE.
         event = build_event(make_candidate())
-        conn = _FakeConnection(fetchone_script=[None, ("0" * 64,)])
+        drifted = build_event(make_candidate(
+            reference_price=999.0,
+            features={
+                "rsi_14": 60.0,
+                "rsi_delta_3": 3.5,
+                "entry_confirmation_rsi_rising": True,
+            },
+        ))
+        conn = _FakeConnection(fetchone_script=[None, (dict(event.lineage),)])
+        store = PgUpstreamSourceStore(conn)
+        assert store.save_event(drifted) == "DUPLICATE"
+
+    def test_save_event_conflict_on_immutable_source_drift(self):
+        event = build_event(make_candidate())
+        conflicting = build_event(make_candidate(scanner_version="9.9.9"))
+        conn = _FakeConnection(
+            fetchone_script=[None, (dict(conflicting.lineage),)],
+        )
         store = PgUpstreamSourceStore(conn)
         with pytest.raises(SourceIntegrityError) as excinfo:
             store.save_event(event)
         assert str(excinfo.value) == "EVENT_KEY_LINEAGE_CONFLICT"
+
+    def test_save_event_accepts_stored_lineage_as_json_text(self):
+        # Driver variance: some DB-API drivers return jsonb as TEXT.
+        event = build_event(make_candidate())
+        conn = _FakeConnection(
+            fetchone_script=[None, (json.dumps(dict(event.lineage)),)],
+        )
+        store = PgUpstreamSourceStore(conn)
+        assert store.save_event(event) == "DUPLICATE"
 
     def test_save_event_not_active_when_row_vanished(self):
         conn = _FakeConnection(fetchone_script=[None, None])

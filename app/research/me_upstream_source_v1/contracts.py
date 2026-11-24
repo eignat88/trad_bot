@@ -123,32 +123,48 @@ LINEAGE_FEATURE_KEYS = (
     "entry_confirmation_rsi_rising",
 )
 
-#: Lineage keys compared across the upstream and V3 ledgers AND used for
-#: immutable-lineage conflict detection.  Only ORIGINAL detector facts that
-#: are stable across re-detections of the same signal qualify:
+#: IMMUTABLE source fields of the ORIGINAL detector event — the ONLY fields
+#: allowed to drive redelivery integrity conflict detection.  A redelivery
+#: of one ``source_event_key`` that differs on ANY of these is a REAL
+#: integrity conflict (``EVENT_KEY_LINEAGE_CONFLICT`` -> sticky ``BLOCKED``):
+#: they cannot legitimately change between re-detections of the same signal
+#: because they define what the signal IS.
 #:
-#: * ``source_setup_id`` and ``source_signal_time`` are EXCLUDED — every
-#:   re-detection of the same signal candle produces a NEW setup_id and a
-#:   new detected_at, so including them would make every idempotent
-#:   redelivery an "integrity conflict" (criterion 5 forbids that);
-#: * ``source_score``, ``source_reasons``, ``source_state`` and
-#:   ``source_market_regime`` are excluded — the later scoring/attach passes
-#:   may rewrite them;
-#: * capture-side metadata (``capture_*``, ``identity_namespace``) is
-#:   excluded — it describes this capture, not the source signal.
-COMPARABLE_LINEAGE_KEYS = (
+#: Everything else — price facts, entry/stop/target geometry, detector
+#: feature values — is VOLATILE while the signal candle is still forming
+#: (``SetupCandidate``: "detected_at and prices may change while that candle
+#: is still forming"), so their drift on redelivery is ordinary re-detection
+#: variance: idempotent ``DUPLICATE``, never ``INTEGRITY_CONFLICT``.  The
+#: first-capture snapshot is preserved verbatim and never overwritten.
+#:
+#: ``source_setup_id`` and ``source_signal_time`` are excluded for the same
+#: reason (a NEW setup_id/detected_at per re-detection); ``source_score``,
+#: ``source_reasons``, ``source_state`` and ``source_market_regime`` are
+#: excluded because later scoring/attach passes may rewrite them; capture
+#: metadata (``capture_*``, ``identity_namespace``) describes this capture,
+#: not the source signal.
+IMMUTABLE_SOURCE_KEYS = (
     "source_identity",
     "source_scanner",
     "source_scanner_version",
     "source_direction",
-    "source_signal_candle_open_time",
     "source_entry_timeframe",
+    "source_signal_candle_open_time",
+    "source_pipeline_fingerprint",
+)
+
+#: Cross-ledger SNAPSHOT comparison keys (upstream vs V3) — a SEPARATE
+#: mechanism from the redelivery check above.  The snapshot set is broader:
+#: it also covers the volatile detector facts (price/geometry/features) so
+#: two first-captures of the same identity can be compared for drift.  Drift
+#: on the volatile subset is reported diagnostically (``snapshot_drifts``);
+#: only drift on :data:`IMMUTABLE_SOURCE_KEYS` is an integrity mismatch.
+COMPARABLE_LINEAGE_KEYS = IMMUTABLE_SOURCE_KEYS + (
     "source_reference_price",
     "source_invalidation_price",
     "source_target_price",
     "source_target_2",
     "source_entry_zone",
-    "source_pipeline_fingerprint",
 )
 
 #: Feature keys compared across ledgers (intersection of both captures).
@@ -264,12 +280,38 @@ def lineage_hash(lineage: Mapping[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def comparable_lineage_view(lineage: Mapping[str, Any]) -> dict[str, Any]:
-    """Frozen immutable/comparable subset of a lineage (ORIGINAL facts).
+def immutable_source_view(lineage: Mapping[str, Any]) -> dict[str, Any]:
+    """Stable identity + immutable provenance subset of a lineage.
 
-    This subset is BOTH the immutable-lineage conflict set (a re-delivery
-    differing on it is an ``INTEGRITY_CONFLICT``) AND the cross-ledger
-    comparison set (upstream vs V3).
+    This subset — and ONLY this subset — drives redelivery integrity
+    conflict detection: a re-delivery of one ``source_event_key`` differing
+    on it is a REAL conflict.  Volatile facts (price/geometry/features) are
+    deliberately outside it: they legitimately drift between re-detections
+    while the candle is forming (see :data:`IMMUTABLE_SOURCE_KEYS`).
+    """
+    return {
+        key: _json_safe(lineage.get(key))
+        for key in IMMUTABLE_SOURCE_KEYS
+    }
+
+
+def immutable_source_hash(lineage: Mapping[str, Any]) -> str:
+    """Deterministic hash of the immutable source-field subset.
+
+    Used for redelivery conflict detection (``EVENT_KEY_LINEAGE_CONFLICT``).
+    Distinct from :func:`comparable_lineage_hash`, which fingerprints the
+    broader cross-ledger snapshot.
+    """
+    return lineage_hash(immutable_source_view(lineage))
+
+
+def comparable_lineage_view(lineage: Mapping[str, Any]) -> dict[str, Any]:
+    """Frozen cross-ledger SNAPSHOT subset of a lineage (ORIGINAL facts).
+
+    Used to compare two first-captures of the same identity across the
+    upstream and V3 ledgers (see :data:`COMPARABLE_LINEAGE_KEYS`).  This is
+    NOT the redelivery conflict set — that is
+    :func:`immutable_source_view`.
     """
     view: dict[str, Any] = {
         key: _json_safe(lineage.get(key))
@@ -285,10 +327,10 @@ def comparable_lineage_view(lineage: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def comparable_lineage_hash(lineage: Mapping[str, Any]) -> str:
-    """Deterministic hash of the immutable/comparable lineage subset.
+    """Deterministic hash of the cross-ledger snapshot subset.
 
-    Used for immutable-lineage conflict detection (``EVENT_KEY_LINEAGE_
-    CONFLICT``) and as the cross-ledger lineage fingerprint.
+    Cross-ledger lineage fingerprint only.  NOT used for redelivery
+    integrity conflicts — that check uses :func:`immutable_source_hash`.
     """
     return lineage_hash(comparable_lineage_view(lineage))
 
@@ -325,6 +367,7 @@ class UpstreamSourceEvent:
     lineage: dict[str, Any]
     lineage_hash: str
     comparable_lineage_hash: str = field(default="")
+    immutable_source_hash: str = field(default="")
 
 
 def build_source_event(
@@ -448,6 +491,7 @@ def build_source_event(
         lineage=lineage,
         lineage_hash=lineage_hash(lineage),
         comparable_lineage_hash=comparable_lineage_hash(lineage),
+        immutable_source_hash=immutable_source_hash(lineage),
     )
 
 

@@ -26,6 +26,9 @@ from app.research.me_upstream_source_v1.contracts import (
     SourceValidationError,
     build_source_event,
     comparable_lineage_hash,
+    IMMUTABLE_SOURCE_KEYS,
+    immutable_source_hash,
+    immutable_source_view,
     comparable_lineage_view,
     lineage_hash,
     normalize_reason_code,
@@ -525,6 +528,77 @@ def test_contracts_comparable_lineage_hash_differs_when_reference_price_differs(
     assert (
         comparable_lineage_hash(event_a.lineage)
         != comparable_lineage_hash(event_b.lineage)
+    )
+
+
+# --- immutable source hash: the ONLY redelivery conflict key -------------
+# (Codex review P1: redelivery integrity validation must not treat ordinary
+# forming-candle drift — RSI / price / geometry — as a conflict.)
+
+
+def test_contracts_immutable_source_view_covers_only_stable_fields():
+    view = immutable_source_view(build(make_candidate()).lineage)
+    assert set(view) == set(IMMUTABLE_SOURCE_KEYS)
+    # Volatile detector facts and features are outside the conflict set.
+    assert "source_reference_price" not in view
+    assert "source_entry_zone" not in view
+    assert "source_features" not in view
+
+
+def test_contracts_immutable_source_hash_stable_under_forming_candle_drift():
+    base = make_candidate()
+    drifted = make_candidate(
+        reference_price=50_123.0,
+        entry_zone_low=49_999.0,
+        entry_zone_high=50_111.0,
+        invalidation_price=41_000.0,
+        target_1=60_000.0,
+        target_2=65_000.0,
+        features={
+            "rsi_14": 71.5,
+            "rsi_delta_3": -4.2,
+            "entry_confirmation_rsi_rising": False,
+        },
+    )
+    event_a = build(base)
+    event_b = build(drifted)
+
+    assert event_b.source_event_key == event_a.source_event_key
+    # Volatile drift: same immutable hash (DUPLICATE, never a conflict) ...
+    assert (
+        immutable_source_hash(event_a.lineage)
+        == immutable_source_hash(event_b.lineage)
+    )
+    assert event_b.immutable_source_hash == event_a.immutable_source_hash
+    # ... while the cross-ledger SNAPSHOT hash observes the drift.
+    assert (
+        comparable_lineage_hash(event_a.lineage)
+        != comparable_lineage_hash(event_b.lineage)
+    )
+
+
+def test_contracts_immutable_source_hash_differs_when_provenance_differs():
+    event_a = build(make_candidate())
+    event_b = build(make_candidate(scanner_version="9.9.9"))
+
+    assert event_b.source_event_key == event_a.source_event_key
+    assert (
+        immutable_source_hash(event_a.lineage)
+        != immutable_source_hash(event_b.lineage)
+    )
+
+
+def test_contracts_immutable_source_hash_ignores_post_scoring_fields():
+    base = make_candidate()
+    rewritten = make_candidate(
+        score=0.05,
+        market_regime="chop",
+        reasons=("completely", "different", "reasons"),
+        state=SetupState.CONFIRMED,
+    )
+    assert (
+        immutable_source_hash(build(base).lineage)
+        == immutable_source_hash(build(rewritten).lineage)
     )
 
 

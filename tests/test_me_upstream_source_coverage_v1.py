@@ -240,10 +240,30 @@ class TestMatchLedgers:
         assert counts["upstream_only"] == 1
         assert counts["v3_only"] == 1
 
-    def test_lineage_mismatch_on_comparable_fact(self):
+    def test_snapshot_drift_on_volatile_fact_is_not_a_mismatch(self):
+        # Two first-captures of one identity can observe different
+        # re-detections while the candle forms: price/geometry/feature drift
+        # is EXPECTED variance — diagnostic snapshot drift, never an
+        # integrity mismatch (Codex review P1).
         counts = match_ledgers(
             [_upstream_row(reference_price=100.0)],
             [_v3_row(reference_price=101.0)],
+            window_start=FREEZE,
+            as_of=NOW,
+            grace_seconds=900,
+        )
+        assert counts["matched"] == 1
+        assert counts["lineage_mismatches"] == 0
+        assert counts["snapshot_drifts"] == 1
+
+    def test_lineage_mismatch_on_immutable_source_field(self):
+        # Drift on the IMMUTABLE SOURCE fields (scanner provenance of the
+        # same identity) is the real integrity mismatch.
+        counts = match_ledgers(
+            [_upstream_row()],
+            [_v3_row(lineage_overrides={
+                "source_scanner_version": "9.9.9",
+            })],
             window_start=FREEZE,
             as_of=NOW,
             grace_seconds=900,
@@ -273,6 +293,7 @@ class TestMatchLedgers:
             grace_seconds=900,
         )
         assert counts["lineage_mismatches"] == 0
+        assert counts["snapshot_drifts"] == 0
 
     def test_no_lineage_mismatch_for_redelivery_variance(self):
         # A redelivery of the same signal (fresh setup_id / detected_at) is
@@ -291,6 +312,7 @@ class TestMatchLedgers:
         )
         assert counts["matched"] == 1
         assert counts["lineage_mismatches"] == 0
+        assert counts["snapshot_drifts"] == 0
 
     def test_v3_duplicate_identity_is_counted(self):
         counts = match_ledgers(
@@ -763,7 +785,26 @@ class TestReconcileCoverageSql:
         assert result["rejected_events"] == 0
         assert result["status"] == COVERAGE_PASS
 
-    def test_lineage_mismatch_is_conflict(self):
+    def test_immutable_source_mismatch_is_conflict(self):
+        # Same identity, DIFFERENT immutable source provenance -> the real
+        # integrity mismatch -> INTEGRITY_CONFLICT (highest precedence).
+        result, _ = _reconcile(
+            _script(
+                upstream=(_upstream_row(captured_at=NOW - timedelta(hours=1)),),
+                v3=(_v3_row(created_at=NOW - timedelta(hours=1),
+                            lineage_overrides={
+                                "source_scanner_version": "9.9.9",
+                            }),),
+            ),
+            as_of=NOW,
+        )
+        assert result["lineage_mismatches"] == 1
+        assert result["status"] == INTEGRITY_CONFLICT
+
+    def test_volatile_snapshot_drift_is_not_a_conflict(self):
+        # Price/geometry/feature drift between two first-captures of one
+        # identity is expected forming-candle variance: diagnostic
+        # ``snapshot_drifts`` only — never an INTEGRITY_CONFLICT.
         result, _ = _reconcile(
             _script(
                 upstream=(_upstream_row(reference_price=100.0,
@@ -773,8 +814,10 @@ class TestReconcileCoverageSql:
             ),
             as_of=NOW,
         )
-        assert result["lineage_mismatches"] == 1
-        assert result["status"] == INTEGRITY_CONFLICT
+        assert result["lineage_mismatches"] == 0
+        assert result["snapshot_drifts"] == 1
+        assert result["status"] != INTEGRITY_CONFLICT
+        assert result["status"] == COVERAGE_PASS
 
     def test_blocked_capture_state_is_conflict(self):
         result, _ = _reconcile(
