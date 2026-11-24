@@ -105,6 +105,7 @@ def _upstream_row(
     symbol: str = "BTCUSDT",
     candle_ms: int = 1_700_000_000_000,
     captured_at: datetime | None = None,
+    detected_at: datetime | None = None,
     reference_price: float = 100.0,
     lineage=None,
 ) -> dict:
@@ -113,6 +114,7 @@ def _upstream_row(
             symbol=symbol,
             candle_ms=candle_ms,
             reference_price=reference_price,
+            detected_at=detected_at,
         ),
         activation_freeze_ts=FREEZE,
         captured_at=captured_at or NOW,
@@ -133,6 +135,7 @@ def _v3_row(
     symbol: str = "BTCUSDT",
     candle_ms: int = 1_700_000_000_000,
     created_at: datetime | None = None,
+    detected_at: datetime | None = None,
     reference_price: float = 100.0,
     lineage_overrides: dict | None = None,
 ) -> dict:
@@ -142,6 +145,7 @@ def _v3_row(
             symbol=symbol,
             candle_ms=candle_ms,
             reference_price=reference_price,
+            detected_at=detected_at,
         ),
         activation_freeze_ts=FREEZE,
         captured_at=created_at or NOW,
@@ -300,18 +304,70 @@ class TestMatchLedgers:
 
     def test_rows_outside_confirmed_activity_window_are_excluded(self):
         # The audit only uses the intersection of confirmed activity
-        # periods: V3 rows from before the upstream capture started are
-        # reported as outside-window, never as coverage gaps.
+        # periods, judged on the ORIGINAL EVENT time (signal_time): a V3
+        # event from before the upstream capture's confirmed activity is
+        # reported as outside-window, never as a coverage gap.
         counts = match_ledgers(
-            [_upstream_row(captured_at=NOW - timedelta(hours=1))],
-            [_v3_row(created_at=NOW - timedelta(days=2))],
+            [_upstream_row(detected_at=NOW - timedelta(seconds=30))],
+            [_v3_row(detected_at=NOW - timedelta(days=2))],
             window_start=NOW - timedelta(hours=1),
             as_of=NOW,
             grace_seconds=900,
         )
         assert counts["outside_window_v3"] == 1
         assert counts["v3_only"] == 0
-        assert counts["matched"] == 1 or counts["upstream_only"] == 1
+        assert counts["upstream_only"] == 1  # its in-window twin is unmatched
+
+    def test_ingestion_skew_between_ledgers_never_excludes_rows(self):
+        # Regression (VPS 20/22): the same event ingested at different wall
+        # clock moments (upstream captured late, V3 captured promptly) must
+        # stay matchable — ingestion time never shrinks the scope.
+        counts = match_ledgers(
+            [_upstream_row(captured_at=NOW)],  # late ingestion
+            [_v3_row(created_at=NOW - timedelta(minutes=5))],  # early
+            window_start=FREEZE,
+            as_of=NOW,
+            grace_seconds=900,
+        )
+        assert counts["matched"] == 1
+        assert counts["outside_window_upstream"] == 0
+        assert counts["outside_window_v3"] == 0
+        assert counts["lineage_mismatches"] == 0
+
+    def test_delayed_upstream_recovery_still_matches(self):
+        # The upstream capture missed its first delivery and only landed the
+        # event on a later re-delivery (10 min after detection) while V3 got
+        # it in the original cycle: the pair must MATCH, not split into
+        # false lag/gap verdicts.
+        up = _upstream_row(
+            captured_at=NOW - timedelta(seconds=30) + timedelta(minutes=10),
+        )
+        counts = match_ledgers(
+            [up],
+            [_v3_row(created_at=NOW - timedelta(seconds=30))],
+            window_start=FREEZE,
+            as_of=NOW,
+            grace_seconds=900,
+        )
+        assert counts["matched"] == 1
+        assert counts["upstream_only"] == 0
+        assert counts["v3_only"] == 0
+
+    def test_ingestion_skew_alone_is_never_outside_window(self):
+        # Old ingestion times with in-window EVENT times are in scope: the
+        # window follows the signal, not the delivery.
+        counts = match_ledgers(
+            [_upstream_row(captured_at=NOW - timedelta(days=2),
+                           detected_at=NOW - timedelta(seconds=30))],
+            [_v3_row(created_at=NOW - timedelta(days=2),
+                     detected_at=NOW - timedelta(seconds=30))],
+            window_start=NOW - timedelta(hours=1),
+            as_of=NOW,
+            grace_seconds=900,
+        )
+        assert counts["outside_window_upstream"] == 0
+        assert counts["outside_window_v3"] == 0
+        assert counts["matched"] == 1
 
     def test_delivery_latency_stats(self):
         up = _upstream_row(captured_at=NOW - timedelta(seconds=42))
@@ -761,6 +817,106 @@ class TestReconcileCoverageSql:
             "INSERT INTO research_me_upstream_coverage.coverage_audit" in text
             for text, _ in conn.log
         )
+
+    # --- regression: activity-window basis (VPS 20/22) -------------------
+
+    def test_ingestion_skew_between_ledgers_still_matches(self):
+        # EXACT VPS failure shape: upstream ingested at wall-clock now, the
+        # V3 ledger ingested the SAME event 5 minutes earlier.  Activity
+        # starts follow the EVENT time, so both rows are in scope and the
+        # pair matches (was: matched=0 because window_start jumped to the
+        # later first-ingestion and excluded the whole V3 side).
+        result, _ = _reconcile(
+            _script(
+                upstream=(_upstream_row(captured_at=NOW),),
+                v3=(_v3_row(created_at=NOW - timedelta(minutes=5)),),
+            ),
+            as_of=NOW,
+        )
+        assert result["matched"] == 1
+        assert result["outside_window_v3"] == 0
+        assert result["status"] == COVERAGE_PASS
+
+    def test_activity_start_follows_event_time_not_ingestion(self):
+        result, _ = _reconcile(
+            _script(
+                upstream=(
+                    _upstream_row(captured_at=NOW,
+                                  detected_at=NOW - timedelta(minutes=4)),),
+                v3=(_v3_row(created_at=NOW - timedelta(minutes=4),
+                            detected_at=NOW - timedelta(minutes=4)),),
+            ),
+            as_of=NOW,
+        )
+        # Both activity starts are the shared event time, not the skewed
+        # ingestion times NOW and NOW-4min.
+        assert result["upstream_activity_start"] == NOW - timedelta(minutes=4)
+        assert result["v3_activity_start"] == NOW - timedelta(minutes=4)
+        assert result["window_start"] == NOW - timedelta(minutes=4)
+        assert result["matched"] == 1
+
+    def test_activity_mismatch_v3_event_before_window_is_not_a_gap(self):
+        # Mismatched activity periods: the V3 side saw an event BEFORE the
+        # upstream capture's first confirmed event.  That absence is not a
+        # confirmed miss (upstream activity was not confirmed then): it must
+        # be outside-window evidence, never a false COVERAGE_GAP — and the
+        # in-window unmatched event must still become a gap after grace
+        # (no over-exclusion / no weakened gap detection).
+        old = NOW - timedelta(hours=3)
+        result, _ = _reconcile(
+            _script(
+                upstream=(
+                    _upstream_row(symbol="BTCUSDT",
+                                  detected_at=NOW - timedelta(minutes=20),
+                                  captured_at=NOW - timedelta(minutes=20)),),
+                v3=(
+                    _v3_row(symbol="ETHUSDT",
+                            detected_at=old, created_at=old),
+                    _v3_row(symbol="SOLUSDT",
+                            detected_at=NOW - timedelta(minutes=18),
+                            created_at=NOW - timedelta(minutes=18)),
+                ),
+            ),
+            as_of=NOW,
+        )
+        assert result["outside_window_v3"] == 1
+        assert result["v3_only_gap"] == 1  # the IN-window one is still a gap
+        assert result["upstream_only_gap"] == 1  # in-window, past grace
+        assert result["status"] == COVERAGE_GAP
+
+    def test_out_of_window_rows_never_produce_pass_evidence(self):
+        # Rows outside the audited window cannot manufacture a PASS: with
+        # nothing in scope the verdict stays UNKNOWN (matched >= 1 is still
+        # required) — the false-PASS protection is not weakened.
+        old = NOW - timedelta(days=2)
+        result, _ = _reconcile(
+            _script(
+                upstream=(_upstream_row(detected_at=old, captured_at=old),),
+                v3=(_v3_row(detected_at=old, created_at=old),),
+            ),
+            as_of=NOW,
+        )
+        assert result["matched"] == 0
+        assert result["status"] != COVERAGE_PASS
+        assert result["status"] == SOURCE_COVERAGE_UNKNOWN
+
+    def test_delayed_v3_delivery_within_grace_is_lag_not_gap(self):
+        # Delivery delay (the "delays accounted" rule): an event ingested
+        # into V3 just now is still within grace -> COVERAGE_LAG, and only a
+        # delivery older than grace confirms the gap.
+        fresh = NOW - timedelta(seconds=30)
+        result, _ = _reconcile(
+            _script(
+                upstream=(_upstream_row(symbol="BTCUSDT",
+                                        detected_at=fresh,
+                                        captured_at=fresh),),
+                v3=(_v3_row(symbol="ETHUSDT",
+                            detected_at=fresh, created_at=fresh),),
+            ),
+            as_of=NOW,
+        )
+        assert result["upstream_only_lag"] == 1
+        assert result["status"] == COVERAGE_LAG
 
     def test_invalid_grace_rejected(self):
         conn = _FakeConnection(_script())

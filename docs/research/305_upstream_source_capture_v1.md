@@ -151,6 +151,21 @@ upstream/V3/matched counts, upstream-only (lag vs gap after grace), V3-only,
 duplicate identities, lineage mismatches, capture errors, delivery latency
 and unprocessed-within-grace.
 
+**Window basis (two distinct clocks — do not conflate):**
+
+* **Scope (the audited window)** is judged on the **original event time**
+  (`signal_time`) — identical on both ledgers and part of the signal's
+  identity. `window_start = max(freeze_ts, first-event-time-upstream,
+  first-event-time-v3)`; rows with `signal_time < window_start` are
+  outside-window evidence — never gaps, never PASS evidence. Ingestion
+  times (`captured_at`/`created_at`) deliberately do **not** move the
+  window: they differ between the capture routes by construction (capture
+  latency, retries, recovered re-deliveries) and using them would exclude
+  exactly the delayed events the grace window exists to tolerate.
+* **Grace (lag vs gap)** is judged on **ingestion time**: a counterpart had
+  `grace_seconds` to land after the event reached the delivering ledger
+  ("delays accounted"), never from raw detection time.
+
 Verdict precedence (strict):
 
 ```
@@ -175,9 +190,9 @@ step (`save_coverage_audit`) — reconciliation itself never writes.
 | --- | --- | --- |
 | `tests/test_me_upstream_source_identity_v1.py` | identity determinism, contracts, lineage hashes | PASS (48) |
 | `tests/test_me_upstream_source_capture_v1.py` | flag/activation/freeze/idempotency/redelivery-variance/conflict/fail-open (acceptance criteria 1–12) + PgUpstreamSourceStore SQL contract | PASS (42) |
-| `tests/test_me_upstream_source_coverage_v1.py` | matching + verdicts LAG/GAP/UNKNOWN/INTEGRITY_CONFLICT (pure + SQL path doubles) | PASS (39) |
+| `tests/test_me_upstream_source_coverage_v1.py` | matching + verdicts LAG/GAP/UNKNOWN/INTEGRITY_CONFLICT (pure + SQL path doubles) + activity-window-basis regressions (ingestion skew, delayed recovery, mismatched activity periods) | PASS (47) |
 | `tests/test_me_upstream_source_wiring_v1.py` | static audit: capture placement before scoring/gates; runtime publication; runner hook fail-open; regression of all 5 existing capture hooks; migration 094 audits; deploy safety | PASS (28) |
-| `tests/test_me_upstream_source_pg_integration_v1.py` | acceptance criteria 1–12 on **real PostgreSQL**, isolated scratch DB `me_ups305_it_*`, migration 094 + stand-in V3 table | prepared; **skipped** here (no local PostgreSQL server; opt-in `ME_UPS305_PG_INTEGRATION=1`) |
+| `tests/test_me_upstream_source_pg_integration_v1.py` | acceptance criteria 1–12 + activity-window regressions on **real PostgreSQL**, isolated scratch DB `me_ups305_it_*`, migration 094 + stand-in V3 table | prepared; **skipped** here (no local PostgreSQL server; opt-in `ME_UPS305_PG_INTEGRATION=1`) |
 
 Static audits prove: publication is before scoring/dedup/geometry/gates/
 regime/expectancy; the capture package imports nothing from `app.paper` /

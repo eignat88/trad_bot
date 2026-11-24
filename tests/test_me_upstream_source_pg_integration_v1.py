@@ -632,3 +632,74 @@ class TestConflictVerdict:
         result = reconcile_coverage(conn)
         assert result["status"] == INTEGRITY_CONFLICT
         assert result["reason"] == "CAPTURE_STATE_BLOCKED"
+
+
+# ─── regression: activity-window basis (VPS 20/22 remediation) ──────────
+
+
+class TestActivityWindowBasis:
+    def test_ingestion_skew_between_ledgers_still_matches(self, conn):
+        # VPS regression: the upstream ledger ingested the event at wall
+        # clock now while V3 ingested the SAME event 5 minutes earlier
+        # (captured_at = signal + 200 ms).  The audited window follows the
+        # original EVENT time, so both rows are in scope and the pair must
+        # MATCH (was: matched=0 / v3_only_gap=0 because window_start jumped
+        # to the later first-ingestion).
+        activate(conn)
+        store = PgUpstreamSourceStore(conn)
+        candidate = make_candidate()
+        # Delayed upstream ingestion: recovered delivery ~10 min after the
+        # detection, while the V3 hook landed it in the original cycle.
+        status = capture_with_status(
+            store, candidate, env=ENABLED,
+            clock=lambda: SIGNAL_TIME + timedelta(minutes=10),
+        )
+        assert status == CAPTURED
+        insert_v3(conn, candidate)  # prompt ingestion (signal + 200 ms)
+
+        result = reconcile_coverage(conn)
+        assert result["matched"] == 1
+        assert result["outside_window_v3"] == 0
+        assert result["lineage_mismatches"] == 0
+        assert result["status"] == COVERAGE_PASS
+
+    def test_v3_event_before_upstream_activity_is_not_a_gap(self, conn):
+        # Mismatched activity periods: a V3 event detected BEFORE the
+        # upstream capture's first confirmed event is outside-window
+        # evidence — never a confirmed COVERAGE_GAP — while in-window
+        # unmatched events still become gaps after grace (no weakened gap
+        # detection).
+        activate(conn)
+        store = PgUpstreamSourceStore(conn)
+        assert capture_with_status(store, make_candidate(), env=ENABLED) == CAPTURED
+        # V3-only event from before the upstream ledger's first event.
+        insert_v3(
+            conn,
+            make_candidate(
+                symbol="ETHUSDT",
+                setup_id=uuid4(),
+                detected_at=NOW - timedelta(hours=1),  # post-freeze, pre-window
+            ),
+        )
+
+        result = reconcile_coverage(conn, as_of=NOW + timedelta(hours=2))
+        assert result["outside_window_v3"] == 1
+        assert result["v3_only_gap"] == 0  # pre-window absence is not an error
+        assert result["upstream_only_gap"] == 1  # in-window gap still detected
+
+    def test_event_times_anchor_the_window_not_ingestion(self, conn):
+        # Both ledgers ingested their rows long ago but the EVENT time is
+        # recent: the rows are in scope (the window follows the signal) and
+        # the pair matches.
+        activate(conn)
+        store = PgUpstreamSourceStore(conn)
+        candidate = make_candidate()
+        assert capture_with_status(
+            store, candidate, env=ENABLED,
+            clock=lambda: SIGNAL_TIME + timedelta(minutes=30),
+        ) == CAPTURED
+        insert_v3(conn, candidate)
+        result = reconcile_coverage(conn)
+        assert result["matched"] == 1
+        assert result["outside_window_upstream"] == 0
+        assert result["outside_window_v3"] == 0

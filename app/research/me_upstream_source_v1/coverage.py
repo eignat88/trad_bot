@@ -187,9 +187,16 @@ def match_ledgers(
     upstream_all = _normalize_rows(upstream_rows, side="upstream")
     v3_all = _normalize_rows(v3_rows, side="v3")
 
-    # Scope: only the intersection of confirmed activity periods.
-    upstream = [r for r in upstream_all if r["ledger_time"] >= start]
-    v3 = [r for r in v3_all if r["ledger_time"] >= start]
+    # Scope: only the intersection of confirmed activity periods, judged on
+    # the ORIGINAL EVENT time (``signal_time``) — the one timestamp that is
+    # identical on both ledgers and part of the signal's identity.  Ingestion
+    # times (``captured_at`` / ``created_at``) differ between the two capture
+    # routes by construction — capture latency, retries and recovered
+    # re-deliveries all shift them — and must never shrink the audited
+    # window: that would silently exclude exactly the delayed/recovered
+    # events the grace window exists to tolerate.
+    upstream = [r for r in upstream_all if r["signal_time"] >= start]
+    v3 = [r for r in v3_all if r["signal_time"] >= start]
     outside_upstream = len(upstream_all) - len(upstream)
     outside_v3 = len(v3_all) - len(v3)
 
@@ -206,6 +213,11 @@ def match_ledgers(
     v3_only_lag = 0
     v3_only_gap = 0
 
+    # Lag vs gap (delivery expectation): judged on INGESTION time
+    # (``ledger_time``) — a counterpart had ``grace_seconds`` to land after
+    # the event reached the delivering ledger ("delays accounted"), never
+    # from raw detection time.  This is intentionally a different basis from
+    # the activity window above.
     for identity, up_row in upstream_by_identity.items():
         counterparts = v3_by_identity.get(identity) or []
         if not counterparts:
@@ -418,16 +430,26 @@ def reconcile_coverage(
         for r in cur.fetchall()
     ]
 
-    # Confirmed activity periods (first committed ledger timestamp each).
+    # Confirmed activity periods: each side's first post-freeze EVENT time
+    # (``signal_time`` — original detection time).  Ingestion timestamps
+    # (captured_at/created_at) are deliberately NOT used here: they differ
+    # between the capture routes by construction (latency, retries,
+    # re-delivery recovery) and using them would shift ``window_start`` to
+    # the later first-ingestion and exclude the earlier side's first event
+    # from its own confirmed activity period.
     upstream_activity_start = min(
-        (as_utc(r["captured_at"] or r["created_at"]) for r in upstream_rows),
+        (as_utc(r["signal_time"]) for r in upstream_rows),
         default=None,
     )
+    # Fallback when the upstream ledger has events=0: the capture_health
+    # stream proves the capture was OPERATING (ingestion-time evidence; with
+    # zero events the verdict is UNKNOWN either way, so this fallback can
+    # never manufacture a PASS).
     upstream_health_start = _first_health_time(cur)
     if upstream_activity_start is None:
         upstream_activity_start = upstream_health_start
     v3_activity_start = min(
-        (as_utc(r["created_at"] or r["captured_at"]) for r in v3_rows),
+        (as_utc(r["signal_time"]) for r in v3_rows),
         default=None,
     )
 
