@@ -234,6 +234,11 @@ def validate_htf_candles(
                 evaluation_asof_ms=asof_ms,
             )
         open_ms = int(open_raw)
+        # ASOF isolation: unavailable candles cannot influence a past
+        # classification, even when future OHLCV or grid is malformed.
+        # Preserve the trailing suffix in dropped_unclosed.
+        if open_ms + timeframe_ms > asof_ms:
+            break
         if open_ms % timeframe_ms:
             return CandleValidationResult(
                 ok=False,
@@ -274,11 +279,9 @@ def validate_htf_candles(
             )
         seen[open_ms] = candle
         previous_open = open_ms
-        if open_ms + timeframe_ms <= asof_ms:
-            closed.append(candle)
+        closed.append(candle)
 
-    # candles form a strictly ascending grid-aligned sequence here, so the
-    # not-yet-closed / future candles form exactly one trailing suffix
+    # Exclude the future suffix from all validation at this ASOF.
     dropped = tuple(candles[len(closed):])
     if not closed:
         return CandleValidationResult(
