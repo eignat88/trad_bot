@@ -831,6 +831,14 @@ def test_no_tracked_file_modified_against_base():
         # TestV1ByteIdentity).  The other issue268 surfaces (V2 store,
         # V2 preflight) are new-against-base files and never appear as M.
         "scanner_runner.py",
+        # Issue #305 (independent upstream source coverage): app/scanners/
+        # orchestrator.py gains the pre-scoring upstream publication
+        # (additive, fail-open, capture OFF by default; the V3/SRC capture
+        # blocks and every trading gate stay byte-identical).  Like
+        # scanner_runner.py above it is NOT a phase-2 surface and routes the
+        # FULL PR gate (NO_PHASE2) — see the routing gate's
+        # external_allowlisted.  Nothing else tracked is modified.
+        "app/scanners/orchestrator.py",
         # …and the routing gate itself, which must be taught that the two
         # cross-PR paths above are NOT phase2-governed (they route NO_PHASE2
         # through the full PR gate — see its

@@ -167,6 +167,13 @@ class ScannerOrchestrator:
         self.last_scan_time = datetime.now(timezone.utc)
         all_candidates: list[SetupCandidate] = []
         stats: dict[str, dict[str, int | float]] = {}
+        # Issue #305 — upstream source capture publication (PRE-scoring).
+        # Detector-level snapshots of the ORIGINAL
+        # MOMENTUM_EXHAUSTION_REVERSE_LONG_V2 / LONG events, collected
+        # IMMEDIATELY after scanner.scan(ctx) — before scoring, dedup, risk
+        # geometry, direction gate, regime filter and expectancy filter.
+        # Fail-open: publication errors never affect production.
+        upstream_source_events: list[SetupCandidate] = []
         # Track research observation rejections for status resolution.
         # Each entry: (setup_id, status, rejection_stage, rejection_reason)
         research_rejections: list[tuple[str, str, str | None, str | None]] = []
@@ -183,6 +190,25 @@ class ScannerOrchestrator:
                             self.research_observer.observe(c)
                         except Exception:
                             logger.debug("research observation failed for %s", name, exc_info=True)
+                # ── Issue #305: ME upstream source capture (PRE-scoring) ──
+                # The signal candle identity is resolved from the same ctx
+                # helper the later pipeline uses, so the normalized event
+                # identity is byte-identical to the V3 ledger's
+                # lineage->>'source_identity' (cross-ledger matching).
+                for c in candidates:
+                    if (
+                        c.scanner_name == "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2"
+                        and c.direction == "LONG"
+                    ):
+                        try:
+                            upstream_source_events.append(
+                                self._attach_signal_candle(c, ctx)
+                            )
+                        except Exception:
+                            logger.debug(
+                                "upstream source publication failed for %s",
+                                name, exc_info=True,
+                            )
                 all_candidates.extend(candidates)
                 stats[name] = {
                     "candidates_found": len(candidates),
@@ -196,6 +222,16 @@ class ScannerOrchestrator:
                     "errors_count": 1,
                     "duration_ms": round((time.perf_counter() - started) * 1000, 3),
                 }
+
+        # Issue #305 — publish the PRE-scoring upstream source events to the
+        # caller (scanner_runner forwards them to the fail-open,
+        # prospective-only upstream capture).  This list is built from the
+        # RAW detector output and is therefore independent of scoring, dedup,
+        # risk geometry, direction gate, regime filter and expectancy filter
+        # (all of which run BELOW, on ``scored`` / ``unique`` / ``valid``).
+        # Only candidates the CURRENT scan emits are ever published here:
+        # no historical backfill is possible.
+        stats["_me_upstream_source_events"] = upstream_source_events
 
         # Some scanners (currently TREND_PULLBACK_V2) emit a calibrated local
         # score with explainable reasons. Preserve it instead of silently
