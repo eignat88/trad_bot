@@ -481,7 +481,16 @@ def test_package_is_not_wired_into_any_production_surface():
     for path in scan:
         if _package_dir() in path.parents:
             continue
+        if "research" in path.parts:
+            # offline research packages may reference each other (e.g. the
+            # Issue #308 H1-C adapter reuses this classifier) — that is not
+            # production wiring; every research package has its own
+            # isolation + purity tests
+            continue
         text = path.read_text(encoding="utf-8")
-        if "me_entry_quality_h1" in text:
+        # precise needle: the exact #297 package name.  Sibling research
+        # packages (e.g. me_entry_quality_h1c_v1, Issue #308) have their own
+        # isolation tests and must not trip this one by name prefix.
+        if "me_entry_quality_h1_v1" in text:
             offenders.append(str(path.relative_to(root)))
     assert offenders == [], f"production wiring detected: {offenders}"
