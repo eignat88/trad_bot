@@ -110,7 +110,7 @@ def test_4h_grid_is_utc_aligned():
         assert int(candle.timestamp) % TIMEFRAME_4H_MS == 0
     off_grid = _bar(BASE_MS + 60_000, 12.0, 10.0)
     result = validate_htf_candles(
-        [off_grid], timeframe=TIMEFRAME_4H, evaluation_asof_ms=BASE_MS + TIMEFRAME_4H_MS
+        [off_grid], timeframe=TIMEFRAME_4H, evaluation_asof_ms=BASE_MS + 2 * TIMEFRAME_4H_MS
     )
     assert result.reason == REASON_UNALIGNED_CANDLE
 
@@ -408,3 +408,32 @@ def test_result_does_not_depend_on_system_timezone(monkeypatch):
             monkeypatch.setenv("TZ", "UTC")
             time.tzset()
     assert classify_combined(candles_4h, candles_1d, evaluation_asof_ms=asof) == baseline
+
+
+def test_unclosed_corrupt_future_ohlc_cannot_change_past_asof_result():
+    """A future bad candle must not repaint a valid historical ASOF result."""
+    candles = _series(10)
+    asof = int(candles[-1].timestamp) + TIMEFRAME_4H_MS
+    baseline = validate_htf_candles(
+        candles, timeframe=TIMEFRAME_4H, evaluation_asof_ms=asof
+    )
+    assert baseline.ok
+    future = _bar(asof, float("nan"), 10.0)
+    observed = validate_htf_candles(
+        candles + [future], timeframe=TIMEFRAME_4H, evaluation_asof_ms=asof
+    )
+    assert observed.ok
+    assert observed.closed_candles == baseline.closed_candles
+    assert observed.dropped_unclosed == (future,)
+
+
+def test_unclosed_off_grid_future_candle_cannot_repaint_past():
+    candles = _series(10)
+    asof = int(candles[-1].timestamp) + TIMEFRAME_4H_MS
+    future = _bar(asof + 60_000, 13.0, 11.0)
+    result = validate_htf_candles(
+        candles + [future], timeframe=TIMEFRAME_4H, evaluation_asof_ms=asof
+    )
+    assert result.ok
+    assert result.closed_candles == tuple(candles)
+    assert result.dropped_unclosed == (future,)
