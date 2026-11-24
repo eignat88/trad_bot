@@ -742,3 +742,28 @@ class TestDeterminism:
             canonical_lookback=N,
         )
         assert result.ok is True
+
+
+def test_closed_row_hidden_after_future_suffix_fails_closed():
+    """A future suffix must not conceal a later out-of-order closed row."""
+    rows = _rows()
+    rows += [_row(ASOF, 25.0, 15.0), rows[-1]]
+    result = provide_htf_candles(
+        rows, timeframe="4H", evaluation_asof_ms=ASOF,
+        source_identity=_identity(rows), canonical_lookback=10,
+    )
+    assert not result.ok
+    assert result.reason == "OUT_OF_ORDER_CANDLE"
+
+
+def test_future_suffix_with_bad_ohlc_still_does_not_invalidate_history():
+    rows = _rows()
+    future = _row(ASOF, 25.0, 15.0)
+    future["open"] = float("nan")
+    rows.append(future)
+    result = provide_htf_candles(
+        rows, timeframe="4H", evaluation_asof_ms=ASOF,
+        source_identity=_identity(rows), canonical_lookback=10,
+    )
+    assert result.ok
+    assert result.coverage.status == "COMPLETE"
