@@ -15,6 +15,7 @@ import pytest
 
 from app.research.me_entry_quality_h1c_v1.event_adapter import (
     H1C_EVENT_ADAPTER_VERSION,
+    TIMESTAMP_PRECISION_POLICY,
     REASON_DUPLICATE_SOURCE_EVENT,
     REASON_INVALID_CAPTURED_AT,
     REASON_INVALID_SIGNAL_TIME,
@@ -26,7 +27,9 @@ from app.research.me_entry_quality_h1c_v1.event_adapter import (
     SourceEventRecord,
     adapt_source_events,
     classification_asof_ms,
+    classification_asof_us,
     parse_utc_ms,
+    parse_utc_us,
 )
 
 DAY = 86_400_000
@@ -119,9 +122,71 @@ class TestAdaptSourceEvents:
             "source_event_key",
             "source_identity",
             "signal_time_ms",
+            "signal_time_us",
             "activation_freeze_ts_ms",
             "lineage_hash",
         }
+
+    def test_signal_time_us_preserved_exactly(self):
+        # 1970-02-01T00:00:00.365952Z — expectation is plain arithmetic:
+        # 31 days * 86400 s * 1e6 us + 365952 us
+        row = _event_row(signal_time=datetime(1970, 2, 1, 0, 0, 0, 365952,
+                                              tzinfo=timezone.utc))
+        record = adapt_source_events([row]).records[0]
+        assert record.signal_time_us == 31 * 86_400 * 1_000_000 + 365952
+        assert record.signal_time_ms == BASE_MS + 365
+        assert record.signal_time_ms == record.signal_time_us // 1000
+
+    def test_ms_view_floors_toward_the_past(self):
+        # sub-millisecond remainder .750us-scale is EXPLICITLY floored, never
+        # rounded and never silently lost (us preserved on the record)
+        row = _event_row(signal_time=datetime(1970, 2, 1, 0, 0, 0, 999750,
+                                              tzinfo=timezone.utc))
+        record = adapt_source_events([row]).records[0]
+        assert record.signal_time_us % 1000 == 750
+        assert record.signal_time_ms == BASE_MS + 999
+        assert record.signal_time_ms == record.signal_time_us // 1000
+
+    def test_precision_policy_is_explicit(self):
+        assert TIMESTAMP_PRECISION_POLICY == "US_PRESERVED__MS_FLOOR_TOWARD_PAST"
+
+    def test_parse_utc_us_multiplies_integer_ms_exactly(self):
+        assert parse_utc_us(BASE_MS) == BASE_MS * 1000
+        assert parse_utc_us(1.0) == 1000
+
+    def test_parse_utc_us_from_iso_preserves_microseconds(self):
+        assert (
+            parse_utc_us("1970-02-01T00:00:00.365952Z")
+            == 31 * 86_400 * 1_000_000 + 365952
+        )
+        assert parse_utc_ms("1970-02-01T00:00:00.999999Z") == BASE_MS + 999
+
+    def test_record_rejects_inconsistent_ms_us_views(self):
+        for bad_us in (6001, 4999):  # //1000 -> 6 and 4, neither equals 5
+            with pytest.raises(ValueError):
+                SourceEventRecord(
+                    source_event_key="k",
+                    source_identity="s",
+                    symbol="BTCUSDT",
+                    signal_time_ms=5,
+                    captured_at_ms=0,
+                    activation_freeze_ts_ms=0,
+                    lineage_hash="h",
+                    signal_time_us=bad_us,
+                )
+
+    def test_record_accepts_consistent_ms_us_views(self):
+        record = SourceEventRecord(
+            source_event_key="k",
+            source_identity="s",
+            symbol="BTCUSDT",
+            signal_time_ms=5,
+            captured_at_ms=0,
+            activation_freeze_ts_ms=0,
+            lineage_hash="h",
+            signal_time_us=5750,  # 5750 // 1000 == 5 -> consistent (floored)
+        )
+        assert record.signal_time_us == 5750
 
     def test_record_to_dict_roundtrip(self):
         record = adapt_source_events([_event_row()]).records[0]

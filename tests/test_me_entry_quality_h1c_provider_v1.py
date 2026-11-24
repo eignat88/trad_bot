@@ -32,6 +32,7 @@ from app.research.me_entry_quality_h1c_v1.htf_provider import (
     COVERAGE_COMPLETE,
     COVERAGE_NONE,
     COVERAGE_PARTIAL,
+    EMPTY_PAYLOAD_HASH,
     HtfSourceIdentity,
     REASON_INVALID_SOURCE_IDENTITY,
     REASON_ROW_PARSE_ERROR,
@@ -110,9 +111,14 @@ class TestSourceIdentity:
                 SOURCE_KIND_OFFLINE_SNAPSHOT, "x", _rows(), fetched_at_ms=1.5
             )
 
-    def test_empty_payload_rejected(self):
+    def test_empty_payload_identity_rejected(self):
         with pytest.raises(ValueError):
-            source_payload_hash([])
+            build_source_identity(SOURCE_KIND_OFFLINE_SNAPSHOT, "x", [])
+
+    def test_empty_multiset_hash_is_defined(self):
+        assert source_payload_hash([]) == EMPTY_PAYLOAD_HASH
+        assert source_payload_hash(()) == EMPTY_PAYLOAD_HASH
+        assert len(EMPTY_PAYLOAD_HASH) == 64
 
 
 class TestPayloadHash:
@@ -341,7 +347,7 @@ class TestProvideHtfCandles:
             source_label="empty",
             fetched_at_ms=None,
             row_count=0,
-            payload_hash="",
+            payload_hash=EMPTY_PAYLOAD_HASH,
         )
         result = provide_htf_candles(
             [],
@@ -379,6 +385,71 @@ class TestProvideHtfCandles:
         )
         assert result.ok is False
         assert result.reason == REASON_INVALID_SOURCE_IDENTITY
+
+    def test_empty_payload_hash_rejected(self):
+        rows = _rows()
+        ident = HtfSourceIdentity(
+            source_kind=SOURCE_KIND_OFFLINE_SNAPSHOT,
+            source_label="x",
+            fetched_at_ms=None,
+            row_count=len(rows),
+            payload_hash="",  # empty hash is never acceptable
+        )
+        result = provide_htf_candles(
+            rows,
+            timeframe=TIMEFRAME_4H,
+            evaluation_asof_ms=ASOF,
+            source_identity=ident,
+        )
+        assert result.ok is False
+        assert result.reason == REASON_INVALID_SOURCE_IDENTITY
+
+    @pytest.mark.parametrize(
+        "bad_hash",
+        [
+            "A" * 64,  # uppercase
+            "a" * 63,  # short
+            "a" * 65,  # long
+            "z" * 64,  # non-hex
+            "g" + "a" * 63,
+        ],
+    )
+    def test_malformed_payload_hash_rejected(self, bad_hash):
+        rows = _rows()
+        ident = HtfSourceIdentity(
+            source_kind=SOURCE_KIND_OFFLINE_SNAPSHOT,
+            source_label="x",
+            fetched_at_ms=None,
+            row_count=len(rows),
+            payload_hash=bad_hash,
+        )
+        result = provide_htf_candles(
+            rows,
+            timeframe=TIMEFRAME_4H,
+            evaluation_asof_ms=ASOF,
+            source_identity=ident,
+        )
+        assert result.ok is False
+        assert result.reason == REASON_INVALID_SOURCE_IDENTITY
+
+    def test_row_count_verified_even_with_valid_hash(self):
+        rows = _rows()
+        ident = _identity(rows)
+        shortened = HtfSourceIdentity(
+            source_kind=ident.source_kind,
+            source_label=ident.source_label,
+            fetched_at_ms=ident.fetched_at_ms,
+            row_count=ident.row_count + 1,
+            payload_hash=ident.payload_hash,
+        )
+        result = provide_htf_candles(
+            rows,
+            timeframe=TIMEFRAME_4H,
+            evaluation_asof_ms=ASOF,
+            source_identity=shortened,
+        )
+        assert result.ok is False
+        assert result.reason == REASON_SOURCE_PAYLOAD_MISMATCH
 
     def test_tampered_rows_fail_closed(self):
         rows = _rows()
@@ -442,17 +513,55 @@ class TestCoverage:
         assert result.coverage.status == COVERAGE_COMPLETE
         assert result.coverage.present_buckets == 10
 
-    def test_invalid_source_reports_none_coverage(self):
-        rows = _rows()
+    def test_coverage_diagnostics_on_invalid_series(self):
+        # an interior gap fails validation, but coverage must still report
+        # the ACTUAL present/missing buckets — never a bogus NONE
+        rows = _rows(n=10)
         del rows[4]
         result = provide_htf_candles(
             rows,
             timeframe=TIMEFRAME_4H,
             evaluation_asof_ms=ASOF,
             source_identity=_identity(rows),
-            canonical_lookback=N,
+            canonical_lookback=10,
         )
-        assert result.coverage.status in (COVERAGE_NONE, COVERAGE_PARTIAL)
+        assert result.ok is False
+        assert result.reason == REASON_CANDLE_GAP
+        assert result.coverage.status == COVERAGE_PARTIAL
+        assert result.coverage.present_buckets == 9
+        assert result.coverage.missing_open_ms == (ASOF - 6 * TF,)
+
+    def test_coverage_diagnostics_on_stale_series(self):
+        rows = _rows(n=10)[:-1]  # newest closed bucket missing
+        result = provide_htf_candles(
+            rows,
+            timeframe=TIMEFRAME_4H,
+            evaluation_asof_ms=ASOF,
+            source_identity=_identity(rows),
+            canonical_lookback=10,
+        )
+        assert result.ok is False
+        assert result.reason == REASON_MISSING_LATEST_CLOSED_CANDLE
+        assert result.coverage.status == COVERAGE_PARTIAL
+        assert result.coverage.present_buckets == 9
+        assert result.coverage.missing_open_ms == (ASOF - TF,)
+
+    def test_coverage_none_only_when_nothing_present(self):
+        ident = HtfSourceIdentity(
+            source_kind=SOURCE_KIND_OFFLINE_SNAPSHOT,
+            source_label="empty",
+            fetched_at_ms=None,
+            row_count=0,
+            payload_hash=EMPTY_PAYLOAD_HASH,
+        )
+        result = provide_htf_candles(
+            [],
+            timeframe=TIMEFRAME_4H,
+            evaluation_asof_ms=ASOF,
+            source_identity=ident,
+            canonical_lookback=10,
+        )
+        assert result.coverage.status == COVERAGE_NONE
 
     def test_coverage_to_dict_shape(self):
         rows = _rows(n=10)
@@ -474,6 +583,85 @@ class TestCoverage:
         }
         assert result.coverage.window_close_ms == ASOF
         assert result.coverage.window_open_ms == ASOF - 10 * TF
+
+
+class TestAsofIsolation:
+    """Review fix 1: corrupt future/unclosed payloads never affect history."""
+
+    def test_corrupt_future_rows_are_excluded_before_ohlc_validation(self):
+        rows = _rows() + [
+            {"open_ms": ASOF, "open": float("nan"), "high": float("nan"),
+             "low": float("nan"), "close": float("nan"), "volume": float("nan")},
+            {"open_ms": ASOF + TF, "open": -1.0, "high": float("inf"),
+             "low": 5.0, "close": 2.0, "volume": -7.0},
+        ]
+        ident = _identity(rows)
+        result = provide_htf_candles(
+            rows,
+            timeframe=TIMEFRAME_4H,
+            evaluation_asof_ms=ASOF,
+            source_identity=ident,
+            canonical_lookback=N + 2,
+        )
+        assert result.ok is True
+        assert result.reason == "OK"
+        assert len(result.candles) == N
+        assert result.coverage.dropped_unclosed_count == 2
+
+    def test_corrupt_unclosed_boundary_row_is_excluded(self):
+        rows = _rows() + [
+            {"open_ms": ASOF, "open": float("nan"), "high": "garbage",
+             "low": None, "close": float("nan"), "volume": "x"},
+        ]
+        ident = _identity(rows)
+        result = provide_htf_candles(
+            rows,
+            timeframe=TIMEFRAME_4H,
+            evaluation_asof_ms=ASOF,
+            source_identity=ident,
+            canonical_lookback=N + 1,
+        )
+        assert result.ok is True
+        assert len(result.candles) == N
+        assert result.coverage.dropped_unclosed_count == 1
+
+    def test_corrupt_closed_row_still_fails_closed(self):
+        rows = _rows()
+        rows[3] = dict(rows[3], high=float("nan"))
+        result = provide_htf_candles(
+            rows,
+            timeframe=TIMEFRAME_4H,
+            evaluation_asof_ms=ASOF,
+            source_identity=_identity(rows),
+            canonical_lookback=N,
+        )
+        assert result.ok is False
+        assert result.reason == REASON_ROW_PARSE_ERROR
+
+    def test_future_corruption_cannot_change_past_result(self):
+        clean = _rows()
+        before = provide_htf_candles(
+            clean,
+            timeframe=TIMEFRAME_4H,
+            evaluation_asof_ms=ASOF,
+            source_identity=_identity(clean),
+            canonical_lookback=N,
+        )
+        dirty = clean + [
+            {"open_ms": ASOF + i * TF, "open": float("nan"), "high": None,
+             "low": "x", "close": float("inf"), "volume": -1}
+            for i in range(3)
+        ]
+        after = provide_htf_candles(
+            dirty,
+            timeframe=TIMEFRAME_4H,
+            evaluation_asof_ms=ASOF,
+            source_identity=_identity(dirty),
+            canonical_lookback=N,
+        )
+        assert before.candles == after.candles
+        assert before.ok is True and after.ok is True
+        assert before.reason == after.reason
 
 
 class TestDeterminism:

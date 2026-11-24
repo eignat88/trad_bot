@@ -66,26 +66,35 @@ canonical_lookback, min_closed_candles, require_latest_closed)`:
 * `HtfSourceIdentity` — immutable provenance: `source_kind` (closed set:
   `BYBIT_KLINE_V5` / `MARKET_CANDLE_TABLE` / `OFFLINE_SNAPSHOT` — unknown
   kinds fail closed), `source_label`, `fetched_at_ms`, `row_count`,
-  `payload_hash` (SHA-256 of the canonicalized row multiset — order-
-  insensitive, tamper-detecting);
+  `payload_hash` (mandatory canonical lowercase-hex SHA-256 of the
+  canonicalized row multiset — order-insensitive, tamper-detecting; an
+  empty or malformed digest fails closed with `INVALID_SOURCE_IDENTITY`);
 * strict fail-closed chain: identity → `SOURCE_PAYLOAD_MISMATCH` on
-  tampered/replaced rows → `ROW_PARSE_ERROR` → the UNCHANGED #297 validator
-  (`CANDLE_GAP`, `DUPLICATE_CANDLE`, `MISSING_LATEST_CLOSED_CANDLE`,
-  `INSUFFICIENT_HISTORY`, `INVALID_OHLC`, … propagated verbatim);
-* only actually-closed candles are returned; unclosed/future rows land in
-  `dropped_unclosed` and are never used;
+  tampered/replaced rows (`row_count` AND the SHA-256 are verified
+  unconditionally, never only "when the hash is set") → `ROW_PARSE_ERROR` →
+  the UNCHANGED #297 validator (`CANDLE_GAP`, `DUPLICATE_CANDLE`,
+  `MISSING_LATEST_CLOSED_CANDLE`, `INSUFFICIENT_HISTORY`, `INVALID_OHLC`, …
+  propagated verbatim);
+* **ASOF isolation**: the trailing future/unclosed suffix is excluded
+  BEFORE any OHLCV/grid validation — a corrupt or off-grid future payload
+  can never influence a historical classification (only rows whose open
+  time is itself unparseable fail closed, because such a row cannot be
+  placed in time). Only actually-closed candles are returned; the suffix
+  lands in `dropped_unclosed` and is never used;
 * `CoverageReport` — canonical-window coverage (`COMPLETE` / `PARTIAL` /
-  `NONE`) with the exact `missing_open_ms` buckets. Leading shortfall =
-  `PARTIAL` (classification runs over the available window); interior gaps
-  and stale tails are INVALID (`CANDLE_GAP` / `MISSING_LATEST_CLOSED_CANDLE`),
-  never silently accepted.
+  `NONE`) with the exact `missing_open_ms` buckets, computed from the opens
+  ACTUALLY PRESENT in the payload for every outcome — an invalid series
+  gets an accurate report and a partial source is NEVER relabeled `NONE`.
+  Leading shortfall = `PARTIAL` (classification runs over the available
+  window); interior gaps and stale tails are INVALID (`CANDLE_GAP` /
+  `MISSING_LATEST_CLOSED_CANDLE`), never silently accepted.
 
 ## 3. H1-C.3 event adapter (`event_adapter.py`)
 
 * `adapt_source_events(rows)` normalizes #305 `source_event` rows into
   frozen `SourceEventRecord`s — `source_event_key`, `source_identity`,
-  `signal_time`, `activation_freeze_ts`, `lineage_hash` preserved VERBATIM
-  (`lineage_payload()` returns exactly these five);
+  `signal_time` (`_ms` + exact `_us`), `activation_freeze_ts`, `lineage_hash`
+  preserved VERBATIM (`lineage_payload()` returns exactly these fields);
 * **classification ASOF = `signal_time`** (`classification_asof_ms` — never
   `captured_at`);
 * duplicate `source_event_key` deliveries → explicit
@@ -93,35 +102,58 @@ canonical_lookback, min_closed_candles, require_latest_closed)`:
   input order); invalid rows are rejected with specific reason codes
   (`MISSING_LINEAGE_HASH`, `INVALID_SIGNAL_TIME`, …) — never coerced, never
   dropped silently;
-* `parse_utc_ms` — exact UTC anchoring: aware `datetime` (any offset),
-  ISO-8601 with explicit offset (`Z` or `±HH:MM`), integral epoch-ms
-  integers; naive timestamps rejected (cannot be anchored to UTC).
+* **timestamp precision policy** (`TIMESTAMP_PRECISION_POLICY =
+  US_PRESERVED__MS_FLOOR_TOWARD_PAST`): the exact `signal_time` instant is
+  preserved losslessly at microsecond resolution (`signal_time_us`); the
+  epoch-ms views are derived by explicitly FLOORING the sub-millisecond
+  remainder toward the past (`us // 1000`) — never float rounding, never
+  implicit truncation. Flooring is causal-safe (the ASOF never extends
+  beyond the true instant). `parse_utc_us` / `parse_utc_ms` accept aware
+  `datetime` (any offset) at full microsecond resolution, ISO-8601 with
+  explicit offset (`Z` or `±HH:MM`), integral epoch-ms integers; naive
+  timestamps and non-integral floats are rejected (no UTC anchor, no
+  guessing). The record rejects inconsistent `_ms`/`_us` views.
 
 ## 4. H1-C.4 result contract (`h1_result.py`, `pipeline.py`)
 
 Per event: 4H regime/BOS/coverage + source identity, 1D ditto, one of the
 nine `<4H>/<1D>` combinations preserved verbatim (or a verbatim
 `INVALID_SOURCE` combination), explicit `eligible` + `eligibility_reason`,
-protocol version `H1C_1.0.0`, and the full verbatim source lineage. An
+protocol version `H1C_1.1.0`, and the full verbatim source lineage. An
 `INVALID_SOURCE` on one timeframe keeps the other timeframe's own state but
 forces `combined_eligible = False`. A failed source NEVER produces a market
 mode.
 
+**Eligibility requires COMPLETE canonical coverage** (`canonical_lookback =
+60` frozen candidate): `eligible = True` only when BOTH timeframes are
+valid AND both report `COMPLETE` window coverage (60/60 candles). A
+classification over a partial window (e.g. 17 or 59 of 60) is kept as a
+DIAGNOSTIC result — the regime over the available window is computed and
+`combined_eligible` stays True — but it never gets `eligible = True` and
+never `outcome.ok = True`. `eligibility_reason` names the gap explicitly
+(`HTF_4H_INCOMPLETE_COVERAGE` / `HTF_1D_INCOMPLETE_COVERAGE` /
+`HTF_BOTH_INCOMPLETE_COVERAGE`); `outcome.reason = INCOMPLETE_COVERAGE`
+distinguishes it from `INVALID_SOURCE`.
+
 `run_h1_event(record, rows_4h, rows_1d, source_4h=…, source_1d=…)` runs the
-three stages purely and returns `H1EventOutcome`.
+three stages purely and returns `H1EventOutcome` (`ok = result.eligible`).
 
 ## 5. Tests (all deterministic, offline)
 
-`tests/test_me_entry_quality_h1c_provider_v1.py` (25),
-`tests/test_me_entry_quality_h1c_event_adapter_v1.py` (22),
-`tests/test_me_entry_quality_h1c_result_v1.py` (19),
-`tests/test_me_entry_quality_h1c_purity_v1.py` (8) — **100 passed / 0
-failed / 0 skipped**, covering: ASOF-at-close boundary, no-lookahead /
+`tests/test_me_entry_quality_h1c_provider_v1.py`,
+`tests/test_me_entry_quality_h1c_event_adapter_v1.py`,
+`tests/test_me_entry_quality_h1c_result_v1.py`,
+`tests/test_me_entry_quality_h1c_purity_v1.py` — **124 passed / 0 failed /
+0 skipped** after the PR #309 review remediation, covering: ASOF-at-close
+boundary, ASOF isolation of corrupt future payloads, no-lookahead /
 future-append invariance, stale candles, duplicate source events, invalid
-source (gaps, tamper, bad OHLCV, unknown kinds), immutable lineage, partial
-coverage, and all nine HTF combinations. Plus the full regression set
-(829 passed together with the #297 suites and HTF/ASOF/coverage/governance
-suites). No test touches PostgreSQL or Bybit.
+source (gaps, tamper, bad OHLCV, unknown kinds, empty/malformed
+`payload_hash`), immutable lineage, microsecond precision policy, accurate
+coverage diagnostics on invalid series, the 59/60 vs 60/60 eligibility
+boundary (plus mixed 60/59), and all nine HTF combinations over complete
+60-candle windows. Plus the full regression set (H1-A/B: 215 passed
+together; HTF/ASOF/coverage/governance suites re-run). No test touches
+PostgreSQL or Bybit.
 
 Governance note: `tests/test_me_entry_quality_h1_classifier_v1.py`'s
 production-wiring test received a minimal intent-preserving fix — its needle

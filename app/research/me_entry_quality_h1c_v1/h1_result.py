@@ -33,19 +33,32 @@ from app.research.me_entry_quality_h1_v1.classifier import (
 from app.research.me_entry_quality_h1c_v1.event_adapter import (
     SourceEventRecord,
     classification_asof_ms,
+    classification_asof_us,
+)
+from app.research.me_entry_quality_h1c_v1.htf_provider import (
+    COVERAGE_COMPLETE,
+    COVERAGE_NONE,
 )
 
-H1C_PROTOCOL_VERSION = "H1C_1.0.0"
+H1C_PROTOCOL_VERSION = "H1C_1.1.0"
 
 REASON_ELIGIBLE = "ELIGIBLE"
 REASON_INVALID_4H = "HTF_4H_INVALID_SOURCE"
 REASON_INVALID_1D = "HTF_1D_INVALID_SOURCE"
 REASON_INVALID_BOTH = "HTF_BOTH_INVALID_SOURCE"
+REASON_INCOMPLETE_4H = "HTF_4H_INCOMPLETE_COVERAGE"
+REASON_INCOMPLETE_1D = "HTF_1D_INCOMPLETE_COVERAGE"
+REASON_INCOMPLETE_BOTH = "HTF_BOTH_INCOMPLETE_COVERAGE"
 
 
 @dataclass(frozen=True)
 class HtfStateSummary:
-    """Per-timeframe state block of the H1 result."""
+    """Per-timeframe state block of the H1 result.
+
+    ``window_coverage`` is the provider's canonical-window coverage
+    (``COMPLETE`` / ``PARTIAL`` / ``NONE``) — a diagnostic classification
+    over a partial window is kept, but eligibility requires ``COMPLETE``.
+    """
 
     timeframe: str
     regime: str
@@ -54,6 +67,7 @@ class HtfStateSummary:
     reason: str
     detail: str
     evaluation_asof_ms: int
+    window_coverage: str = COVERAGE_NONE
     source: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -65,6 +79,7 @@ class HtfStateSummary:
             "reason": self.reason,
             "detail": self.detail,
             "evaluation_asof_ms": self.evaluation_asof_ms,
+            "window_coverage": self.window_coverage,
             "source": None if self.source is None else dict(self.source),
         }
 
@@ -73,6 +88,7 @@ class HtfStateSummary:
         cls,
         state: TimeframeState,
         *,
+        window_coverage: str = COVERAGE_COMPLETE,
         source: dict[str, Any] | None = None,
     ) -> "HtfStateSummary":
         return cls(
@@ -83,6 +99,7 @@ class HtfStateSummary:
             reason=state.reason,
             detail=state.detail,
             evaluation_asof_ms=state.evaluation_asof_ms,
+            window_coverage=window_coverage,
             source=source,
         )
 
@@ -106,6 +123,7 @@ class H1Result:
     eligibility_reason: str
     swing_lookback: int
     canonical_lookback: int
+    signal_time_us: int = 0
 
     def lineage_payload(self) -> dict[str, Any]:
         """Exactly the preserved source lineage fields (verbatim)."""
@@ -113,6 +131,7 @@ class H1Result:
             "source_event_key": self.source_event_key,
             "source_identity": self.source_identity,
             "signal_time_ms": self.evaluation_asof_ms,
+            "signal_time_us": self.signal_time_us,
             "activation_freeze_ts_ms": self.activation_freeze_ts_ms,
             "lineage_hash": self.lineage_hash,
         }
@@ -145,6 +164,11 @@ def build_h1_result(
 ) -> H1Result:
     """Assemble the H1 result for one event from the two HTF states.
 
+    Eligibility (review remediation): ``eligible`` requires BOTH timeframes
+    classified (``combined_eligible``) AND ``COMPLETE`` canonical-window
+    coverage for BOTH.  A classification over a partial window (e.g. 17 or
+    59 of 60 candles) is kept as a DIAGNOSTIC result but never eligible.
+
     Raises ``ValueError`` when a summary was not classified at the event's
     ``signal_time`` (e.g. at ``captured_at``) — the causal anchor is not
     negotiable.
@@ -167,14 +191,23 @@ def build_h1_result(
     valid_1d = summary_1d.regime != REGIME_INVALID_SOURCE
     combined_eligible = valid_4h and valid_1d
 
-    if combined_eligible:
-        eligibility_reason = REASON_ELIGIBLE
-    elif not valid_4h and not valid_1d:
+    complete_4h = summary_4h.window_coverage == COVERAGE_COMPLETE
+    complete_1d = summary_1d.window_coverage == COVERAGE_COMPLETE
+
+    if not valid_4h and not valid_1d:
         eligibility_reason = REASON_INVALID_BOTH
     elif not valid_4h:
         eligibility_reason = f"{REASON_INVALID_4H}:{summary_4h.reason}"
-    else:
+    elif not valid_1d:
         eligibility_reason = f"{REASON_INVALID_1D}:{summary_1d.reason}"
+    elif not complete_4h and not complete_1d:
+        eligibility_reason = REASON_INCOMPLETE_BOTH
+    elif not complete_4h:
+        eligibility_reason = REASON_INCOMPLETE_4H
+    elif not complete_1d:
+        eligibility_reason = REASON_INCOMPLETE_1D
+    else:
+        eligibility_reason = REASON_ELIGIBLE
 
     coverage_ok = (
         summary_4h.coverage_status == COVERAGE_VALID
@@ -193,8 +226,11 @@ def build_h1_result(
         htf_1d=summary_1d,
         combined_regime=combined_regime,
         combined_eligible=combined_eligible,
-        eligible=bool(combined_eligible and coverage_ok),
+        eligible=bool(
+            combined_eligible and coverage_ok and complete_4h and complete_1d
+        ),
         eligibility_reason=eligibility_reason,
         swing_lookback=int(swing_lookback),
         canonical_lookback=int(canonical_lookback),
+        signal_time_us=classification_asof_us(record),
     )

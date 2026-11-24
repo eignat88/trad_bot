@@ -126,17 +126,29 @@ def source_payload_hash(rows: Sequence[Any]) -> str:
     """Deterministic SHA-256 over the canonicalized row multiset.
 
     Order-insensitive: the same rows delivered in a different order hash
-    identically.  Raises ``ValueError`` on an empty payload — an identity
-    must name real data.
+    identically.  The empty multiset hashes to the standard SHA-256 of the
+    empty byte string (well-defined), while :func:`build_source_identity`
+    still refuses to mint an identity for an empty payload.
     """
     lines = sorted(_canonical_row_line(row) for row in rows)
-    if not lines:
-        raise ValueError("cannot hash an empty candle payload")
     digest = hashlib.sha256()
     for line in lines:
         digest.update(line.encode("utf-8"))
         digest.update(b"\n")
     return digest.hexdigest()
+
+
+#: canonical hash of an empty payload (SHA-256 of the empty byte string)
+EMPTY_PAYLOAD_HASH = hashlib.sha256(b"").hexdigest()
+
+
+def is_sha256_hex(text: Any) -> bool:
+    """True iff ``text`` is a canonical lowercase hex SHA-256 digest."""
+    return (
+        isinstance(text, str)
+        and len(text) == 64
+        and all(c in "0123456789abcdef" for c in text)
+    )
 
 
 def build_source_identity(
@@ -153,6 +165,8 @@ def build_source_identity(
         raise ValueError("source_label must be a non-empty string")
     if fetched_at_ms is not None and not _is_int(fetched_at_ms):
         raise ValueError("fetched_at_ms must be an int or None")
+    if not rows:
+        raise ValueError("source identity must name real data (empty payload)")
     return HtfSourceIdentity(
         source_kind=source_kind,
         source_label=source_label,
@@ -225,21 +239,25 @@ class _RowError(Exception):
         self.detail = detail
 
 
-def _parse_row(row: Any, index: int) -> Candle:
+def _row_values(row: Any, index: int) -> dict[str, Any]:
     if isinstance(row, Mapping):
-        values = {name: row.get(name) for name in _ROW_FIELDS}
-    elif isinstance(row, Sequence) and not isinstance(row, (str, bytes)):
+        return {name: row.get(name) for name in _ROW_FIELDS}
+    if isinstance(row, Sequence) and not isinstance(row, (str, bytes)):
         if len(row) != 6:
             raise _RowError(
                 REASON_ROW_PARSE_ERROR,
                 f"row {index}: expected 6 fields {_ROW_FIELDS}, got {len(row)}",
             )
-        values = dict(zip(_ROW_FIELDS, row))
-    else:
-        raise _RowError(
-            REASON_ROW_PARSE_ERROR,
-            f"row {index}: unsupported row type {type(row).__name__}",
-        )
+        return dict(zip(_ROW_FIELDS, row))
+    raise _RowError(
+        REASON_ROW_PARSE_ERROR,
+        f"row {index}: unsupported row type {type(row).__name__}",
+    )
+
+
+def _parse_row(row: Any, index: int) -> Candle:
+    """STRICT parse — used only for rows that are CLOSED at the ASOF."""
+    values = _row_values(row, index)
     open_ms = values["open_ms"]
     if not _is_int(open_ms):
         raise _RowError(
@@ -261,24 +279,48 @@ def _parse_row(row: Any, index: int) -> Candle:
     )
 
 
+def _lenient_open_ms(row: Any, index: int) -> int:
+    """Open time of any row (diagnostics/coverage); integer only."""
+    values = _row_values(row, index)
+    open_ms = values["open_ms"]
+    if not _is_int(open_ms):
+        raise _RowError(
+            REASON_ROW_PARSE_ERROR, f"row {index}: open_ms must be a real integer"
+        )
+    return int(open_ms)
+
+
+def _lenient_candle(row: Any, index: int) -> Candle | None:
+    """Best-effort candle for reporting the dropped future suffix."""
+    try:
+        return _parse_row(row, index)
+    except _RowError:
+        return None
+
+
 def _coverage(
-    closed: Sequence[Candle],
+    present_opens: set[int],
     *,
     timeframe_ms: int,
     evaluation_asof_ms: int,
     canonical_lookback: int,
     dropped_unclosed_count: int,
-    validation_ok: bool,
 ) -> CoverageReport:
+    """Canonical-window coverage from the ACTUAL opens present in the source.
+
+    Computed independently of series validity: an invalid series still gets
+    an accurate ``COMPLETE`` / ``PARTIAL`` / ``NONE`` report — a partial
+    source is NEVER relabeled ``NONE``.
+    """
     latest = latest_closed_open_ms(evaluation_asof_ms, timeframe_ms)
     window_open = latest - (int(canonical_lookback) - 1) * timeframe_ms
-    present = {int(c.timestamp) for c in closed if int(c.timestamp) >= window_open}
     expected = tuple(
         window_open + i * timeframe_ms for i in range(int(canonical_lookback))
     )
-    missing = tuple(slot for slot in expected if slot not in present)
-    if not validation_ok:
-        status = COVERAGE_PARTIAL if present else COVERAGE_NONE
+    missing = tuple(slot for slot in expected if slot not in present_opens)
+    present_buckets = int(canonical_lookback) - len(missing)
+    if present_buckets == 0:
+        status = COVERAGE_NONE
     elif not missing:
         status = COVERAGE_COMPLETE
     else:
@@ -286,7 +328,7 @@ def _coverage(
     return CoverageReport(
         status=status,
         expected_buckets=int(canonical_lookback),
-        present_buckets=len(present),
+        present_buckets=present_buckets,
         missing_open_ms=missing,
         window_open_ms=window_open,
         window_close_ms=latest + timeframe_ms,
@@ -308,14 +350,19 @@ def provide_htf_candles(
 
     Fail-closed chain:
 
-    1. source identity must be a known, self-consistent source
-       (``INVALID_SOURCE_IDENTITY`` / ``UNKNOWN_SOURCE_KIND`` /
-       ``SOURCE_PAYLOAD_MISMATCH``);
-    2. every row must parse (``ROW_PARSE_ERROR``);
-    3. the Issue #297 validator must pass — its reason codes
-       (``CANDLE_GAP``, ``MISSING_LATEST_CLOSED_CANDLE``,
-       ``INSUFFICIENT_HISTORY``, ``INVALID_OHLC``, ...) are propagated
-       verbatim.  Missing data NEVER becomes a usable series.
+    1. source identity must be a known, self-consistent source with a
+       canonical lowercase-hex SHA-256 ``payload_hash`` (``INVALID_SOURCE_
+       IDENTITY`` / ``UNKNOWN_SOURCE_KIND``); ``row_count`` and the SHA-256
+       are verified UNCONDITIONALLY (``SOURCE_PAYLOAD_MISMATCH``);
+    2. ASOF isolation: the trailing future/unclosed suffix is excluded
+       BEFORE any OHLCV / grid validation — corrupt or off-grid future
+       payloads can never influence a historical classification;
+    3. every closed row must parse (``ROW_PARSE_ERROR``);
+    4. the Issue #297 validator must pass — its reason codes are
+       propagated verbatim.  Missing data NEVER becomes a usable series.
+
+    Coverage diagnostics are computed from the opens actually present in
+    the payload for every outcome, valid or not.
     """
     if timeframe not in TIMEFRAME_MS:
         raise ValueError(f"unknown timeframe {timeframe!r}")
@@ -326,93 +373,137 @@ def provide_htf_candles(
 
     tf_ms = int(TIMEFRAME_MS[timeframe])
     asof_ms = int(evaluation_asof_ms)
+    latest = latest_closed_open_ms(asof_ms, tf_ms)
 
-    empty_coverage = CoverageReport(
-        status=COVERAGE_NONE,
-        expected_buckets=int(canonical_lookback),
-        present_buckets=0,
-        missing_open_ms=(),
-        window_open_ms=0,
-        window_close_ms=0,
-        dropped_unclosed_count=0,
-    )
-
-    def _fail(reason: str, detail: str, *, coverage: CoverageReport | None = None) -> HtfCandleSet:
+    def _build(
+        *,
+        ok: bool,
+        reason: str,
+        detail: str,
+        candles: tuple[Candle, ...] = (),
+        dropped: tuple[Candle, ...] = (),
+        present_opens: set[int] | None = None,
+        dropped_count: int = 0,
+    ) -> HtfCandleSet:
         return HtfCandleSet(
             timeframe=timeframe,
             evaluation_asof_ms=asof_ms,
-            candles=(),
-            dropped_unclosed=(),
-            latest_closed_open_ms=0,
+            candles=candles,
+            dropped_unclosed=dropped,
+            latest_closed_open_ms=latest,
             source_identity=source_identity,
-            coverage=empty_coverage if coverage is None else coverage,
-            ok=False,
+            coverage=_coverage(
+                present_opens if present_opens is not None else set(),
+                timeframe_ms=tf_ms,
+                evaluation_asof_ms=asof_ms,
+                canonical_lookback=canonical_lookback,
+                dropped_unclosed_count=dropped_count,
+            ),
+            ok=ok,
             reason=reason,
             detail=detail,
         )
 
-    # 1. source identity
+    # 1. source identity — hash format + row_count + SHA-256 always verified
     if not isinstance(source_identity, HtfSourceIdentity):
-        return _fail(
-            REASON_INVALID_SOURCE_IDENTITY,
-            f"source_identity must be HtfSourceIdentity, got {type(source_identity).__name__}",
+        return _build(
+            ok=False,
+            reason=REASON_INVALID_SOURCE_IDENTITY,
+            detail=f"source_identity must be HtfSourceIdentity, got {type(source_identity).__name__}",
         )
     if source_identity.source_kind not in KNOWN_SOURCE_KINDS:
-        return _fail(
-            REASON_UNKNOWN_SOURCE_KIND,
-            f"unknown source kind {source_identity.source_kind!r}",
+        return _build(
+            ok=False,
+            reason=REASON_UNKNOWN_SOURCE_KIND,
+            detail=f"unknown source kind {source_identity.source_kind!r}",
         )
     if not source_identity.source_label.strip():
-        return _fail(REASON_INVALID_SOURCE_IDENTITY, "source_label is empty")
-    if source_identity.payload_hash and source_identity.row_count != len(rows):
-        return _fail(
-            REASON_SOURCE_PAYLOAD_MISMATCH,
-            f"row_count {source_identity.row_count} != {len(rows)} supplied rows",
+        return _build(
+            ok=False,
+            reason=REASON_INVALID_SOURCE_IDENTITY,
+            detail="source_label is empty",
         )
-    if source_identity.payload_hash:
-        try:
-            actual_hash = source_payload_hash(rows)
-        except ValueError as exc:
-            return _fail(REASON_SOURCE_PAYLOAD_MISMATCH, str(exc))
-        if actual_hash != source_identity.payload_hash:
-            return _fail(
-                REASON_SOURCE_PAYLOAD_MISMATCH,
-                "supplied rows do not hash to source_identity.payload_hash",
-            )
+    if not is_sha256_hex(source_identity.payload_hash):
+        return _build(
+            ok=False,
+            reason=REASON_INVALID_SOURCE_IDENTITY,
+            detail="payload_hash must be a canonical lowercase hex SHA-256 digest",
+        )
+    if source_identity.row_count != len(rows):
+        return _build(
+            ok=False,
+            reason=REASON_SOURCE_PAYLOAD_MISMATCH,
+            detail=f"row_count {source_identity.row_count} != {len(rows)} supplied rows",
+        )
+    if source_payload_hash(rows) != source_identity.payload_hash:
+        return _build(
+            ok=False,
+            reason=REASON_SOURCE_PAYLOAD_MISMATCH,
+            detail="supplied rows do not hash to source_identity.payload_hash",
+        )
 
-    # 2. parse rows
-    candles: list[Candle] = []
+    # 2-3. walk rows: strict-parse the CLOSED prefix, drop the future suffix
+    # before any OHLCV / grid validation (ASOF isolation)
+    parse_error: _RowError | None = None
+    closed_candles: list[Candle] = []
+    present_opens: set[int] = set()
+    dropped_raw: list[Any] = []
+    in_future_suffix = False
+
     for index, row in enumerate(rows):
+        if in_future_suffix:
+            dropped_raw.append(row)
+            continue
         try:
-            candles.append(_parse_row(row, index))
+            open_ms = _lenient_open_ms(row, index)
         except _RowError as exc:
-            return _fail(exc.reason, exc.detail)
+            parse_error = parse_error or exc
+            continue
+        present_opens.add(open_ms)
+        if open_ms + tf_ms > asof_ms:
+            # unclosed or future at this ASOF — excluded wholesale BEFORE
+            # OHLCV validation; a corrupt payload here cannot affect history
+            in_future_suffix = True
+            dropped_raw.append(row)
+            continue
+        try:
+            closed_candles.append(_parse_row(row, index))
+        except _RowError as exc:
+            parse_error = parse_error or exc
 
-    # 3. strict causal validation (Issue #297, unchanged)
+    dropped = tuple(
+        candle
+        for candle in (
+            _lenient_candle(row, index)
+            for index, row in enumerate(dropped_raw)
+        )
+        if candle is not None
+    )
+
+    if parse_error is not None:
+        return _build(
+            ok=False,
+            reason=parse_error.reason,
+            detail=parse_error.detail,
+            dropped=dropped,
+            present_opens=present_opens,
+            dropped_count=len(dropped_raw),
+        )
+
+    # 4. strict causal validation of the CLOSED prefix (Issue #297, unchanged)
     validation: CandleValidationResult = validate_htf_candles(
-        candles,
+        closed_candles,
         timeframe=timeframe,
         evaluation_asof_ms=asof_ms,
         min_closed_candles=min_closed_candles,
         require_latest_closed=require_latest_closed,
     )
-    coverage = _coverage(
-        validation.closed_candles,
-        timeframe_ms=tf_ms,
-        evaluation_asof_ms=asof_ms,
-        canonical_lookback=canonical_lookback,
-        dropped_unclosed_count=len(validation.dropped_unclosed),
-        validation_ok=validation.ok,
-    )
-    return HtfCandleSet(
-        timeframe=timeframe,
-        evaluation_asof_ms=asof_ms,
-        candles=validation.closed_candles,
-        dropped_unclosed=validation.dropped_unclosed,
-        latest_closed_open_ms=validation.latest_closed_open_ms,
-        source_identity=source_identity,
-        coverage=coverage,
+    return _build(
         ok=validation.ok,
         reason=validation.reason,
         detail=validation.detail,
+        candles=validation.closed_candles,
+        dropped=dropped,
+        present_opens=present_opens,
+        dropped_count=len(dropped_raw),
     )

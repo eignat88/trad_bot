@@ -33,6 +33,8 @@ from app.research.me_entry_quality_h1c_v1.h1_result import (
     H1C_PROTOCOL_VERSION,
     HtfStateSummary,
     REASON_ELIGIBLE,
+    REASON_INCOMPLETE_1D,
+    REASON_INCOMPLETE_BOTH,
     REASON_INVALID_4H,
     build_h1_result,
 )
@@ -41,6 +43,7 @@ from app.research.me_entry_quality_h1c_v1.htf_provider import (
     build_source_identity,
 )
 from app.research.me_entry_quality_h1c_v1.pipeline import (
+    REASON_INCOMPLETE_COVERAGE,
     REASON_INVALID_SOURCE,
     REASON_OK,
     run_h1_event,
@@ -48,7 +51,7 @@ from app.research.me_entry_quality_h1c_v1.pipeline import (
 
 TF4 = TIMEFRAME_4H_MS
 DAY = 86_400_000
-BASE_MS = 31 * DAY  # 1970-02-01T00:00:00Z
+BASE_MS = 200 * DAY  # 1970-07-20T00:00:00Z — room for 60-candle windows
 N = 17
 ASOF = BASE_MS + N * DAY  # UTC midnight — closes both the 4H and 1D grids
 
@@ -87,20 +90,28 @@ def _zigzag(points, n):
     return out
 
 
-def _rows(regime, *, tf, asof=ASOF, n=N):
+def _rows(regime, *, tf, asof=ASOF, n=N, pad_to=None):
+    """Zigzag tail of ``n`` candles, optionally padded to ``pad_to`` total
+    candles with a flat filler that forms no swings (constant 19/12)."""
     high_pts, low_pts = FIXTURES[regime]
     highs = _zigzag(high_pts, n)
     lows = _zigzag(low_pts, n)
+    total = n if pad_to is None else int(pad_to)
     out = []
-    for i in range(n):
-        open_ms = asof - (n - i) * tf
-        mid = (highs[i] + lows[i]) / 2.0
+    for i in range(total):
+        open_ms = asof - (total - i) * tf
+        if i < total - n:
+            high, low = 19.0, 12.0  # flat filler: no strict extrema
+        else:
+            j = i - (total - n)
+            high, low = highs[j], lows[j]
+        mid = (high + low) / 2.0
         out.append(
             {
                 "open_ms": open_ms,
                 "open": mid,
-                "high": highs[i],
-                "low": lows[i],
+                "high": high,
+                "low": low,
                 "close": mid,
                 "volume": 1.0,
             }
@@ -134,9 +145,9 @@ def _scrub(result_dict):
     return out
 
 
-def _run(regime_4h, regime_1d, *, record=None, asof=ASOF):
-    rows_4h = _rows(regime_4h, tf=TF4, asof=asof)
-    rows_1d = _rows(regime_1d, tf=DAY, asof=asof)
+def _run(regime_4h, regime_1d, *, record=None, asof=ASOF, pad_to=60):
+    rows_4h = _rows(regime_4h, tf=TF4, asof=asof, pad_to=pad_to)
+    rows_1d = _rows(regime_1d, tf=DAY, asof=asof, pad_to=pad_to)
     rec = record if record is not None else _record(signal_time_ms=asof)
     return run_h1_event(
         rec,
@@ -184,6 +195,7 @@ class TestResultContract:
             "source_event_key": "evt-1",
             "source_identity": "ME_UPSTREAM_SOURCE_V1::scanner::v3",
             "signal_time_ms": ASOF,
+            "signal_time_us": ASOF * 1000,
             "activation_freeze_ts_ms": ASOF - DAY,
             "lineage_hash": "b" * 64,
         }
@@ -213,6 +225,7 @@ class TestResultContract:
             "reason",
             "detail",
             "evaluation_asof_ms",
+            "window_coverage",
             "source",
         }
         assert d["htf_4h"]["source"]["source_kind"] == "OFFLINE_SNAPSHOT"
@@ -336,11 +349,57 @@ class TestFailurePropagation:
             _record(), rows_4h, rows_1d,
             source_4h=_identity(rows_4h, "s4"), source_1d=_identity(rows_1d, "s1"),
         )
-        assert outcome.ok is True
+        # diagnostic classification over the available window is kept ...
         assert outcome.candle_set_4h.coverage.status == "PARTIAL"
         assert outcome.candle_set_4h.coverage.present_buckets == 17
         assert len(outcome.candle_set_4h.coverage.missing_open_ms) == 43
         assert outcome.result.htf_4h.regime == REGIME_BULLISH
+        assert outcome.result.combined_eligible is True
+        # ... but a partial window is NEVER eligible (review fix 4)
+        assert outcome.ok is False
+        assert outcome.reason == REASON_INCOMPLETE_COVERAGE
+        assert outcome.result.eligible is False
+        assert outcome.result.eligibility_reason == REASON_INCOMPLETE_BOTH
+
+    def test_59_of_60_is_diagnostic_not_eligible(self):
+        rows_4h = _rows(REGIME_BULLISH, tf=TF4, pad_to=60)[1:]  # drop oldest
+        rows_1d = _rows(REGIME_NEUTRAL, tf=DAY, pad_to=60)[1:]
+        outcome = run_h1_event(
+            _record(), rows_4h, rows_1d,
+            source_4h=_identity(rows_4h, "s4"), source_1d=_identity(rows_1d, "s1"),
+        )
+        assert outcome.candle_set_4h.coverage.status == "PARTIAL"
+        assert outcome.candle_set_4h.coverage.present_buckets == 59
+        assert len(outcome.candle_set_4h.coverage.missing_open_ms) == 1
+        # classification computed over the available window
+        assert outcome.result.htf_4h.regime == REGIME_BULLISH
+        assert outcome.result.combined_eligible is True
+        # but 59/60 never qualifies for eligibility
+        assert outcome.ok is False
+        assert outcome.reason == REASON_INCOMPLETE_COVERAGE
+        assert outcome.result.eligible is False
+        assert outcome.result.eligibility_reason == REASON_INCOMPLETE_BOTH
+
+    def test_60_of_60_is_eligible(self):
+        outcome = _run(REGIME_BULLISH, REGIME_NEUTRAL, pad_to=60)
+        assert outcome.candle_set_4h.coverage.status == "COMPLETE"
+        assert outcome.candle_set_1d.coverage.status == "COMPLETE"
+        assert outcome.ok is True
+        assert outcome.result.eligible is True
+        assert outcome.result.eligibility_reason == REASON_ELIGIBLE
+
+    def test_eligibility_requires_complete_for_both_timeframes(self):
+        rows_4h = _rows(REGIME_BULLISH, tf=TF4, pad_to=60)  # 60/60
+        rows_1d = _rows(REGIME_NEUTRAL, tf=DAY, pad_to=60)[1:]  # 59/60
+        outcome = run_h1_event(
+            _record(), rows_4h, rows_1d,
+            source_4h=_identity(rows_4h, "s4"), source_1d=_identity(rows_1d, "s1"),
+        )
+        assert outcome.result.combined_eligible is True
+        assert outcome.result.eligible is False
+        assert outcome.ok is False
+        assert outcome.reason == REASON_INCOMPLETE_COVERAGE
+        assert outcome.result.eligibility_reason == REASON_INCOMPLETE_1D
 
     def test_gap_in_source_is_invalid_not_neutral(self):
         rows_4h = _rows(REGIME_BULLISH, tf=TF4)

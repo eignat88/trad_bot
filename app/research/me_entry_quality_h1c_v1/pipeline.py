@@ -48,10 +48,11 @@ from app.research.me_entry_quality_h1c_v1.htf_provider import (
     provide_htf_candles,
 )
 
-H1C_PIPELINE_VERSION = "H1C_PIPELINE_1.0.0"
+H1C_PIPELINE_VERSION = "H1C_PIPELINE_1.1.0"
 
 REASON_OK = "OK"
 REASON_INVALID_SOURCE = "INVALID_SOURCE"
+REASON_INCOMPLETE_COVERAGE = "INCOMPLETE_COVERAGE"
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,7 @@ def _invalid_summary(
         reason=candle_set.reason,
         detail=candle_set.detail,
         evaluation_asof_ms=asof_ms,
+        window_coverage=candle_set.coverage.status,
         source=candle_set.source_identity.to_dict(),
     )
 
@@ -143,7 +145,9 @@ def run_h1_event(
             canonical_lookback=canonical_lookback,
         )
         return HtfStateSummary.from_timeframe_state(
-            state, source=candle_set.source_identity.to_dict()
+            state,
+            window_coverage=candle_set.coverage.status,
+            source=candle_set.source_identity.to_dict(),
         )
 
     summary_4h = _summarize(set_4h)
@@ -157,7 +161,7 @@ def run_h1_event(
         canonical_lookback=canonical_lookback,
     )
 
-    if result.combined_eligible:
+    if result.eligible:
         return H1EventOutcome(
             record=record,
             result=result,
@@ -167,11 +171,16 @@ def run_h1_event(
             candle_set_4h=set_4h,
             candle_set_1d=set_1d,
         )
+    if result.combined_eligible:
+        # diagnostic classification only — canonical window incomplete
+        reason = REASON_INCOMPLETE_COVERAGE
+    else:
+        reason = REASON_INVALID_SOURCE
     return H1EventOutcome(
         record=record,
         result=result,
         ok=False,
-        reason=REASON_INVALID_SOURCE,
+        reason=reason,
         detail=result.eligibility_reason,
         candle_set_4h=set_4h,
         candle_set_1d=set_1d,
