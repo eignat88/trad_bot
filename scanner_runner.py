@@ -1687,6 +1687,173 @@ def me_inverse_short_v3_source_wiring() -> dict:
     }
 
 
+# --- ME upstream source capture (Issue #305) ------------------------------
+#
+# ME_INVERSE_SHORT_V3_UPSTREAM_SOURCE_CAPTURE_V1 — isolated, prospective-
+# only, detector-level upstream source capture.  It consumes the PRE-scoring
+# publication the orchestrator builds IMMEDIATELY after scanner.scan(ctx)
+# under stats["_me_upstream_source_events"] (before scoring, dedup, risk
+# geometry, direction gate, regime filter and expectancy filter) and writes
+# ONLY to its own research schema (research_me_upstream_coverage) through its
+# own dedicated store connection.
+#
+# Independent of every other delivery above: own flag
+# (ME_UPSTREAM_SOURCE_CAPTURE_V1_ENABLED — OFF by default), own activation
+# row (RUNNING + frozen freeze_ts + protocol fingerprint), own error sink
+# (ME_UPSTREAM_SOURCE_CAPTURE_ERROR) and own module state.
+#
+# Fail-open by contract: a capture failure must never break the scanner
+# cycle, never affect the V1/V2/OOS-2/V3 deliveries and never touch
+# trading/scoring/regime logic.  The flag is checked BEFORE any connection
+# attempt: with the flag off the hook performs no DB I/O at all.  Fail-open
+# must never hide data loss: every error is observable here (counters,
+# dds.scanner_error sink) and in research_me_upstream_coverage.capture_health.
+
+_me_upstream_source_store = None
+_me_upstream_source_store_retry_at = 0.0
+
+# Runtime delivery counters for the upstream hook (diagnostics only).
+_me_upstream_source_stats: dict = {
+    "deliveries": 0, "captured": 0, "duplicates": 0, "disabled": 0,
+    "not_active": 0, "pre_freeze": 0, "blocked": 0, "invalid": 0,
+    "integrity_conflicts": 0, "errors": 0,
+}
+
+
+def _get_me_upstream_source_store(repository: ScannerRepository):
+    """Dedicated pg8000 store for the upstream capture's research schema.
+
+    Independent from the scanner's main transaction and from every other
+    research/contour store: upstream commits/rollbacks can never touch a
+    production transaction (and vice versa).
+    """
+    global _me_upstream_source_store, _me_upstream_source_store_retry_at
+    if _me_upstream_source_store is not None:
+        return _me_upstream_source_store
+    now = time.monotonic()
+    if now - _me_upstream_source_store_retry_at < 60.0:
+        return None
+    try:
+        from app.research.me_upstream_source_v1.store import connect_pg_store
+
+        _me_upstream_source_store = connect_pg_store(
+            host=repository._host,
+            port=repository._port,
+            database=repository._database,
+            user=repository._user,
+            password=repository._password,
+            unix_sock=repository._unix_sock or None,
+        )
+        return _me_upstream_source_store
+    except Exception:
+        _me_upstream_source_store = None
+        _me_upstream_source_store_retry_at = now
+        logger.debug(
+            "ME upstream source capture store unavailable", exc_info=True)
+        return None
+
+
+def _capture_me_upstream_source_v1(
+    repository: ScannerRepository,
+    candidate: SetupCandidate,
+) -> None:
+    """Append ONE detector-level event to the upstream research ledger.
+
+    Only ``MOMENTUM_EXHAUSTION_REVERSE_LONG_V2`` / ``LONG`` source candidates
+    qualify.  Research only: nothing is routed back into the trading flow and
+    no scanner decision is changed.  Fail-open: the whole body is wrapped and
+    must never raise into the scanner cycle.
+    """
+    # getattr: a non-candidate payload must be ignored, never raise into the
+    # scanner cycle.
+    if (
+        getattr(candidate, "scanner_name", None)
+        != "MOMENTUM_EXHAUSTION_REVERSE_LONG_V2"
+        or getattr(candidate, "direction", None) != "LONG"
+    ):
+        return
+
+    _me_upstream_source_stats["deliveries"] += 1
+
+    def _report_error(status: str) -> None:
+        """Separate upstream-capture error diagnostics; never silent."""
+        try:
+            repository.save_error(
+                symbol=candidate.symbol,
+                scanner_name=candidate.scanner_name,
+                error_type="ME_UPSTREAM_SOURCE_CAPTURE_ERROR",
+                error_message=(
+                    f"status={status} signal_time={candidate.detected_at} "
+                    f"setup_id={candidate.setup_id}"),
+            )
+        except Exception:
+            logger.debug(
+                "ME upstream source capture error sink failed", exc_info=True)
+
+    try:
+        # TWO-FACTOR: ME_UPSTREAM_SOURCE_CAPTURE_V1_ENABLED must be ON before
+        # any connection attempt or write (capture disabled by default).
+        from app.research.me_upstream_source_v1.activation import (
+            is_runtime_enabled,
+        )
+        if not is_runtime_enabled():
+            _me_upstream_source_stats["disabled"] += 1
+            return  # no connection attempt, no write while the flag is off
+
+        from app.research.me_upstream_source_v1.capture import (
+            CAPTURE_BLOCKED,
+            CAPTURE_DUPLICATE,
+            CAPTURE_ERROR,
+            CAPTURE_INTEGRITY_CONFLICT,
+            CAPTURE_INVALID_EVENT,
+            CAPTURE_NOT_ACTIVE,
+            CAPTURE_PRE_FREEZE,
+            CAPTURED,
+            capture_with_status,
+        )
+
+        store = _get_me_upstream_source_store(repository)
+        if store is None:
+            raise RuntimeError("me upstream source capture store unavailable")
+        status = capture_with_status(store, candidate)
+        _status_counter = {
+            CAPTURED: "captured",
+            CAPTURE_DUPLICATE: "duplicates",
+            CAPTURE_NOT_ACTIVE: "not_active",
+            CAPTURE_PRE_FREEZE: "pre_freeze",
+            CAPTURE_BLOCKED: "blocked",
+            CAPTURE_INVALID_EVENT: "invalid",
+            CAPTURE_INTEGRITY_CONFLICT: "integrity_conflicts",
+            CAPTURE_ERROR: "errors",
+        }
+        _me_upstream_source_stats[
+            _status_counter.get(status, "invalid")] += 1
+        if status in (CAPTURE_ERROR, CAPTURE_INTEGRITY_CONFLICT):
+            logger.error(
+                "ME upstream source capture status=%s; scanner unaffected "
+                "symbol=%s signal_time=%s",
+                status, candidate.symbol, candidate.detected_at)
+            _report_error(status)
+        elif status == CAPTURE_INVALID_EVENT:
+            logger.warning(
+                "ME upstream source capture invalid event; scanner unaffected "
+                "symbol=%s signal_time=%s",
+                candidate.symbol, candidate.detected_at)
+            _report_error(status)
+        elif status in ("DISABLED", "NOT_ACTIVE", "PRE_FREEZE", "BLOCKED"):
+            logger.info(
+                "ME upstream source capture status=%s symbol=%s",
+                status, candidate.symbol)
+    except Exception:
+        _me_upstream_source_stats["errors"] += 1
+        logger.exception(
+            "ME upstream source capture failed; scanner unaffected "
+            "symbol=%s signal_time=%s",
+            getattr(candidate, "symbol", None),
+            getattr(candidate, "detected_at", None))
+        _report_error("EXCEPTION")
+
+
 # --- Prospective OOS Observer -------------------------------------------
 
 _prospective_observer = None
@@ -2503,6 +2670,21 @@ def run_scan_cycle(
                     _capture_me_inverse_short_v3_source(
                         repository, inv_candidate,
                     )
+
+                # ME upstream source capture (Issue #305): detector-level
+                # PRE-scoring events published by the orchestrator under
+                # stats["_me_upstream_source_events"] (built IMMEDIATELY after
+                # scanner.scan(ctx), before scoring/dedup/geometry/gates) —
+                # delivered through its OWN hook: own flag
+                # (ME_UPSTREAM_SOURCE_CAPTURE_V1_ENABLED), own activation/
+                # fingerprint, own store connection, own error sink.
+                # Independent of the V1/V2/OOS-2/V3 deliveries: an upstream
+                # capture failure never affects them and vice versa;
+                # fail-open.  Research only — no trading decision changes.
+                for inv_candidate in symbol_stats.get(
+                    "_me_upstream_source_events", []
+                ):
+                    _capture_me_upstream_source_v1(repository, inv_candidate)
 
                 # SRR LONG Research: capture every SRR LONG candidate for
                 # research outcome tracking (independent of paper trading).
