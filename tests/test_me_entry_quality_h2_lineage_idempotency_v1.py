@@ -44,11 +44,21 @@ CRAFTED = (
 )
 SIGNAL_US = (BASE_MS + 18 * MS + 60_000) * 1000
 
+#: rising warmup buckets before the crafted sequence (canonical window)
+WARMUP = 106
 
-def rows_from_closes(closes, start_index=0):
+
+def warmup_closes(n):
+    return [99.0 - 0.5 * (n - 1 - i) for i in range(n)]
+
+
+def rows_from_closes(closes, start_index=0, warmup=WARMUP):
+    placed = [
+        (start_index - warmup + j, c) for j, c in enumerate(warmup_closes(warmup))
+    ] + [(start_index + i, c) for i, c in enumerate(closes)]
     rows = []
-    for i, close in enumerate(closes):
-        open_ms = BASE_MS + (start_index + i) * MS
+    for bucket, close in placed:
+        open_ms = BASE_MS + bucket * MS
         prev = rows[-1]["close"] if rows else float(close)
         rows.append({
             "open_ms": open_ms,

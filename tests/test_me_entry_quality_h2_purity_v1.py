@@ -17,6 +17,7 @@ ALLOWED_IMPORTS = {
     "__future__",
     "collections",
     "dataclasses",
+    "decimal",  # exact PostgreSQL NUMERIC handling — pure stdlib
     "hashlib",
     "json",
     "math",

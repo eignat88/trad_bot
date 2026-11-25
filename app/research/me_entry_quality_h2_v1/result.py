@@ -41,7 +41,7 @@ from app.research.me_entry_quality_h2_v1.rsi_confirmation import (
     RSI_PERIOD,
 )
 
-H2_PROTOCOL_VERSION = "H2_1.0.0"
+H2_PROTOCOL_VERSION = "H2_1.1.0"
 
 #: Version of the RSI calculation semantics used by H2
 #: (Wilder RSI(14), parity with ``app.indicators.technical.rsi_wilder``).
@@ -80,6 +80,23 @@ ENTRY_REFERENCE_LABEL = "CONFIRMATION_CANDLE_CLOSE_REFERENCE_ONLY_NOT_EXECUTABLE
 #: The original source price is preserved verbatim and is NOT an execution
 #: price for the delayed entry (the delayed entry happens later).
 ORIGINAL_PRICE_BASIS = "SOURCE_REFERENCE_PRICE_VERBATIM_NOT_EXECUTABLE"
+
+#: Explicit conversion policy for the original source price (PostgreSQL
+#: ``NUMERIC`` arrives as :class:`decimal.Decimal`): the source value is
+#: preserved VERBATIM as exact decimal text in ``original_price_exact`` and
+#: is never rounded or replaced; ``original_price`` is only the documented
+#: IEEE-754 float64 view used for research arithmetic.  A value that has no
+#: finite float64 view is rejected outright — never silently coerced.
+ORIGINAL_PRICE_PRECISION_POLICY = "SOURCE_VALUE_VERBATIM__FLOAT64_VIEW_V1"
+
+#: Fixed historical-window policy for H2's recomputed Wilder RSI: exactly
+#: :data:`CANONICAL_LOOKBACK` closed 5m buckets ENDING AT the base candle
+#: ``O_0``, Wilder-seeded at the window start, then extended causally over
+#: the post-signal observations.  Earlier history supplied by the caller is
+#: EXCLUDED, so the same event can never get different RSI values just
+#: because a longer historical prefix was loaded (and a missing window
+#: bucket is an ``INCOMPLETE_COVERAGE`` failure, never a silent reseed).
+H2_RSI_WINDOW_POLICY = "CANONICAL_120_CLOSED_5M_ANCHORED_AT_BASE_CANDLE_V1"
 
 # ─── expiry / coverage ───────────────────────────────────────────────────────
 EXPIRY_REASON_WINDOW_EXHAUSTED = "OBSERVATION_WINDOW_EXHAUSTED_NO_CONFIRMATION"
@@ -171,6 +188,7 @@ class H2Policy:
             "peak_rule": self.peak_rule,
             "policy_status": self.policy_status,
             "rsi_calc_version": H2_RSI_CALC_VERSION,
+            "rsi_window_policy": H2_RSI_WINDOW_POLICY,
         }
 
     def fingerprint(self) -> str:
@@ -286,6 +304,9 @@ class H2VariantResult:
     # ── original signal facts (verbatim; NOT execution prices) ──
     original_price: float | None
     original_price_basis: str
+    #: exact source value (PostgreSQL NUMERIC) preserved verbatim as decimal
+    #: text — see :data:`ORIGINAL_PRICE_PRECISION_POLICY`
+    original_price_exact: str | None
     source_rsi_14_snapshot: float | None
     source_rsi_delta_3_snapshot: float | None
     source_entry_confirmation_rsi_rising: bool | None
@@ -314,6 +335,10 @@ class H2VariantResult:
     coverage_detail: str = ""
     reason: str = ""
     detail: str = ""
+    #: full 5m candle-source provenance (identity + hash + row_count +
+    #: coverage + canonical window + provider reason) used for this result —
+    #: the H1-C provenance contract, serialized for auditability
+    candle_source: dict[str, Any] | None = None
 
     def lineage_payload(self) -> dict[str, Any]:
         """Exactly the preserved source lineage fields (verbatim)."""
@@ -335,7 +360,14 @@ class H2VariantResult:
             "symbol": self.symbol,
             "evaluation_asof_ms": self.evaluation_asof_ms,
             "original_price": self.original_price,
+            "original_price_exact": self.original_price_exact,
             "original_price_basis": self.original_price_basis,
+            "original_price_precision_policy": (
+                ORIGINAL_PRICE_PRECISION_POLICY
+                if self.original_price is not None
+                or self.original_price_exact is not None
+                else ""
+            ),
             "source_rsi_14_snapshot": self.source_rsi_14_snapshot,
             "source_rsi_delta_3_snapshot": self.source_rsi_delta_3_snapshot,
             "source_entry_confirmation_rsi_rising": (
@@ -362,4 +394,5 @@ class H2VariantResult:
             "coverage_detail": self.coverage_detail,
             "reason": self.reason,
             "detail": self.detail,
+            "candle_source": self.candle_source,
         }

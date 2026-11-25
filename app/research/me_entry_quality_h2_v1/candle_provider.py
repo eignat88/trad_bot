@@ -80,9 +80,11 @@ __all__ = [
     "Candle5mValidationResult",
     "CandleSourceIdentity",
     "CANDLE_5M_MS",
+    "CANONICAL_LOOKBACK_5M",
     "INCOMPLETE_COVERAGE_REASONS",
     "TIMEFRAME_5M",
     "build_source_identity",
+    "canonical_window_coverage",
     "is_sha256_hex",
     "provide_5m_candles",
     "source_payload_hash",
@@ -94,6 +96,18 @@ CANDLE_5M_MS = 300_000
 
 #: Minimum closed candles for a defined Wilder RSI(14) (period + 1).
 MIN_CLOSED_CANDLES_RSI_SEED = 15
+
+#: Fixed canonical cohort window (review 6055546804, finding 3): the exact
+#: number of CLOSED 5m buckets required for an event's RSI history.  This is
+#: deliberately SEPARATE from :data:`MIN_CLOSED_CANDLES_RSI_SEED` — the
+#: minimum needed for Wilder RSI(14) to be mathematically DEFINED — and is
+#: the frozen historical-window policy
+#: (:data:`~app.research.me_entry_quality_h2_v1.result.H2_RSI_WINDOW_POLICY`):
+#: the window is anchored at the base candle ``O_0`` and its complete
+#: presence is a COHORT-ELIGIBILITY gate, not a seed-size choice.  An
+#: eligible H2 result REQUIRES the full window; a partial window is always
+#: ``INCOMPLETE_COVERAGE``.
+CANONICAL_LOOKBACK_5M = 120
 
 #: Honest-but-incomplete data: valid rows, insufficient range.
 INCOMPLETE_COVERAGE_REASONS = frozenset({
@@ -430,6 +444,53 @@ def _coverage_5m(
         window_open_ms=window_open,
         window_close_ms=latest + CANDLE_5M_MS,
         dropped_unclosed_count=int(dropped_unclosed_count),
+    )
+
+
+def canonical_window_coverage(
+    candles: Sequence[Candle],
+    *,
+    base_index: int,
+    lookback: int = CANONICAL_LOOKBACK_5M,
+) -> CoverageReport:
+    """Coverage of the EVENT-ANCHORED canonical RSI history window.
+
+    The window is the ``lookback`` CLOSED 5m buckets ending at the base
+    candle ``O_0`` (``candles[base_index]``) — a FIXED window per event,
+    deliberately independent of the evaluation ASOF and of how much extra
+    earlier history the caller happened to load.  ``CoverageReport`` uses
+    the H1-C contract unchanged: ``present_buckets`` / ``expected_buckets``,
+    the exact ``missing_open_ms`` bucket opens and the window bounds.
+
+    ``status`` is ``COMPLETE`` only when every window bucket is present —
+    partial windows are never complete (they fail cohort eligibility).
+    """
+    if not _is_int(base_index) or base_index < 0 or base_index >= len(candles):
+        raise ValueError("base_index must reference a provided candle")
+    if not _is_int(lookback) or lookback < 1:
+        raise ValueError("lookback must be a positive integer")
+    base_open = int(candles[base_index].timestamp)
+    window_open = base_open - (int(lookback) - 1) * CANDLE_5M_MS
+    expected = tuple(
+        window_open + i * CANDLE_5M_MS for i in range(int(lookback))
+    )
+    present_opens = {int(c.timestamp) for c in candles}
+    missing = tuple(slot for slot in expected if slot not in present_opens)
+    present_buckets = int(lookback) - len(missing)
+    if present_buckets == 0:
+        status = COVERAGE_NONE
+    elif not missing:
+        status = COVERAGE_COMPLETE
+    else:
+        status = COVERAGE_PARTIAL
+    return CoverageReport(
+        status=status,
+        expected_buckets=int(lookback),
+        present_buckets=present_buckets,
+        missing_open_ms=missing,
+        window_open_ms=window_open,
+        window_close_ms=base_open + CANDLE_5M_MS,
+        dropped_unclosed_count=0,
     )
 
 

@@ -2,14 +2,15 @@
 
 Rule-level tests use explicit closed-observation lists (exact expected
 indices).  Pipeline-level tests use a crafted 5m close sequence whose Wilder
-RSI(14) series is:
+RSI(14) series (computed over the fixed 120-bucket canonical window anchored
+at O_0) is:
 
     idx  14..17 -> 100.0   (rising closes, no losses)
-    idx  18    -> 77.6892  (down close)
-    idx  19    -> 80.6022  (up close)
-    idx  20    -> 67.3454  (down close)
-    idx  21    -> 62.5939  (down close)
-    idx  22    -> 68.2269  (up close)
+    idx  18    -> 75.3334  (down close)
+    idx  19    -> 78.8455  (up close)
+    idx  20    -> 64.9109  (down close)
+    idx  21    -> 60.0154  (down close)
+    idx  22    -> 66.3857  (up close)
 
 with the original signal fired mid-candle idx 18 (a FORMING candle), so
 ``O_0 = idx 17`` and ``O_1..O_5 = idx 18..22``.
@@ -68,15 +69,31 @@ CRAFTED = (
     [100.0 + i for i in range(17)]  # idx 0..16
     + [118.0, 114.0, 116.5, 113.0, 111.5, 115.0]  # idx 17..22
 )
-# reference Wilder RSI(14) at the observation candles (parity-tested)
-RSI_AT = {17: 100.0, 18: 77.6892, 19: 80.6022, 20: 67.3454,
-          21: 62.5939, 22: 68.2269}
+# reference Wilder RSI(14) at the observation candles, computed over the
+# fixed 120-bucket canonical window anchored at O_0 (parity-tested against
+# app.indicators.technical.rsi_wilder on the identical window)
+RSI_AT = {17: 100.0, 18: 75.3334, 19: 78.8455, 20: 64.9109,
+          21: 60.0154, 22: 66.3857}
+
+#: enough rising warmup buckets BEFORE the crafted sequence for the
+#: 120-bucket canonical window of every crafted signal (O_0 >= idx 14)
+WARMUP = 106
 
 
-def rows_from_closes(closes, start_index=0):
+def warmup_closes(n):
+    # strictly rising: Wilder avg_loss stays 0, RSI pinned at 100.0
+    return [99.0 - 0.5 * (n - 1 - i) for i in range(n)]
+
+
+def rows_from_closes(closes, start_index=0, warmup=WARMUP):
+    """Crafted source rows: `warmup` rising buckets placed BEFORE
+    `start_index`, then one row per close at bucket `start_index + i`."""
+    placed = [
+        (start_index - warmup + j, c) for j, c in enumerate(warmup_closes(warmup))
+    ] + [(start_index + i, c) for i, c in enumerate(closes)]
     rows = []
-    for i, close in enumerate(closes):
-        open_ms = BASE_MS + (start_index + i) * MS
+    for bucket, close in placed:
+        open_ms = BASE_MS + bucket * MS
         prev = rows[-1]["close"] if rows else float(close)
         rows.append({
             "open_ms": open_ms,
@@ -102,7 +119,8 @@ def event_row(signal_ms, *, key="evt-1", features=None, price=1234.5):
         "lineage_hash": "ab" * 32,
         "signal_time": signal,
         "captured_at": signal + timedelta(seconds=20),
-        "activation_freeze_ts": signal,
+        # #305 cohort contract: signal_time > activation_freeze_ts STRICTLY
+        "activation_freeze_ts": signal - timedelta(hours=1),
         "source_fingerprint": "fp-test-1",
         "source_reference_price": price,
         "features": features if features is not None else {
@@ -113,8 +131,9 @@ def event_row(signal_ms, *, key="evt-1", features=None, price=1234.5):
     }
 
 
-def run(closes, signal_ms, policies, asof_ms, *, key="evt-1", features=None):
-    rows = rows_from_closes(closes)
+def run(closes, signal_ms, policies, asof_ms, *, key="evt-1", features=None,
+        warmup=WARMUP):
+    rows = rows_from_closes(closes, warmup=warmup)
     identity = build_source_identity(
         SOURCE_KIND_OFFLINE_SNAPSHOT, "crafted", rows
     )
@@ -381,6 +400,7 @@ class TestStateMachineTerminalStates:
             short_closes, sig,
             [H2Policy(VARIANT_TURN_1, observation_window=3)],
             asof_ms=BASE_MS + 20 * MS,
+            warmup=0,
         )
         (result,) = outcome.results
         assert result.status == STATE_INCOMPLETE_COVERAGE
@@ -389,7 +409,7 @@ class TestStateMachineTerminalStates:
 
     def test_gap_in_ohlcv_is_incomplete_coverage(self):
         rows = rows_from_closes(CRAFTED)
-        del rows[17]  # gap inside the closed/observation range (O_0 bucket)
+        del rows[WARMUP + 17]  # gap inside the closed/observation range (O_0 bucket)
         identity = build_source_identity(
             SOURCE_KIND_OFFLINE_SNAPSHOT, "crafted", rows
         )

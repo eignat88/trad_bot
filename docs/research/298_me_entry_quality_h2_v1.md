@@ -82,6 +82,70 @@ Reason-code → H2 state: `CANDLE_GAP` / `EMPTY_SERIES` /
 `INVALID_SOURCE`.  A missing data path is never repaired, gap-filled or
 downgraded.
 
+### 4.1 Canonical coverage vs mathematical RSI warmup (review finding 3)
+
+Two DISTINCT requirements, never conflated:
+
+* **mathematical RSI minimum** (`MIN_CLOSED_CANDLES_RSI_SEED = 15`): Wilder
+  RSI(14) needs 15 closes through `O_0` to be DEFINED at all
+  (`INSUFFICIENT_RSI_WARMUP`);
+* **canonical cohort window** (`CANONICAL_LOOKBACK_5M = 120`): the fixed
+  120 CLOSED 5m buckets ENDING AT `O_0` (`canonical_window_coverage()`).
+  Full coverage is a COHORT-ELIGIBILITY gate — an eligible H2 result
+  REQUIRES all 120 buckets; 15/120 or 119/120 are `INCOMPLETE_COVERAGE`
+  (`CANONICAL_WINDOW_INCOMPLETE` with the exact present/missing buckets),
+  never a silently reseeded RSI and never a false `COMPLETE`.
+
+### 4.2 Fixed historical-window RSI policy (`H2_RSI_WINDOW_POLICY`)
+
+The recomputed Wilder RSI is seeded at the START of the canonical window
+and extended causally over the post-signal observations.  Earlier history
+supplied by the caller is EXCLUDED: the same event can never get different
+results just because a longer historical prefix was loaded (tested at
+window / window+4 / window+28 prefixes — bit-identical semantic results).
+
+### 4.3 Serialized candle-source provenance (review finding 2)
+
+`H2EventOutcome.to_dict()["source"]` and every
+`H2VariantResult.to_dict()["candle_source"]` carry the full provenance
+block in the existing H1-C contract (`HtfSourceIdentity` +
+`CoverageReport` — no parallel format): `source_kind`, `source_label`,
+`payload_hash`, `row_count`, `fetched_at_ms`, `provider_version`,
+`evaluation_asof_ms`, the actual closed-candle range (first/last open ms,
+counts, dropped unclosed), `coverage` (status, expected/present buckets,
+missing bucket opens), the `canonical_window` report, and the provider's
+`source_ok` / `source_reason` / `source_detail` (kept even when the source
+is INVALID).  No OHLCV values are embedded.  Serialization is
+deterministic.
+
+## 4.4 Original price: PostgreSQL NUMERIC / Decimal (review finding 1)
+
+`source_reference_price` is a PostgreSQL `NUMERIC` and arrives as
+`decimal.Decimal` — accepted alongside `int` and `float`; `bool`, strings
+and other types are rejected; NaN/Infinity/-Infinity are rejected; the
+price must be strictly positive; an ABSENT optional price stays absent and
+never becomes a fabricated price.  Precision policy
+(`ORIGINAL_PRICE_PRECISION_POLICY`): the exact source value is preserved
+VERBATIM as decimal text (`original_price_exact`) and never rounded;
+`original_price` is only the documented IEEE-754 float64 view for research
+arithmetic (a value without a finite float64 view is rejected outright).
+The source price NEVER becomes the delayed-entry execution price.
+
+## 4.5 #305 activation / freeze temporal boundary (review finding 4)
+
+`#305`'s database CHECK protects stored rows, but H2 accepts
+caller-supplied mappings — so the temporal cohort contract is enforced at
+the H2 boundary at FULL microsecond precision, before any eligible result:
+
+* `signal_time > activation_freeze_ts` STRICTLY (equality is rejected —
+  no retroactive admission of pre-freeze events), reason
+  `PRE_FREEZE_SIGNAL_TIME`;
+* `captured_at >= activation_freeze_ts`, reason `PRE_FREEZE_CAPTURED_AT`;
+* unparsable timestamps are rejected explicitly
+  (`INVALID_SOURCE_TIMING` / adapter rejection).
+
+The stored #305 `freeze_ts` is only compared, never changed.
+
 ## 5. Wilder RSI(14) parity
 
 `rsi_confirmation.rsi_wilder_last` reproduces
@@ -137,7 +201,8 @@ Result contract (every field explicit):
 
 * source event key, variant id, symbol;
 * original signal time (`_us` exact + `_ms` floor) and original price —
-  labeled `SOURCE_REFERENCE_PRICE_VERBATIM_NOT_EXECUTABLE`;
+  labeled `SOURCE_REFERENCE_PRICE_VERBATIM_NOT_EXECUTABLE`, with the exact
+  NUMERIC value preserved verbatim (`original_price_exact`, §4.4);
 * confirmation candle open, confirmation close time (entry candidate time),
   recomputed RSI at confirmation (separate from the verbatim `rsi_14`);
 * entry delay (`_us` exact + `_ms` floor), measured from the exact
@@ -173,6 +238,7 @@ Result contract (every field explicit):
 | `test_me_entry_quality_h2_variants_v1.py` | TURN_1 / TURN_2 / PEAK_REVERSAL rules + pipeline, expiry, pending, NOT_READY, INVALID_SOURCE, INCOMPLETE_COVERAGE, entry-price honesty |
 | `test_me_entry_quality_h2_causal_asof_v1.py` | T-1ms/T/T+1ms, microsecond boundaries, forming-candle signal, future-append invariance, no lookahead, captured_at isolation |
 | `test_me_entry_quality_h2_lineage_idempotency_v1.py` | lineage immutability, ms-floor policy, idempotency, repeatability, policy fingerprint |
+| `test_me_entry_quality_h2_review_fixes_v1.py` | review 6055546804 regressions: Decimal/NUMERIC prices, serialized provenance, canonical coverage gate (15/119/120 window boundaries, prefix-length determinism), #305 freeze-boundary guard |
 | `test_me_entry_quality_h2_purity_v1.py` | AST purity, forbidden tokens, production isolation, no SQL/systemd wiring |
 
 ## 10. Explicitly OUT of scope (unchanged)

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 from app.models import Candle
@@ -44,12 +45,16 @@ from app.research.me_entry_quality_h1c_v1.event_adapter import (
     EventRejection,
     SourceEventRecord,
     adapt_source_events,
+    parse_utc_us,
 )
 from app.research.me_entry_quality_h2_v1.candle_provider import (
     CANDLE_5M_MS,
+    CANONICAL_LOOKBACK_5M,
     INCOMPLETE_COVERAGE_REASONS,
+    TIMEFRAME_5M,
     Candle5mSet,
     CandleSourceIdentity,
+    canonical_window_coverage,
     provide_5m_candles,
 )
 from app.research.me_entry_quality_h2_v1.result import (
@@ -81,7 +86,7 @@ from app.research.me_entry_quality_h2_v1.rsi_confirmation import (
     turn_2_confirmation,
 )
 
-H2_PIPELINE_VERSION = "H2_PIPELINE_1.0.0"
+H2_PIPELINE_VERSION = "H2_PIPELINE_1.1.0"
 
 REASON_OK = "OK"
 REASON_EVENT_REJECTED = "SOURCE_EVENT_REJECTED"
@@ -93,6 +98,16 @@ REASON_AWAITING_OBSERVATION = "AWAITING_POST_SIGNAL_OBSERVATION"
 REASON_INVALID_SOURCE_REFERENCE_PRICE = "INVALID_SOURCE_REFERENCE_PRICE"
 REASON_INSUFFICIENT_RSI_WARMUP = "INSUFFICIENT_RSI_WARMUP"
 REASON_MISSING_BASE_CANDLE = "MISSING_BASE_CANDLE"
+#: canonical cohort window (event-anchored) not fully covered by the source
+REASON_CANONICAL_WINDOW_INCOMPLETE = "CANONICAL_WINDOW_INCOMPLETE"
+#: #305 prospective-cohort timing contract, enforced at the H2 boundary for
+#: caller-supplied rows (the database CHECK does not protect them):
+#: ``signal_time > activation_freeze_ts`` STRICTLY (never equal, never
+#: before — no retroactive admission) and ``captured_at`` must not precede
+#: the freeze.  The stored #305 ``freeze_ts`` itself is never touched.
+REASON_PRE_FREEZE_SIGNAL_TIME = "PRE_FREEZE_SIGNAL_TIME"
+REASON_PRE_FREEZE_CAPTURED_AT = "PRE_FREEZE_CAPTURED_AT"
+REASON_INVALID_SOURCE_TIMING = "INVALID_SOURCE_TIMING"
 
 
 @dataclass(frozen=True)
@@ -107,6 +122,11 @@ class H2EventOutcome:
     candle_set: Candle5mSet | None = None
     adapter_rejections: tuple[EventRejection, ...] = ()
     pipeline_version: str = H2_PIPELINE_VERSION
+    #: full candle-source provenance block (H1-C contract) for the OHLCV
+    #: data actually used — identity, payload hash, row count, coverage,
+    #: canonical window, provider reason.  ``None`` only when the event was
+    #: rejected before any candle data was evaluated.
+    source: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -115,6 +135,7 @@ class H2EventOutcome:
             "reason": self.reason,
             "detail": self.detail,
             "record": None if self.record is None else self.record.to_dict(),
+            "source": self.source,
             "results": [r.to_dict() for r in self.results],
             "adapter_rejections": [r.to_dict() for r in self.adapter_rejections],
         }
@@ -132,18 +153,97 @@ def _extract_features(row: Mapping[str, Any]) -> Mapping[str, Any]:
     return {}
 
 
-def _extract_original_price(row: Mapping[str, Any]) -> float | None:
+def _extract_original_price(
+    row: Mapping[str, Any],
+) -> tuple[float, str] | None:
+    """``(float64 view, exact decimal text)`` of the optional source price.
+
+    ``source_reference_price`` is PostgreSQL ``NUMERIC`` and arrives as
+    :class:`decimal.Decimal` from the database driver — accepted alongside
+    ``int`` and ``float``.  ``bool``, strings and other types are rejected;
+    NaN / Infinity / -Infinity are rejected; the price must be strictly
+    positive.  An ABSENT optional price stays absent (``None``) and never
+    becomes a fabricated price.
+
+    Precision policy (:data:`ORIGINAL_PRICE_PRECISION_POLICY`): the exact
+    source value is preserved VERBATIM as decimal text (``Decimal``/``int``
+    via exact decimal formatting, ``float`` via its shortest round-trip
+    repr) and is never rounded; the ``float`` view is only for research
+    arithmetic and must be a finite float64 (a value outside that range is
+    rejected, never silently coerced).
+    """
     value = row.get("source_reference_price")
     if value is None and isinstance(row.get("lineage"), Mapping):
         value = row["lineage"].get("source_reference_price")
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
         raise H2FeatureError(REASON_INVALID_SOURCE_REFERENCE_PRICE)
-    number = float(value)
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise H2FeatureError(REASON_INVALID_SOURCE_REFERENCE_PRICE)
+        if not value > 0:
+            raise H2FeatureError(REASON_INVALID_SOURCE_REFERENCE_PRICE)
+        exact = format(value, "f")
+    elif isinstance(value, int):
+        if not value > 0:
+            raise H2FeatureError(REASON_INVALID_SOURCE_REFERENCE_PRICE)
+        exact = str(value)
+    else:  # float
+        if not math.isfinite(value) or not value > 0:
+            raise H2FeatureError(REASON_INVALID_SOURCE_REFERENCE_PRICE)
+        exact = repr(value)
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise H2FeatureError(REASON_INVALID_SOURCE_REFERENCE_PRICE) from exc
     if not math.isfinite(number):
         raise H2FeatureError(REASON_INVALID_SOURCE_REFERENCE_PRICE)
-    return number
+    return number, exact
+
+
+def _source_provenance(
+    candle_set: Candle5mSet,
+    canonical: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Full candle-source provenance block (H1-C contract, serialized).
+
+    Identity / hash / row count / coverage reuse the existing H1-C
+    ``HtfSourceIdentity`` + ``CoverageReport`` formats unchanged.  No OHLCV
+    values are embedded — the source identity (payload hash, row count,
+    label, fetch time), the actual closed-candle range and the coverage /
+    canonical-window diagnostics fully identify the data used.
+    """
+    identity = candle_set.source_identity
+    candles = candle_set.candles
+    return {
+        "source_kind": identity.source_kind,
+        "source_label": identity.source_label,
+        "payload_hash": identity.payload_hash,
+        "row_count": identity.row_count,
+        "fetched_at_ms": identity.fetched_at_ms,
+        "provider_version": candle_set.provider_version,
+        "timeframe": TIMEFRAME_5M,
+        "evaluation_asof_ms": candle_set.evaluation_asof_ms,
+        "closed_range": {
+            "first_closed_open_ms": (
+                int(candles[0].timestamp) if candles else None
+            ),
+            "last_closed_open_ms": (
+                int(candles[-1].timestamp) if candles else None
+            ),
+            "closed_candle_count": len(candles),
+            "dropped_unclosed_count": len(candle_set.dropped_unclosed),
+            "latest_closed_open_ms": candle_set.latest_closed_open_ms,
+        },
+        "coverage": candle_set.coverage.to_dict(),
+        "canonical_window": (
+            None if canonical is None else dict(canonical)
+        ),
+        "source_ok": candle_set.ok,
+        "source_reason": candle_set.reason,
+        "source_detail": candle_set.detail,
+    }
 
 
 def _shell_result(
@@ -153,6 +253,7 @@ def _shell_result(
     status: str,
     symbol: str,
     original_price: float | None,
+    original_price_exact: str | None,
     snapshot: SourceFeatureSnapshot | None,
     evaluation_asof_ms: int,
     reason: str,
@@ -161,6 +262,7 @@ def _shell_result(
     coverage_detail: str = "",
     observed_window_candles: int = 0,
     expiry_reason: str | None = None,
+    candle_source: Mapping[str, Any] | None = None,
 ) -> H2VariantResult:
     """One result with only source lineage + terminal status filled in."""
     if record is None:
@@ -184,6 +286,7 @@ def _shell_result(
         activation_freeze_ts_ms=freeze_ms,
         lineage_hash=lineage_hash,
         original_price=original_price,
+        original_price_exact=original_price_exact,
         original_price_basis=(
             ORIGINAL_PRICE_BASIS if original_price is not None else ""
         ),
@@ -201,6 +304,7 @@ def _shell_result(
         coverage_detail=coverage_detail,
         reason=reason,
         detail=detail,
+        candle_source=None if candle_source is None else dict(candle_source),
     )
 
 
@@ -211,12 +315,14 @@ def _terminal_results(
     status: str,
     symbol: str,
     original_price: float | None,
+    original_price_exact: str | None = None,
     snapshot: SourceFeatureSnapshot | None,
     evaluation_asof_ms: int,
     reason: str,
     detail: str,
     coverage_status: str,
     coverage_detail: str = "",
+    candle_source: Mapping[str, Any] | None = None,
 ) -> tuple[H2VariantResult, ...]:
     return tuple(
         _shell_result(
@@ -225,12 +331,14 @@ def _terminal_results(
             status=status,
             symbol=symbol,
             original_price=original_price,
+            original_price_exact=original_price_exact,
             snapshot=snapshot,
             evaluation_asof_ms=evaluation_asof_ms,
             reason=reason,
             detail=detail,
             coverage_status=coverage_status,
             coverage_detail=coverage_detail,
+            candle_source=candle_source,
         )
         for policy in policies
     )
@@ -315,10 +423,90 @@ def run_h2_event(
             "evaluation_asof_ms must not precede the original signal_time"
         )
 
+    # 1b. prospective-cohort timing guard (review 6055546804, finding 4).
+    # #305's database CHECK protects stored rows, but H2 accepts
+    # caller-supplied mappings — so the temporal cohort contract is enforced
+    # here at the H2 boundary, at FULL microsecond precision.  Strict
+    # ``signal_time > activation_freeze_ts`` (never equal — no retroactive
+    # admission of pre-freeze events); ``captured_at`` must not precede the
+    # freeze.  The stored #305 ``freeze_ts`` is only compared, never changed.
+    try:
+        freeze_us = parse_utc_us(
+            row.get("activation_freeze_ts"), field_name="activation_freeze_ts"
+        )
+        captured_us = parse_utc_us(row.get("captured_at"), field_name="captured_at")
+    except ValueError as exc:
+        return H2EventOutcome(
+            record=record,
+            results=_terminal_results(
+                policies,
+                record=record,
+                status=STATE_INVALID_SOURCE,
+                symbol=record.symbol,
+                original_price=None,
+                snapshot=None,
+                evaluation_asof_ms=asof_ms,
+                reason=REASON_INVALID_SOURCE_TIMING,
+                detail=str(exc),
+                coverage_status=COVERAGE_NONE,
+            ),
+            ok=False,
+            reason=REASON_INVALID_SOURCE,
+            detail=f"{REASON_INVALID_SOURCE_TIMING}: {exc}",
+            adapter_rejections=batch.rejections,
+        )
+    if record.signal_time_us <= freeze_us:
+        return H2EventOutcome(
+            record=record,
+            results=_terminal_results(
+                policies,
+                record=record,
+                status=STATE_INVALID_SOURCE,
+                symbol=record.symbol,
+                original_price=None,
+                snapshot=None,
+                evaluation_asof_ms=asof_ms,
+                reason=REASON_PRE_FREEZE_SIGNAL_TIME,
+                detail=(
+                    "#305 contract signal_time > activation_freeze_ts "
+                    f"violated: signal_time_us={record.signal_time_us} <= "
+                    f"activation_freeze_ts_us={freeze_us}"
+                ),
+                coverage_status=COVERAGE_NONE,
+            ),
+            ok=False,
+            reason=REASON_INVALID_SOURCE,
+            detail=REASON_PRE_FREEZE_SIGNAL_TIME,
+            adapter_rejections=batch.rejections,
+        )
+    if captured_us < freeze_us:
+        return H2EventOutcome(
+            record=record,
+            results=_terminal_results(
+                policies,
+                record=record,
+                status=STATE_INVALID_SOURCE,
+                symbol=record.symbol,
+                original_price=None,
+                snapshot=None,
+                evaluation_asof_ms=asof_ms,
+                reason=REASON_PRE_FREEZE_CAPTURED_AT,
+                detail=(
+                    f"captured_at_us={captured_us} precedes "
+                    f"activation_freeze_ts_us={freeze_us}"
+                ),
+                coverage_status=COVERAGE_NONE,
+            ),
+            ok=False,
+            reason=REASON_INVALID_SOURCE,
+            detail=REASON_PRE_FREEZE_CAPTURED_AT,
+            adapter_rejections=batch.rejections,
+        )
+
     # 2. original feature snapshot — verbatim (#305 semantics).
     try:
         snapshot = SourceFeatureSnapshot.from_mapping(_extract_features(row))
-        original_price = _extract_original_price(row)
+        price = _extract_original_price(row)
     except H2FeatureError as exc:
         return H2EventOutcome(
             record=record,
@@ -339,6 +527,8 @@ def run_h2_event(
             detail=str(exc),
             adapter_rejections=batch.rejections,
         )
+    original_price = None if price is None else price[0]
+    original_price_exact = None if price is None else price[1]
 
     # 3. caller-supplied 5m candles — validated + ASOF-truncated.
     candle_set = provide_5m_candles(
@@ -357,6 +547,7 @@ def run_h2_event(
             if candle_set.reason == "EMPTY_SERIES"
             else COVERAGE_PARTIAL
         )
+        provenance = _source_provenance(candle_set, None)
         return H2EventOutcome(
             record=record,
             results=_terminal_results(
@@ -365,12 +556,14 @@ def run_h2_event(
                 status=status,
                 symbol=record.symbol,
                 original_price=original_price,
+                original_price_exact=original_price_exact,
                 snapshot=snapshot,
                 evaluation_asof_ms=asof_ms,
                 reason=candle_set.reason,
                 detail=candle_set.detail,
                 coverage_status=coverage,
                 coverage_detail=candle_set.reason,
+                candle_source=provenance,
             ),
             ok=False,
             reason=(
@@ -381,11 +574,18 @@ def run_h2_event(
             detail=f"{candle_set.reason}: {candle_set.detail}",
             candle_set=candle_set,
             adapter_rejections=batch.rejections,
+            source=provenance,
         )
 
     # 4-5. per-variant delayed-entry state machine.
     candles = candle_set.candles
     base_index, first_obs = _observation_indices(candles, record.signal_time_us)
+    canonical = (
+        canonical_window_coverage(candles, base_index=base_index).to_dict()
+        if base_index >= 0
+        else None
+    )
+    provenance = _source_provenance(candle_set, canonical)
     results: list[H2VariantResult] = []
     for policy in policies:
         results.append(
@@ -394,10 +594,13 @@ def run_h2_event(
                 record=record,
                 snapshot=snapshot,
                 original_price=original_price,
+                original_price_exact=original_price_exact,
                 candles=candles,
                 base_index=base_index,
                 first_obs=first_obs,
                 asof_ms=asof_ms,
+                canonical_report=canonical,
+                candle_source=provenance,
             )
         )
 
@@ -427,6 +630,7 @@ def run_h2_event(
         detail=detail,
         candle_set=candle_set,
         adapter_rejections=batch.rejections,
+        source=provenance,
     )
 
 
@@ -436,10 +640,13 @@ def _evaluate_variant(
     record: SourceEventRecord,
     snapshot: SourceFeatureSnapshot,
     original_price: float | None,
+    original_price_exact: str | None,
     candles: Sequence[Candle],
     base_index: int,
     first_obs: int,
     asof_ms: int,
+    canonical_report: Mapping[str, Any] | None,
+    candle_source: Mapping[str, Any] | None,
 ) -> H2VariantResult:
     def _terminal(
         status: str, reason: str, detail: str, **kwargs: Any
@@ -450,11 +657,13 @@ def _evaluate_variant(
             status=status,
             symbol=record.symbol,
             original_price=original_price,
+            original_price_exact=original_price_exact,
             snapshot=snapshot,
             evaluation_asof_ms=asof_ms,
             reason=reason,
             detail=detail,
             coverage_status=kwargs.pop("coverage_status", COVERAGE_COMPLETE),
+            candle_source=candle_source,
             **kwargs,
         )
 
@@ -485,6 +694,8 @@ def _evaluate_variant(
             coverage_detail=REASON_MISSING_BASE_CANDLE,
         )
 
+    # mathematical RSI minimum (Wilder seed) — SEPARATE from the canonical
+    # cohort window below (review 6055546804, finding 3)
     if base_index < policy.rsi_period:
         return _terminal(
             STATE_INCOMPLETE_COVERAGE,
@@ -498,17 +709,67 @@ def _evaluate_variant(
             coverage_detail=REASON_INSUFFICIENT_RSI_WARMUP,
         )
 
-    closes = [float(c.close) for c in candles]
+    # canonical cohort eligibility: the full event-anchored history window
+    # (CANONICAL_LOOKBACK_5M buckets ending at O_0) must be covered.  A
+    # PARTIAL window can never yield an eligible result and is never
+    # labeled COMPLETE.
+    canonical_status = (
+        None if canonical_report is None else canonical_report.get("status")
+    )
+    if canonical_status != COVERAGE_COMPLETE:
+        present = 0 if canonical_report is None else canonical_report.get(
+            "present_buckets", 0
+        )
+        expected = CANONICAL_LOOKBACK_5M
+        missing_count = (
+            expected - present
+            if canonical_report is not None
+            else expected
+        )
+        return _terminal(
+            STATE_INCOMPLETE_COVERAGE,
+            REASON_CANONICAL_WINDOW_INCOMPLETE,
+            (
+                f"canonical RSI history window ({expected} closed 5m buckets "
+                f"ending at O_0) is not fully covered: {present}/{expected} "
+                f"present, {missing_count} missing"
+            ),
+            coverage_status=(
+                COVERAGE_NONE if not present else COVERAGE_PARTIAL
+            ),
+            coverage_detail=REASON_CANONICAL_WINDOW_INCOMPLETE,
+        )
+
+    # FIXED historical window policy (H2_RSI_WINDOW_POLICY): the Wilder
+    # series is seeded at the canonical window start and extended causally
+    # over the post-signal observations — earlier history supplied by the
+    # caller is excluded, so the RSI never depends on the loaded prefix
+    # length.
+    window_start_index = base_index - (CANONICAL_LOOKBACK_5M - 1)
+    closes = [float(c.close) for c in candles[window_start_index:]]
     series = rsi_wilder_series(closes, period=policy.rsi_period)
+    base_pos = base_index - window_start_index
+
+    if base_pos < policy.rsi_period:
+        return _terminal(
+            STATE_INCOMPLETE_COVERAGE,
+            REASON_INSUFFICIENT_RSI_WARMUP,
+            (
+                f"RSI({policy.rsi_period}) is undefined at O_0 inside the "
+                f"canonical window ({base_pos + 1} closes)"
+            ),
+            coverage_status=COVERAGE_PARTIAL,
+            coverage_detail=REASON_INSUFFICIENT_RSI_WARMUP,
+        )
 
     window = int(policy.observation_window)
     obs_indices = [
         first_obs + offset
         for offset in range(min(window, len(candles) - first_obs))
     ]
-    obs_values: list[float] = [series[base_index]]
+    obs_values: list[float] = [series[base_pos]]
     for index in obs_indices:
-        value = series[index]
+        value = series[index - window_start_index]
         assert value is not None  # guaranteed by the warmup check above
         obs_values.append(value)
     observed = len(obs_indices)
@@ -537,6 +798,7 @@ def _evaluate_variant(
             activation_freeze_ts_ms=record.activation_freeze_ts_ms,
             lineage_hash=record.lineage_hash,
             original_price=original_price,
+            original_price_exact=original_price_exact,
             original_price_basis=(
                 ORIGINAL_PRICE_BASIS if original_price is not None else ""
             ),
@@ -564,6 +826,9 @@ def _evaluate_variant(
             coverage_status=COVERAGE_COMPLETE,
             reason=REASON_OK,
             detail="",
+            candle_source=(
+                None if candle_source is None else dict(candle_source)
+            ),
         )
 
     if observed >= window:

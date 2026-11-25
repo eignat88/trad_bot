@@ -45,11 +45,21 @@ CRAFTED = (
     + [118.0, 114.0, 116.5, 113.0, 111.5, 115.0]
 )
 
+#: rising warmup buckets before the crafted sequence (canonical window)
+WARMUP = 106
 
-def rows_from_closes(closes, start_index=0):
+
+def warmup_closes(n):
+    return [99.0 - 0.5 * (n - 1 - i) for i in range(n)]
+
+
+def rows_from_closes(closes, start_index=0, warmup=WARMUP):
+    placed = [
+        (start_index - warmup + j, c) for j, c in enumerate(warmup_closes(warmup))
+    ] + [(start_index + i, c) for i, c in enumerate(closes)]
     rows = []
-    for i, close in enumerate(closes):
-        open_ms = BASE_MS + (start_index + i) * MS
+    for bucket, close in placed:
+        open_ms = BASE_MS + bucket * MS
         prev = rows[-1]["close"] if rows else float(close)
         rows.append({
             "open_ms": open_ms,
@@ -74,7 +84,8 @@ def event_row(signal_us, *, key="evt-asof", captured_shift_s=20):
         "lineage_hash": "cd" * 32,
         "signal_time": signal,
         "captured_at": signal + timedelta(seconds=captured_shift_s),
-        "activation_freeze_ts": signal,
+        # #305 cohort contract: signal_time > activation_freeze_ts STRICTLY
+        "activation_freeze_ts": signal - timedelta(hours=1),
         "source_fingerprint": "fp-asof-1",
         "source_reference_price": 1000.0,
         "features": {
@@ -129,7 +140,8 @@ class TestMicrosecondSignalBoundaries:
         outcome = run_at(signal_us, BASE_MS + 21 * MS, rows)
         result = outcome.results[0]
         assert result.status == STATE_CONFIRMED_DELAYED
-        # O_0 = 18 (77.69), O_1 = 19 (80.60, up), O_2 = 20 (67.35, down)
+        # O_0 = 18 (RSI 100.0), O_1 = 19 (75.33-ish pattern: up), O_2 = 20
+        # (down) — values from the fixed canonical window; first decline at 20
         assert result.confirmation_candle_open_ms == BASE_MS + 20 * MS
 
     def test_signal_one_microsecond_before_close_picks_that_candle(self):
@@ -138,7 +150,7 @@ class TestMicrosecondSignalBoundaries:
         outcome = run_at(signal_us, BASE_MS + 21 * MS, rows)
         result = outcome.results[0]
         assert result.status == STATE_CONFIRMED_DELAYED
-        # O_0 = 17 (100.0), O_1 = 18 (77.69, down) -> confirms at candle 18
+        # O_0 = 17 (100.0), O_1 = 18 (down) -> confirms at candle 18
         assert result.confirmation_candle_open_ms == BASE_MS + 18 * MS
 
     def test_one_microsecond_changes_the_selected_observation(self):
@@ -166,12 +178,23 @@ class TestFormingCandleSignal:
 
 
 class TestFutureAppendInvariance:
+    @staticmethod
+    def _semantic(result):
+        # the candle-source provenance block legitimately records the
+        # SUPPLIED payload (row_count/hash differ when future rows are
+        # appended); every semantic result field must stay identical
+        payload = result.to_dict()
+        payload.pop("candle_source")
+        return payload
+
     def test_appended_future_candles_do_not_change_earlier_result(self):
         base_rows = rows_from_closes(CRAFTED)
         asof = BASE_MS + 19 * MS
         result_before = run_at(SIGNAL_US, asof, base_rows).results[0]
 
-        future_good = rows_from_closes([130.0, 131.0, 132.0], start_index=23)
+        future_good = rows_from_closes(
+            [130.0, 131.0, 132.0], start_index=23, warmup=0
+        )
         future_corrupt = [{
             "open_ms": BASE_MS + 26 * MS,
             "open": "junk", "high": None, "low": -9,
@@ -180,7 +203,7 @@ class TestFutureAppendInvariance:
         extended = base_rows + future_good + future_corrupt
         result_after = run_at(SIGNAL_US, asof, extended).results[0]
 
-        assert result_before.to_dict() == result_after.to_dict()
+        assert self._semantic(result_before) == self._semantic(result_after)
 
     def test_no_lookahead_from_later_decline(self):
         # signal mid idx 15: the first decline (candle idx 18) must NOT be
