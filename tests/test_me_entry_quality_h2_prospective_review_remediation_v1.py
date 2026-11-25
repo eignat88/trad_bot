@@ -502,3 +502,29 @@ class TestRunnerExitCodes:
         monkeypatch.delenv("H2_PROSPECTIVE_ALLOW_UNFROZEN_POLICIES", raising=False)
         monkeypatch.delenv("H2_PROSPECTIVE_POLICY_FINGERPRINT_PINS", raising=False)
         assert runner_mod.main(["--once"]) == runner_mod.EXIT_CONFIG_ERROR
+
+
+class TestRunnerClientFactoryPins:
+    def test_research_client_is_single_attempt_per_page(self):
+        # review P1-budget: the "1 pagination page = 1 HTTP request" budget
+        # invariant is pinned by the research client factory settings
+        config = H2ProspectiveConfig(
+            enabled=True, candle_budget_confirmed=True,
+            allow_unfrozen_policies=True,
+        )
+        client = runner_mod._make_bybit_client_factory(config)()
+        assert client.settings.bybit_max_attempts == 1
+        assert getattr(client.settings, "bybit_rate_limit_max_retries", 0) == 0
+
+    def test_runtime_budget_reserves_exact_page_cost(self):
+        config = H2ProspectiveConfig(
+            enabled=True, candle_budget_confirmed=True,
+            allow_unfrozen_policies=True,
+        )
+        runtime, _store = runner_mod.build_runtime(
+            config,
+            store_factory=InMemoryProspectiveStore,
+            source_connection_factory=lambda: None,
+        )
+        budget = runtime._provider.budget
+        assert budget.requests_per_page == 1

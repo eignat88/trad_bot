@@ -76,4 +76,39 @@ runtime to its authorized research-only surfaces.  Nothing is weakened.
 * policy fingerprints are recorded but NOT frozen (windows 3/6 remain
   preliminary candidates);
 * the real-PG integration suite requires `ME_H2PRO_PG_INTEGRATION=1` on a
-  test server (not run in this environment — no local PostgreSQL).
+  test server — RUN in the remediation round on an isolated scratch
+  PostgreSQL 17.2 (see below).
+
+---
+
+## Review remediation (round 2) — commit `979a565`
+
+All five review findings fixed and covered by tests; full report:
+`reports/issue312_review_remediation_v1.md`.
+
+| Finding | Fix (summary) | Evidence |
+|---|---|---|
+| **P1 Decimal loss** — `Decimal` serialized to `str`, restore fed `str` into `run_h2_event` -> valid #305 event became `INVALID_SOURCE` | strict `parse_source_price()`/`exact_price_str()` (exact `Decimal`, rejects NaN/Inf/<=0/non-plain strings); NUMERIC column authoritative + exact string in payload; strict restore; DB CHECK on prices; restore/engine price errors -> explicit terminal `INVALID_SOURCE` | real PostgreSQL 17.2 `NUMERIC` round-trip incl. `Decimal('123.4567890123456789')` exact -> restore -> `run_h2_event` (`original_price_exact` verbatim); DB refuses NaN/Inf/0/negative; redelivery + restart equivalence |
+| **P1 Watermark loss** — `(signal_time, key)` cursor dropped late-committed events with earlier `signal_time` | delivery cursor is CAPTURE order `(captured_at, source_event_key)`; per cycle: forward scan from cursor (guaranteed progress) + bounded overlap sweep (`H2_PROSPECTIVE_SOURCE_OVERLAP_S`, default 7200s) for capture-to-commit disorder and `captured_at` ties; idempotent ingest, variant states re-ensured on duplicates; checkpoint-last | mandatory scenario (B captured first / A earlier signal delivered later -> both accepted, evaluated exactly once) + late-commit-after-restart, equal-timestamp ties, batch boundaries, crash-between-ingest-and-checkpoint — all green |
+| **P1 API budget** — 1 consume per paginated `get_klines_range()`; budget reset on restart | `try_consume(count)` reserves the ACTUAL HTTP cost of the full pagination (`pages_for_range` mirrors `BybitClient` pagination; 1 page = 1 request under the factory-pinned single-attempt client; conservative `requests_per_page`); retries re-reserve; exhaustion -> zero requests; hourly window PERSISTED in new `api_budget_state` (hydrate/save, fail-closed latch on save failure); production limiter untouched | fake-transport acceptance table: multi-page, retry recount, exhaustion blocks all requests, restart persistence (in-memory + real PG), rate-limit fail-closed, budget-unconfirmed -> 0 requests |
+| **P2 Exit code** — `--once` returned `EXIT_OK` on exception | `EXIT_CYCLE_FAILED=1` on any failure; `store.close()` in `finally` both paths; 0/2/3 semantics kept | exit-code tests: success 0, failure != 0, disabled 3, config error 2, store always closed |
+| **P2 Migration 095 re-apply** — plain `CREATE TRIGGER` broke re-application | `DROP TRIGGER IF EXISTS` + `CREATE TRIGGER` (idempotent re-apply); DO-guard raises `H2P_SCHEMA_INCOMPATIBLE` on incompatible pre-existing schema with full rollback; new `api_budget_state`; price CHECK; renamed cursor columns | scratch-PG tests: first apply + re-apply (x3) pass; re-apply preserves existing results byte-identical and keeps immutability triggers; induced error rolls back everything; incompatible schema predictably refused |
+
+Plus (task §7): an enabled runtime with empty policy fingerprint pins refuses
+to start unless `H2_PROSPECTIVE_ALLOW_UNFROZEN_POLICIES=1` — unfrozen-policy
+accumulation always requires a deliberate act (fail closed).
+
+**Test attribution (commit `979a565`, real runs):**
+
+* #312 prospective suite incl. real PostgreSQL 17.2 (scratch cluster,
+  `ME_H2PRO_PG_INTEGRATION=1`): **125 passed / 0 skipped / 0 failed**;
+* offline-only run: 108 passed / 17 skipped (PG opt-in flag unset);
+* H2 PR #311 regression (engine + purity): **168 passed / 0 failed**;
+* real Bybit requests during testing: **none** (fake transport only).
+
+Unverified/limited scenarios are listed explicitly in
+`reports/issue312_review_remediation_v1.md` §5 (empty #305 cohort, residual
+capture-to-commit disorder beyond the overlap window, page=1-request
+invariant pinned by client settings, load characteristics).
+
+**Status:** `IMPLEMENTATION_READY / RE_REVIEW_REQUIRED / ACTIVATION_HOLD`

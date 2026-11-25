@@ -39,8 +39,8 @@ Contract:
   the raw upstream cohort only.
 
 Pure parts (:func:`check_source_row`, :func:`delivery_from_row`) have no I/O;
-the SELECT (:func:`read_new_source_events`) takes an explicit connection and
-an explicit watermark — the caller owns checkpointing.
+the SELECT (:func:`read_source_events_after`) takes an explicit connection and
+an explicit capture-order cursor — the caller owns checkpointing.
 """
 from __future__ import annotations
 
