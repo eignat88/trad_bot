@@ -1,0 +1,383 @@
+"""Issue #312 / FR-07 — H2 prospective runtime orchestration (research only).
+
+One bounded, restart-safe polling cycle:
+
+1. read new #305 deliveries (SELECT-only) and ingest them idempotently into
+   the research store (freeze/lineage checks at the boundary; watermark
+   checkpoint — unfinished events are never skipped);
+2. for every pending (event x variant x policy) state: acquire CLOSED 5m
+   candles under the dedicated research API budget and evaluate the pure
+   PR #311 H2 engine at the ACTUAL observation instant;
+3. persist lifecycle decisions / terminal outcomes and telemetry.
+
+Isolation (FR-07, criterion 18):
+
+* no ``scanner_runner.py``, no trading signals, no orders, no paper/live, no
+  production detector / scoring / gate interaction of any kind;
+* with ``config.enabled`` False the runtime performs NO database connection,
+  NO Bybit request and NO write (criterion 17);
+* when the candle budget is unconfirmed the provider stays OFF, source
+  ingest continues and the cycle reports ``BLOCKED_CANDLE_SOURCE``;
+* a Bybit / API failure is fail-closed for the research runtime ONLY — it
+  never touches the production scanner (criterion 14).
+
+Missing data never fabricates an outcome: candle-fetch failures leave states
+``PENDING_CONFIRMATION`` and only the explicit lifecycle rules
+(:mod:`.lifecycle`) can finalize ``INCOMPLETE_COVERAGE``.
+"""
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, Sequence
+
+from app.research.me_entry_quality_h2_prospective_v1.candle_adapter import (
+    BybitClosedCandleProvider,
+    observation_grid,
+    observation_window_elapsed,
+    rows_as_mappings,
+)
+from app.research.me_entry_quality_h2_prospective_v1.config import (
+    H2ProspectiveConfig,
+)
+from app.research.me_entry_quality_h2_prospective_v1.contracts import (
+    INGEST_ACCEPTED,
+    INGEST_REJECTED_INVALID,
+    INGEST_REJECTED_LINEAGE,
+    INGEST_REJECTED_PRE_FREEZE,
+    RUNTIME_DISABLED,
+    STATE_CONFIRMED_DELAYED,
+    STATE_EXPIRED,
+    STATE_INCOMPLETE_COVERAGE,
+    STATE_INVALID_SOURCE,
+    STATE_NOT_READY,
+    candidate_policies,
+    policy_manifest,
+)
+from app.research.me_entry_quality_h2_prospective_v1.lifecycle import (
+    EvaluationObservation,
+    decide_next_state,
+)
+from app.research.me_entry_quality_h2_prospective_v1.source_reader import (
+    SourceDelivery,
+    delivery_from_row,
+    read_new_source_events,
+    watermark_of,
+)
+from app.research.me_entry_quality_h2_prospective_v1.store import (
+    H2ProspectiveStore,
+    VariantState,
+)
+from app.research.me_entry_quality_h2_prospective_v1.telemetry import (
+    TelemetryCounters,
+    cycle_status,
+    log_cycle,
+    log_source_empty_waiting,
+)
+from app.research.me_entry_quality_h2_v1.pipeline import run_h2_event
+from app.research.me_entry_quality_h2_v1.result import H2Policy
+
+H2P_RUNTIME_VERSION = "H2_PROSPECTIVE_RUNTIME_1.0.0"
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CycleReport:
+    """Deterministic summary of ONE runtime cycle (telemetry payload)."""
+
+    status: str
+    counters: dict[str, Any] = field(default_factory=dict)
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+class H2ProspectiveRuntime:
+    """Restart-safe research runtime (disabled by default, fail closed)."""
+
+    def __init__(
+        self,
+        *,
+        config: H2ProspectiveConfig,
+        store: H2ProspectiveStore,
+        candle_provider: BybitClosedCandleProvider,
+        source_connection_factory: Callable[[], Any] | None = None,
+        policies: Sequence[H2Policy] | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._config = config
+        self._store = store
+        self._provider = candle_provider
+        self._source_connection_factory = source_connection_factory
+        self._clock = clock
+        self._policies = tuple(policies) if policies is not None else (
+            candidate_policies(config.observation_windows)
+        )
+        if not self._policies:
+            raise ValueError("at least one H2Policy is required")
+        pins = set(config.policy_fingerprint_pins)
+        if pins:
+            for policy in self._policies:
+                if policy.fingerprint() not in pins:
+                    raise ValueError(
+                        "POLICY_FINGERPRINT_MISMATCH: computed policy "
+                        f"fingerprint {policy.fingerprint()} is not pinned"
+                    )
+
+    @property
+    def policies(self) -> tuple[H2Policy, ...]:
+        return self._policies
+
+    def policy_manifest(self) -> dict[str, Any]:
+        return policy_manifest(self._policies)
+
+    # ── one bounded cycle ──────────────────────────────────────────────────
+    def run_cycle(self) -> CycleReport:
+        if not self._config.enabled:
+            # Criterion 17: nothing connects, nothing is requested, nothing
+            # is written while the runtime is disabled.
+            return CycleReport(status=RUNTIME_DISABLED)
+
+        counters = TelemetryCounters()
+        self._provider.budget.start_cycle()
+        details: dict[str, Any] = {
+            "runtime_version": H2P_RUNTIME_VERSION,
+            "policy_manifest": self.policy_manifest(),
+        }
+
+        rows_seen = self._ingest_phase(counters, details)
+        candle_ready = self._evaluate_phase(counters, details)
+
+        cohort_empty = (
+            rows_seen == 0 and self._store.ingest_event_count() == 0
+        )
+        status = cycle_status(
+            counters=counters,
+            source_rows_seen=rows_seen,
+            candle_provider_enabled=candle_ready,
+            source_cohort_empty=cohort_empty,
+        )
+        if cohort_empty:
+            # FR-08: expected state — not an RSI-algorithm error and not
+            # proof of source coverage.
+            log_source_empty_waiting(logger)
+            details["source_empty_waiting"] = True
+
+        counters.variants_pending = len(
+            self._store.list_variant_states(pending_only=True, limit=1000)
+        )
+        self._store.record_health(status, counters.to_dict(), details)
+        log_cycle(logger, status=status, counters=counters, details=details)
+        return CycleReport(
+            status=status, counters=counters.to_dict(), details=details
+        )
+
+    # ── phase 1: source ingest (FR-01) ─────────────────────────────────────
+    def _ingest_phase(self, counters: TelemetryCounters, details: dict) -> int:
+        if self._source_connection_factory is None:
+            details["source_reader"] = "NO_CONNECTION_FACTORY"
+            return 0
+        conn = self._source_connection_factory()
+        try:
+            watermark_us, watermark_key = self._store.get_watermark()
+            rows = read_new_source_events(
+                conn,
+                watermark_signal_time_us=watermark_us,
+                watermark_key=watermark_key,
+                limit=self._config.source_batch_limit,
+            )
+        finally:
+            try:
+                conn.close()
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("source connection close failed", exc_info=True)
+
+        details["source_rows_read"] = len(rows)
+        counters.source_events_received = len(rows)
+        for row in rows:
+            delivery: SourceDelivery = delivery_from_row(row)
+            outcome = self._store.ingest_event(delivery)
+            if outcome.duplicate:
+                counters.idempotent_duplicates += 1
+                continue
+            if outcome.conflict:
+                counters.lineage_conflicts += 1
+            if outcome.status == INGEST_ACCEPTED:
+                counters.source_events_accepted += 1
+                self._ensure_variant_states(delivery)
+            elif outcome.status == INGEST_REJECTED_PRE_FREEZE:
+                counters.source_events_pre_freeze += 1
+                counters.source_events_rejected += 1
+            elif outcome.status in (INGEST_REJECTED_LINEAGE, INGEST_REJECTED_INVALID):
+                counters.source_events_invalid += 1
+                counters.source_events_rejected += 1
+        if rows:
+            new_us, new_key = watermark_of(rows)
+            self._store.set_watermark(new_us, new_key)
+        return len(rows)
+
+    def _ensure_variant_states(self, delivery: SourceDelivery) -> None:
+        row = delivery.row or {}
+        for policy in self._policies:
+            self._store.ensure_variant_state(
+                source_event_key=delivery.source_event_key,
+                variant_id=policy.variant_id,
+                policy_fingerprint=policy.fingerprint(),
+                policy=policy.to_dict(),
+                symbol=str(row.get("symbol") or ""),
+                signal_time_us=delivery.signal_time_us,
+            )
+
+    # ── phase 2: closed-candle evaluation (FR-02/FR-03/FR-04) ──────────────
+    def _evaluate_phase(self, counters: TelemetryCounters, details: dict) -> bool:
+        if not self._provider.enabled:
+            details["candle_provider"] = "DISABLED_BUDGET_UNCONFIRMED"
+            return False
+
+        pending = self._store.list_variant_states(
+            pending_only=True, limit=self._config.max_events_per_cycle
+        )
+        details["pending_evaluated"] = len(pending)
+        if not pending:
+            return True
+
+        by_event: dict[str, list[VariantState]] = {}
+        for state in pending:
+            by_event.setdefault(state.source_event_key, []).append(state)
+
+        asof_ms = int(self._clock() * 1000)
+        for event_key, states in by_event.items():
+            self._evaluate_event(event_key, states, asof_ms, counters, details)
+        return True
+
+    def _evaluate_event(
+        self,
+        event_key: str,
+        states: Sequence[VariantState],
+        asof_ms: int,
+        counters: TelemetryCounters,
+        details: dict,
+    ) -> None:
+        row = self._store.get_source_row(event_key)
+        if row is None:
+            details.setdefault("missing_source_rows", []).append(event_key)
+            return
+        signal_time_us = int(states[0].signal_time_us or 0)
+        if signal_time_us <= 0:
+            from app.research.me_entry_quality_h1c_v1.event_adapter import (
+                parse_utc_us,
+            )
+
+            signal_time_us = parse_utc_us(
+                row.get("signal_time"), field_name="signal_time"
+            )
+        symbol = states[0].symbol or str(row.get("symbol") or "")
+        grid = observation_grid(signal_time_us)
+
+        outcome = self._provider.fetch_closed_5m(
+            symbol=symbol, grid=grid, evaluation_asof_ms=asof_ms
+        )
+        counters.api_requests += outcome.api_requests
+        counters.api_retries += outcome.retries
+        counters.rate_limit_skips += outcome.rate_limit_skips
+        if not outcome.ok:
+            counters.candle_fetch_errors += 1
+            details.setdefault("candle_fetch_failures", {})[event_key] = (
+                outcome.reason
+            )
+            return
+
+        policies_by_fp = {state.policy_fingerprint: state for state in states}
+        policies = []
+        for state in states:
+            policy_dict = state.policy
+            policies.append(
+                H2Policy(
+                    variant_id=str(policy_dict.get("variant_id") or state.variant_id),
+                    observation_window=int(policy_dict.get("observation_window") or 1),
+                    rsi_period=int(policy_dict.get("rsi_period") or 14),
+                    peak_rule=policy_dict.get("peak_rule"),
+                )
+            )
+
+        pipeline_outcome = run_h2_event(
+            row,
+            rows_5m=rows_as_mappings(outcome.rows),
+            source_identity=outcome.source_identity,
+            policies=policies,
+            evaluation_asof_ms=asof_ms,
+        )
+        for result in pipeline_outcome.results:
+            state = policies_by_fp.get(result.policy_fingerprint)
+            if state is None:  # pragma: no cover - defensive
+                continue
+            self._apply_variant_result(
+                state=state,
+                result=result,
+                asof_ms=asof_ms,
+                grid=grid,
+                candle_source=pipeline_outcome.source,
+                counters=counters,
+            )
+
+    def _apply_variant_result(
+        self,
+        *,
+        state: VariantState,
+        result: Any,
+        asof_ms: int,
+        grid: Any,
+        candle_source: Mapping[str, Any] | None,
+        counters: TelemetryCounters,
+    ) -> None:
+        window = int(state.policy.get("observation_window") or 1)
+        window_elapsed = observation_window_elapsed(
+            grid, observation_window=window, evaluation_asof_ms=asof_ms
+        )
+        coverage_attempts = state.coverage_attempts + (
+            1 if result.status == STATE_INCOMPLETE_COVERAGE else 0
+        )
+        decision = decide_next_state(
+            EvaluationObservation(
+                current_state=state.state,
+                pipeline_status=result.status,
+                coverage_reason=str(result.reason or result.coverage_detail or ""),
+                observed_window_candles=int(result.observed_window_candles),
+                observation_window=window,
+                window_elapsed=window_elapsed,
+                coverage_attempts=max(1, coverage_attempts),
+                coverage_finalize_after_attempts=(
+                    self._config.coverage_finalize_after_attempts
+                ),
+            )
+        )
+        counters.variant_states_evaluated += 1
+        apply = self._store.apply_evaluation(
+            source_event_key=state.source_event_key,
+            variant_id=state.variant_id,
+            policy_fingerprint=state.policy_fingerprint,
+            result_dict=result.to_dict(),
+            decision=decision,
+            evaluation_asof_ms=asof_ms,
+            window_elapsed=window_elapsed,
+            candle_source=candle_source,
+        )
+        if apply.conflict:
+            counters.immutable_result_conflicts += 1
+        counters.note_variant(state.variant_id, apply.state)
+        self._count_terminal(counters, result, apply.state)
+
+    @staticmethod
+    def _count_terminal(counters: TelemetryCounters, result: Any, state: str) -> None:
+        if state == STATE_CONFIRMED_DELAYED and result.status == STATE_CONFIRMED_DELAYED:
+            counters.variants_confirmed_delayed += 1
+            if result.entry_delay_ms is not None:
+                counters.confirmation_delays_ms.append(int(result.entry_delay_ms))
+        elif state == STATE_EXPIRED:
+            counters.variants_expired += 1
+        elif state == STATE_INCOMPLETE_COVERAGE:
+            counters.variants_incomplete_coverage += 1
+        elif state == STATE_INVALID_SOURCE:
+            counters.variants_invalid_source += 1
+        elif state == STATE_NOT_READY:
+            counters.variants_not_ready += 1
