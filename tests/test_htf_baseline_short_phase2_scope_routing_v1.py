@@ -827,6 +827,14 @@ def test_every_frozen_and_allowlisted_path_routes_on(tmp_path, monkeypatch):
         "monitoring/grafana/dashboards/me-inverse-short-oos-2.json",
         "tests/test_me_long_v2_inverse_short_oos2_isolation_v1.py",
         "scripts/me_inverse_short_v3_preflight.py",
+        # Issue #305 SOURCE_ONLY routing bugfix: same cross-PR mechanical
+        # class as scanner_runner.py above — the #305 coverage module's
+        # additive diagnostics parameter and the two research test modules
+        # are NOT phase-2 surfaces and route the FULL PR gate (NO_PHASE2).
+        "app/research/me_upstream_source_v1/coverage.py",
+        "tests/test_me_upstream_source_coverage_v1.py",
+        "tests/test_me_inverse_short_v2_source_only.py",
+        "docs/research/305_upstream_source_capture_v1.md",
     }
     for path in (*frozen, *allowed_modified):
         expected = NO_PHASE2 if path in external_allowlisted else PHASE2_ONLY

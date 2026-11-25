@@ -863,6 +863,19 @@ def test_no_tracked_file_modified_against_base():
         "monitoring/grafana/dashboards/me-inverse-short-oos-2.json",
         "tests/test_me_long_v2_inverse_short_oos2_isolation_v1.py",
         "scripts/me_inverse_short_v3_preflight.py",
+        # Issue #305 SOURCE_ONLY routing bugfix (upstream metadata loss):
+        # scanner_runner.py is already allowlisted above; the fix additionally
+        # touches the #305 coverage module (additive unverified_intervals
+        # DIAGNOSTICS parameter — verdict formulas and freeze semantics stay
+        # byte-identical) and the two research test modules (regression
+        # scenarios A-E + deployment-gap diagnostics tests).  Research-only,
+        # no phase-2/frozen strategy semantics change in any of them.
+        "app/research/me_upstream_source_v1/coverage.py",
+        "tests/test_me_upstream_source_coverage_v1.py",
+        "tests/test_me_inverse_short_v2_source_only.py",
+        # …and the #305 research documentation, which records the SOURCE_ONLY
+        # routing defect, its fix and the deployment-gap accounting plan.
+        "docs/research/305_upstream_source_capture_v1.md",
     )
 
     unexpected = []

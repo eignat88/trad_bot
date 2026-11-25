@@ -2373,22 +2373,35 @@ def run_scan_cycle(
                         stat[field] += values[field]
 
                 if source_only:
-                    # Preserve the pre-gate source publication verbatim.
-                    # Suppress ordinary scanner setup routing and ALL unrelated
-                    # research metadata. The original V2 delivery site below
-                    # remains the ONE production source-capture call site.
+                    # Preserve the pre-gate source publications verbatim.
+                    # BOTH research source streams must survive SOURCE_ONLY
+                    # routing — the V2/V3 source metadata AND the #305
+                    # detector-level upstream capture (both are built BEFORE
+                    # any trading filter and are research-only):
+                    #   * _me_inverse_short_source_events — V1/V2/OOS-2/V3
+                    #   * _me_upstream_source_events     — #305 upstream
+                    # Suppress ordinary scanner setup routing and ALL
+                    # unrelated research metadata. The original V2 delivery
+                    # site below remains the ONE production source-capture
+                    # call site.
                     source_events = symbol_stats.get(
                         "_me_inverse_short_source_events", []
                     )
+                    upstream_events = symbol_stats.get(
+                        "_me_upstream_source_events", []
+                    )
                     symbol_stats = {
                         "_me_inverse_short_source_events": source_events,
+                        "_me_upstream_source_events": upstream_events,
                     }
                     candidates = []
-                    if source_events:
+                    if source_events or upstream_events:
                         logger.info(
                             "ME_INVERSE_SHORT_V2_SOURCE_ONLY source_events=%d "
+                            "upstream_events=%d "
                             "symbol=%s (normal_setups=0)",
-                            len(source_events), symbol,
+                            len(source_events), len(upstream_events),
+                            symbol,
                         )
 
                 for c in candidates:

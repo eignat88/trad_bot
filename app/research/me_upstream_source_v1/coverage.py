@@ -369,6 +369,55 @@ def reconcile_coverage(
     *,
     as_of: datetime | None = None,
     grace_seconds: int = DEFAULT_GRACE_SECONDS,
+    unverified_intervals: Sequence[tuple[datetime, datetime]] | None = None,
+) -> dict[str, Any]:
+    """Read-only upstream ↔ V3 reconciliation (SELECT statements only).
+
+    ``unverified_intervals`` — optional explicit ``(start, end)`` intervals
+    whose coverage can NOT be verified retroactively (e.g. a delivery-
+    routing outage between ``freeze_ts`` and a fix deployment — the
+    SOURCE_ONLY routing defect window of 2026-11-24/25).  Purely
+    DIAGNOSTIC: recorded in the result (and persisted in
+    ``coverage_audit.diagnostics``) and never converted into verdict
+    evidence — the absence of events inside such an interval is never
+    treated as verified completeness (``COVERAGE_PASS`` still requires
+    matched >= 1), no historical rows are admitted retroactively, and the
+    original ``freeze_ts`` and the COVERAGE_PASS formula stay untouched.
+    """
+    intervals = _normalize_unverified_intervals(unverified_intervals)
+    result = _reconcile_coverage_impl(
+        connection, as_of=as_of, grace_seconds=grace_seconds,
+    )
+    if intervals is not None:
+        result["unverified_intervals"] = intervals
+    return result
+
+
+def _normalize_unverified_intervals(
+    raw: Sequence[tuple[datetime, datetime]] | None,
+) -> list[tuple[str, str]] | None:
+    """Validate deployment-gap intervals -> ISO strings (diagnostics only)."""
+    if raw is None:
+        return None
+    normalized: list[tuple[str, str]] = []
+    for item in raw:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise ValueError("INVALID_UNVERIFIED_INTERVAL")
+        start, end = item
+        if not isinstance(start, datetime) or not isinstance(end, datetime):
+            raise ValueError("INVALID_UNVERIFIED_INTERVAL")
+        start_utc, end_utc = as_utc(start), as_utc(end)
+        if start_utc >= end_utc:
+            raise ValueError("INVALID_UNVERIFIED_INTERVAL")
+        normalized.append((start_utc.isoformat(), end_utc.isoformat()))
+    return normalized
+
+
+def _reconcile_coverage_impl(
+    connection: Any,
+    *,
+    as_of: datetime | None = None,
+    grace_seconds: int = DEFAULT_GRACE_SECONDS,
 ) -> dict[str, Any]:
     """Read-only upstream ↔ V3 reconciliation (SELECT statements only)."""
     if type(grace_seconds) is not int or grace_seconds < 0:
