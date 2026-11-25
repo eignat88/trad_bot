@@ -36,9 +36,9 @@ from app.research.me_entry_quality_h2_prospective_v1.runtime import (
 from app.research.me_entry_quality_h2_prospective_v1.source_reader import (
     SOURCE_EVENT_COLUMNS,
     assert_select_only,
+    cursor_of,
     delivery_from_row,
     row_mapping,
-    watermark_of,
 )
 from app.research.me_entry_quality_h2_prospective_v1.store import (
     InMemoryProspectiveStore,
@@ -206,12 +206,63 @@ class TestSelectOnlyGuard:
         else:  # pragma: no cover
             raise AssertionError("wrong-width row accepted")
 
-    def test_watermark_is_the_batch_tail(self):
+    def test_cursor_is_the_batch_tail(self):
+        # review P1-watermark: the cursor tracks the CAPTURE order
         rows = [make_source_row(key=f"e{i}") for i in range(3)]
-        us, key = watermark_of(rows)
+        us, key = cursor_of(rows)
         assert key == "e2"
         assert us > 0
-        assert watermark_of([]) == (0, "")
+        assert cursor_of([]) == (0, "")
+
+
+class TestSourcePriceValidation:
+    """Review P1-Decimal: strict, exact, type-safe source prices."""
+
+    def test_decimal_price_is_delivered_exact(self):
+        from decimal import Decimal
+
+        row = make_source_row()
+        row["source_reference_price"] = Decimal("123.4567890123456789")
+        delivery = delivery_from_row(row)
+        assert delivery.status == INGEST_ACCEPTED
+        assert delivery.row["source_reference_price"] == Decimal(
+            "123.4567890123456789"
+        )
+
+    def test_invalid_prices_are_rejected_not_coerced(self):
+        for bad in (
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            0,
+            0.0,
+            -1,
+            -0.5,
+            "abc",
+            "12,34",
+            "1e5",
+            " 12 ",
+            "",
+            None,
+            True,
+            [1.0],
+        ):
+            row = make_source_row()
+            row["source_reference_price"] = bad
+            delivery = delivery_from_row(row)
+            assert delivery.status == INGEST_REJECTED_INVALID, bad
+            assert delivery.reason == "INVALID_SOURCE_PRICE", bad
+
+    def test_plain_numeric_strings_are_parsed_exactly(self):
+        from decimal import Decimal
+
+        row = make_source_row()
+        row["source_reference_price"] = "123.4567890123456789"
+        delivery = delivery_from_row(row)
+        assert delivery.status == INGEST_ACCEPTED
+        assert delivery.row["source_reference_price"] == Decimal(
+            "123.4567890123456789"
+        )
 
 
 class TestSourceEmptyWaiting:

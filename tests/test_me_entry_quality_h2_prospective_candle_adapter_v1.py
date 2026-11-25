@@ -24,6 +24,7 @@ from app.research.me_entry_quality_h2_prospective_v1.candle_adapter import (
     REASON_PROVIDER_DISABLED,
     observation_grid,
     observation_window_elapsed,
+    pages_for_range,
     required_fetch_range,
     rows_as_mappings,
 )
@@ -132,18 +133,18 @@ class TestBudget:
         assert budget.budget_skips == 1
 
     def test_hourly_cap_is_enforced(self):
-        clock_now = [0.0]
+        wall_now = [0.0]
         budget = CandleApiBudget(
             max_requests_per_cycle=100,
             max_requests_per_hour=3,
-            clock=lambda: clock_now[0],
+            wall=lambda: wall_now[0],
             sleep=lambda _s: None,
         )
         budget.start_cycle()
         for _ in range(3):
             assert budget.try_consume()
         assert not budget.try_consume()
-        clock_now[0] = 3601.0  # next hour window
+        wall_now[0] = 3601.0  # next hour window
         assert budget.try_consume()
 
     def test_retries_are_counted(self):
@@ -151,6 +152,67 @@ class TestBudget:
         budget.note_retry()
         budget.backoff(1)
         assert budget.retries == 1
+
+    # ── review P1-budget: ACTUAL request accounting ────────────────────────
+
+    def test_multi_request_reservation_is_all_or_nothing(self):
+        budget = CandleApiBudget(
+            max_requests_per_cycle=10, max_requests_per_hour=100
+        )
+        budget.start_cycle()
+        assert budget.try_consume(3)
+        assert budget.api_requests == 3
+        # a 8-request reservation would exceed the cycle cap -> nothing spent
+        assert not budget.try_consume(8)
+        assert budget.api_requests == 3
+        assert budget.try_consume(7)
+
+    def test_pages_map_to_http_requests(self):
+        budget = CandleApiBudget(page_size=1000, requests_per_page=1)
+        assert budget.requests_for_pages(1) == 1
+        assert budget.requests_for_pages(3) == 3
+        conservative = CandleApiBudget(requests_per_page=3)
+        assert conservative.requests_for_pages(2) == 6
+
+    def test_hour_window_survives_restart(self):
+        # persisted state -> new budget object (process restart) keeps the
+        # consumed hourly allowance (review P1-budget restart table)
+        wall_now = [1_000.0]
+        saved: dict = {}
+
+        budget = CandleApiBudget(
+            max_requests_per_cycle=100,
+            max_requests_per_hour=5,
+            wall=lambda: wall_now[0],
+            on_change=lambda state: saved.update(state),
+            sleep=lambda _s: None,
+        )
+        budget.start_cycle()
+        for _ in range(4):
+            assert budget.try_consume()
+        assert saved["requests_in_hour"] == 4
+
+        restarted = CandleApiBudget(
+            max_requests_per_cycle=100,
+            max_requests_per_hour=5,
+            wall=lambda: wall_now[0],
+            sleep=lambda _s: None,
+        )
+        restarted.hydrate(saved)
+        restarted.start_cycle()
+        assert restarted.try_consume()  # 5th within the hour
+        assert not restarted.try_consume()  # hour exhausted -> no request
+
+    def test_persistence_failure_is_fail_closed(self):
+        def boom(_state):
+            raise RuntimeError("store down")
+
+        budget = CandleApiBudget(on_change=boom, sleep=lambda _s: None)
+        budget.start_cycle()
+        assert budget.try_consume()  # consumed, but the save failed
+        assert budget.persistence_failed
+        assert not budget.try_consume()  # fail closed: no unpersisted budget
+        assert budget.api_requests == 1
 
 
 class _ScriptedClient:
@@ -261,6 +323,61 @@ class TestProvider:
         )
         assert not outcome.ok
         assert outcome.rows == ()
+
+    def test_multipage_fetch_reserves_every_http_request(self):
+        # review P1-budget acceptance: pagination with max_pages > 1 must
+        # put ALL pages in the budget before a single request leaves
+        client = _ScriptedClient([as_candles(candle_rows(0, 30))] * 5)
+        provider = self._provider(
+            client, page_size=10, max_pages=20, max_requests_per_cycle=10_000
+        )
+        provider.budget.start_cycle()
+        outcome = provider.fetch_closed_5m(
+            symbol="BTCUSDT",
+            grid=observation_grid((BASE_MS + 18 * MS + 60_000) * 1000),
+            evaluation_asof_ms=BASE_MS + 25 * MS,
+        )
+        assert outcome.ok
+        # the canonical window spans >10 buckets -> multiple pages -> the
+        # full pagination cost is in the budget
+        assert outcome.api_requests > 1
+        assert outcome.api_requests == provider.budget.api_requests
+
+    def test_multipage_budget_exhaustion_blocks_all_requests(self):
+        # a range that cannot be paid for makes NO request at all
+        client = _ScriptedClient([as_candles(candle_rows(0, 30))] * 5)
+        provider = self._provider(client, page_size=10, max_pages=20)
+        provider.budget.start_cycle()
+        # cycle cap smaller than one full range reservation
+        provider.budget.max_requests_per_cycle = 3
+        outcome = provider.fetch_closed_5m(
+            symbol="BTCUSDT",
+            grid=observation_grid((BASE_MS + 18 * MS + 60_000) * 1000),
+            evaluation_asof_ms=BASE_MS + 25 * MS,
+        )
+        assert not outcome.ok
+        assert outcome.reason == REASON_BUDGET_EXHAUSTED
+        assert client.calls == []
+
+    def test_retry_attempt_is_fully_recounted(self):
+        # each retry re-reserves the FULL page count (fail-closed upper bound)
+        client = _ScriptedClient(
+            [RuntimeError("rate limited"), as_candles(candle_rows(0, 30))]
+        )
+        provider = self._provider(
+            client, page_size=10, max_pages=20, max_requests_per_cycle=10_000
+        )
+        provider.budget.start_cycle()
+        outcome = provider.fetch_closed_5m(
+            symbol="BTCUSDT",
+            grid=observation_grid((BASE_MS + 18 * MS + 60_000) * 1000),
+            evaluation_asof_ms=BASE_MS + 25 * MS,
+        )
+        assert outcome.ok
+        assert outcome.retries == 1
+        assert outcome.api_requests == 2 * pages_for_range(
+            outcome.requested_range[0], outcome.requested_range[1], 10
+        )
 
 
 class TestClosedCandleContract:

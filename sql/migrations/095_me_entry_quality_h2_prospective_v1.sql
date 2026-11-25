@@ -46,21 +46,53 @@ CREATE TABLE IF NOT EXISTS research_me_entry_quality_h2_prospective.ingest_event
             'REJECTED_LINEAGE_INTEGRITY',
             'REJECTED_INVALID_SOURCE'
         )
+    ),
+
+    -- Review P1-Decimal: a source price is a FINITE POSITIVE decimal —
+    -- NUMERIC NaN / Infinity / zero / negative are refused by the database
+    -- as well (defense in depth behind the strict ingest validation).
+    CONSTRAINT h2p_ingest_price_chk
+    CHECK (
+        source_reference_price IS NULL OR (
+            source_reference_price > 0
+            AND source_reference_price NOT IN (
+                'NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric
+            )
+        )
     )
 );
 
 CREATE INDEX IF NOT EXISTS idx_h2p_ingest_signal
 ON research_me_entry_quality_h2_prospective.ingest_event (signal_time_us, source_event_key);
 
--- Reader watermark: exclusive checkpoint (signal_time_us, source_event_key)
--- so restarts never skip unfinished events and never re-ingest old ones.
+-- Reader cursor: exclusive CAPTURE-ORDER checkpoint
+-- (captured_at_us, source_event_key) — never signal_time (review
+-- P1-watermark: late-committed events with earlier signal_time are never
+-- skipped).  Written ONLY after the batch's ingest + variant states are
+-- durably committed (checkpoint-last in the runtime).
 CREATE TABLE IF NOT EXISTS research_me_entry_quality_h2_prospective.reader_watermark (
     id INTEGER PRIMARY KEY DEFAULT 1,
-    signal_time_us BIGINT NOT NULL DEFAULT 0,
-    source_event_key TEXT NOT NULL DEFAULT '',
+    cursor_captured_at_us BIGINT NOT NULL DEFAULT 0,
+    cursor_key TEXT NOT NULL DEFAULT '',
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
     CONSTRAINT h2p_watermark_singleton_chk CHECK (id = 1)
+);
+
+-- ---------------------------------------------------------------------------
+-- Research API budget state: the hourly Bybit request window is PERSISTED so
+-- a runtime restart never resets it unsafely (review P1-budget).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS research_me_entry_quality_h2_prospective.api_budget_state (
+    id INTEGER PRIMARY KEY DEFAULT 1,
+    hour_started_at_ms BIGINT NOT NULL DEFAULT 0,
+    requests_in_hour INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT h2p_budget_singleton_chk CHECK (id = 1),
+    CONSTRAINT h2p_budget_counts_chk CHECK (
+        requests_in_hour >= 0 AND hour_started_at_ms >= 0
+    )
 );
 
 -- ---------------------------------------------------------------------------
@@ -256,6 +288,8 @@ ON research_me_entry_quality_h2_prospective.runtime_health (recorded_at, status)
 -- ---------------------------------------------------------------------------
 -- Immutability protection: terminal results, evaluation journal, conflict
 -- ledger and the ingest snapshot are append-only / never rewritten.
+-- Review P2-migration: every trigger is DROP + CREATE so the migration is
+-- safely RE-APPLICABLE (idempotent); the functions are CREATE OR REPLACE.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION
 research_me_entry_quality_h2_prospective.protect_immutable()
@@ -267,6 +301,8 @@ BEGIN
 END;
 $$;
 
+DROP TRIGGER IF EXISTS h2p_protect_variant_result
+ON research_me_entry_quality_h2_prospective.variant_result;
 CREATE TRIGGER h2p_protect_variant_result
 BEFORE UPDATE OR DELETE
 ON research_me_entry_quality_h2_prospective.variant_result
@@ -274,6 +310,8 @@ FOR EACH ROW
 EXECUTE FUNCTION
 research_me_entry_quality_h2_prospective.protect_immutable();
 
+DROP TRIGGER IF EXISTS h2p_protect_evaluation_log
+ON research_me_entry_quality_h2_prospective.evaluation_log;
 CREATE TRIGGER h2p_protect_evaluation_log
 BEFORE UPDATE OR DELETE
 ON research_me_entry_quality_h2_prospective.evaluation_log
@@ -281,6 +319,8 @@ FOR EACH ROW
 EXECUTE FUNCTION
 research_me_entry_quality_h2_prospective.protect_immutable();
 
+DROP TRIGGER IF EXISTS h2p_protect_result_conflict
+ON research_me_entry_quality_h2_prospective.result_conflict;
 CREATE TRIGGER h2p_protect_result_conflict
 BEFORE UPDATE OR DELETE
 ON research_me_entry_quality_h2_prospective.result_conflict
@@ -300,6 +340,7 @@ BEGIN
        OR NEW.source_identity IS DISTINCT FROM OLD.source_identity
        OR NEW.lineage_hash IS DISTINCT FROM OLD.lineage_hash
        OR NEW.signal_time_us IS DISTINCT FROM OLD.signal_time_us
+       OR NEW.source_reference_price IS DISTINCT FROM OLD.source_reference_price
        OR NEW.immutable_source_hash IS DISTINCT FROM OLD.immutable_source_hash
        OR NEW.ingest_status IS DISTINCT FROM OLD.ingest_status
     THEN
@@ -309,17 +350,64 @@ BEGIN
 END;
 $$;
 
+DROP TRIGGER IF EXISTS h2p_protect_ingest_snapshot
+ON research_me_entry_quality_h2_prospective.ingest_event;
 CREATE TRIGGER h2p_protect_ingest_snapshot
 BEFORE UPDATE ON research_me_entry_quality_h2_prospective.ingest_event
 FOR EACH ROW
 EXECUTE FUNCTION
 research_me_entry_quality_h2_prospective.protect_ingest_snapshot();
 
+DROP TRIGGER IF EXISTS h2p_protect_ingest_delete
+ON research_me_entry_quality_h2_prospective.ingest_event;
 CREATE TRIGGER h2p_protect_ingest_delete
 BEFORE DELETE
 ON research_me_entry_quality_h2_prospective.ingest_event
 FOR EACH ROW
 EXECUTE FUNCTION
 research_me_entry_quality_h2_prospective.protect_immutable();
+
+-- ---------------------------------------------------------------------------
+-- Review P2-migration: never silently accept an INCOMPATIBLE pre-existing
+-- schema.  Re-application of THIS migration is idempotent; a table that
+-- exists but lacks a required column is a predictable REFUSAL (the whole
+-- transaction rolls back).
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE
+    missing TEXT;
+BEGIN
+    SELECT string_agg(expected.col, ', ') INTO missing
+    FROM (
+        SELECT 'reader_watermark.cursor_captured_at_us' AS col
+        WHERE NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'research_me_entry_quality_h2_prospective'
+              AND table_name = 'reader_watermark'
+              AND column_name = 'cursor_captured_at_us'
+        )
+        UNION ALL
+        SELECT 'ingest_event.source_reference_price'
+        WHERE NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'research_me_entry_quality_h2_prospective'
+              AND table_name = 'ingest_event'
+              AND column_name = 'source_reference_price'
+        )
+        UNION ALL
+        SELECT 'variant_result.entry_candidate_price'
+        WHERE NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'research_me_entry_quality_h2_prospective'
+              AND table_name = 'variant_result'
+              AND column_name = 'entry_candidate_price'
+        )
+    ) AS expected;
+    IF missing IS NOT NULL THEN
+        RAISE EXCEPTION
+            'H2P_SCHEMA_INCOMPATIBLE: missing columns: %', missing;
+    END IF;
+END;
+$$;
 
 COMMIT;

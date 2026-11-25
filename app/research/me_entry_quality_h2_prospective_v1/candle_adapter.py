@@ -139,6 +139,22 @@ class CandleApiBudget:
     Separate from every production limiter: the counters live in this process
     only and are additionally capped per cycle and per hour so the research
     runtime can never compete with the scanner for Bybit request capacity.
+
+    Review P1-budget — request accounting:
+
+    * ``try_consume(count)`` reserves ``count`` ACTUAL HTTP requests
+      (all-or-nothing).  One ``get_klines_range`` page is one HTTP request
+      (the research client is built with ``bybit_max_attempts=1`` and
+      ``bybit_rate_limit_max_retries=0`` — enforced by the runner factory and
+      pinned by tests), so a paged fetch reserves its whole page count BEFORE
+      any request leaves and can never exceed the caps even with
+      ``max_pages > 1``;
+    * ``requests_per_page > 1`` makes the reservation a conservative UPPER
+      bound (for clients that retry internally) — it never under-counts;
+    * the hourly window is PERSISTED through the store (``hydrate`` /
+      ``on_change``) so a restart never resets it unsafely.  Persistence is
+      fail-closed: once a save fails, no further request is granted until the
+      store recovers.
     """
 
     max_requests_per_cycle: int = 10
@@ -148,38 +164,88 @@ class CandleApiBudget:
     request_pause_s: float = 0.5
     page_size: int = 1000
     max_pages: int = 10
+    #: HTTP requests ONE ``get_klines_range`` page may cost (1 = exact).
+    requests_per_page: int = 1
     #: injectable monotonic clock (tests)
     clock: Callable[[], float] = field(default=time.monotonic)
+    #: injectable wall clock for the PERSISTED hour window (tests)
+    wall: Callable[[], float] = field(default=time.time)
     #: injectable sleep (tests never actually sleep)
     sleep: Callable[[float], None] = field(default=time.sleep)
+    #: persistence hook (store.save_api_budget_state)
+    on_change: Callable[[Mapping[str, Any]], None] | None = None
+    #: fail-closed latch: True once a state save failed
+    persistence_failed: bool = False
     # ── accounting (telemetry) ──
     api_requests: int = 0
     retries: int = 0
     rate_limit_skips: int = 0
     budget_skips: int = 0
     _cycle_requests: int = 0
-    _hour_started_at: float | None = field(default=None)
+    _hour_started_at_ms: int | None = field(default=None)
     _hour_requests: int = 0
 
     def start_cycle(self) -> None:
         self._cycle_requests = 0
 
-    def try_consume(self) -> bool:
-        """Consume ONE request unit; ``False`` when a cap would be exceeded."""
-        now = self.clock()
-        if self._hour_started_at is None or now - self._hour_started_at >= 3600.0:
-            self._hour_started_at = now
+    def state(self) -> dict[str, Any]:
+        return {
+            "hour_started_at_ms": int(self._hour_started_at_ms or 0),
+            "requests_in_hour": int(self._hour_requests),
+        }
+
+    def hydrate(self, state: Mapping[str, Any] | None) -> None:
+        """Restore the PERSISTED hour window (review P1-budget restart)."""
+        if not state:
+            return
+        self._hour_started_at_ms = (
+            int(state.get("hour_started_at_ms") or 0) or None
+        )
+        self._hour_requests = int(state.get("requests_in_hour") or 0)
+        self.persistence_failed = False
+
+    def _persist(self) -> None:
+        if self.on_change is None:
+            return
+        try:
+            self.on_change(self.state())
+        except Exception:  # noqa: BLE001 - fail closed on persistence errors
+            self.persistence_failed = True
+
+    def _roll_hour(self) -> None:
+        now_ms = int(self.wall() * 1000)
+        if (
+            self._hour_started_at_ms is None
+            or now_ms - self._hour_started_at_ms >= 3_600_000
+        ):
+            self._hour_started_at_ms = now_ms
             self._hour_requests = 0
-        if self._cycle_requests >= self.max_requests_per_cycle:
+
+    def try_consume(self, count: int = 1) -> bool:
+        """Reserve ``count`` HTTP requests; ``False`` when a cap would be
+        exceeded (all-or-nothing — nothing is consumed on failure)."""
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+            raise ValueError("count must be a positive integer")
+        if self.persistence_failed:
+            # Fail closed: an unpersisted budget could reset on restart.
             self.budget_skips += 1
             return False
-        if self._hour_requests >= self.max_requests_per_hour:
+        self._roll_hour()
+        if self._cycle_requests + count > self.max_requests_per_cycle:
             self.budget_skips += 1
             return False
-        self._cycle_requests += 1
-        self._hour_requests += 1
-        self.api_requests += 1
+        if self._hour_requests + count > self.max_requests_per_hour:
+            self.budget_skips += 1
+            return False
+        self._cycle_requests += count
+        self._hour_requests += count
+        self.api_requests += count
+        self._persist()
         return True
+
+    def requests_for_pages(self, pages: int) -> int:
+        """Reservation size for ``pages`` pagination pages (>= 1)."""
+        return max(1, int(pages)) * max(1, int(self.requests_per_page))
 
     def note_retry(self) -> None:
         self.retries += 1
@@ -230,6 +296,21 @@ class CandleFetchOutcome:
                 else self.source_identity.to_dict()
             ),
         }
+
+
+def pages_for_range(start_ms: int, end_ms: int, page_size: int) -> int:
+    """Number of ``get_klines_range`` HTTP requests for ``[start_ms, end_ms]``.
+
+    Mirrors ``BybitClient.get_klines_range`` pagination exactly (inclusive
+    bounds, at most ``page_size`` 5m bars per request), so one reserved unit
+    maps to ONE actual HTTP request (review P1-budget).
+    """
+    if end_ms < start_ms:
+        return 0
+    clamped = max(1, min(int(page_size), 1000))
+    span = int(end_ms) - int(start_ms) + 1
+    per_page_ms = clamped * CANDLE_5M_MS
+    return max(1, (span + per_page_ms - 1) // per_page_ms)
 
 
 def _looks_like_rate_limit(message: str) -> bool:
@@ -302,18 +383,37 @@ class BybitClosedCandleProvider:
         requests_before = self._budget.api_requests
         retries_before = self._budget.retries
         skips_before = self._budget.rate_limit_skips
+        # Review P1-budget: reserve the FULL pagination cost of the range
+        # BEFORE any HTTP request leaves.  One page == one HTTP request under
+        # the documented client invariant (single attempt per page).
+        pages_needed = pages_for_range(
+            start_ms, end_ms, self._budget.page_size
+        )
+        if pages_needed > self._budget.max_pages:
+            return CandleFetchOutcome(
+                ok=False,
+                reason=REASON_FETCH_ERROR,
+                detail=(
+                    f"range needs {pages_needed} pages > max_pages="
+                    f"{self._budget.max_pages}; refusing to fetch"
+                ),
+                requested_range=requested,
+            )
+        reserve = self._budget.requests_for_pages(pages_needed)
         rows: tuple[Candle, ...] = ()
         last_error = ""
         attempts = 0
         while True:
             attempts += 1
-            if not self._budget.try_consume():
+            if not self._budget.try_consume(reserve):
                 return CandleFetchOutcome(
                     ok=False,
                     reason=REASON_BUDGET_EXHAUSTED,
                     detail=(
                         "research API request budget exhausted "
-                        f"(attempt {attempts}); fail closed, no partial data"
+                        f"({reserve} requests reserved for {pages_needed} "
+                        f"page(s), attempt {attempts}); fail closed, no "
+                        "partial data"
                     ),
                     requested_range=requested,
                     api_requests=self._budget.api_requests - requests_before,

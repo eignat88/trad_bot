@@ -114,13 +114,15 @@ class FakeSourceCursor:
         if self._force_redeliver:
             self._result = [self._tuple(r) for r in self._rows]
             return
-        wm_ts, _wm2, wm_key, limit = params
+        # capture-order cursor (review P1-watermark):
+        # (captured_at, source_event_key) exclusive
+        after_us, _after_us2, after_key, limit = params
         picked = [
             r for r in self._rows
-            if r["signal_time"] > wm_ts
-            or (r["signal_time"] == wm_ts and r["source_event_key"] > wm_key)
+            if r["captured_at"] > after_us
+            or (r["captured_at"] == after_us and r["source_event_key"] > after_key)
         ]
-        picked.sort(key=lambda r: (r["signal_time"], r["source_event_key"]))
+        picked.sort(key=lambda r: (r["captured_at"], r["source_event_key"]))
         self._result = [self._tuple(r) for r in picked[: int(limit)]]
 
     @staticmethod
@@ -285,7 +287,7 @@ class TestRestartRecovery:
                                  asof_ms=SIGNAL_MS + 1_000,
                                  policies=[TURN1_W3])
         r1.run_cycle()
-        assert store.get_watermark()[1] == "evt-1"
+        assert store.get_cursor()[1] == "evt-1"
 
         # "restart": a fresh runtime over the SAME persistent store; the
         # source redelivers the same event (watermark regression) and the
@@ -294,7 +296,9 @@ class TestRestartRecovery:
                                  asof_ms=BASE_MS + 19 * MS,
                                  policies=[TURN1_W3], force_redeliver=True)
         report = r2.run_cycle()
-        assert report.counters["idempotent_duplicates"] == 1
+        # the forced redelivery is seen by both scan phases (forward scan +
+        # overlap sweep) and stays idempotent either way
+        assert report.counters["idempotent_duplicates"] == 2
         assert report.counters["source_events_accepted"] == 0
         assert report.counters["variants_confirmed_delayed"] == 1
         keys = list(store.results)
@@ -409,8 +413,29 @@ class TestDisabledRuntime:
         assert H2ProspectiveConfig().candle_budget_confirmed is False
         with pytest.raises(H2ProspectiveConfigError):
             load_config({"H2_PROSPECTIVE_ENABLED": "maybe"})
-        config = load_config({"H2_PROSPECTIVE_ENABLED": "1"})
+
+    def test_unfrozen_policy_accumulation_needs_explicit_permission(self):
+        # review §7: enabled + empty pins + no opt-in = fail closed
+        with pytest.raises(H2ProspectiveConfigError):
+            load_config({"H2_PROSPECTIVE_ENABLED": "1"})
+        # explicit pre-freeze research permission
+        config = load_config({
+            "H2_PROSPECTIVE_ENABLED": "1",
+            "H2_PROSPECTIVE_ALLOW_UNFROZEN_POLICIES": "1",
+        })
         assert config.enabled is True
+        # pinned fingerprints are the other permitted route
+        pinned = load_config({
+            "H2_PROSPECTIVE_ENABLED": "1",
+            "H2_PROSPECTIVE_POLICY_FINGERPRINT_PINS": "ab" * 32,
+        })
+        assert pinned.policy_fingerprint_pins == ("ab" * 32,)
+        # invalid opt-in value stays strict
+        with pytest.raises(H2ProspectiveConfigError):
+            load_config({
+                "H2_PROSPECTIVE_ENABLED": "1",
+                "H2_PROSPECTIVE_ALLOW_UNFROZEN_POLICIES": "maybe",
+            })
 
     def test_runner_exits_before_any_io_when_disabled(self, monkeypatch):
         def _explode(*_a, **_k):

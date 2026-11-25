@@ -238,12 +238,27 @@ class TestVariantState:
         assert [s.source_event_key for s in pending] == ["evt-1"]
 
 
-class TestWatermark:
-    def test_watermark_roundtrip(self):
+class TestCursor:
+    def test_cursor_roundtrip(self):
+        # review P1-watermark: the cursor is the capture-order checkpoint
         store = InMemoryProspectiveStore()
-        assert store.get_watermark() == (0, "")
-        store.set_watermark(BASE_MS * 1000, "evt-9")
-        assert store.get_watermark() == (BASE_MS * 1000, "evt-9")
+        assert store.get_cursor() == (0, "")
+        store.set_cursor(BASE_MS * 1000, "evt-9")
+        assert store.get_cursor() == (BASE_MS * 1000, "evt-9")
+
+
+class TestApiBudgetState:
+    def test_budget_state_roundtrip(self):
+        # review P1-budget: hourly window persists across restarts
+        store = InMemoryProspectiveStore()
+        assert store.load_api_budget_state() is None
+        store.save_api_budget_state(
+            {"hour_started_at_ms": 12_345, "requests_in_hour": 7}
+        )
+        assert store.load_api_budget_state() == {
+            "hour_started_at_ms": 12_345,
+            "requests_in_hour": 7,
+        }
 
 
 class TestHealthAndConflicts:
@@ -359,13 +374,38 @@ class TestPgSqlContract:
         heads = [h for h, _ in conn.statements]
         assert heads == ["SELECT", "UPDATE"]
 
-    def test_watermark_roundtrip_statements(self):
+    def test_cursor_roundtrip_statements(self):
         pg, conn = self._store()
         conn.fetchone_rows.append((123, "evt-1"))
-        assert pg.get_watermark() == (123, "evt-1")
-        pg.set_watermark(456, "evt-2")
+        assert pg.get_cursor() == (123, "evt-1")
+        pg.set_cursor(456, "evt-2")
         heads = [h for h, _ in conn.statements]
         assert heads == ["SELECT", "INSERT"]
+
+    def test_api_budget_state_statements(self):
+        pg, conn = self._store()
+        conn.fetchone_rows.append(None)
+        assert pg.load_api_budget_state() is None
+        pg.save_api_budget_state(
+            {"hour_started_at_ms": 99, "requests_in_hour": 2}
+        )
+        heads = [h for h, _ in conn.statements]
+        assert heads == ["SELECT", "INSERT"]
+
+    def test_get_source_row_restores_price_from_numeric_column(self):
+        # review P1-Decimal: the NUMERIC column is authoritative
+        from decimal import Decimal
+
+        pg, conn = self._store()
+        conn.fetchone_rows.append((
+            {
+                "source_event_key": "evt-1",
+                "source_reference_price": "123.4567890123456789",
+            },
+            Decimal("123.4567890123456789"),
+        ))
+        row = pg.get_source_row("evt-1")
+        assert row["source_reference_price"] == Decimal("123.4567890123456789")
 
     def test_apply_evaluation_statements_are_parameterized(self):
         pg, conn = self._store()

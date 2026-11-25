@@ -38,12 +38,16 @@ from typing import Any, Mapping, Sequence
 
 from app.research.me_entry_quality_h2_prospective_v1.contracts import (
     INGEST_ACCEPTED,
+    INGEST_REJECTED_INVALID,
     INGEST_REJECTED_LINEAGE,
     REASON_EVENT_KEY_LINEAGE_CONFLICT,
+    REASON_INVALID_SOURCE_PRICE,
     REASON_OK,
     STATE_PENDING_CONFIRMATION,
     TERMINAL_STATES,
+    exact_price_str,
     immutable_result_hash,
+    parse_source_price,
 )
 from app.research.me_entry_quality_h2_prospective_v1.lifecycle import (
     LifecycleDecision,
@@ -59,6 +63,7 @@ CONFLICT_TABLE = f"{SCHEMA}.result_conflict"
 EVALUATION_TABLE = f"{SCHEMA}.evaluation_log"
 HEALTH_TABLE = f"{SCHEMA}.runtime_health"
 WATERMARK_TABLE = f"{SCHEMA}.reader_watermark"
+BUDGET_TABLE = f"{SCHEMA}.api_budget_state"
 
 CONFLICT_EVENT_KEY_LINEAGE = "EVENT_KEY_LINEAGE_CONFLICT"
 CONFLICT_IMMUTABLE_RESULT = "IMMUTABLE_RESULT_CONFLICT"
@@ -122,10 +127,24 @@ class H2ProspectiveStore:
         """Number of distinct ingested ``source_event_key`` rows."""
         raise NotImplementedError
 
-    def get_watermark(self) -> tuple[int, str]:
+    def get_cursor(self) -> tuple[int, str]:
+        """Capture-order delivery cursor ``(captured_at_us, source_event_key)``.
+
+        Review P1-watermark: the cursor tracks the #305 CAPTURE/COMMIT order
+        (``captured_at``), never ``signal_time`` — late-committed events with
+        earlier signal times are never skipped.
+        """
         raise NotImplementedError
 
-    def set_watermark(self, signal_time_us: int, source_event_key: str) -> None:
+    def set_cursor(self, captured_at_us: int, source_event_key: str) -> None:
+        raise NotImplementedError
+
+    # ── research API budget state (review P1-budget) ────────────────────────
+    def load_api_budget_state(self) -> dict[str, Any] | None:
+        """Persisted research API budget state (survives restarts)."""
+        raise NotImplementedError
+
+    def save_api_budget_state(self, state: Mapping[str, Any]) -> None:
         raise NotImplementedError
 
     # ── lifecycle ──────────────────────────────────────────────────────────
@@ -202,7 +221,8 @@ class InMemoryProspectiveStore(H2ProspectiveStore):
         self._conflicts: list[dict[str, Any]] = []
         self._evaluations: list[dict[str, Any]] = []
         self._health: list[dict[str, Any]] = []
-        self._watermark: tuple[int, str] = (0, "")
+        self._cursor: tuple[int, str] = (0, "")
+        self._api_budget_state: dict[str, Any] | None = None
         self.writes = 0
 
     # ── ingest ─────────────────────────────────────────────────────────────
@@ -249,16 +269,31 @@ class InMemoryProspectiveStore(H2ProspectiveStore):
         entry = self._ingest.get(source_event_key)
         if entry is None or entry.get("row") is None:
             return None
-        return dict(entry["row"])
+        row = dict(entry["row"])
+        row["source_reference_price"] = parse_source_price(
+            row.get("source_reference_price")
+        )
+        return row
 
     def ingest_event_count(self) -> int:
         return len(self._ingest)
 
-    def get_watermark(self) -> tuple[int, str]:
-        return self._watermark
+    def get_cursor(self) -> tuple[int, str]:
+        return self._cursor
 
-    def set_watermark(self, signal_time_us: int, source_event_key: str) -> None:
-        self._watermark = (int(signal_time_us), str(source_event_key))
+    def set_cursor(self, captured_at_us: int, source_event_key: str) -> None:
+        self._cursor = (int(captured_at_us), str(source_event_key))
+        self.writes += 1
+
+    def load_api_budget_state(self) -> dict[str, Any] | None:
+        return (
+            None
+            if self._api_budget_state is None
+            else dict(self._api_budget_state)
+        )
+
+    def save_api_budget_state(self, state: Mapping[str, Any]) -> None:
+        self._api_budget_state = dict(state)
         self.writes += 1
 
     # ── lifecycle ──────────────────────────────────────────────────────────
@@ -577,6 +612,21 @@ class PgProspectiveStore(H2ProspectiveStore):
             )
 
         row = delivery.row or {}
+        # Review P1-Decimal: the NUMERIC column keeps the EXACT decimal and
+        # the JSON payload keeps its exact text form — never a float round
+        # trip, never an opaque str on restore.
+        try:
+            price_decimal = parse_source_price(
+                row.get("source_reference_price")
+            )
+        except ValueError as exc:
+            return IngestOutcome(
+                status=INGEST_REJECTED_INVALID,
+                reason=REASON_INVALID_SOURCE_PRICE,
+                detail=str(exc),
+            )
+        payload = dict(row)
+        payload["source_reference_price"] = exact_price_str(price_decimal)
         self._execute(
             f"""
             INSERT INTO {INGEST_TABLE} (
@@ -608,8 +658,8 @@ class PgProspectiveStore(H2ProspectiveStore):
                 str(row.get("source_fingerprint") or ""),
                 row.get("signal_candle_open_time"),
                 row.get("entry_timeframe"),
-                row.get("source_reference_price"),
-                self._json(row),
+                price_decimal,
+                self._json(payload),
             ),
         )
         self._commit()
@@ -617,7 +667,10 @@ class PgProspectiveStore(H2ProspectiveStore):
 
     def get_source_row(self, source_event_key: str) -> Mapping[str, Any] | None:
         cur = self._execute(
-            f"SELECT source_payload FROM {INGEST_TABLE} WHERE source_event_key = %s",
+            f"""
+            SELECT source_payload, source_reference_price
+            FROM {INGEST_TABLE} WHERE source_event_key = %s
+            """,
             (source_event_key,),
         )
         row = cur.fetchone()
@@ -626,33 +679,82 @@ class PgProspectiveStore(H2ProspectiveStore):
         payload = row[0]
         if isinstance(payload, str):
             payload = json.loads(payload)
-        return dict(payload)
+        payload = dict(payload)
+        # Review P1-Decimal: restore the price as an EXACT Decimal.  The
+        # NUMERIC column is authoritative; the payload string is a strict
+        # fallback — arbitrary strings are rejected, never coerced.
+        column_price = row[1]
+        if column_price is not None:
+            payload["source_reference_price"] = parse_source_price(
+                column_price
+            )
+        else:
+            payload["source_reference_price"] = parse_source_price(
+                payload.get("source_reference_price")
+            )
+        return payload
 
     def ingest_event_count(self) -> int:
         cur = self._execute(f"SELECT COUNT(*) FROM {INGEST_TABLE}")
         row = cur.fetchone()
         return int(row[0]) if row is not None else 0
 
-    def get_watermark(self) -> tuple[int, str]:
+    def get_cursor(self) -> tuple[int, str]:
         cur = self._execute(
-            f"SELECT signal_time_us, source_event_key FROM {WATERMARK_TABLE} WHERE id = 1"
+            f"""
+            SELECT cursor_captured_at_us, cursor_key FROM {WATERMARK_TABLE}
+            WHERE id = 1
+            """
         )
         row = cur.fetchone()
         if row is None:
             return 0, ""
         return int(row[0]), row[1]
 
-    def set_watermark(self, signal_time_us: int, source_event_key: str) -> None:
+    def set_cursor(self, captured_at_us: int, source_event_key: str) -> None:
         self._execute(
             f"""
-            INSERT INTO {WATERMARK_TABLE} (id, signal_time_us, source_event_key)
+            INSERT INTO {WATERMARK_TABLE} (id, cursor_captured_at_us, cursor_key)
             VALUES (1, %s, %s)
             ON CONFLICT (id) DO UPDATE
-            SET signal_time_us = EXCLUDED.signal_time_us,
-                source_event_key = EXCLUDED.source_event_key,
+            SET cursor_captured_at_us = EXCLUDED.cursor_captured_at_us,
+                cursor_key = EXCLUDED.cursor_key,
                 updated_at = NOW()
             """,
-            (int(signal_time_us), str(source_event_key)),
+            (int(captured_at_us), str(source_event_key)),
+        )
+        self._commit()
+
+    # ── research API budget state (review P1-budget) ────────────────────────
+    def load_api_budget_state(self) -> dict[str, Any] | None:
+        cur = self._execute(
+            f"""
+            SELECT hour_started_at_ms, requests_in_hour
+            FROM {BUDGET_TABLE} WHERE id = 1
+            """
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "hour_started_at_ms": int(row[0]),
+            "requests_in_hour": int(row[1]),
+        }
+
+    def save_api_budget_state(self, state: Mapping[str, Any]) -> None:
+        self._execute(
+            f"""
+            INSERT INTO {BUDGET_TABLE} (id, hour_started_at_ms, requests_in_hour)
+            VALUES (1, %s, %s)
+            ON CONFLICT (id) DO UPDATE
+            SET hour_started_at_ms = EXCLUDED.hour_started_at_ms,
+                requests_in_hour = EXCLUDED.requests_in_hour,
+                updated_at = NOW()
+            """,
+            (
+                int(state.get("hour_started_at_ms") or 0),
+                int(state.get("requests_in_hour") or 0),
+            ),
         )
         self._commit()
 

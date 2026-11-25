@@ -46,6 +46,7 @@ from app.research.me_entry_quality_h2_prospective_v1.contracts import (
     INGEST_REJECTED_INVALID,
     INGEST_REJECTED_LINEAGE,
     INGEST_REJECTED_PRE_FREEZE,
+    REASON_INVALID_SOURCE_PRICE,
     RUNTIME_DISABLED,
     STATE_CONFIRMED_DELAYED,
     STATE_EXPIRED,
@@ -57,13 +58,14 @@ from app.research.me_entry_quality_h2_prospective_v1.contracts import (
 )
 from app.research.me_entry_quality_h2_prospective_v1.lifecycle import (
     EvaluationObservation,
+    LifecycleDecision,
     decide_next_state,
 )
 from app.research.me_entry_quality_h2_prospective_v1.source_reader import (
     SourceDelivery,
+    cursor_of,
     delivery_from_row,
-    read_new_source_events,
-    watermark_of,
+    read_source_events_after,
 )
 from app.research.me_entry_quality_h2_prospective_v1.store import (
     H2ProspectiveStore,
@@ -110,6 +112,13 @@ class H2ProspectiveRuntime:
         self._provider = candle_provider
         self._source_connection_factory = source_connection_factory
         self._clock = clock
+        # Review P1-budget: the hourly request window is PERSISTED — hydrate
+        # it on start and keep saving it, so a restart never resets the
+        # research budget unsafely.
+        budget = getattr(candle_provider, "budget", None)
+        if budget is not None:
+            budget.hydrate(self._store.load_api_budget_state())
+            budget.on_change = self._store.save_api_budget_state
         self._policies = tuple(policies) if policies is not None else (
             candidate_policies(config.observation_windows)
         )
@@ -179,42 +188,105 @@ class H2ProspectiveRuntime:
             return 0
         conn = self._source_connection_factory()
         try:
-            watermark_us, watermark_key = self._store.get_watermark()
-            rows = read_new_source_events(
-                conn,
-                watermark_signal_time_us=watermark_us,
-                watermark_key=watermark_key,
-                limit=self._config.source_batch_limit,
-            )
+            cursor_us, cursor_key = self._store.get_cursor()
+            # Review P1-watermark: the delivery cursor is the CAPTURE order
+            # (captured_at, source_event_key) — never signal_time — so a
+            # late-committed event with an earlier signal_time is never lost.
+            # Two bounded phases per cycle:
+            #   1. forward scan from the cursor — guaranteed forward
+            #      progress for every visible row (the cursor IS capture
+            #      order, so a monotonic scan is complete);
+            #   2. an overlap sweep back ``source_overlap_s`` seconds —
+            #      catches capture-to-commit disorder (rows whose capture
+            #      instant predates the cursor but whose commit became
+            #      visible later) and ``captured_at`` ties.
+            # Both phases feed one idempotent ingest; the cursor is
+            # checkpointed LAST, only after all writes above committed.
+            max_seen_us, max_seen_key = int(cursor_us), str(cursor_key)
+            rows_seen = 0
+            batches_used = 0
+
+            def _consume(rows: list) -> tuple[int, int, bool]:
+                nonlocal rows_seen, max_seen_us, max_seen_key, batches_used
+                if not rows:
+                    return 0, 0, True
+                batches_used += 1
+                rows_seen += len(rows)
+                counters.source_events_received += len(rows)
+                for row in rows:
+                    self._ingest_row(row, counters)
+                batch_us, batch_key = cursor_of(rows)
+                if (batch_us, batch_key) > (max_seen_us, max_seen_key):
+                    max_seen_us, max_seen_key = batch_us, batch_key
+                return batch_us, batch_key, len(rows) < self._config.source_batch_limit
+
+            # phase 1: forward scan from the capture-order cursor
+            f_us, f_key = int(cursor_us), str(cursor_key)
+            while batches_used < self._config.source_max_batches_per_cycle:
+                rows = read_source_events_after(
+                    conn,
+                    after_captured_us=f_us,
+                    after_key=f_key,
+                    limit=self._config.source_batch_limit,
+                )
+                f_us, f_key, exhausted = _consume(rows)
+                if exhausted:
+                    break
+
+            # phase 2: bounded overlap sweep for late-committed stragglers
+            # (only meaningful once the cursor moved: with a zero cursor
+            # phase 1 already covers the whole table)
+            if int(cursor_us) > 0 and (
+                batches_used < self._config.source_max_batches_per_cycle
+            ):
+                o_us = max(0, int(cursor_us) - int(self._config.source_overlap_us))
+                o_key = "" if o_us != int(cursor_us) else str(cursor_key)
+                while batches_used < self._config.source_max_batches_per_cycle:
+                    rows = read_source_events_after(
+                        conn,
+                        after_captured_us=o_us,
+                        after_key=o_key,
+                        limit=self._config.source_batch_limit,
+                    )
+                    o_us, o_key, exhausted = _consume(rows)
+                    if exhausted:
+                        break
         finally:
             try:
                 conn.close()
             except Exception:  # pragma: no cover - defensive
                 logger.debug("source connection close failed", exc_info=True)
 
-        details["source_rows_read"] = len(rows)
-        counters.source_events_received = len(rows)
-        for row in rows:
-            delivery: SourceDelivery = delivery_from_row(row)
-            outcome = self._store.ingest_event(delivery)
-            if outcome.duplicate:
-                counters.idempotent_duplicates += 1
-                continue
-            if outcome.conflict:
-                counters.lineage_conflicts += 1
+        details["source_rows_read"] = rows_seen
+        # Checkpoint LAST (review P1-watermark): the cursor can only advance
+        # after every ingest and variant-state write above is durably
+        # committed — a crash in between simply re-delivers idempotently.
+        if (max_seen_us, max_seen_key) > (int(cursor_us), str(cursor_key)):
+            self._store.set_cursor(max_seen_us, max_seen_key)
+        return rows_seen
+
+    def _ingest_row(self, row: Mapping[str, Any], counters: TelemetryCounters) -> None:
+        delivery: SourceDelivery = delivery_from_row(row)
+        outcome = self._store.ingest_event(delivery)
+        if outcome.duplicate:
+            counters.idempotent_duplicates += 1
+            # Review P1-watermark crash-safety: variant states are re-ensured
+            # even on duplicates — a crash between ingest and state creation
+            # can never leave an accepted event without its lifecycle rows.
             if outcome.status == INGEST_ACCEPTED:
-                counters.source_events_accepted += 1
                 self._ensure_variant_states(delivery)
-            elif outcome.status == INGEST_REJECTED_PRE_FREEZE:
-                counters.source_events_pre_freeze += 1
-                counters.source_events_rejected += 1
-            elif outcome.status in (INGEST_REJECTED_LINEAGE, INGEST_REJECTED_INVALID):
-                counters.source_events_invalid += 1
-                counters.source_events_rejected += 1
-        if rows:
-            new_us, new_key = watermark_of(rows)
-            self._store.set_watermark(new_us, new_key)
-        return len(rows)
+            return
+        if outcome.conflict:
+            counters.lineage_conflicts += 1
+        if outcome.status == INGEST_ACCEPTED:
+            counters.source_events_accepted += 1
+            self._ensure_variant_states(delivery)
+        elif outcome.status == INGEST_REJECTED_PRE_FREEZE:
+            counters.source_events_pre_freeze += 1
+            counters.source_events_rejected += 1
+        elif outcome.status in (INGEST_REJECTED_LINEAGE, INGEST_REJECTED_INVALID):
+            counters.source_events_invalid += 1
+            counters.source_events_rejected += 1
 
     def _ensure_variant_states(self, delivery: SourceDelivery) -> None:
         row = delivery.row or {}
@@ -258,7 +330,16 @@ class H2ProspectiveRuntime:
         counters: TelemetryCounters,
         details: dict,
     ) -> None:
-        row = self._store.get_source_row(event_key)
+        try:
+            row = self._store.get_source_row(event_key)
+        except ValueError as exc:
+            # Review P1-Decimal: a stored price that fails the strict restore
+            # parse is an explicit INVALID_SOURCE outcome — never a silent
+            # coercion and never a fabricated evaluation.
+            self._apply_invalid_source(
+                event_key, states, asof_ms, str(exc), counters, details
+            )
+            return
         if row is None:
             details.setdefault("missing_source_rows", []).append(event_key)
             return
@@ -300,13 +381,19 @@ class H2ProspectiveRuntime:
                 )
             )
 
-        pipeline_outcome = run_h2_event(
-            row,
-            rows_5m=rows_as_mappings(outcome.rows),
-            source_identity=outcome.source_identity,
-            policies=policies,
-            evaluation_asof_ms=asof_ms,
-        )
+        try:
+            pipeline_outcome = run_h2_event(
+                row,
+                rows_5m=rows_as_mappings(outcome.rows),
+                source_identity=outcome.source_identity,
+                policies=policies,
+                evaluation_asof_ms=asof_ms,
+            )
+        except ValueError as exc:
+            self._apply_invalid_source(
+                event_key, states, asof_ms, str(exc), counters, details
+            )
+            return
         for result in pipeline_outcome.results:
             state = policies_by_fp.get(result.policy_fingerprint)
             if state is None:  # pragma: no cover - defensive
@@ -319,6 +406,51 @@ class H2ProspectiveRuntime:
                 candle_source=pipeline_outcome.source,
                 counters=counters,
             )
+
+    def _apply_invalid_source(
+        self,
+        event_key: str,
+        states: Sequence[VariantState],
+        asof_ms: int,
+        detail: str,
+        counters: TelemetryCounters,
+        details: dict,
+    ) -> None:
+        """Explicit INVALID_SOURCE outcome for unusable source rows
+        (review P1-Decimal: e.g. an unparseable stored price)."""
+        details.setdefault("invalid_source_rows", {})[event_key] = detail[:300]
+        for state in states:
+            decision = LifecycleDecision(
+                new_state=STATE_INVALID_SOURCE,
+                terminal=True,
+                reason=REASON_INVALID_SOURCE_PRICE,
+                detail=detail[:500],
+            )
+            result_dict = {
+                "status": STATE_INVALID_SOURCE,
+                "reason": REASON_INVALID_SOURCE_PRICE,
+                "detail": detail[:500],
+                "symbol": state.symbol,
+                "signal_time_us": int(state.signal_time_us or 0),
+                "policy": dict(state.policy),
+                "policy_fingerprint": state.policy_fingerprint,
+            }
+            counters.variant_states_evaluated += 1
+            apply = self._store.apply_evaluation(
+                source_event_key=state.source_event_key,
+                variant_id=state.variant_id,
+                policy_fingerprint=state.policy_fingerprint,
+                result_dict=result_dict,
+                decision=decision,
+                evaluation_asof_ms=asof_ms,
+                window_elapsed=False,
+                candle_source=None,
+            )
+            if apply.conflict:
+                counters.immutable_result_conflicts += 1
+            counters.note_variant(state.variant_id, apply.state)
+            if apply.state == STATE_INVALID_SOURCE:
+                counters.variants_invalid_source += 1
 
     def _apply_variant_result(
         self,

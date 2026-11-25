@@ -16,7 +16,9 @@ source ingest keeps running.
 
 Exit codes (systemd ``SuccessExitStatus=3`` convention):
 
-* ``0`` — graceful stop;
+* ``0`` — graceful stop / successful ``--once`` cycle;
+* ``1`` — a ``--once`` cycle FAILED (config was fine; smoke-tests and
+  systemd must distinguish PASS from FAIL — review P2-exit);
 * ``2`` — invalid configuration (fail closed, never guessed);
 * ``3`` — runtime disabled / not activated (operator action).
 
@@ -53,6 +55,7 @@ H2P_RUNNER_VERSION = "H2P_RUNNER_1.0.0"
 logger = logging.getLogger("h2_prospective_runner")
 
 EXIT_OK = 0
+EXIT_CYCLE_FAILED = 1
 EXIT_CONFIG_ERROR = 2
 EXIT_NOT_ACTIVE = 3
 
@@ -128,6 +131,10 @@ def build_runtime(
         request_pause_s=config.candle_request_pause_s,
         page_size=config.candle_page_size,
         max_pages=config.candle_max_pages,
+        # Review P1-budget: the research client is built single-attempt
+        # (``bybit_max_attempts=1`` above + zero rate-limit retries), so ONE
+        # pagination page costs exactly ONE HTTP request.
+        requests_per_page=1,
     )
     provider = BybitClosedCandleProvider(
         budget=budget,
@@ -236,15 +243,23 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.once:
+        store: H2ProspectiveStore | None = None
         try:
             runtime, store = build_runtime(config)
             report = runtime.run_cycle()
-            store.close()
             logger.info("H2_PROSPECTIVE_ONCE_DONE status=%s", report.status)
             return EXIT_OK
         except Exception:  # noqa: BLE001
+            # Review P2-exit: a failed cycle must NEVER report success to a
+            # smoke-test or systemd — exit non-zero, keep the failure loud.
             logger.exception("H2_PROSPECTIVE_ONCE_FAILED")
-            return EXIT_OK
+            return EXIT_CYCLE_FAILED
+        finally:
+            if store is not None:
+                try:
+                    store.close()
+                except Exception:  # pragma: no cover - defensive
+                    logger.exception("H2_PROSPECTIVE_STORE_CLOSE_FAILED")
 
     return run_forever(config)
 

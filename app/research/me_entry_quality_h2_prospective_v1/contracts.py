@@ -21,6 +21,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
+from decimal import Decimal
 from typing import Any, Mapping
 
 from app.research.me_entry_quality_h2_v1.result import (
@@ -84,10 +87,64 @@ INGEST_STATUSES: frozenset[str] = frozenset({
 REASON_PRE_FREEZE_SIGNAL_TIME = "PRE_FREEZE_SIGNAL_TIME"
 REASON_PRE_FREEZE_CAPTURED_AT = "PRE_FREEZE_CAPTURED_AT"
 REASON_INVALID_SOURCE_TIMING = "INVALID_SOURCE_TIMING"
+REASON_INVALID_SOURCE_PRICE = "INVALID_SOURCE_PRICE"
 REASON_LINEAGE_HASH_MISMATCH = "LINEAGE_HASH_MISMATCH"
 REASON_EVENT_KEY_LINEAGE_CONFLICT = "EVENT_KEY_LINEAGE_CONFLICT"
 REASON_SOURCE_ROW_PARSE_ERROR = "SOURCE_ROW_PARSE_ERROR"
 REASON_OK = "OK"
+
+# ─── type-safe source price handling (review P1-Decimal) ─────────────────────
+#: Plain decimal text only — no signs, exponents, whitespace games or
+#: arbitrary strings from untrusted sources.
+_PRICE_TEXT = re.compile(r"^[0-9]+(?:\.[0-9]+)?$|^\.[0-9]+$")
+
+
+def parse_source_price(value: Any) -> Decimal:
+    """Canonical, EXACT ``source_reference_price`` parse (fail closed).
+
+    Review P1-Decimal: PostgreSQL ``NUMERIC`` values arrive as
+    :class:`decimal.Decimal` and must reach the H2 engine (which accepts only
+    ``int`` / ``float`` / ``Decimal``) without losing precision and without
+    ever round-tripping through ``float``.
+
+    Accepts ``Decimal`` (kept exact), ``int``, finite ``float`` (converted
+    via its shortest round-trip repr — never binary artifacts), and plain
+    decimal strings matching :data:`_PRICE_TEXT` (strict — arbitrary strings
+    are rejected).  Rejects ``bool``, ``NaN``, ``Infinity``, zero and
+    negative values.
+    """
+    if isinstance(value, bool):
+        raise ValueError("source price must not be a bool")
+    if isinstance(value, Decimal):
+        parsed = value
+    elif isinstance(value, int):
+        parsed = Decimal(value)
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("source price must be finite")
+        parsed = Decimal(repr(value))
+    elif isinstance(value, str):
+        # Strict: plain decimal digits only — no surrounding whitespace,
+        # signs, exponents or thousands separators (untrusted-input guard).
+        if not _PRICE_TEXT.match(value):
+            raise ValueError(
+                "source price string must be plain decimal digits"
+            )
+        parsed = Decimal(value)
+    else:
+        raise ValueError(
+            f"unsupported source price type: {type(value).__name__}"
+        )
+    if not parsed.is_finite():
+        raise ValueError("source price must be finite")
+    if parsed <= 0:
+        raise ValueError("source price must be positive")
+    return parsed
+
+
+def exact_price_str(value: Any) -> str:
+    """Exact decimal TEXT of a source price for loss-free JSON persistence."""
+    return format(parse_source_price(value), "f")
 
 # ─── runtime contour statuses (telemetry / health) ───────────────────────────
 RUNTIME_RUNNING = "RUNNING"

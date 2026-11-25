@@ -72,10 +72,21 @@ class H2ProspectiveConfig:
     poll_interval_s: float = 300.0
     #: Max #305 rows read per poll (PostgreSQL load control).
     source_batch_limit: int = 200
+    #: Max source read batches per cycle (bounded polling, review P1-watermark).
+    source_max_batches_per_cycle: int = 10
+    #: Overlap rewind (seconds) re-read each cycle so late-committed #305 rows
+    #: and ``captured_at`` ties can never be lost (review P1-watermark).
+    #: Must exceed the maximum capture-to-commit disorder of the source.
+    source_overlap_s: int = 7200
     #: Max source events evaluated per cycle (PostgreSQL / API load control).
     max_events_per_cycle: int = 20
     #: Statement timeout for every research statement (milliseconds).
     statement_timeout_ms: int = 10_000
+    #: Explicit permission to run prospective accumulation with UNFROZEN
+    #: policy fingerprints (pre-freeze research mode).  With pins absent and
+    #: this flag off, an enabled runtime refuses to start (fail closed) —
+    #: unfrozen-policy accumulation always needs a deliberate act.
+    allow_unfrozen_policies: bool = False
 
     # ── database (dedicated research connections only) ──────────────────────
     db_host: str = "localhost"
@@ -110,11 +121,22 @@ class H2ProspectiveConfig:
     #: INCOMPLETE_COVERAGE (never EXPIRED, never CONFIRMED_DELAYED).
     coverage_finalize_after_attempts: int = 3
 
+    @property
+    def source_overlap_us(self) -> int:
+        """Overlap rewind in microseconds (exact integer math)."""
+        return int(self.source_overlap_s) * 1_000_000
+
     def __post_init__(self) -> None:
         if self.poll_interval_s <= 0:
             raise H2ProspectiveConfigError("poll_interval_s must be positive")
         if self.source_batch_limit < 1:
             raise H2ProspectiveConfigError("source_batch_limit must be >= 1")
+        if self.source_max_batches_per_cycle < 1:
+            raise H2ProspectiveConfigError(
+                "source_max_batches_per_cycle must be >= 1"
+            )
+        if self.source_overlap_s < 0:
+            raise H2ProspectiveConfigError("source_overlap_s cannot be negative")
         if self.max_events_per_cycle < 1:
             raise H2ProspectiveConfigError("max_events_per_cycle must be >= 1")
         if self.statement_timeout_ms < 1:
@@ -192,7 +214,7 @@ def load_config(environ: Mapping[str, str] | None = None) -> H2ProspectiveConfig
                 "H2_PROSPECTIVE_POLICY_FINGERPRINT_PINS: canonical sha256 hex required"
             )
 
-    return H2ProspectiveConfig(
+    config = H2ProspectiveConfig(
         enabled=_parse_bool(_get("H2_PROSPECTIVE_ENABLED"), "H2_PROSPECTIVE_ENABLED"),
         poll_interval_s=_parse_float(
             _get("H2_PROSPECTIVE_POLL_INTERVAL_S"), 300.0,
@@ -201,6 +223,18 @@ def load_config(environ: Mapping[str, str] | None = None) -> H2ProspectiveConfig
         source_batch_limit=_parse_int(
             _get("H2_PROSPECTIVE_SOURCE_BATCH_LIMIT"), 200,
             "H2_PROSPECTIVE_SOURCE_BATCH_LIMIT",
+        ),
+        source_max_batches_per_cycle=_parse_int(
+            _get("H2_PROSPECTIVE_SOURCE_MAX_BATCHES_PER_CYCLE"), 10,
+            "H2_PROSPECTIVE_SOURCE_MAX_BATCHES_PER_CYCLE",
+        ),
+        source_overlap_s=_parse_int(
+            _get("H2_PROSPECTIVE_SOURCE_OVERLAP_S"), 7200,
+            "H2_PROSPECTIVE_SOURCE_OVERLAP_S",
+        ),
+        allow_unfrozen_policies=_parse_bool(
+            _get("H2_PROSPECTIVE_ALLOW_UNFROZEN_POLICIES"),
+            "H2_PROSPECTIVE_ALLOW_UNFROZEN_POLICIES",
         ),
         max_events_per_cycle=_parse_int(
             _get("H2_PROSPECTIVE_MAX_EVENTS_PER_CYCLE"), 20,
@@ -256,3 +290,19 @@ def load_config(environ: Mapping[str, str] | None = None) -> H2ProspectiveConfig
             "H2_PROSPECTIVE_COVERAGE_FINALIZE_AFTER_ATTEMPTS",
         ),
     )
+
+    # Review §7: prospective accumulation with UNFROZEN policy fingerprints
+    # must never start by accident — it needs a deliberate permission (pins
+    # or an explicit opt-in), otherwise fail closed.
+    if (
+        config.enabled
+        and not config.policy_fingerprint_pins
+        and not config.allow_unfrozen_policies
+    ):
+        raise H2ProspectiveConfigError(
+            "H2_PROSPECTIVE_POLICY_FINGERPRINT_PINS is empty while the "
+            "runtime is enabled: pin the approved fingerprints or set "
+            "H2_PROSPECTIVE_ALLOW_UNFROZEN_POLICIES=1 for explicit pre-freeze "
+            "research (fail closed)"
+        )
+    return config

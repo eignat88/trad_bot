@@ -25,6 +25,14 @@ Contract:
   is computed for every accepted delivery so a redelivery can be compared
   idempotently by the store and a lineage drift becomes an explicit
   ``EVENT_KEY_LINEAGE_CONFLICT`` — never a silent overwrite;
+* ``source_reference_price`` is validated STRICTLY and delivered to the H2
+  pipeline as an exact :class:`decimal.Decimal` (review P1-Decimal):
+  ``NaN`` / ``Infinity`` / zero / negative / arbitrary strings are explicit
+  ``INVALID_SOURCE_PRICE`` rejections;
+* the delivery cursor is the CAPTURE order ``(captured_at,
+  source_event_key)`` — never ``signal_time`` — so late-committed events are
+  never lost (review P1-watermark; overlap/reconciliation lives in the
+  runtime);
 * invalid rows are rejected with deterministic reason codes — never dropped
   silently, never coerced;
 * trading scanner filters are deliberately NOT applied: this reader admits
@@ -48,12 +56,14 @@ from app.research.me_entry_quality_h2_prospective_v1.contracts import (
     INGEST_REJECTED_LINEAGE,
     INGEST_REJECTED_PRE_FREEZE,
     REASON_EVENT_KEY_LINEAGE_CONFLICT,
+    REASON_INVALID_SOURCE_PRICE,
     REASON_INVALID_SOURCE_TIMING,
     REASON_LINEAGE_HASH_MISMATCH,
     REASON_OK,
     REASON_PRE_FREEZE_CAPTURED_AT,
     REASON_PRE_FREEZE_SIGNAL_TIME,
     REASON_SOURCE_ROW_PARSE_ERROR,
+    parse_source_price,
 )
 from app.research.me_upstream_source_v1.contracts import (
     immutable_source_hash,
@@ -86,9 +96,9 @@ SOURCE_EVENT_COLUMNS: tuple[str, ...] = (
 _SELECT_SQL = f"""
     SELECT {", ".join(SOURCE_EVENT_COLUMNS)}
     FROM research_me_upstream_coverage.source_event
-    WHERE signal_time > %s
-       OR (signal_time = %s AND source_event_key > %s)
-    ORDER BY signal_time, source_event_key
+    WHERE captured_at > %s
+       OR (captured_at = %s AND source_event_key > %s)
+    ORDER BY captured_at, source_event_key
     LIMIT %s
 """
 
@@ -150,9 +160,10 @@ class SourceDelivery:
 def delivery_from_row(row: Mapping[str, Any]) -> SourceDelivery:
     """Ingest-time checks for ONE ``source_event`` mapping (pure, fail closed).
 
-    Freeze boundary (FR-01 / criterion 3) and lineage integrity (criterion
-    15) only — feature/price validation belongs to the H2 pipeline, which
-    reports it as the ``INVALID_SOURCE`` lifecycle state.
+    Freeze boundary (FR-01 / criterion 3), lineage integrity (criterion 15)
+    and strict source-price validation (review P1-Decimal); deeper
+    feature/price evaluation belongs to the H2 pipeline, which reports it as
+    the ``INVALID_SOURCE`` lifecycle state.
     """
     if not isinstance(row, Mapping):
         return SourceDelivery(
@@ -235,11 +246,29 @@ def delivery_from_row(row: Mapping[str, Any]) -> SourceDelivery:
             lineage_hash=stored_hash,
         )
 
+    # ── source price: strict, exact, type-safe (review P1-Decimal) ─────────
+    try:
+        price_decimal = parse_source_price(row.get("source_reference_price"))
+    except ValueError as exc:
+        return SourceDelivery(
+            source_event_key=key_text,
+            status=INGEST_REJECTED_INVALID,
+            reason=REASON_INVALID_SOURCE_PRICE,
+            detail=str(exc),
+            signal_time_us=signal_time_us,
+        )
+
+    # The delivered row carries the CANONICAL Decimal price so the H2 engine
+    # (int/float/Decimal contract) never sees a str and never sees a value
+    # rounded through float.
+    delivered_row = dict(row)
+    delivered_row["source_reference_price"] = price_decimal
+
     return SourceDelivery(
         source_event_key=key_text,
         status=INGEST_ACCEPTED,
         reason=REASON_OK,
-        row=dict(row),
+        row=delivered_row,
         immutable_hash=immutable_source_hash(dict(lineage)),
         signal_time_us=signal_time_us,
         source_identity=identity,
@@ -247,40 +276,48 @@ def delivery_from_row(row: Mapping[str, Any]) -> SourceDelivery:
     )
 
 
-def read_new_source_events(
+def read_source_events_after(
     connection: Any,
     *,
-    watermark_signal_time_us: int | None = None,
-    watermark_key: str = "",
+    after_captured_us: int | None = None,
+    after_key: str = "",
     limit: int = 200,
 ) -> list[dict[str, Any]]:
-    """Read new #305 rows AFTER the watermark (SELECT-only, bounded).
+    """Read #305 rows AFTER the capture-order cursor (SELECT-only, bounded).
 
-    Deterministic order ``(signal_time, source_event_key)``; the exclusive
-    watermark pair keeps restarts idempotent (already-ingested rows are never
-    re-emitted unless the watermark itself regresses — and then the store's
-    idempotent ingest still refuses to duplicate outcomes).
+    Review P1-watermark: the delivery cursor is ``(captured_at,
+    source_event_key)`` — the CAPTURE/COMMIT order of the #305 store — never
+    ``signal_time``.  A late-committed event with an EARLIER ``signal_time``
+    is therefore still delivered: ``signal_time`` ordering is a property of
+    the data, never of the delivery sequence.
+
+    ``captured_at`` ties are broken by ``source_event_key`` so equal
+    timestamps can never drop a row at a batch boundary.  Residual
+    capture-to-commit disorder is covered by the caller's overlap rewind
+    (see ``H2ProspectiveRuntime._ingest_phase``); the store's idempotent
+    ingest makes re-reads safe.
     """
     assert_select_only(_SELECT_SQL)
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise ValueError("limit must be a positive integer")
-    if watermark_signal_time_us is None:
-        watermark_ts: datetime = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    if after_captured_us is None:
+        since_ts: datetime = datetime(1970, 1, 1, tzinfo=timezone.utc)
     else:
         # exact integer conversion — never float seconds (µs precision)
-        watermark_ts = datetime.fromtimestamp(
-            watermark_signal_time_us // 1_000_000, tz=timezone.utc
-        ) + timedelta(microseconds=watermark_signal_time_us % 1_000_000)
+        since_ts = datetime.fromtimestamp(
+            after_captured_us // 1_000_000, tz=timezone.utc
+        ) + timedelta(microseconds=after_captured_us % 1_000_000)
     cur = connection.cursor()
-    cur.execute(_SELECT_SQL, (watermark_ts, watermark_ts, watermark_key, int(limit)))
+    cur.execute(_SELECT_SQL, (since_ts, since_ts, after_key, int(limit)))
     return [row_mapping(row) for row in cur.fetchall()]
 
 
-def watermark_of(rows: Sequence[Mapping[str, Any]]) -> tuple[int, str]:
-    """Exclusive watermark ``(signal_time_us, source_event_key)`` of a batch."""
+def cursor_of(rows: Sequence[Mapping[str, Any]]) -> tuple[int, str]:
+    """Exclusive capture-order cursor ``(captured_at_us, source_event_key)``
+    of a batch (the last row in deterministic (captured_at, key) order)."""
     if not rows:
         return 0, ""
     last = rows[-1]
-    signal_us = parse_utc_us(last.get("signal_time"), field_name="signal_time")
+    captured_us = parse_utc_us(last.get("captured_at"), field_name="captured_at")
     key = last.get("source_event_key")
-    return signal_us, key if isinstance(key, str) else ""
+    return captured_us, key if isinstance(key, str) else ""

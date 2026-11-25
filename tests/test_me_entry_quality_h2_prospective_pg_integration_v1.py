@@ -4,7 +4,7 @@ Covers the FR-05 store + migration 095 against a REAL PostgreSQL server,
 inside a FULLY ISOLATED scratch environment:
 
 * an OWN scratch database (created + dropped by this module);
-* migration 095 applied transactionally;
+* migration 095 applied transactionally (and re-applied — idempotency);
 * no production service, schema or data is read or written;
 * the #305 source schema is NEVER created or touched here — the runtime's
   source reader is SELECT-only and its store knows only its own schema.
@@ -16,12 +16,25 @@ SAFETY
   (``ME_H2PRO_PG_IT_HOST/PORT/USER``, default ``127.0.0.1:5432 postgres``)
   and only ever writes inside its own ``me_h2pro_it_*`` scratch database.
 
-Scenario coverage (acceptance criteria): 1, 2, 5, 13, 15, 16, 18.
+Scenario coverage (acceptance criteria): 1, 2, 5, 13, 15, 16, 18, plus the
+PR #313 review remediation evidence:
+
+* P1-Decimal   — REAL ``NUMERIC`` round-trip (ingest -> persistence ->
+                 restore -> H2 evaluation) with
+                 ``Decimal('123.4567890123456789')`` exact, DB-level refusal
+                 of NaN/Infinity/zero/negative, redelivery and restart
+                 equivalence;
+* P1-Watermark — cursor persistence and capture-order B-then-A ingestion;
+* P1-Budget    — persisted hourly request-window state across "restarts";
+* P2-Migration — first apply, RE-APPLY (idempotent), immutability triggers,
+                 preserved results, transactional rollback on error and a
+                 predictable refusal on an incompatible pre-existing schema.
 """
 from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -33,7 +46,6 @@ from app.research.me_entry_quality_h2_prospective_v1.contracts import (  # noqa:
     INGEST_ACCEPTED,
     STATE_CONFIRMED_DELAYED,
     STATE_PENDING_CONFIRMATION,
-    immutable_result_hash,
 )
 from app.research.me_entry_quality_h2_prospective_v1.lifecycle import (  # noqa: E402
     LifecycleDecision,
@@ -44,6 +56,12 @@ from app.research.me_entry_quality_h2_prospective_v1.source_reader import (  # n
 from app.research.me_entry_quality_h2_prospective_v1.store import (  # noqa: E402
     PgProspectiveStore,
 )
+from app.research.me_entry_quality_h1c_v1.htf_provider import (  # noqa: E402
+    SOURCE_KIND_BYBIT_KLINE_V5,
+    build_source_identity,
+)
+from app.research.me_entry_quality_h2_v1.pipeline import run_h2_event  # noqa: E402
+from app.research.me_entry_quality_h2_v1.result import H2Policy  # noqa: E402
 from app.research.me_upstream_source_v1.contracts import lineage_hash  # noqa: E402
 
 HOST = os.environ.get("ME_H2PRO_PG_IT_HOST", "127.0.0.1")
@@ -51,12 +69,15 @@ PORT = int(os.environ.get("ME_H2PRO_PG_IT_PORT", "5432"))
 USER = os.environ.get("ME_H2PRO_PG_IT_USER", "postgres")
 
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATIONS = (
-    ROOT / "sql" / "migrations" / "095_me_entry_quality_h2_prospective_v1.sql",
+MIGRATION_PATH = (
+    ROOT / "sql" / "migrations" / "095_me_entry_quality_h2_prospective_v1.sql"
 )
+MIGRATIONS = (MIGRATION_PATH,)
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 BASE_MS = 1_767_225_600_000
+
+EXACT_PRICE = Decimal("123.4567890123456789")
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("ME_H2PRO_PG_INTEGRATION") != "1",
@@ -84,6 +105,12 @@ def scratch_db():
         conn = _admin_connect()
         conn.autocommit = True
         with conn.cursor() as cur:
+            # terminate any leftover backends so DROP cannot block forever
+            cur.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()",
+                (name,),
+            )
             cur.execute(f'DROP DATABASE IF EXISTS "{name}"')
         conn.close()
 
@@ -96,10 +123,17 @@ def store(scratch_db):
         for migration in MIGRATIONS:
             cur.execute(migration.read_text(encoding="utf-8"))
     conn.autocommit = False
-    yield PgProspectiveStore(conn)
+    try:
+        yield PgProspectiveStore(conn)
+    finally:
+        try:
+            conn.close()
+        except Exception:  # pragma: no cover - defensive
+            pass
 
 
-def make_source_row(key="evt-1", signal_ms=BASE_MS + 300_000, tweak=None):
+def make_source_row(key="evt-1", signal_ms=BASE_MS + 300_000, tweak=None,
+                    price=None):
     signal = EPOCH + timedelta(milliseconds=signal_ms)
     lineage = {
         "source_identity": f"ident-{key}",
@@ -120,7 +154,9 @@ def make_source_row(key="evt-1", signal_ms=BASE_MS + 300_000, tweak=None):
         "signal_candle_open_time": signal_ms // 300_000 * 300_000,
         "entry_timeframe": "5m",
         "source_fingerprint": "fp-test-1",
-        "source_reference_price": 1234.5,
+        "source_reference_price": (
+            1234.5 if price is None else price
+        ),
         "features": {
             "rsi_14": 71.25,
             "rsi_delta_3": 4.5,
@@ -180,10 +216,180 @@ class TestPgIngest:
         assert outcome.conflict
         assert store.ingest_event_count() == 1  # snapshot preserved
 
-    def test_watermark_roundtrip(self, store):
-        assert store.get_watermark() == (0, "")
-        store.set_watermark(BASE_MS * 1000, "evt-1")
-        assert store.get_watermark() == (BASE_MS * 1000, "evt-1")
+    def test_cursor_roundtrip(self, store):
+        # review P1-watermark: capture-order cursor checkpoint
+        assert store.get_cursor() == (0, "")
+        store.set_cursor(BASE_MS * 1000, "evt-1")
+        assert store.get_cursor() == (BASE_MS * 1000, "evt-1")
+
+
+class TestPgDecimalNumericRoundTrip:
+    """Review P1-Decimal: exact decimals through REAL ``NUMERIC`` columns."""
+
+    def test_numeric_round_trip_is_exact(self, store):
+        row = make_source_row()
+        row["source_reference_price"] = EXACT_PRICE
+        delivery = delivery_from_row(row)
+        assert delivery.row["source_reference_price"] == EXACT_PRICE
+        outcome = store.ingest_event(delivery)
+        assert outcome.status == INGEST_ACCEPTED
+
+        raw = store._execute(
+            "SELECT source_reference_price, "
+            "source_payload->>'source_reference_price' "
+            "FROM research_me_entry_quality_h2_prospective.ingest_event "
+            "WHERE source_event_key = 'evt-1'"
+        ).fetchone()
+        assert isinstance(raw[0], Decimal) and raw[0] == EXACT_PRICE
+        assert raw[1] == "123.4567890123456789"
+
+        restored = store.get_source_row("evt-1")
+        assert restored["source_reference_price"] == EXACT_PRICE
+
+    def test_redelivery_and_restart_keep_the_exact_price(self, store, scratch_db):
+        row = make_source_row()
+        row["source_reference_price"] = EXACT_PRICE
+        store.ingest_event(delivery_from_row(row))
+        store.set_cursor(BASE_MS * 1000, "evt-1")
+
+        # "restart": a fresh store object over a NEW connection to the same DB
+        conn2 = _admin_connect(scratch_db)
+        conn2.autocommit = False
+        try:
+            store2 = PgProspectiveStore(conn2)
+            assert store2.get_source_row("evt-1")["source_reference_price"] == (
+                EXACT_PRICE
+            )
+            assert store2.get_cursor() == (BASE_MS * 1000, "evt-1")
+            row2 = make_source_row()
+            row2["source_reference_price"] = EXACT_PRICE
+            dup = store2.ingest_event(delivery_from_row(row2))
+            assert dup.duplicate
+            assert store2.ingest_event_count() == 1
+            assert store2.get_source_row("evt-1")["source_reference_price"] == (
+                EXACT_PRICE
+            )
+        finally:
+            conn2.close()
+
+    def test_restored_price_reaches_the_h2_engine_exactly(self, store):
+        # acceptance: ingest -> persistence -> restore -> H2 evaluation,
+        # exact decimal text preserved VERBATIM through the pure PR #311
+        # engine (no float rounding, no string escape)
+        row = make_source_row()
+        row["source_reference_price"] = EXACT_PRICE
+        store.ingest_event(delivery_from_row(row))
+        restored = store.get_source_row("evt-1")
+
+        # identity and rows come from ONE payload (provenance hash is exact)
+        from app.models import Candle
+        from app.research.me_entry_quality_h2_prospective_v1.candle_adapter import (
+            rows_as_mappings,
+        )
+
+        mapped = rows_as_mappings([Candle(BASE_MS, 1.0, 2.0, 0.5, 1.5, 10.0)])
+        identity = build_source_identity(
+            SOURCE_KIND_BYBIT_KLINE_V5, "h2pro-it:BTCUSDT:5m", mapped,
+            fetched_at_ms=BASE_MS,
+        )
+        outcome = run_h2_event(
+            restored,
+            rows_5m=mapped,
+            source_identity=identity,
+            policies=[
+                H2Policy(variant_id="H2_RSI_TURN_1", observation_window=3)
+            ],
+            evaluation_asof_ms=BASE_MS + 400_000,
+        )
+        assert outcome.results
+        payload = outcome.results[0].to_dict()
+        assert payload["original_price_exact"] == "123.4567890123456789"
+
+    def test_database_refuses_nan_inf_zero_negative_prices(self, scratch_db):
+        # defense in depth behind the strict ingest validation: the CHECK
+        # constraint refuses bad NUMERIC literals at the database
+        conn = _admin_connect(scratch_db)
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute(MIGRATION_PATH.read_text(encoding="utf-8"))
+                for bad in (
+                    "'NaN'::numeric",
+                    "'Infinity'::numeric",
+                    "'-Infinity'::numeric",
+                    "0",
+                    "-5",
+                ):
+                    with pytest.raises(Exception):
+                        cur.execute(
+                            "INSERT INTO research_me_entry_quality_h2_prospective"
+                            ".ingest_event (source_event_key, source_identity, "
+                            "symbol, signal_time_us, captured_at, "
+                            "activation_freeze_ts, signal_candle_open_time, "
+                            "entry_timeframe, source_fingerprint, "
+                            "ingest_status, "
+                            "source_reference_price, immutable_source_hash) "
+                            f"VALUES ('evt-bad', 'ident', 'BTCUSDT', 1, NOW(), "
+                            f"NOW(), 1, '5m', 'fp', 'ACCEPTED', {bad}, 'hash')"
+                        )
+                # a finite positive price still passes
+                cur.execute(
+                    "INSERT INTO research_me_entry_quality_h2_prospective"
+                    ".ingest_event (source_event_key, source_identity, "
+                    "symbol, signal_time_us, captured_at, "
+                    "activation_freeze_ts, signal_candle_open_time, "
+                    "entry_timeframe, source_fingerprint, "
+                    "ingest_status, "
+                    "source_reference_price, immutable_source_hash) "
+                    "VALUES ('evt-good', 'ident', 'BTCUSDT', 1, NOW(), "
+                    "NOW(), 1, '5m', 'fp', 'ACCEPTED', "
+                    "123.4567890123456789, 'hash')"
+                )
+        finally:
+            conn.close()
+
+
+class TestPgCaptureOrderIngest:
+    def test_signal_order_inversion_stores_both_events(self, store):
+        # review P1-watermark mandatory scenario at the persistence layer:
+        # B (later signal) is ingested FIRST; A (earlier signal) LATER —
+        # both first-seen snapshots are stored, none dropped
+        s_a = BASE_MS + 1000
+        s_b = BASE_MS + 2000
+        b = make_source_row(
+            key="evt-b", signal_ms=s_b,
+        )
+        a = make_source_row(key="evt-a", signal_ms=s_a)
+        # capture order: B first
+        assert store.ingest_event(delivery_from_row(b)).status == INGEST_ACCEPTED
+        assert store.ingest_event(delivery_from_row(a)).status == INGEST_ACCEPTED
+        assert store.ingest_event_count() == 2
+        assert store.get_source_row("evt-a")["source_event_key"] == "evt-a"
+        assert store.get_source_row("evt-b")["source_event_key"] == "evt-b"
+
+
+class TestPgBudgetState:
+    def test_api_budget_state_survives_restart(self, store, scratch_db):
+        # review P1-budget: the hourly window is persisted in the DB
+        assert store.load_api_budget_state() is None
+        store.save_api_budget_state(
+            {"hour_started_at_ms": 1_700_000_000_000, "requests_in_hour": 42}
+        )
+        conn2 = _admin_connect(scratch_db)
+        conn2.autocommit = False
+        try:
+            store2 = PgProspectiveStore(conn2)
+            assert store2.load_api_budget_state() == {
+                "hour_started_at_ms": 1_700_000_000_000,
+                "requests_in_hour": 42,
+            }
+            # overwriting is a singleton upsert
+            store2.save_api_budget_state(
+                {"hour_started_at_ms": 1_700_000_003_600, "requests_in_hour": 3}
+            )
+            assert store.load_api_budget_state()["requests_in_hour"] == 3
+        finally:
+            conn2.close()
 
 
 class TestPgLifecycle:
@@ -283,3 +489,130 @@ class TestPgLifecycle:
             ".runtime_health ORDER BY id DESC LIMIT 1"
         ).fetchone()
         assert row[0] == "SOURCE_EMPTY_WAITING"
+
+
+class TestPgMigration095:
+    """Review P2-migration: re-applicability, rollback and strict guards."""
+
+    def test_first_apply_and_reapply_are_idempotent(self, scratch_db):
+        conn = _admin_connect(scratch_db)
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                text = MIGRATION_PATH.read_text(encoding="utf-8")
+                cur.execute(text)   # first apply: PASS
+                cur.execute(text)   # re-apply: PASS (idempotent)
+                cur.execute(text)   # third apply: still PASS
+                cur.execute(
+                    "SELECT to_regclass('research_me_entry_quality_h2_prospective"
+                    ".api_budget_state')"
+                )
+                assert cur.fetchone()[0] is not None
+        finally:
+            conn.close()
+
+    def test_reapply_preserves_existing_results_and_immutability(
+        self, store, scratch_db
+    ):
+        # an existing terminal result must SURVIVE re-apply untouched and the
+        # UPDATE/DELETE ban must stay active afterwards
+        store.apply_evaluation(
+            source_event_key="evt-1",
+            variant_id="H2_RSI_TURN_1",
+            policy_fingerprint="ff" * 32,
+            result_dict=result_dict(),
+            decision=LifecycleDecision(
+                new_state=STATE_CONFIRMED_DELAYED, terminal=True, reason="OK"
+            ),
+            evaluation_asof_ms=BASE_MS + 400_000,
+            window_elapsed=True,
+        )
+        before = store._execute(
+            "SELECT status, result_payload FROM "
+            "research_me_entry_quality_h2_prospective.variant_result"
+        ).fetchall()
+        assert len(before) == 1
+        # release the store's read transaction so the re-apply DDL
+        # (DROP TRIGGER takes ACCESS EXCLUSIVE) cannot deadlock on it
+        store._conn.rollback()
+
+        # re-apply the migration on the SAME database (fresh connection)
+        conn = _admin_connect(scratch_db)
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute(MIGRATION_PATH.read_text(encoding="utf-8"))
+        finally:
+            conn.close()
+
+        after = store._execute(
+            "SELECT status, result_payload FROM "
+            "research_me_entry_quality_h2_prospective.variant_result"
+        ).fetchall()
+        assert after == before  # byte-identical, nothing touched
+
+        # immutability triggers are still active after re-apply
+        with pytest.raises(Exception):
+            store._execute(
+                "DELETE FROM research_me_entry_quality_h2_prospective"
+                ".variant_result"
+            )
+        store.broken = False
+
+    def test_induced_migration_error_rolls_back_everything(self, scratch_db):
+        # transactional migration: a failing statement leaves NO partial
+        # schema behind (review P2-migration rollback requirement)
+        conn = _admin_connect(scratch_db)
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                text = MIGRATION_PATH.read_text(encoding="utf-8")
+                assert text.count("COMMIT;") == 1
+                broken = text.replace("COMMIT;", "SELECT 1/0;\nCOMMIT;")
+                with pytest.raises(Exception):
+                    cur.execute(broken)
+                cur.execute("ROLLBACK")  # explicit: conn.rollback() is a
+                # no-op in autocommit mode while the txn block is aborted
+                cur.execute(
+                    "SELECT to_regclass('research_me_entry_quality_h2_prospective"
+                    ".reader_watermark')"
+                )
+                assert cur.fetchone()[0] is None
+                cur.execute(
+                    "SELECT to_regclass('research_me_entry_quality_h2_prospective"
+                    ".variant_result')"
+                )
+                assert cur.fetchone()[0] is None
+        finally:
+            conn.close()
+
+    def test_incompatible_pre_existing_schema_is_predictably_refused(
+        self, scratch_db
+    ):
+        # a foreign/legacy table in the schema must NEVER be silently
+        # accepted: the migration raises H2P_SCHEMA_INCOMPATIBLE and rolls
+        # the whole transaction back
+        conn = _admin_connect(scratch_db)
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "CREATE SCHEMA research_me_entry_quality_h2_prospective"
+                )
+                cur.execute(
+                    "CREATE TABLE research_me_entry_quality_h2_prospective"
+                    ".reader_watermark (id INTEGER PRIMARY KEY)"
+                )  # missing cursor_captured_at_us / cursor_key
+                with pytest.raises(Exception) as excinfo:
+                    cur.execute(MIGRATION_PATH.read_text(encoding="utf-8"))
+                assert "H2P_SCHEMA_INCOMPATIBLE" in str(excinfo.value)
+                cur.execute("ROLLBACK")  # explicit: autocommit rollback no-op
+                # the rollback dropped the new tables created before the
+                # guard fired
+                cur.execute(
+                    "SELECT to_regclass('research_me_entry_quality_h2_prospective"
+                    ".api_budget_state')"
+                )
+                assert cur.fetchone()[0] is None
+        finally:
+            conn.close()
