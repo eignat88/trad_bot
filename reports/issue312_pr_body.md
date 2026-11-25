@@ -37,10 +37,23 @@ candles and persists per-variant delayed-entry outcomes.
 * new suites: `tests/test_me_entry_quality_h2_prospective_{source_reader,candle_adapter,lifecycle,store,runtime,pg_integration}_v1.py`
 * acceptance criteria 1–18 covered (see `reports/issue312_implementation_report.md`
   for the criterion-to-test matrix)
-* regression: 167/167 PR #311 H2 tests PASS unchanged; full-suite run details
-  in the report
+* regression: **168/168** H2 tests pass — the original 167 (PR #311) plus a
+  new strengthened isolation guard; full-suite branch-vs-base attribution in
+  the report (remaining deltas = 2 PR-scoped Phase-2 guards that CI deselects
+  + 1 timing-flaky test that fails at the untouched base in isolation — none
+  introduced by this change)
 * real-PostgreSQL suite is opt-in (`ME_H2PRO_PG_INTEGRATION=1`) per repo
   convention and covers migration 095 in an isolated scratch database
+
+## Contract amendment (explicit)
+
+`tests/test_me_entry_quality_h2_purity_v1.py::TestProductionIsolation` banned
+the substring `me_entry_quality_h2` in migrations/deploy units — an
+invariant from the time H2 was pure in-memory code.  Issue #312 explicitly
+authorizes a research-only migration + disabled templates, so the three
+guards are sharpened to the exact pure-engine name `me_entry_quality_h2_v1`
+(original invariant preserved) and a NEW guard confines the prospective
+runtime to its authorized research-only surfaces.  Nothing is weakened.
 
 ## Runbook & docs
 

@@ -67,7 +67,7 @@ scanner/trading/gate change, no #305 write, no historical backfill.
 | 15 | Lineage conflict -> explicit integrity conflict | `source_reader`, `store`, `pg_integration` | PASS |
 | 16 | No execution model -> no fictional Net E[R] | `runtime` (TestNoFictionalExecution: payload + migration checks) | PASS |
 | 17 | H2 disabled -> no Bybit/source/writes | `runtime` (TestDisabledRuntime, incl. runner exit before any I/O) | PASS |
-| 18 | Production isolation | `store` (schema isolation + SQL contract), `runtime` (AST import scan, migration scope), `source_reader` (SELECT-only), git-level (zero modified tracked files) | PASS |
+| 18 | Production isolation | `store` (schema isolation + SQL contract), `runtime` (AST import scan, migration scope), `source_reader` (SELECT-only), `test_me_entry_quality_h2_purity_v1` (168/168 incl. new prospective-surface confinement guard), git-level (no production file modified) | PASS |
 
 Additional coverage: grid/ASOF microsecond anchors, canonical fetch range,
 budget caps (per-cycle/per-hour), empty payload never synthesized, policy
@@ -80,9 +80,17 @@ triggers, PG store driver-level placeholder/schema contract.
   driver checks; the 7 real-PostgreSQL tests are OPT-IN via
   `ME_H2PRO_PG_INTEGRATION=1` and skip without a test server — none exists in
   this environment).
-* PR #311 H2 regression: **167/167 PASS** (unchanged).
-* Full-suite regression (see section 7 for the exact command):
-  {{FULL_SUITE_RESULT}}
+* PR #311 H2 regression: **168 passed** = the original **167/167** plus one
+  NEW strengthened isolation guard added by the contract amendment below.
+* Full-suite regression (same command on branch and on base `origin/main`
+  = `388e4ba`, logs `reports/issue312_full_run_head.txt` /
+  `issue312_full_run_base.txt`, diff via
+  `reports/issue312_compare_failures.py`):
+  branch **76 failed, 7960 passed, 439 skipped, 168 errors** vs base
+  **73 failed, 7883 passed, 432 skipped, 168 errors**.  Deltas fully
+  attributed in 4.1 (net +3 failures = 2 PR-scoped Phase-2 guards + 1
+  timing-flaky test that fails at base in isolation too; +77 passed = the
+  new suites; +7 skipped = the opt-in PG suite; errors identical).
 * Five unrelated test files fail to COLLECT on Windows (pre-existing
   `ModuleNotFoundError: No module named 'pwd'`, Linux-only module in
   `test_me_r_v3_atomic_pg_e2e_issue154.py`,
@@ -91,6 +99,59 @@ triggers, PG store driver-level placeholder/schema contract.
   `test_operations_monitor_retention.py`,
   `test_srr_short_r_expansion_candle_path_integrity_audit_v1.py`) — they are
   untouched by this change and collect/run on the Linux CI.
+
+### 4.1 Failure attribution (branch vs base, full suite)
+
+The first branch-vs-base diff showed exactly FOUR failures present at the
+branch but not at base; after the contract amendment the remaining deltas
+are fully accounted for below.  All other failing/errored tests are
+byte-identical between the two runs (they require a live PostgreSQL or are
+Windows-environmental and fail identically on the untouched base).
+
+1–3. `tests/test_me_entry_quality_h2_purity_v1.py::TestProductionIsolation`
+(`test_no_production_module_references_h2`, `test_no_sql_migration_for_h2`,
+`test_no_systemd_unit_for_h2`): a genuine contract conflict — PR #311's
+guards banned the substring `me_entry_quality_h2` in migrations and deploy
+units because at that time H2 was pure in-memory research code with NO
+authorized persistence or service surface.  Issue #312 explicitly authorizes
+exactly those two surfaces ("отдельная схема persistence + SQL-миграции",
+"шаблоны systemd/env … не устанавливать").  Resolution: a **deliberate,
+minimal contract amendment** of those three guards — the ban is sharpened to
+the exact pure-engine name `me_entry_quality_h2_v1` (preserving the original
+invariant verbatim) and a NEW guard
+(`test_prospective_runtime_confined_to_authorized_surfaces`) confines the
+prospective runtime to its four authorized research-only files (own
+migration + disabled env/service/role templates).  The pure engine is still
+banned everywhere outside `app/research`; nothing is weakened.  After the
+amendment the whole H2 suite passes 168/168.
+
+4. `tests/test_htf_baseline_short_phase2_isolation_v1.py`
+(`test_new_files_are_confined_to_phase2_surface`, and after the commit also
+`test_no_tracked_file_modified_against_base`): PR-scoped confinement guards
+from an EARLIER issue (HTF Phase-2) that assert no new/modified files
+outside the Phase-2 surface.  They fail in ANY long-lived workspace and for
+ANY later issue's PR: the failure message flags 192+ paths, ~180 of which
+are pre-existing session artifacts from issues #268–#308
+(`reports/issue268_*` … `reports/issue308_*`, `_h2_pr311/`, `var/`) that
+existed long before this change.  CI already treats these guards as
+PR-scoped: `main-pr-safety.yml` explicitly `--deselect`s both
+`test_new_files_are_confined_to_phase2_surface` and
+`test_no_tracked_file_modified_against_base` outside Phase-2 PRs with the
+comment that the confinement tests are meaningless outside Phase-2.  Not
+modified here (they belong to another issue's surface); documented as
+scope-guard noise.  (`test_no_tracked_file_modified_against_base` now also
+flags the documented `tests/test_me_entry_quality_h2_purity_v1.py` contract
+amendment — expected and covered by the same CI deselect.)
+
+5. `tests/test_issue253_limiter_deny_propagation_v1.py::test_recovery_allows_the_same_entrypoint_after_cooldown`
+(final run only; it did NOT fail in the first branch run): a timing-flaky
+cooldown test.  It fails **identically at the untouched base when run in
+isolation** (verified in the clean `origin/main` clone), i.e. its outcome
+depends on suite timing, not on this change.
+
+6. One compare-script false positive (`paper_runner:paper_runner.py:290`):
+a `paper_runner` log line inside a PASSING test's captured log, matched by
+the failure-line regex.  No test is attached to it.
 
 ## 5. Audits
 
@@ -121,7 +182,10 @@ triggers, PG store driver-level placeholder/schema contract.
   `H2P_ROW_IMMUTABLE` refuse UPDATE/DELETE.
 
 ### 5.3 Production isolation audit
-* `git status`: ZERO modified/deleted tracked files — everything is additive.
+* `git status` at commit time: ZERO modified production files — the change
+  set is fully additive EXCEPT the documented contract amendment of
+  `tests/test_me_entry_quality_h2_purity_v1.py` (guard sharpening, section
+  4.1); no production code, config or schema file is modified.
 * `scanner_runner.py`, production detector/scoring/regime gate, paper/live:
   untouched.
 * #305 schema: SELECT-only code path + tests asserting non-SELECT is
@@ -157,7 +221,7 @@ pytest tests/test_me_entry_quality_h2_prospective_source_reader_v1.py \
        tests/test_me_entry_quality_h2_prospective_runtime_v1.py \
        tests/test_me_entry_quality_h2_prospective_pg_integration_v1.py -q
 
-# PR #311 H2 regression (167)
+# PR #311 H2 regression (167 original + 1 strengthened isolation guard)
 pytest tests/test_me_entry_quality_h2_candle_provider_v1.py \
        tests/test_me_entry_quality_h2_causal_asof_v1.py \
        tests/test_me_entry_quality_h2_lineage_idempotency_v1.py \
