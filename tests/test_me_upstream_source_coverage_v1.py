@@ -968,6 +968,92 @@ class TestReconcileCoverageSql:
 
 
 # ---------------------------------------------------------------------------
+# Deployment-gap diagnostics (Issue #305 SOURCE_ONLY routing defect):
+# the unverifiable interval is recorded explicitly and NEVER converted into
+# verdict evidence — the freeze_ts and the COVERAGE_PASS formula stay intact.
+# ---------------------------------------------------------------------------
+
+class TestDeploymentGapDiagnostics:
+    GAP = (FREEZE, NOW - timedelta(hours=1))
+
+    def test_unverified_intervals_recorded_without_verdict_change(self):
+        script = _script(
+            upstream=(_upstream_row(captured_at=NOW - timedelta(hours=1)),),
+            v3=(_v3_row(created_at=NOW - timedelta(hours=1)),),
+        )
+        base, _ = _reconcile(script, as_of=NOW)
+        with_gap, _ = _reconcile(
+            script, as_of=NOW, unverified_intervals=[self.GAP],
+        )
+        # Verdicts are IDENTICAL — the gap is diagnostics, not evidence.
+        assert (with_gap["status"], with_gap["reason"]) == (
+            base["status"], base["reason"],
+        )
+        assert base["status"] == COVERAGE_PASS
+        assert "unverified_intervals" not in base
+        assert with_gap["unverified_intervals"] == [
+            (FREEZE.isoformat(), (NOW - timedelta(hours=1)).isoformat()),
+        ]
+
+    def test_gap_absence_never_produces_pass_evidence(self):
+        # An empty interval (no events at all — exactly the outage shape)
+        # stays UNKNOWN even when the gap is declared: no SOURCE_VALIDATED-
+        # style verdict can arise from "no errors".
+        result, _ = _reconcile(
+            _script(upstream=(), v3=()),
+            as_of=NOW,
+            unverified_intervals=[self.GAP],
+        )
+        assert result["matched"] == 0
+        assert result["status"] == SOURCE_COVERAGE_UNKNOWN
+
+    def test_unverified_intervals_are_persisted_in_audit_diagnostics(self):
+        result, _ = _reconcile(
+            _script(
+                upstream=(_upstream_row(captured_at=NOW - timedelta(hours=1)),),
+                v3=(_v3_row(created_at=NOW - timedelta(hours=1)),),
+            ),
+            as_of=NOW,
+            unverified_intervals=[self.GAP],
+        )
+        conn = _FakeConnection(_script())
+        save_coverage_audit(conn, result)
+        diagnostics = conn.log[-1][1][-1]
+        assert "unverified_intervals" in diagnostics
+        assert FREEZE.isoformat() in diagnostics
+
+    @pytest.mark.parametrize("bad", [
+        [(NOW, NOW)],                          # empty interval
+        [(NOW, NOW - timedelta(hours=1))],     # reversed
+        [("a", "b")],                          # not datetimes
+        [(NOW,)],                              # wrong arity
+        [(NOW, NOW, NOW)],                     # wrong arity
+        [1, 2],                                # not interval items
+    ])
+    def test_malformed_intervals_rejected(self, bad):
+        conn = _FakeConnection(_script())
+        with pytest.raises(ValueError):
+            reconcile_coverage(
+                conn, as_of=NOW, unverified_intervals=bad,
+            )
+
+    def test_no_source_validated_verdict_exists(self):
+        # "No errors" must never equal validated coverage: the vocabulary
+        # has no SOURCE_VALIDATED verdict and PASS requires matched >= 1.
+        import app.research.me_upstream_source_v1.coverage as mod
+        import app.research.me_upstream_source_v1.contracts as contracts_mod
+
+        values = {
+            v for v in vars(mod).values()
+            if isinstance(v, str)
+        } | {
+            v for v in vars(contracts_mod).values()
+            if isinstance(v, str)
+        }
+        assert "SOURCE_VALIDATED" not in values
+
+
+# ---------------------------------------------------------------------------
 # Cross-ledger identity compatibility (the V3 side match key)
 # ---------------------------------------------------------------------------
 

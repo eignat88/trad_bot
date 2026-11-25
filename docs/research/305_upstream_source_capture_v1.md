@@ -241,3 +241,65 @@ regime/expectancy; the capture package imports nothing from `app.paper` /
 * PostgreSQL integration tests require a test PostgreSQL server
   (`ME_UPS305_PG_IT_*`, opt-in) — they are skipped in environments without
   one and must run in CI/DB-capable staging before deployment.
+
+## 11. SOURCE_ONLY routing defect (2026-11-25) — root cause, fix, gap
+
+### Defect
+
+With `ME_INVERSE_SHORT_V2_SOURCE_ONLY=1` the `source_only` branch of
+`scanner_runner.run_scan_cycle` rebuilt `symbol_stats` keeping only
+`_me_inverse_short_source_events` and **silently dropped**
+`_me_upstream_source_events`. The #305 delivery loop then read an empty
+list every cycle: the upstream capture was ACTIVE (`RUNNING`, frozen
+`freeze_ts = 2026-11-24 13:31:53.365952+00`) but received zero events
+(audit 2026-11-25 06:23 UTC: `SOURCE_COVERAGE_UNKNOWN /
+NO_UPSTREAM_ACTIVITY`, capture errors = 0 — fail-open hid nothing, the
+events never reached the hook).
+
+Full data-flow audit confirmed this is the **only** loss point: the
+orchestrator publishes `stats["_me_upstream_source_events"]` immediately
+after `scanner.scan(ctx)` (pre-scoring, pre-dedup, pre-geometry, pre-gates,
+fail-open); no other assignment to `symbol_stats` exists and every
+downstream consumer reads via `.get(key, [])`.
+
+### Fix (research routing only)
+
+The `source_only` rebuild now preserves BOTH research source streams
+(`_me_inverse_short_source_events` + `_me_upstream_source_events`) and
+nothing else; `candidates = []` and all other suppressions are unchanged.
+SOURCE_ONLY semantics — no ordinary setup routing, no paper/live side
+effects — are intact. Regression scenarios A–E live in
+`tests/test_me_inverse_short_v2_source_only.py` (scenario A reproduces the
+loss on pre-fix code).
+
+### Deployment-gap accounting (prospective integrity)
+
+* `freeze_ts` is **unchanged** (`2026-11-24 13:31:53.365952+00`); no
+  backfill is possible or attempted.
+* The interval `(freeze_ts, fix_deploy_ts)` is a period of **potentially
+  incomplete capture** (the routing defect). It is recorded explicitly via
+  the reconciler's `unverified_intervals` parameter — pure diagnostics,
+  persisted in `coverage_audit.diagnostics`. The `COVERAGE_PASS` formula,
+  the historical-exclusion rules and every verdict precedence are
+  byte-identical.
+* The gap can NOT be validated retroactively by construction: pre-window
+  rows are `outside_window_*` (never PASS evidence, never gaps), `PASS`
+  requires `matched >= 1` inside the audited window, and "no errors" never
+  yields a validated verdict (there is no `SOURCE_VALIDATED` state).
+* `fix_deploy_ts` is captured at deployment time and passed as
+  `unverified_intervals=[(freeze_ts, fix_deploy_ts)]` on the first
+  post-deploy audit. Recommended: run one read-only reconcile BEFORE and
+  AFTER the fix deploy and archive both results.
+
+### Post-deploy verification checklist (VPS)
+
+1. Record `fix_deploy_ts`; confirm git HEAD contains the fix.
+2. New detector-level events appear in
+   `research_me_upstream_coverage.source_event` (prospective, post-fix).
+3. Read-only reconciliation over the post-fix window: `COVERAGE_PASS`
+   (matched >= 1) or an honest `COVERAGE_LAG/GAP` — never UNKNOWN hidden
+   as success; integrity conflicts = 0.
+4. Persist one `coverage_audit` row with
+   `unverified_intervals=[(freeze_ts, fix_deploy_ts)]` documenting the
+   gap.
+5. #296 stays `DEPLOY_HOLD` until a separate GO decision.
