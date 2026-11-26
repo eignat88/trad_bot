@@ -53,6 +53,20 @@ class TestAudit(unittest.TestCase):
     def test_no_timestamp_no_event(self):
         self.assertIsNone(parse_line("scanner", "BYBIT_API_CALL result=OK"))
 
+def test_real_pre_send_skip_event_is_counted():
+    line = (
+        "2026-11-26T08:00:20+0000 host python: "
+        "BYBIT_API_SKIP endpoint=/v5/market/kline "
+        "symbol=BTCUSDT reason=BREAKER_OPEN "
+        "detail=breaker_cooldown_exceeds_deadline"
+    )
+    parsed = parse_line("scanner", line)
+    assert parsed is not None
+    assert parsed["result"] == "BYBIT_API_SKIP"
+
+    report = analyze({"scanner": [line]})
+    assert report["by_service"]["scanner"]["pre_send_skip"] == 1
+    assert report["by_service"]["scanner"]["sent_confirmed"] == 0
 
 if __name__ == "__main__":
     unittest.main()

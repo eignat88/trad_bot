@@ -30,6 +30,22 @@ def parse_line(service: str, line: str) -> dict | None:
     if not match:
         return None
     timestamp = match.group(1)
+    if "BYBIT_API_SKIP" in line:
+        payload = line.split("BYBIT_API_SKIP", 1)[1]
+        fields = dict(_FIELDS.findall(payload))
+        return {
+            "kind": "api",
+            "service": service,
+            "second": timestamp,
+            "minute": timestamp[:16],
+            "result": "BYBIT_API_SKIP",
+            "endpoint": fields.get("endpoint", "?"),
+            "symbol": fields.get("symbol", "?"),
+            "interval": fields.get("interval", "?"),
+            "limit": fields.get("limit", "?"),
+            "attempt": fields.get("attempt_index", "?"),
+            "request_id": fields.get("logical_request_id", "?"),
+        }
     if "BYBIT_API_CALL" in line:
         payload = line.split("BYBIT_API_CALL", 1)[1]
         fields = dict(_FIELDS.findall(payload))
