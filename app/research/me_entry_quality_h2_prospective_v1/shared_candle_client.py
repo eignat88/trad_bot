@@ -33,7 +33,10 @@ def build_h2_shared_client(config):
             "H2_SHARED_LIMITER_CONTRACT_REQUIRED: absolute path to the "
             "deployed production limiter contract must be configured"
         )
-    values = load_limiter_contract(path)
+    values = {
+        key: value for key, value in load_limiter_contract(path).items()
+        if not key.startswith('_')
+    }
     state_path = values["global_limiter_state_path"]
     if not os.path.isabs(state_path):
         raise ValueError(
