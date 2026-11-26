@@ -75,7 +75,10 @@ MIGRATION_PATH = (
 MIGRATION_096_PATH = (
     ROOT / "sql" / "migrations" / "096_me_entry_quality_h2_prospective_overlap_v1.sql"
 )
-MIGRATIONS = (MIGRATION_PATH, MIGRATION_096_PATH)
+MIGRATION_097_PATH = (
+    ROOT / "sql" / "migrations" / "097_h2_prospective_clean_activation_v1.sql"
+)
+MIGRATIONS = (MIGRATION_PATH, MIGRATION_096_PATH, MIGRATION_097_PATH)
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 BASE_MS = 1_767_225_600_000
@@ -812,3 +815,39 @@ class TestPgMigration095:
                 assert cur.fetchone()[0] is None
         finally:
             conn.close()
+
+
+class TestCleanActivationPg:
+    def test_fresh_boundary_persists_across_restart_and_refuses_mutation(
+        self, store, scratch_db
+    ):
+        now = datetime.now(timezone.utc)
+        boundary_us = (
+            int(now.timestamp()) * 1_000_000 + now.microsecond
+        ) + 10_000_000
+        fingerprints = ("aa" * 32, "bb" * 32)
+        store.bind_clean_activation(boundary_us, fingerprints)
+
+        conn2 = _admin_connect(scratch_db)
+        conn2.autocommit = False
+        try:
+            restarted = PgProspectiveStore(conn2)
+            restarted.bind_clean_activation(boundary_us, fingerprints)
+            with pytest.raises(ValueError, match="IMMUTABLE_MISMATCH"):
+                restarted.bind_clean_activation(boundary_us + 1, fingerprints)
+            with pytest.raises(ValueError, match="IMMUTABLE_MISMATCH"):
+                restarted.bind_clean_activation(boundary_us, ("cc" * 32,))
+            with pytest.raises(Exception, match="H2_CLEAN_ACTIVATION_IMMUTABLE"):
+                restarted._execute(
+                    "UPDATE research_me_entry_quality_h2_prospective.clean_activation "
+                    "SET activation_ts_us = activation_ts_us + 1 WHERE id=1"
+                )
+        finally:
+            conn2.rollback()
+            conn2.close()
+
+    def test_retroactive_boundary_refused(self, store):
+        earlier = datetime.now(timezone.utc) - timedelta(hours=1)
+        boundary_us = int(earlier.timestamp()) * 1_000_000 + earlier.microsecond
+        with pytest.raises(ValueError, match="NOT_FRESH"):
+            store.bind_clean_activation(boundary_us, ("aa" * 32,))
