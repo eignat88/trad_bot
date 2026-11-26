@@ -356,9 +356,10 @@ class H2ProspectiveRuntime:
             counters.source_events_received += len(rows)
             for row in rows:
                 dup_before = counters.idempotent_duplicates
-                    pre_before = counters.source_events_pre_freeze
+                pre_before = counters.source_events_pre_freeze
                 self._ingest_row(row, counters)
-                if counters.idempotent_duplicates == dup_before:
+                if (counters.idempotent_duplicates == dup_before
+                        and counters.source_events_pre_freeze == pre_before):
                     # first-seen HERE = late commit (forward never saw it)
                     counters.late_events_discovered += 1
             o_us, o_key = cursor_of(rows)
