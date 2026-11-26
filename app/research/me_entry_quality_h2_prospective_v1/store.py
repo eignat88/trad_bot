@@ -312,7 +312,9 @@ class InMemoryProspectiveStore(H2ProspectiveStore):
         normalized = (int(activation_ts_us), tuple(sorted(fingerprints)), mode)
         current = getattr(self, "_clean_activation", None)
         if current is None:
-            if self.ingest_event_count() or self.get_cursor() != (0, ""):
+            if (self.ingest_event_count() or self.get_cursor() != (0, "")
+                    or self.get_overlap_state()["pass_active"]
+                    or self.get_overlap_state()["passes_completed"]):
                 raise ValueError("H2_CLEAN_ACTIVATION_REQUIRES_EMPTY_STORE")
             self._clean_activation = normalized
         elif current != normalized:
@@ -778,7 +780,9 @@ class PgProspectiveStore(H2ProspectiveStore):
         )
         row = cur.fetchone()
         if row is None:
-            if self.ingest_event_count() or self.get_cursor() != (0, ""):
+            if (self.ingest_event_count() or self.get_cursor() != (0, "")
+                    or self.get_overlap_state()["pass_active"]
+                    or self.get_overlap_state()["passes_completed"]):
                 raise ValueError("H2_CLEAN_ACTIVATION_REQUIRES_EMPTY_STORE")
             self._execute(
                 f"""
