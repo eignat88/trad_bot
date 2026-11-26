@@ -35,6 +35,7 @@ from app.scanners.cycle_completion_v1 import (
     classify_me_capture_failure,
     classify_symbol_failure,
 )
+from app.scanners.recovery_policy_v1 import decide_recovery
 from app.scanners.direction_gate import ScannerDirectionGatePolicy
 from app.scanners.expectancy_filter import ExpectancyFilter, load_expectancy
 from app.scanners.funnel_diagnostics import flush_and_persist_all
@@ -3184,6 +3185,11 @@ def main() -> None:
         me_capture_spool = MECleanCaptureSpool(spool_path)
         logger.info("ME clean durable capture enabled: %s", spool_path)
 
+    # AC7 Phase B: opt-in, OFF unless explicitly set to "1".
+    ac7_recovery_enabled = (
+        os.getenv("SCANNER_AC7_RECOVERY_ENABLED", "0") == "1"
+    )
+    ac7_recovery_attempted = False
     cycle = 0
     while not SHUTDOWN:
         # ------------------------------------------------------------------
@@ -3246,6 +3252,7 @@ def main() -> None:
         # fact). Created OUTSIDE the try so the abort path below can always
         # report what had been processed before the cycle died.
         report = CycleCompletionReport()
+        ac7_cycle_finished_ok = False
         try:
             total, scanned, failed = run_scan_cycle(
                 client, orchestrator, repository, symbols, run_id, settings,
@@ -3315,6 +3322,7 @@ def main() -> None:
                     _run_oos_evaluator(client, repository)
                 except Exception:
                     logger.exception("OOS evaluator cycle failed")
+            ac7_cycle_finished_ok = True
         except Exception:
             logger.exception("cycle #%d failed", cycle)
             if run_id:
@@ -3337,6 +3345,30 @@ def main() -> None:
         delay = seconds_until_next_cycle(
             start, settings.scan_interval, time.monotonic(),
         )
+        if ac7_recovery_enabled and ac7_cycle_finished_ok:
+            if report.is_complete:
+                # A complete cycle resets the one-shot recovery guard.
+                ac7_recovery_attempted = False
+            else:
+                ac7_choice = decide_recovery(
+                    enabled=True,
+                    expected_symbols=report.expected_symbols,
+                    processed_symbols=report.processed_count,
+                    limiter_pre_send_skips=len(
+                        report.limiter_pre_send_skip_symbols
+                    ),
+                    previous_recovery_attempted=ac7_recovery_attempted,
+                    normal_delay_seconds=delay,
+                )
+                if ac7_choice.expedite:
+                    delay = ac7_choice.delay_seconds
+                    ac7_recovery_attempted = True
+                logger.info(
+                    "scanner AC7 recovery: cycle=%d expedite=%s "
+                    "reason=%s next_delay=%.1fs",
+                    cycle, ac7_choice.expedite,
+                    ac7_choice.reason, delay,
+                )
         logger.info("cycle #%d sleeping %.0fs before next cycle", cycle, delay)
         for _ in range(int(delay)):
             if SHUTDOWN:
