@@ -41,6 +41,10 @@ from app.research.me_entry_quality_h2_prospective_v1.candle_adapter import (
 from app.research.me_entry_quality_h2_prospective_v1.config import (
     H2ProspectiveConfig,
 )
+from app.research.me_entry_quality_h2_prospective_v1.clean_boundary import (
+    activation_timestamp_us,
+    eligible_for_clean_holdout,
+)
 from app.research.me_entry_quality_h2_prospective_v1.contracts import (
     INGEST_ACCEPTED,
     INGEST_REJECTED_INVALID,
@@ -126,11 +130,22 @@ class H2ProspectiveRuntime:
         self._overlap_restart_recovery_pending = bool(
             self._store.get_overlap_state().get("pass_active")
         )
+        self._clean_activation_us = (
+            activation_timestamp_us(config.clean_activation_ts)
+            if config.clean_activation_ts else None
+        )
         self._policies = tuple(policies) if policies is not None else (
             candidate_policies(config.observation_windows)
         )
         if not self._policies:
             raise ValueError("at least one H2Policy is required")
+        if self._clean_activation_us is not None and config.enabled:
+            # PG activation row is immutable. On restart the exact timestamp
+            # and entire manifest must match; never silently switch cohort.
+            self._store.bind_clean_activation(
+                self._clean_activation_us,
+                tuple(sorted(p.fingerprint() for p in self._policies)),
+            )
         pins = set(config.policy_fingerprint_pins)
         if pins:
             for policy in self._policies:
@@ -407,6 +422,12 @@ class H2ProspectiveRuntime:
         return rows_seen
 
     def _ingest_row(self, row: Mapping[str, Any], counters: TelemetryCounters) -> None:
+        if self._clean_activation_us is not None:
+            # Historical #305 events advance the delivery cursor, but NEVER
+            # enter the H2 ingest ledger or create evaluated variant states.
+            if not eligible_for_clean_holdout(row, self._clean_activation_us):
+                counters.source_events_pre_freeze += 1
+                return
         delivery: SourceDelivery = delivery_from_row(row)
         outcome = self._store.ingest_event(delivery)
         if outcome.duplicate:
