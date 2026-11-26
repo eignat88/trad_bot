@@ -308,9 +308,18 @@ class TestProvider:
             symbol="BTCUSDT", grid=grid, evaluation_asof_ms=BASE_MS + 25 * MS
         )
         assert first.ok
-        assert not second.ok
-        assert second.reason == REASON_BUDGET_EXHAUSTED
+        assert second.ok     # same closed range reused within this cycle
+        assert second.api_requests == 0
+        assert second.source_identity == first.source_identity
         assert len(client.calls) == 1
+
+        # A new cycle must not reuse old exchange data.
+        provider.start_cycle()
+        third = provider.fetch_closed_5m(
+            symbol="BTCUSDT", grid=grid, evaluation_asof_ms=BASE_MS + 25 * MS
+        )
+        assert third.ok
+        assert len(client.calls) == 2
 
     def test_empty_payload_is_never_synthesized(self):
         client = _ScriptedClient([[]])
