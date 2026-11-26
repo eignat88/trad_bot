@@ -1,0 +1,41 @@
+[Unit]
+Description=H2 RSI-Only Prospective Research Runtime (research only, disabled by default)
+After=postgresql.service
+Wants=postgresql.service
+# Bounded crash-loop protection for transient failures.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=tradbot_h2_prospective
+Group=tradbot_h2_prospective
+
+WorkingDirectory=/opt/trad_bot_h2_prospective_release
+
+Environment=PYTHONPATH=/opt/trad_bot_h2_prospective_release
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Research runtime configuration (deploy/env/h2-prospective-runtime.env.example)
+EnvironmentFile=/opt/trad_bot_h2_prospective_release/deploy/env/h2-prospective-runtime.env
+
+ExecStart=/opt/trad_bot_h2_prospective_release/.venv312/bin/python -B -m app.research.me_entry_quality_h2_prospective_v1.runner
+
+Restart=on-failure
+# 3: runtime disabled / not activated (operator action).
+SuccessExitStatus=3
+RestartSec=60
+TimeoutStopSec=15
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+
+# NOTE: this unit is a TEMPLATE ONLY (Issue #312).  It must NOT be installed
+# or enabled on the VPS without a separate explicit GO.  The runtime is
+# research-only: it never generates trading signals, never opens trades and
+# never touches paper/live state.

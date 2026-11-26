@@ -135,8 +135,23 @@ class TestProductionIsolation:
         "app/indicators/technical.py",
         "bot.py",
     )
+    #: The pure engine (Issue #298/#311) is ``me_entry_quality_h2_v1``.  It
+    #: must stay unwired from every production surface, migration and unit.
+    ENGINE_NEEDLE = "me_entry_quality_h2_v1"
+    #: Issue #312 authorizes ONE narrow exception surface: the research-only
+    #: prospective runtime (``me_entry_quality_h2_prospective``) may appear in
+    #: its own package, its own migration and disabled-by-default deploy
+    #: templates — nowhere else.
+    RUNTIME_NEEDLE = "me_entry_quality_h2_prospective"
+    AUTHORIZED_RESEARCH_RUNTIME_SURFACES = (
+        "deploy/env/h2-prospective-runtime.env.example",
+        "deploy/systemd/trad-bot-h2-prospective-runtime.service",
+        "deploy/sql/312_h2_prospective_role.sql",
+        "sql/migrations/095_me_entry_quality_h2_prospective_v1.sql",
+        "sql/migrations/096_me_entry_quality_h2_prospective_overlap_v1.sql",
+    )
 
-    def test_no_production_module_references_h2(self):
+    def _production_targets(self):
         targets = []
         for rel in self.SURFACES:
             path = ROOT / rel
@@ -144,14 +159,36 @@ class TestProductionIsolation:
                 targets.append(path)
         targets.extend((ROOT / "app").rglob("*.py"))
         targets.extend((ROOT / "deploy").rglob("*"))
-        needle = "me_entry_quality_h2"
-        offenders = [
-            str(p.relative_to(ROOT))
-            for p in targets
+        return [
+            p for p in targets
             if p.is_file()
             and "research" not in p.parts  # research<->research reuse is offline
-            and needle in p.read_text(encoding="utf-8", errors="ignore")
             and "test_me_entry_quality_h2" not in str(p)
+        ]
+
+    def test_no_production_module_references_h2(self):
+        # the pure H2 engine is never referenced from any production surface
+        offenders = [
+            str(p.relative_to(ROOT))
+            for p in self._production_targets()
+            if self.ENGINE_NEEDLE
+            in p.read_text(encoding="utf-8", errors="ignore")
+        ]
+        assert offenders == []
+
+    def test_prospective_runtime_confined_to_authorized_surfaces(self):
+        # Issue #312: the prospective runtime may only appear inside its own
+        # authorized (disabled-by-default) surfaces
+        authorized = {
+            str((ROOT / rel).resolve())
+            for rel in self.AUTHORIZED_RESEARCH_RUNTIME_SURFACES
+        }
+        offenders = [
+            str(p.relative_to(ROOT))
+            for p in self._production_targets()
+            if str(p.resolve()) not in authorized
+            and self.RUNTIME_NEEDLE
+            in p.read_text(encoding="utf-8", errors="ignore")
         ]
         assert offenders == []
 
@@ -161,7 +198,14 @@ class TestProductionIsolation:
             return
         for path in sql_dir.rglob("*.sql"):
             text = path.read_text(encoding="utf-8", errors="ignore")
-            assert "me_entry_quality_h2" not in text, path.name
+            assert self.ENGINE_NEEDLE not in text, path.name
+            if self.RUNTIME_NEEDLE in text:
+                assert path.name in (
+                    "095_me_entry_quality_h2_prospective_v1.sql",
+                    "096_me_entry_quality_h2_prospective_overlap_v1.sql",
+                ), (
+                    f"unauthorized prospective-runtime migration: {path.name}"
+                )
 
     def test_no_systemd_unit_for_h2(self):
         deploy_dir = ROOT / "deploy"
@@ -169,7 +213,11 @@ class TestProductionIsolation:
             return
         for path in deploy_dir.rglob("*.service"):
             text = path.read_text(encoding="utf-8", errors="ignore")
-            assert "me_entry_quality_h2" not in text, path.name
+            assert self.ENGINE_NEEDLE not in text, path.name
+            if self.RUNTIME_NEEDLE in text:
+                assert path.name == "trad-bot-h2-prospective-runtime.service", (
+                    f"unauthorized prospective-runtime unit: {path.name}"
+                )
 
     def test_detector_module_untouched_by_h2(self):
         text = (ROOT / "app" / "scanners" /

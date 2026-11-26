@@ -35,6 +35,10 @@ from app.scanners.cycle_completion_v1 import (
     classify_me_capture_failure,
     classify_symbol_failure,
 )
+from app.scanners.recovery_policy_v1 import (
+    decide_recovery,
+    breaker_cooldown_hint_seconds,
+)
 from app.scanners.direction_gate import ScannerDirectionGatePolicy
 from app.scanners.expectancy_filter import ExpectancyFilter, load_expectancy
 from app.scanners.funnel_diagnostics import flush_and_persist_all
@@ -1933,7 +1937,13 @@ def _get_prospective_observer(repository: ScannerRepository):
     if _prospective_observer is None:
         try:
             import pg8000
-            from app.research.prospective_observer import ProspectiveOOSObserver
+            # Issue #322: use the signal-integrity adapter (ME_SHORT-scoped
+            # stable candle identity). It subclasses the frozen
+            # ProspectiveOOSObserver and delegates every non-ME_SHORT family to
+            # it unchanged, so this is a drop-in wiring change.
+            from app.research.scanner_signal_integrity_observer import (
+                ScannerSignalIntegrityObserver,
+            )
             from app.research.prospective_completed_event_repository import (
                 ProspectiveCompletedEventRepository,
             )
@@ -1980,7 +1990,7 @@ def _get_prospective_observer(repository: ScannerRepository):
 
             completed_event_repo = ProspectiveCompletedEventRepository(_prospective_conn)
 
-            _prospective_observer = ProspectiveOOSObserver(
+            _prospective_observer = ScannerSignalIntegrityObserver(
                 _prospective_conn, experiments,
                 research_repo=research_repo_for_promote,
                 completed_event_repo=completed_event_repo,
@@ -2487,6 +2497,8 @@ def run_scan_cycle(
                                 direction=c.direction,
                                 symbol=c.symbol,
                                 signal_time=c.detected_at,
+                                entry_timeframe=c.entry_timeframe,
+                                signal_candle_open_time=c.signal_candle_open_time,
                                 reference_price=c.reference_price,
                                 invalidation_price=c.invalidation_price,
                                 target_1=c.target_1,
@@ -2567,6 +2579,8 @@ def run_scan_cycle(
                                 direction=oc.direction,
                                 symbol=oc.symbol,
                                 signal_time=oc.detected_at,
+                                entry_timeframe=oc.entry_timeframe,
+                                signal_candle_open_time=oc.signal_candle_open_time,
                                 reference_price=oc.reference_price,
                                 invalidation_price=oc.invalidation_price,
                                 target_1=oc.target_1,
@@ -2632,6 +2646,8 @@ def run_scan_cycle(
                                     direction=c.direction,
                                     symbol=c.symbol,
                                     signal_time=c.detected_at,
+                                    entry_timeframe=c.entry_timeframe,
+                                    signal_candle_open_time=c.signal_candle_open_time,
                                     reference_price=c.reference_price,
                                     invalidation_price=c.invalidation_price,
                                     target_1=c.target_1,
@@ -2808,6 +2824,8 @@ def run_scan_cycle(
                                 direction=erc.direction,
                                 symbol=erc.symbol,
                                 signal_time=erc.detected_at,
+                                entry_timeframe=erc.entry_timeframe,
+                                signal_candle_open_time=erc.signal_candle_open_time,
                                 reference_price=erc.reference_price,
                                 invalidation_price=erc.invalidation_price,
                                 target_1=erc.target_1,
@@ -2851,6 +2869,8 @@ def run_scan_cycle(
                                 direction=rrc.direction,
                                 symbol=rrc.symbol,
                                 signal_time=rrc.detected_at,
+                                entry_timeframe=rrc.entry_timeframe,
+                                signal_candle_open_time=rrc.signal_candle_open_time,
                                 reference_price=rrc.reference_price,
                                 invalidation_price=rrc.invalidation_price,
                                 target_1=rrc.target_1,
@@ -3184,6 +3204,12 @@ def main() -> None:
         me_capture_spool = MECleanCaptureSpool(spool_path)
         logger.info("ME clean durable capture enabled: %s", spool_path)
 
+    # AC7 Phase B: opt-in, OFF unless explicitly set to "1".
+    ac7_recovery_enabled = (
+        os.getenv("SCANNER_AC7_RECOVERY_ENABLED", "0") == "1"
+    )
+    # Fail closed after restart until a complete cycle.
+    ac7_recovery_attempted = True
     cycle = 0
     while not SHUTDOWN:
         # ------------------------------------------------------------------
@@ -3246,6 +3272,7 @@ def main() -> None:
         # fact). Created OUTSIDE the try so the abort path below can always
         # report what had been processed before the cycle died.
         report = CycleCompletionReport()
+        ac7_cycle_finished_ok = False
         try:
             total, scanned, failed = run_scan_cycle(
                 client, orchestrator, repository, symbols, run_id, settings,
@@ -3315,6 +3342,7 @@ def main() -> None:
                     _run_oos_evaluator(client, repository)
                 except Exception:
                     logger.exception("OOS evaluator cycle failed")
+            ac7_cycle_finished_ok = True
         except Exception:
             logger.exception("cycle #%d failed", cycle)
             if run_id:
@@ -3337,6 +3365,54 @@ def main() -> None:
         delay = seconds_until_next_cycle(
             start, settings.scan_interval, time.monotonic(),
         )
+        if ac7_recovery_enabled and ac7_cycle_finished_ok:
+            if report.is_complete:
+                # A complete cycle resets the one-shot recovery guard.
+                ac7_recovery_attempted = False
+            else:
+                try:
+                    # Review D2: count DISTINCT pre-send-skip symbols among
+                    # the symbols that produced NO market context this cycle.
+                    # ``limiter_pre_send_skip_symbols`` spans every outcome
+                    # stage, so a scan-stage rate-limit outcome of an
+                    # already-processed symbol (or repeated outcomes) must
+                    # never inflate the count into a spurious INVALID_SKIPS
+                    # fail-closed.  The ``<= missing`` invariant inside
+                    # decide_recovery still catches corrupt reports.
+                    ac7_unprocessed = set(report.unprocessed_symbols)
+                    ac7_choice = decide_recovery(
+                        enabled=True,
+                        expected_symbols=report.expected_symbols,
+                        processed_symbols=report.processed_count,
+                        limiter_pre_send_skips=len(
+                            ac7_unprocessed
+                            & set(report.limiter_pre_send_skip_symbols)
+                        ),
+                        previous_recovery_attempted=ac7_recovery_attempted,
+                        normal_delay_seconds=delay,
+                        # Review D1: the 130 s floor is experimental — the
+                        # expedited wake-up is additionally clamped by the
+                        # LIVE shared-breaker cooldown (read-only snapshot).
+                        # An unprovable hint raises and the normal schedule
+                        # is kept (fail-closed).
+                        limiter_cooldown_hint_seconds=(
+                            breaker_cooldown_hint_seconds(client)
+                        ),
+                    )
+                    if ac7_choice.expedite:
+                        delay = ac7_choice.delay_seconds
+                        ac7_recovery_attempted = True
+                    logger.info(
+                        "scanner AC7 recovery: cycle=%d expedite=%s "
+                        "reason=%s next_delay=%.1fs",
+                        cycle, ac7_choice.expedite,
+                        ac7_choice.reason, delay,
+                    )
+                except Exception:
+                    logger.exception(
+                        "scanner AC7 recovery decision failed; "
+                        "normal schedule retained"
+                    )
         logger.info("cycle #%d sleeping %.0fs before next cycle", cycle, delay)
         for _ in range(int(delay)):
             if SHUTDOWN:
