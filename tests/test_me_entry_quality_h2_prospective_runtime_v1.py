@@ -442,12 +442,14 @@ class TestDisabledRuntime:
         config = load_config({
             "H2_PROSPECTIVE_ENABLED": "1",
             "H2_PROSPECTIVE_ALLOW_UNFROZEN_POLICIES": "1",
+            "H2_PROSPECTIVE_CLEAN_ACTIVATION_TS": "2026-11-26T07:30:00Z",
         })
         assert config.enabled is True
         # pinned fingerprints are the other permitted route
         pinned = load_config({
             "H2_PROSPECTIVE_ENABLED": "1",
             "H2_PROSPECTIVE_POLICY_FINGERPRINT_PINS": "ab" * 32,
+            "H2_PROSPECTIVE_CLEAN_ACTIVATION_TS": "2026-11-26T07:30:00Z",
         })
         assert pinned.policy_fingerprint_pins == ("ab" * 32,)
         # invalid opt-in value stays strict
