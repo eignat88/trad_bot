@@ -40,7 +40,7 @@ def make_report(processed, skips, request_state):
     return report
 
 
-def execute(report, *, enabled=True, attempted=False):
+def execute(report, *, enabled=True, attempted=False, hint=0.0):
     events = []
 
     state = {
@@ -50,6 +50,8 @@ def execute(report, *, enabled=True, attempted=False):
         "report": report,
         "delay": 260.0,
         "decide_recovery": decide_recovery,
+        "breaker_cooldown_hint_seconds": lambda _client: hint,
+        "client": object(),
         "cycle": 297,
         "logger": SimpleNamespace(
             info=lambda *a: events.append(("info", a)),

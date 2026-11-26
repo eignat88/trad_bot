@@ -1,4 +1,13 @@
-"""Execute the actual main-loop AST with fake I/O and a fake clock."""
+"""Execute the actual main-loop AST with fake I/O and a fake clock.
+
+The harness compiles the REAL ``while not SHUTDOWN`` loop out of
+``scanner_runner.main`` and runs it against fake repositories, a fake clock
+and synthetic cycle reports — no PostgreSQL, no Bybit, no services.
+
+Every scheduled cycle is an ordinary loop iteration: recovery only shortens
+the sleep before the next cycle, so each rescan gets its own
+``repository.start_run()`` call and its own ``run_id`` by construction.
+"""
 import ast
 import inspect
 import textwrap
@@ -7,16 +16,25 @@ from types import SimpleNamespace
 import pytest
 import scanner_runner as sr
 
+#: Skip stories for synthetic cycles.
+SKIP_PRE_SEND = "LIMITER_PRE_SEND_SKIP"      # limiter refused before send
+SKIP_RESPONSE = "RATE_LIMIT_RESPONSE"        # Bybit answered 10006 / HTTP 429
+
 
 class Report:
     def __init__(self):
         self.expected_symbols = 0
         self.processed = []
-        self.skips = []
+        self.skips = []          # every not-processed symbol (any story)
+        self.pre_send = []       # subset refused by the limiter pre-send
 
     @property
     def processed_count(self):
         return len(self.processed)
+
+    @property
+    def unprocessed_symbols(self):
+        return list(self.skips)
 
     @property
     def is_complete(self):
@@ -39,18 +57,18 @@ class Report:
 
     @property
     def skipped_symbols(self):
-        return self.skips
+        return list(self.skips)
 
     @property
     def rate_limit_response_symbols(self):
-        return []
+        return [s for s in self.skips if s not in self.pre_send]
 
     @property
     def limiter_pre_send_skip_symbols(self):
-        return self.skips
+        return list(self.pre_send)
 
     def log_summary(self):
-        return "synthetic limiter pre-send skips"
+        return "synthetic incomplete cycle"
 
 
 def main_loop_code():
@@ -69,19 +87,38 @@ def main_loop_code():
     return compile(ast.fix_missing_locations(mod), "<real_loop>", "exec")
 
 
-@pytest.mark.parametrize(
-    "enabled,expected_delays",
-    [(True, [260, 130, 260]), (False, [260, 260, 260])],
-)
-def test_three_real_loop_iterations(enabled, expected_delays):
+MAIN_LOOP_CODE = main_loop_code()
+
+
+def run_main_loop(
+    cycle_specs,
+    *,
+    enabled=True,
+    hint_fn=None,
+    oos_interval=0,
+    source_only=True,
+    universe_size=50,
+    scan_seconds=40.0,
+):
+    """Run the real main loop for ``len(cycle_specs)`` cycles.
+
+    ``cycle_specs`` items are ``(processed, skipped, skip_story)`` triples
+    where ``skip_story`` is :data:`SKIP_PRE_SEND` or :data:`SKIP_RESPONSE`.
+
+    Returns ``(run_ids, finished, delays, oos_calls, state)``.
+    """
     clock = [0.0]
     run_ids = []
     finished = []
     delays = []
     oos_calls = []
+    start_run_calls = []
+    state = {}
+    spec_index = [0]
 
     class Repo:
         def start_run(self, **kwargs):
+            start_run_calls.append(dict(kwargs))
             run_ids.append(len(run_ids) + 1)
             return run_ids[-1]
 
@@ -91,16 +128,19 @@ def test_three_real_loop_iterations(enabled, expected_delays):
         def finish_run(self, run_id, **kwargs):
             finished.append((run_id, kwargs["status"]))
 
-    state = {}
-
     def scan(*args, report, **kwargs):
-        run_id = args[4]
-        clock[0] += 40.0
-        report.expected_symbols = 50
-        if run_id == 2:
-            report.skips = [f"S{i}" for i in range(50)]
+        clock[0] += scan_seconds
+        processed, skipped, story = cycle_specs[spec_index[0]]
+        spec_index[0] += 1
+        report.expected_symbols = universe_size
+        report.processed = [f"S{i}" for i in range(processed)]
+        report.skips = [
+            f"S{processed + i}" for i in range(skipped)
+        ]
+        if story == SKIP_PRE_SEND:
+            report.pre_send = list(report.skips)
         else:
-            report.processed = [f"S{i}" for i in range(50)]
+            report.pre_send = []
         return 0, len(report.processed), len(report.skips)
 
     def log_info(fmt, *args):
@@ -109,13 +149,18 @@ def test_three_real_loop_iterations(enabled, expected_delays):
 
     def fake_sleep(seconds):
         clock[0] += seconds
-        if len(run_ids) >= 3:
+        if len(run_ids) >= len(cycle_specs):
             state["SHUTDOWN"] = True
+
+    if hint_fn is None:
+        hint_fn = lambda _client: 0.0
 
     state.update({
         "SHUTDOWN": False,
         "cycle": 0,
         "ac7_recovery_enabled": enabled,
+        # Fail-closed restart guard: closed for recovery until a complete
+        # cycle, exactly as main() initializes it.
         "ac7_recovery_attempted": True,
         "symbols": [],
         "universe": [],
@@ -125,15 +170,15 @@ def test_three_real_loop_iterations(enabled, expected_delays):
         "settings": SimpleNamespace(
             scan_interval=300,
             scanner_universe=SimpleNamespace(mode="test"),
-            oos_evaluator_cycle_interval=0,
+            oos_evaluator_cycle_interval=oos_interval,
         ),
-        "source_only": True,
+        "source_only": source_only,
         "expectancy_filter": None,
         "prospective_obs": None,
         "me_early_mae_v2_pipeline": None,
         "me_capture_spool": None,
         "get_scanner_universe": lambda *_: [
-            {"symbol": f"S{i}"} for i in range(50)
+            {"symbol": f"S{i}"} for i in range(universe_size)
         ],
         "run_scan_cycle": scan,
         "CycleCompletionReport": Report,
@@ -143,6 +188,7 @@ def test_three_real_loop_iterations(enabled, expected_delays):
         "load_expectancy": lambda *a: None,
         "seconds_until_next_cycle": sr.seconds_until_next_cycle,
         "decide_recovery": sr.decide_recovery,
+        "breaker_cooldown_hint_seconds": hint_fn,
         "time": SimpleNamespace(
             monotonic=lambda: clock[0],
             sleep=fake_sleep,
@@ -155,7 +201,27 @@ def test_three_real_loop_iterations(enabled, expected_delays):
         ),
     })
 
-    exec(main_loop_code(), state)
+    exec(MAIN_LOOP_CODE, state)
+
+    return run_ids, finished, delays, oos_calls, state, start_run_calls
+
+
+COMPLETE = (50, 0, SKIP_PRE_SEND)
+
+
+@pytest.mark.parametrize(
+    "enabled,expected_delays",
+    [(True, [260, 130, 260]), (False, [260, 260, 260])],
+)
+def test_three_real_loop_iterations(enabled, expected_delays):
+    cycle_specs = [
+        COMPLETE,
+        (0, 50, SKIP_PRE_SEND),
+        COMPLETE,
+    ]
+    run_ids, finished, delays, oos_calls, state, _ = run_main_loop(
+        cycle_specs, enabled=enabled,
+    )
 
     assert run_ids == [1, 2, 3]
     assert finished == [

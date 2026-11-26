@@ -35,7 +35,10 @@ from app.scanners.cycle_completion_v1 import (
     classify_me_capture_failure,
     classify_symbol_failure,
 )
-from app.scanners.recovery_policy_v1 import decide_recovery
+from app.scanners.recovery_policy_v1 import (
+    decide_recovery,
+    breaker_cooldown_hint_seconds,
+)
 from app.scanners.direction_gate import ScannerDirectionGatePolicy
 from app.scanners.expectancy_filter import ExpectancyFilter, load_expectancy
 from app.scanners.funnel_diagnostics import flush_and_persist_all
@@ -3352,15 +3355,33 @@ def main() -> None:
                 ac7_recovery_attempted = False
             else:
                 try:
+                    # Review D2: count DISTINCT pre-send-skip symbols among
+                    # the symbols that produced NO market context this cycle.
+                    # ``limiter_pre_send_skip_symbols`` spans every outcome
+                    # stage, so a scan-stage rate-limit outcome of an
+                    # already-processed symbol (or repeated outcomes) must
+                    # never inflate the count into a spurious INVALID_SKIPS
+                    # fail-closed.  The ``<= missing`` invariant inside
+                    # decide_recovery still catches corrupt reports.
+                    ac7_unprocessed = set(report.unprocessed_symbols)
                     ac7_choice = decide_recovery(
                         enabled=True,
                         expected_symbols=report.expected_symbols,
                         processed_symbols=report.processed_count,
                         limiter_pre_send_skips=len(
-                            report.limiter_pre_send_skip_symbols
+                            ac7_unprocessed
+                            & set(report.limiter_pre_send_skip_symbols)
                         ),
                         previous_recovery_attempted=ac7_recovery_attempted,
                         normal_delay_seconds=delay,
+                        # Review D1: the 130 s floor is experimental — the
+                        # expedited wake-up is additionally clamped by the
+                        # LIVE shared-breaker cooldown (read-only snapshot).
+                        # An unprovable hint raises and the normal schedule
+                        # is kept (fail-closed).
+                        limiter_cooldown_hint_seconds=(
+                            breaker_cooldown_hint_seconds(client)
+                        ),
                     )
                     if ac7_choice.expedite:
                         delay = ac7_choice.delay_seconds
