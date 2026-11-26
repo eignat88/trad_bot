@@ -331,6 +331,12 @@ def load_config(environ: Mapping[str, str] | None = None) -> H2ProspectiveConfig
         ),
     )
 
+    if (config.enabled and config.candle_budget_confirmed
+            and not config.shared_limiter_contract_path):
+        raise H2ProspectiveConfigError(
+            "H2_SHARED_LIMITER_CONTRACT_REQUIRED: shared production "
+            "limiter contract must be configured before candle GO"
+        )
     if config.enabled and not config.clean_activation_ts:
         raise H2ProspectiveConfigError(
             "H2_CLEAN_ACTIVATION_TS_REQUIRED: set "
