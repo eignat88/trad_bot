@@ -305,6 +305,21 @@ class InMemoryProspectiveStore(H2ProspectiveStore):
     def ingest_event_count(self) -> int:
         return len(self._ingest)
 
+    def bind_clean_activation(
+        self, activation_ts_us: int, fingerprints: tuple[str, ...],
+        mode: str = "CLEAN_FROZEN",
+    ) -> None:
+        normalized = (int(activation_ts_us), tuple(sorted(fingerprints)), mode)
+        current = getattr(self, "_clean_activation", None)
+        if current is None:
+            if (self.ingest_event_count() or self.get_cursor() != (0, "")
+                    or self.get_overlap_state()["pass_active"]
+                    or self.get_overlap_state()["passes_completed"]):
+                raise ValueError("H2_CLEAN_ACTIVATION_REQUIRES_EMPTY_STORE")
+            self._clean_activation = normalized
+        elif current != normalized:
+            raise ValueError("H2_CLEAN_ACTIVATION_IMMUTABLE_MISMATCH")
+
     def get_cursor(self) -> tuple[int, str]:
         return self._cursor
 
@@ -743,6 +758,56 @@ class PgProspectiveStore(H2ProspectiveStore):
         cur = self._execute(f"SELECT COUNT(*) FROM {INGEST_TABLE}")
         row = cur.fetchone()
         return int(row[0]) if row is not None else 0
+
+    def bind_clean_activation(
+        self, activation_ts_us: int, fingerprints: tuple[str, ...],
+        mode: str = "CLEAN_FROZEN",
+    ) -> None:
+        """Fix the clean cohort and policy set once; never change on restart.
+
+        The first insert is allowed only from 120 seconds before to 1 hour
+        after DB clock (future-start permits pinning before any signal).
+        No DB grant allows this role to update or delete the activation.
+        """
+        normalized = tuple(sorted(fingerprints))
+        if mode not in ("CLEAN_FROZEN", "PRE_FREEZE_RESEARCH"):
+            raise ValueError("H2_CLEAN_ACTIVATION_INVALID_POLICY_MODE")
+        if not normalized:
+            raise ValueError("H2_CLEAN_ACTIVATION_REQUIRES_POLICIES")
+        tbl = "research_me_entry_quality_h2_prospective.clean_activation"
+        cur = self._execute(
+            f"SELECT activation_ts_us, policy_fingerprints, policy_mode FROM {tbl} WHERE id=1"
+        )
+        row = cur.fetchone()
+        if row is None:
+            if (self.ingest_event_count() or self.get_cursor() != (0, "")
+                    or self.get_overlap_state()["pass_active"]
+                    or self.get_overlap_state()["passes_completed"]):
+                raise ValueError("H2_CLEAN_ACTIVATION_REQUIRES_EMPTY_STORE")
+            self._execute(
+                f"""
+                INSERT INTO {tbl} (id, activation_ts_us, policy_fingerprints, policy_mode)
+                SELECT 1, %s, %s, %s
+                WHERE %s BETWEEN
+                    (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::bigint
+                      - 120000000
+                    AND
+                    (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::bigint
+                      + 3600000000
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (int(activation_ts_us), list(normalized), mode, int(activation_ts_us)),
+            )
+            self._commit()
+            cur = self._execute(
+                f"SELECT activation_ts_us, policy_fingerprints, policy_mode FROM {tbl} WHERE id=1"
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("H2_CLEAN_ACTIVATION_NOT_FRESH_OR_NOT_PERSISTED")
+        if (int(row[0]) != int(activation_ts_us)
+                or tuple(row[1]) != normalized or str(row[2]) != mode):
+            raise ValueError("H2_CLEAN_ACTIVATION_IMMUTABLE_MISMATCH")
 
     def get_cursor(self) -> tuple[int, str]:
         cur = self._execute(

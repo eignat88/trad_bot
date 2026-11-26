@@ -1,5 +1,5 @@
 -- Issue #312
--- Run only AFTER migration 095 has been applied to the research database.
+-- Run only AFTER migrations 095, 096 and 097 has been applied to the research database.
 -- Execute as a PostgreSQL administrator.  TEMPLATE ONLY — do NOT apply
 -- without a separate explicit GO.
 --
@@ -57,7 +57,9 @@ ON research_me_entry_quality_h2_prospective.ingest_event,
    research_me_entry_quality_h2_prospective.variant_result,
    research_me_entry_quality_h2_prospective.result_conflict,
    research_me_entry_quality_h2_prospective.evaluation_log,
-   research_me_entry_quality_h2_prospective.runtime_health
+   research_me_entry_quality_h2_prospective.runtime_health,
+   research_me_entry_quality_h2_prospective.api_budget_state,
+   research_me_entry_quality_h2_prospective.overlap_cursor
 TO tradbot_h2_prospective;
 
 -- Immutability of terminal results / journal / conflicts is enforced by
@@ -65,6 +67,10 @@ TO tradbot_h2_prospective;
 
 GRANT USAGE ON ALL SEQUENCES
 IN SCHEMA research_me_entry_quality_h2_prospective
+TO tradbot_h2_prospective;
+
+GRANT SELECT, INSERT
+ON research_me_entry_quality_h2_prospective.clean_activation
 TO tradbot_h2_prospective;
 
 COMMIT;

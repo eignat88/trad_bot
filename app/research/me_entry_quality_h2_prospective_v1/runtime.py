@@ -41,6 +41,10 @@ from app.research.me_entry_quality_h2_prospective_v1.candle_adapter import (
 from app.research.me_entry_quality_h2_prospective_v1.config import (
     H2ProspectiveConfig,
 )
+from app.research.me_entry_quality_h2_prospective_v1.clean_boundary import (
+    activation_timestamp_us,
+    eligible_for_clean_holdout,
+)
 from app.research.me_entry_quality_h2_prospective_v1.contracts import (
     INGEST_ACCEPTED,
     INGEST_REJECTED_INVALID,
@@ -126,6 +130,10 @@ class H2ProspectiveRuntime:
         self._overlap_restart_recovery_pending = bool(
             self._store.get_overlap_state().get("pass_active")
         )
+        self._clean_activation_us = (
+            activation_timestamp_us(config.clean_activation_ts)
+            if config.clean_activation_ts else None
+        )
         self._policies = tuple(policies) if policies is not None else (
             candidate_policies(config.observation_windows)
         )
@@ -139,6 +147,16 @@ class H2ProspectiveRuntime:
                         "POLICY_FINGERPRINT_MISMATCH: computed policy "
                         f"fingerprint {policy.fingerprint()} is not pinned"
                     )
+        if self._clean_activation_us is not None and config.enabled:
+            # No DB write can occur before every fingerprint is checked.
+            # In clean pinned mode, the approved set must be exact.
+            expected = {p.fingerprint() for p in self._policies}
+            if pins and pins != expected:
+                raise ValueError("POLICY_FINGERPRINT_MISMATCH: pin set differs")
+            mode = "CLEAN_FROZEN" if pins else "PRE_FREEZE_RESEARCH"
+            self._store.bind_clean_activation(
+                self._clean_activation_us, tuple(sorted(expected)), mode=mode
+            )
 
     @property
     def policies(self) -> tuple[H2Policy, ...]:
@@ -341,8 +359,10 @@ class H2ProspectiveRuntime:
             counters.source_events_received += len(rows)
             for row in rows:
                 dup_before = counters.idempotent_duplicates
+                pre_before = counters.source_events_pre_freeze
                 self._ingest_row(row, counters)
-                if counters.idempotent_duplicates == dup_before:
+                if (counters.idempotent_duplicates == dup_before
+                        and counters.source_events_pre_freeze == pre_before):
                     # first-seen HERE = late commit (forward never saw it)
                     counters.late_events_discovered += 1
             o_us, o_key = cursor_of(rows)
@@ -407,6 +427,12 @@ class H2ProspectiveRuntime:
         return rows_seen
 
     def _ingest_row(self, row: Mapping[str, Any], counters: TelemetryCounters) -> None:
+        if self._clean_activation_us is not None:
+            # Historical #305 events advance the delivery cursor, but NEVER
+            # enter the H2 ingest ledger or create evaluated variant states.
+            if not eligible_for_clean_holdout(row, self._clean_activation_us):
+                counters.source_events_pre_freeze += 1
+                return
         delivery: SourceDelivery = delivery_from_row(row)
         outcome = self._store.ingest_event(delivery)
         if outcome.duplicate:
