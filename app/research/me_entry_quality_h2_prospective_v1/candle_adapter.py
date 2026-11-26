@@ -136,9 +136,8 @@ def required_fetch_range(
 class CandleApiBudget:
     """Explicit, bounded request budget for the research candle source.
 
-    Separate from every production limiter: the counters live in this process
-    only and are additionally capped per cycle and per hour so the research
-    runtime can never compete with the scanner for Bybit request capacity.
+    These research-local caps supplement (never replace) the mandatory
+    production shared limiter. Every real HTTP attempt is admitted at P3.
 
     Review P1-budget — request accounting:
 
@@ -437,6 +436,19 @@ class BybitClosedCandleProvider:
                 last_error = f"{type(exc).__name__}: {exc}"
                 if _looks_like_rate_limit(last_error):
                     self._budget.note_rate_limit_skip()
+                # Shared limiter denied a grant OR Bybit returned 10006/429:
+                # never retry here above the limiter or add burst pressure.
+                from app.exchange.bybit_client import BybitRateLimitError
+                if isinstance(exc, BybitRateLimitError) or _looks_like_rate_limit(last_error):
+                    return CandleFetchOutcome(
+                        ok=False,
+                        reason=REASON_FETCH_ERROR,
+                        detail=last_error,
+                        requested_range=requested,
+                        api_requests=self._budget.api_requests - requests_before,
+                        retries=self._budget.retries - retries_before,
+                        rate_limit_skips=self._budget.rate_limit_skips - skips_before,
+                    )
                 if attempts > self._budget.max_retries:
                     return CandleFetchOutcome(
                         ok=False,
