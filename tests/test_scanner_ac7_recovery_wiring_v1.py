@@ -82,7 +82,8 @@ def schedule(
         "decide_recovery": decide_recovery,
         "cycle": 297,
         "logger": SimpleNamespace(
-            info=lambda *args: logs.append(args)
+            info=lambda *args: logs.append(("info", args)),
+            exception=lambda *args: logs.append(("exception", args)),
         ),
     }
 
@@ -190,12 +191,15 @@ def test_expediting_never_lengthens_schedule():
 
 
 def test_unexpected_report_fails_closed():
-    with pytest.raises(ValueError):
-        schedule(
-            enabled=True,
-            finished_ok=True,
-            complete=False,
-            processed=50,
-            skips=50,
-            already_attempted=False,
-        )
+    delay, attempted, logs = schedule(
+        enabled=True,
+        finished_ok=True,
+        complete=False,
+        processed=50,
+        skips=50,
+        already_attempted=False,
+    )
+    assert delay == 260.0
+    assert attempted is False
+    assert any(level == "exception" for level, _ in logs)
+    assert not any(level == "info" for level, _ in logs)

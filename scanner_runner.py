@@ -3351,25 +3351,31 @@ def main() -> None:
                 # A complete cycle resets the one-shot recovery guard.
                 ac7_recovery_attempted = False
             else:
-                ac7_choice = decide_recovery(
-                    enabled=True,
-                    expected_symbols=report.expected_symbols,
-                    processed_symbols=report.processed_count,
-                    limiter_pre_send_skips=len(
-                        report.limiter_pre_send_skip_symbols
-                    ),
-                    previous_recovery_attempted=ac7_recovery_attempted,
-                    normal_delay_seconds=delay,
-                )
-                if ac7_choice.expedite:
-                    delay = ac7_choice.delay_seconds
-                    ac7_recovery_attempted = True
-                logger.info(
-                    "scanner AC7 recovery: cycle=%d expedite=%s "
-                    "reason=%s next_delay=%.1fs",
-                    cycle, ac7_choice.expedite,
-                    ac7_choice.reason, delay,
-                )
+                try:
+                    ac7_choice = decide_recovery(
+                        enabled=True,
+                        expected_symbols=report.expected_symbols,
+                        processed_symbols=report.processed_count,
+                        limiter_pre_send_skips=len(
+                            report.limiter_pre_send_skip_symbols
+                        ),
+                        previous_recovery_attempted=ac7_recovery_attempted,
+                        normal_delay_seconds=delay,
+                    )
+                    if ac7_choice.expedite:
+                        delay = ac7_choice.delay_seconds
+                        ac7_recovery_attempted = True
+                    logger.info(
+                        "scanner AC7 recovery: cycle=%d expedite=%s "
+                        "reason=%s next_delay=%.1fs",
+                        cycle, ac7_choice.expedite,
+                        ac7_choice.reason, delay,
+                    )
+                except Exception:
+                    logger.exception(
+                        "scanner AC7 recovery decision failed; "
+                        "normal schedule retained"
+                    )
         logger.info("cycle #%d sleeping %.0fs before next cycle", cycle, delay)
         for _ in range(int(delay)):
             if SHUTDOWN:
