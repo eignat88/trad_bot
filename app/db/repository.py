@@ -837,6 +837,9 @@ class ScannerRepository:
                     reasons = EXCLUDED.reasons,
                     features = EXCLUDED.features,
                     updated_at = now()
+                WHERE dds.scanner_setup.status NOT IN (
+                    'EXECUTED', 'INVALIDATED', 'EXPIRED'
+                )
                 """,
                 (
                     str(c.setup_id), c.scanner_name, c.scanner_version, instrument_id, run_id,
@@ -885,6 +888,13 @@ class ScannerRepository:
             identity = self._signal_identity(record)
             for index, existing in enumerate(records):
                 if self._signal_identity(existing) == identity:
+                    # D3 (issue #304): a re-detection must NEVER rewrite a
+                    # terminal result — executed/invalidated/expired setups
+                    # are historical facts.
+                    if existing.get("status") in (
+                        "EXECUTED", "INVALIDATED", "EXPIRED"
+                    ):
+                        break
                     record["setup_id"] = existing["setup_id"]
                     records[index] = record
                     break

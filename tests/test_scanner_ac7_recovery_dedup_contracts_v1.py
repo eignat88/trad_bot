@@ -6,15 +6,117 @@ OOS observations, run_id reuse and historical backfill) lives in the
 storage contracts below — this file pins them so a future refactor cannot
 silently break the recovery safety argument.
 
-Offline: source-contract assertions only, no PostgreSQL, no Bybit.
+Offline: source-contract assertions plus behavioural tests on the isolated
+JSONL backend of ``ScannerRepository`` — no PostgreSQL, no Bybit.
 """
 import inspect
+import json
 
 from app.db.repository import ScannerRepository
 from app.research import prospective_observer
 from app.research.prospective_observer import ProspectiveOOSObserver
+from app.scanners.models import SetupCandidate, SetupState
 
 import app.scanners.recovery_policy_v1 as recovery_policy
+
+#: Statuses after which a detection must NEVER be rewritten.
+TERMINAL_STATUSES = ("EXECUTED", "INVALIDATED", "EXPIRED")
+
+
+def test_candidates_upsert_never_rewrites_terminal_status():
+    """Re-detection of an ALREADY-TERMINAL setup must not change its
+    terminal status.  The PG upsert is conditioned on the current status
+    and the JSONL backend skips terminal records — a recovery rescan over
+    the same candles is therefore safe for executed/invalidated/expired
+    setups."""
+    source = inspect.getsource(ScannerRepository._save_pg)
+    guard = "WHERE dds.scanner_setup.status NOT IN ("
+    assert guard in source
+    tail = source[source.index(guard):source.index(guard) + 200]
+    for status in TERMINAL_STATUSES:
+        assert f"'{status}'" in tail, status
+
+    jsonl_source = inspect.getsource(ScannerRepository._save_jsonl)
+    assert "EXECUTED" in jsonl_source and "EXPIRED" in jsonl_source
+
+
+def test_repeat_detection_of_terminal_setup_keeps_terminal_status(tmp_path):
+    """Behavioural: on the isolated JSONL backend, re-saving a candidate
+    for a candle whose stored setup is terminal leaves the record
+    untouched (status AND fields), while a non-terminal record is
+    refreshed exactly like any regular rescan would."""
+    path = tmp_path / "setups.jsonl"
+    repo = ScannerRepository(backend="jsonl", jsonl_path=str(path))
+
+    def cand(score, ts=1_777_294_700_000):
+        return SetupCandidate(
+            scanner_name="TREND_PULLBACK",
+            symbol="BTCUSDT",
+            direction="LONG",
+            entry_timeframe="5m",
+            signal_candle_open_time=ts,
+            reference_price=79_203.10,
+            score=score,
+        )
+
+    # First detection of candle T.
+    repo.save_setup(cand(10.0))
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["status"] == SetupState.DETECTED.value
+
+    # The paper/trading engine executes it -> terminal.
+    records[0]["status"] = "EXECUTED"
+    path.write_text(json.dumps(records[0]) + "\n", encoding="utf-8")
+
+    # Recovery rescan re-detects the SAME candle with different fields.
+    repo.save_setup(cand(99.0))
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(records) == 1                      # no duplicate row
+    assert records[0]["status"] == "EXECUTED"     # terminal status kept
+    assert records[0]["score"] == 10.0            # fields untouched
+
+    # A NON-terminal record on another candle is refreshed as usual.
+    repo.save_setup(cand(5.0, ts=1_777_295_000_000))
+    repo.save_setup(cand(7.0, ts=1_777_295_000_000))
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(records) == 2
+    fresh = [r for r in records if r["signal_candle_open_time"]
+             == 1_777_295_000_000][0]
+    assert fresh["score"] == 7.0
+    assert fresh["status"] == SetupState.DETECTED.value
+
+
+def test_repeat_signal_same_candle_maps_to_one_oos_identity():
+    """Scenario: the recovery rescan re-signals the SAME candle.
+
+    The OOS observation identity ``source_signal_id`` is derived
+    deterministically from (scanner, symbol, direction, signal_time) — the
+    same candle therefore maps to the SAME identity within a process (the
+    recovery rescan runs in the scanner process), and every observation
+    INSERT is idempotent (``ON CONFLICT (experiment_id, source_signal_id)
+    DO NOTHING`` — asserted above).  Re-processing a candle can never
+    create duplicate OOS observations."""
+
+    class _K:
+        _make_source_key = ProspectiveOOSObserver._make_source_key
+
+    k = _K()
+    candle = 1_777_294_700_000
+    first = k._make_source_key("ME_SHORT", "BTCUSDT", "SHORT", candle)
+    again = k._make_source_key("ME_SHORT", "BTCUSDT", "SHORT", candle)
+    assert first == again                        # same candle -> same id
+
+    assert k._make_source_key(
+        "ME_SHORT", "BTCUSDT", "SHORT", candle + 300_000) != first
+    assert k._make_source_key(
+        "ME_SHORT", "ETHUSDT", "SHORT", candle) != first
+    assert k._make_source_key(
+        "ME_SHORT", "BTCUSDT", "LONG", candle) != first
+
+    source = inspect.getsource(prospective_observer)
+    assert source.count("ON CONFLICT (experiment_id, source_signal_id)") \
+        == source.count("INSERT INTO research.prospective_observation")
 
 
 def test_candidates_upsert_natural_key_prevents_duplicates():
