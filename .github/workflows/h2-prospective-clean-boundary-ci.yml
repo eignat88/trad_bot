@@ -6,6 +6,7 @@ on:
     paths:
       - 'app/research/me_entry_quality_h2_prospective_v1/**'
       - 'tests/test_me_entry_quality_h2_prospective_*.py'
+      - 'tests/test_me_entry_quality_h2_shared_limiter_v1.py'
       - 'sql/migrations/097_h2_prospective_clean_activation_v1.sql'
       - 'deploy/sql/312_h2_prospective_role.sql'
       - 'deploy/systemd/trad-bot-h2-prospective-runtime.service'
@@ -58,7 +59,7 @@ jobs:
       - name: Compile H2 runtime and regression tests
         run: |
           python -m compileall -q app/research/me_entry_quality_h2_prospective_v1
-          python -m compileall -q tests/test_me_entry_quality_h2_prospective_*.py
+          python -m compileall -q tests/test_me_entry_quality_h2_prospective_*.py tests/test_me_entry_quality_h2_shared_limiter_v1.py
       - name: H2 offline and real-PG scratch integration
         env:
           PYTHONPATH: .
@@ -70,4 +71,4 @@ jobs:
           ME_H2PRO_PG_IT_USER: 'postgres'
           PGPASSWORD: h2_ci_only_password
         run: |
-          python -m pytest -q -p no:cacheprovider tests/test_me_entry_quality_h2_prospective_*.py --tb=short
+          python -m pytest -q -p no:cacheprovider tests/test_me_entry_quality_h2_prospective_*.py tests/test_me_entry_quality_h2_shared_limiter_v1.py --tb=short
