@@ -94,6 +94,9 @@ class H2ProspectiveConfig:
     #: this flag off, an enabled runtime refuses to start (fail closed) —
     #: unfrozen-policy accumulation always needs a deliberate act.
     allow_unfrozen_policies: bool = False
+    #: Independent H2 clean-start boundary, not the upstream #305 freeze.
+    #: Must be set before enabled runner starts; persisted immutably in 097.
+    clean_activation_ts: str = ""
 
     # ── database (dedicated research connections only) ──────────────────────
     db_host: str = "localhost"
@@ -183,6 +186,14 @@ class H2ProspectiveConfig:
             raise H2ProspectiveConfigError(
                 "coverage_finalize_after_attempts must be >= 1"
             )
+        if self.clean_activation_ts:
+            from app.research.me_entry_quality_h2_prospective_v1.clean_boundary import (
+                activation_timestamp_us,
+            )
+            try:
+                activation_timestamp_us(self.clean_activation_ts)
+            except ValueError as exc:
+                raise H2ProspectiveConfigError(str(exc)) from exc
         if not self.db_name:
             raise H2ProspectiveConfigError("db_name must not be empty")
 
@@ -227,6 +238,7 @@ def load_config(environ: Mapping[str, str] | None = None) -> H2ProspectiveConfig
 
     config = H2ProspectiveConfig(
         enabled=_parse_bool(_get("H2_PROSPECTIVE_ENABLED"), "H2_PROSPECTIVE_ENABLED"),
+        clean_activation_ts=_get("H2_PROSPECTIVE_CLEAN_ACTIVATION_TS") or "",
         poll_interval_s=_parse_float(
             _get("H2_PROSPECTIVE_POLL_INTERVAL_S"), 300.0,
             "H2_PROSPECTIVE_POLL_INTERVAL_S",
@@ -305,6 +317,12 @@ def load_config(environ: Mapping[str, str] | None = None) -> H2ProspectiveConfig
             "H2_PROSPECTIVE_COVERAGE_FINALIZE_AFTER_ATTEMPTS",
         ),
     )
+
+    if config.enabled and not config.clean_activation_ts:
+        raise H2ProspectiveConfigError(
+            "H2_CLEAN_ACTIVATION_TS_REQUIRED: set "
+            "H2_PROSPECTIVE_CLEAN_ACTIVATION_TS before enabling"
+        )
 
     # Review §7: prospective accumulation with UNFROZEN policy fingerprints
     # must never start by accident — it needs a deliberate permission (pins
