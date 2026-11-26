@@ -78,8 +78,11 @@ class H2ProspectiveConfig:
     source_forward_batches_per_cycle: int = 8
     #: Overlap reconciliation batch budget per cycle (review P1-overlap).
     source_overlap_batches_per_cycle: int = 2
-    #: Overlap rewind (seconds) re-read each cycle so late-committed #305 rows
-    #: and ``captured_at`` ties can never be lost (review P1-watermark).
+    #: Overlap rewind (seconds) re-read each cycle to reconcile late-committed
+    #: #305 rows and ``captured_at`` ties within the DOCUMENTED window
+    #: (review P1-watermark / P1-overlap FR-05: bounded guarantee only — never
+    #: an absolute no-loss claim; violations report
+    #: ``OVERLAP_COVERAGE_DEGRADED``).
     #: Must exceed the maximum capture-to-commit disorder of the source.
     source_overlap_s: int = 7200
     #: Max source events evaluated per cycle (PostgreSQL / API load control).
