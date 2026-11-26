@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS research_me_entry_quality_h2_prospective.clean_activa
     id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     activation_ts_us BIGINT NOT NULL CHECK (activation_ts_us > 0),
     policy_fingerprints TEXT[] NOT NULL CHECK (cardinality(policy_fingerprints) > 0),
+    policy_mode TEXT NOT NULL CHECK (policy_mode IN ('CLEAN_FROZEN', 'PRE_FREEZE_RESEARCH')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE OR REPLACE FUNCTION research_me_entry_quality_h2_prospective.deny_clean_activation_mutation()
