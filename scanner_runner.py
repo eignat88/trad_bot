@@ -3189,7 +3189,8 @@ def main() -> None:
     ac7_recovery_enabled = (
         os.getenv("SCANNER_AC7_RECOVERY_ENABLED", "0") == "1"
     )
-    ac7_recovery_attempted = False
+    # Fail closed after restart until a complete cycle.
+    ac7_recovery_attempted = True
     cycle = 0
     while not SHUTDOWN:
         # ------------------------------------------------------------------
