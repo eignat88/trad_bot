@@ -497,6 +497,7 @@ class TestRunnerExitCodes:
         )
         monkeypatch.setenv("H2_PROSPECTIVE_ENABLED", "1")
         monkeypatch.setenv("H2_PROSPECTIVE_ALLOW_UNFROZEN_POLICIES", "1")
+        monkeypatch.setenv("H2_PROSPECTIVE_CLEAN_ACTIVATION_TS", "2026-11-26T07:30:00Z")
         assert runner_mod.main(["--once"]) == runner_mod.EXIT_OK
         assert fake_store.closed == 1
 
