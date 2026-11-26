@@ -30,7 +30,7 @@ SHA-256 payload hash), serialized into the H2 result ``candle_source`` block.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Sequence
 
 from app.models import Candle
@@ -340,6 +340,10 @@ class BybitClosedCandleProvider:
         self._enabled = bool(enabled)
         self._client_factory = client_factory
         self._source_label_prefix = source_label_prefix
+        # Only successful fully closed, exact ASOF range results are memoized.
+        # Reset at EACH cycle: never rely on stale cross-cycle exchange data.
+        self._cycle_cache: dict[tuple[str, int, int], CandleFetchOutcome] = {}
+
 
     @property
     def enabled(self) -> bool:
@@ -348,6 +352,10 @@ class BybitClosedCandleProvider:
     @property
     def budget(self) -> CandleApiBudget:
         return self._budget
+
+    def start_cycle(self) -> None:
+        self._cycle_cache.clear()
+        self._budget.start_cycle()
 
     def fetch_closed_5m(
         self,
@@ -361,6 +369,13 @@ class BybitClosedCandleProvider:
             grid, evaluation_asof_ms=evaluation_asof_ms
         )
         requested = (start_ms, end_ms)
+        cache_key = (symbol, start_ms, end_ms)
+        if self._enabled and cache_key in self._cycle_cache:
+            # No new Bybit request, and preserve exact original provenance.
+            return replace(
+                self._cycle_cache[cache_key],
+                api_requests=0, retries=0, rate_limit_skips=0,
+            )
         if not self._enabled:
             return CandleFetchOutcome(
                 ok=False,
@@ -484,7 +499,7 @@ class BybitClosedCandleProvider:
             rows_as_mappings(rows),
             fetched_at_ms=int(time.time() * 1000),
         )
-        return CandleFetchOutcome(
+        result = CandleFetchOutcome(
             ok=True,
             reason=REASON_OK,
             rows=rows,
@@ -494,6 +509,8 @@ class BybitClosedCandleProvider:
             retries=self._budget.retries - retries_before,
             rate_limit_skips=self._budget.rate_limit_skips - skips_before,
         )
+        self._cycle_cache[cache_key] = result
+        return result
 
 
 def rows_as_mappings(rows: Sequence[Candle]) -> list[dict[str, Any]]:
