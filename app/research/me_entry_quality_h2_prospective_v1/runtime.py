@@ -139,13 +139,6 @@ class H2ProspectiveRuntime:
         )
         if not self._policies:
             raise ValueError("at least one H2Policy is required")
-        if self._clean_activation_us is not None and config.enabled:
-            # PG activation row is immutable. On restart the exact timestamp
-            # and entire manifest must match; never silently switch cohort.
-            self._store.bind_clean_activation(
-                self._clean_activation_us,
-                tuple(sorted(p.fingerprint() for p in self._policies)),
-            )
         pins = set(config.policy_fingerprint_pins)
         if pins:
             for policy in self._policies:
@@ -154,6 +147,15 @@ class H2ProspectiveRuntime:
                         "POLICY_FINGERPRINT_MISMATCH: computed policy "
                         f"fingerprint {policy.fingerprint()} is not pinned"
                     )
+        if self._clean_activation_us is not None and config.enabled:
+            # No DB write can occur before every fingerprint is checked.
+            # In clean pinned mode, the approved set must be exact.
+            expected = {p.fingerprint() for p in self._policies}
+            if pins and pins != expected:
+                raise ValueError("POLICY_FINGERPRINT_MISMATCH: pin set differs")
+            self._store.bind_clean_activation(
+                self._clean_activation_us, tuple(sorted(expected))
+            )
 
     @property
     def policies(self) -> tuple[H2Policy, ...]:
