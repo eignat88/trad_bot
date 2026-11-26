@@ -148,6 +148,7 @@ class TestProductionIsolation:
         "deploy/systemd/trad-bot-h2-prospective-runtime.service",
         "deploy/sql/312_h2_prospective_role.sql",
         "sql/migrations/095_me_entry_quality_h2_prospective_v1.sql",
+        "sql/migrations/096_me_entry_quality_h2_prospective_overlap_v1.sql",
     )
 
     def _production_targets(self):
@@ -199,7 +200,10 @@ class TestProductionIsolation:
             text = path.read_text(encoding="utf-8", errors="ignore")
             assert self.ENGINE_NEEDLE not in text, path.name
             if self.RUNTIME_NEEDLE in text:
-                assert path.name == "095_me_entry_quality_h2_prospective_v1.sql", (
+                assert path.name in (
+                    "095_me_entry_quality_h2_prospective_v1.sql",
+                    "096_me_entry_quality_h2_prospective_overlap_v1.sql",
+                ), (
                     f"unauthorized prospective-runtime migration: {path.name}"
                 )
 

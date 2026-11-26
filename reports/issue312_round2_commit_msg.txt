@@ -1,0 +1,43 @@
+issue #312: fix P1 source overlap starvation (durable overlap cursor, split budgets)
+
+Review round 2 (RE_REVIEW_CHANGES_REQUIRED): the overlap sweep re-read the
+first pages of the window every cycle without saving progress, and the shared
+batch budget let the forward scan starve reconciliation entirely.
+
+- FR-01: durable independent overlap cursor - new singleton table
+  research_me_entry_quality_h2_prospective.overlap_cursor (migration 096);
+  progress survives restart; forward cursor (reader_watermark) untouched
+  and independent.
+- FR-02: split per-cycle budgets source_forward_batches_per_cycle (8) /
+  source_overlap_batches_per_cycle (2); neither phase can starve the other.
+- FR-03: deterministic reconciliation passes - ceiling pinned at pass start,
+  durable per-batch checkpoints, next floor = min(prev ceiling, ceiling -
+  source_overlap_s) so the documented window is re-checked and a falling-behind
+  sweep catches up contiguously (no skipped ranges); no #305 deletion, no
+  backfill; window changes during long scans cannot silently exclude unchecked
+  ranges.
+- FR-04: crash safety - checkpoint-last after durable ingest + variant states;
+  all five failure points covered by tests; no recreated terminal outcomes.
+- FR-05: strict source checks and #305 freeze_ts unchanged; explicit bounded
+  guarantee (no NEVER_LOST wording); broken coverage window reports diagnostic
+  status OVERLAP_COVERAGE_DEGRADED instead of a false coverage confirmation;
+  guarantee_floor_us / oldest_unchecked_capture_ts published every cycle.
+- Telemetry: 8 overlap metrics in counters/health/cycle logs (forward/overlap
+  batches, pass completion, cursor lag, oldest unchecked capture, late events,
+  backlog estimate, restart recovery).
+
+Migration 096 (new version - applied 095 untouched): idempotent, transactional,
+H2P_SCHEMA_INCOMPATIBLE guard; re-apply preserves ingest events, variant
+states, results, conflict ledger.
+
+Tests (real runs, offline + real PG 17.2 scratch cluster, no real Bybit
+requests): overlap reconciliation matrix 14 tests (all 12 mandatory scenarios
+incl. key test: 1000+ overlap events, 2 batches/cycle, late event near window
+end, mid-pass restart -> discovered exactly once); PG 25 tests (durable cursor
+durability/restart-equivalence, migration 096 apply/re-apply); #312 suite incl.
+PG 147 passed; H2 PR #311 + purity 168 passed; full suite vs base 388e4ba
+analyzed in reports/issue312_review_remediation_v1.md §3 (new failures: only
+the 2 known Phase-2 worktree guards, attributed; zero #312 runtime regressions).
+
+Status: IMPLEMENTATION_READY / RE_REVIEW_REQUIRED / ACTIVATION_HOLD.
+PR stays Draft - no merge/deploy/activation/production migration.

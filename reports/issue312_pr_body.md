@@ -112,3 +112,54 @@ capture-to-commit disorder beyond the overlap window, page=1-request
 invariant pinned by client settings, load characteristics).
 
 **Status:** `IMPLEMENTATION_READY / RE_REVIEW_REQUIRED / ACTIVATION_HOLD`
+
+## Review remediation — round 2 review (Source Overlap Starvation, `RE_REVIEW_CHANGES_REQUIRED`)
+
+**P1 — Source Overlap Starvation**: the overlap sweep re-read the first pages of
+the window every cycle without saving progress, and the shared batch budget let
+the forward scan starve reconciliation entirely — late events near the end of a
+large window could stay unprocessed forever.
+
+- **Durable overlap cursor** (`overlap_cursor` singleton, migration **096**):
+  reconciliation progress survives restarts and is independent of the forward
+  cursor (`reader_watermark`).
+- **Independent per-cycle budgets**: `source_forward_batches_per_cycle` (8) and
+  `source_overlap_batches_per_cycle` (2) — neither phase can starve the other.
+- **Deterministic passes (FR-03)**: the pass ceiling is pinned at pass start
+  (forward advancement cannot exclude unchecked ranges); progress checkpoints
+  after every durably processed batch; the next pass floor is
+  `min(previous ceiling, new ceiling − source_overlap_s)` — the documented
+  window is re-checked while the sweep keeps up, and when it falls behind the
+  sweep catches up contiguously (ranges are never silently skipped).
+- **Honest coverage boundary (FR-05)**: no `NEVER_LOST` claims — the guarantee
+  is the documented overlap window; when it cannot be honoured the cycle reports
+  the diagnostic status `OVERLAP_COVERAGE_DEGRADED` (health row + log marker)
+  instead of a false coverage confirmation, and every report publishes
+  `details.overlap.guarantee_floor_us` / `oldest_unchecked_capture_ts`.
+- **Telemetry (review §4)**: 8 new metrics — `forward_batches_scanned`,
+  `overlap_batches_scanned`, `overlap_pass_completed`, `overlap_cursor_lag_s`,
+  `oldest_unchecked_capture_ts`, `late_events_discovered`,
+  `overlap_backlog_estimate`, `overlap_restart_recovery` — in counters, runtime
+  health and cycle logs; no per-event logging.
+- **Crash safety (FR-04)**: checkpoint-last; the five failure points are covered
+  by tests; redelivery is idempotent; terminal outcomes are never recreated.
+
+**Migration 096** (new version — 095 untouched, per review §6): idempotent,
+transactional, `H2P_SCHEMA_INCOMPATIBLE` guard; re-apply preserves ingest
+events / variant states / results / conflict ledger. All PG tests run on an
+isolated scratch PostgreSQL 17.2 only — production DB untouched.
+
+**Tests** — all 12 mandatory scenarios plus the key mandatory test (>1000
+overlap rows, 2 batches/cycle, late event near the window end, mid-pass
+restart — the event is discovered exactly once):
+`tests/test_me_entry_quality_h2_prospective_overlap_reconciliation_v1.py` (14)
++ `TestPgOverlapCursor` / `TestPgMigration096` (8) on real PostgreSQL.
+
+**Regression** (real runs): #312 suite incl. real PG — 147 passed / 0 failed;
+H2 PR #311 engine + purity — 168 passed; full-suite baseline comparison vs
+`388e4ba` with failing-test attribution in
+`reports/issue312_review_remediation_v1.md` §3.
+
+**Status:** `IMPLEMENTATION_READY / RE_REVIEW_REQUIRED / ACTIVATION_HOLD` —
+PR stays **Draft**; no merge / deploy / activation / production migration was
+performed.

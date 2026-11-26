@@ -65,6 +65,7 @@ from app.research.me_entry_quality_h2_prospective_v1.source_reader import (
     SourceDelivery,
     cursor_of,
     delivery_from_row,
+    count_source_events_between,
     read_source_events_after,
 )
 from app.research.me_entry_quality_h2_prospective_v1.store import (
@@ -119,6 +120,12 @@ class H2ProspectiveRuntime:
         if budget is not None:
             budget.hydrate(self._store.load_api_budget_state())
             budget.on_change = self._store.save_api_budget_state
+        # Review P1-overlap FR-04: a pass interrupted by a restart resumes
+        # where its durable cursor stopped (reported once as
+        # ``overlap_restart_recovery``).
+        self._overlap_restart_recovery_pending = bool(
+            self._store.get_overlap_state().get("pass_active")
+        )
         self._policies = tuple(policies) if policies is not None else (
             candidate_policies(config.observation_windows)
         )
@@ -190,67 +197,46 @@ class H2ProspectiveRuntime:
         try:
             cursor_us, cursor_key = self._store.get_cursor()
             # Review P1-watermark: the delivery cursor is the CAPTURE order
-            # (captured_at, source_event_key) — never signal_time — so a
-            # late-committed event with an earlier signal_time is never lost.
-            # Two bounded phases per cycle:
-            #   1. forward scan from the cursor — guaranteed forward
+            # (captured_at, source_event_key) — never signal_time.  Two
+            # phases per cycle with INDEPENDENT bounded budgets (review
+            # P1-overlap FR-02) — forward backlog can never starve
+            # reconciliation and vice versa:
+            #   1. forward scan from the forward cursor — guaranteed forward
             #      progress for every visible row (the cursor IS capture
             #      order, so a monotonic scan is complete);
-            #   2. an overlap sweep back ``source_overlap_s`` seconds —
+            #   2. a DURABLE reconciliation pass over the overlap range —
             #      catches capture-to-commit disorder (rows whose capture
-            #      instant predates the cursor but whose commit became
-            #      visible later) and ``captured_at`` ties.
-            # Both phases feed one idempotent ingest; the cursor is
-            # checkpointed LAST, only after all writes above committed.
-            max_seen_us, max_seen_key = int(cursor_us), str(cursor_key)
+            #      instant predates the forward cursor but whose commit
+            #      became visible later) and ``captured_at`` ties, with its
+            #      own persisted progress cursor (FR-01/FR-03/FR-04).
             rows_seen = 0
-            batches_used = 0
-
-            def _consume(rows: list) -> tuple[int, int, bool]:
-                nonlocal rows_seen, max_seen_us, max_seen_key, batches_used
-                if not rows:
-                    return 0, 0, True
-                batches_used += 1
-                rows_seen += len(rows)
-                counters.source_events_received += len(rows)
-                for row in rows:
-                    self._ingest_row(row, counters)
-                batch_us, batch_key = cursor_of(rows)
-                if (batch_us, batch_key) > (max_seen_us, max_seen_key):
-                    max_seen_us, max_seen_key = batch_us, batch_key
-                return batch_us, batch_key, len(rows) < self._config.source_batch_limit
 
             # phase 1: forward scan from the capture-order cursor
             f_us, f_key = int(cursor_us), str(cursor_key)
-            while batches_used < self._config.source_max_batches_per_cycle:
+            fwd_start_us, fwd_start_key = f_us, f_key
+            for _ in range(self._config.source_forward_batches_per_cycle):
                 rows = read_source_events_after(
                     conn,
                     after_captured_us=f_us,
                     after_key=f_key,
                     limit=self._config.source_batch_limit,
                 )
-                f_us, f_key, exhausted = _consume(rows)
-                if exhausted:
+                if not rows:
                     break
+                counters.forward_batches_scanned += 1
+                rows_seen += len(rows)
+                counters.source_events_received += len(rows)
+                for row in rows:
+                    self._ingest_row(row, counters)
+                f_us, f_key = cursor_of(rows)
+                if len(rows) < self._config.source_batch_limit:
+                    break
+            if (f_us, f_key) > (fwd_start_us, fwd_start_key):
+                # checkpoint-last: forward progress only after durable writes
+                self._store.set_cursor(f_us, f_key)
 
-            # phase 2: bounded overlap sweep for late-committed stragglers
-            # (only meaningful once the cursor moved: with a zero cursor
-            # phase 1 already covers the whole table)
-            if int(cursor_us) > 0 and (
-                batches_used < self._config.source_max_batches_per_cycle
-            ):
-                o_us = max(0, int(cursor_us) - int(self._config.source_overlap_us))
-                o_key = "" if o_us != int(cursor_us) else str(cursor_key)
-                while batches_used < self._config.source_max_batches_per_cycle:
-                    rows = read_source_events_after(
-                        conn,
-                        after_captured_us=o_us,
-                        after_key=o_key,
-                        limit=self._config.source_batch_limit,
-                    )
-                    o_us, o_key, exhausted = _consume(rows)
-                    if exhausted:
-                        break
+            # phase 2: durable overlap reconciliation pass (own budget)
+            rows_seen += self._overlap_pass(conn, counters, details, f_us)
         finally:
             try:
                 conn.close()
@@ -258,11 +244,166 @@ class H2ProspectiveRuntime:
                 logger.debug("source connection close failed", exc_info=True)
 
         details["source_rows_read"] = rows_seen
-        # Checkpoint LAST (review P1-watermark): the cursor can only advance
-        # after every ingest and variant-state write above is durably
-        # committed — a crash in between simply re-delivers idempotently.
-        if (max_seen_us, max_seen_key) > (int(cursor_us), str(cursor_key)):
-            self._store.set_cursor(max_seen_us, max_seen_key)
+        return rows_seen
+
+    def _overlap_pass(
+        self,
+        conn: Any,
+        counters: TelemetryCounters,
+        details: dict,
+        forward_us: int,
+    ) -> int:
+        """One bounded reconciliation pass with DURABLE per-batch progress.
+
+        Review P1-overlap (FR-01..FR-05):
+
+        * the pass range ``[pass_floor_us, pass_ceiling_us]`` is FIXED when
+          the pass starts (the ceiling pins the forward cursor position at
+          that moment) — forward-cursor advancement during the pass can
+          never exclude unchecked ranges (FR-03);
+        * the next pass's floor is ``min(previous ceiling, new ceiling -
+          source_overlap_us)``: the documented window is re-checked while
+          the sweep keeps up, and the pass simply continues where the last
+          one ended when it fell behind — ranges are NEVER silently
+          skipped; when it falls behind (the floor must reach back BEYOND
+          the documented window to stay contiguous), the documented
+          disorder guarantee is not honoured for the slid-past ranges and
+          the cycle reports ``OVERLAP_COVERAGE_DEGRADED`` instead of a
+          false confirmation (FR-05);
+        * progress is checkpointed AFTER every durably processed batch and
+          survives restarts (FR-04); a crashed pass resumes where it
+          stopped (``overlap_restart_recovery``);
+        * completeness is BOUNDED by the documented overlap guarantee — no
+          absolute no-loss claim is made for disorder beyond it; the
+          boundary is published as ``guarantee_floor_us`` /
+          ``oldest_unchecked_capture_ts`` diagnostics.
+        """
+        state = self._store.get_overlap_state()
+        rows_seen = 0
+        window_us = int(self._config.source_overlap_us)
+        passes_completed = int(state["passes_completed"])
+
+        if state["pass_active"]:
+            ceiling_us = int(state["pass_ceiling_us"])
+            floor_us = int(state["pass_floor_us"])
+            o_us = int(state["cursor_captured_at_us"])
+            o_key = str(state["cursor_key"])
+            if self._overlap_restart_recovery_pending:
+                counters.overlap_restart_recovery = True
+                self._overlap_restart_recovery_pending = False
+        else:
+            # ── start a NEW pass with fixed bounds (FR-03) ──
+            ceiling_us = int(forward_us)
+            window_floor_us = max(0, ceiling_us - window_us)
+            if passes_completed > 0:
+                # contiguity guard: never exclude ranges the previous pass
+                # has not reached — floor <= previous pass ceiling
+                floor_us = min(int(state["pass_ceiling_us"]), window_floor_us)
+            else:
+                floor_us = window_floor_us
+            o_us, o_key = floor_us, ""
+            state = {
+                "cursor_captured_at_us": o_us,
+                "cursor_key": o_key,
+                "pass_floor_us": floor_us,
+                "pass_ceiling_us": ceiling_us,
+                "pass_active": True,
+                "passes_completed": passes_completed,
+            }
+            self._store.save_overlap_state(state)
+
+        # FR-05 coverage diagnostic: the documented window is honoured iff the
+        # pass floor equals the documented window floor.  A strictly LOWER
+        # floor means the previous pass fell behind by more than one window —
+        # ranges slid out of the window while unchecked, so the documented
+        # disorder guarantee was NOT honoured for them (the sweep catches up
+        # contiguously instead of re-checking the window).
+        documented_floor = max(0, ceiling_us - window_us)
+        coverage_degraded = floor_us < documented_floor
+        counters.overlap_coverage_degraded = coverage_degraded
+
+        exhausted = ceiling_us <= o_us  # empty range completes immediately
+        for _ in range(self._config.source_overlap_batches_per_cycle):
+            if exhausted:
+                break
+            rows = read_source_events_after(
+                conn,
+                after_captured_us=o_us,
+                after_key=o_key,
+                limit=self._config.source_batch_limit,
+                to_captured_us=ceiling_us,
+            )
+            if not rows:
+                exhausted = True
+                break
+            counters.overlap_batches_scanned += 1
+            rows_seen += len(rows)
+            counters.source_events_received += len(rows)
+            for row in rows:
+                dup_before = counters.idempotent_duplicates
+                self._ingest_row(row, counters)
+                if counters.idempotent_duplicates == dup_before:
+                    # first-seen HERE = late commit (forward never saw it)
+                    counters.late_events_discovered += 1
+            o_us, o_key = cursor_of(rows)
+            # FR-03/FR-04: durable per-batch checkpoint AFTER the covered
+            # rows are ingested and their variant states exist (checkpoint
+            # last — a crash re-delivers idempotently, never skips).
+            self._store.save_overlap_state(
+                {
+                    "cursor_captured_at_us": o_us,
+                    "cursor_key": o_key,
+                    "pass_floor_us": floor_us,
+                    "pass_ceiling_us": ceiling_us,
+                    "pass_active": True,
+                    "passes_completed": passes_completed,
+                }
+            )
+            if len(rows) < self._config.source_batch_limit:
+                exhausted = True
+
+        if exhausted:
+            # pass end: advance past the fixed ceiling and close the pass
+            passes_completed += 1
+            self._store.save_overlap_state(
+                {
+                    "cursor_captured_at_us": ceiling_us,
+                    "cursor_key": "",
+                    "pass_floor_us": floor_us,
+                    "pass_ceiling_us": ceiling_us,
+                    "pass_active": False,
+                    "passes_completed": passes_completed,
+                }
+            )
+            counters.overlap_pass_completed = True
+
+        # telemetry: lag, backlog, unchecked boundary (bounded queries)
+        counters.overlap_cursor_lag_s = max(0.0, (int(forward_us) - o_us) / 1e6)
+        counters.oldest_unchecked_capture_ts = o_us if not exhausted else None
+        try:
+            counters.overlap_backlog_estimate = count_source_events_between(
+                conn,
+                after_captured_us=o_us,
+                after_key=o_key,
+                to_captured_us=ceiling_us,
+            )
+        except Exception:  # pragma: no cover - diagnostic only
+            logger.debug("overlap backlog estimate failed", exc_info=True)
+        details["overlap"] = {
+            "pass_floor_us": floor_us,
+            "pass_ceiling_us": ceiling_us,
+            "pass_active": not exhausted,
+            "passes_completed": passes_completed,
+            # the DOCUMENTED completeness boundary (FR-05): capture
+            # instants strictly below it are outside this pass's guarantee
+            "guarantee_floor_us": floor_us,
+            "coverage_degraded": coverage_degraded,
+            "coverage_guarantee": (
+                "BROKEN_WINDOW_CONTIGUOUS_SWEEP"
+                if coverage_degraded
+                else "DOCUMENTED_OVERLAP_WINDOW"
+            ),
+        }
         return rows_seen
 
     def _ingest_row(self, row: Mapping[str, Any], counters: TelemetryCounters) -> None:

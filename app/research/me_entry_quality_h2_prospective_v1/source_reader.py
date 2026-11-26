@@ -30,9 +30,12 @@ Contract:
   ``NaN`` / ``Infinity`` / zero / negative / arbitrary strings are explicit
   ``INVALID_SOURCE_PRICE`` rejections;
 * the delivery cursor is the CAPTURE order ``(captured_at,
-  source_event_key)`` — never ``signal_time`` — so late-committed events are
-  never lost (review P1-watermark; overlap/reconciliation lives in the
-  runtime);
+  source_event_key)`` — never ``signal_time`` — so late-committed events with
+  earlier signal times stay within the reconciliation scope; the reconciliation
+  pass (durable overlap cursor in the runtime) carries them across bounded
+  per-cycle budgets; completeness is bounded by the DOCUMENTED overlap
+  guarantee and violations are reported as diagnostics (FR-05) — no absolute
+  no-loss claim is made beyond that contract;
 * invalid rows are rejected with deterministic reason codes — never dropped
   silently, never coerced;
 * trading scanner filters are deliberately NOT applied: this reader admits
@@ -96,10 +99,19 @@ SOURCE_EVENT_COLUMNS: tuple[str, ...] = (
 _SELECT_SQL = f"""
     SELECT {", ".join(SOURCE_EVENT_COLUMNS)}
     FROM research_me_upstream_coverage.source_event
-    WHERE captured_at > %s
-       OR (captured_at = %s AND source_event_key > %s)
+    WHERE (captured_at > %s
+       OR (captured_at = %s AND source_event_key > %s))
+      AND captured_at <= %s
     ORDER BY captured_at, source_event_key
     LIMIT %s
+"""
+
+_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM research_me_upstream_coverage.source_event
+    WHERE (captured_at > %s
+       OR (captured_at = %s AND source_event_key > %s))
+      AND captured_at <= %s
 """
 
 
@@ -276,12 +288,20 @@ def delivery_from_row(row: Mapping[str, Any]) -> SourceDelivery:
     )
 
 
+def _us_to_datetime(us: int) -> datetime:
+    """Exact integer µs -> aware datetime (never float seconds)."""
+    return datetime.fromtimestamp(
+        int(us) // 1_000_000, tz=timezone.utc
+    ) + timedelta(microseconds=int(us) % 1_000_000)
+
+
 def read_source_events_after(
     connection: Any,
     *,
     after_captured_us: int | None = None,
     after_key: str = "",
     limit: int = 200,
+    to_captured_us: int | None = None,
 ) -> list[dict[str, Any]]:
     """Read #305 rows AFTER the capture-order cursor (SELECT-only, bounded).
 
@@ -292,10 +312,16 @@ def read_source_events_after(
     the data, never of the delivery sequence.
 
     ``captured_at`` ties are broken by ``source_event_key`` so equal
-    timestamps can never drop a row at a batch boundary.  Residual
-    capture-to-commit disorder is covered by the caller's overlap rewind
-    (see ``H2ProspectiveRuntime._ingest_phase``); the store's idempotent
-    ingest makes re-reads safe.
+    timestamps can never drop a row at a batch boundary.
+
+    ``to_captured_us`` pins the INCLUSIVE upper bound of the read: the
+    reconciliation pass uses it to freeze its range (review P1-overlap
+    FR-03 — a pass ceiling fixed at pass start; forward-cursor advancement
+    can never exclude unchecked ranges).  ``None`` = unbounded.
+
+    Completeness is bounded by the documented overlap guarantee of the
+    caller's reconciliation pass; violations surface as FR-05 diagnostics,
+    never as a silent claim of full coverage.
     """
     assert_select_only(_SELECT_SQL)
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
@@ -303,13 +329,38 @@ def read_source_events_after(
     if after_captured_us is None:
         since_ts: datetime = datetime(1970, 1, 1, tzinfo=timezone.utc)
     else:
-        # exact integer conversion — never float seconds (µs precision)
-        since_ts = datetime.fromtimestamp(
-            after_captured_us // 1_000_000, tz=timezone.utc
-        ) + timedelta(microseconds=after_captured_us % 1_000_000)
+        since_ts = _us_to_datetime(after_captured_us)
+    ceiling_ts = (
+        _us_to_datetime(to_captured_us)
+        if to_captured_us is not None
+        else datetime(9999, 12, 31, tzinfo=timezone.utc)
+    )
     cur = connection.cursor()
-    cur.execute(_SELECT_SQL, (since_ts, since_ts, after_key, int(limit)))
+    cur.execute(
+        _SELECT_SQL, (since_ts, since_ts, after_key, ceiling_ts, int(limit))
+    )
     return [row_mapping(row) for row in cur.fetchall()]
+
+
+def count_source_events_between(
+    connection: Any,
+    *,
+    after_captured_us: int,
+    after_key: str = "",
+    to_captured_us: int | None = None,
+) -> int:
+    """SELECT COUNT of #305 rows in the cursor range (backlog estimate)."""
+    assert_select_only(_COUNT_SQL)
+    since_ts = _us_to_datetime(after_captured_us)
+    ceiling_ts = (
+        _us_to_datetime(to_captured_us)
+        if to_captured_us is not None
+        else datetime(9999, 12, 31, tzinfo=timezone.utc)
+    )
+    cur = connection.cursor()
+    cur.execute(_COUNT_SQL, (since_ts, since_ts, after_key, ceiling_ts))
+    row = cur.fetchone()
+    return int(row[0]) if row else 0
 
 
 def cursor_of(rows: Sequence[Mapping[str, Any]]) -> tuple[int, str]:

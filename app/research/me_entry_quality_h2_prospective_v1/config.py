@@ -72,8 +72,12 @@ class H2ProspectiveConfig:
     poll_interval_s: float = 300.0
     #: Max #305 rows read per poll (PostgreSQL load control).
     source_batch_limit: int = 200
-    #: Max source read batches per cycle (bounded polling, review P1-watermark).
-    source_max_batches_per_cycle: int = 10
+    #: Forward-scan batch budget per cycle (review P1-overlap FR-02): reading
+    #: new events can never starve reconciliation and vice versa — the two
+    #: phases have INDEPENDENT, bounded budgets whose sum stays bounded.
+    source_forward_batches_per_cycle: int = 8
+    #: Overlap reconciliation batch budget per cycle (review P1-overlap).
+    source_overlap_batches_per_cycle: int = 2
     #: Overlap rewind (seconds) re-read each cycle so late-committed #305 rows
     #: and ``captured_at`` ties can never be lost (review P1-watermark).
     #: Must exceed the maximum capture-to-commit disorder of the source.
@@ -131,9 +135,13 @@ class H2ProspectiveConfig:
             raise H2ProspectiveConfigError("poll_interval_s must be positive")
         if self.source_batch_limit < 1:
             raise H2ProspectiveConfigError("source_batch_limit must be >= 1")
-        if self.source_max_batches_per_cycle < 1:
+        if self.source_forward_batches_per_cycle < 1:
             raise H2ProspectiveConfigError(
-                "source_max_batches_per_cycle must be >= 1"
+                "source_forward_batches_per_cycle must be >= 1"
+            )
+        if self.source_overlap_batches_per_cycle < 1:
+            raise H2ProspectiveConfigError(
+                "source_overlap_batches_per_cycle must be >= 1"
             )
         if self.source_overlap_s < 0:
             raise H2ProspectiveConfigError("source_overlap_s cannot be negative")
@@ -224,9 +232,13 @@ def load_config(environ: Mapping[str, str] | None = None) -> H2ProspectiveConfig
             _get("H2_PROSPECTIVE_SOURCE_BATCH_LIMIT"), 200,
             "H2_PROSPECTIVE_SOURCE_BATCH_LIMIT",
         ),
-        source_max_batches_per_cycle=_parse_int(
-            _get("H2_PROSPECTIVE_SOURCE_MAX_BATCHES_PER_CYCLE"), 10,
-            "H2_PROSPECTIVE_SOURCE_MAX_BATCHES_PER_CYCLE",
+        source_forward_batches_per_cycle=_parse_int(
+            _get("H2_PROSPECTIVE_SOURCE_FORWARD_BATCHES_PER_CYCLE"), 8,
+            "H2_PROSPECTIVE_SOURCE_FORWARD_BATCHES_PER_CYCLE",
+        ),
+        source_overlap_batches_per_cycle=_parse_int(
+            _get("H2_PROSPECTIVE_SOURCE_OVERLAP_BATCHES_PER_CYCLE"), 2,
+            "H2_PROSPECTIVE_SOURCE_OVERLAP_BATCHES_PER_CYCLE",
         ),
         source_overlap_s=_parse_int(
             _get("H2_PROSPECTIVE_SOURCE_OVERLAP_S"), 7200,

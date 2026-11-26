@@ -111,19 +111,39 @@ class FakeSourceCursor:
 
     def execute(self, sql, params=()):
         assert_select_only(sql)
+        if sql.lstrip().upper().startswith("SELECT COUNT("):
+            # backlog estimate query (review P1-overlap telemetry)
+            after_us, _after_us2, after_key, ceiling_us = params
+            picked = [
+                r for r in self._rows
+                if (
+                    r["captured_at"] > after_us
+                    or (r["captured_at"] == after_us
+                        and r["source_event_key"] > after_key)
+                )
+                and r["captured_at"] <= ceiling_us
+            ]
+            self._result = [(len(picked),)]
+            return
         if self._force_redeliver:
             self._result = [self._tuple(r) for r in self._rows]
             return
         # capture-order cursor (review P1-watermark):
-        # (captured_at, source_event_key) exclusive
-        after_us, _after_us2, after_key, limit = params
+        # (captured_at, source_event_key) exclusive, pass ceiling inclusive
+        after_us, _after_us2, after_key, ceiling_us, limit = params
         picked = [
             r for r in self._rows
-            if r["captured_at"] > after_us
-            or (r["captured_at"] == after_us and r["source_event_key"] > after_key)
+            if (
+                r["captured_at"] > after_us
+                or (r["captured_at"] == after_us and r["source_event_key"] > after_key)
+            )
+            and r["captured_at"] <= ceiling_us
         ]
         picked.sort(key=lambda r: (r["captured_at"], r["source_event_key"]))
         self._result = [self._tuple(r) for r in picked[: int(limit)]]
+
+    def fetchone(self):
+        return self._result[0] if self._result else None
 
     @staticmethod
     def _tuple(row):

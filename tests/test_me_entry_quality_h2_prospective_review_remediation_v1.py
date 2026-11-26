@@ -125,14 +125,33 @@ class FakeSourceCursor:
 
     def execute(self, sql, params=()):
         assert_select_only(sql)
+        if sql.lstrip().upper().startswith("SELECT COUNT("):
+            # backlog estimate query (review P1-overlap telemetry)
+            after_us, _after_us2, after_key, ceiling_us = params
+            picked = [
+                r for r in self._rows
+                if (
+                    r["captured_at"] > after_us
+                    or (r["captured_at"] == after_us
+                        and r["source_event_key"] > after_key)
+                )
+                and r["captured_at"] <= ceiling_us
+            ]
+            self._result = [(len(picked),)]
+            return
         if self._force_redeliver:
             self._result = [self._tuple(r) for r in self._rows]
             return
-        after_us, _after_us2, after_key, limit = params
+        # capture-order cursor (review P1-watermark):
+        # (captured_at, source_event_key) exclusive, pass ceiling inclusive
+        after_us, _after_us2, after_key, ceiling_us, limit = params
         picked = [
             r for r in self._rows
-            if r["captured_at"] > after_us
-            or (r["captured_at"] == after_us and r["source_event_key"] > after_key)
+            if (
+                r["captured_at"] > after_us
+                or (r["captured_at"] == after_us and r["source_event_key"] > after_key)
+            )
+            and r["captured_at"] <= ceiling_us
         ]
         picked.sort(key=lambda r: (r["captured_at"], r["source_event_key"]))
         self._result = [self._tuple(r) for r in picked[: int(limit)]]
@@ -143,6 +162,9 @@ class FakeSourceCursor:
 
     def fetchall(self):
         return list(self._result)
+
+    def fetchone(self):
+        return self._result[0] if self._result else None
 
     def close(self):
         return None
@@ -220,7 +242,7 @@ def build_runtime_at(store, rows, *, asof_ms, config=None, force_redeliver=False
 
 # ─── P1-Watermark: mandatory late-delivery scenarios ────────────────────────
 
-class TestLateDeliveryNeverLost:
+class TestLateDeliveryReconciliation:
     def test_signal_order_inversion_both_accepted_both_evaluated_once(self):
         # MANDATORY scenario: B (signal 10:10) captured first; A (signal
         # 10:05 — EARLIER) captured/delivered later.  A signal_time watermark
@@ -325,7 +347,8 @@ class TestLateDeliveryNeverLost:
             candle_retry_backoff_s=0.0,
             candle_request_pause_s=0.0,
             source_batch_limit=1,
-            source_max_batches_per_cycle=2,
+            source_forward_batches_per_cycle=2,
+            source_overlap_batches_per_cycle=1,
         )
         runtime, _ = build_runtime_at(
             store, rows, asof_ms=BASE_MS + 22 * MS, config=config
@@ -369,7 +392,9 @@ class TestLateDeliveryNeverLost:
         # "restart": the same rows are replayed
         runtime2, _ = build_runtime_at(store, rows, asof_ms=BASE_MS + 23 * MS)
         report2 = runtime2.run_cycle()
-        assert report2.counters["idempotent_duplicates"] == 1
+        # redelivery happens twice (forward replay + overlap-window re-read)
+        # — both are idempotent, exactly ONE outcome exists
+        assert report2.counters["idempotent_duplicates"] == 2
         assert report2.counters["source_events_accepted"] == 0
         assert len(store.results) == 1  # one outcome, not two
         assert store.get_cursor() != (0, "")  # checkpoint catches up

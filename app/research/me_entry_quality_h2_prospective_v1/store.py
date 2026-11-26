@@ -64,6 +64,19 @@ EVALUATION_TABLE = f"{SCHEMA}.evaluation_log"
 HEALTH_TABLE = f"{SCHEMA}.runtime_health"
 WATERMARK_TABLE = f"{SCHEMA}.reader_watermark"
 BUDGET_TABLE = f"{SCHEMA}.api_budget_state"
+OVERLAP_TABLE = f"{SCHEMA}.overlap_cursor"
+
+
+def default_overlap_state() -> dict[str, Any]:
+    """Fresh reconciliation-pass state (review P1-overlap)."""
+    return {
+        "cursor_captured_at_us": 0,
+        "cursor_key": "",
+        "pass_floor_us": 0,
+        "pass_ceiling_us": 0,
+        "pass_active": False,
+        "passes_completed": 0,
+    }
 
 CONFLICT_EVENT_KEY_LINEAGE = "EVENT_KEY_LINEAGE_CONFLICT"
 CONFLICT_IMMUTABLE_RESULT = "IMMUTABLE_RESULT_CONFLICT"
@@ -132,11 +145,24 @@ class H2ProspectiveStore:
 
         Review P1-watermark: the cursor tracks the #305 CAPTURE/COMMIT order
         (``captured_at``), never ``signal_time`` — late-committed events with
-        earlier signal times are never skipped.
+        earlier signal times stay inside the reconciliation scope (bounded by
+        the documented overlap guarantee, see FR-05 diagnostics).
         """
         raise NotImplementedError
 
     def set_cursor(self, captured_at_us: int, source_event_key: str) -> None:
+        raise NotImplementedError
+
+    # ── overlap reconciliation state (review P1-overlap) ────────────────────
+    def get_overlap_state(self) -> dict[str, Any]:
+        """Durable reconciliation-pass state (survives restart).
+
+        Keys: ``cursor_captured_at_us``, ``cursor_key``, ``pass_floor_us``,
+        ``pass_ceiling_us``, ``pass_active``, ``passes_completed``.
+        """
+        raise NotImplementedError
+
+    def save_overlap_state(self, state: Mapping[str, Any]) -> None:
         raise NotImplementedError
 
     # ── research API budget state (review P1-budget) ────────────────────────
@@ -223,6 +249,7 @@ class InMemoryProspectiveStore(H2ProspectiveStore):
         self._health: list[dict[str, Any]] = []
         self._cursor: tuple[int, str] = (0, "")
         self._api_budget_state: dict[str, Any] | None = None
+        self._overlap_state: dict[str, Any] = default_overlap_state()
         self.writes = 0
 
     # ── ingest ─────────────────────────────────────────────────────────────
@@ -283,6 +310,24 @@ class InMemoryProspectiveStore(H2ProspectiveStore):
 
     def set_cursor(self, captured_at_us: int, source_event_key: str) -> None:
         self._cursor = (int(captured_at_us), str(source_event_key))
+
+    def get_overlap_state(self) -> dict[str, Any]:
+        return dict(self._overlap_state)
+
+    def save_overlap_state(self, state: Mapping[str, Any]) -> None:
+        # MERGE over the current state: a partial update must never regress
+        # fields it did not mention (review FR-04 checkpoint safety)
+        merged = dict(self._overlap_state)
+        merged.update(
+            {k: v for k, v in state.items() if k in default_overlap_state()}
+        )
+        merged["cursor_captured_at_us"] = int(merged["cursor_captured_at_us"])
+        merged["pass_floor_us"] = int(merged["pass_floor_us"])
+        merged["pass_ceiling_us"] = int(merged["pass_ceiling_us"])
+        merged["passes_completed"] = int(merged["passes_completed"])
+        merged["pass_active"] = bool(merged["pass_active"])
+        merged["cursor_key"] = str(merged["cursor_key"])
+        self._overlap_state = merged
         self.writes += 1
 
     def load_api_budget_state(self) -> dict[str, Any] | None:
@@ -722,6 +767,63 @@ class PgProspectiveStore(H2ProspectiveStore):
                 updated_at = NOW()
             """,
             (int(captured_at_us), str(source_event_key)),
+        )
+        self._commit()
+
+    # ── overlap reconciliation state (review P1-overlap) ────────────────────
+    def get_overlap_state(self) -> dict[str, Any]:
+        cur = self._execute(
+            f"""
+            SELECT cursor_captured_at_us, cursor_key, pass_floor_us,
+                   pass_ceiling_us, pass_active, passes_completed
+            FROM {OVERLAP_TABLE} WHERE id = 1
+            """
+        )
+        row = cur.fetchone()
+        state = default_overlap_state()
+        if row is not None:
+            state.update(
+                {
+                    "cursor_captured_at_us": int(row[0]),
+                    "cursor_key": str(row[1] or ""),
+                    "pass_floor_us": int(row[2]),
+                    "pass_ceiling_us": int(row[3]),
+                    "pass_active": bool(row[4]),
+                    "passes_completed": int(row[5]),
+                }
+            )
+        return state
+
+    def save_overlap_state(self, state: Mapping[str, Any]) -> None:
+        # MERGE over the current state: a partial update must never regress
+        # fields it did not mention (review FR-04 checkpoint safety)
+        merged = self.get_overlap_state()
+        merged.update(
+            {k: v for k, v in state.items() if k in default_overlap_state()}
+        )
+        self._execute(
+            f"""
+            INSERT INTO {OVERLAP_TABLE} (
+                id, cursor_captured_at_us, cursor_key, pass_floor_us,
+                pass_ceiling_us, pass_active, passes_completed
+            ) VALUES (1, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE
+            SET cursor_captured_at_us = EXCLUDED.cursor_captured_at_us,
+                cursor_key = EXCLUDED.cursor_key,
+                pass_floor_us = EXCLUDED.pass_floor_us,
+                pass_ceiling_us = EXCLUDED.pass_ceiling_us,
+                pass_active = EXCLUDED.pass_active,
+                passes_completed = EXCLUDED.passes_completed,
+                updated_at = NOW()
+            """,
+            (
+                int(merged["cursor_captured_at_us"]),
+                str(merged["cursor_key"]),
+                int(merged["pass_floor_us"]),
+                int(merged["pass_ceiling_us"]),
+                bool(merged["pass_active"]),
+                int(merged["passes_completed"]),
+            ),
         )
         self._commit()
 

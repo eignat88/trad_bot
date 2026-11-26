@@ -17,12 +17,20 @@ from typing import Any
 
 from app.research.me_entry_quality_h2_prospective_v1.contracts import (
     RUNTIME_BLOCKED_CANDLE_SOURCE,
+    RUNTIME_OVERLAP_COVERAGE_DEGRADED,
     RUNTIME_RUNNING,
     RUNTIME_SOURCE_EMPTY_WAITING,
     SOURCE_EMPTY_WAITING_LOG,
 )
 
 H2P_TELEMETRY_VERSION = "H2P_TELEMETRY_1.0.0"
+
+#: Verbatim diagnostic marker (review FR-05): the documented overlap window
+#: cannot be honoured; coverage completeness is bounded and reported.
+OVERLAP_COVERAGE_DEGRADED_LOG = (
+    "H2P_OVERLAP_COVERAGE_DEGRADED: documented overlap window cannot be "
+    "honoured; reconciliation runs contiguously; see oldest_unchecked_capture_ts"
+)
 
 
 @dataclass
@@ -55,6 +63,26 @@ class TelemetryCounters:
     api_retries: int = 0
     rate_limit_skips: int = 0
     budget_skips: int = 0
+    # ── overlap reconciliation (review P1-overlap) ──
+    #: forward-scan batches read this cycle
+    forward_batches_scanned: int = 0
+    #: reconciliation batches read this cycle
+    overlap_batches_scanned: int = 0
+    #: a reconciliation pass reached its (fixed) ceiling this cycle
+    overlap_pass_completed: bool = False
+    #: how far the reconciliation cursor trails the forward cursor (seconds)
+    overlap_cursor_lag_s: float = 0.0
+    #: capture µs BELOW which nothing will be reconciled in the active pass —
+    #: the documented completeness boundary (FR-05 diagnostics)
+    oldest_unchecked_capture_ts: int | None = None
+    #: rows FIRST discovered by the sweep (late commits, unseen by forward)
+    late_events_discovered: int = 0
+    #: estimated rows still to be swept in the active pass
+    overlap_backlog_estimate: int = 0
+    #: a pass interrupted by a restart was resumed this cycle
+    overlap_restart_recovery: bool = False
+    #: the documented overlap window cannot be honoured (coverage degraded)
+    overlap_coverage_degraded: bool = False
     # ── integrity ──
     immutable_result_conflicts: int = 0
 
@@ -88,6 +116,15 @@ class TelemetryCounters:
             "api_retries": self.api_retries,
             "rate_limit_skips": self.rate_limit_skips,
             "budget_skips": self.budget_skips,
+            "forward_batches_scanned": self.forward_batches_scanned,
+            "overlap_batches_scanned": self.overlap_batches_scanned,
+            "overlap_pass_completed": self.overlap_pass_completed,
+            "overlap_cursor_lag_s": self.overlap_cursor_lag_s,
+            "oldest_unchecked_capture_ts": self.oldest_unchecked_capture_ts,
+            "late_events_discovered": self.late_events_discovered,
+            "overlap_backlog_estimate": self.overlap_backlog_estimate,
+            "overlap_restart_recovery": self.overlap_restart_recovery,
+            "overlap_coverage_degraded": self.overlap_coverage_degraded,
             "immutable_result_conflicts": self.immutable_result_conflicts,
         }
         if self.confirmation_delays_ms:
@@ -104,11 +141,17 @@ def cycle_status(
     candle_provider_enabled: bool,
     source_cohort_empty: bool = False,
 ) -> str:
-    """The honest contour status of ONE cycle (never a market mode)."""
+    """The honest contour status of ONE cycle (never a market mode).
+
+    Precedence: blocked candle source > empty waiting > overlap coverage
+    degraded (review FR-05 diagnostic) > running.
+    """
     if not candle_provider_enabled:
         return RUNTIME_BLOCKED_CANDLE_SOURCE
     if source_rows_seen == 0 and source_cohort_empty:
         return RUNTIME_SOURCE_EMPTY_WAITING
+    if counters.overlap_coverage_degraded:
+        return RUNTIME_OVERLAP_COVERAGE_DEGRADED
     return RUNTIME_RUNNING
 
 
@@ -122,6 +165,8 @@ def log_cycle(
     """Log one cycle: the FR-08 metrics, plus ``SOURCE_EMPTY_WAITING``."""
     if status == RUNTIME_SOURCE_EMPTY_WAITING:
         logger.info(SOURCE_EMPTY_WAITING_LOG)
+    if status == RUNTIME_OVERLAP_COVERAGE_DEGRADED:
+        logger.info(OVERLAP_COVERAGE_DEGRADED_LOG)
     logger.info(
         "H2_PROSPECTIVE_CYCLE status=%s counters=%s details=%s",
         status,

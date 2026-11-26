@@ -154,6 +154,11 @@ RUNTIME_SOURCE_EMPTY_WAITING = "SOURCE_EMPTY_WAITING"
 #: Candle source unavailable / budget unconfirmed — provider stays OFF.
 RUNTIME_BLOCKED_CANDLE_SOURCE = "BLOCKED_CANDLE_SOURCE"
 RUNTIME_DISABLED = "DISABLED"
+#: Diagnostic (review FR-05): the documented overlap window cannot be
+#: honoured right now (the sweep runs contiguously instead of re-checking
+#: the full window) — coverage completeness is bounded, never falsely
+#: confirmed.
+RUNTIME_OVERLAP_COVERAGE_DEGRADED = "OVERLAP_COVERAGE_DEGRADED"
 
 #: Log line emitted verbatim when the #305 cohort has no events (criterion 4).
 SOURCE_EMPTY_WAITING_LOG = "SOURCE_EMPTY_WAITING"

@@ -72,7 +72,10 @@ ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = (
     ROOT / "sql" / "migrations" / "095_me_entry_quality_h2_prospective_v1.sql"
 )
-MIGRATIONS = (MIGRATION_PATH,)
+MIGRATION_096_PATH = (
+    ROOT / "sql" / "migrations" / "096_me_entry_quality_h2_prospective_overlap_v1.sql"
+)
+MIGRATIONS = (MIGRATION_PATH, MIGRATION_096_PATH)
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 BASE_MS = 1_767_225_600_000
@@ -489,6 +492,199 @@ class TestPgLifecycle:
             ".runtime_health ORDER BY id DESC LIMIT 1"
         ).fetchone()
         assert row[0] == "SOURCE_EMPTY_WAITING"
+
+
+class TestPgOverlapCursor:
+    """Review P1-overlap FR-01/FR-04: the reconciliation pass state is
+    DURABLE in the H2 research schema and survives restarts."""
+
+    def test_default_state(self, store):
+        state = store.get_overlap_state()
+        assert state["pass_active"] is False
+        assert state["cursor_captured_at_us"] == 0
+        assert state["cursor_key"] == ""
+        assert state["passes_completed"] == 0
+
+    def test_state_roundtrip_and_durability_across_connections(
+        self, store, scratch_db
+    ):
+        store.save_overlap_state({
+            "cursor_captured_at_us": 1_767_225_600_000_000,
+            "cursor_key": "evt-42",
+            "pass_floor_us": 1000,
+            "pass_ceiling_us": 2000,
+            "pass_active": True,
+            "passes_completed": 7,
+        })
+        # a brand-new connection (= a runtime restart) sees the saved pass
+        conn2 = _admin_connect(scratch_db)
+        conn2.autocommit = True
+        try:
+            with conn2.cursor() as cur:
+                cur.execute(
+                    "SELECT cursor_captured_at_us, cursor_key, pass_floor_us,"
+                    " pass_ceiling_us, pass_active, passes_completed"
+                    " FROM research_me_entry_quality_h2_prospective"
+                    ".overlap_cursor WHERE id = 1"
+                )
+                row = cur.fetchone()
+        finally:
+            conn2.close()
+        assert row == (
+            1_767_225_600_000_000, "evt-42", 1000, 2000, True, 7,
+        )
+
+    def test_restart_recovery_state_is_seeable_by_a_new_store(
+        self, store, scratch_db
+    ):
+        store.save_overlap_state({
+            "cursor_captured_at_us": 555,
+            "cursor_key": "evt-x",
+            "pass_floor_us": 100,
+            "pass_ceiling_us": 600,
+            "pass_active": True,
+            "passes_completed": 2,
+        })
+        conn2 = _admin_connect(scratch_db)
+        conn2.autocommit = False
+        try:
+            store2 = PgProspectiveStore(conn2)  # exactly a restart
+            state = store2.get_overlap_state()
+        finally:
+            conn2.close()
+        assert state["pass_active"] is True      # resume is armed
+        assert state["cursor_captured_at_us"] == 555
+        assert state["passes_completed"] == 2
+
+    def test_partial_updates_do_not_regress_other_fields(self, store):
+        store.save_overlap_state({
+            "cursor_captured_at_us": 10,
+            "pass_ceiling_us": 20,
+            "pass_active": True,
+        })
+        store.save_overlap_state({
+            "cursor_captured_at_us": 15,
+            "passes_completed": 3,
+        })
+        state = store.get_overlap_state()
+        assert state["cursor_captured_at_us"] == 15
+        assert state["pass_ceiling_us"] == 20  # preserved
+        assert state["pass_active"] is True    # preserved
+        assert state["passes_completed"] == 3
+
+
+class TestPgMigration096:
+    """Migration 096 (overlap cursor): first apply, re-apply, data safety,
+    diagnostic status CHECK."""
+
+    def test_first_apply_and_reapply_are_idempotent(self, scratch_db):
+        conn = _admin_connect(scratch_db)
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute(MIGRATION_PATH.read_text(encoding="utf-8"))
+                text = MIGRATION_096_PATH.read_text(encoding="utf-8")
+                cur.execute(text)   # first apply: PASS
+                cur.execute(text)   # re-apply: PASS (idempotent)
+                cur.execute(text)   # third apply: still PASS
+                cur.execute(
+                    "SELECT to_regclass('research_me_entry_quality_h2_prospective"
+                    ".overlap_cursor')"
+                )
+                assert cur.fetchone()[0] is not None
+        finally:
+            conn.close()
+
+    def test_reapply_preserves_overlap_state(self, store):
+        store.save_overlap_state({
+            "cursor_captured_at_us": 42,
+            "cursor_key": "evt-keep",
+            "pass_floor_us": 1,
+            "pass_ceiling_us": 99,
+            "pass_active": True,
+            "passes_completed": 5,
+        })
+        store._conn.rollback()
+        conn = store._conn
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(MIGRATION_096_PATH.read_text(encoding="utf-8"))
+            cur.execute(MIGRATION_096_PATH.read_text(encoding="utf-8"))
+        conn.autocommit = False
+        state = store.get_overlap_state()
+        assert state["cursor_captured_at_us"] == 42
+        assert state["cursor_key"] == "evt-keep"
+        assert state["pass_active"] is True
+        assert state["passes_completed"] == 5
+
+    def test_health_status_accepts_the_diagnostic_and_keeps_the_guard(
+        self, store
+    ):
+        # the FR-05 diagnostic status is accepted ...
+        store.record_health(
+            "OVERLAP_COVERAGE_DEGRADED",
+            {"overlap_coverage_degraded": True},
+            {"overlap": {"coverage_degraded": True}},
+        )
+        row = store._execute(
+            "SELECT status FROM research_me_entry_quality_h2_prospective"
+            ".runtime_health ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row[0] == "OVERLAP_COVERAGE_DEGRADED"
+        # ... while the CHECK still refuses unknown statuses
+        conn = store._conn
+        conn.rollback()  # close the read txn before switching autocommit
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "INSERT INTO research_me_entry_quality_h2_prospective"
+                        ".runtime_health (status) VALUES ('NOT_A_STATUS')"
+                    )
+                    raised = False
+                except psycopg2.errors.CheckViolation:
+                    raised = True
+                finally:
+                    cur.execute("ROLLBACK")
+            assert raised
+        finally:
+            conn.autocommit = False
+
+    def test_reapply_keeps_ingest_states_results_intact(self, store):
+        # review §6: re-apply must never destroy ingest events / states /
+        # results / conflict ledger
+        row = make_source_row(key="evt-keep2")
+        store.ingest_event(delivery_from_row(row))
+        store.ensure_variant_state(
+            source_event_key="evt-keep2",
+            variant_id="H2_RSI_TURN_1",
+            policy_fingerprint="ff" * 32,
+            policy={},
+            symbol="BTCUSDT",
+            signal_time_us=1,
+        )
+        store.record_conflict(
+            conflict_kind="EVENT_KEY_LINEAGE_CONFLICT",
+            source_event_key="evt-keep2",
+            stored_hash="aa",
+            delivered_hash="bb",
+        )
+        conn = store._conn
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(MIGRATION_096_PATH.read_text(encoding="utf-8"))
+            cur.execute(
+                "SELECT (SELECT COUNT(*) FROM research_me_entry_quality"
+                "_h2_prospective.ingest_event),"
+                " (SELECT COUNT(*) FROM research_me_entry_quality"
+                "_h2_prospective.variant_state),"
+                " (SELECT COUNT(*) FROM research_me_entry_quality"
+                "_h2_prospective.result_conflict)"
+            )
+            counts = cur.fetchone()
+        conn.autocommit = False
+        assert counts == (1, 1, 1)
 
 
 class TestPgMigration095:
