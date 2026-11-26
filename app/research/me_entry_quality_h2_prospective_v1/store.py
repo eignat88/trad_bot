@@ -306,9 +306,10 @@ class InMemoryProspectiveStore(H2ProspectiveStore):
         return len(self._ingest)
 
     def bind_clean_activation(
-        self, activation_ts_us: int, fingerprints: tuple[str, ...]
+        self, activation_ts_us: int, fingerprints: tuple[str, ...],
+        mode: str = "CLEAN_FROZEN",
     ) -> None:
-        normalized = (int(activation_ts_us), tuple(sorted(fingerprints)))
+        normalized = (int(activation_ts_us), tuple(sorted(fingerprints)), mode)
         current = getattr(self, "_clean_activation", None)
         if current is None:
             if self.ingest_event_count() or self.get_cursor() != (0, ""):
@@ -757,7 +758,8 @@ class PgProspectiveStore(H2ProspectiveStore):
         return int(row[0]) if row is not None else 0
 
     def bind_clean_activation(
-        self, activation_ts_us: int, fingerprints: tuple[str, ...]
+        self, activation_ts_us: int, fingerprints: tuple[str, ...],
+        mode: str = "CLEAN_FROZEN",
     ) -> None:
         """Fix the clean cohort and policy set once; never change on restart.
 
@@ -766,11 +768,13 @@ class PgProspectiveStore(H2ProspectiveStore):
         No DB grant allows this role to update or delete the activation.
         """
         normalized = tuple(sorted(fingerprints))
+        if mode not in ("CLEAN_FROZEN", "PRE_FREEZE_RESEARCH"):
+            raise ValueError("H2_CLEAN_ACTIVATION_INVALID_POLICY_MODE")
         if not normalized:
             raise ValueError("H2_CLEAN_ACTIVATION_REQUIRES_POLICIES")
         tbl = "research_me_entry_quality_h2_prospective.clean_activation"
         cur = self._execute(
-            f"SELECT activation_ts_us, policy_fingerprints FROM {tbl} WHERE id=1"
+            f"SELECT activation_ts_us, policy_fingerprints, policy_mode FROM {tbl} WHERE id=1"
         )
         row = cur.fetchone()
         if row is None:
@@ -778,8 +782,8 @@ class PgProspectiveStore(H2ProspectiveStore):
                 raise ValueError("H2_CLEAN_ACTIVATION_REQUIRES_EMPTY_STORE")
             self._execute(
                 f"""
-                INSERT INTO {tbl} (id, activation_ts_us, policy_fingerprints)
-                SELECT 1, %s, %s
+                INSERT INTO {tbl} (id, activation_ts_us, policy_fingerprints, policy_mode)
+                SELECT 1, %s, %s, %s
                 WHERE %s BETWEEN
                     (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::bigint
                       - 120000000
@@ -788,16 +792,17 @@ class PgProspectiveStore(H2ProspectiveStore):
                       + 3600000000
                 ON CONFLICT (id) DO NOTHING
                 """,
-                (int(activation_ts_us), list(normalized), int(activation_ts_us)),
+                (int(activation_ts_us), list(normalized), mode, int(activation_ts_us)),
             )
             self._commit()
             cur = self._execute(
-                f"SELECT activation_ts_us, policy_fingerprints FROM {tbl} WHERE id=1"
+                f"SELECT activation_ts_us, policy_fingerprints, policy_mode FROM {tbl} WHERE id=1"
             )
             row = cur.fetchone()
             if row is None:
                 raise ValueError("H2_CLEAN_ACTIVATION_NOT_FRESH_OR_NOT_PERSISTED")
-        if int(row[0]) != int(activation_ts_us) or tuple(row[1]) != normalized:
+        if (int(row[0]) != int(activation_ts_us)
+                or tuple(row[1]) != normalized or str(row[2]) != mode):
             raise ValueError("H2_CLEAN_ACTIVATION_IMMUTABLE_MISMATCH")
 
     def get_cursor(self) -> tuple[int, str]:
