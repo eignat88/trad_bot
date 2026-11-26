@@ -30,7 +30,7 @@ SHA-256 payload hash), serialized into the H2 result ``candle_source`` block.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Sequence
 
 from app.models import Candle
@@ -136,9 +136,8 @@ def required_fetch_range(
 class CandleApiBudget:
     """Explicit, bounded request budget for the research candle source.
 
-    Separate from every production limiter: the counters live in this process
-    only and are additionally capped per cycle and per hour so the research
-    runtime can never compete with the scanner for Bybit request capacity.
+    These research-local caps supplement (never replace) the mandatory
+    production shared limiter. Every real HTTP attempt is admitted at P3.
 
     Review P1-budget — request accounting:
 
@@ -315,7 +314,7 @@ def pages_for_range(start_ms: int, end_ms: int, page_size: int) -> int:
 
 def _looks_like_rate_limit(message: str) -> bool:
     text = message.lower()
-    return "429" in text or "rate limit" in text or "ratelimit" in text
+    return any(marker in text for marker in ("429", "10006", "rate limit", "ratelimit", "too many visits"))
 
 
 class BybitClosedCandleProvider:
@@ -341,6 +340,10 @@ class BybitClosedCandleProvider:
         self._enabled = bool(enabled)
         self._client_factory = client_factory
         self._source_label_prefix = source_label_prefix
+        # Only successful fully closed, exact ASOF range results are memoized.
+        # Reset at EACH cycle: never rely on stale cross-cycle exchange data.
+        self._cycle_cache: dict[tuple[str, int, int], CandleFetchOutcome] = {}
+
 
     @property
     def enabled(self) -> bool:
@@ -349,6 +352,10 @@ class BybitClosedCandleProvider:
     @property
     def budget(self) -> CandleApiBudget:
         return self._budget
+
+    def start_cycle(self) -> None:
+        self._cycle_cache.clear()
+        self._budget.start_cycle()
 
     def fetch_closed_5m(
         self,
@@ -362,6 +369,13 @@ class BybitClosedCandleProvider:
             grid, evaluation_asof_ms=evaluation_asof_ms
         )
         requested = (start_ms, end_ms)
+        cache_key = (symbol, start_ms, end_ms)
+        if self._enabled and cache_key in self._cycle_cache:
+            # No new Bybit request, and preserve exact original provenance.
+            return replace(
+                self._cycle_cache[cache_key],
+                api_requests=0, retries=0, rate_limit_skips=0,
+            )
         if not self._enabled:
             return CandleFetchOutcome(
                 ok=False,
@@ -437,6 +451,19 @@ class BybitClosedCandleProvider:
                 last_error = f"{type(exc).__name__}: {exc}"
                 if _looks_like_rate_limit(last_error):
                     self._budget.note_rate_limit_skip()
+                # Shared limiter denied a grant OR Bybit returned 10006/429:
+                # never retry here above the limiter or add burst pressure.
+                from app.exchange.bybit_client import BybitRateLimitError
+                if isinstance(exc, BybitRateLimitError) or _looks_like_rate_limit(last_error):
+                    return CandleFetchOutcome(
+                        ok=False,
+                        reason=REASON_FETCH_ERROR,
+                        detail=last_error,
+                        requested_range=requested,
+                        api_requests=self._budget.api_requests - requests_before,
+                        retries=self._budget.retries - retries_before,
+                        rate_limit_skips=self._budget.rate_limit_skips - skips_before,
+                    )
                 if attempts > self._budget.max_retries:
                     return CandleFetchOutcome(
                         ok=False,
@@ -472,7 +499,7 @@ class BybitClosedCandleProvider:
             rows_as_mappings(rows),
             fetched_at_ms=int(time.time() * 1000),
         )
-        return CandleFetchOutcome(
+        result = CandleFetchOutcome(
             ok=True,
             reason=REASON_OK,
             rows=rows,
@@ -482,6 +509,8 @@ class BybitClosedCandleProvider:
             retries=self._budget.retries - retries_before,
             rate_limit_skips=self._budget.rate_limit_skips - skips_before,
         )
+        self._cycle_cache[cache_key] = result
+        return result
 
 
 def rows_as_mappings(rows: Sequence[Candle]) -> list[dict[str, Any]]:

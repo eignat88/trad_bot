@@ -109,6 +109,10 @@ class H2ProspectiveConfig:
     # ── candle provider (FR-02): dedicated bounded research budget ─────────
     #: The budget must be explicitly confirmed; otherwise the provider is OFF.
     candle_budget_confirmed: bool = False
+    #: Canonical cross-process limiter contract (required for real H2 API).
+    #: The same production state file and config fingerprint are enforced.
+    shared_limiter_contract_path: str = ""
+
     candle_max_requests_per_cycle: int = 10
     candle_max_requests_per_hour: int = 240
     candle_max_retries: int = 2
@@ -155,6 +159,12 @@ class H2ProspectiveConfig:
             raise H2ProspectiveConfigError("max_events_per_cycle must be >= 1")
         if self.statement_timeout_ms < 1:
             raise H2ProspectiveConfigError("statement_timeout_ms must be >= 1")
+        if self.shared_limiter_contract_path:
+            import os
+            if not os.path.isabs(self.shared_limiter_contract_path):
+                raise H2ProspectiveConfigError(
+                    "H2_SHARED_LIMITER_CONTRACT_PATH must be absolute"
+                )
         if self.candle_max_requests_per_cycle < 1:
             raise H2ProspectiveConfigError(
                 "candle_max_requests_per_cycle must be >= 1"
@@ -281,6 +291,9 @@ def load_config(environ: Mapping[str, str] | None = None) -> H2ProspectiveConfig
         db_password=_get("H2_PROSPECTIVE_DB_PASSWORD")
         or _get("DB_PASSWORD") or "",
         db_unix_sock=_get("H2_PROSPECTIVE_DB_UNIX_SOCK") or "",
+        shared_limiter_contract_path=(
+            _get("H2_SHARED_LIMITER_CONTRACT_PATH") or ""
+        ),
         candle_budget_confirmed=_parse_bool(
             _get("H2_CANDLE_API_BUDGET_CONFIRMED"), "H2_CANDLE_API_BUDGET_CONFIRMED"
         ),
@@ -318,6 +331,12 @@ def load_config(environ: Mapping[str, str] | None = None) -> H2ProspectiveConfig
         ),
     )
 
+    if (config.enabled and config.candle_budget_confirmed
+            and not config.shared_limiter_contract_path):
+        raise H2ProspectiveConfigError(
+            "H2_SHARED_LIMITER_CONTRACT_REQUIRED: shared production "
+            "limiter contract must be configured before candle GO"
+        )
     if config.enabled and not config.clean_activation_ts:
         raise H2ProspectiveConfigError(
             "H2_CLEAN_ACTIVATION_TS_REQUIRED: set "

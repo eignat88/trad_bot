@@ -532,14 +532,25 @@ class TestRunnerExitCodes:
 
 
 class TestRunnerClientFactoryPins:
-    def test_research_client_is_single_attempt_per_page(self):
+    def test_research_client_is_single_attempt_per_page(self, tmp_path):
         # review P1-budget: the "1 pagination page = 1 HTTP request" budget
         # invariant is pinned by the research client factory settings
+        import json
+        contract = {
+            "global_limiter_state_path": str(tmp_path / "limiter.json"),
+            "global_limiter_g_rps": 8.0,
+            "global_limiter_burst": 12.0,
+        }
+        contract_path = tmp_path / "contract.json"
+        contract_path.write_text(json.dumps(contract), encoding="utf-8")
         config = H2ProspectiveConfig(
             enabled=True, candle_budget_confirmed=True,
             allow_unfrozen_policies=True,
+            shared_limiter_contract_path=str(contract_path),
         )
         client = runner_mod._make_bybit_client_factory(config)()
+        assert client.settings.global_bybit_rate_limiter_enabled is True
+        assert client.settings.global_limiter_state_path == str(tmp_path / "limiter.json")
         assert client.settings.bybit_max_attempts == 1
         assert getattr(client.settings, "bybit_rate_limit_max_retries", 0) == 0
 

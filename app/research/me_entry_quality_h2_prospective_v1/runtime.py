@@ -173,7 +173,7 @@ class H2ProspectiveRuntime:
             return CycleReport(status=RUNTIME_DISABLED)
 
         counters = TelemetryCounters()
-        self._provider.budget.start_cycle()
+        self._provider.start_cycle()
         details: dict[str, Any] = {
             "runtime_version": H2P_RUNTIME_VERSION,
             "policy_manifest": self.policy_manifest(),
