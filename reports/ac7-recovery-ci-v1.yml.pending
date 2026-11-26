@@ -1,0 +1,96 @@
+name: AC7 Recovery CI V1
+
+# SCANNER_AC7_RECOVERY_CI_V1 — offline CI slice for Issue #304 (Scanner AC7
+# recovery scheduling).
+#
+# Why this exists: no existing workflow collects the AC7 recovery suites, so
+# the recovery scheduler, its one-shot/restart guards and the cooldown-hint
+# policy would merge untested by CI.  This workflow is deliberately separate
+# and does NOT modify main-pr-safety.yml.
+#
+# Guarantees:
+#   * tests the EXACT PR head commit (not the merge commit, not the base);
+#   * provenance guard fails the run if the checked-out tree lacks the
+#     Issue #304 recovery markers (it cannot silently test a stale tree);
+#   * offline only: fake transport and synthetic reports — no Bybit, no VPS,
+#     no production, no PostgreSQL (DB-dependent suites are never collected).
+
+on:
+  pull_request:
+    branches:
+      - main
+      - 'research/**'
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        description: 'Exact commit SHA to validate (use the PR head SHA).'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ac7-recovery-ci-v1-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.head_sha || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  ac7-recovery-regression:
+    name: Scanner AC7 recovery regression (offline)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact head commit
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.head_sha }}
+
+      - name: Provenance guard — exact head SHA, Issue #304 recovery tree
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          RESOLVED="$(git rev-parse "${EXPECTED_SHA}^{commit}")"
+          ACTUAL="$(git rev-parse HEAD)"
+          echo "requested=${EXPECTED_SHA}"
+          echo "resolved =${RESOLVED}"
+          echo "checked_out=${ACTUAL}"
+          test "${RESOLVED}" = "${ACTUAL}"
+          grep -q "RECOVERY_DELAY_SECONDS = 130.0" app/scanners/recovery_policy_v1.py
+          grep -q "def breaker_cooldown_hint_seconds" app/scanners/recovery_policy_v1.py
+          grep -q "ac7_recovery_enabled" scanner_runner.py
+          echo "issue304_recovery_markers=ok"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install offline test dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest pyyaml python-dotenv numpy pandas scipy
+
+      - name: AC7 recovery suites (offline, no DB, no network)
+        shell: bash
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+        run: |
+          python -m pytest -q -p no:cacheprovider \
+            tests/test_scanner_ac7_recovery_policy_v1.py \
+            tests/test_scanner_ac7_recovery_wiring_v1.py \
+            tests/test_scanner_ac7_recovery_restart_v1.py \
+            tests/test_scanner_ac7_recovery_loop_v1.py \
+            tests/test_scanner_ac7_recovery_outage_v1.py \
+            tests/test_scanner_ac7_recovery_real_report_v1.py \
+            tests/test_scanner_ac7_recovery_real_breaker_v1.py \
+            tests/test_scanner_ac7_recovery_cooldown_hint_v1.py \
+            tests/test_scanner_ac7_recovery_dedup_contracts_v1.py \
+            tests/test_scanner_ac7_cycle_completion_phase_a_v1.py \
+            tests/test_issue261_me_capture_enqueue_failure_cycle_completion_v1.py

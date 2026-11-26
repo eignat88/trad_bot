@@ -887,6 +887,9 @@ class ScannerRepository:
             identity = self._signal_identity(record)
             for index, existing in enumerate(records):
                 if self._signal_identity(existing) == identity:
+                    # D3 (issue #304): a re-detection must NEVER rewrite a
+                    # terminal result — executed/invalidated/expired setups
+                    # are historical facts.
                     if existing.get("status") in (
                         "EXECUTED", "INVALIDATED", "EXPIRED"
                     ):
