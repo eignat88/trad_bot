@@ -102,21 +102,13 @@ def _make_bybit_client_factory(config: H2ProspectiveConfig) -> Callable[[], Any]
     API budget is confirmed.
     """
     def factory() -> Any:
-        from app.config.settings import Settings
-        from app.exchange.bybit_client import BybitClient
-
-        settings = Settings(
-            bybit_timeout=config.bybit_timeout_s,
-            bybit_rate_limit_rps=1.0,
-            # Review P1-budget invariant: ONE pagination page must cost
-            # EXACTLY ONE HTTP request.  ``Settings`` defaults would allow
-            # up to 5 rate-limit retries per page — pinned to 0 here (and
-            # asserted by tests) so the request budget can never be
-            # undershot by invisible transport retries.
-            bybit_max_attempts=1,
-            bybit_rate_limit_max_retries=0,
+        from app.research.me_entry_quality_h2_prospective_v1.shared_candle_client import (
+            build_h2_shared_client,
         )
-        return BybitClient(settings)
+
+        # No private-only fallback: construction fails closed without an
+        # approved canonical contract. Every GET page acquires P3 globally.
+        return build_h2_shared_client(config)
 
     return factory
 
