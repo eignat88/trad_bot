@@ -18,7 +18,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 # Research runtime configuration (deploy/env/h2-prospective-runtime.env.example)
 EnvironmentFile=/opt/trad_bot_h2_prospective_release/deploy/env/h2-prospective-runtime.env
 
-ExecStart=/opt/trad_bot_h2_prospective_release/.venv/bin/python -B -m app.research.me_entry_quality_h2_prospective_v1.runner
+ExecStart=/opt/trad_bot_h2_prospective_release/.venv312/bin/python -B -m app.research.me_entry_quality_h2_prospective_v1.runner
 
 Restart=on-failure
 # 3: runtime disabled / not activated (operator action).
