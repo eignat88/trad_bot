@@ -1937,7 +1937,13 @@ def _get_prospective_observer(repository: ScannerRepository):
     if _prospective_observer is None:
         try:
             import pg8000
-            from app.research.prospective_observer import ProspectiveOOSObserver
+            # Issue #322: use the signal-integrity adapter (ME_SHORT-scoped
+            # stable candle identity). It subclasses the frozen
+            # ProspectiveOOSObserver and delegates every non-ME_SHORT family to
+            # it unchanged, so this is a drop-in wiring change.
+            from app.research.scanner_signal_integrity_observer import (
+                ScannerSignalIntegrityObserver,
+            )
             from app.research.prospective_completed_event_repository import (
                 ProspectiveCompletedEventRepository,
             )
@@ -1984,7 +1990,7 @@ def _get_prospective_observer(repository: ScannerRepository):
 
             completed_event_repo = ProspectiveCompletedEventRepository(_prospective_conn)
 
-            _prospective_observer = ProspectiveOOSObserver(
+            _prospective_observer = ScannerSignalIntegrityObserver(
                 _prospective_conn, experiments,
                 research_repo=research_repo_for_promote,
                 completed_event_repo=completed_event_repo,
@@ -2491,6 +2497,8 @@ def run_scan_cycle(
                                 direction=c.direction,
                                 symbol=c.symbol,
                                 signal_time=c.detected_at,
+                                entry_timeframe=c.entry_timeframe,
+                                signal_candle_open_time=c.signal_candle_open_time,
                                 reference_price=c.reference_price,
                                 invalidation_price=c.invalidation_price,
                                 target_1=c.target_1,
@@ -2571,6 +2579,8 @@ def run_scan_cycle(
                                 direction=oc.direction,
                                 symbol=oc.symbol,
                                 signal_time=oc.detected_at,
+                                entry_timeframe=oc.entry_timeframe,
+                                signal_candle_open_time=oc.signal_candle_open_time,
                                 reference_price=oc.reference_price,
                                 invalidation_price=oc.invalidation_price,
                                 target_1=oc.target_1,
@@ -2636,6 +2646,8 @@ def run_scan_cycle(
                                     direction=c.direction,
                                     symbol=c.symbol,
                                     signal_time=c.detected_at,
+                                    entry_timeframe=c.entry_timeframe,
+                                    signal_candle_open_time=c.signal_candle_open_time,
                                     reference_price=c.reference_price,
                                     invalidation_price=c.invalidation_price,
                                     target_1=c.target_1,
@@ -2812,6 +2824,8 @@ def run_scan_cycle(
                                 direction=erc.direction,
                                 symbol=erc.symbol,
                                 signal_time=erc.detected_at,
+                                entry_timeframe=erc.entry_timeframe,
+                                signal_candle_open_time=erc.signal_candle_open_time,
                                 reference_price=erc.reference_price,
                                 invalidation_price=erc.invalidation_price,
                                 target_1=erc.target_1,
@@ -2855,6 +2869,8 @@ def run_scan_cycle(
                                 direction=rrc.direction,
                                 symbol=rrc.symbol,
                                 signal_time=rrc.detected_at,
+                                entry_timeframe=rrc.entry_timeframe,
+                                signal_candle_open_time=rrc.signal_candle_open_time,
                                 reference_price=rrc.reference_price,
                                 invalidation_price=rrc.invalidation_price,
                                 target_1=rrc.target_1,

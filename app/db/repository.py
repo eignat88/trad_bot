@@ -823,7 +823,6 @@ class ScannerRepository:
                     instrument_id, scanner_name, direction, entry_timeframe,
                     signal_candle_open_time
                 ) WHERE signal_candle_open_time > 0 DO UPDATE SET
-                    run_id = EXCLUDED.run_id,
                     detected_at = EXCLUDED.detected_at,
                     reference_price = EXCLUDED.reference_price,
                     entry_zone_low = EXCLUDED.entry_zone_low,
