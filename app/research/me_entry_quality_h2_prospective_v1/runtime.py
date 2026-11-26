@@ -153,8 +153,9 @@ class H2ProspectiveRuntime:
             expected = {p.fingerprint() for p in self._policies}
             if pins and pins != expected:
                 raise ValueError("POLICY_FINGERPRINT_MISMATCH: pin set differs")
+            mode = "CLEAN_FROZEN" if pins else "PRE_FREEZE_RESEARCH"
             self._store.bind_clean_activation(
-                self._clean_activation_us, tuple(sorted(expected))
+                self._clean_activation_us, tuple(sorted(expected)), mode=mode
             )
 
     @property
