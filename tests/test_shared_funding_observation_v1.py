@@ -102,3 +102,11 @@ def test_missing_period_stamp_is_explicitly_unknown():
 def test_default_provenance_cannot_be_reassigned():
     with pytest.raises(ValueError):
         FundingObservation("ETHUSDT", FundingStatus.OK, NOW, 0.01, source="arbitrary")
+
+@pytest.mark.parametrize("bad", [False, True])
+def test_boolean_funding_rates_are_invalid(bad):
+    obs = parse_funding_history_observation(
+        symbol="ETHUSDT", payload=raw(bad), observed_at=NOW
+    )
+    assert obs.status == FundingStatus.INVALID
+    assert obs.rate_percent is None

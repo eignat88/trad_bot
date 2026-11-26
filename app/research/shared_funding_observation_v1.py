@@ -87,8 +87,11 @@ def parse_funding_history_observation(
     row = rows[0]
     if not isinstance(row, dict):
         return FundingObservation(symbol, FundingStatus.INVALID, observed_at, None)
+    raw_rate = row.get("fundingRate")
+    if isinstance(raw_rate, bool):
+        return FundingObservation(symbol, FundingStatus.INVALID, observed_at, None)
     try:
-        fraction = float(row.get("fundingRate"))
+        fraction = float(raw_rate)
     except (TypeError, ValueError, OverflowError):
         return FundingObservation(symbol, FundingStatus.INVALID, observed_at, None)
     if not math.isfinite(fraction):
