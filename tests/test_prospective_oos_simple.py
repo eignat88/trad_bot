@@ -194,8 +194,6 @@ class TestPromotedCounterAccuracy:
         observer.observe(
             scanner_name="BREAKOUT_RETEST", direction="LONG", symbol="BTCUSDT",
             signal_time=datetime.now(timezone.utc),
-            entry_timeframe="5m",
-            signal_candle_open_time=1795680000000,
             reference_price=83791.6, invalidation_price=83478.3,
             target_1=84805.6, target_2=85566.1, score=44.55,
             features={}, parameters={}, market_regime="RANGE",
@@ -214,8 +212,6 @@ class TestPromotedCounterAccuracy:
         observer.observe(
             scanner_name="BREAKOUT_RETEST", direction="LONG", symbol="BTCUSDT",
             signal_time=datetime.now(timezone.utc),
-            entry_timeframe="5m",
-            signal_candle_open_time=1795680000000,
             reference_price=83791.6, invalidation_price=83478.3,
             target_1=84805.6, target_2=85566.1, score=44.55,
             features={}, parameters={}, market_regime="RANGE",
@@ -237,8 +233,6 @@ class TestAdapterFailure:
         observer.observe(
             scanner_name="BREAKOUT_RETEST", direction="LONG", symbol="BTCUSDT",
             signal_time=datetime.now(timezone.utc),
-            entry_timeframe="5m",
-            signal_candle_open_time=1795680000000,
             reference_price=83791.6, invalidation_price=83478.3,
             target_1=84805.6, target_2=85566.1, score=44.55,
             features={}, parameters={}, market_regime="RANGE",
@@ -272,8 +266,6 @@ class TestNewExperimentAdapters:
         observer.observe(
             scanner_name=scanner_name, direction=direction, symbol="BTCUSDT",
             signal_time=datetime.now(timezone.utc),
-            entry_timeframe="5m",
-            signal_candle_open_time=1795680000000,
             reference_price=83791.6, invalidation_price=83478.3,
             target_1=84805.6, target_2=85566.1, score=44.55,
             features={}, parameters={}, market_regime="RANGE",

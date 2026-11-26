@@ -1933,7 +1933,13 @@ def _get_prospective_observer(repository: ScannerRepository):
     if _prospective_observer is None:
         try:
             import pg8000
-            from app.research.prospective_observer import ProspectiveOOSObserver
+            # Issue #322: use the signal-integrity adapter (ME_SHORT-scoped
+            # stable candle identity). It subclasses the frozen
+            # ProspectiveOOSObserver and delegates every non-ME_SHORT family to
+            # it unchanged, so this is a drop-in wiring change.
+            from app.research.scanner_signal_integrity_observer import (
+                ScannerSignalIntegrityObserver,
+            )
             from app.research.prospective_completed_event_repository import (
                 ProspectiveCompletedEventRepository,
             )
@@ -1980,7 +1986,7 @@ def _get_prospective_observer(repository: ScannerRepository):
 
             completed_event_repo = ProspectiveCompletedEventRepository(_prospective_conn)
 
-            _prospective_observer = ProspectiveOOSObserver(
+            _prospective_observer = ScannerSignalIntegrityObserver(
                 _prospective_conn, experiments,
                 research_repo=research_repo_for_promote,
                 completed_event_repo=completed_event_repo,
