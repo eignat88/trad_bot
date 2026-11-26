@@ -282,7 +282,7 @@ class TestProvider:
 
     def test_api_failure_is_fail_closed_after_bounded_retries(self):
         # criterion 14: no partial history, bounded retry, explicit reason
-        client = _ScriptedClient([RuntimeError("rate limited")] * 5)
+        client = _ScriptedClient([RuntimeError("transient network error")] * 5)
         provider = self._provider(client)
         provider.budget.start_cycle()
         outcome = provider.fetch_closed_5m(
@@ -362,7 +362,7 @@ class TestProvider:
     def test_retry_attempt_is_fully_recounted(self):
         # each retry re-reserves the FULL page count (fail-closed upper bound)
         client = _ScriptedClient(
-            [RuntimeError("rate limited"), as_candles(candle_rows(0, 30))]
+            [RuntimeError("transient network error"), as_candles(candle_rows(0, 30))]
         )
         provider = self._provider(
             client, page_size=10, max_pages=20, max_requests_per_cycle=10_000
