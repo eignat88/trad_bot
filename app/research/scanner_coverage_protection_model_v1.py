@@ -130,16 +130,16 @@ def simulate_slots(
     waits: dict[str, int] = {}
     role_count = {role.value: 0 for role in RequestRole}
 
-    def priority(x: Demand, index: int) -> tuple[int, int]:
+    def priority(x: Demand, index: int) -> tuple[int, int, int]:
         if not policy_enabled:
-            return (0, index)
+            return (0, x.arrived_slot, index)
         rank = {
             RequestRole.PROTECTIVE: 0,
             RequestRole.UNKNOWN: 0,
             RequestRole.SCANNER: 1,
             RequestRole.ENTRY_ONLY: 2,
         }
-        return (rank[x.role], index)
+        return (rank[x.role], x.arrived_slot, index)
 
     for slot, cap in enumerate(capacities):
         eligible = [

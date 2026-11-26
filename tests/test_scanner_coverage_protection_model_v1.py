@@ -100,5 +100,27 @@ class TestHypotheticalContention(unittest.TestCase):
             simulate_slots([], [-1])
 
 
+
+    def test_fifo_unsorted_input_default_off(self):
+        jobs = [
+            Demand("new", RequestRole.SCANNER, 1, 2),
+            Demand("old", RequestRole.SCANNER, 0, 2),
+        ]
+        result = simulate_slots(jobs, [0, 1, 0])
+        self.assertEqual(result.sent, ("old",))
+        self.assertEqual(result.not_sent, ("new",))
+
+    def test_fifo_unsorted_input_candidate_policy(self):
+        jobs = [
+            Demand("new", RequestRole.PROTECTIVE, 1, 2),
+            Demand("old", RequestRole.PROTECTIVE, 0, 2),
+        ]
+        result = simulate_slots(
+            jobs, [0, 1, 0], policy_enabled=True
+        )
+        self.assertEqual(result.sent, ("old",))
+        self.assertEqual(result.not_sent, ("new",))
+
+
 if __name__ == "__main__":
     unittest.main()
