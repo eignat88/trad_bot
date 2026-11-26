@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -239,9 +240,92 @@ class ProspectiveOOSObserver:
     def _make_source_key(
         self, scanner_name: str, symbol: str, direction: str, signal_time: Any,
     ) -> int:
-        """Deterministic synthetic source_signal_id from candidate identity."""
-        key_str = f"{scanner_name}:{symbol}:{direction}:{signal_time}"
-        return -abs(hash(key_str)) % (2**31)
+        """Restart-stable legacy helper; not used for new candle OOS.
+
+        This does not migrate or rewrite historical source_signal_id values.
+        """
+        payload = json.dumps(
+            ["issue322:legacy:v1", scanner_name, symbol, direction, str(signal_time)],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        digest = hashlib.sha256(payload).digest()
+        value = int.from_bytes(digest[:8], "big") % (2**31 - 1)
+        return -(value + 1)
+
+    @staticmethod
+    def _make_candle_source_key(
+        scanner_name: str,
+        symbol: str,
+        direction: str,
+        entry_timeframe: str,
+        signal_candle_open_time: int | None,
+    ) -> int | None:
+        """Restart-stable prospective identity for a known signal candle.
+
+        Missing or invalid candle lineage fails closed. The versioned
+        namespace prevents accidental reuse of legacy hash identities.
+        """
+        if (
+            type(signal_candle_open_time) is not int
+            or signal_candle_open_time <= 0
+            or not all(
+                isinstance(value, str) and value.strip()
+                for value in (
+                    scanner_name, symbol, direction, entry_timeframe
+                )
+            )
+        ):
+            return None
+
+        payload = json.dumps(
+            [
+                "issue322:candle:v1",
+                scanner_name,
+                symbol,
+                direction,
+                entry_timeframe,
+                signal_candle_open_time,
+            ],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+        digest = hashlib.sha256(payload).digest()
+        # Keep new candle IDs outside the legacy/HTF 31-bit range.
+        # The result fits a signed PostgreSQL BIGINT.
+        value = int.from_bytes(digest[:8], "big") % (2**62 - 2**31)
+        return -(2**31 + 1 + value)
+
+    @staticmethod
+    def _srr_identity_cutover_allows(
+        signal_candle_open_time: int | None,
+        cutover_ts: str | None,
+    ) -> bool:
+        """Allow only candles strictly after the explicit SRR ID cutover."""
+        if (
+            type(signal_candle_open_time) is not int
+            or signal_candle_open_time <= 0
+            or not isinstance(cutover_ts, str)
+            or not cutover_ts.strip()
+        ):
+            return False
+
+        try:
+            cutover_dt = datetime.fromisoformat(
+                cutover_ts.replace("Z", "+00:00")
+            )
+            if cutover_dt.tzinfo is None:
+                return False
+
+            cutover_utc = cutover_dt.astimezone(timezone.utc)
+            candle_utc = datetime.fromtimestamp(
+                signal_candle_open_time / 1000,
+                tz=timezone.utc,
+            )
+            return candle_utc > cutover_utc
+        except (ValueError, TypeError, OverflowError, OSError):
+            return False
 
     @staticmethod
     def _make_htf_source_key(exp_id: str, setup_event_id: str) -> int:
@@ -274,6 +358,8 @@ class ProspectiveOOSObserver:
         parameters: dict,
         market_regime: str | None,
         detection_result: Any | None = None,
+        entry_timeframe: str | None = None,
+        signal_candle_open_time: int | None = None,
     ) -> list[int]:
         """Process a candidate against all applicable prospective experiments.
 
@@ -294,8 +380,9 @@ class ProspectiveOOSObserver:
         if not self._conn:
             return []
 
-        source_key = self._make_source_key(
-            scanner_name, symbol, direction, signal_time,
+        source_key = self._make_candle_source_key(
+            scanner_name, symbol, direction,
+            entry_timeframe, signal_candle_open_time,
         )
         active_registry = self._load_active_registry(self._registry)
 
@@ -320,6 +407,15 @@ class ProspectiveOOSObserver:
                     if direction not in allowed_directions:
                         continue
                 elif exp_spec["direction"] != direction:
+                    continue
+
+                # Generic OOS requires immutable candle identity.
+                # HTF and V3 have their own independent identity contracts.
+                if (
+                    source_key is None
+                    and not exp_id.startswith("HTF_KEYLEVEL_")
+                    and exp_id != "MOMENTUM_EXHAUSTION_REVERSE_LONG_V3_OOS"
+                ):
                     continue
 
                 # HTF prospective capture is valid only strictly after the
@@ -420,6 +516,12 @@ class ProspectiveOOSObserver:
                         score, features, parameters, market_regime,
                     )
                 elif exp_id == "SRR_SHORT_EXECUTION_R_EXPANSION_PROSPECTIVE_VALIDATION_V1":
+                    # Fail closed until a prospective-only cutover is configured.
+                    if not self._srr_identity_cutover_allows(
+                        signal_candle_open_time,
+                        os.environ.get("SRR_OOS_IDENTITY_CUTOVER_TS"),
+                    ):
+                        continue
                     obs_id = self._observe_srr_short_execution_r_expansion(
                         cursor, exp_id, exp_spec,
                         source_key, symbol, direction, signal_time,
