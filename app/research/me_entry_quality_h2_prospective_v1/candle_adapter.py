@@ -314,7 +314,7 @@ def pages_for_range(start_ms: int, end_ms: int, page_size: int) -> int:
 
 def _looks_like_rate_limit(message: str) -> bool:
     text = message.lower()
-    return "429" in text or "rate limit" in text or "ratelimit" in text
+    return any(marker in text for marker in ("429", "10006", "rate limit", "ratelimit", "too many visits"))
 
 
 class BybitClosedCandleProvider:
