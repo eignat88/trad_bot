@@ -1,0 +1,47 @@
+[Unit]
+Description=H1-E Prospective HTF Observer (research only, disabled by default)
+After=postgresql.service
+Wants=postgresql.service
+# Bounded crash-loop protection for transient failures.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=tradbot_h1e_observer
+Group=tradbot_h1e_observer
+
+WorkingDirectory=/opt/trad_bot_h1e_observer_release
+
+Environment=PYTHONPATH=/opt/trad_bot_h1e_observer_release
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Research observer configuration (deploy/env/h1e-observer.env.example).
+# Separate credentials, separate logging contour; the file ships with
+# H1E_WORKER_ENABLE=0 / H1E_DEPLOY_GATE=0 / H1E_DDL_APPLIED=0.
+EnvironmentFile=/opt/trad_bot_h1e_observer_release/deploy/env/h1e-observer.env
+
+ExecStart=/opt/trad_bot_h1e_observer_release/.venv312/bin/python -B -m app.research.me_entry_quality_h1e_infra_v1.worker
+# Read-only health probe after start (no writes, no API).
+ExecStartPost=/opt/trad_bot_h1e_observer_release/.venv312/bin/python -B -m app.research.me_entry_quality_h1e_infra_v1.worker --health
+
+Restart=on-failure
+# 3: observer disabled / not activated (operator action, by design).
+SuccessExitStatus=3
+RestartSec=60
+# graceful stop: the current cycle finishes, then the worker exits
+TimeoutStopSec=120
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+
+# NOTE: this unit is a TEMPLATE ONLY (Issue #324, Phase C).  It must NOT be
+# installed or enabled on the VPS without separate explicit owner GOs
+# (deploy / DDL / H1-E freeze / activation).  The observer is research-only:
+# it never generates trading signals, never opens trades, never performs
+# backfill and never transitions to OOS.
