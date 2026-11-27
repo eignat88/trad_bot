@@ -144,6 +144,42 @@ def _full_classification():
 # ─── first-event handling: SOXSUSDT offline, SYNTHETIC fixture ─────────────
 
 
+class TestSpecLiteralReportFields:
+    """Issue #314 §3.5 per-event field names, top level (audit D3)."""
+
+    def test_spec_fields_are_top_level_and_correct(self):
+        _, _, _, classification = _full_classification()
+        report = classification.to_dict()
+        result = classification.result
+        assert report["source_event_key"] == EVENT_ROW["source_event_key"]
+        assert report["signal_time"] == "2026-11-25T13:11:00.804844+00:00"
+        assert report["regime_4h"] == result.htf_4h.regime
+        assert report["bos_4h"] == result.htf_4h.bos
+        assert report["regime_1d"] == result.htf_1d.regime
+        assert report["bos_1d"] == result.htf_1d.bos
+        assert report["combined_state"] == result.combined_regime
+        assert report["coverage_4h"]["status"] == COVERAGE_COMPLETE
+        assert report["coverage_1d"]["status"] == COVERAGE_COMPLETE
+        assert report["eligible"] is True
+        assert report["eligibility_reason"] == "ELIGIBLE"
+
+    def test_spec_fields_stay_present_on_fail_closed_result(self):
+        record = _event_record()
+        rows_4h, rows_1d = _payloads(record, n_4h=59)
+        classification = _classify(record, rows_4h, rows_1d)
+        report = classification.to_dict()
+        result = classification.result
+        assert report["eligible"] is False
+        for name in ("source_event_key", "signal_time", "regime_4h", "bos_4h",
+                     "coverage_4h", "regime_1d", "bos_1d", "coverage_1d",
+                     "combined_state", "eligible", "eligibility_reason"):
+            assert name in report
+        if result is None:
+            assert report["combined_state"] is None
+        else:
+            assert report["combined_state"] == result.combined_regime
+
+
 class TestFirstEventSyntheticFixture:
     def test_event_lineage_is_verbatim(self):
         record = _event_record()

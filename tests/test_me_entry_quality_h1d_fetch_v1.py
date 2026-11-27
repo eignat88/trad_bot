@@ -294,6 +294,40 @@ class TestFailClosedErrors:
         assert excinfo.value.limiter_result == "SKIPPED"
         assert excinfo.value.__cause__ is error
 
+    @pytest.mark.parametrize("result", [
+        "SKIPPED", "STATE_UNAVAILABLE", "REVOKED", "LIMITER_UNAVAILABLE",
+    ])
+    def test_every_limiter_gate_result_is_a_limiter_denial(self, result):
+        """Audit D2: ``LIMITER_UNAVAILABLE`` (shared limiter ERROR) must be a
+        limiter denial, never misclassified as a Bybit rate limit."""
+        error = BybitRateLimitError(
+            "denied", limiter_result=result, limiter_reason="gate")
+        stub = StubKlineApi([], fail_with=error)
+        with pytest.raises(HtfFetchLimiterDeniedError) as excinfo:
+            _fetch(stub)
+        assert excinfo.value.limiter_result == result
+        assert excinfo.value.__cause__ is error
+
+    def test_process_local_breaker_deferral_is_breaker_denied(self):
+        """``retry_budget.raise_bybit_rate_limit_deferred`` carries no
+        structured ``limiter_result`` — the cooldown marker classifies it."""
+        error = BybitRateLimitError(
+            "request deferred: rate-limit cooldown open (2.00s remaining)")
+        stub = StubKlineApi([], fail_with=error)
+        with pytest.raises(HtfFetchBreakerDeniedError) as excinfo:
+            _fetch(stub)
+        assert excinfo.value.__cause__ is error
+
+    def test_retry_storm_guard_denial_is_breaker_denied(self):
+        error = BybitRateLimitError(
+            "SOXSUSDT: Rate limited on /v5/market/kline after 1 attempt(s) "
+            "(storm guard: retry share capped)",
+            limiter_result="RATE_LIMIT",
+            limiter_reason="storm guard: retry share capped")
+        stub = StubKlineApi([], fail_with=error)
+        with pytest.raises(HtfFetchBreakerDeniedError):
+            _fetch(stub)
+
     @pytest.mark.parametrize("result", ["BREAKER_OPEN"])
     def test_breaker_denial_is_explicit(self, result):
         error = BybitRateLimitError(

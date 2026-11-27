@@ -45,7 +45,10 @@ from app.research.me_entry_quality_h1d_v1.classification import (
 )
 
 H1D_PROVENANCE_VERSION = "H1D_PROVENANCE_REPLAY_V1"
-SNAPSHOT_SCHEMA = "H1D_HTF_SNAPSHOT_1"
+#: schema 2 adds the per-dataset ``source_kind`` / ``evaluation_asof_ms``
+#: fields demanded by the Issue #314 §3.4 dataset list; schema-1 documents
+#: are rejected explicitly ("unknown snapshot schema"), never misread.
+SNAPSHOT_SCHEMA = "H1D_HTF_SNAPSHOT_2"
 
 #: fixture labels — a synthetic payload must NEVER masquerade as real data.
 FIXTURE_LABEL_SYNTHETIC = "SYNTHETIC_TEST_FIXTURE"
@@ -112,10 +115,14 @@ class TimeframePayload:
 
     timeframe: str
     interval: str
+    source_kind: str
     source_label: str
     fetched_at_ms: int | None
     row_count: int
     payload_sha256: str
+    #: the causal evaluation instant of the owning event (= ``signal_time``)
+    #: in whole milliseconds — the ASOF this payload was classified against.
+    evaluation_asof_ms: int
     source_identity: dict[str, Any]
     rows: tuple[dict[str, Any], ...]
 
@@ -123,10 +130,12 @@ class TimeframePayload:
         return {
             "timeframe": self.timeframe,
             "interval": self.interval,
+            "source_kind": self.source_kind,
             "source_label": self.source_label,
             "fetched_at_ms": self.fetched_at_ms,
             "row_count": self.row_count,
             "payload_sha256": self.payload_sha256,
+            "evaluation_asof_ms": self.evaluation_asof_ms,
             "source_identity": dict(self.source_identity),
             "rows": [dict(row) for row in self.rows],
         }
@@ -205,6 +214,7 @@ def _build_payload(
     source_label: str,
     rows: Sequence[Mapping[str, Any]],
     fetched_at_ms: int | None,
+    evaluation_asof_ms: int,
 ) -> TimeframePayload:
     normalized = _normalize_rows(rows)
     identity: HtfSourceIdentity = build_source_identity(
@@ -212,10 +222,12 @@ def _build_payload(
     return TimeframePayload(
         timeframe=timeframe,
         interval=interval,
+        source_kind=source_kind,
         source_label=source_label,
         fetched_at_ms=fetched_at_ms,
         row_count=len(normalized),
         payload_sha256=payload_sha256(normalized),
+        evaluation_asof_ms=evaluation_asof_ms,
         source_identity=identity.to_dict(),
         rows=normalized,
     )
@@ -249,11 +261,13 @@ def build_snapshot(
     payload_4h = _build_payload(
         timeframe="4H", interval=interval_4h, source_kind=source_kind,
         source_label=source_label_4h or source_label, rows=rows_4h,
-        fetched_at_ms=fetched_at_ms)
+        fetched_at_ms=fetched_at_ms,
+        evaluation_asof_ms=record.signal_time_ms)
     payload_1d = _build_payload(
         timeframe="1D", interval=interval_1d, source_kind=source_kind,
         source_label=source_label_1d or source_label, rows=rows_1d,
-        fetched_at_ms=fetched_at_ms)
+        fetched_at_ms=fetched_at_ms,
+        evaluation_asof_ms=record.signal_time_ms)
 
     document: dict[str, Any] = {
         "schema": SNAPSHOT_SCHEMA,
@@ -297,10 +311,12 @@ def _payload_from_dict(data: Any, *, field_name: str) -> TimeframePayload:
         payload = TimeframePayload(
             timeframe=str(data["timeframe"]),
             interval=str(data["interval"]),
+            source_kind=str(data["source_kind"]),
             source_label=str(data["source_label"]),
             fetched_at_ms=data.get("fetched_at_ms"),
             row_count=int(data["row_count"]),
             payload_sha256=str(data["payload_sha256"]),
+            evaluation_asof_ms=int(data["evaluation_asof_ms"]),
             source_identity=dict(data["source_identity"]),
             rows=rows,
         )
@@ -313,6 +329,11 @@ def _payload_from_dict(data: Any, *, field_name: str) -> TimeframePayload:
         raise ProvenanceTamperError(
             f"{field_name}: row_count {payload.row_count} != "
             f"{len(payload.rows)} stored rows")
+    if payload.source_kind != payload.source_identity.get("source_kind"):
+        raise ProvenanceTamperError(
+            f"{field_name}: source_kind {payload.source_kind!r} != "
+            f"source_identity.source_kind "
+            f"{payload.source_identity.get('source_kind')!r}")
     recomputed = payload_sha256(payload.rows)
     if recomputed != payload.payload_sha256:
         raise ProvenanceTamperError(
@@ -388,6 +409,13 @@ def snapshot_from_dict(document: Any) -> Snapshot:
     if snapshot.asof_us != snapshot.signal_time_us:
         raise ProvenanceTamperError(
             "asof_us must equal signal_time_us (ASOF = signal_time)")
+    for name, payload in (("payload_4h", snapshot.payload_4h),
+                          ("payload_1d", snapshot.payload_1d)):
+        if payload.evaluation_asof_ms != snapshot.signal_time_ms:
+            raise ProvenanceTamperError(
+                f"{name}: evaluation_asof_ms "
+                f"{payload.evaluation_asof_ms} != signal_time_ms "
+                f"{snapshot.signal_time_ms} (ASOF = signal_time)")
     return snapshot
 
 

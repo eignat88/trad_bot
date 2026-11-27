@@ -144,6 +144,23 @@ class TestSnapshotBuild:
             assert payload.row_count == 60 == len(payload.rows)
             assert len(payload.payload_sha256) == 64
 
+    def test_per_dataset_spec_fields(self):
+        """Issue #314 §3.4 dataset field list, per timeframe (audit D4)."""
+        snapshot = _snapshot()
+        for payload in (snapshot.payload_4h, snapshot.payload_1d):
+            assert payload.source_kind == SOURCE_KIND_OFFLINE_SNAPSHOT
+            assert payload.evaluation_asof_ms == snapshot.signal_time_ms
+        document = snapshot.to_dict()
+        for name in ("payload_4h", "payload_1d"):
+            dataset = document[name]
+            assert dataset["source_kind"] == SOURCE_KIND_OFFLINE_SNAPSHOT
+            assert dataset["source_label"] == "SYNTHETIC_TEST_FIXTURE:SOXSUSDT:htf"
+            assert dataset["evaluation_asof_ms"] == 1795612260804
+            assert dataset["fetched_at_ms"] == 1795612260804
+            assert dataset["row_count"] == 60
+            assert len(dataset["payload_sha256"]) == 64
+            assert len(dataset["rows"]) == 60
+
     def test_source_identity_built_via_h1c_builder(self):
         snapshot = _snapshot()
         record, rows_4h, _ = _fixture_payloads()
@@ -259,6 +276,31 @@ class TestTamperDetection:
         document = self._document()
         document["signal_time_us"] += 1
         document["asof_us"] += 1
+        with pytest.raises(ProvenanceTamperError):
+            snapshot_from_dict(document)
+
+    def test_evaluation_asof_tamper_detected_even_with_hash_recomputed(self):
+        """Defense in depth: the per-dataset ``evaluation_asof_ms`` must stay
+        tied to ``signal_time`` even if the document hash is rebuilt."""
+        document = self._document()
+        document["payload_4h"]["evaluation_asof_ms"] += 1
+        document["snapshot_sha256"] = compute_snapshot_hash(document)
+        with pytest.raises(ProvenanceTamperError):
+            snapshot_from_dict(document)
+
+    def test_source_kind_field_tamper_detected_even_with_hash_recomputed(self):
+        document = self._document()
+        document["payload_1d"]["source_kind"] = "BYBIT_KLINES"
+        document["snapshot_sha256"] = compute_snapshot_hash(document)
+        with pytest.raises(ProvenanceTamperError):
+            snapshot_from_dict(document)
+
+    def test_dataset_fields_missing_is_an_explicit_error(self):
+        """Schema-2 documents must carry the per-dataset fields — a stripped
+        dataset fails closed, never loads as a weaker snapshot."""
+        document = self._document()
+        del document["payload_4h"]["evaluation_asof_ms"]
+        document["snapshot_sha256"] = compute_snapshot_hash(document)
         with pytest.raises(ProvenanceTamperError):
             snapshot_from_dict(document)
 

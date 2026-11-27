@@ -28,6 +28,7 @@ No network, no database, no clock, no I/O.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
 from app.research.me_entry_quality_h1_v1.htf_candles import (
@@ -59,6 +60,13 @@ REASON_INVALID_SOURCE = "INVALID_SOURCE"
 REASON_INCOMPLETE_COVERAGE = "INCOMPLETE_COVERAGE"
 
 
+def _iso_utc_us(us: int) -> str:
+    """ISO-8601 UTC rendering of a microsecond epoch (deterministic, no clock)."""
+    seconds, micros = divmod(int(us), 1_000_000)
+    base = datetime.fromtimestamp(seconds, tz=timezone.utc)
+    return f"{base.strftime('%Y-%m-%dT%H:%M:%S')}.{micros:06d}+00:00"
+
+
 @dataclass(frozen=True)
 class H1DClassification:
     """Complete H1-D classification outcome for ONE #305 source event."""
@@ -76,8 +84,19 @@ class H1DClassification:
     diagnostics: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
+        result = self.result
         return {
             "classification_version": self.classification_version,
+            # Issue #314 §3.5 per-event report fields (spec-literal names;
+            # ``coverage_4h`` / ``coverage_1d`` / ``eligible`` /
+            # ``eligibility_reason`` are the keys below).
+            "source_event_key": self.record.source_event_key,
+            "signal_time": _iso_utc_us(self.record.signal_time_us),
+            "regime_4h": None if result is None else result.htf_4h.regime,
+            "bos_4h": None if result is None else result.htf_4h.bos,
+            "regime_1d": None if result is None else result.htf_1d.regime,
+            "bos_1d": None if result is None else result.htf_1d.bos,
+            "combined_state": None if result is None else result.combined_regime,
             "lineage": self.record.lineage_payload(),
             "symbol": self.record.symbol,
             "asof_us": self.asof_us,
@@ -89,7 +108,7 @@ class H1DClassification:
                 "reason": self.outcome.reason,
                 "detail": self.outcome.detail,
             },
-            "result": None if self.result is None else self.result.to_dict(),
+            "result": None if result is None else result.to_dict(),
             "coverage_4h": self.coverage_4h.to_dict(),
             "coverage_1d": self.coverage_1d.to_dict(),
             "diagnostics": dict(self.diagnostics),

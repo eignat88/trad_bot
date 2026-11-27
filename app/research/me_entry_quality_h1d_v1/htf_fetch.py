@@ -230,7 +230,20 @@ def normalize_kline_row(row: Any, *, step_ms: int) -> dict[str, Any] | None:
 # ─── error propagation (fail closed, explicit) ──────────────────────────────
 
 _BREAKER_RESULTS = ("BREAKER_OPEN",)
-_LIMITER_RESULTS = ("SKIPPED", "STATE_UNAVAILABLE", "REVOKED")
+# ``LIMITER_UNAVAILABLE`` is raised by ``BybitClient._budgeted_get`` when the
+# shared limiter itself errors (bybit_client.py ``limiter_result`` observability
+# contract: ``BREAKER_OPEN`` / ``SKIPPED`` / ``STATE_UNAVAILABLE`` / ``REVOKED``
+# / ``LIMITER_UNAVAILABLE``) — a limiter denial, never a Bybit rate limit.
+_LIMITER_RESULTS = ("SKIPPED", "STATE_UNAVAILABLE", "REVOKED",
+                    "LIMITER_UNAVAILABLE")
+
+#: message / limiter-reason markers of the PROCESS-LOCAL breaker cooldown
+#: (``retry_budget.raise_bybit_rate_limit_deferred``) and the retry-storm
+#: guard (``deny("storm guard: retry share capped")``).  Those terminal
+#: errors carry no structured ``limiter_result`` flag of their own, so the
+#: class is refined by marker; anything unrecognized keeps failing closed
+#: as an explicit rate-limit denial.
+_BREAKER_DEFERRAL_MARKERS = ("cooldown open", "storm guard")
 
 
 def _translate_client_error(exc: BaseException) -> HtfFetchError:
@@ -249,6 +262,13 @@ def _translate_client_error(exc: BaseException) -> HtfFetchError:
         if limiter_result in _LIMITER_RESULTS:
             return HtfFetchLimiterDeniedError(
                 f"shared limiter denied request: {exc}",
+                limiter_result=limiter_result,
+                limiter_reason=limiter_reason,
+            )
+        reason_text = f"{limiter_reason or ''} {exc}".lower()
+        if any(marker in reason_text for marker in _BREAKER_DEFERRAL_MARKERS):
+            return HtfFetchBreakerDeniedError(
+                f"breaker/storm-guard deferred request: {exc}",
                 limiter_result=limiter_result,
                 limiter_reason=limiter_reason,
             )
