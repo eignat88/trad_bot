@@ -33,6 +33,15 @@ Hard guarantees of this module
   Split ``save_alias``/``save_dual_record`` hooks are rejected at construction;
   a failed batch changes nothing (no in-memory alias, no persisted row); batch
   delivery is idempotent and crash-safe.
+* **Family-aware legacy identity — ME_SHORT candle compatibility** (review P2
+  B4.1): legacy ids are resolved per family.  The frozen ``hash()`` band
+  ``[0, 2**31)`` stays valid for every family; the PR #323 negative candle-key
+  band (``_make_candle_source_key``) is accepted VERBATIM for the ME_SHORT
+  ``candle`` family only and is never replaced by a positive hash id.  ME_SHORT
+  requires a CONFIRMED persisted id (``signal_time``-based hash derivation would
+  fabricate an unrelated id); a confirmed candle id that contradicts the
+  capture's candle lineage is rejected before any write.  Negative ids are
+  never accepted for non-candle families and no fallback id is ever minted.
 
 Identity derivation (stable across processes and PYTHONHASHSEED values)
 ----------------------------------------------------------------------
@@ -79,6 +88,11 @@ __all__ = [
     "canonical_key_hex",
     "stable_source_signal_id",
     "legacy_source_signal_id",
+    "is_legacy_hash_id",
+    "is_candle_key",
+    "CANDLE_KEY_BAND_MIN",
+    "CANDLE_KEY_BAND_MAX",
+    "LEGACY_HASH_BAND_MAX",
     "validate_legacy_signal_time",
     "resolve_legacy_identity",
     "format_ts_us",
@@ -128,10 +142,23 @@ FAMILY_SLUGS: Mapping[str, str] = MappingProxyType(
 #: Scope key that special-cases the ME_SHORT family (scanner + direction).
 _ME_SHORT_SCOPE_KEY = "MOMENTUM_EXHAUSTION|SHORT"
 
+#: Family slug of the ME_SHORT candle family (PR #323 ``issue322:candle:v1``).
+_ME_SHORT_CANDLE_SLUG = FAMILY_SLUGS[_ME_SHORT_SCOPE_KEY]
+
 # Fold into ``[-(2**62 - 2**31), -1]``-bounded values strictly below ``-2**31``,
 # identical to PR #323 so the two key families never overlap.
 _FOLD_MODULUS = 2**62 - 2**31
 _FOLD_BASE = 2**31 + 1
+
+# PR #323 candle-key band (``_make_candle_source_key``): ``-(2**31 + 1 + x)`` for
+# ``x`` in ``[0, 2**62 - 2**31)`` — negative, strictly below ``-2**31``, inside
+# signed BIGINT.  ME_SHORT legacy identities produced by the completed #323
+# adapter live in exactly this band and are accepted VERBATIM for that family.
+CANDLE_KEY_BAND_MIN = -(2**62)
+CANDLE_KEY_BAND_MAX = -(2**31 + 1)
+
+# Frozen ``hash()``-based legacy band (``_make_source_key``): ``[0, 2**31)``.
+LEGACY_HASH_BAND_MAX = 2**31
 
 
 class IdentityError(ValueError):
@@ -345,6 +372,21 @@ def _frozen_legacy_key(
     return -abs(hash(key_str)) % (2**31)
 
 
+def is_legacy_hash_id(value: Any) -> bool:
+    """True for a frozen ``hash()``-based legacy id (band ``[0, 2**31)``)."""
+    return type(value) is int and 0 <= value < LEGACY_HASH_BAND_MAX
+
+
+def is_candle_key(value: Any) -> bool:
+    """True for a PR #323 ``issue322:candle:v1`` key (negative BIGINT band).
+
+    Exactly the ``ScannerSignalIntegrityObserver._make_candle_source_key()``
+    output band (``scanner_signal_integrity_observer.py:127-131``):
+    ``-(2**31 + 1 + digest % (2**62 - 2**31))``.
+    """
+    return type(value) is int and CANDLE_KEY_BAND_MIN <= value <= CANDLE_KEY_BAND_MAX
+
+
 def legacy_source_signal_id(
     scanner_name: str, symbol: str, direction: str, signal_time: Any
 ) -> int:
@@ -405,18 +447,30 @@ def resolve_legacy_identity(
     legacy_signal_time: Any = None,
     legacy_source_signal_id: int | None = None,
 ) -> int:
-    """Resolve the LEGACY identity for one signal — confirmed or fail-closed.
+    """Resolve the LEGACY identity for one signal — family-aware, fail-closed.
 
-    Exactly two sources are accepted (review B1):
+    Exactly two sources are accepted (review B1 + P2 B4.1):
 
     * ``legacy_source_signal_id`` — a CONFIRMED original legacy id (e.g. the
       persisted ``source_signal_id`` of a historical/frozen OOS row).  Used
-      VERBATIM and never re-derived: historical values came from an unknown
-      ``PYTHONHASHSEED`` and can not be recomputed.  Must be an ``int`` inside
-      the frozen 31-bit legacy band ``[0, 2**31)``.
+      VERBATIM and never re-derived:
+
+      - the frozen ``hash()`` band ``[0, 2**31)`` is accepted for EVERY family
+        (historical legacy identities);
+      - the PR #323 candle-key band ``[-(2**62), -(2**31 + 1)]`` is accepted
+        ONLY for the ME_SHORT ``candle`` family
+        (``ScannerSignalIntegrityObserver._make_candle_source_key``) — a
+        negative candle id is never replaced by a positive hash id;
+      - any other value — negative ids for non-candle families, out-of-band
+        numbers, non-ints — raises :class:`IdentityError`.
+
     * ``legacy_signal_time`` — the exact frozen key input (aware ``datetime`` or
       ISO-8601 string); the legacy id is then re-derived byte-compatibly with
-      the frozen ``_make_source_key()`` replica.
+      the frozen ``_make_source_key()`` replica.  NEVER available for the
+      ME_SHORT ``candle`` family: its live identity is the deterministic candle
+      key, and a ``signal_time``-derived hash would fabricate an id unrelated to
+      the persisted candle id — without a confirmed identity ME_SHORT therefore
+      fails closed (``CONFIRMED_LEGACY_ID_REQUIRED``).
 
     A missing, empty, naive or malformed signal time NEVER yields an identity —
     the frozen key is not minted from ``None``/``""``/garbage placeholders and
@@ -424,12 +478,15 @@ def resolve_legacy_identity(
     or invalid data raises :class:`IdentityError` so callers reject the capture
     instead of persisting an incorrect alias.
     """
+    candle_family = family_slug(scanner_name, direction) == _ME_SHORT_CANDLE_SLUG
     if legacy_source_signal_id is not None:
-        if type(legacy_source_signal_id) is not int or not (
-            0 <= legacy_source_signal_id < 2**31
-        ):
-            raise IdentityError("INVALID_LEGACY_SOURCE_SIGNAL_ID")
-        return legacy_source_signal_id
+        if is_legacy_hash_id(legacy_source_signal_id):
+            return legacy_source_signal_id
+        if candle_family and is_candle_key(legacy_source_signal_id):
+            return legacy_source_signal_id
+        raise IdentityError("INVALID_LEGACY_SOURCE_SIGNAL_ID")
+    if candle_family:
+        raise IdentityError("CONFIRMED_LEGACY_ID_REQUIRED")
     validate_legacy_signal_time(legacy_signal_time)
     return _frozen_legacy_key(scanner_name, symbol, direction, legacy_signal_time)
 
@@ -471,7 +528,12 @@ class DualIdentityRecord:
 
 @dataclass(frozen=True)
 class AliasEdge:
-    """One legacy↔stable alias edge inside an atomic :class:`IdentityBatch`."""
+    """One legacy↔stable alias edge inside an atomic :class:`IdentityBatch`.
+
+    Legacy-key acceptance is family-aware (review P2 B4.1/B4.2): the frozen
+    ``hash()`` band ``[0, 2**31)`` for every family, plus the PR #323 negative
+    candle-key band for the ME_SHORT ``candle`` family only.
+    """
 
     stable_key: int
     legacy_key: int
@@ -480,12 +542,13 @@ class AliasEdge:
     def validate(self) -> None:
         if type(self.stable_key) is not int or self.stable_key >= -(2**31):
             raise AliasIntegrityError("ALIAS_EDGE_STABLE_KEY_INVALID")
-        if type(self.legacy_key) is not int or not (
-            0 <= self.legacy_key < 2**31
-        ):
-            raise AliasIntegrityError("ALIAS_EDGE_LEGACY_KEY_INVALID")
         if not isinstance(self.family_slug, str) or not self.family_slug.strip():
             raise AliasIntegrityError("ALIAS_EDGE_FAMILY_SLUG_INVALID")
+        if is_legacy_hash_id(self.legacy_key):
+            return
+        if self.family_slug == _ME_SHORT_CANDLE_SLUG and is_candle_key(self.legacy_key):
+            return
+        raise AliasIntegrityError("ALIAS_EDGE_LEGACY_KEY_INVALID")
 
 
 @dataclass(frozen=True)
@@ -692,6 +755,14 @@ class MigrationIdentityCore:
         Insufficient or invalid legacy data raises :class:`IdentityError`
         before anything is written — no fallback value is ever substituted.
 
+        ME_SHORT ``candle`` family (review P2 B4.1): the live identity is the
+        PR #323 candle key — a CONFIRMED id is mandatory (positive historical
+        ``hash()`` ids are accepted verbatim; negative candle ids are accepted
+        verbatim and must match this capture's deterministic candle key — a
+        mismatch is conflicting lineage and is rejected before any write).
+        ``legacy_signal_time``-based derivation is not available for this
+        family.
+
         Persistence is one atomic ALL_OR_NOTHING batch (review B2): the alias
         edge and the dual record commit together through a single
         :meth:`IdentityPersistenceHook.save_identity_batch` call, or the whole
@@ -720,6 +791,12 @@ class MigrationIdentityCore:
             legacy_signal_time=legacy_signal_time,
             legacy_source_signal_id=legacy_source_signal_id,
         )
+        if slug == _ME_SHORT_CANDLE_SLUG and is_candle_key(legacy) and legacy != stable:
+            # The candle key is deterministic from THIS lineage (byte-identical
+            # to PR #323 _make_candle_source_key): a confirmed candle id that
+            # does not match it belongs to another signal — conflicting
+            # lineage data is rejected before anything is written (B4.1 #6).
+            raise IdentityError("CONFLICTING_LEGACY_CANDLE_ID")
         record = DualIdentityRecord(
             family_slug=slug,
             identity_version=f"{NAMESPACE_PREFIX}:{slug}:v1",

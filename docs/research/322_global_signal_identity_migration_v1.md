@@ -246,6 +246,36 @@ alias-write failure, dual-record-write failure, crash-before-commit, repeated
 redelivery, concurrent same-signal capture (single core and shared store),
 restart recovery, batch-invariant and split-write-hook rejection.
 
+### 3.8 Family-aware legacy identity — ME_SHORT candle compatibility (review P2 B4)
+
+Legacy identity resolution is **family-aware** so the migration is fully
+backward compatible with the completed ME_SHORT model of PR #323
+(`ScannerSignalIntegrityObserver._make_candle_source_key`,
+`issue322:candle:v1`, negative BIGINT band `[-(2**62), -(2**31 + 1)]`):
+
+* the frozen `hash()` band `[0, 2**31)` remains valid for **every** family
+  (confirmed verbatim, or re-derived from a validated `legacy_signal_time`);
+* the PR #323 **candle-key band is accepted verbatim for the ME_SHORT
+  `candle` family only** — a negative candle id is never replaced by a
+  positive hash id, and (because the candle key is deterministic from the
+  candle lineage) a confirmed candle id that contradicts the capture's lineage
+  is rejected before any write (`CONFLICTING_LEGACY_CANDLE_ID`);
+* ME_SHORT requires a **CONFIRMED** persisted identity:
+  `legacy_signal_time`-based hash derivation is disabled for this family
+  (it would fabricate an id unrelated to the persisted candle id) —
+  without a confirmed id the capture fails closed
+  (`CONFIRMED_LEGACY_ID_REQUIRED`);
+* negative ids are **never** accepted for non-candle families; no universal
+  negative-id allowance exists (band checks: `is_candle_key`,
+  `is_legacy_hash_id`); no fallback id is ever minted.
+
+Parity anchor (test-executable): `_make_candle_source_key(...)` ≡
+`stable_source_signal_id(..., slug="candle")` — payload and fold are identical,
+so ME_SHORT canonical identity is bit-identical to PR #323 and historical
+source IDs (both the pre-#323 hash rows and the post-#323 candle rows) stay
+valid without any data change.  Alias/dual-record atomicity (§3.7) is unchanged:
+candle edges go through the same `IdentityBatch` ALL_OR_NOTHING contract.
+
 ## 4. Phased rollout (§c)
 
 | Phase | What happens | Consumes stable key? | DB writes | Default |
@@ -336,6 +366,11 @@ change, never a runtime toggle.
     store is consistent (no orphan aliases, no records without their alias, no
     duplication, no conflicting identities) and historical frozen identities are
     unchanged.
+11. **ME_SHORT candle compatibility (review P2 B4)**: negative PR #323 candle ids are
+    accepted verbatim for the `candle` family only (never replaced by hash ids, lineage
+    conflicts rejected before write), historical `hash()` ids keep their contract for
+    every family, ME_SHORT without a confirmed identity fails closed, and no historical
+    OOS row requires any change.
 
 ## 9. Open questions for the owner
 
