@@ -113,7 +113,7 @@ owner-approved H1-E freeze.
    freezes.
 
 **Test evidence** — `tests/test_me_entry_quality_h1e_activation_freeze_v1.py`
-(11 tests): event after #305 but at/before H1-E freeze → rejected; store
+(10 tests): event after #305 but at/before H1-E freeze → rejected; store
 bound to the later freeze refuses an earlier-freeze event (checked against
 the H1-E freeze, not the source freeze); `signal_time == freeze_ts` →
 rejected; strict-after → admitted; missing approval / whitespace approval
@@ -137,7 +137,7 @@ key and the `h1e_pending_retry` table.
 | `sql/proposals/324_h1e_prospective_ledger_v1_proposal.sql` | activation FK + `h1e_freeze_ts_us`, `h1e_event_prospective_guard` trigger, approval immutability, `uq_h1e_conflict_event_identity`, `h1e_pending_retry` (still PROPOSAL ONLY — DO NOT APPLY) |
 | `tests/test_me_entry_quality_h1e_durable_retry_v1.py` | NEW (9 tests, B1) |
 | `tests/test_me_entry_quality_h1e_commit_atomicity_v1.py` | NEW (5 tests, B2) |
-| `tests/test_me_entry_quality_h1e_activation_freeze_v1.py` | NEW (11 tests, B3) |
+| `tests/test_me_entry_quality_h1e_activation_freeze_v1.py` | NEW (10 tests, B3) |
 | `tests/test_me_entry_quality_h1e_ledger_v1.py` | activation-bound fixtures + 5 DDL contract tests |
 | `tests/test_me_entry_quality_h1e_capture_v1.py` | DEFERRED test rewritten to the queue-driven flow (redelivery idempotent) |
 | `tests/test_me_entry_quality_h1e_isolation_purity_v1.py` | determinism script binds the activation |

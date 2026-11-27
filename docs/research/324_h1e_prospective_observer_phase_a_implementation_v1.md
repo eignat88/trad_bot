@@ -147,16 +147,20 @@ source_fingerprint, activation_freeze_ts (#305), captured_at (timing columns onl
   the next cycle re-reads from the previous checkpoint and converges to the
   identical outcome (crash between read/classify/commit covered by tests).
   There is NO durable mutation path outside `commit_batch`.
-* **Durable pending-retry (review fix B1)** — a `DEFERRED` classification
-  is queued in durable retry state that is INDEPENDENT of the source
-  cursor and survives restart (identity, attempt count, deferral reason,
-  next-attempt time).  Due entries are re-processed in deterministic order
-  at the ORIGINAL `signal_time` ASOF (no later candles).  Attempts are
+* **Durable pending-retry (review fix B1, bounded per cycle by B4)** — a
+  `DEFERRED` classification is queued in durable retry state that is
+  INDEPENDENT of the source cursor and survives restart (identity,
+  attempt count, deferral reason, next-attempt time).  Due entries are
+  re-processed in deterministic queue order at the ORIGINAL `signal_time`
+  ASOF (no later candles), at most `CaptureConfig.retry_batch_limit` per
+  cycle — unprocessed due entries stay in the queue untouched (no
+  attempt consumed, nothing terminal from the limit).  Total attempts are
   bounded (`CaptureConfig.max_attempts`): budget exhaustion produces a
   terminal non-eligible result (`H1E_RETRY_BUDGET_EXHAUSTED`) without
   further classifier calls.  Redelivery of a queued or terminal identity
-  is an idempotent `DUPLICATE` — retries are NEVER driven by redelivery;
-  terminal and conflicted identities are never re-executed.
+  is an idempotent `DUPLICATE` — even when it races its own queue retry
+  in the same cycle; retries are NEVER driven by redelivery; terminal and
+  conflicted identities are never re-executed.
 * **Freeze** — fail-closed admission gate (see §3); rejected rows are
   durable reject-ledger records with deterministic reason codes.
 

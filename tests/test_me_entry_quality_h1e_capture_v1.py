@@ -385,3 +385,46 @@ def test_deferred_classification_is_queued_and_retried_not_lost():
     assert final_redelivery.duplicates == 1
     assert final_redelivery.retried_keys == ()
     assert len(store.lookup(identity).classifications) == 2
+
+
+def test_cycle_report_keeps_reconciliation_contract_with_b4_diagnostics():
+    """B4 diagnostics are ADDITIVE — the reconciliation contract is intact."""
+    from app.research.me_entry_quality_h1e_v1.classification import STATUS_DEFERRED as DEF
+
+    rows = [
+        make_source_row(
+            signal_time_us=FIXTURE_FREEZE_US + 10_000_000,
+            captured_us=FIXTURE_FREEZE_US + 100_000_000,
+            candle_open_ms=1_700_000_000_000,
+        )
+    ]
+    cfg = CaptureConfig(
+        allow_fixture_freeze=True, retry_backoff_us=0, retry_batch_limit=1)
+
+    def defer_classifier(event, prior_deferrals=0):
+        return make_classification_record(
+            event, eligible=False, status=DEF,
+            non_eligible_codes=("H1E_HTF_LIMITER_DENIED",))
+
+    store = InMemoryH1EStore(activation=FREEZE)
+    first = run_capture_cycle(
+        reader=FakeReader(rows), store=store, classifier=defer_classifier,
+        freeze=FREEZE, cursor=CaptureCursor(), config=cfg, now_us=FIXTURE_FREEZE_US + 200_000_000)
+    report = run_capture_cycle(
+        reader=FakeReader([]), store=store, classifier=defer_classifier,
+        freeze=FREEZE, cursor=CaptureCursor.after_rows(rows), config=cfg,
+        now_us=FIXTURE_FREEZE_US + 300_000_000)
+    # pre-existing reconciliation contract: unchanged
+    assert report.accounted_count == report.read_count
+    assert set(report.to_dict()) >= {
+        "version", "cursor_before", "cursor_after", "read_count",
+        "admitted_count", "rejections", "duplicates", "conflicts",
+        "deferred_keys", "committed_count", "committed", "commit_error",
+        "retried_keys", "retry_terminal_keys", "retry_skipped_keys",
+    }
+    # B4 diagnostics: exact queue accounting, derived from durable state
+    assert report.pending_due_total == 1
+    assert report.pending_processed == 1
+    assert report.pending_remaining == len(store.pending_retries()) == 1
+    assert report.retry_batch_limit_reached is False
+    assert report.to_dict()["pending_remaining"] == report.pending_remaining

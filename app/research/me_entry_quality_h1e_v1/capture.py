@@ -276,6 +276,16 @@ class CycleReport:
     retry_terminal_keys: tuple[str, ...] = ()
     #: pending entries skipped WITHOUT execution (terminal/conflicted/etc.)
     retry_skipped_keys: tuple[str, ...] = ()
+    #: due pending-retry entries visible at cycle start (B4 diagnostics)
+    pending_due_total: int = 0
+    #: due entries actually processed this cycle (<= retry_batch_limit)
+    pending_processed: int = 0
+    #: EXACT durable queue size after the batch commit — post-commit state
+    #: on success; the unchanged pre-cycle size when the commit failed
+    pending_remaining: int = 0
+    #: True when at least one due entry was left unprocessed because the
+    #: per-cycle ``retry_batch_limit`` was reached
+    retry_batch_limit_reached: bool = False
 
     @property
     def accounted_count(self) -> int:
@@ -301,6 +311,10 @@ class CycleReport:
             "retried_keys": list(self.retried_keys),
             "retry_terminal_keys": list(self.retry_terminal_keys),
             "retry_skipped_keys": list(self.retry_skipped_keys),
+            "pending_due_total": self.pending_due_total,
+            "pending_processed": self.pending_processed,
+            "pending_remaining": self.pending_remaining,
+            "retry_batch_limit_reached": self.retry_batch_limit_reached,
         }
 
 
@@ -324,6 +338,13 @@ class CaptureConfig:
     #: earliest-delay before a deferred event becomes due again (µs);
     #: ``0`` = due on the next cycle.
     retry_backoff_us: int = 0
+    #: hard bound on the number of DUE pending-retry entries processed in
+    #: ONE cycle (review fix B4) — independent of ``batch_limit`` (which
+    #: bounds NEW source rows).  The offline default of 50 is a bounded-work
+    #: initial value, NOT a production recommendation; entries that do not
+    #: fit stay due in the durable queue untouched (no attempt is consumed,
+    #: nothing is terminated by the limit).
+    retry_batch_limit: int = 50
 
 
 def run_capture_cycle(
@@ -339,15 +360,16 @@ def run_capture_cycle(
 ) -> CycleReport:
     """Run ONE deterministic capture cycle (bounded work, atomic commit).
 
-    The cycle (1) re-processes DUE entries of the durable pending-retry
-    queue independent of the source cursor, (2) reads at most
-    ``config.batch_limit`` rows after ``cursor``, (3) admits them through
-    the fail-closed H1-E checks and classifies each NEW identity through
-    the injected classifier, and (4) commits every effect — ledger writes,
-    conflicts, pending-retry state and the advanced checkpoint — in ONE
-    atomic transaction.  ``now_us`` is the caller-supplied cycle instant
-    used for retry scheduling (no clock is read here); when omitted every
-    pending entry is considered due.
+    The cycle (1) re-processes at most ``config.retry_batch_limit`` DUE
+    entries of the durable pending-retry queue (deterministic queue order,
+    independent of the source cursor — unprocessed entries stay due), (2)
+    reads at most ``config.batch_limit`` rows after ``cursor``, (3) admits
+    them through the fail-closed H1-E checks and classifies each NEW
+    identity through the injected classifier, and (4) commits every effect
+    — ledger writes, conflicts, pending-retry state and the advanced
+    checkpoint — in ONE atomic transaction.  ``now_us`` is the
+    caller-supplied cycle instant used for retry scheduling (no clock is
+    read here); when omitted every pending entry is considered due.
     """
     cfg = config or CaptureConfig()
     if not isinstance(freeze, H1EFreeze):
@@ -364,6 +386,13 @@ def run_capture_cycle(
         raise ValueError("max_attempts must be a real integer")
     if cfg.max_attempts < 1:
         raise ValueError("max_attempts must be positive")
+    if (
+        not isinstance(cfg.retry_batch_limit, int)
+        or isinstance(cfg.retry_batch_limit, bool)
+    ):
+        raise ValueError("retry_batch_limit must be a real integer")
+    if cfg.retry_batch_limit < 1:
+        raise ValueError("retry_batch_limit must be positive")
 
     writes: list[LedgerWrite] = []
     conflict_payloads: list[Mapping[str, Any]] = []
@@ -378,12 +407,25 @@ def run_capture_cycle(
     duplicates = 0
 
     # ── 1. durable pending-retry queue (independent of the cursor) ──────
+    queue_snapshot = tuple(store.pending_retries())
     pending_map: dict[str, PendingRetry] = {
-        retry.ledger_identity: retry for retry in store.pending_retries()
+        retry.ledger_identity: retry for retry in queue_snapshot
     }
-    for retry in store.pending_retries():
-        if now_us is not None and int(retry.next_attempt_us) > int(now_us):
-            continue  # not due yet
+    due_entries = [
+        retry for retry in queue_snapshot  # deterministic queue order
+        if now_us is None or int(retry.next_attempt_us) <= int(now_us)
+    ]
+    pending_due_total = len(due_entries)
+    pending_processed = 0
+    retried_this_cycle: set[str] = set()
+    for retry in due_entries:
+        if pending_processed >= int(cfg.retry_batch_limit):
+            # bounded per-cycle work (review fix B4): every unprocessed due
+            # entry stays in the durable queue untouched — no attempt is
+            # consumed and NOTHING becomes terminal because of the limit.
+            break
+        pending_processed += 1
+        retried_this_cycle.add(retry.ledger_identity)
         entry = store.lookup(retry.ledger_identity)
         if entry is None or getattr(entry, "current_status", "") != STATUS_DEFERRED:
             # terminal / conflicted / vanished identities are NEVER
@@ -526,6 +568,13 @@ def run_capture_cycle(
                 continue
             # a queued DEFERRED identity is re-attempted ONLY via the
             # durable pending queue (B1) — redelivery is idempotent.
+            if identity in retried_this_cycle:
+                # the retry loop already produced this cycle's effect for
+                # this identity (re-classified / terminal / re-deferred) —
+                # a concurrent redelivery is a DUPLICATE, never a second
+                # classification pass and never a re-queue (B4).
+                duplicates += 1
+                continue
             if identity not in pending_map:
                 # self-heal: the durable queue lost an entry (never the
                 # event) — re-queue it atomically with this batch.
@@ -595,6 +644,13 @@ def run_capture_cycle(
             retried_keys=tuple(retried_keys),
             retry_terminal_keys=tuple(retry_terminal_keys),
             retry_skipped_keys=tuple(retry_skipped_keys),
+            pending_due_total=pending_due_total,
+            pending_processed=pending_processed,
+            # commit failed → NOTHING was applied: the durable queue is
+            # exactly the pre-cycle snapshot (documented semantics).
+            pending_remaining=len(queue_snapshot),
+            retry_batch_limit_reached=(
+                pending_due_total > pending_processed),
         )
 
     return CycleReport(
@@ -612,6 +668,12 @@ def run_capture_cycle(
         retried_keys=tuple(retried_keys),
         retry_terminal_keys=tuple(retry_terminal_keys),
         retry_skipped_keys=tuple(retry_skipped_keys),
+        pending_due_total=pending_due_total,
+        pending_processed=pending_processed,
+        # EXACT durable queue size after this commit: pending_map mirrors
+        # every pending-update of the batch one-to-one.
+        pending_remaining=len(pending_map),
+        retry_batch_limit_reached=(pending_due_total > pending_processed),
     )
 
 
