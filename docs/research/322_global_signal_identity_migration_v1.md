@@ -185,6 +185,67 @@ conflicts with its legacy twin → duplicates instead of dedup. Therefore:
 * Historical `run_id`, `observation_id`, `source_observation_id` values never change.
 * Legacy identity remains readable forever (dual-read).
 
+### 3.6 Legacy identity resolution — review B1 (no legacy id from missing/invalid data)
+
+A dual-identity capture must record the **legacy** id that the frozen observer
+actually uses for this signal. Exactly two sources are accepted
+(`resolve_legacy_identity` in the reference module):
+
+1. **Confirmed original legacy id** (`legacy_source_signal_id=`) — the persisted
+   `source_signal_id` of an existing (possibly frozen) row, used **verbatim**.
+   Historical values came from an unknown `PYTHONHASHSEED` and can never be
+   re-derived; re-minting them would silently fabricate identity.
+2. **Exact frozen key inputs** (`legacy_signal_time=`) — a validated
+   `signal_time` (timezone-aware `datetime` = `detected_at`/`ctx.evaluated_at`,
+   or a non-empty ISO-8601 timestamp string), re-derived byte-compatibly with
+   `_make_source_key()` (`-abs(hash(key_str)) % (2**31)` over
+   `f"{scanner}:{symbol}:{direction}:{signal_time}"`, raw input formatting).
+
+Everything else is **fail-closed**: `None`, empty/whitespace strings, malformed
+strings, naive timestamps and non-timestamp objects (ints/floats/bools/…)
+raise `IdentityError` **before anything is written** — no alias, no record.
+No fallback is ever substituted (never `now()`, never `0`, never an epoch
+default): a fabricated-but-plausible legacy id is exactly the defect this rule
+removes. Off-scope captures (default-OFF, disabled family, unknown candle
+lineage) keep their existing silent-`None` behaviour — nothing is minted there
+at all.
+
+### 3.7 Atomic persistence contract — review B2 (ALL_OR_NOTHING)
+
+One capture is **one logical change**: an `IdentityBatch` containing the
+dual-identity record and its mandatory alias edge(s), delivered through a
+**single** `IdentityPersistenceHook.save_identity_batch(batch)` call:
+
+* **ALL_OR_NOTHING** — alias edges and the record commit together or not at
+  all; a failed batch leaves no trace (no persisted row, no in-memory alias).
+  Split `save_alias()`/`save_dual_record()`-style hooks are **outside the
+  contract** and are rejected at core construction (`TypeError`), so a partial
+  write cannot exist even by accident.
+* **No orphans, both directions** — `IdentityBatch.validate()` rejects an alias
+  edge without its record (`ORPHAN_ALIAS_EDGE`) and a record without its
+  mandatory matching alias edge (`BATCH_WITHOUT_ALIAS`,
+  `RECORD_WITHOUT_MATCHING_ALIAS`).
+* **Idempotent redelivery** — re-delivering the same signal yields the same
+  `IdentityBatch.idempotency_key`
+  (`identity_version:canonical_key_hex:legacy_id`); a hook MUST treat a
+  committed key as a no-op, and the in-memory alias map is append-idempotent.
+* **Concurrent capture** — the commit path is serialized per core
+  (`threading.Lock`) and the in-memory append-only constraint is pre-checked
+  before any write, so concurrent delivery of the same signal converges on one
+  identity and a conflicting edge is rejected before it can be persisted.
+* **Crash/restart safety** — the single batch is the only commit point; after a
+  crash the store is pre- or post-batch, never partial. Identity is re-derived
+  deterministically after restart and alias edges are replayed from the store
+  (`SignalIdentityAliasMap.add_alias`), so recovery changes nothing.
+* Historical/frozen alias edges are never re-pointed (`AliasIntegrityError`),
+  including under replay.
+
+Verified by fault-injection tests
+(`tests/test_issue322_global_identity_migration_atomic_persistence_v1.py`):
+alias-write failure, dual-record-write failure, crash-before-commit, repeated
+redelivery, concurrent same-signal capture (single core and shared store),
+restart recovery, batch-invariant and split-write-hook rejection.
+
 ## 4. Phased rollout (§c)
 
 | Phase | What happens | Consumes stable key? | DB writes | Default |
@@ -259,12 +320,22 @@ change, never a runtime toggle.
    `observation_id`, `source_observation_id` are immutable (asserted by isolation tests).
 5. **Paper trade uniqueness intact**: no change to `save_paper_trade`/trade dedup
    surfaces (`repository.py:1351`).
-6. **Frozen files byte-identical**: `git diff` shows zero modified production files in
-   PHASE-0; frozen-observer tests keep passing.
+6. **Frozen files byte-identical**: `git diff` shows zero modified production files
+   (the migration core module is the only allowed change) in PHASE-0;
+   frozen-observer tests keep passing.
 7. **Default-OFF**: constructing the migration core without explicit config performs no
    capture, no write, no import side effect on production modules.
 8. **Determinism**: canonical keys are identical across processes and PYTHONHASHSEED
    values (subprocess-tested), µs-precision timestamps round-trip exactly.
+9. **Legacy identity integrity (review B1)**: a wrong legacy id can never be created or
+   stored from incomplete source data — missing/empty/naive/malformed `legacy_signal_time`
+   is rejected explicitly before any write; a confirmed persisted legacy id is used
+   verbatim; no fallback value is ever substituted.
+10. **Atomic persistence (review B2)**: alias and dual-record are one ALL_OR_NOTHING
+    transactional batch — after a failure, redelivery, concurrency or crash/restart the
+    store is consistent (no orphan aliases, no records without their alias, no
+    duplication, no conflicting identities) and historical frozen identities are
+    unchanged.
 
 ## 9. Open questions for the owner
 

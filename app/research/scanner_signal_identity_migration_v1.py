@@ -21,6 +21,18 @@ Hard guarantees of this module
   ``hash()`` ``source_signal_id`` values stay exactly as written and remain
   readable forever through the append-only alias map.  Persistence hooks here
   are ABSTRACT ONLY — no SQL, no migrations in this module.
+* **Legacy identity is never minted from missing/invalid data** (review B1):
+  :meth:`MigrationIdentityCore.capture_dual` accepts either a CONFIRMED
+  original legacy id (persisted historical value, used verbatim) or a validated
+  ``legacy_signal_time`` (the exact frozen key input).  Missing, empty, naive or
+  malformed signal times raise :class:`IdentityError` before anything is
+  written — no ``None``/``""``/now()/zero fallback is ever substituted.
+* **ALL_OR_NOTHING persistence** (review B2): one capture is ONE atomic batch
+  (:class:`IdentityBatch` — alias edge(s) + dual-identity record) delivered
+  through a single :meth:`IdentityPersistenceHook.save_identity_batch` call.
+  Split ``save_alias``/``save_dual_record`` hooks are rejected at construction;
+  a failed batch changes nothing (no in-memory alias, no persisted row); batch
+  delivery is idempotent and crash-safe.
 
 Identity derivation (stable across processes and PYTHONHASHSEED values)
 ----------------------------------------------------------------------
@@ -40,6 +52,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import MappingProxyType
@@ -53,16 +66,21 @@ __all__ = [
     "FAMILY_SLUGS",
     "MigrationConfig",
     "DualIdentityRecord",
+    "AliasEdge",
+    "IdentityBatch",
     "SignalIdentityAliasMap",
     "IdentityPersistenceHook",
     "MigrationIdentityCore",
     "IdentityError",
     "AliasIntegrityError",
+    "IdentityPersistenceError",
     "family_slug",
     "canonical_payload",
     "canonical_key_hex",
     "stable_source_signal_id",
     "legacy_source_signal_id",
+    "validate_legacy_signal_time",
+    "resolve_legacy_identity",
     "format_ts_us",
 ]
 
@@ -122,6 +140,15 @@ class IdentityError(ValueError):
 
 class AliasIntegrityError(ValueError):
     """An alias edge would rewrite history (append-only violation)."""
+
+
+class IdentityPersistenceError(RuntimeError):
+    """An atomic identity batch could not be committed.
+
+    Raised only after the failed batch has left NO trace (ALL_OR_NOTHING): no
+    alias edge, no dual-identity record, no in-memory mutation.  The capture may
+    be retried safely — retrying converges on the same identity.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +335,13 @@ def stable_source_signal_id(
     return -(_FOLD_BASE + value)
 
 
+def _frozen_legacy_key(
+    scanner_name: str, symbol: str, direction: str, signal_time: Any
+) -> int:
+    key_str = f"{scanner_name}:{symbol}:{direction}:{signal_time}"
+    return -abs(hash(key_str)) % (2**31)
+
+
 def legacy_source_signal_id(
     scanner_name: str, symbol: str, direction: str, signal_time: Any
 ) -> int:
@@ -320,9 +354,81 @@ def legacy_source_signal_id(
     relate a freshly observed signal to legacy rows; it must never be used as a
     new identity.  Historical values can not be re-derived (the original hash
     seed is gone) — they remain readable through recorded aliases only.
+
+    This is a raw replica and does NOT validate its ``signal_time`` input — use
+    :func:`resolve_legacy_identity` (which validates and fails closed) whenever
+    a legacy identity is minted or recovered for a capture.
     """
-    key_str = f"{scanner_name}:{symbol}:{direction}:{signal_time}"
-    return -abs(hash(key_str)) % (2**31)
+    return _frozen_legacy_key(scanner_name, symbol, direction, signal_time)
+
+
+def validate_legacy_signal_time(value: Any) -> None:
+    """Validate the frozen key's ``signal_time`` input — fail-closed (review B1).
+
+    Accepts exactly the shapes the frozen capture path passes to
+    ``ProspectiveOOSObserver.observe()`` as ``signal_time``: a timezone-AWARE
+    :class:`~datetime.datetime` (``SetupCandidate.detected_at`` /
+    ``ctx.evaluated_at``) or a non-empty ISO-8601 timestamp string (replay
+    paths).  Anything else — ``None``, empty/whitespace strings, malformed
+    strings, naive timestamps, ints/floats/bools/other objects — raises
+    :class:`IdentityError`; a legacy identity must never be minted from a
+    missing, empty or incorrect signal time.
+    """
+    if value is None:
+        raise IdentityError("MISSING_LEGACY_SIGNAL_TIME")
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise IdentityError("NAIVE_LEGACY_SIGNAL_TIME")
+        return
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise IdentityError("EMPTY_LEGACY_SIGNAL_TIME")
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            raise IdentityError("INVALID_LEGACY_SIGNAL_TIME") from None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise IdentityError("NAIVE_LEGACY_SIGNAL_TIME")
+        return
+    raise IdentityError("INVALID_LEGACY_SIGNAL_TIME")
+
+
+def resolve_legacy_identity(
+    scanner_name: str,
+    symbol: str,
+    direction: str,
+    *,
+    legacy_signal_time: Any = None,
+    legacy_source_signal_id: int | None = None,
+) -> int:
+    """Resolve the LEGACY identity for one signal — confirmed or fail-closed.
+
+    Exactly two sources are accepted (review B1):
+
+    * ``legacy_source_signal_id`` — a CONFIRMED original legacy id (e.g. the
+      persisted ``source_signal_id`` of a historical/frozen OOS row).  Used
+      VERBATIM and never re-derived: historical values came from an unknown
+      ``PYTHONHASHSEED`` and can not be recomputed.  Must be an ``int`` inside
+      the frozen 31-bit legacy band ``[0, 2**31)``.
+    * ``legacy_signal_time`` — the exact frozen key input (aware ``datetime`` or
+      ISO-8601 string); the legacy id is then re-derived byte-compatibly with
+      the frozen ``_make_source_key()`` replica.
+
+    A missing, empty, naive or malformed signal time NEVER yields an identity —
+    the frozen key is not minted from ``None``/``""``/garbage placeholders and
+    no fallback (current time, zero, epoch) is ever substituted.  Insufficient
+    or invalid data raises :class:`IdentityError` so callers reject the capture
+    instead of persisting an incorrect alias.
+    """
+    if legacy_source_signal_id is not None:
+        if type(legacy_source_signal_id) is not int or not (
+            0 <= legacy_source_signal_id < 2**31
+        ):
+            raise IdentityError("INVALID_LEGACY_SOURCE_SIGNAL_ID")
+        return legacy_source_signal_id
+    validate_legacy_signal_time(legacy_signal_time)
+    return _frozen_legacy_key(scanner_name, symbol, direction, legacy_signal_time)
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +462,78 @@ class DualIdentityRecord:
 
 
 # ---------------------------------------------------------------------------
+# Atomic identity batch (review B2) — one logical change, ALL_OR_NOTHING
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AliasEdge:
+    """One legacy↔stable alias edge inside an atomic :class:`IdentityBatch`."""
+
+    stable_key: int
+    legacy_key: int
+    family_slug: str
+
+    def validate(self) -> None:
+        if type(self.stable_key) is not int or self.stable_key >= -(2**31):
+            raise AliasIntegrityError("ALIAS_EDGE_STABLE_KEY_INVALID")
+        if type(self.legacy_key) is not int or not (
+            0 <= self.legacy_key < 2**31
+        ):
+            raise AliasIntegrityError("ALIAS_EDGE_LEGACY_KEY_INVALID")
+        if not isinstance(self.family_slug, str) or not self.family_slug.strip():
+            raise AliasIntegrityError("ALIAS_EDGE_FAMILY_SLUG_INVALID")
+
+
+@dataclass(frozen=True)
+class IdentityBatch:
+    """One atomic identity change: alias edge(s) + one dual-identity record.
+
+    The batch is the unit of persistence: alias edges and the dual record
+    commit TOGETHER or not at all (ALL_OR_NOTHING).  The structural invariant
+    excludes orphans in both directions — an alias edge that belongs to no
+    record (``ORPHAN_ALIAS_EDGE``) and a record without its mandatory alias
+    edge (``BATCH_WITHOUT_ALIAS`` / ``RECORD_WITHOUT_MATCHING_ALIAS``) are both
+    rejected by :meth:`validate` before anything is written.
+    """
+
+    record: DualIdentityRecord
+    alias_edges: tuple[AliasEdge, ...]
+
+    @property
+    def idempotency_key(self) -> str:
+        """Deterministic key of this logical change (redelivery ⇒ same key).
+
+        Persisting a batch whose ``idempotency_key`` is already committed MUST
+        be a no-op — this is what makes repeated signal delivery duplicate-free.
+        """
+        record = self.record
+        return (
+            f"{record.identity_version}:{record.canonical_key_hex}"
+            f":{record.legacy_source_signal_id}"
+        )
+
+    def validate(self) -> None:
+        if not isinstance(self.record, DualIdentityRecord):
+            raise AliasIntegrityError("BATCH_WITHOUT_RECORD")
+        edges = self.alias_edges
+        if not isinstance(edges, tuple) or not edges:
+            raise AliasIntegrityError("BATCH_WITHOUT_ALIAS")
+        for edge in edges:
+            if not isinstance(edge, AliasEdge):
+                raise AliasIntegrityError("BATCH_ALIAS_EDGE_INVALID")
+            edge.validate()
+            if edge.stable_key != self.record.stable_source_signal_id:
+                raise AliasIntegrityError("ORPHAN_ALIAS_EDGE")
+            if edge.family_slug != self.record.family_slug:
+                raise AliasIntegrityError("BATCH_FAMILY_SLUG_MISMATCH")
+        if not any(
+            edge.legacy_key == self.record.legacy_source_signal_id for edge in edges
+        ):
+            raise AliasIntegrityError("RECORD_WITHOUT_MATCHING_ALIAS")
+
+
+# ---------------------------------------------------------------------------
 # Alias map — pure in-memory, append-only, dual-read (persistence ABSTRACT)
 # ---------------------------------------------------------------------------
 
@@ -376,7 +554,12 @@ class SignalIdentityAliasMap:
         self._stable_to_legacy: dict[int, tuple[int, ...]] = {}
         self._edge_count = 0
 
-    def add_alias(self, stable_key: int, legacy_key: int) -> None:
+    def check_alias(self, stable_key: int, legacy_key: int) -> None:
+        """Raise unless :meth:`add_alias` would succeed (pre-write validation).
+
+        Used by :meth:`MigrationIdentityCore.capture_dual` BEFORE any
+        persistence so a conflicting edge can never leave a persisted trace.
+        """
         if type(stable_key) is not int or type(legacy_key) is not int:
             raise AliasIntegrityError("alias keys must be int")
         existing = self._legacy_to_stable.get(legacy_key)
@@ -385,7 +568,10 @@ class SignalIdentityAliasMap:
                 "append-only violation: legacy key already aliased to a "
                 "different stable key"
             )
-        if existing is None:
+
+    def add_alias(self, stable_key: int, legacy_key: int) -> None:
+        self.check_alias(stable_key, legacy_key)
+        if legacy_key not in self._legacy_to_stable:
             self._legacy_to_stable[legacy_key] = stable_key
             current = self._stable_to_legacy.get(stable_key, ())
             if legacy_key not in current:
@@ -404,17 +590,28 @@ class SignalIdentityAliasMap:
 
 @runtime_checkable
 class IdentityPersistenceHook(Protocol):
-    """ABSTRACT persistence boundary (no SQL ships with this module).
+    """ABSTRACT atomic persistence boundary (no SQL ships with this module).
 
-    A future, separately-approved migration implements these against the real
-    schema; until then every hook is optional and the core works in-memory.
-    Implementations MUST be append-only (mirror :class:`SignalIdentityAliasMap`).
+    A future, separately-approved migration implements this against the real
+    schema; until then the hook is optional and the core works in-memory.
+    Contract — enforced by :meth:`MigrationIdentityCore.capture_dual` and
+    verified by the fault-injection tests (review B2):
+
+    * **ALL_OR_NOTHING**: :meth:`save_identity_batch` is ONE logical operation;
+      every alias edge and the dual-identity record of the batch commit
+      together or not at all.  Split ``save_alias``/``save_dual_record``-style
+      hooks are not part of this contract and are rejected at core
+      construction — a partial failure can never leave an orphan alias or a
+      record without its alias.
+    * **Idempotent**: re-saving an already-committed batch (same
+      :attr:`IdentityBatch.idempotency_key`) is a no-op, never a duplicate.
+    * **Append-only**: alias edges are never removed and a legacy key is never
+      re-pointed (mirror :class:`SignalIdentityAliasMap`).
+    * **Crash-safe**: after a crash/restart the store shows the state before or
+      after the batch — never in between — and replaying the batch converges.
     """
 
-    def save_alias(self, stable_key: int, legacy_key: int, family_slug: str) -> None:
-        ...
-
-    def save_dual_record(self, record: DualIdentityRecord) -> None:
+    def save_identity_batch(self, batch: IdentityBatch) -> None:
         ...
 
 
@@ -437,9 +634,16 @@ class MigrationIdentityCore:
         alias_map: SignalIdentityAliasMap | None = None,
         persistence: IdentityPersistenceHook | None = None,
     ) -> None:
+        if persistence is not None and not isinstance(persistence, IdentityPersistenceHook):
+            raise TypeError(
+                "persistence must implement the atomic "
+                "IdentityPersistenceHook.save_identity_batch contract "
+                "(split alias/record writes are forbidden)"
+            )
         self._config = config if config is not None else MigrationConfig.default_off()
         self._aliases = alias_map if alias_map is not None else SignalIdentityAliasMap()
         self._persistence = persistence
+        self._commit_lock = threading.Lock()
 
     @property
     def config(self) -> MigrationConfig:
@@ -466,14 +670,26 @@ class MigrationIdentityCore:
         signal_candle_open_time: int,
         *,
         legacy_signal_time: Any = None,
+        legacy_source_signal_id: int | None = None,
         observed_at: datetime | None = None,
     ) -> DualIdentityRecord | None:
         """Shadow-phase dual-identity capture.  ``None`` when off-scope.
 
-        Records BOTH identity spaces; consumes neither.  The legacy id mirrors
-        the frozen base derivation (process-dependent — passed through as
-        computed by the caller's process); the stable id is the canonical key.
-        Default-OFF configuration returns ``None`` without minting anything.
+        Records BOTH identity spaces; consumes neither.  The stable id is the
+        canonical key.  The legacy id is NEVER minted from missing/invalid
+        input (review B1): pass either the CONFIRMED persisted
+        ``legacy_source_signal_id`` (used verbatim, e.g. a historical/frozen OOS
+        value) or the validated ``legacy_signal_time`` (exact frozen key input).
+        Insufficient or invalid legacy data raises :class:`IdentityError`
+        before anything is written — no fallback value is ever substituted.
+
+        Persistence is one atomic ALL_OR_NOTHING batch (review B2): the alias
+        edge and the dual record commit together through a single
+        :meth:`IdentityPersistenceHook.save_identity_batch` call, or the whole
+        capture leaves no trace (no in-memory alias, no persisted row).  The
+        call is idempotent — re-delivering the same signal converges on the
+        same identity without duplication.  Default-OFF configuration returns
+        ``None`` without minting anything.
         """
         slug = family_slug(scanner_name, direction)
         if not self.is_family_enabled(slug):
@@ -488,8 +704,12 @@ class MigrationIdentityCore:
         )
         if stable is None:
             return None  # fail-closed: unknown candle lineage mints nothing
-        legacy = legacy_source_signal_id(
-            scanner_name, symbol, direction, legacy_signal_time
+        legacy = resolve_legacy_identity(
+            scanner_name,
+            symbol,
+            direction,
+            legacy_signal_time=legacy_signal_time,
+            legacy_source_signal_id=legacy_source_signal_id,
         )
         record = DualIdentityRecord(
             family_slug=slug,
@@ -510,10 +730,24 @@ class MigrationIdentityCore:
             ),
             phase=self._config.phase,
         )
-        self._aliases.add_alias(stable, legacy)
-        if self._persistence is not None:
-            self._persistence.save_alias(stable, legacy, slug)
-            self._persistence.save_dual_record(record)
+        batch = IdentityBatch(
+            record=record,
+            alias_edges=(AliasEdge(stable, legacy, slug),),
+        )
+        batch.validate()
+        with self._commit_lock:
+            # Pre-validate the in-memory append-only constraint BEFORE any
+            # write so a conflicting edge can never be persisted either.
+            self._aliases.check_alias(stable, legacy)
+            if self._persistence is not None:
+                try:
+                    self._persistence.save_identity_batch(batch)
+                except Exception as exc:  # ALL_OR_NOTHING: nothing was written
+                    raise IdentityPersistenceError(
+                        "IDENTITY_BATCH_WRITE_FAILED"
+                    ) from exc
+            # Committed: the in-memory edge cannot fail after the pre-check.
+            self._aliases.add_alias(stable, legacy)
         return record
 
     def resolve_stable(self, stable_key: int) -> tuple[int, ...]:

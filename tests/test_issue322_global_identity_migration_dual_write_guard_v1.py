@@ -34,11 +34,8 @@ def test_default_off_never_captures_or_calls_persistence():
     writes = []
 
     class TripwirePersistence:
-        def save_alias(self, *args):
-            writes.append(("alias", args))
-
-        def save_dual_record(self, *args):
-            writes.append(("record", args))
+        def save_identity_batch(self, batch):
+            writes.append(batch)
 
     core = MigrationIdentityCore(
         MigrationConfig.default_off(),
