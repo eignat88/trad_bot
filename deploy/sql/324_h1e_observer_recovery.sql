@@ -1,0 +1,27 @@
+-- Issue #324 / H1-E — recovery contour for the isolated observer.
+-- PROPOSAL ONLY — DO NOT APPLY on any working database without an explicit
+-- owner GO.  Companion to deploy/sql/324_h1e_observer_role.sql.
+--
+-- Deterministic recovery after crash/restart (no backfill, no OOS):
+--   1. the worker resumes from the committed checkpoint row
+--      (research_me_entry_quality_h1e.h1e_checkpoint) — re-delivery is
+--      at-least-once and identity-idempotent, exactly-once effect comes
+--      from the unique keys and the immutable first-capture row;
+--   2. deferred events resume from the durable pending-retry queue
+--      (research_me_entry_quality_h1e.h1e_pending_retry) — INDEPENDENT of
+--      the delivery cursor;
+--   3. a stuck/corrupt pending row is NEVER deleted silently: it fails
+--      closed (H1E_PENDING_IDENTITY_MISMATCH) and must be reviewed by an
+--      operator (inspect preserved_hash vs the event row).
+
+-- Read-only recovery inspection:
+--   SELECT * FROM research_me_entry_quality_h1e.h1e_checkpoint;
+--   SELECT ledger_identity, source_event_key, attempt_count, deferred_reason,
+--          next_attempt_us
+--     FROM research_me_entry_quality_h1e.h1e_pending_retry
+--    ORDER BY next_attempt_us, ledger_identity;
+
+-- Administrative activation control (the observer role cannot write it):
+-- a freeze is minted ONLY with an explicit owner GO; once frozen, the
+-- activation is immutable (freeze_ts / protocol_fingerprint / approval),
+-- so recovery NEVER rewrites it — a new experiment id is required instead.

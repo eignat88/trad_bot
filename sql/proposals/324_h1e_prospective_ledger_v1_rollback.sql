@@ -1,0 +1,49 @@
+-- Issue #324 / H1-E
+-- ROLLBACK / RECOVERY script for the H1-E prospective ledger DDL proposal
+-- (sql/proposals/324_h1e_prospective_ledger_v1_proposal.sql).
+--
+-- PROPOSAL ONLY — DO NOT APPLY on any working database without an explicit
+-- owner GO.  This file is the REVERSE side of the reviewed DDL package:
+-- it documents and implements how to remove the isolated research schema
+-- and how to recover after an interrupted apply.
+--
+-- Rollback semantics:
+--   * the H1-E schema is fully isolated (research_me_entry_quality_h1e);
+--     NOTHING outside it references its objects, so rollback is a single
+--     transactional DROP SCHEMA;
+--   * the #305 source schema (research_me_upstream_coverage), V3, scanner,
+--     paper and OOS objects are NEVER touched;
+--   * evidence retained outside the dropped schema (backups / dumps taken
+--     before apply) is the recovery source of truth.
+--
+-- Recovery semantics (after a crashed apply):
+--   * the proposal script is idempotent (CREATE ... IF NOT EXISTS) and
+--     wrapped in BEGIN/COMMIT — a crash leaves no half-applied state once
+--     rolled back; simply re-run the proposal script;
+--   * the prospective guard trigger and the append-only triggers are
+--     recreated by re-running the proposal — verify with the checks below.
+--
+-- Verification after apply OR rollback (read-only):
+--   SELECT COUNT(*) FROM information_schema.tables
+--    WHERE table_schema = 'research_me_entry_quality_h1e';
+--   -- apply: 10 tables (activation, event, classification, status_event,
+--   --        reject_event, conflict_event, provenance_snapshot,
+--   --        pending_retry, checkpoint, coverage_audit)
+--   -- rollback: 0 rows
+
+-- ===========================================================================
+-- ROLLBACK (deletes the isolated research schema and ALL its evidence).
+-- Requires: (1) an owner GO, (2) a verified backup/dump of the schema if the
+-- evidence must be preserved.  Uncomment ONLY in that case.
+-- ===========================================================================
+-- BEGIN;
+-- DROP SCHEMA IF EXISTS research_me_entry_quality_h1e CASCADE;
+-- COMMIT;
+
+-- ===========================================================================
+-- BACKUP (run BEFORE rollback, keeps the evidence):
+--   pg_dump --schema=research_me_entry_quality_h1e \
+--     --file=h1e_ledger_backup_<date>.sql <database>
+-- RESTORE (isolated test database first):
+--   psql <database> -f h1e_ledger_backup_<date>.sql
+-- ===========================================================================
