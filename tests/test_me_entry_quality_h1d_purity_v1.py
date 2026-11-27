@@ -205,7 +205,16 @@ class TestNativeDStaysInResearchAdapter:
 
 class TestProductionIsolation:
     def test_nothing_outside_the_package_references_h1d(self):
-        """No production module may import or reference the H1-D package."""
+        """No production module may import or reference the H1-D package.
+
+        SANCTIONED EXCEPTION (Issue #324): the research-only
+        ``app/research/me_entry_quality_h1e_v1`` package is the single
+        approved consumer of the FROZEN H1-D contracts — the #324 spec
+        requires H1-E to integrate the H1-D ``240``/native ``D`` adapter
+        and ``H1D_HTF_SNAPSHOT_2`` provenance UNCHANGED.  H1-E itself is
+        RESEARCH_ONLY / NO_DEPLOY and is verified wiring-free by
+        ``test_me_entry_quality_h1e_isolation_purity_v1.py``.
+        """
         targets = []
         targets.extend((ROOT / "app").rglob("*.py"))
         targets.extend((ROOT / "deploy").rglob("*"))
@@ -213,6 +222,7 @@ class TestProductionIsolation:
         targets.extend((ROOT / "scripts").rglob("*.py"))
         targets.append(ROOT / "bot.py")
         offenders = []
+        sanctioned = []
         for path in targets:
             if not path.is_file():
                 continue
@@ -222,8 +232,19 @@ class TestProductionIsolation:
                 continue  # its own tests
             text = path.read_text(encoding="utf-8", errors="ignore")
             if "me_entry_quality_h1d" in text:
+                if "me_entry_quality_h1e_v1" in path.parts:
+                    sanctioned.append(str(path.relative_to(ROOT)))
+                    continue
                 offenders.append(str(path.relative_to(ROOT)))
         assert offenders == []
+        # the sanctioned consumer set is EXACTLY the H1-E research package
+        assert all(
+            "me_entry_quality_h1e_v1" in Path(p).parts for p in sanctioned
+        )
+        assert all(
+            p.startswith("app\\research\\") or p.startswith("app/research/")
+            for p in sanctioned
+        )
 
     def test_no_sql_migration_for_h1d(self):
         for path in (ROOT / "sql").rglob("*.sql"):
