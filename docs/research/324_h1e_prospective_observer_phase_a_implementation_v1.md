@@ -139,11 +139,24 @@ source_fingerprint, activation_freeze_ts (#305), captured_at (timing columns onl
   conflicts`, no silent skips); identical redelivery → idempotent
   `DUPLICATE` (first-capture snapshot kept verbatim); different preserved
   facts on the same identity → `H1E_EVENT_KEY_LINEAGE_CONFLICT`, isolated
-  in the conflict journal, never an overwrite.
-* **Atomicity** — ledger effects + checkpoint advance in ONE transaction
+  in the conflict journal INSIDE the batch transaction (recorded exactly
+  once per conflict key — review fix B2), never an overwrite.
+* **Atomicity** — ledger writes, reject/conflict journals, the durable
+  pending-retry state and the checkpoint advance in ONE transaction
   (`H1EStore.commit_batch`); an interrupted transaction applies NOTHING;
   the next cycle re-reads from the previous checkpoint and converges to the
   identical outcome (crash between read/classify/commit covered by tests).
+  There is NO durable mutation path outside `commit_batch`.
+* **Durable pending-retry (review fix B1)** — a `DEFERRED` classification
+  is queued in durable retry state that is INDEPENDENT of the source
+  cursor and survives restart (identity, attempt count, deferral reason,
+  next-attempt time).  Due entries are re-processed in deterministic order
+  at the ORIGINAL `signal_time` ASOF (no later candles).  Attempts are
+  bounded (`CaptureConfig.max_attempts`): budget exhaustion produces a
+  terminal non-eligible result (`H1E_RETRY_BUDGET_EXHAUSTED`) without
+  further classifier calls.  Redelivery of a queued or terminal identity
+  is an idempotent `DUPLICATE` — retries are NEVER driven by redelivery;
+  terminal and conflicted identities are never re-executed.
 * **Freeze** — fail-closed admission gate (see §3); rejected rows are
   durable reject-ledger records with deterministic reason codes.
 
@@ -154,18 +167,25 @@ ONLY, DO NOT APPLY**.  Additive-only DDL for the isolated schema
 `research_me_entry_quality_h1e` (never `dds.*`, never `market.*`, never
 `research_me_upstream_coverage.*`):
 
-`h1e_activation` (separate freeze, immutable via trigger),
-`h1e_event` (immutable first-capture record; unique
-`(source_event_key, h1e_protocol_fingerprint)`),
-`h1e_classification` (append-only classification attempts),
-`h1e_status_event` (append-only status journal — status is DERIVED),
-`h1e_reject_event`, `h1e_conflict_event`, `h1e_provenance_snapshot`,
-`h1e_checkpoint` (single row, monotonic trigger, same transaction as the
-batch), `h1e_coverage_audit`.
+`h1e_activation` (separate freeze; freeze/protocol/approval immutable via
+trigger), `h1e_event` (immutable first-capture record; unique
+`(source_event_key, h1e_protocol_fingerprint)`; each row linked to the
+approved activation and guarded by the `h1e_event_prospective_guard`
+trigger — `signal_time_us > h1e_freeze_ts_us` enforced at the DATABASE
+level, review fix B3), `h1e_classification` (append-only classification
+attempts), `h1e_status_event` (append-only status journal — status is
+DERIVED), `h1e_reject_event`, `h1e_conflict_event` (unique conflict key —
+recorded exactly once), `h1e_provenance_snapshot`, `h1e_pending_retry`
+(durable retry state, updated atomically with the batch), `h1e_checkpoint`
+(single row, monotonic trigger, same transaction as the batch),
+`h1e_coverage_audit`.
 
 Append-only is enforced by immutability triggers
 (`H1E_LEDGER_IMMUTABLE`); checkpoint regression raises
-`H1E_CHECKPOINT_REGRESSION`.  Rationale (retention / recovery):
+`H1E_CHECKPOINT_REGRESSION`.  The two freezes stay INDEPENDENT: the #305
+source freeze boundary (`CHECK (signal_time_us > source_freeze_ts_us)`)
+and the separately approved H1-E freeze (trigger against `h1e_activation`).
+Rationale (retention / recovery):
 see `324_h1e_prospective_ledger_ddl_v1.md`.
 
 ## 7. Coverage & health (`H1E_COVERAGE_HEALTH_V1`)

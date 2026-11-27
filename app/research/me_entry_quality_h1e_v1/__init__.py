@@ -63,6 +63,8 @@ from .capture import (
     CycleReport,
     H1E_CAPTURE_VERSION,
     LedgerWrite,
+    PendingRetry,
+    PendingRetryUpdate,
     RejectionRecord,
     run_capture_cycle,
 )
@@ -71,8 +73,10 @@ from .classification import (
     ClassificationRecord,
     H1E_CLASSIFICATION_VERSION,
     HtfPayload,
+    NONELIGIBLE_RETRY_BUDGET_EXHAUSTED,
     RetryPolicy,
     classify_h1e_event,
+    terminal_noneligible_record,
 )
 from .contracts import (
     AdmissionDecision,
@@ -93,9 +97,13 @@ from .coverage_health import (
 )
 from .ledger import (
     H1E_LEDGER_VERSION,
+    ActivationFingerprintMismatch,
+    FreezeTsMismatch,
     LedgerEntry,
     LedgerIdentityConflict,
     InMemoryH1EStore,
+    NoApprovedActivation,
+    PreFreezeWrite,
 )
 from .oos_readiness import (
     H1E_OOS_READINESS_VERSION,
@@ -117,6 +125,7 @@ from .source_readiness import (
 
 __all__ = [
     "ALL_DIMENSIONS",
+    "ActivationFingerprintMismatch",
     "AdmissionDecision",
     "CaptureConfig",
     "CaptureCursor",
@@ -126,6 +135,7 @@ __all__ = [
     "CycleReport",
     "DimensionReport",
     "EXPERIMENT_ID",
+    "FreezeTsMismatch",
     "H1E_CAPTURE_VERSION",
     "H1E_CLASSIFICATION_VERSION",
     "H1E_COVERAGE_HEALTH_VERSION",
@@ -143,7 +153,12 @@ __all__ = [
     "LedgerEventView",
     "LedgerIdentityConflict",
     "LedgerWrite",
+    "NONELIGIBLE_RETRY_BUDGET_EXHAUSTED",
+    "NoApprovedActivation",
     "PHASE_A_STATUS",
+    "PendingRetry",
+    "PendingRetryUpdate",
+    "PreFreezeWrite",
     "ReadinessCheck",
     "ReadinessReport",
     "RejectionRecord",
@@ -158,4 +173,5 @@ __all__ = [
     "protocol_fingerprint",
     "reconcile",
     "run_capture_cycle",
+    "terminal_noneligible_record",
 ]

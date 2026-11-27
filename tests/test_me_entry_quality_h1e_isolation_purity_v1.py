@@ -142,7 +142,7 @@ rows = [
                     candle_open_ms=1_700_000_000_000 + i * 300_000)
     for i in range(3)
 ]
-store = InMemoryH1EStore()
+store = InMemoryH1EStore(activation=freeze)
 report = run_capture_cycle(
     reader=FakeReader(rows), store=store,
     classifier=lambda event, prior_deferrals=0: make_classification_record(event),

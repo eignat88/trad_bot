@@ -150,6 +150,8 @@ NONELIGIBLE_HTF_INCOMPLETE_COVERAGE = "H1E_HTF_INCOMPLETE_COVERAGE"
 NONELIGIBLE_HTF_INVALID_SOURCE = "H1E_HTF_INVALID_SOURCE"
 NONELIGIBLE_SNAPSHOT_TAMPER = "H1E_SNAPSHOT_TAMPER"
 NONELIGIBLE_CLASSIFIER_ERROR = "H1E_CLASSIFIER_ERROR"
+#: capture-level deferral budget exhausted (terminal fail-closed)
+NONELIGIBLE_RETRY_BUDGET_EXHAUSTED = "H1E_RETRY_BUDGET_EXHAUSTED"
 
 STATUS_CLASSIFIED = "CLASSIFIED"
 STATUS_DEFERRED = "DEFERRED"
@@ -276,6 +278,23 @@ def _noneligible_record(
         snapshot_sha256="",
         h1d_diagnostics={"attempts": attempts},
     )
+
+
+def terminal_noneligible_record(
+    event: H1ESourceEvent,
+    *,
+    code: str,
+    detail: str = "",
+    attempts: int = 1,
+) -> ClassificationRecord:
+    """Terminal fail-closed record (bounded-work budget exhaustion etc.).
+
+    Used by the capture worker when a deferred event exhausts its durable
+    retry budget WITHOUT another classifier invocation — explicit
+    non-eligible outcome, never a market mode.
+    """
+    return _noneligible_record(
+        event, code=code, detail=detail, attempts=attempts)
 
 
 def _drop_future_rows(
@@ -570,6 +589,7 @@ __all__ = [
     "NONELIGIBLE_HTF_RATE_LIMITED",
     "NONELIGIBLE_HTF_RETRY_BUDGET_EXHAUSTED",
     "NONELIGIBLE_HTF_TIMEOUT",
+    "NONELIGIBLE_RETRY_BUDGET_EXHAUSTED",
     "NONELIGIBLE_SNAPSHOT_TAMPER",
     "REASON_ELIGIBLE",
     "RetryPolicy",
@@ -577,4 +597,5 @@ __all__ = [
     "STATUS_DEFERRED",
     "classify_h1e_event",
     "replay_canonical_bytes",
+    "terminal_noneligible_record",
 ]

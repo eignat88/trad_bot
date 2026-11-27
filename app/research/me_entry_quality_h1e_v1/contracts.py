@@ -272,9 +272,69 @@ class H1ESourceEvent:
             **self.lineage_payload(),
             "symbol": self.symbol,
             "captured_at_us": int(self.captured_at_us),
+            "source_freeze_ts_us": int(self.source_freeze_ts_us),
             "source_fingerprint": self.source_fingerprint,
             "preserved_hash": self.preserved_hash,
+            "lineage": dict(self.lineage),
         }
+
+    @classmethod
+    def from_dict(cls, document: Mapping[str, Any]) -> "H1ESourceEvent":
+        """Lossless rebuild from a stored ``to_dict()`` payload (durable retry).
+
+        Fail-closed: the preserved facts are RE-DERIVED and must match the
+        stored values verbatim — the ``source_event_key`` must hash from the
+        ``source_identity`` and the ``preserved_hash`` must recompute.  A
+        mismatch raises ``ValueError`` (tampered / foreign payload is never
+        re-executed).
+        """
+        if not isinstance(document, Mapping):
+            raise ValueError("H1E_REJECT_ROW_PARSE")
+        try:
+            source_event_key = str(document["source_event_key"])
+            source_identity = str(document["source_identity"])
+            symbol = str(document["symbol"])
+            signal_time_us = int(document["signal_time_us"])
+            captured_at_us = int(document["captured_at_us"])
+            source_freeze_ts_us = int(document["source_freeze_ts_us"])
+            lineage_hash = str(document["lineage_hash"])
+            source_fingerprint = str(document["source_fingerprint"])
+            preserved_hash = str(document["preserved_hash"])
+            lineage = document["lineage"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"H1E_REJECT_ROW_PARSE: {exc}") from exc
+        if not isinstance(lineage, Mapping):
+            raise ValueError("H1E_REJECT_ROW_PARSE: lineage must be an object")
+        derived_key = expected_source_event_key(source_identity)
+        if derived_key != source_event_key:
+            raise ValueError(
+                "H1E_REJECT_SOURCE_EVENT_KEY_IDENTITY_CONFLICT: "
+                f"{source_event_key} != {derived_key}"
+            )
+        recomputed = preserved_identity_hash(
+            source_event_key=source_event_key,
+            source_identity=source_identity,
+            signal_time_us=signal_time_us,
+            lineage_hash=lineage_hash,
+            source_fingerprint=source_fingerprint,
+        )
+        if recomputed != preserved_hash:
+            raise ValueError(
+                "H1E_PAYLOAD_PRESERVED_HASH_MISMATCH: "
+                f"{preserved_hash} != {recomputed}"
+            )
+        return cls(
+            source_event_key=source_event_key,
+            source_identity=source_identity,
+            symbol=symbol,
+            signal_time_us=signal_time_us,
+            captured_at_us=captured_at_us,
+            source_freeze_ts_us=source_freeze_ts_us,
+            lineage_hash=lineage_hash,
+            source_fingerprint=source_fingerprint,
+            lineage=dict(lineage),
+            preserved_hash=preserved_hash,
+        )
 
 
 @dataclass(frozen=True)

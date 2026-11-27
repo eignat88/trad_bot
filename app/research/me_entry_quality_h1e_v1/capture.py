@@ -20,17 +20,37 @@ Delivery semantics (at-least-once delivery, exactly-once effect):
   duplicates + conflicts`` (no silent skips);
 * a redelivery of an already committed identity with the SAME preserved
   facts is an idempotent ``DUPLICATE`` (no second ledger row, first-capture
-  snapshot kept verbatim);
+  snapshot kept verbatim) — INCLUDING queued ``DEFERRED`` identities:
+  redelivery never re-triggers classification;
 * a redelivery with DIFFERENT preserved facts is a real integrity conflict
-  (``H1E_EVENT_KEY_LINEAGE_CONFLICT``): isolated in the conflict ledger,
-  NEVER an overwrite, fail-closed for that identity;
-* ledger inserts and the checkpoint advance in ONE atomic transaction
+  (``H1E_EVENT_KEY_LINEAGE_CONFLICT``): isolated in the conflict journal
+  INSIDE the batch transaction (recorded exactly once per conflict key),
+  NEVER an overwrite, fail-closed for that identity (review fix B2);
+* ledger writes, reject/conflict journals, the durable pending-retry state
+  and the checkpoint advance in ONE atomic transaction
   (:meth:`H1EStore.commit_batch`); an interrupted transaction commits
   NOTHING and the next cycle re-reads from the previous checkpoint
-  (at-least-once redelivery → idempotent effect);
-* the H1-E freeze gate is fail-closed: ``signal_time > freeze_ts`` STRICTLY,
-  preserved excluded windows rejected, and a SYNTHETIC fixture freeze is
-  refused unless explicitly allowed (offline tests).
+  (at-least-once redelivery → idempotent effect).  There is NO durable
+  mutation path outside ``commit_batch``.
+
+Durable pending-retry semantics (review fix B1):
+
+* a ``DEFERRED`` classification is queued in a DURABLE pending-retry state
+  that is INDEPENDENT of the source cursor — the event is re-attempted
+  even after the cursor advanced and after a restart, so a deferred event
+  is NEVER lost and NEVER re-counted as a new delivery;
+* the queue stores the event identity, the attempt count, the deferral
+  reason and the next-attempt time; due entries are re-processed in
+  deterministic order and always at the ORIGINAL ``signal_time`` ASOF
+  (no later candles — the classification contract is unchanged);
+* attempts are BOUNDED (``config.max_attempts``): once the budget is spent
+  the event becomes a TERMINAL non-eligible result (``H1E_RETRY_BUDGET_EXHAUSTED``)
+  without further classifier calls; terminal events and conflicted
+  identities are never re-executed.
+
+The H1-E freeze gate is fail-closed: ``signal_time > freeze_ts`` STRICTLY,
+preserved excluded windows rejected, and a SYNTHETIC fixture freeze is
+refused unless explicitly allowed (offline tests).
 
 This module performs NO I/O of its own: the reader, the store and the
 classifier are injected callables/objects.  No production service is bound,
@@ -46,6 +66,8 @@ from app.research.me_entry_quality_h1c_v1.event_adapter import parse_utc_us
 from app.research.me_entry_quality_h1e_v1.classification import (
     ClassificationRecord,
     STATUS_DEFERRED,
+    terminal_noneligible_record,
+    NONELIGIBLE_RETRY_BUDGET_EXHAUSTED,
 )
 from app.research.me_entry_quality_h1e_v1.contracts import (
     AdmissionDecision,
@@ -54,6 +76,7 @@ from app.research.me_entry_quality_h1e_v1.contracts import (
     admit_source_row,
     ledger_identity,
 )
+from app.research.me_entry_quality_h1e_v1.protocol import EXPERIMENT_ID
 
 H1E_CAPTURE_VERSION = "H1E_PROSPECTIVE_EVENT_CAPTURE_V1"
 
@@ -95,6 +118,45 @@ class CaptureCursor:
                    source_event_key=key if isinstance(key, str) else "")
 
 
+# ─── durable pending-retry contract (B1) ────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class PendingRetry:
+    """Durable state of ONE deferred event awaiting re-processing.
+
+    Independent of the delivery cursor: the event is re-attempted from this
+    queue even after the source cursor advanced and after a restart.
+    ``attempt_count`` counts classification attempts already made;
+    ``next_attempt_us`` is the earliest instant of the next attempt.
+    """
+
+    ledger_identity: str
+    source_event_key: str
+    attempt_count: int
+    deferred_reason: str
+    next_attempt_us: int
+    preserved_hash: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ledger_identity": self.ledger_identity,
+            "source_event_key": self.source_event_key,
+            "attempt_count": int(self.attempt_count),
+            "deferred_reason": self.deferred_reason,
+            "next_attempt_us": int(self.next_attempt_us),
+            "preserved_hash": self.preserved_hash,
+        }
+
+
+@dataclass(frozen=True)
+class PendingRetryUpdate:
+    """One atomic pending-queue mutation (``retry=None`` removes the entry)."""
+
+    ledger_identity: str
+    retry: PendingRetry | None = None
+
+
 # ─── injected collaborators ────────────────────────────────────────────────
 
 
@@ -123,18 +185,32 @@ class LedgerWrite:
     classification: Mapping[str, Any] | None
     attempt_count: int
     captured_at_us: int
+    #: explicit link to the approved H1-E activation (B3)
+    activation_id: str = ""
+    #: the H1-E freeze instant this event is evaluated against (B3)
+    h1e_freeze_ts_us: int = 0
 
 
 class H1EStore(Protocol):
-    """Ledger store with ATOMIC batch commit (insert + checkpoint)."""
+    """Ledger store with ONE ATOMIC batch transaction.
+
+    ``commit_batch`` applies ledger writes, reject/conflict journals, the
+    durable pending-retry state and the checkpoint TOGETHER — there is no
+    other durable mutation path (review fix B2).
+    """
 
     def lookup(self, ledger_identity: str) -> Any | None: ...
 
-    def commit_batch(
-        self, items: Sequence[LedgerWrite], checkpoint: CaptureCursor,
-    ) -> None: ...
+    def pending_retries(self) -> Sequence[PendingRetry]: ...
 
-    def record_conflict(self, payload: Mapping[str, Any]) -> None: ...
+    def commit_batch(
+        self,
+        items: Sequence[LedgerWrite],
+        checkpoint: CaptureCursor,
+        *,
+        conflicts: Sequence[Mapping[str, Any]] = (),
+        pending: Sequence[PendingRetryUpdate] = (),
+    ) -> None: ...
 
 
 Classifier = Callable[..., Any]
@@ -194,6 +270,12 @@ class CycleReport:
     committed_count: int
     committed: bool
     commit_error: str = ""
+    #: identities re-attempted from the durable pending queue this cycle
+    retried_keys: tuple[str, ...] = ()
+    #: retries that exhausted the bounded budget (terminal non-eligible)
+    retry_terminal_keys: tuple[str, ...] = ()
+    #: pending entries skipped WITHOUT execution (terminal/conflicted/etc.)
+    retry_skipped_keys: tuple[str, ...] = ()
 
     @property
     def accounted_count(self) -> int:
@@ -216,6 +298,9 @@ class CycleReport:
             "committed_count": self.committed_count,
             "committed": self.committed,
             "commit_error": self.commit_error,
+            "retried_keys": list(self.retried_keys),
+            "retry_terminal_keys": list(self.retry_terminal_keys),
+            "retry_skipped_keys": list(self.retry_skipped_keys),
         }
 
 
@@ -232,6 +317,13 @@ class CaptureConfig:
     allow_fixture_freeze: bool = False
     #: expected #305 source pipeline fingerprint (``""`` = not pinned)
     expected_fingerprint: str = ""
+    #: hard bound on TOTAL classification attempts per event — the durable
+    #: retry queue is drained fail-closed even if the injected classifier
+    #: keeps deferring (review fix B1).
+    max_attempts: int = 3
+    #: earliest-delay before a deferred event becomes due again (µs);
+    #: ``0`` = due on the next cycle.
+    retry_backoff_us: int = 0
 
 
 def run_capture_cycle(
@@ -243,13 +335,19 @@ def run_capture_cycle(
     cursor: CaptureCursor,
     ceiling_captured_us: int | None = None,
     config: CaptureConfig | None = None,
+    now_us: int | None = None,
 ) -> CycleReport:
     """Run ONE deterministic capture cycle (bounded work, atomic commit).
 
-    The cycle reads at most ``config.batch_limit`` rows after ``cursor``,
-    admits them through the fail-closed H1-E checks, classifies each new
-    identity through the injected classifier and commits every effect PLUS
-    the advanced checkpoint in ONE atomic transaction.
+    The cycle (1) re-processes DUE entries of the durable pending-retry
+    queue independent of the source cursor, (2) reads at most
+    ``config.batch_limit`` rows after ``cursor``, (3) admits them through
+    the fail-closed H1-E checks and classifies each NEW identity through
+    the injected classifier, and (4) commits every effect — ledger writes,
+    conflicts, pending-retry state and the advanced checkpoint — in ONE
+    atomic transaction.  ``now_us`` is the caller-supplied cycle instant
+    used for retry scheduling (no clock is read here); when omitted every
+    pending entry is considered due.
     """
     cfg = config or CaptureConfig()
     if not isinstance(freeze, H1EFreeze):
@@ -262,16 +360,91 @@ def run_capture_cycle(
         raise ValueError("batch_limit must be a real integer")
     if cfg.batch_limit < 1:
         raise ValueError("batch_limit must be positive")
+    if not isinstance(cfg.max_attempts, int) or isinstance(cfg.max_attempts, bool):
+        raise ValueError("max_attempts must be a real integer")
+    if cfg.max_attempts < 1:
+        raise ValueError("max_attempts must be positive")
 
-    rows = list(reader.read_after(
-        cursor, limit=int(cfg.batch_limit), ceiling_captured_us=ceiling_captured_us))
-
+    writes: list[LedgerWrite] = []
+    conflict_payloads: list[Mapping[str, Any]] = []
+    pending_updates: list[PendingRetryUpdate] = []
     rejections: list[RejectionRecord] = []
     conflicts: list[ConflictRecord] = []
-    writes: list[LedgerWrite] = []
     deferred_keys: list[str] = []
+    retried_keys: list[str] = []
+    retry_terminal_keys: list[str] = []
+    retry_skipped_keys: list[str] = []
     admitted = 0
     duplicates = 0
+
+    # ── 1. durable pending-retry queue (independent of the cursor) ──────
+    pending_map: dict[str, PendingRetry] = {
+        retry.ledger_identity: retry for retry in store.pending_retries()
+    }
+    for retry in store.pending_retries():
+        if now_us is not None and int(retry.next_attempt_us) > int(now_us):
+            continue  # not due yet
+        entry = store.lookup(retry.ledger_identity)
+        if entry is None or getattr(entry, "current_status", "") != STATUS_DEFERRED:
+            # terminal / conflicted / vanished identities are NEVER
+            # re-executed — the stale queue entry is dropped atomically.
+            retry_skipped_keys.append(retry.source_event_key)
+            pending_updates.append(PendingRetryUpdate(retry.ledger_identity))
+            pending_map.pop(retry.ledger_identity, None)
+            continue
+        if str(getattr(entry, "preserved_hash", "")) != retry.preserved_hash:
+            raise ValueError(
+                "H1E_PENDING_IDENTITY_MISMATCH: durable retry state does "
+                "not match the committed preserved identity"
+            )
+        event = H1ESourceEvent.from_dict(entry.payload)
+        if int(retry.attempt_count) >= int(cfg.max_attempts):
+            # bounded budget exhausted — TERMINAL fail-closed result,
+            # NO further classifier invocation (no endless attempts).
+            record = terminal_noneligible_record(
+                event,
+                code=NONELIGIBLE_RETRY_BUDGET_EXHAUSTED,
+                detail=(
+                    f"attempt_count={retry.attempt_count} >= "
+                    f"max_attempts={cfg.max_attempts}: "
+                    f"{retry.deferred_reason}"
+                ),
+                attempts=int(retry.attempt_count),
+            )
+            writes.append(_classified_write(
+                event, freeze, record, attempt_count=int(retry.attempt_count)))
+            retry_terminal_keys.append(event.source_event_key)
+            pending_updates.append(PendingRetryUpdate(retry.ledger_identity))
+            pending_map.pop(retry.ledger_identity, None)
+            continue
+        produced = classifier(event, prior_deferrals=int(retry.attempt_count))
+        record = produced.record if hasattr(produced, "record") else produced
+        attempt_count = int(retry.attempt_count) + 1
+        writes.append(_classified_write(
+            event, freeze, record, attempt_count=attempt_count))
+        retried_keys.append(event.source_event_key)
+        if record.status == STATUS_DEFERRED:
+            pending_updates.append(PendingRetryUpdate(
+                retry.ledger_identity,
+                PendingRetry(
+                    ledger_identity=retry.ledger_identity,
+                    source_event_key=event.source_event_key,
+                    attempt_count=attempt_count,
+                    deferred_reason=_deferral_reason(record),
+                    next_attempt_us=(
+                        (int(now_us) if now_us is not None else 0)
+                        + int(cfg.retry_backoff_us)
+                    ),
+                    preserved_hash=event.preserved_hash,
+                ),
+            ))
+        else:
+            pending_updates.append(PendingRetryUpdate(retry.ledger_identity))
+            pending_map.pop(retry.ledger_identity, None)
+
+    # ── 2. source rows after the cursor (capture order) ────────────────
+    rows = list(reader.read_after(
+        cursor, limit=int(cfg.batch_limit), ceiling_captured_us=ceiling_captured_us))
 
     previous_cursor = cursor.as_tuple()
     for row in rows:
@@ -327,7 +500,6 @@ def run_capture_cycle(
         event: H1ESourceEvent = decision.event  # type: ignore[assignment]
         identity = ledger_identity(event.source_event_key, freeze.protocol_fingerprint)
         existing = store.lookup(identity)
-        prior_deferrals = 0
         if existing is not None:
             existing_hash = getattr(existing, "preserved_hash", "")
             if existing_hash != event.preserved_hash:
@@ -337,7 +509,9 @@ def run_capture_cycle(
                     delivered_preserved_hash=event.preserved_hash,
                     detail="redelivery with different preserved identity facts",
                 ))
-                store.record_conflict({
+                # B2: the conflict journal is written INSIDE the batch
+                # transaction — never before it, never outside it.
+                conflict_payloads.append({
                     "source_event_key": event.source_event_key,
                     "ledger_identity": identity,
                     "existing_preserved_hash": existing_hash,
@@ -350,37 +524,60 @@ def run_capture_cycle(
                 # no-op (exactly-once effect); first capture kept verbatim.
                 duplicates += 1
                 continue
-            # a DEFERRED classification is re-attempted on redelivery
-            # (at-least-once delivery, bounded deferral budget).
-            prior_deferrals = int(getattr(existing, "attempt_count", 1))
+            # a queued DEFERRED identity is re-attempted ONLY via the
+            # durable pending queue (B1) — redelivery is idempotent.
+            if identity not in pending_map:
+                # self-heal: the durable queue lost an entry (never the
+                # event) — re-queue it atomically with this batch.
+                pending_updates.append(PendingRetryUpdate(
+                    identity,
+                    PendingRetry(
+                        ledger_identity=identity,
+                        source_event_key=event.source_event_key,
+                        attempt_count=int(getattr(existing, "attempt_count", 1)),
+                        deferred_reason="H1E_PENDING_SELF_HEAL",
+                        next_attempt_us=(
+                            (int(now_us) if now_us is not None else 0)
+                            + int(cfg.retry_backoff_us)
+                        ),
+                        preserved_hash=event.preserved_hash,
+                    ),
+                ))
+                pending_map[identity] = pending_updates[-1].retry  # type: ignore[arg-type]
+                admitted += 1
+                continue
+            duplicates += 1
+            continue
 
-        produced = classifier(event, prior_deferrals=prior_deferrals)
+        produced = classifier(event, prior_deferrals=0)
         record: ClassificationRecord = (
             produced.record if hasattr(produced, "record") else produced
         )
-        attempt_count = prior_deferrals + 1
-        writes.append(LedgerWrite(
-            ledger_identity=identity,
-            source_event_key=event.source_event_key,
-            protocol_fingerprint=freeze.protocol_fingerprint,
-            event_kind=(
-                EVENT_KIND_DEFERRED
-                if record.status == STATUS_DEFERRED
-                else EVENT_KIND_CLASSIFIED
-            ),
-            preserved_hash=event.preserved_hash,
-            payload=event.to_dict(),
-            classification=record.to_dict(),
-            attempt_count=attempt_count,
-            captured_at_us=event.captured_at_us,
-        ))
+        writes.append(_classified_write(event, freeze, record, attempt_count=1))
         admitted += 1
         if record.status == STATUS_DEFERRED:
             deferred_keys.append(event.source_event_key)
+            pending_updates.append(PendingRetryUpdate(
+                identity,
+                PendingRetry(
+                    ledger_identity=identity,
+                    source_event_key=event.source_event_key,
+                    attempt_count=1,
+                    deferred_reason=_deferral_reason(record),
+                    next_attempt_us=(
+                        (int(now_us) if now_us is not None else 0)
+                        + int(cfg.retry_backoff_us)
+                    ),
+                    preserved_hash=event.preserved_hash,
+                ),
+            ))
+            pending_map[identity] = pending_updates[-1].retry  # type: ignore[arg-type]
 
     checkpoint = CaptureCursor.after_rows(rows) if rows else cursor
     try:
-        store.commit_batch(writes, checkpoint)
+        store.commit_batch(
+            writes, checkpoint,
+            conflicts=conflict_payloads, pending=pending_updates)
     except Exception as exc:  # noqa: BLE001 — atomic failure is a report fact
         return CycleReport(
             version=H1E_CAPTURE_VERSION,
@@ -395,6 +592,9 @@ def run_capture_cycle(
             committed_count=0,
             committed=False,
             commit_error=str(exc),
+            retried_keys=tuple(retried_keys),
+            retry_terminal_keys=tuple(retry_terminal_keys),
+            retry_skipped_keys=tuple(retry_skipped_keys),
         )
 
     return CycleReport(
@@ -409,4 +609,39 @@ def run_capture_cycle(
         deferred_keys=tuple(deferred_keys),
         committed_count=len(writes),
         committed=True,
+        retried_keys=tuple(retried_keys),
+        retry_terminal_keys=tuple(retry_terminal_keys),
+        retry_skipped_keys=tuple(retry_skipped_keys),
+    )
+
+
+def _deferral_reason(record: ClassificationRecord) -> str:
+    codes = tuple(record.non_eligible_codes or ())
+    return codes[0] if codes else str(record.eligibility_reason)
+
+
+def _classified_write(
+    event: H1ESourceEvent,
+    freeze: H1EFreeze,
+    record: ClassificationRecord,
+    *,
+    attempt_count: int,
+) -> LedgerWrite:
+    return LedgerWrite(
+        ledger_identity=ledger_identity(
+            event.source_event_key, freeze.protocol_fingerprint),
+        source_event_key=event.source_event_key,
+        protocol_fingerprint=freeze.protocol_fingerprint,
+        event_kind=(
+            EVENT_KIND_DEFERRED
+            if record.status == STATUS_DEFERRED
+            else EVENT_KIND_CLASSIFIED
+        ),
+        preserved_hash=event.preserved_hash,
+        payload=event.to_dict(),
+        classification=record.to_dict(),
+        attempt_count=attempt_count,
+        captured_at_us=event.captured_at_us,
+        activation_id=EXPERIMENT_ID,
+        h1e_freeze_ts_us=int(freeze.freeze_ts_us),
     )

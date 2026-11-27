@@ -61,7 +61,7 @@ def test_fixture_freeze_refused_outside_offline_tests():
     with pytest.raises(ValueError, match="fixture freeze refused"):
         run_capture_cycle(
             reader=FakeReader([]),
-            store=InMemoryH1EStore(),
+            store=InMemoryH1EStore(activation=FREEZE),
             classifier=_classifier,
             freeze=FREEZE,
             cursor=CaptureCursor(),
@@ -72,7 +72,7 @@ def test_fixture_freeze_refused_outside_offline_tests():
 def test_cycle_is_deterministic_and_fully_accounted():
     rows = _rows(5)
     reader = FakeReader(rows)
-    store = InMemoryH1EStore()
+    store = InMemoryH1EStore(activation=FREEZE)
     report = run_capture_cycle(
         reader=reader, store=store, classifier=_classifier,
         freeze=FREEZE, cursor=CaptureCursor(), config=CFG)
@@ -85,7 +85,7 @@ def test_cycle_is_deterministic_and_fully_accounted():
     assert len(store.entries()) == 5
 
     # determinism: the same reader/store state replays identically
-    store2 = InMemoryH1EStore()
+    store2 = InMemoryH1EStore(activation=FREEZE)
     report2 = run_capture_cycle(
         reader=FakeReader(rows), store=store2, classifier=_classifier,
         freeze=FREEZE, cursor=CaptureCursor(), config=CFG)
@@ -96,7 +96,7 @@ def test_cycle_is_deterministic_and_fully_accounted():
 
 def test_redelivery_is_idempotent_exactly_once_effect():
     rows = _rows(3)
-    store = InMemoryH1EStore()
+    store = InMemoryH1EStore(activation=FREEZE)
     first = run_capture_cycle(
         reader=FakeReader(rows), store=store, classifier=_classifier,
         freeze=FREEZE, cursor=CaptureCursor(), config=CFG)
@@ -125,7 +125,7 @@ def test_pre_freeze_and_invalid_rows_are_explicit_rejections():
             corrupt="lineage_hash",
         ),
     ]
-    store = InMemoryH1EStore()
+    store = InMemoryH1EStore(activation=FREEZE)
     report = run_capture_cycle(
         reader=FakeReader(rows), store=store, classifier=_classifier,
         freeze=FREEZE, cursor=CaptureCursor(), config=CFG)
@@ -149,7 +149,7 @@ def test_out_of_order_signal_times_are_delivered_in_capture_order():
         )
         for i in range(3)
     ]
-    store = InMemoryH1EStore()
+    store = InMemoryH1EStore(activation=FREEZE)
     seen: list[int] = []
 
     def ordered_classifier(event, prior_deferrals=0):
@@ -183,7 +183,7 @@ def test_identity_collision_is_isolated_fail_closed():
     assert row_a["source_event_key"] == row_b["source_event_key"]
     assert row_a["lineage_hash"] != row_b["lineage_hash"]
 
-    store = InMemoryH1EStore()
+    store = InMemoryH1EStore(activation=FREEZE)
     first = run_capture_cycle(
         reader=FakeReader([row_a]), store=store, classifier=_classifier,
         freeze=FREEZE, cursor=CaptureCursor(), config=CFG)
@@ -206,7 +206,7 @@ def test_identity_collision_is_isolated_fail_closed():
 
 def test_commit_crash_is_all_or_nothing_then_restart_recovers():
     rows = _rows(3)
-    store = FaultInjectingStore()
+    store = FaultInjectingStore(activation=FREEZE)
     store.fail_next_commit = True
     crashed = run_capture_cycle(
         reader=FakeReader(rows), store=store, classifier=_classifier,
@@ -232,7 +232,7 @@ def test_commit_crash_is_all_or_nothing_then_restart_recovers():
 
 def test_classifier_crash_between_read_and_commit_leaves_no_effects():
     rows = _rows(2)
-    store = InMemoryH1EStore()
+    store = InMemoryH1EStore(activation=FREEZE)
     calls = {"n": 0}
 
     def flaky(event, prior_deferrals=0):
@@ -259,7 +259,7 @@ def test_classifier_crash_between_read_and_commit_leaves_no_effects():
 
 def test_retry_on_interrupted_transaction_yields_identical_outcome():
     rows = _rows(2)
-    store = FaultInjectingStore()
+    store = FaultInjectingStore(activation=FREEZE)
     store.fail_next_commit = True
     run_capture_cycle(
         reader=FakeReader(rows), store=store, classifier=_classifier,
@@ -277,7 +277,7 @@ def test_retry_on_interrupted_transaction_yields_identical_outcome():
         e.final_classification for e in store.entries()]
     assert len(classifications) == 2
     # unchanged outcome across the interrupted transaction
-    store2 = InMemoryH1EStore()
+    store2 = InMemoryH1EStore(activation=FREEZE)
     clean = run_capture_cycle(
         reader=FakeReader(rows), store=store2, classifier=_classifier,
         freeze=FREEZE, cursor=CaptureCursor(), config=CFG)
@@ -299,7 +299,7 @@ def test_reader_order_violation_fails_closed():
             return self.delivered[: int(limit)]
 
     reader = StrictOrderReader(list(reversed(rows)))
-    store = InMemoryH1EStore()
+    store = InMemoryH1EStore(activation=FREEZE)
     with pytest.raises(ValueError, match="H1E_READER_ORDER_VIOLATION"):
         run_capture_cycle(
             reader=reader, store=store, classifier=_classifier,
@@ -309,7 +309,7 @@ def test_reader_order_violation_fails_closed():
 
 def test_batch_bound_is_respected_and_cursor_advances_by_batch():
     rows = _rows(5)
-    store = InMemoryH1EStore()
+    store = InMemoryH1EStore(activation=FREEZE)
     cfg = CaptureConfig(allow_fixture_freeze=True, batch_limit=2)
     first = run_capture_cycle(
         reader=FakeReader(rows), store=store, classifier=_classifier,
@@ -325,10 +325,14 @@ def test_batch_bound_is_respected_and_cursor_advances_by_batch():
     assert len(store.entries()) == 4
 
 
-def test_deferred_classification_is_retried_not_deduplicated():
+def test_deferred_classification_is_queued_and_retried_not_lost():
+    """B1: a DEFERRED event lives in the durable pending queue — redelivery
+    is idempotent and the retry is driven by the queue, independent of the
+    source cursor."""
     rows = _rows(1)
-    store = InMemoryH1EStore()
+    store = InMemoryH1EStore(activation=FREEZE)
     state = {"defer": True}
+    cfg = CaptureConfig(allow_fixture_freeze=True, retry_backoff_us=1_000_000)
 
     def flaky_classifier(event, prior_deferrals=0):
         if state["defer"]:
@@ -336,21 +340,48 @@ def test_deferred_classification_is_retried_not_deduplicated():
                 event, eligible=False, status=STATUS_DEFERRED)
         return make_classification_record(event)
 
+    t0 = FIXTURE_FREEZE_US + 500_000_000
     first = run_capture_cycle(
         reader=FakeReader(rows), store=store, classifier=flaky_classifier,
-        freeze=FREEZE, cursor=CaptureCursor(), config=CFG)
+        freeze=FREEZE, cursor=CaptureCursor(), config=cfg, now_us=t0)
     assert first.deferred_keys == (rows[0]["source_event_key"],)
     identity = ledger_identity(rows[0]["source_event_key"])
     assert store.current_status(identity) == STATUS_DEFERRED
+    queued = store.pending_retries()
+    assert [p.ledger_identity for p in queued] == [identity]
+    assert queued[0].attempt_count == 1
+    assert queued[0].deferred_reason != ""
+    assert queued[0].next_attempt_us == t0 + 1_000_000
 
-    # redelivery: NOT a duplicate — the deferred classification is retried
-    state["defer"] = False
-    second = run_capture_cycle(
+    # redelivery BEFORE the retry is due: idempotent duplicate, the
+    # classification is NOT re-executed and the queue is untouched
+    redelivered = run_capture_cycle(
         reader=FakeReader(rows), store=store, classifier=flaky_classifier,
-        freeze=FREEZE, cursor=CaptureCursor(), config=CFG)
-    assert second.admitted_count == 1
-    assert second.duplicates == 0
+        freeze=FREEZE, cursor=CaptureCursor(), config=cfg, now_us=t0 + 500_000)
+    assert redelivered.duplicates == 1
+    assert redelivered.admitted_count == 0
+    assert redelivered.retried_keys == ()
+    assert len(store.pending_retries()) == 1
+
+    # due: the durable queue re-processes the event WITHOUT redelivery
+    state["defer"] = False
+    retried = run_capture_cycle(
+        reader=FakeReader([]), store=store, classifier=flaky_classifier,
+        freeze=FREEZE, cursor=CaptureCursor.after_rows(rows),
+        config=cfg, now_us=t0 + 2_000_000)
+    assert retried.retried_keys == (rows[0]["source_event_key"],)
     entry = store.lookup(identity)
     assert entry.current_status == "CLASSIFIED"
     assert entry.attempt_count == 2
     assert len(entry.classifications) == 2  # append-only evidence
+    assert store.pending_retries() == ()
+
+    # redelivery AFTER finalization: no re-classification, no ledger
+    # duplicates (exactly-once effect)
+    final_redelivery = run_capture_cycle(
+        reader=FakeReader(rows), store=store, classifier=flaky_classifier,
+        freeze=FREEZE, cursor=CaptureCursor(), config=cfg,
+        now_us=t0 + 3_000_000)
+    assert final_redelivery.duplicates == 1
+    assert final_redelivery.retried_keys == ()
+    assert len(store.lookup(identity).classifications) == 2

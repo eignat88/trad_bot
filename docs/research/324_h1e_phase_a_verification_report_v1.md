@@ -1,9 +1,10 @@
 # #324 H1-E — Phase A Verification Report
 
 **Branch:** `research/324-h1e-prospective-observer-v1` (Draft PR #325, base `main` @ `03d6fac466e2f9ddd890803649db54b13a451ba3`)
+**HEAD:** see the B1–B3 commit below (parent `119b342caaa23c559133838a04916f00af574cd0`)
 **Environment:** Windows dev host, Python 3.13 venv, offline (no network
 calls, no production DB writes, no DDL applied, no services touched)
-**Status:** `PHASE_A_OFFLINE_IMPLEMENTATION / NO_DEPLOY / NOT_ACTIVATED / H1_OOS_HOLD`
+**Status:** `PHASE_A_READY_FOR_RE_REVIEW` (post B1–B3 review fixes)
 
 ---
 
@@ -21,7 +22,10 @@ calls, no production DB writes, no DDL applied, no services touched)
 Cross-cutting: `protocol.py` (freeze/exclusions) →
 `…_protocol_freeze_v1.py` (11); provenance tamper →
 `…_provenance_tamper_v1.py` (8); isolation/purity/determinism →
-`…_isolation_purity_v1.py` (6).  Total: 98 tests.
+`…_isolation_purity_v1.py` (6).  Review-round regression: durable retry
+(B1) → `…_durable_retry_v1.py` (9); commit atomicity (B2) →
+`…_commit_atomicity_v1.py` (5); activation freeze (B3) →
+`…_activation_freeze_v1.py` (11).  Total: 127 tests.
 
 ## 2. Exact test results
 
@@ -29,10 +33,10 @@ Commands (from the PR worktree; interpreter = project venv):
 
 ```
 python -m pytest tests/test_me_entry_quality_h1e_*.py -q
-    → 98 passed
+    → 127 passed   (98 pre-review + 29 new B1/B2/B3 regression tests)
 
 python -m pytest tests/test_me_entry_quality_h1*.py tests/test_me_upstream_source_*.py -q
-    → 681 passed, 26 skipped
+    → 710 passed, 26 skipped
 ```
 
 The second command is the targeted H1-A/B (#297) + H1-C (#308/#309) +
@@ -47,10 +51,11 @@ module):
 
 ```
 python -m pytest tests --ignore=<5 pre-existing broken-on-Windows modules> -q
-    → 87 failed, 8612 passed, 375 skipped, 94 errors (24:13 min)
+    → 87 failed, 8641 passed, 375 skipped, 94 errors (25:19 min)
 ```
 
-Full-suite analysis (verified against the PR base commit `03d6fac`):
+Full-suite analysis (verified against the PR base commit `03d6fac`, both
+before and after the B1–B3 fixes):
 
 * the failing/erroring modules are ALL untouched by this PR (DB-gated
   analytics/migration/PostgreSQL suites, paper/LR/SRR modules, the
@@ -67,8 +72,9 @@ Full-suite analysis (verified against the PR base commit `03d6fac`):
   for `NO_PHASE2`-routed PRs ("meaningless — and PR-blocking — outside a
   Phase-2-only PR"); this PR touches zero governed Phase-2 paths (no
   `app/research/htf_baseline_short_phase2_*`, no FROZEN_PATHS, no
-  `main-pr-safety.yml`) and therefore routes `NO_PHASE2`;
-* raw logs: `reports/324_h1e/{h1e_tests_final,h1_regression_final,full_suite_h1e,failing_modules_on_base}.txt`.
+  `main-pr-safety.yml`) and therefore routes `NO_PHASE2` — **they are NOT
+  a new regression of PR #325**;
+* raw logs: `reports/324_h1e/{h1e_tests_final,h1_regression_final,h1_regression_b123,full_suite_h1e,full_suite_h1e_b123,failing_modules_on_base}.txt`.
 
 ## 3. Scenario matrix (all offline, deterministic)
 
@@ -121,9 +127,14 @@ was executed anywhere.
 | --- | --- | --- |
 | F1 | `parse_utc_us` interprets integer timestamps as epoch **ms**; fixture rows passed µs ints → wrong ASOF (0/60 coverage) | fixtures now use UTC-anchored datetimes (µs-exact); contract unchanged |
 | F2 | H1-C kept a *diagnostic* regime on non-eligible outcomes; the #324 spec forbids inferring BULLISH/BEARISH/NEUTRAL from invalid data | `ClassificationRecord` exposes regime/BOS ONLY when eligible; diagnostics live in `h1d_diagnostics` |
-| F3 | deferred classifications were deduplicated on redelivery (blocking bounded retry) | redelivery of a `DEFERRED` identity re-classifies (append-only journal, attempt counter) |
+| F3 | deferred classifications were deduplicated on redelivery (blocking bounded retry) | first fixed via redelivery-triggered retry; **superseded by F6/B1** — retries are now queue-driven and redelivery is idempotent |
 | F4 | test bug: future-append test compared two different histories | test now appends future candles onto the same history (spec scenario preserved) |
 | F5 | pre-existing H1-D purity guard (`test_nothing_outside_the_package_references_h1d`) forbids ANY external reference to H1-D, conflicting with the #324 requirement to integrate the frozen H1-D adapter | **justified test-only amendment**: exactly `app/research/me_entry_quality_h1e_v1` is added as a sanctioned research-only consumer (asserted to be the ONLY one); no production file changed — flagged for reviewer attention |
+| F6 (review B1) | `DEFERRED` events lost for re-processing after the cursor advanced (F3's redelivery-only retry masked it) | durable pending-retry queue, cursor-independent, restart-safe, bounded → terminal `H1E_RETRY_BUDGET_EXHAUSTED`; retries at the original ASOF |
+| F7 (review B2) | `record_conflict()` persisted conflicts outside the batch transaction (partial writes on crash) | conflicts flow through the ONE atomic `commit_batch` (with writes/pending/checkpoint); conflict journal idempotent (exactly once per conflict key); `record_conflict()` removed |
+| F8 (review B3) | DDL enforced `signal_time_us > source_freeze_ts_us` (#305 freeze) instead of the separate H1-E freeze | `h1e_activation` FK + `h1e_freeze_ts_us` per event + `h1e_event_prospective_guard` trigger (fail-closed on missing approval / fingerprint / freeze tamper / pre-freeze incl. equality); #305 CHECK kept independent; reference gate + two-freeze tests |
+
+Full details of the review round: `324_h1e_b1_b2_b3_review_fixes_v1.md`.
 
 ## 7. Scope compliance checklist
 

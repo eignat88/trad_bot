@@ -17,14 +17,29 @@
 -- CREATE TABLE / CREATE INDEX / CREATE FUNCTION / CREATE TRIGGER only.
 --
 -- Identity: one ledger row per (source_event_key, h1e_protocol_fingerprint).
--- Append-only everywhere except the single-row checkpoint; status is DERIVED
--- from the append-only journal — immutable evidence is never overwritten.
+-- Append-only everywhere except the single-row checkpoint and the durable
+-- pending-retry state; status is DERIVED from the append-only journal —
+-- immutable evidence is never overwritten.
+--
+-- TWO INDEPENDENT FREEZES (review fix B3):
+--   * the #305 source freeze (``source_freeze_ts_us``) — preserved verbatim
+--     from the #305 lineage, enforced by the ``h1e_event_prospective_chk``
+--     CHECK constraint;
+--   * the SEPARATE owner-approved H1-E freeze (``h1e_freeze_ts_us``, linked
+--     to ``h1e_activation``) — enforced at the DATABASE level by the
+--     ``h1e_event_prospective_guard`` trigger: no row can be written
+--     without an approved activation, with a mismatching protocol
+--     fingerprint, with a tampered freeze instant, or at/before the H1-E
+--     freeze.  A direct INSERT cannot bypass it.
+--
 -- Retention: classification payloads + provenance snapshot hashes are kept
 -- for the experiment lifetime (they ARE the evidence); reject/conflict
 -- journals are kept forever (audit).  Deterministic recovery: restart from
--- the committed checkpoint and re-deliver (at-least-once); exactly-once
--- effect comes from identity idempotency (unique key + identical redelivery
--- is a no-op in the application transaction), never from rewriting rows.
+-- the committed checkpoint and re-deliver (at-least-once) plus the durable
+-- pending-retry queue for deferred events; exactly-once effect comes from
+-- identity idempotency (unique keys + identical redelivery is a no-op in
+-- the application transaction; conflicts are recorded EXACTLY ONCE per
+-- conflict key — review fix B2), never from rewriting rows.
 -- ============================================================================
 
 BEGIN;
@@ -55,7 +70,8 @@ CREATE TABLE IF NOT EXISTS research_me_entry_quality_h1e.h1e_activation (
     CHECK (status <> 'RUNNING' OR freeze_ts IS NOT NULL)
 );
 
--- freeze_ts / protocol identity are immutable after fixation (mirrors #305)
+-- freeze_ts / protocol identity / approval metadata are immutable after
+-- fixation (review fix B3: a frozen H1-E freeze can never be changed)
 CREATE OR REPLACE FUNCTION
 research_me_entry_quality_h1e.protect_h1e_activation()
 RETURNS trigger
@@ -72,6 +88,18 @@ BEGIN
     THEN
         RAISE EXCEPTION 'H1E_IMMUTABLE_PROTOCOL_FINGERPRINT';
     END IF;
+    IF OLD.freeze_ts IS NOT NULL
+       AND (NEW.approval_ref IS DISTINCT FROM OLD.approval_ref
+            OR NEW.approved_by IS DISTINCT FROM OLD.approved_by)
+    THEN
+        RAISE EXCEPTION 'H1E_IMMUTABLE_APPROVAL';
+    END IF;
+    IF OLD.freeze_ts IS NOT NULL AND OLD.status IN ('APPROVED', 'RUNNING')
+       AND NEW.status = 'DRAFT'
+    THEN
+        -- a frozen activation can never be de-approved
+        RAISE EXCEPTION 'H1E_IMMUTABLE_APPROVAL';
+    END IF;
     NEW.updated_at := NOW();
     RETURN NEW;
 END;
@@ -87,11 +115,17 @@ research_me_entry_quality_h1e.protect_h1e_activation();
 -- Immutable first-capture event record.
 -- Preserved #305 identity carried VERBATIM: source_event_key,
 -- source_identity, signal_time (µs exact), lineage_hash, source_fingerprint.
+-- Each event is explicitly linked to the approved H1-E activation
+-- (h1e_activation_id) and evaluated against the SEPARATE H1-E freeze
+-- (h1e_freeze_ts_us) — the #305 source freeze stays an INDEPENDENT
+-- boundary (review fix B3: two different freezes, both enforced).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS research_me_entry_quality_h1e.h1e_event (
     ledger_identity TEXT PRIMARY KEY,
     source_event_key TEXT NOT NULL,
     h1e_protocol_fingerprint TEXT NOT NULL,
+    h1e_activation_id TEXT NOT NULL
+        REFERENCES research_me_entry_quality_h1e.h1e_activation(experiment_id),
     source_identity TEXT NOT NULL,
     symbol TEXT NOT NULL,
     signal_time_us BIGINT NOT NULL,
@@ -99,6 +133,7 @@ CREATE TABLE IF NOT EXISTS research_me_entry_quality_h1e.h1e_event (
     signal_time_ms BIGINT NOT NULL,
     captured_at_us BIGINT NOT NULL,
     source_freeze_ts_us BIGINT NOT NULL,
+    h1e_freeze_ts_us BIGINT NOT NULL,
     lineage_hash TEXT NOT NULL,
     source_fingerprint TEXT NOT NULL DEFAULT '',
     preserved_hash TEXT NOT NULL,
@@ -109,10 +144,61 @@ CREATE TABLE IF NOT EXISTS research_me_entry_quality_h1e.h1e_event (
     CONSTRAINT h1e_event_ms_floor_chk
     CHECK (signal_time_ms = signal_time_us / 1000),
 
-    -- strict prospective boundary (the H1-E freeze — NOT the #305 freeze)
+    -- #305 source freeze boundary — INDEPENDENT of the H1-E freeze
     CONSTRAINT h1e_event_prospective_chk
     CHECK (signal_time_us > source_freeze_ts_us)
 );
+
+-- The H1-E prospective boundary is enforced at the DATABASE level against
+-- the APPROVED activation row (a PostgreSQL CHECK cannot reference another
+-- table, so the guard is a trigger — it cannot be bypassed by a direct
+-- INSERT; concurrent inserts are serialized against the activation row by
+-- the FOR SHARE lock, and the activation itself is immutable once frozen).
+CREATE OR REPLACE FUNCTION
+research_me_entry_quality_h1e.enforce_h1e_prospective_boundary()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    act_status TEXT;
+    act_freeze_ts TIMESTAMPTZ;
+    act_fingerprint TEXT;
+    act_freeze_us BIGINT;
+BEGIN
+    SELECT status, freeze_ts, protocol_fingerprint
+      INTO act_status, act_freeze_ts, act_fingerprint
+      FROM research_me_entry_quality_h1e.h1e_activation
+     WHERE experiment_id = NEW.h1e_activation_id
+       FOR SHARE;  -- concurrency-safe: pins the approved activation row
+
+    IF NOT FOUND OR act_status IS NULL THEN
+        RAISE EXCEPTION 'H1E_NO_APPROVED_ACTIVATION';
+    END IF;
+    IF act_status NOT IN ('APPROVED', 'RUNNING') OR act_freeze_ts IS NULL THEN
+        RAISE EXCEPTION 'H1E_NO_APPROVED_ACTIVATION';
+    END IF;
+    IF NEW.h1e_protocol_fingerprint IS DISTINCT FROM act_fingerprint THEN
+        RAISE EXCEPTION 'H1E_FINGERPRINT_MISMATCH';
+    END IF;
+    act_freeze_us := ROUND(
+        EXTRACT(EPOCH FROM act_freeze_ts) * 1000000)::BIGINT;
+    IF NEW.h1e_freeze_ts_us IS DISTINCT FROM act_freeze_us THEN
+        RAISE EXCEPTION 'H1E_FREEZE_TS_MISMATCH';
+    END IF;
+    -- strict H1-E prospective boundary: signal_time STRICTLY AFTER the
+    -- H1-E freeze (equality is rejected — no backfill, ever)
+    IF NEW.signal_time_us <= NEW.h1e_freeze_ts_us THEN
+        RAISE EXCEPTION 'H1E_PRE_FREEZE_EVENT';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER h1e_event_prospective_guard
+BEFORE INSERT ON research_me_entry_quality_h1e.h1e_event
+FOR EACH ROW
+EXECUTE FUNCTION
+research_me_entry_quality_h1e.enforce_h1e_prospective_boundary();
 
 -- Unique identity per (source_event_key, H1 protocol/fingerprint).
 CREATE UNIQUE INDEX IF NOT EXISTS uq_h1e_event_identity
@@ -244,7 +330,9 @@ research_me_entry_quality_h1e.protect_h1e_append_only();
 -- ---------------------------------------------------------------------------
 -- Conflicting-payload isolation (H1E_EVENT_KEY_LINEAGE_CONFLICT):
 -- a redelivery with DIFFERENT preserved facts is recorded here and NEVER
--- overwrites the original h1e_event row.
+-- overwrites the original h1e_event row.  The unique index makes the
+-- recording of ONE conflict EXACTLY ONCE (the application transaction uses
+-- the equivalent of ON CONFLICT DO NOTHING — review fix B2).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS research_me_entry_quality_h1e.h1e_conflict_event (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -256,12 +344,42 @@ CREATE TABLE IF NOT EXISTS research_me_entry_quality_h1e.h1e_conflict_event (
     recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS uq_h1e_conflict_event_identity
+ON research_me_entry_quality_h1e.h1e_conflict_event
+(source_event_key, existing_preserved_hash, delivered_preserved_hash);
+
 CREATE TRIGGER h1e_protect_conflict_event
 BEFORE UPDATE OR DELETE
 ON research_me_entry_quality_h1e.h1e_conflict_event
 FOR EACH ROW
 EXECUTE FUNCTION
 research_me_entry_quality_h1e.protect_h1e_append_only();
+
+-- ---------------------------------------------------------------------------
+-- Durable pending-retry queue (review fix B1): deferred events await
+-- re-processing INDEPENDENT of the delivery cursor and survive restart.
+-- This state table is intentionally MUTABLE — it is updated and deleted
+-- ONLY inside the same transaction as the classification journal and the
+-- checkpoint (atomic retry-state); its rows disappear exactly when the
+-- event reaches a terminal outcome (or is re-queued for another attempt).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS research_me_entry_quality_h1e.h1e_pending_retry (
+    ledger_identity TEXT PRIMARY KEY
+        REFERENCES research_me_entry_quality_h1e.h1e_event(ledger_identity),
+    source_event_key TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL,
+    deferred_reason TEXT NOT NULL DEFAULT '',
+    next_attempt_us BIGINT NOT NULL,
+    preserved_hash TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT h1e_pending_retry_attempt_chk
+    CHECK (attempt_count >= 1)
+);
+
+CREATE INDEX IF NOT EXISTS idx_h1e_pending_retry_due
+ON research_me_entry_quality_h1e.h1e_pending_retry
+(next_attempt_us, ledger_identity);
 
 -- ---------------------------------------------------------------------------
 -- Provenance snapshot hashes (H1D_HTF_SNAPSHOT_2).  The full snapshot
