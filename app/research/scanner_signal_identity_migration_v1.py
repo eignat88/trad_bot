@@ -162,6 +162,8 @@ class MigrationConfig:
             raise ValueError("PHASE-0 is default-OFF: no capture flags may be set")
         if self.phase < PHASE_1_SHADOW_DUAL_IDENTITY and self.families_enabled:
             raise ValueError("families may only be enabled from PHASE-1 onward")
+        if self.families_enabled and not self.dual_write:
+            raise ValueError("enabled families require dual_write")
         if self.phase < PHASE_2_READ_MIGRATION and self.read_migration:
             raise ValueError("read_migration requires PHASE-2 or later")
         if self.phase < PHASE_3_CUTOVER and self.cutover:
@@ -450,6 +452,7 @@ class MigrationIdentityCore:
     def is_family_enabled(self, slug: str | None) -> bool:
         return (
             self._config.phase >= PHASE_1_SHADOW_DUAL_IDENTITY
+            and self._config.dual_write
             and slug is not None
             and slug in self._config.families_enabled
         )
