@@ -93,8 +93,10 @@ def test_legacy_key_band_disjoint_from_stable_band(probes):
 
 
 def test_same_candle_same_identity_within_process():
-    assert (
-        legacy_source_signal_id("X", "Y", "SHORT", 1) is not None
-    )
+    # Same candle -> byte-identical derivation within one process (the frozen
+    # legacy formula is deterministic for a fixed PYTHONHASHSEED).
+    value = legacy_source_signal_id("X", "Y", "SHORT", 1)
+    assert value == legacy_source_signal_id("X", "Y", "SHORT", 1)
+    assert value == -abs(hash("X:Y:SHORT:1")) % (2**31)
     assert stable_source_signal_id("MOMENTUM_EXHAUSTION", "BTCUSDT", "SHORT", "5m", 5) == \
         stable_source_signal_id("MOMENTUM_EXHAUSTION", "BTCUSDT", "SHORT", "5m", 5)

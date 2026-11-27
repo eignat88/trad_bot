@@ -146,8 +146,11 @@ class IdentityPersistenceError(RuntimeError):
     """An atomic identity batch could not be committed.
 
     Raised only after the failed batch has left NO trace (ALL_OR_NOTHING): no
-    alias edge, no dual-identity record, no in-memory mutation.  The capture may
-    be retried safely — retrying converges on the same identity.
+    alias edge, no dual-identity record, no in-memory mutation — for hooks that
+    honour the atomic contract.  A contract-violating hook (e.g. one that writes
+    and then raises) cannot be rolled back by the core and is outside the
+    :class:`IdentityPersistenceHook` guarantee.  The capture may be retried
+    safely — retrying converges on the same identity.
     """
 
 
@@ -547,6 +550,12 @@ class SignalIdentityAliasMap:
       :class:`AliasIntegrityError` (retroactive re-keying is forbidden);
     * persisted aliases must go through :class:`IdentityPersistenceHook` —
       abstract only in V1 (no SQL / migrations ship with this module).
+
+    Concurrency: an instance is owned by ONE :class:`MigrationIdentityCore`
+    (its commit lock serializes check→persist→add).  A map shared across
+    several concurrently-used cores is NOT internally locked against the
+    cross-core check→add race — such sharing requires external
+    synchronization around the whole capture call.
     """
 
     def __init__(self) -> None:

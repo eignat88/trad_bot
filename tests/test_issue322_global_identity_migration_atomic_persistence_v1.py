@@ -169,6 +169,12 @@ def test_crash_before_commit_leaves_no_partial_save():
 
 
 def test_restart_after_crash_recovers_with_unchanged_identity():
+    # NOTE (review D4): "restart" here is a fresh core over the same store in
+    # one process.  Cross-PYTHONHASHSEED (true process) stability of the
+    # STABLE id is asserted in ..._subprocess_v1.py; a real restart under a
+    # new hash seed legitimately re-derives a DIFFERENT legacy id for the same
+    # signal (one stable key owns many legacy keys) and aliases it — never
+    # re-points history.
     store = AtomicIdentityStore()
     store.crash_before_commit = True
     with pytest.raises(IdentityPersistenceError):
@@ -183,6 +189,9 @@ def test_restart_after_crash_recovers_with_unchanged_identity():
 
 
 def test_restart_rebuilds_alias_map_without_identity_change():
+    # See the review-D4 note on test_restart_after_crash_recovers_with_
+    # unchanged_identity: in-process restart simulation; cross-seed stable-id
+    # stability lives in ..._subprocess_v1.py.
     store = AtomicIdentityStore()
     rec1 = capture(make_core(store), legacy_signal_time=ISO_TIME)
     # restart: fresh core, alias map replayed from the committed store
