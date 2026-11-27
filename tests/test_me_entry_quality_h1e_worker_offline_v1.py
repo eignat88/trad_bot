@@ -170,6 +170,46 @@ def test_healthcheck_is_read_only():
     assert factory.calls == 0  # health never calls the API
 
 
+def test_health_disabled_succeeds_without_sql_or_api():
+    """The installed-but-DISABLED state must never fail a health probe."""
+    factory = ExplodingFactory()
+    code = main(argv=["--health"], env={},
+                connection_factory=factory, client_factory=factory)
+    assert code == 0  # safe post-start probe: nothing to check yet
+    assert factory.calls == 0  # NO SQL, NO API while disabled
+
+
+def test_health_enabled_but_misconfigured_fails_closed():
+    env = dict(FULL_GATES)
+    env.pop("H1E_ACTIVATION_ID")
+    factory = ExplodingFactory()
+    code = main(argv=["--health"], env=env,
+                connection_factory=factory, client_factory=factory)
+    assert code == 2  # misconfiguration is reported, still fail closed
+    assert factory.calls == 0
+
+
+def test_systemd_exec_start_post_is_safe_for_disabled_startup():
+    """ExecStartPost runs --health; the disabled state must exit 0."""
+    unit = UNIT.read_text(encoding="utf-8")
+    assert "--health" in unit
+    factory = ExplodingFactory()
+    code = main(argv=["--health"], env={},
+                connection_factory=factory, client_factory=factory)
+    assert code == 0  # systemd sees success, NOT a false failure
+    assert factory.calls == 0
+
+
+def test_disabled_run_and_health_do_not_split():
+    """Run path and health path are separated: run=3 (disabled), health=0."""
+    factory = ExplodingFactory()
+    assert main(argv=[], env={}, connection_factory=factory,
+                client_factory=factory) == 3
+    assert main(argv=["--health"], env={}, connection_factory=factory,
+                client_factory=factory) == 0
+    assert factory.calls == 0
+
+
 # ─── existing services untouched ───────────────────────────────────────────
 
 

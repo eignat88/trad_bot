@@ -40,10 +40,19 @@ SELECT COUNT(*), MIN(captured_at), MAX(captured_at),
        COUNT(DISTINCT source_identity) AS identities
   FROM research_me_upstream_coverage.source_event;
 
--- identity / metadata mismatch audit (read-only)
-SELECT COUNT(*) AS hash_mismatches
+-- identity / metadata integrity audit (read-only; no extensions required)
+SELECT COUNT(*) AS empty_or_malformed_hashes
   FROM research_me_upstream_coverage.source_event
- WHERE lineage_hash <> encode(digest(lineage::text, 'sha256'), 'hex');
+ WHERE lineage_hash IS NULL
+    OR lineage_hash = ''
+    OR lineage_hash NOT SIMILAR TO '[0-9a-f]{64}';
+
+SELECT COUNT(*) AS duplicate_identities FROM (
+    SELECT source_identity
+      FROM research_me_upstream_coverage.source_event
+     GROUP BY source_identity
+    HAVING COUNT(*) > 1
+) AS duplicates;
 
 -- 24-25 Nov window inventory (the unproven window)
 SELECT date_trunc('day', captured_at) AS day, COUNT(*)

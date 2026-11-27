@@ -10,7 +10,7 @@ retried blindly.**
 | # | Check | Expected | On mismatch |
 |---|---|---|---|
 | P1 | `git -C /opt/... rev-parse HEAD` | matches the approved release SHA | STOP |
-| P2 | `psql -c "SELECT status FROM research_me_upstream_coverage.source_event LIMIT 0"` | reachable | STOP |
+| P2 | `psql -c "SELECT source_event_key FROM research_me_upstream_coverage.source_event LIMIT 0"` | reachable (table + SELECT grant exist) | STOP |
 | P3 | `SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='research_me_entry_quality_h1e'` | `0` (unless re-deploying) | STOP, go to Recovery |
 | P4 | untracked `.env.pre_*` files | present, untouched | STOP if altered |
 

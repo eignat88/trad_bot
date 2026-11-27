@@ -12,8 +12,12 @@ Hard rules:
 * NOTHING runs at import time — importing this module performs no
   database call and no API call;
 * ``main()`` is DISABLED by default: without the explicit deployment
-  gate it logs one line and exits 0 WITHOUT touching the database or the
-  API;
+  gate it logs one line and exits 3 (repo convention: disabled / not
+  activated) WITHOUT touching the database or the API;
+* ``--health`` is SEPARATED from the run path: it is the safe post-start
+  probe of the installed service — with the observer DISABLED it exits 0
+  without any SQL or API call; only an ENABLED observer gets the
+  read-only activation probe;
 * separate explicit gates are required for deployment, for the applied
   DDL, for the H1-E freeze and for the activation (all fail closed);
 * safe stop (SIGINT/SIGTERM ends the CURRENT cycle first) and
@@ -220,8 +224,27 @@ def main(
     """Explicit entry point — DISABLED without its gates (fail closed)."""
     environ = os.environ if env is None else env
     arguments = list(sys.argv[1:] if argv is None else argv)
+    enabled = str(environ.get("H1E_WORKER_ENABLE", "")).strip() == "1"
+    health_mode = bool(arguments) and arguments[0] == "--health"
 
-    if str(environ.get("H1E_WORKER_ENABLE", "")).strip() != "1":
+    if health_mode:
+        # SEPARATED checks: "--health" is the safe post-start probe of the
+        # INSTALLED service.  With the observer DISABLED it must succeed
+        # WITHOUT any SQL or API call (a disabled observer is the normal,
+        # correct state — never a systemd error).  With the observer
+        # enabled it becomes the read-only ACTIVATION probe.
+        if not enabled:
+            print("h1e health OK: service installed, "
+                  "observer DISABLED (not activated)")
+            return 0
+        try:
+            config = load_config_from_env(environ)
+        except WorkerGateError as exc:
+            print(f"h1e health FAILED: {exc}", file=sys.stderr)
+            return 2
+        return _healthcheck(config, connection_factory)
+
+    if not enabled:
         # default OFF (repo convention: exit 3 = disabled / not activated):
         # NO database call, NO API call
         print("h1e observer worker DISABLED (H1E_WORKER_ENABLE != 1)")
@@ -232,9 +255,6 @@ def main(
     except WorkerGateError as exc:
         print(f"h1e observer worker gate failed: {exc}", file=sys.stderr)
         return 2
-
-    if arguments and arguments[0] == "--health":
-        return _healthcheck(config, connection_factory)
 
     from app.research.me_entry_quality_h1e_infra_v1.pg_ledger_store import (
         PgH1EStore,
@@ -278,7 +298,7 @@ def _healthcheck(
     config: WorkerConfig,
     connection_factory: Callable[[str], Callable[[], Any]] | None,
 ) -> int:
-    """READ-ONLY health probe (no writes, no API)."""
+    """READ-ONLY activation probe (no writes, no API) — ENABLED observers."""
     connection_factory = connection_factory or _default_connection_factory
     open_connection = connection_factory(config.pg_dsn)
     try:

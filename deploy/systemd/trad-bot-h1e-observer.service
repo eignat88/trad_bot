@@ -21,7 +21,9 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=/opt/trad_bot_h1e_observer_release/deploy/env/h1e-observer.env
 
 ExecStart=/opt/trad_bot_h1e_observer_release/.venv312/bin/python -B -m app.research.me_entry_quality_h1e_infra_v1.worker
-# Read-only health probe after start (no writes, no API).
+# Safe post-start probe: succeeds WITHOUT SQL/API while the observer is
+# DISABLED (the normal installed state); becomes the read-only activation
+# probe only when the gates are on.
 ExecStartPost=/opt/trad_bot_h1e_observer_release/.venv312/bin/python -B -m app.research.me_entry_quality_h1e_infra_v1.worker --health
 
 Restart=on-failure
